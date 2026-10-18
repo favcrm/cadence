@@ -131,7 +131,13 @@ pub(crate) fn provider_launch(
     codex: &CodexOpts,
     team_role: Option<&str>,
     provider_default_model: bool,
+    profile: Option<&str>,
 ) -> Result<i32> {
+    if profile.is_some() && (instructions_file.is_some() || briefing == BriefMode::Off) {
+        return Err(Error::rejected(
+            "--profile cannot be combined with --instructions-file or --no-bootstrap",
+        ));
+    }
     // Role instructions reach every provider but codex only through the
     // briefing — refuse before anything is registered, created or
     // launched rather than store text nothing will ever read.
@@ -452,6 +458,7 @@ pub(crate) fn provider_launch(
         "role": role, "sandbox": sandbox,
         "instructions": instructions, "params": params,
         "team_role": team_role,
+        "profile": profile,
         "model_policy": if provider_default_model {
             Some("provider_default")
         } else {
@@ -464,6 +471,14 @@ pub(crate) fn provider_launch(
             // agent is resumed; a live one is reused as-is.
             let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
             refuse_endpoint_mismatch(&alias, &show["agent"], provider, endpoint_kind)?;
+            if let Some(profile) = profile {
+                if show["agent"]["params"]["profile"].as_str() != Some(profile) {
+                    return Err(Error::rejected(format!(
+                        "'{alias}' already has different saved profile settings; \
+                         resume that session or use a new alias"
+                    )));
+                }
+            }
             let state = show["agent"]["state"].as_str().unwrap_or_default();
             if matches!(state, "stopped" | "offline") {
                 client::rpc(state_dir, "agent_resume", json!({"alias": alias}))?;
@@ -594,6 +609,7 @@ pub(crate) fn join_group(
     codex_opts: CodexOpts,
     team_role: Option<String>,
     provider_default_model: bool,
+    profile: Option<String>,
 ) -> Result<i32> {
     // Validate the provider before any work — the registry names the
     // supported launch verbs in the rejection.
@@ -644,6 +660,7 @@ pub(crate) fn join_group(
         &codex_opts,
         team_role.as_deref(),
         provider_default_model,
+        profile.as_deref(),
     )
 }
 

@@ -58,4 +58,70 @@ impl Shared {
             &observed,
         ))
     }
+
+    pub(super) fn rpc_agent_settings_get(self: &Arc<Self>) -> Result<Value> {
+        let agents = self.store.agents()?;
+        let pm = self.pm()?;
+        crate::agent_settings::snapshot(&pm.dir, &self.store, &agents)
+    }
+
+    pub(super) fn rpc_agent_settings_set(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("agent settings set", params, peer_pid)?;
+        let expected = required_str(params, "expected_revision")?;
+        let config = params.get("config").ok_or_else(|| {
+            Error::invalid("invalid_request", "Missing required parameter 'config'")
+        })?;
+        let agents = self.store.agents()?;
+        let pm = self.pm()?;
+        crate::agent_settings::save(&pm, &self.state_dir, &self.store, &agents, expected, config)
+    }
+
+    pub(super) fn rpc_agent_settings_catalog(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("agent settings catalog", params, peer_pid)?;
+        let provider = required_str(params, "provider")?;
+        let pm = self.pm()?;
+        crate::agent_settings::catalog(&pm.dir, provider)
+    }
+
+    pub(super) fn rpc_agent_settings_sync(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("agent settings sync", params, peer_pid)?;
+        let expected = required_str(params, "expected_revision")?;
+        let profile = match params.get("profile") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) => Some(id.as_str()),
+            Some(_) => {
+                return Err(Error::invalid(
+                    "invalid_request",
+                    "'profile' must be a string or null",
+                ))
+            }
+        };
+        let agents = self.store.agents()?;
+        let pm = self.pm()?;
+        crate::agent_settings::sync(&pm, &self.store, &agents, expected, profile)
+    }
+
+    pub(super) fn rpc_agent_settings_preview(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("agent settings preview", params, peer_pid)?;
+        let expected = required_str(params, "expected_revision")?;
+        let profile = required_str(params, "profile")?;
+        let harness = required_str(params, "harness")?;
+        crate::agent_settings::preview(&self.store, expected, profile, harness)
+    }
 }

@@ -789,6 +789,124 @@ pub(crate) fn read_settings_body(request: &mut Request) -> std::result::Result<V
     Ok(buf)
 }
 
+pub(crate) fn agent_settings_get(state_dir: &Path, read_only: bool) -> HttpResp {
+    match client::rpc(state_dir, "agent_settings_get", json!({})) {
+        Ok(mut snapshot) => {
+            if let Some(obj) = snapshot.as_object_mut() {
+                obj.insert("read_only".to_string(), json!(read_only));
+            }
+            json_response(snapshot)
+        }
+        Err(err) => settings_rpc_error(err),
+    }
+}
+
+fn agent_settings_body(request: &mut Request) -> std::result::Result<Value, HttpResp> {
+    const CAP: u64 = 256 * 1024;
+    let mut buf = Vec::new();
+    let mut limited = request.as_reader().take(CAP + 1);
+    if let Err(e) = limited.read_to_end(&mut buf) {
+        return Err(coded_response(
+            400,
+            "invalid_request",
+            &format!("body read failed: {e}"),
+            None,
+        ));
+    }
+    if buf.len() as u64 > CAP {
+        return Err(coded_response(
+            400,
+            "invalid_request",
+            "settings body exceeds 256 KiB",
+            None,
+        ));
+    }
+    let text = std::str::from_utf8(&buf).map_err(|_| {
+        coded_response(
+            400,
+            "invalid_request",
+            "settings body must be UTF-8 JSON",
+            None,
+        )
+    })?;
+    serde_json::from_str(text).map_err(|_| {
+        coded_response(
+            400,
+            "invalid_request",
+            "settings body must be a JSON object",
+            None,
+        )
+    })
+}
+
+fn agent_settings_error(err: Error) -> HttpResp {
+    if err.kind() == "conflict" {
+        let message = err.to_string();
+        let revision = message
+            .split_once("settings revision is ")
+            .map(|(_, token)| token.trim().to_string());
+        let body = serde_json::to_vec_pretty(&json!({
+            "error": message,
+            "code": "revision_conflict",
+            "revision": revision,
+        }))
+        .unwrap_or_default();
+        let mut resp = Response::from_data(body).with_status_code(StatusCode(409));
+        resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+        return resp;
+    }
+    settings_rpc_error(err)
+}
+
+pub(crate) fn agent_settings_post(request: &mut Request, state_dir: &Path, path: &str) -> HttpResp {
+    let body = match agent_settings_body(request) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let (method, params) = if path.ends_with("/catalog") {
+        (
+            "agent_settings_catalog",
+            json!({"provider": body.get("provider").cloned().unwrap_or(Value::Null)}),
+        )
+    } else if path.ends_with("/sync") {
+        (
+            "agent_settings_sync",
+            json!({
+                "expected_revision": body.get("expected_revision").cloned().unwrap_or(Value::Null),
+                "profile": body.get("profile").cloned().unwrap_or(Value::Null),
+            }),
+        )
+    } else if path.ends_with("/preview") {
+        (
+            "agent_settings_preview",
+            json!({
+                "expected_revision": body.get("expected_revision").cloned().unwrap_or(Value::Null),
+                "profile": body.get("profile").cloned().unwrap_or(Value::Null),
+                "harness": body.get("harness").cloned().unwrap_or(Value::Null),
+            }),
+        )
+    } else {
+        (
+            "agent_settings_set",
+            json!({
+                "expected_revision": body.get("expected_revision").cloned().unwrap_or(Value::Null),
+                "config": body.get("config").cloned().unwrap_or(Value::Null),
+            }),
+        )
+    };
+    match client::rpc(state_dir, method, params) {
+        Ok(mut snapshot) => {
+            if method == "agent_settings_set" {
+                if let Some(obj) = snapshot.as_object_mut() {
+                    obj.insert("read_only".to_string(), json!(false));
+                }
+            }
+            json_response(snapshot)
+        }
+        Err(err) => agent_settings_error(err),
+    }
+}
+
 /// `POST /api/settings/model-defaults` — operator-only, admitted by
 /// `operator::admit` (session plus process proof) before this runs.
 pub(crate) fn model_defaults_post(request: &mut Request, state_dir: &Path) -> HttpResp {
@@ -949,6 +1067,19 @@ pub(crate) fn write_route(
         } else {
             updates::check_now(state_dir)
         };
+        send(request, resp);
+        return;
+    }
+    if path == "/api/settings/agents"
+        || path == "/api/settings/agents/catalog"
+        || path == "/api/settings/agents/sync"
+        || path == "/api/settings/agents/preview"
+    {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = agent_settings_post(&mut request, state_dir, path);
         send(request, resp);
         return;
     }

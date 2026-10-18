@@ -1457,6 +1457,56 @@ pub fn write_file(pm: &Pm, slug: &str, name: &str, text: &str, actor: &str) -> R
     Ok(out)
 }
 
+/// Remove one agent file through the same lock and tracker commit as
+/// [`write_file`]. The master slug is refused: those files are the
+/// running master's briefing, not a settings profile.
+pub fn remove_file(pm: &Pm, slug: &str, name: &str, actor: &str) -> Result<Value> {
+    if slug == ALIAS {
+        return Err(Error::rejected(
+            "agents/master is the master briefing — settings cannot remove it",
+        ));
+    }
+    if !FILES.contains(&name) {
+        return Err(Error::rejected(format!(
+            "'{name}' is not an agent file — one of {}",
+            FILES.join(", ")
+        )));
+    }
+    let dir = real_dir(&pm.dir, slug)?;
+    let _lock = pm.lock()?;
+    let path = dir.join(name);
+    if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{} is a symlink — refusing to remove through it",
+            path.display()
+        )));
+    }
+    let before = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({"agent": slug, "file": name, "removed": false}));
+        }
+        Err(e) => {
+            return Err(Error::rejected(format!(
+                "cannot read {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    std::fs::remove_file(&path)?;
+    if let Err(e) = crate::issue::write::commit(
+        pm,
+        std::slice::from_ref(&path),
+        &format!("agents/{slug}: remove {name}"),
+        &[],
+        actor,
+    ) {
+        let _ = std::fs::write(&path, &before);
+        return Err(e);
+    }
+    Ok(json!({"agent": slug, "file": name, "removed": true}))
+}
+
 /// Read the agent's files in [`FILES`] order, refusing symlinks and
 /// files over their caps. `all` requires every file; otherwise a
 /// missing one is skipped.

@@ -121,6 +121,7 @@ pub struct ProviderEnv(
     Arc<RwLock<BTreeMap<String, String>>>,
     Option<std::path::PathBuf>,
     Option<crate::platform::deployments::HostedCompanyMaster>,
+    Option<Arc<crate::store::Store>>,
 );
 
 impl ProviderEnv {
@@ -208,7 +209,12 @@ impl ProviderEnv {
     /// The authority is outside the mutable environment map and is inherited
     /// by clones without being exposed through `set`, `remove` or `vars`.
     pub(crate) fn with_workspace(&self, workspace: std::path::PathBuf) -> Self {
-        Self(Arc::clone(&self.0), Some(workspace), self.2.clone())
+        Self(
+            Arc::clone(&self.0),
+            Some(workspace),
+            self.2.clone(),
+            self.3.clone(),
+        )
     }
 
     pub(crate) fn workspace(&self) -> Option<&std::path::Path> {
@@ -226,6 +232,16 @@ impl ProviderEnv {
 
     pub(crate) fn company_master(&self) -> bool {
         self.2.is_some()
+    }
+
+    /// Bind launch policy to the daemon's actual store, never an environment
+    /// variable a provider or worker can replace.
+    pub(crate) fn with_settings_store(&self, store: Arc<crate::store::Store>) -> Self {
+        Self(Arc::clone(&self.0), self.1.clone(), self.2.clone(), Some(store))
+    }
+
+    pub(crate) fn settings_store(&self) -> Option<&crate::store::Store> {
+        self.3.as_deref()
     }
 
     pub fn set(&self, name: &str, value: impl Into<String>) {

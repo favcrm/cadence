@@ -73,7 +73,14 @@ pub(crate) fn brief_agent(
     enqueue: bool,
     instructions: Option<&str>,
 ) -> Result<PathBuf> {
-    let agent = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?["agent"].clone();
+    let agent = client::rpc(
+        state_dir,
+        "agent_show",
+        json!({
+            "alias": alias, "limit": 0, "include_profile_instructions": true,
+        }),
+    )?["agent"]
+        .clone();
     // A mailbox consumes no briefing — nothing runs in it.
     if !registry::has_actor(
         agent["provider"].as_str().unwrap_or_default(),
@@ -92,9 +99,14 @@ pub(crate) fn brief_agent(
     let file = client::briefing_path(state_dir, &agent["params"], alias);
     let instructions = match instructions {
         Some(text) => Some(text.to_string()),
-        None => std::fs::read_to_string(&file)
-            .ok()
-            .and_then(|old| role_instructions(&old).map(str::to_string)),
+        None => agent["instructions"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| {
+                std::fs::read_to_string(&file)
+                    .ok()
+                    .and_then(|old| role_instructions(&old).map(str::to_string))
+            }),
     }
     .filter(|text| !text.trim().is_empty());
     let body = briefing_body(state_dir, &agent, root_alias, instructions.as_deref());

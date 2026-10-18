@@ -487,9 +487,8 @@ fn agenticos_read_extension(env: &ProviderEnv) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
-/// The tracker dir `[pi]` policy is read from (CAD-559): the daemon's
-/// `CADENCE_PM_DIR`, else the process default — the same seam
-/// `pi_confine_inputs` uses for its tracker grant.
+/// The tracker directory used for the confinement read grant. Launch policy
+/// comes from the daemon-bound settings store, not this environment path.
 fn pi_pm_dir(env: &ProviderEnv) -> Option<PathBuf> {
     env.var("CADENCE_PM_DIR")
         .filter(|v| !v.is_empty())
@@ -497,17 +496,21 @@ fn pi_pm_dir(env: &ProviderEnv) -> Option<PathBuf> {
         .or_else(|| crate::issue::default_dir().ok())
 }
 
-/// The operator-pinned provider packages (`[pi].providers` in pm.yaml).
+fn settings_policy(env: &ProviderEnv) -> Result<Option<crate::pi_policy::PiPolicy>> {
+    let store = env
+        .settings_store()
+        .ok_or_else(|| Error::rejected("Pi settings authority is not bound to this adapter"))?;
+    store.pi_policy()
+}
+
+/// The operator-pinned provider packages from the transactional settings store.
 /// Each `name@version` resolves under the OPERATOR's Pi npm dir
 /// (`<PI_CODING_AGENT_DIR|~/.pi/agent>/npm/node_modules`) — never the
 /// agent's private `PI_CODING_AGENT_DIR`, so a confined master cannot
 /// pick its own extensions. Resolution is fail-closed at launch: a
 /// missing package, a version drift or a malformed pin refuses the open.
 fn provider_packages(env: &ProviderEnv) -> Result<Vec<crate::pi_policy::ProviderPackage>> {
-    let Some(pm_dir) = pi_pm_dir(env) else {
-        return Ok(vec![]);
-    };
-    let Some(policy) = crate::pi_policy::read(&pm_dir)? else {
+    let Some(policy) = settings_policy(env)? else {
         return Ok(vec![]);
     };
     if policy.providers.is_empty() {
@@ -2389,10 +2392,7 @@ impl PiAdapter {
         // the wire, exactly like the open path's re-check — under the
         // role this adapter opened as (CAD-575).
         let want = format!("{provider}/{model_id}");
-        let pi_policy = pi_pm_dir(&self.env)
-            .map(|dir| crate::pi_policy::read(&dir))
-            .transpose()?
-            .flatten();
+        let pi_policy = settings_policy(&self.env)?;
         let role = if self.shared.master.load(Ordering::SeqCst) {
             "master"
         } else {
@@ -2808,16 +2808,13 @@ impl ProviderAdapter for PiAdapter {
         if want.trim().is_empty() {
             return Err(Error::rejected(format!(
                 "pi agent '{}' has no model configured — pass --model \
-                 <provider/id> or set pi.models.default.{} in pm.yaml; a \
+                 <provider/id> or configure the {} default in Settings > Agents; a \
                  silent provider fallback is never used (CAD-559)",
                 agent.alias,
                 if master { "master" } else { "worker" }
             )));
         }
-        let pi_policy = pi_pm_dir(&self.env)
-            .map(|dir| crate::pi_policy::read(&dir))
-            .transpose()?
-            .flatten();
+        let pi_policy = settings_policy(&self.env)?;
         crate::pi_policy::require_allowed(
             pi_policy.as_ref(),
             if master { "master" } else { "worker" },

@@ -711,6 +711,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             cloud_params,
             confine,
             no_confine,
+            profile,
         } => join::run(
             state_dir,
             group,
@@ -743,6 +744,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             cloud_params,
             confine,
             no_confine,
+            profile,
         ),
         Commands::Attach { name, print } => attach::run(state_dir, name, print),
         Commands::Resume { group, all, detach } => resume::run(state_dir, group, all, detach),

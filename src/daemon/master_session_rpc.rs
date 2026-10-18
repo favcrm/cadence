@@ -320,12 +320,7 @@ impl Shared {
         // The policy's per-role vocabularies annotate every offered
         // model and supply the rows the provider never offered — a
         // missing `[pi]` is two empty lists, like the launch gates.
-        let policy = self
-            .pm_dir()
-            .ok()
-            .map(|dir| crate::pi_policy::read(&dir))
-            .transpose()?
-            .flatten();
+        let policy = self.stored_pi_policy()?;
         let (master_list, worker_list) = policy
             .as_ref()
             .map(|p| {

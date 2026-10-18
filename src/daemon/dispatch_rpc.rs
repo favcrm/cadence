@@ -289,10 +289,7 @@ impl Shared {
             }
             crate::model_defaults::validate_model_id(model)?;
             if provider == "pi" {
-                let policy = match self.pm_dir() {
-                    Ok(dir) => crate::pi_policy::read(&dir)?,
-                    Err(_) => None,
-                };
+                let policy = self.stored_pi_policy()?;
                 crate::pi_policy::require_allowed(policy.as_ref(), "worker", model)?;
             }
         }
@@ -460,7 +457,7 @@ impl Shared {
                 let effective = match effective {
                     Some(m) => m,
                     None => {
-                        let policy = crate::pi_policy::read(&pm_dir)?;
+                        let policy = self.stored_pi_policy()?;
                         crate::pi_policy::resolve_model(policy.as_ref(), "worker", None)?
                     }
                 };
@@ -557,10 +554,7 @@ impl Shared {
         let (front, body) = issue::write::load_front(&dir)?;
         let items = issue::parse::acceptance_items(&body);
         let lane = self.kickoff_existing_lane(&project, &front)?;
-        let policy = match self.pm_dir() {
-            Ok(dir) => crate::pi_policy::read(&dir)?,
-            Err(_) => None,
-        };
+        let policy = self.stored_pi_policy()?;
         let mut providers = Vec::new();
         let mut seen: Vec<&str> = Vec::new();
         for spec in crate::adapter::registry::SPECS {

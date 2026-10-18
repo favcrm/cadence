@@ -52,5 +52,6 @@ pub(super) fn run(
         },
         team_role.as_deref(),
         provider_default_model,
+        None,
     )
 }

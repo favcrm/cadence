@@ -992,43 +992,117 @@ export interface MemoryDetail extends MemoryCard {
   body: string;
 }
 
-export interface ModelSelector {
-  mode: "model" | "provider_default";
-  model?: string;
-}
+/** CAD-1548 Settings > Agents. Field names match the approved draft document. */
+export type AgentScope = "off" | "allow" | "master" | "worker";
+export type AgentProviderKind = "Pi extension" | "native CLI";
 
-export interface ProviderModelDefaults {
-  default: ModelSelector;
-  roles: Record<string, ModelSelector>;
-}
-
-export interface ModelDefaultsConfig {
-  schema: number;
-  providers: Record<string, ProviderModelDefaults>;
-}
-
-export interface ModelProviderInfo {
+export interface AgentHarness {
   id: string;
   label: string;
-  eligible: boolean;
-  kinds: string[];
-  suggestions: string[];
-  suggestions_note: string;
-  limitation?: string | null;
+  cli: string;
+  note: string;
 }
 
-export interface ModelRoleInfo {
+export interface AgentProvider {
   id: string;
   label: string;
+  kind: AgentProviderKind;
+  pin: string;
+  gate: boolean;
+  paid: boolean;
+  note: string;
 }
 
-/** GET/POST /api/settings/model-defaults */
-export interface ModelDefaultsSnapshot {
-  revision: number;
-  config: ModelDefaultsConfig;
-  providers: ModelProviderInfo[];
-  roles: ModelRoleInfo[];
+export interface AgentModel {
+  id: string;
+  provider: string;
+  ctx: string;
+  out: string;
+  thinking: boolean | null;
+  images: boolean | null;
+}
+
+export interface AgentProfile {
+  id: string;
+  role: string;
+  model: string;
+  job: string;
+}
+
+export interface AgentPin {
+  pkg: string;
+  pinned: string;
+}
+
+export interface AgentSettingsConfig {
+  harnesses: AgentHarness[];
+  providers: AgentProvider[];
+  models: AgentModel[];
+  profiles: AgentProfile[];
+  scope: Record<string, AgentScope>;
+  roleDefaults: Record<string, string>;
+  pins: AgentPin[];
+}
+
+export interface AgentHarnessObservation {
+  installed: boolean | null;
+  version: string | null;
+  live: number;
+}
+
+export interface AgentProfileFile {
+  path: string;
+  status: "not written" | "in sync" | "needs sync" | "unmanaged";
+}
+
+export interface AgentProfileObservation {
+  version: string;
+  usedBy: string[];
+  history: Array<{ at: string; what: string }>;
+  files: AgentProfileFile[];
+}
+
+export interface AgentSettingsObservations {
+  harnesses: Record<string, AgentHarnessObservation>;
+  models: Record<string, { live: number }>;
+  profiles: Record<string, AgentProfileObservation>;
+}
+
+export interface AgentCatalogModel {
+  id: string;
+  ctx: string;
+  out: string;
+  thinking: boolean | null;
+  images: boolean | null;
+}
+
+export interface AgentCatalog {
+  source: string;
+  fetchedAt: string;
+  models: AgentCatalogModel[];
+  error?: string;
+}
+
+export interface AgentSettingsSnapshot {
+  revision: string;
   read_only: boolean;
+  config: AgentSettingsConfig;
+  observations: AgentSettingsObservations;
+  catalogs: Record<string, AgentCatalog>;
+}
+
+export interface AgentSyncResult {
+  snapshot: AgentSettingsSnapshot;
+  files: Array<{ profile: string; path: string; status: string }>;
+}
+
+export interface AgentPreviewResult {
+  command: string | null;
+  model: string | null;
+  source: string;
+  allowed: boolean;
+  reasons: string[];
+  profile_revision: string;
 }
 
 /** One declared `inputs:` entry in a workflow's frontmatter (CAD-496). */
