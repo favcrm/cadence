@@ -235,6 +235,7 @@ jobs:
       - run: python3 scripts/test_release_reuse.py
       - run: python3 -m unittest scripts/test_enqueue_human_paths.py
       - run: python3 -m unittest scripts/test_enqueue_scope_approval.py
+      - run: python3 scripts/test_enqueue_requirements.py
       - run: python3 scripts/test_operator_preflight.py
       # CAD-1475: the operator-owned publicity lifecycle guard — the real
       # helper driven through a stateful s3api boundary (conditional write,

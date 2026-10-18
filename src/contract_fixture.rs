@@ -1,44 +1,27 @@
-//! ADR 0006 §5.6 — the fake platform behind the shared
-//! connected-platform fixture in `contracts/connected-platform/v1/`.
+//! ADR 0006 connected-platform vocabulary and test adapter.
 //!
-//! Test support, not a live adapter: it simulates the platform side
-//! the proxy and effect gate (CAD-366/CAD-506) talk to, deterministically
-//! and with no network and no credentials. Its declared tool table is the
-//! fixture's own `fake-tool-table.json`, embedded at compile time, so the
-//! tested table is the published contract byte-for-byte.
-//!
-//! What it models:
-//! - the declared tool table `{tool → {effect, scopes, label?}}` (C2) and
-//!   the classification rules of C1–C3, including the manifest-version pin;
-//! - `execute`: the platform call. Sends append to an observable execution
-//!   log ("did it fire?"); every write carries an idempotency key derived
-//!   from the `effect_id` and a repeated key returns the recorded outcome
-//!   without executing again (C9);
-//! - `read_back`: the post-execution state comparison that produces
-//!   `outcome.verified` (C10), with knobs for mismatch and for platforms
-//!   that offer no read-back;
-//! - reviewed source artifacts a send derives from (`source_hash`, §5.4
-//!   step 3) — the test mutates them to trigger `source_changed`;
-//! - injected platform faults (`failed` outcomes).
-//!
-//! What it deliberately does not model: custody, grants, the gate's
-//! staging/durability and the press itself — those are CAD-366/506's
-//! side of the seam.
+//! Production adapters and effect guards share the tool table,
+//! classification rules and read-back verdicts below. The deterministic
+//! `FakePlatform` and its embedded table are test-only; they have no
+//! network access or credentials.
 
+#[cfg(test)]
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 
-/// Repo-relative directory the shared fixture lives at. Both Cadence's
-/// tests and AgenticOS consumers pin this path at a version (v1/).
-pub const FIXTURE_DIR: &str = "contracts/connected-platform/v1";
-
+#[cfg(test)]
 /// The fake adapter's declared tool table — the fixture file itself.
 pub const TOOL_TABLE_JSON: &str =
     include_str!("../contracts/connected-platform/v1/fake-tool-table.json");
@@ -146,6 +129,7 @@ impl ToolTable {
         })
     }
 
+    #[cfg(test)]
     /// The table the shipped fake declares — the fixture file itself.
     pub fn standard() -> Self {
         Self::from_json(&serde_json::from_str(TOOL_TABLE_JSON).expect("fixture parses"))
@@ -219,6 +203,7 @@ impl<'de> Deserialize<'de> for Verified {
     }
 }
 
+#[cfg(test)]
 /// What the fake platform did: one attempted platform call. `ok:false`
 /// rows are attempts that errored — traffic happened, the act did not
 /// land.
@@ -235,6 +220,7 @@ pub struct Execution {
     pub error: Option<String>,
 }
 
+#[cfg(test)]
 /// Fake-adapter read-back knob — `given.adapter.read_back` in the
 /// vectors.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -248,6 +234,7 @@ pub enum ReadBack {
     Unknown,
 }
 
+#[cfg(test)]
 /// The deterministic platform-side double. Every knob a vector's
 /// `given.adapter` names lands here. Named `FakePlatform` — the platform
 /// end of the seam — to stay clear of `adapter::fake::FakeAdapter`, the
@@ -274,6 +261,7 @@ pub struct FakePlatform {
     seq: AtomicU64,
 }
 
+#[cfg(test)]
 impl FakePlatform {
     /// The fixture's own table (`fake-tool-table.json`) with the platform
     /// reporting the table's pinned manifest version.
@@ -461,6 +449,7 @@ impl FakePlatform {
     }
 }
 
+#[cfg(test)]
 // CAD-506: the platform double is one `PlatformAdapter` — the same
 // reviewed table, manifest pin, preview and idempotent send the gate
 // drives for a real adapter. The credential crosses the seam as
@@ -518,68 +507,6 @@ impl crate::platform::PlatformAdapter for FakePlatform {
     fn source_hash(&self, _agent: &str, source: &str) -> Option<String> {
         self.source_hash(source)
     }
-}
-
-/// The pending-effect record (§5.4) as a typed view — for tests that
-/// build or inspect rows. The JSON Schema in the fixture is
-/// authoritative; this mirrors it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingEffect {
-    pub request: String,
-    /// Always `"effect"`.
-    pub kind: String,
-    pub agent: String,
-    pub platform: String,
-    pub account: String,
-    pub tool: String,
-    /// Always `"send"` — reads and drafts never pend.
-    pub effect: String,
-    pub input_summary: String,
-    /// The exact staged call arguments the press approves.
-    pub input: Value,
-    /// The rendered bounded artifact the press reviews.
-    pub preview: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    pub effect_id: String,
-    /// waiting → decided → executing → done|failed; or declined, closed,
-    /// reconcile (§5.4 `state` enum).
-    pub state: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub close_reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decision: Option<PendingDecision>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<PendingOutcome>,
-}
-
-/// `decision` — `{by, at, reason?}`; `by` is `{member, role, rule}`, the
-/// verified presser and the rule that authorised them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingDecision {
-    pub by: PendingPresser,
-    pub at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingPresser {
-    pub member: String,
-    pub role: String,
-    pub rule: String,
-}
-
-/// `outcome` — the platform result or error, plus the read-back verdict.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingOutcome {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    pub verified: Verified,
 }
 
 #[cfg(test)]

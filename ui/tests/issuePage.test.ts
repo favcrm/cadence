@@ -3,7 +3,6 @@ import type { Meta } from "../src/lib/types";
 import type { IssueDetail, IssueHistoryEntry } from "../src/lib/types";
 import {
   acceptanceItems,
-  askAgentReason,
   briefPreview,
   issuePath,
   kickoffBlock,
@@ -91,9 +90,6 @@ equal(kickoffBlock(acceptanceItems(body), operatorKickoffBlock({ ...operatorMeta
 equal(kickoffBlock(acceptanceItems(body), operatorKickoffBlock({ ...operatorMeta, read_only: true })) !== null, true, "read-only operator cannot kick off");
 equal(kickoffBlock(acceptanceItems(body), operatorKickoffBlock(operatorMeta)), null, "operator with acceptance can kick off");
 equal(kickoffBlock([], operatorKickoffBlock(operatorMeta)), NO_ACCEPTANCE, "operator still needs acceptance");
-
-equal(askAgentReason(0), "No lane yet", "ask needs a lane");
-equal(askAgentReason(1), null, "a bound agent can be asked");
 
 equal(issuePath("cadence", "CAD 1", "pr"), "/projects/cadence/issues/CAD%201?tab=pr", "issue href");
 equal(parseIssueTab("conversation"), "conversation", "known tab");

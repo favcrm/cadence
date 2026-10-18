@@ -72,16 +72,3 @@ export const NEED_SECTION_LABEL = {
 
 /** "Needs your decision" with no operator row — an answer, not a gap. */
 export const NEEDS_DECISION_EMPTY = "Nothing needs your decision";
-
-/**
- * Drawer status line while the board status comes from notes.
- * A bound job outranks notes; other sources do not use this sentence.
- */
-export function notesStatusSentence(
-  statusSource: string,
-  noteKind: string,
-  status: string,
-): string | null {
-  if (statusSource !== "notes") return null;
-  return `This status comes from the latest tagged note (a ${noteKind}), so the board shows ${status}. A bound job outranks notes.`;
-}

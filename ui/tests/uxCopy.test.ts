@@ -3,7 +3,6 @@ import {
   NEED_SECTION_LABEL,
   NEEDS_DECISION_EMPTY,
   needLabel,
-  notesStatusSentence,
   shaCiLabel,
 } from "../src/lib/uxCopy";
 
@@ -46,15 +45,5 @@ for (const state of ["cancelled", "missing", "pending", "failed"]) {
     throw new Error(`${state} SHA read as passed`);
   }
 }
-
-const notes = notesStatusSentence("notes", "qa", "doing");
-if (notes == null || !notes.includes("bound job")) {
-  throw new Error(`notes sentence should mention a bound job, got ${String(notes)}`);
-}
-if (notes.includes("M3") || /ship/i.test(notes)) {
-  throw new Error(`notes sentence mentioned a future release: ${notes}`);
-}
-equal(notesStatusSentence("file", "qa", "doing"), null);
-equal(notesStatusSentence("job", "qa", "doing"), null);
 
 console.log("ux copy checks passed");
