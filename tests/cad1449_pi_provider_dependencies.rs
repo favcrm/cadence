@@ -14,7 +14,9 @@
 //! bare `require.resolve` only stats, which Landlock does not gate),
 //! while an unrelated sibling package and a private sentinel outside
 //! the npm root must stay unreadable. No
-//! mock sandbox, no mirrored policy, no provider/model/DB/network use.
+//! mock sandbox, no mirrored policy, no live provider/model/network use.
+//! Canonical policy is imported once into an isolated fixture SQLite
+//! store.
 //!
 //! The same group proves the real resolver/policy path refuses to widen
 //! authority on malformed dependency metadata: traversal and absolute

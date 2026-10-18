@@ -1704,7 +1704,8 @@ mod acceptance {
                 "CAD-1548 independent portable fixture",
             ],
         ] {
-            let output = std::process::Command::new("git")
+            let mut command = std::process::Command::new("git");
+            command
                 .arg("-C")
                 .arg(&tracker)
                 .args([
@@ -1721,9 +1722,8 @@ mod acceptance {
                 .env("GIT_AUTHOR_NAME", "cad1548-acceptance")
                 .env("GIT_AUTHOR_EMAIL", "acceptance@example.invalid")
                 .env("GIT_COMMITTER_NAME", "cad1548-acceptance")
-                .env("GIT_COMMITTER_EMAIL", "acceptance@example.invalid")
-                .output()
-                .unwrap();
+                .env("GIT_COMMITTER_EMAIL", "acceptance@example.invalid");
+            let output = cadence_agent::reaper::output(&mut command).unwrap();
             assert!(
                 output.status.success(),
                 "fixture git {args:?}: {}",
