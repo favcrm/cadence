@@ -183,11 +183,13 @@ impl Shared {
     /// `session_hash` is the cap's stored FULL credential hash; a
     /// different row sharing the 8-hex display prefix does not satisfy
     /// it. Fail-closed on any lookup error.
-    fn session_id_live(&self, session_hash: &str) -> bool {
+    /// CAD-1537: `read_only` — a read-only cap's public member session
+    /// counts as live; every other cap still needs a current owner.
+    fn session_id_live(&self, session_hash: &str, read_only: bool) -> bool {
         if !session_hash_ok(session_hash) {
             return false;
         }
-        match self.public_row_hash(session_hash) {
+        match self.public_row_hash(session_hash, read_only) {
             Some(public) => public,
             None => {
                 let now = self.operator_now();
@@ -335,7 +337,18 @@ impl Shared {
         if caps.len() >= CAP_GLOBAL {
             return Err(Error::rejected("screen capability map is full"));
         }
-        if caps.values().filter(|c| c.install_id == install_id).count() >= CAP_PER_INSTALL {
+        // CAD-1537: read-only caps never take the operator's capacity —
+        // they hold at most half the global map, and the per-install bound
+        // counts operator and read-only caps apart.
+        if read_only && caps.values().filter(|c| c.read_only).count() >= CAP_GLOBAL / 2 {
+            return Err(Error::rejected("screen capability map is full"));
+        }
+        if caps
+            .values()
+            .filter(|c| c.install_id == install_id && c.read_only == read_only)
+            .count()
+            >= CAP_PER_INSTALL
+        {
             return Err(Error::rejected(
                 "too many live screen mounts for this installation",
             ));
@@ -513,7 +526,7 @@ impl Shared {
         }
         // The minting session must still be live — a revoke between mint
         // and consume kills the cap. The id was server-resolved at mint.
-        if !self.session_id_live(&cap.session) {
+        if !self.session_id_live(&cap.session, cap.read_only) {
             return Err(Error::rejected("the minting session is no longer live"));
         }
         let pm_dir = self.pm_dir()?;
