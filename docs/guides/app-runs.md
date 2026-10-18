@@ -139,6 +139,24 @@ Both flags are required together. The daemon also checks the actual
 caller, assignment and dependency; possession of a token alone is
 insufficient. Operator artifact reads omit both flags.
 
+Managed Codex cannot open the daemon socket from its command sandbox.
+Its one fetch path is the Cadence MCP bridge on that same turn: call
+`self`, then `app_run_artifact` with `artifact_id` from the kickoff and
+`message` and `token` set to the `id` and `turn_id` of the held turn
+`self` returns. The tool accepts only those three strings. Alias,
+provider, path, and command arguments are refused, as are a missing
+message or token. That MCP call uses the existing guarded
+`app_run_artifact` RPC from the enrolled process. It does not launch a
+subprocess, so the turn token is not copied into a child argv. Pi,
+Claude, and other supported providers keep the CLI above. The daemon
+applies the same caller, assignment, dependency, active-turn, approval,
+and integrity checks. Operator reads stay on the flagless command.
+
+A successful worker fetch records that artifact, the dependent message, and
+the current turn. Approve requires that record for the same three. A revise
+decision stays valid without it. An operator audit read does not record a
+fetch.
+
 For a producer, the strict result envelope is:
 
 ```json

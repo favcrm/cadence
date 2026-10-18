@@ -2330,7 +2330,27 @@ impl Shared {
                     return Err(Error::rejected("agent identity accepts no fields"));
                 }
                 match self.caller_identity(peer_pid)? {
-                    Caller::Agent(verified) => Ok(json!({"alias": verified.agent.alias})),
+                    Caller::Agent(verified) => {
+                        // CAD-792: disclose only held turns this
+                        // registration can read. `agent_reads_message`
+                        // requires the current recipient UID (a legacy
+                        // NULL UID counts only from this registration
+                        // on). A same-alias re-registration must not see
+                        // the previous registration's turn token.
+                        // CAD-375 redaction does not replace that check.
+                        let alias = verified.agent.alias.clone();
+                        let mut running = Vec::new();
+                        for message in self.store.held_turns(&alias)? {
+                            if self.store.agent_reads_message(&message, &alias)? {
+                                running.push(json!({
+                                    "id": message.id,
+                                    "turn_id": message.turn_id,
+                                    "task": message.task_id,
+                                }));
+                            }
+                        }
+                        Ok(json!({"alias": alias, "running": running}))
+                    }
                     Caller::NoAgentIdentity => Err(Error::rejected(
                         "agent identity requires a verified agent endpoint",
                     )),

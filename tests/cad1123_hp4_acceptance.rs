@@ -364,6 +364,16 @@ impl Fx {
             let token = cadence_agent::adapter::registry::CLAUDE_MANAGED_TURN_TOKENS.mint("g1");
             store.mark_running(&message, &token).unwrap();
             let msg = store.message(&message).unwrap().unwrap();
+            if step == 1 {
+                let artifact = run["artifacts"][0]["id"].as_str().unwrap();
+                store
+                    .app_artifact_with_digest(
+                        artifact,
+                        Some((&msg.id, msg.turn_id.as_deref().unwrap())),
+                        bundle,
+                    )
+                    .unwrap();
+            }
             let reply = json!({"turn_id": msg.turn_id, "text": reply.to_string()});
             store.finish(&msg, "completed", &reply, None).unwrap();
         };

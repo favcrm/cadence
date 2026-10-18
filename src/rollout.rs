@@ -65,7 +65,9 @@ use crate::store::{self, Store};
 /// binding row.
 /// v49 (CAD-914) adds resumable wiki transfer jobs and entry progress.
 /// v50 (CAD-1482) adds retained image source lineage.
-pub const SCHEMA_VERSION: i64 = 50;
+/// v51 (CAD-792) adds `app_run_artifact_fetches`, the successful worker
+/// dependency-fetch receipt.
+pub const SCHEMA_VERSION: i64 = 51;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

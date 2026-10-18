@@ -258,6 +258,10 @@ const CATALOG: &[(&str, &[&str])] = &[
         &["id", "catalog_id", "requested_by", "at", "state"],
     ),
     (
+        "app_run_artifact_fetches",
+        &["artifact_id", "message_id", "turn_hash", "created"],
+    ),
+    (
         "app_run_artifacts",
         &[
             "id",

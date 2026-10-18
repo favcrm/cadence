@@ -306,6 +306,16 @@ fn approved_intent(store: &Store, tag: &str, due: i64) -> Value {
         let token = crate::adapter::registry::CLAUDE_MANAGED_TURN_TOKENS.mint("g1");
         store.mark_running(&taken.id, &token).unwrap();
         let taken = store.message(&taken.id).unwrap().unwrap();
+        if step == 1 {
+            let artifact = run["artifacts"][0]["id"].as_str().unwrap();
+            store
+                .app_artifact_with_digest(
+                    artifact,
+                    Some((&taken.id, taken.turn_id.as_deref().unwrap())),
+                    BUNDLE,
+                )
+                .unwrap();
+        }
         let reply = json!({"turn_id":taken.turn_id,"text":reply.to_string()});
         store.finish(&taken, "completed", &reply, None).unwrap();
     };
