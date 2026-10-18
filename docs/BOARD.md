@@ -2075,6 +2075,11 @@ authority is then used by CLI, daemon and adapter launch paths; subsequent
 file edits do not replace it. Retired-source drift is informational. The
 master's own instructions and integrity protections remain separate.
 
+Portable coordination exports omit settings authority alongside model defaults.
+An execution-disabled portable restore does not import legacy settings or
+recreate those authority rows. Its existing read-only and no-launch fences
+remain in force.
+
 `cadence join <pm> <provider> --profile <id>` snapshots the saved job, team role,
 model selection, settings revision and profile digest for the new session.
 An explicit model or native provider-default selection can override the
