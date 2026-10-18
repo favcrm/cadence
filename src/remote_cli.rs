@@ -66,14 +66,16 @@ const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 /// channel the remote milestone does not expose): a command not listed here
 /// is refused *locally* and its bytes never leave the process.
 ///
-/// The cli.write half (`issue_new`/`issue_comment`/`issue_set`) rides the
-/// same envelope — the caller's authority never travels as a request field,
-/// only inside the verified, single-use envelope. A failed or ambiguous
-/// call is never retried by the client: the wake retry is the only loop,
-/// and it fires only on a pre-forward `waking` verdict. Anything else — a
-/// timeout, a dropped connection, a 5xx after forward — stays explicitly
-/// unresolved: the mutation may or may not have landed, so reconcile with
-/// `issue show`/`issue log` first rather than blindly re-issuing.
+/// The cli.write half (`issue_new`/`issue_comment`/`issue_set`/
+/// `project_policy`) rides the same envelope — the caller's authority
+/// never travels as a request field, only inside the verified, single-use
+/// envelope. A failed or ambiguous call is never retried by the client:
+/// the wake retry is the only loop, and it fires only on a pre-forward
+/// `waking` verdict. Anything else — a timeout, a dropped connection, a
+/// 5xx after forward — stays explicitly unresolved: the mutation may or
+/// may not have landed, so reconcile before blindly re-issuing. For
+/// `project_policy`, reconcile by reading the project record; a refusal
+/// is final.
 pub const REMOTE_VERBS: &[&str] = &[
     // cli.read
     "status",
@@ -88,6 +90,7 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_new",
     "issue_comment",
     "issue_set",
+    "project_policy",
 ];
 
 /// The wiki actions this build sends over `/__platform/wiki/call` (CAD-1401,

@@ -694,19 +694,20 @@ fn dispatch(
             }
             (Err(resp), _) | (_, Err(resp)) => resp,
         },
-        // Owner-only, and the role is the verified envelope's
-        // (`role_at_issue`), never an argument: the record this verb
-        // writes decides who may read the project, so a member must not
-        // be able to widen it, grant itself access, or grant anyone
-        // else. For the same reason this arm does not consult the
-        // project's own restriction — administering a policy cannot
-        // depend on the policy it is administering.
+        // Human Owner only: verified `role_at_issue=owner` AND
+        // `principal_kind=user`. An agent can be minted with the owner
+        // role and must not administer policy. Neither value is an
+        // argument. The record this verb writes decides who may read
+        // the project, so a member must not widen it or grant access.
+        // This arm does not consult the project's own restriction —
+        // administering a policy cannot depend on the policy it is
+        // administering.
         Verb::ProjectPolicy => {
-            if actor.role_at_issue != "owner" {
+            if actor.role_at_issue != "owner" || actor.principal_kind != "user" {
                 return cli_fail(
                     403,
                     "not_permitted",
-                    "project_policy is owner-only — a member cannot record project access",
+                    "project_policy is human-owner only — a member or an agent cannot record project access",
                 );
             }
             #[derive(Deserialize)]
@@ -785,10 +786,18 @@ mod policy_tests {
     use super::*;
 
     fn actor_with_role(spelling: &str, role: &str) -> CliActor {
+        let principal_kind = if spelling.starts_with("agents/") {
+            "agent"
+        } else if spelling.starts_with("service/") {
+            "service"
+        } else {
+            "user"
+        };
         CliActor {
             sub: "sub".into(),
             actor: spelling.into(),
             role_at_issue: role.into(),
+            principal_kind: principal_kind.into(),
             scopes: vec!["cli.read".into(), "cli.write".into()],
             jti: "jti".into(),
             exp: i64::MAX,
@@ -902,6 +911,34 @@ mod policy_tests {
         // left with no recorded policy at all, not a widened one.
         assert!(policy_of().is_none(), "a refused call wrote a policy");
 
+        // An agent minted with the owner role is not a human Owner.
+        let owner_agent = actor_with_role("agents/lead", "owner");
+        assert_eq!(
+            call(
+                &owner_agent,
+                json!({"project": "demo", "visibility": "workspace-visible", "grants": ["users/mia"]})
+            ),
+            403
+        );
+        assert!(policy_of().is_none(), "an owner-role agent wrote a policy");
+
+        // A traversal key is refused for a human Owner and writes nothing,
+        // inside the tracker or beside it.
+        assert_eq!(
+            call(
+                &actor_with_role("users/owner", "owner"),
+                json!({"project": "../aos274-escape", "grants": ["users/mia"]})
+            ),
+            400
+        );
+        assert!(!pm
+            .dir
+            .join("..")
+            .join("aos274-escape")
+            .join("project.yaml")
+            .exists());
+        assert!(policy_of().is_none(), "a bad key wrote a policy");
+
         // The Owner's write lands. A first policy is version 1, and a
         // second effective change advances it — the monotonic advance a
         // stale projection relies on to refuse the previous policy.
@@ -1006,6 +1043,7 @@ mod policy_tests {
             sub: "auth0|usr:9/x".into(),
             actor: "users/auth0|usr:9/x".into(),
             role_at_issue: "member".into(),
+            principal_kind: "user".into(),
             scopes: vec!["cli.read".into(), "cli.write".into()],
             jti: "jti".into(),
             exp: i64::MAX,
@@ -1030,3 +1068,6 @@ mod policy_tests {
 
 #[cfg(test)]
 mod cad1179_acceptance;
+
+#[cfg(test)]
+mod aos274_policy_http;

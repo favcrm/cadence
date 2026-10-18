@@ -129,6 +129,15 @@ Reads: `issue ls`, `issue show`, `issue history`, `agent list`,
 Writes shipped by CAD-1179: `issue new`, `issue comment`, `issue set`
 (frontmatter fields only — status/priority/owner/component/title/tags/
 type/milestone/size; body edits are not part of the field vocabulary).
+`issue project policy` maps to `project_policy` (cli.write). Arguments are
+exactly `{project, visibility, grants}`: `visibility` is `workspace-visible`
+or `private` (canonical spellings; `private` stays refused until the
+isolation gate passes), and `grants` is the full replacement member list
+(`users/<handle>` or `operator`), not a merge. The success body is
+`{project, policy, committed}` — a policy record, not an issue card.
+Human Owner only (`role_at_issue=owner` and `principal_kind=user`); a
+member or an owner-role agent is refused before a write. `issue project
+add` and `issue project ls` stay local.
 `message send` (to a named alias — lands as the cli actor's derived
 handle, never "operator") stays in the server verb table but has no
 client mapping in this build — the milestone sends the three `issue_*`
@@ -141,7 +150,10 @@ actor); `issue set` without a nonempty `--if-rev`, with `--force` (the hosted
 route accepts no force field), or naming more than
 one ticket (revisions are per-ticket — the hosted route checks it under
 the tracker lock via `set_fields_if_rev`, and a stale token answers the
-conflict payload rather than writing).
+conflict payload rather than writing). `project_policy` is not retried
+after a refusal, a conflict, or an ambiguous failure — the same wake-only
+retry as the other writes. A malformed project key is rejected by the
+tracker key grammar before any path join.
 
 Refused remotely (default-deny): every operator-only daemon verb
 (`agent join/stop/resume`, `daemon *`, `operator_*`, `rollout`, `master/*`,

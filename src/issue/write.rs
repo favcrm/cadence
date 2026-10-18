@@ -590,13 +590,16 @@ pub fn set_project_policy(
     visibility: project::Visibility,
     members: &[String],
 ) -> Result<Value> {
+    // Validate before any join. A remote key is caller input; `../…` or a
+    // slash must never become a path outside the tracker.
+    let key = crate::issue::model::check_key(key)?;
     if visibility == project::Visibility::Private {
         return Err(Error::rejected(
             "private projects are not available yet — the isolation gate has not passed; \
              only workspace-visible can be recorded",
         ));
     }
-    let dir = project_dir(pm, key)?;
+    let dir = project_dir(pm, &key)?;
     let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     let yaml_path = dir.join("project.yaml");
     if !crate::issue::board::is_real_file(&yaml_path) {
@@ -2597,6 +2600,36 @@ mod tests {
         let err = set_project_policy(&pm, "ghost", project::Visibility::WorkspaceVisible, &[])
             .unwrap_err();
         assert!(err.to_string().contains("no project"), "{err}");
+
+        // A key that is not the tracker grammar never joins the filesystem,
+        // so it cannot create or edit a project outside this pm dir.
+        let before = std::fs::read(pm.dir.join(key).join("project.yaml")).unwrap();
+        for bad in [
+            "../aos274-escape",
+            "cadence/../../aos274-escape",
+            "",
+            "..",
+            "/tmp",
+        ] {
+            let err = set_project_policy(
+                &pm,
+                bad,
+                project::Visibility::WorkspaceVisible,
+                &["users/mia".to_string()],
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("Invalid project key"),
+                "{bad}: {err}"
+            );
+        }
+        let escape = pm.dir.join("..").join("aos274-escape").join("project.yaml");
+        assert!(!escape.exists(), "traversal key wrote outside the tracker");
+        assert_eq!(
+            std::fs::read(pm.dir.join(key).join("project.yaml")).unwrap(),
+            before,
+            "a rejected key mutated the real project"
+        );
     }
 
     /// A commit the tracker refuses leaves the record exactly as it was —

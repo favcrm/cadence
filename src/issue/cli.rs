@@ -787,10 +787,11 @@ pub enum ProjectAction {
         /// Project key.
         key: String,
     },
-    /// Record a project's access policy: visibility and, for a private
-    /// project, the callers it admits. Private is unavailable until the
-    /// isolation gate passes; workspace-visible is the only visibility
-    /// this build can write.
+    /// Record a project's access policy: visibility and the callers it
+    /// admits. `--grant` is the full member list and replaces whatever
+    /// was recorded; omitting it clears grants. It does not merge.
+    /// Private is unavailable until the isolation gate passes;
+    /// workspace-visible is the only visibility this build can write.
     Policy {
         /// Project key.
         key: String,

@@ -202,6 +202,10 @@ pub struct CliActor {
     /// contract reserves to the Owner, so those verbs refuse without
     /// re-reading any platform state. Never a request field.
     pub role_at_issue: String,
+    /// `claims.principal_kind` — `user`, `agent`, or `service`. An agent
+    /// can be minted with `role_at_issue=owner`; verbs reserved to a
+    /// human Owner read this alongside the role. Never a request field.
+    pub principal_kind: String,
     /// The granted cli scopes, each already narrowed to the
     /// `{cli.read, cli.write}` vocabulary.
     pub scopes: Vec<String>,
@@ -438,6 +442,7 @@ pub fn verify(
         sub: claims.sub,
         actor: claims.actor,
         role_at_issue: claims.role_at_issue,
+        principal_kind: claims.principal_kind,
         scopes: claims.scope,
         jti: claims.jti,
         exp: claims.exp,
@@ -579,6 +584,7 @@ mod policy_spelling_tests {
             sub: sub.to_string(),
             actor: spelling.to_string(),
             role_at_issue: "member".to_string(),
+            principal_kind: "user".to_string(),
             scopes: vec!["cli.read".to_string(), "cli.write".to_string()],
             jti: "jti".to_string(),
             exp: i64::MAX,

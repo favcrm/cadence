@@ -1,8 +1,8 @@
 //! CAD-1019 slice 2: dispatch for a `Remote` org selection — maps the
 //! allowlisted local commands to AOS-128 verbs and runs them through
-//! [`cadence_agent::remote_cli`]. Anything outside the read-only allowlist
-//! is refused *here*, before a request is ever built — remote writes land
-//! in their own slice, and operator-only verbs never do.
+//! [`cadence_agent::remote_cli`]. Anything outside the allowlist is refused
+//! *here*, before a request is ever built. Operator-only verbs never map.
+//! `issue project policy` is `project_policy`; project add/list stay local.
 
 use super::*;
 use cadence_agent::wiki::cli::WikiAction;
@@ -428,6 +428,32 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             args.insert("set".into(), json!(pairs));
             args.insert("if_rev".into(), json!(rev));
             "issue_set"
+        }
+        Commands::Issue {
+            action:
+                cadence_agent::issue::cli::IssueAction::Project {
+                    action:
+                        cadence_agent::issue::cli::ProjectAction::Policy {
+                            key,
+                            visibility,
+                            grants,
+                        },
+                },
+        } => {
+            // Exact shared arguments. Visibility is the canonical spelling
+            // (`workspace-visible` | `private`), never the serde rename of
+            // the tracker enum. Grants replace the recorded list; an empty
+            // list is sent as `[]`, not omitted. No role, actor, or org.
+            let visibility = match visibility {
+                cadence_agent::issue::cli::PolicyVisibility::WorkspaceVisible => {
+                    "workspace-visible"
+                }
+                cadence_agent::issue::cli::PolicyVisibility::Private => "private",
+            };
+            args.insert("project".into(), json!(key));
+            args.insert("visibility".into(), json!(visibility));
+            args.insert("grants".into(), json!(grants));
+            "project_policy"
         }
         Commands::Message {
             action:
@@ -941,8 +967,8 @@ fn unavailable(command: &Commands) -> Error {
         "`cadence {}` is not available on a remote org in this build — \
          remote verbs are: status, agent list, agent show, issue ls, \
          issue show, issue log, issue new, issue comment, issue set, \
-         message read, inbox (peek), wiki ls, wiki search, wiki cat, \
-         wiki put (text), wiki cp. \
+         message read, inbox (peek), issue project policy, wiki ls, \
+         wiki search, wiki cat, wiki put (text), wiki cp. \
          Use `--org local` or `cadence org switch` to run locally.",
         name(command)
     ))
@@ -1569,6 +1595,37 @@ mod read_contract_tests {
         }
         let (verb, _) = outcome(&inbox_cmd(Some("m"), true, None, 0, false, None, None)).unwrap();
         assert_eq!(verb, "message_inbox");
+    }
+
+    #[test]
+    fn remote_project_add_and_list_stay_unmapped() {
+        use cadence_agent::issue::cli::ProjectAction;
+        let add = outcome(&Commands::Issue {
+            action: IssueAction::Project {
+                action: ProjectAction::Add {
+                    key: "cadence".into(),
+                    prefix: "CAD".into(),
+                    repos: vec![],
+                    components: vec![],
+                    tags: vec![],
+                    owner: None,
+                },
+            },
+        })
+        .unwrap_err();
+        assert!(add.contains("not available on a remote org"), "{add}");
+        let ls = outcome(&Commands::Issue {
+            action: IssueAction::Project {
+                action: ProjectAction::Ls {
+                    sort: None,
+                    limit: None,
+                    fields: vec![],
+                    json: false,
+                },
+            },
+        })
+        .unwrap_err();
+        assert!(ls.contains("not available on a remote org"), "{ls}");
     }
 
     #[test]
