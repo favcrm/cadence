@@ -1640,6 +1640,193 @@ mod acceptance {
         );
     }
 
+    /// Canonical policy/profile authority is omitted from portable copies;
+    /// an unknown authority column refuses before package publication.
+    fn portable_settings_authority_is_omitted_and_unknown_columns_refuse() {
+        use cadence_agent::backup::portable::{
+            export_portable, restore_inactive, PortableExportOptions, PortableManifest,
+            PortableRestoreOptions, Scope,
+        };
+
+        let root = tempfile::Builder::new()
+            .prefix("c1548-portable-")
+            .tempdir()
+            .unwrap();
+        let pm = root.path().join("pm");
+        let profile = pm.join("agents").join(LEGACY_PROFILE).join("AGENT.md");
+        std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        std::fs::write(&profile, LEGACY_TEXT).unwrap();
+        std::fs::write(
+            pm.join("pm.yaml"),
+            "pi:\n  models:\n    allow: [fixture/portable-only]\n    default:\n      worker: fixture/portable-only\n",
+        )
+        .unwrap();
+        let state = root.path().join("s");
+        std::fs::create_dir_all(&state).unwrap();
+        let db = state.join("cadence.sqlite3");
+        let store = cadence_agent::store::Store::open(&db).unwrap();
+        let imported = store.import_legacy_settings(&pm).unwrap();
+        assert!(imported.legacy_imported);
+        assert_eq!(
+            imported
+                .doc
+                .pi
+                .as_ref()
+                .unwrap()
+                .models
+                .default
+                .worker
+                .as_deref(),
+            Some("fixture/portable-only")
+        );
+        assert!(imported
+            .doc
+            .profiles
+            .iter()
+            .any(|row| { row.id == LEGACY_PROFILE && row.text == LEGACY_TEXT }));
+        drop(store);
+        let before = authority(&state);
+        let before_db = std::fs::read(&db).unwrap();
+        let before_sources = source_files(&pm);
+
+        // A separate clean tracker keeps the legacy authority files out
+        // of this coordination package entirely.
+        let tracker = root.path().join("tracker");
+        std::fs::create_dir_all(&tracker).unwrap();
+        std::fs::write(tracker.join("ticket.md"), "# CAD-1548 portable refusal\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "ticket.md"],
+            vec![
+                "commit",
+                "-q",
+                "-m",
+                "CAD-1548 independent portable fixture",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&tracker)
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "init.defaultBranch=main",
+                    "-c",
+                    "maintenance.auto=false",
+                ])
+                .args(&args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "cad1548-acceptance")
+                .env("GIT_AUTHOR_EMAIL", "acceptance@example.invalid")
+                .env("GIT_COMMITTER_NAME", "cad1548-acceptance")
+                .env("GIT_COMMITTER_EMAIL", "acceptance@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "fixture git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let opts = PortableExportOptions {
+            scope: Scope::Coordination,
+            tracker,
+        };
+        let package = root.path().join("package");
+        export_portable(&state, &package, &opts)
+            .expect("populated canonical settings must be omitted, not reject export");
+        let manifest: PortableManifest =
+            serde_json::from_slice(&std::fs::read(package.join("manifest.json")).unwrap()).unwrap();
+        assert!(manifest
+            .omitted_tables
+            .iter()
+            .any(|table| table == "settings_authority"));
+        assert!(!manifest
+            .tables
+            .iter()
+            .any(|table| table == "settings_authority"));
+        assert!(manifest
+            .omitted_rows
+            .iter()
+            .any(|(table, rows)| { table == "settings_authority" && *rows == 1 }));
+        let restored = root.path().join("restored");
+        restore_inactive(&package, &restored, &PortableRestoreOptions::default())
+            .expect("projected settings authority must restore inactive");
+        for copy in [&package, &restored] {
+            // Do not open Store: its authority readers rightly reject
+            // these deliberately omitted singleton rows.
+            let conn = rusqlite::Connection::open_with_flags(
+                copy.join("cadence.sqlite3"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            for table in ["settings_authority", "model_defaults"] {
+                let rows: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(rows, 0, "portable copy retained {table} authority");
+            }
+        }
+        assert_eq!(authority(&state), before, "export changed source authority");
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before_db,
+            "export changed source database bytes"
+        );
+        assert_eq!(
+            source_files(&pm),
+            before_sources,
+            "export changed legacy sources"
+        );
+
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute(
+                "ALTER TABLE settings_authority ADD COLUMN forged_grant TEXT",
+                [],
+            )
+            .unwrap();
+        }
+        let before_refusal = std::fs::read(&db).unwrap();
+        let refused = root.path().join("refused-package");
+        let err = export_portable(&state, &refused, &opts)
+            .expect_err("an unknown settings authority column must refuse");
+        assert_eq!(
+            err.to_string(),
+            "portable export refuses: table settings_authority columns do not match the known catalog"
+        );
+        assert!(!refused.exists(), "refused export published a package");
+        assert!(
+            std::fs::read_dir(root.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".refused-package.partial-")
+            }),
+            "refused export left private staging"
+        );
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before_refusal,
+            "refused export changed source bytes"
+        );
+        assert_eq!(
+            authority(&state),
+            before,
+            "refused export changed source authority"
+        );
+        assert_eq!(
+            source_files(&pm),
+            before_sources,
+            "refused export changed legacy sources"
+        );
+    }
+
     #[test]
     fn unauthorized_forged_and_invalid_agent_settings_refuse_without_partial_persistence() {
         let fx = Fx::start();
@@ -2072,6 +2259,7 @@ mod acceptance {
         refuse_symlinked_import();
         prove_profile_launch_provenance(&fx, &held.revision);
         pi_kind_role_default_reaches_pi_only();
+        portable_settings_authority_is_omitted_and_unknown_columns_refuse();
         assert_eq!(fx.snapshot()["revision"], held.revision);
         assert_eq!(fx.live_agents(), 0);
     }

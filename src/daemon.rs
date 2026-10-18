@@ -7878,14 +7878,20 @@ mod tests {
             label: "claude store",
             root,
         }];
+        let before_events = shared.store.events_tail(DAEMON_ALIAS, 1).unwrap();
         let mut watch = WalWatch::default();
         pass(&roots, &HashSet::new(), u64::MAX, &shared, &mut watch);
         assert_eq!(wal_size(&db), before);
-        assert!(shared
-            .store
-            .events_tail(DAEMON_ALIAS, 10)
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            shared
+                .store
+                .events_tail(DAEMON_ALIAS, 1)
+                .unwrap()
+                .last()
+                .map(|event| event.seq),
+            before_events.last().map(|event| event.seq),
+            "a small WAL emits no new event"
+        );
     }
 
     /// A WAL written moments ago means a writer cadence cannot see is

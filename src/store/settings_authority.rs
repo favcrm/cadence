@@ -54,7 +54,7 @@ pub(super) struct AuthorityBlob {
 /// Schema 52 DDL, applied after the independent v51 artifact-fetch migration.
 /// Request handlers never execute it.
 pub(super) const SCHEMA_V52: &str = "
-CREATE TABLE settings_authority(
+CREATE TABLE IF NOT EXISTS settings_authority(
     id INTEGER PRIMARY KEY CHECK (id = 1),
     pi TEXT,
     profiles TEXT NOT NULL DEFAULT '[]',

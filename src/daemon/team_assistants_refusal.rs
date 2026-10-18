@@ -4710,15 +4710,26 @@ fn fenced_assistant_send_never_relaunches() {
 fn confined_assistant_refuses_devin_model_at_launch_claim() {
     let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
-    // Pin a devin worker default + allow in the fixture's own pm.yaml —
-    // the operator-configured policy the launch resolves (isolated pm,
-    // never the real one).
-    let pm_yaml = fx.pm().join("pm.yaml");
-    let mut text = std::fs::read_to_string(&pm_yaml).unwrap();
-    text.push_str(
-        "\npi:\n  models:\n    allow:\n      - devin/claude-haiku-5-5-high\n    default:\n      worker: devin/claude-haiku-5-5-high\n",
+    // Pin the operator policy in this fixture's canonical Store, not
+    // in the retired pm.yaml source imported during Fx::new().
+    let mut settings = fx.shared.store.settings().unwrap();
+    settings.doc.pi = Some(
+        serde_json::from_value(json!({
+            "models": {
+                "allow": ["devin/claude-haiku-5-5-high"],
+                "default": {"worker": "devin/claude-haiku-5-5-high"}
+            }
+        }))
+        .unwrap(),
     );
-    std::fs::write(&pm_yaml, text).unwrap();
+    fx.shared
+        .store
+        .save_settings(
+            settings.revision,
+            settings.doc,
+            "independent-refusal-fixture",
+        )
+        .unwrap();
 
     let rt = fx.member_runtime("sub-pia");
     let before = fx.tree();
@@ -4768,19 +4779,27 @@ fn confined_assistant_refuses_devin_model_at_launch_claim() {
     assert_eq!(fx.tree(), before, "a refused launch moved the tracker");
 }
 
-/// A malformed `[pi]` policy is a hard config error — `pi_policy::read`
+/// A malformed canonical Pi policy is a hard config error — the Store
 /// refuses and the launch surfaces the cause, never falls back to a
 /// different model or an unconfined path.
 #[test]
 fn malformed_pi_policy_refuses_launch_claim_closed() {
     let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
-    let pm_yaml = fx.pm().join("pm.yaml");
-    let mut text = std::fs::read_to_string(&pm_yaml).unwrap();
-    text.push_str("\npi:\n  models: [unclosed\n");
-    std::fs::write(&pm_yaml, text).unwrap();
-
     let rt = fx.member_runtime("sub-mal");
+    // Provision first: registration also decodes canonical settings.
+    // Corrupt only the persisted policy so the send reaches the real
+    // launch-time parser, rather than failing during fixture setup.
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE settings_authority SET pi=?, legacy_imported=1 WHERE id=1",
+                ["{\"models\":"],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     let send = fx.op(
         "member_assist_send",
         json!({"member_envelope": fx.member_envelope("sub-mal"), "text": "go"}),

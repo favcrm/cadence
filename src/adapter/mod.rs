@@ -234,9 +234,9 @@ impl ProviderEnv {
         self.2.is_some()
     }
 
-    /// Bind launch policy to the daemon's actual store, never an environment
-    /// variable a provider or worker can replace.
-    pub(crate) fn with_settings_store(&self, store: Arc<crate::store::Store>) -> Self {
+    /// Bind launch policy to the caller's actual workspace store, never an
+    /// environment variable a provider or worker can replace.
+    pub fn with_settings_store(&self, store: Arc<crate::store::Store>) -> Self {
         Self(Arc::clone(&self.0), self.1.clone(), self.2.clone(), Some(store))
     }
 

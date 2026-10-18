@@ -36,7 +36,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cadence_agent::adapter::ProviderEnv;
 
@@ -57,6 +57,7 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 struct Host {
     root: tempfile::TempDir,
     node_bin: PathBuf,
+    store: Arc<cadence_agent::store::Store>,
 }
 
 /// One `node -e` snippet shared by every probe: actually require the
@@ -86,11 +87,17 @@ impl Host {
                 executable.then_some(candidate)
             })
         })?;
-        let host = Self { root, node_bin };
         for dir in ["home", "pm", "state", "bin", "pi-agent/npm/node_modules"] {
-            std::fs::create_dir_all(host.path(dir)).unwrap();
+            std::fs::create_dir_all(root.path().join(dir)).unwrap();
         }
-        Some(host)
+        let store = Arc::new(
+            cadence_agent::store::Store::open(&root.path().join("state/cadence.sqlite3")).unwrap(),
+        );
+        Some(Self {
+            root,
+            node_bin,
+            store,
+        })
     }
 
     fn path(&self, rel: &str) -> PathBuf {
@@ -106,7 +113,7 @@ impl Host {
     /// CADENCE_PM_DIR pointed inside the fixture, a PATH that finds the
     /// fixture `pi` stub, the real `node` and the confine binary.
     fn env(&self) -> ProviderEnv {
-        let env = ProviderEnv::default();
+        let env = ProviderEnv::default().with_settings_store(Arc::clone(&self.store));
         let mut path = self.path("bin").to_string_lossy().into_owned();
         for exe in [&self.node_bin, &PathBuf::from(BINARY)] {
             if let Some(dir) = exe.parent() {
@@ -220,6 +227,7 @@ impl Host {
             "pi:\n  providers: [\"pi-ext@1.0.0\"]\n",
         )
         .unwrap();
+        self.store.import_legacy_settings(&self.path("pm")).unwrap();
     }
 
     /// The real generated master policy for this fixture.
