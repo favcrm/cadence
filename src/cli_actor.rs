@@ -315,16 +315,7 @@ fn public_scheme(host: &str) -> &'static str {
 /// collide with a pane alias it does not own.
 pub(crate) fn handle_of(actor: &str, sub: &str) -> String {
     let tail = actor.split_once('/').map(|(_, t)| t).unwrap_or(sub);
-    tail.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(64)
-        .collect()
+    crate::ident::sanitized(tail)
 }
 
 /// Verify an envelope end to end (the container half of AOS-128's

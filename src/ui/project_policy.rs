@@ -34,21 +34,70 @@ pub(super) fn caller_of(actor: &str) -> Option<project::ProjectCaller<'_>> {
     None
 }
 
+/// The tracker's projects, resolved to one caller — the single read the
+/// three access questions below are answered from.
+///
+/// The fail-closed inputs live here, once: an unreadable tracker is `None`
+/// rather than an empty list (so no answer can read it as "nothing is
+/// restricted"), and a spelling outside the known forms resolves to no
+/// caller at all. Each question then states its own answer, including how
+/// it treats an empty or unresolvable read.
+struct Access<'a> {
+    caller: Option<project::ProjectCaller<'a>>,
+    projects: Option<Vec<project::Project>>,
+}
+
+impl<'a> Access<'a> {
+    fn of(pm: &Pm, actor: &'a str) -> Self {
+        Self {
+            caller: caller_of(actor),
+            projects: project::list(&pm.dir).ok(),
+        }
+    }
+
+    /// The keys this caller may read; empty when either half is missing.
+    fn readable(&self) -> BTreeSet<String> {
+        let (Some(caller), Some(projects)) = (self.caller, self.projects.as_deref()) else {
+            return BTreeSet::new();
+        };
+        projects
+            .iter()
+            .filter(|p| p.allows(caller))
+            .map(|p| p.key.clone())
+            .collect()
+    }
+
+    /// True when `key` exists and its policy does not admit this caller. An
+    /// absent project is not this guard's business.
+    fn refused(&self, key: &str) -> bool {
+        let Some(projects) = self.projects.as_deref() else {
+            return true;
+        };
+        let Some(found) = projects.iter().find(|p| p.key == key) else {
+            return false;
+        };
+        match self.caller {
+            Some(caller) => !found.allows(caller),
+            None => true,
+        }
+    }
+
+    /// True when this caller may read every project in the tracker.
+    fn reads_every_project(&self) -> bool {
+        let (Some(caller), Some(projects)) = (self.caller, self.projects.as_deref()) else {
+            return false;
+        };
+        projects.iter().all(|p| p.allows(caller))
+    }
+}
+
 /// The project keys this caller may read.
 ///
 /// Fail closed: an unknown spelling or an unreadable tracker yields an
 /// empty set, so a listing contributes no row, count or placeholder for a
 /// project the caller may not see.
 pub(super) fn readable(pm: &Pm, actor: &str) -> BTreeSet<String> {
-    let Some(caller) = caller_of(actor) else {
-        return BTreeSet::new();
-    };
-    project::list(&pm.dir)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|p| p.allows(caller))
-        .map(|p| p.key)
-        .collect()
+    Access::of(pm, actor).readable()
 }
 
 /// True when `key` exists and its policy does not admit this caller.
@@ -56,16 +105,7 @@ pub(super) fn readable(pm: &Pm, actor: &str) -> BTreeSet<String> {
 /// An absent project returns false, so the caller's verb keeps its own
 /// unknown-project answer. An unreadable tracker refuses.
 pub(super) fn refused(pm: &Pm, key: &str, actor: &str) -> bool {
-    let Ok(projects) = project::list(&pm.dir) else {
-        return true;
-    };
-    let Some(found) = projects.iter().find(|p| p.key == key) else {
-        return false;
-    };
-    match caller_of(actor) {
-        Some(caller) => !found.allows(caller),
-        None => true,
-    }
+    Access::of(pm, actor).refused(key)
 }
 
 /// True when this caller may read every project in the tracker.
@@ -77,13 +117,7 @@ pub(super) fn refused(pm: &Pm, key: &str, actor: &str) -> bool {
 /// caller is refused live updates instead (AOS-274 / SEC-006). Fail
 /// closed: an unreadable tracker or unknown spelling is not complete.
 pub(super) fn reads_every_project(pm: &Pm, actor: &str) -> bool {
-    let Ok(projects) = project::list(&pm.dir) else {
-        return false;
-    };
-    let Some(caller) = caller_of(actor) else {
-        return false;
-    };
-    projects.iter().all(|p| p.allows(caller))
+    Access::of(pm, actor).reads_every_project()
 }
 
 /// Drop project-scoped rows the caller may not read from an overview

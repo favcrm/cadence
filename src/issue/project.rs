@@ -153,13 +153,11 @@ pub struct Grant(String);
 
 impl Grant {
     pub fn parse(raw: &str) -> Result<Self> {
-        let handle_ok = |handle: &str| {
-            !handle.is_empty()
-                && handle.len() <= 200
-                && handle
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        };
+        // The bound is the derivations' cut ([`crate::ident::HANDLE_MAX`]):
+        // a longer handle can never be produced from a subject, so a grant
+        // carrying one could never match a caller — refused here rather
+        // than recorded as a policy that silently never applies.
+        let handle_ok = |handle: &str| crate::ident::is_handle(handle, crate::ident::HANDLE_MAX);
         let ok = raw == "operator" || raw.strip_prefix("users/").is_some_and(handle_ok);
         if !ok {
             return Err(Error::rejected(format!(
