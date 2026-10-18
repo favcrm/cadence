@@ -649,14 +649,14 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     const el = listRef.current;
     if (!el) return;
     const tail = items[items.length - 1]?.key ?? null;
-    if (tail === tailKey.current) return;
-    const first = tailKey.current === null;
-    // A poll or a batch can land several rows at once: count the arrivals
-    // (never a hardcoded one) so the pill tells the truth. The tail-key
-    // guard above already excludes a prepended page (CAD-1533 review,
-    // finding 3).
+    // The baseline is refreshed on EVERY row-set change, including a
+    // history prepend that leaves the tail key alone — otherwise the next
+    // real arrival counts those prepended rows too and one message is
+    // announced as "21 new" (CAD-1533 spec/security review, blocking).
     const arrivals = Math.max(1, items.length - prevItems.current);
     prevItems.current = items.length;
+    if (tail === tailKey.current) return;
+    const first = tailKey.current === null;
     tailKey.current = tail;
     if (first) {
       scrollPanel("jump");

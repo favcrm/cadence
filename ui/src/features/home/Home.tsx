@@ -478,16 +478,6 @@ const ThreadList = memo(function ThreadList({
   const fallbackItem =
     working && anchorItem === null && shown.length > 0 ? shown[shown.length - 1] : null;
   const activityItem = anchorItem ?? fallbackItem;
-  const activityEntry =
-    anchorItem !== null
-      ? anchorEntry
-      : fallbackItem === null
-        ? null
-        : fallbackItem.type === "tools"
-          ? fallbackItem.entries[fallbackItem.entries.length - 1] ?? null
-          : fallbackItem.type === "pending"
-            ? null
-            : fallbackItem.entry;
   if (items.length === 0) return null;
   return (
     <>
@@ -516,8 +506,8 @@ const ThreadList = memo(function ThreadList({
           // (CAD-1533 review, finding 1).
           const at =
             anchorItem !== null
-              ? activityEntry
-                ? time(activityEntry.created)
+              ? anchorEntry
+                ? time(anchorEntry.created)
                 : undefined
               : working.since !== null
                 ? time(new Date(working.since * 1000).toISOString())
