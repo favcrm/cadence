@@ -68,6 +68,24 @@ pub(super) fn refused(pm: &Pm, key: &str, actor: &str) -> bool {
     }
 }
 
+/// True when this caller may read every project in the tracker.
+///
+/// The board's live stream is one shared `Model` whose frames carry
+/// issue/agent/plan rows and aggregate counts, and it cannot yet be
+/// filtered per subscriber. Serving it to a caller who cannot read every
+/// project would leak rows and counts from the restricted ones, so that
+/// caller is refused live updates instead (AOS-274 / SEC-006). Fail
+/// closed: an unreadable tracker or unknown spelling is not complete.
+pub(super) fn reads_every_project(pm: &Pm, actor: &str) -> bool {
+    let Ok(projects) = project::list(&pm.dir) else {
+        return false;
+    };
+    let Some(caller) = caller_of(actor) else {
+        return false;
+    };
+    projects.iter().all(|p| p.allows(caller))
+}
+
 /// Drop project-scoped rows the caller may not read from an overview
 /// payload.
 ///
@@ -176,6 +194,27 @@ mod tests {
         let (_dir, pm) = pm_with(&[("demo", "")]);
         assert!(!refused(&pm, "demo", "users/anyone"));
         assert!(readable(&pm, "users/anyone").contains("demo"));
+    }
+
+    #[test]
+    fn only_a_caller_that_reads_every_project_gets_the_shared_stream() {
+        let (_dir, pm) = pm_with(&[("demo", PRIVATE), ("open", "")]);
+        // The Owner reads everything; the granted member does too only
+        // because the restricted project lists them.
+        assert!(reads_every_project(&pm, "operator"));
+        assert!(reads_every_project(&pm, "users/mia"));
+        // An unselected member, a reserved kind and an unknown spelling
+        // are all refused the shared stream.
+        for spelling in ["users/stranger", "agents/dev", "service/svc", "mystery"] {
+            assert!(
+                !reads_every_project(&pm, spelling),
+                "{spelling} was offered the shared stream"
+            );
+        }
+        // With no recorded policy every project is readable, so the
+        // stream is unrestricted exactly as before.
+        let (_dir, pm) = pm_with(&[("demo", "")]);
+        assert!(reads_every_project(&pm, "users/anyone"));
     }
 
     #[test]

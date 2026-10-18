@@ -1655,12 +1655,33 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             if head_only {
                 send(request, err_response(405, "stream is GET only"));
             } else {
-                stream_events(
-                    request,
-                    state_dir,
-                    pm_dir,
-                    read_admission.expect("private stream admission"),
-                );
+                let admission = read_admission.expect("private stream admission");
+                // AOS-274: the stream is one shared, unfiltered frame
+                // source. A caller who cannot read every project is
+                // refused live updates rather than served rows and
+                // counts from projects it may not see.
+                let complete = match Pm::at(pm_dir) {
+                    Ok(pm) => match operator::read_actor(&admission, &request, state_dir, opts) {
+                        Ok(actor) => super::project_policy::reads_every_project(&pm, &actor),
+                        Err(resp) => {
+                            send(request, resp);
+                            return;
+                        }
+                    },
+                    // Fail closed when the tracker cannot be read.
+                    Err(_) => false,
+                };
+                if !complete {
+                    send(
+                        request,
+                        err_response(
+                            403,
+                            "live updates are unavailable for a project-restricted workspace",
+                        ),
+                    );
+                    return;
+                }
+                stream_events(request, state_dir, pm_dir, admission);
             }
         }
         _ => {
