@@ -11,9 +11,15 @@ pub(crate) enum MessageAction {
     /// There are no email-style `--to`, `--subject`, `--body` or `--cc`
     /// flags.
     ///
+    /// On a remote org (`--org <slug>`) the supported form is the durable
+    /// enqueue only: `--message <id>` is required, and `--ready`/`--force`,
+    /// `--nudge`, `--priority`/`--supersedes`, `--reply-to` and `--task`
+    /// refuse. Read the outcome with `cadence message read <id> --org <slug>`.
+    ///
     /// Multi-topic reports: open the body with a `SUBJECT: <topic>`
     /// line (a single-line pty body leads with `SUBJECT: <topic> —`)
     /// so the recipient can scan topics; there is no subject field.
+    ///
     Send {
         /// Agent alias or provider-native id.
         alias: String,

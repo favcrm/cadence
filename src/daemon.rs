@@ -106,6 +106,9 @@ mod caller_rule;
 mod campaign_clone_acceptance;
 mod chat_files_rpc;
 mod checkup;
+mod cli_rpc;
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) use cli_rpc::prime_jwks_for_test as prime_cli_jwks_for_test;
 mod connection_test;
 mod connections_rpc;
 #[cfg(all(test, feature = "test-seam"))]
@@ -2660,6 +2663,14 @@ impl Shared {
             "platform_assistant_provision" => {
                 self.rpc_platform_assistant_provision(params, peer_pid)
             }
+            // CAD-1568: the remote CLI's principal-bound surface — the
+            // board's `/api/cli/<verb>` route relays the re-verifiable
+            // signed cli actor envelope as `cli_envelope`; the handler
+            // honors it only on this proven operator/board channel and
+            // re-verifies it against `board-identity.json` + the JWKS.
+            "cli_message_send" => self.rpc_cli_message_send(params, peer_pid),
+            "cli_message_read" => self.rpc_cli_message_read(params, peer_pid),
+            "cli_message_inbox" => self.rpc_cli_message_inbox(params, peer_pid),
             "member_assist_state" => self.rpc_member_assist_state(params, peer_pid),
             "member_assist_history" => self.rpc_member_assist_history(params, peer_pid),
             "member_assist_send" => self.rpc_member_assist_send(params, peer_pid),

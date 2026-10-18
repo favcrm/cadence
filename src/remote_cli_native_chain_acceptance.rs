@@ -1408,3 +1408,5 @@ fn native_chain_automatic_renewal_and_real_wiki_mutation() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+include!("cad1568_native_messages_acceptance.rs");

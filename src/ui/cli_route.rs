@@ -15,11 +15,17 @@
 //!
 //! Every verb is dispatched to the exact call the local CLI or board
 //! makes: tracker reads go through the board read model / tracker
-//! files, agent and message verbs relay the daemon RPCs verbatim, and
-//! the write verbs run `issue::write`/`agent_send` with attribution
-//! derived from the verified envelope's actor — never operator
-//! authority (a `users/…`-derived handle, and `source` carries the
-//! provenance label where the verb has no author field).
+//! files, agent and message verbs relay daemon RPCs, and the write
+//! verbs run `issue::write`/the daemon's `cli_message_*` handlers with
+//! attribution derived from the verified envelope's actor — never
+//! operator authority (a `users/…`-derived handle, and `source` carries
+//! the provenance label where the verb has no author field). The
+//! message verbs do NOT relay verbatim: the raw signed envelope rides
+//! to `cli_message_send`/`cli_message_read`/`cli_message_inbox` as
+//! `cli_envelope` over this proven board connection, and the daemon
+//! re-verifies it against its own trust root (CAD-1568) — a
+//! `cli_*`-carrying relayed call can never widen into operator
+//! attribution or another member's mail.
 //!
 //! Fail closed: a missing, forged, expired, wrong-audience or
 //! wrong-org envelope, an unlisted verb, or an insufficient scope is a
@@ -50,6 +56,15 @@ use crate::issue::{board, history, model, write as issue_write, Pm};
 /// The cache keys on the issuer — a stale or foreign-issuer entry
 /// refetches, so per-fixture issuers in tests stay honest.
 static CLI_JWKS: Mutex<board_identity::JwksCache> = Mutex::new(board_identity::JwksCache::new());
+
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) fn prime_jwks_for_test(issuer: &str, kid: &str, now: i64) -> crate::Result<()> {
+    CLI_JWKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .key(issuer, kid, now)
+        .map(|_| ())
+}
 
 /// Serializes `Spent::load`+`consume` — the single-use check-and-record
 /// races on the on-disk set otherwise (two in-flight replays of one
@@ -137,10 +152,16 @@ fn peek_kid(envelope: &str) -> Result<String, HttpResp> {
     Ok(value["kid"].as_str().unwrap_or_default().to_string())
 }
 
-/// Verify the bearer into a [`CliActor`] or answer the refusal. The
-/// `aud`/`iss`/`organization_id` pins come from this board's configured
-/// public identity, never from the envelope or the request.
-fn cli_caller(request: &Request, public: &crate::ui::PublicBoard) -> Result<CliActor, HttpResp> {
+/// Verify the bearer into the [`CliActor`] plus the raw compact
+/// envelope — the actor derives every attribution, and the bytes go to
+/// the daemon's `cli_message_*` RPCs as `cli_envelope`, which re-verifies
+/// them against its own trust root (CAD-1568). The `aud`/`iss`/
+/// `organization_id` pins come from this board's configured public
+/// identity, never from the envelope or the request.
+fn cli_caller(
+    request: &Request,
+    public: &crate::ui::PublicBoard,
+) -> Result<(CliActor, String), HttpResp> {
     let bearer = header_value(request, "Authorization");
     let envelope = match cli_actor::envelope_from_bearer(bearer.as_deref()) {
         Ok(e) => e,
@@ -167,6 +188,7 @@ fn cli_caller(request: &Request, public: &crate::ui::PublicBoard) -> Result<CliA
         }
     };
     cli_actor::verify(&envelope, &config, &key, now)
+        .map(|actor| (actor, envelope))
         .map_err(|r| cli_fail(status_of(r.code), r.code, &r.message))
 }
 
@@ -201,8 +223,8 @@ pub(super) fn post(
             "cli authority is not configured",
         );
     };
-    let caller = match cli_caller(request, public) {
-        Ok(c) => c,
+    let (caller, envelope) = match cli_caller(request, public) {
+        Ok(pair) => pair,
         Err(resp) => return resp,
     };
     if !cli_actor::scope_covers(&caller, verb.scope()) {
@@ -244,7 +266,7 @@ pub(super) fn post(
             "the envelope's jti was already consumed",
         );
     }
-    dispatch(verb, &args, &caller, state_dir, pm_dir, opts)
+    dispatch(verb, &args, &caller, &envelope, state_dir, pm_dir, opts)
 }
 
 /// `arguments["k"]` as a string — a present-but-nonstring field is a
@@ -300,11 +322,28 @@ fn arg_strs(args: &Value, key: &str) -> Result<Vec<String>, HttpResp> {
 
 /// A daemon-RPC call relayed verbatim — the HTTP path is never less
 /// strict than the RPC it relays: the board's own connection carries
-/// no more authority than the caller's scope already proved.
+/// no more authority than the caller's scope already proved. A typed
+/// daemon refusal keeps its contract `code` (a recipient-class or
+/// ownership refusal the remote caller acts on); an untyped refusal is
+/// `invalid_request`, a daemon-internal failure `capability_unavailable`
+/// — never a fabricated success.
 fn rpc(state_dir: &Path, method: &str, params: Value) -> HttpResp {
     match client::rpc(state_dir, method, params) {
         Ok(v) => json_ok(v),
-        Err(e) => write_err(&e),
+        Err(e @ crate::error::Error::Structured(_)) => {
+            let code = e.code().unwrap_or("invalid_request").to_string();
+            let status = match code.as_str() {
+                "capability_unavailable" => 503,
+                "insufficient_scope" | "not_permitted" | "recipient_class_unsupported" => 403,
+                "not_found" => 404,
+                _ => 400,
+            };
+            cli_fail(status, &code, &e.to_string())
+        }
+        Err(e) => match e.kind() {
+            "rejected" => cli_fail(400, "invalid_request", &e.to_string()),
+            _ => cli_fail(503, "capability_unavailable", &e.to_string()),
+        },
     }
 }
 
@@ -353,11 +392,16 @@ fn readable_projects(pm: &Pm, actor: &CliActor) -> std::collections::BTreeSet<St
 
 /// The verb → the same call the CLI/board makes for it. `actor` is the
 /// verified envelope identity — `handle` for author/provenance fields.
-/// No request field ever renames it.
+/// No request field ever renames it. `envelope` is the raw compact JWS
+/// the route just verified: the message verbs relay it as
+/// `cli_envelope` to the daemon's `cli_message_*` RPCs, which re-verify
+/// it against the daemon's own trust root rather than trusting this
+/// connection's authority (CAD-1568).
 fn dispatch(
     verb: Verb,
     args: &Value,
     actor: &CliActor,
+    envelope: &str,
     state_dir: &Path,
     pm_dir: &Path,
     _opts: &ServeOpts,
@@ -489,20 +533,25 @@ fn dispatch(
             }
             _ => cli_fail(400, "invalid_request", "issue_history needs arguments.id"),
         },
+        // CAD-1568: the message verbs relay the re-verifiable signed
+        // envelope as `cli_envelope` to the daemon's `cli_message_*`
+        // RPCs — the daemon re-verifies it over this proven board
+        // connection and scopes everything by the verified principal;
+        // a bare `agent_inbox`/`message_read` relay would see an
+        // operator-class connection and read any member's mail.
         Verb::MessageRead => match arg_str(args, "message") {
-            Ok(Some(id)) => {
-                let mut params = json!({"message": id});
+            Ok(Some(_)) => {
                 match arg_u64(args, "offset") {
-                    Ok(Some(n)) => params["offset"] = json!(n),
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(resp) => return resp,
                 }
                 match arg_u64(args, "limit") {
-                    Ok(Some(n)) => params["limit"] = json!(n),
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(resp) => return resp,
                 }
-                rpc(state_dir, "message_read", params)
+                let mut params = args.clone();
+                params["cli_envelope"] = json!(envelope);
+                rpc(state_dir, "cli_message_read", params)
             }
             _ => cli_fail(
                 400,
@@ -511,19 +560,18 @@ fn dispatch(
             ),
         },
         Verb::MessageInbox => match arg_str(args, "alias") {
-            Ok(Some(alias)) => {
-                let mut params = json!({"alias": alias, "peek": true});
+            Ok(Some(_)) => {
                 match arg_u64(args, "after") {
-                    Ok(Some(n)) => params["after"] = json!(n),
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(resp) => return resp,
                 }
                 match arg_str(args, "reader") {
-                    Ok(Some(r)) => params["reader"] = json!(r),
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(resp) => return resp,
                 }
-                rpc(state_dir, "agent_inbox", params)
+                let mut params = args.clone();
+                params["cli_envelope"] = json!(envelope);
+                rpc(state_dir, "cli_message_inbox", params)
             }
             _ => cli_fail(
                 400,
@@ -751,24 +799,35 @@ fn dispatch(
                 },
             }
         }
+        // CAD-1568: never a bare `agent_send` relay — that connection is
+        // operator-class, so the daemon would record the message as the
+        // operator's. The signed envelope rides as `cli_envelope` and
+        // the daemon's `cli_message_send` re-verifies it, derives the
+        // principal and enforces the remote recipient classes itself.
+        // Arguments are exactly `alias`, `text` and the stable `message`
+        // id; the daemon refuses every other field, so routing
+        // (`reply_to`, `task`) and steering options are rejected, never
+        // silently dropped.
         Verb::MessageSend => match (arg_str(args, "alias"), arg_str(args, "text")) {
-            (Ok(Some(alias)), Ok(Some(text))) => {
+            (Ok(Some(_)), Ok(Some(text))) => {
                 if text.trim().is_empty() {
                     return cli_fail(400, "invalid_request", "message_send text is empty");
                 }
-                // `source` is the envelope-derived provenance the daemon
-                // stamps on the queue entry (identifier grammar,
-                // lowercase) — never an identity field, never "operator".
-                let source = format!("cli-{}", actor.handle.to_ascii_lowercase());
-                let mut params = json!({"alias": alias, "text": text, "source": source});
-                for key in ["message", "reply_to", "task"] {
-                    match arg_str(args, key) {
-                        Ok(Some(v)) => params[key] = json!(v),
-                        Ok(None) => {}
-                        Err(resp) => return resp,
+                match arg_str(args, "message") {
+                    Ok(Some(id)) if !id.trim().is_empty() => {}
+                    Ok(_) => {
+                        return cli_fail(
+                            400,
+                            "invalid_request",
+                            "message_send needs a stable arguments.message id — supply one \
+                             so a retry after a lost response dedupes instead of resubmitting blind",
+                        )
                     }
+                    Err(resp) => return resp,
                 }
-                rpc(state_dir, "agent_send", params)
+                let mut params = args.clone();
+                params["cli_envelope"] = json!(envelope);
+                rpc(state_dir, "cli_message_send", params)
             }
             (Err(resp), _) | (_, Err(resp)) => resp,
             _ => cli_fail(
@@ -798,6 +857,7 @@ mod policy_tests {
             role_at_issue: role.into(),
             principal_kind: principal_kind.into(),
             scopes: vec!["cli.read".into(), "cli.write".into()],
+            credential_id: "cred".into(),
             jti: "jti".into(),
             exp: i64::MAX,
             // Exactly what `verify` derives from the claims, so the helper
@@ -883,6 +943,7 @@ mod policy_tests {
                 Verb::ProjectPolicy,
                 &args,
                 actor,
+                "",
                 state.path(),
                 &pm.dir,
                 &opts,
@@ -1011,6 +1072,7 @@ mod policy_tests {
                 Verb::ProjectPolicy,
                 &args,
                 &owner,
+                "",
                 state.path(),
                 &pm.dir,
                 &opts,
@@ -1049,6 +1111,7 @@ mod policy_tests {
             role_at_issue: "member".into(),
             principal_kind: "user".into(),
             scopes: vec!["cli.read".into(), "cli.write".into()],
+            credential_id: "cred".into(),
             jti: "jti".into(),
             exp: i64::MAX,
             handle: cli_actor::handle_of("users/auth0|usr:9/x", "auth0|usr:9/x"),

@@ -11,6 +11,21 @@
         assert!(s.enqueue("a1", "different", None, "m1", "user").is_err());
     }
 
+    #[test]
+    fn enqueue_retry_survives_chat_attribution_change() {
+        let (dir, s) = store();
+        reg(&s, "a1", &dir.path().join("w"));
+        s.enqueue("a1", "hello", None, "m1", "user").unwrap();
+        s.ensure_thread("a1").unwrap();
+        let (duplicate, state) = s
+            .enqueue_sent("a1", "hello", None, "m1", "user", None, &Sender::Operator)
+            .unwrap();
+        assert!(duplicate);
+        assert_eq!(state, "queued");
+        assert_eq!(s.queued_count("a1").unwrap(), 1);
+        assert!(s.message("m1").unwrap().unwrap().sender.is_none());
+    }
+
     /// CAD-468: `enqueue_daemon` admits exactly the pairs the daemon
     /// mints — `sys-<source>-…` for a daemon source (`wake`, and `nudge`
     /// for the silent-end report reminder) — and refuses every crossing:

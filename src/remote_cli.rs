@@ -62,12 +62,11 @@ const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 
 /// The allowlisted remote verbs this build can send — the CAD-1019 contract
 /// ∩ AOS-128's `HOSTED_CADENCE_CLI_VERBS`, minus `team_list` (no local
-/// `team` command exists to map to it) and `message_send` (an agent-to-agent
-/// channel the remote milestone does not expose): a command not listed here
+/// `team` command exists to map to it): a command not listed here
 /// is refused *locally* and its bytes never leave the process.
 ///
 /// The cli.write half (`issue_new`/`issue_comment`/`issue_set`/
-/// `project_policy`) rides the same envelope — the caller's authority
+/// `project_policy`/`message_send`) rides the same envelope — the caller's authority
 /// never travels as a request field, only inside the verified, single-use
 /// envelope. A failed or ambiguous call is never retried by the client:
 /// the wake retry is the only loop, and it fires only on a pre-forward
@@ -75,7 +74,10 @@ const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 /// 5xx after forward — stays explicitly unresolved: the mutation may or
 /// may not have landed, so reconcile before blindly re-issuing. For
 /// `project_policy`, reconcile by reading the project record; a refusal
-/// is final.
+/// is final. For `message_send`, the caller-chosen `message` id in
+/// `arguments` is the reconciliation key: `message_read` returns the
+/// principal's own durable message by id, and resubmitting the same id
+/// dedupes server-side — never a blind replay.
 pub const REMOTE_VERBS: &[&str] = &[
     // cli.read
     "status",
@@ -91,6 +93,7 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_comment",
     "issue_set",
     "project_policy",
+    "message_send",
 ];
 
 /// The wiki actions this build sends over `/__platform/wiki/call` (CAD-1401,
@@ -1044,6 +1047,11 @@ fn call_once(
     if !arguments.is_empty() {
         body["arguments"] = Value::Object(arguments.clone());
     }
+    // CAD-1568: a mutating verb's transport failure after the call was
+    // attempted is outcome-unknown, not a rejection — the mutation may
+    // have landed, so the caller must reconcile by idempotency key, never
+    // assume nothing landed. `message_send` reconciles on `arguments.message`.
+    let mutating = matches!(surface, Surface::Cli) && verb == "message_send";
     post(
         &target.endpoint,
         &format!("{relay}/call"),
@@ -1051,6 +1059,13 @@ fn call_once(
         &body,
         request_timeout(deadline, CALL_TIMEOUT)?,
     )
+    .map_err(|e| {
+        if mutating && e.kind() != "unknown" {
+            Error::unknown(format!("{e} — the send may or may not have been recorded"))
+        } else {
+            e
+        }
+    })
 }
 
 /// CAD-913: one `POST /__platform/wiki/upload` multipart request — the same
@@ -1523,6 +1538,68 @@ fn refusal_error(status: u16, body: Option<&Value>) -> Error {
     reject(text)
 }
 
+/// CAD-1568: actionable text for the `cli_message_*` family's typed
+/// refusals, keyed on the container's bounded `error.code` — the raw
+/// `error.message` the route returns is never shown (a `cli_fail` body
+/// can carry arbitrary server text). Unknown or absent codes keep the
+/// generic decoded refusal unchanged.
+fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Error) -> Error {
+    let action: Option<(&'static str, &'static str)> = match (verb, code) {
+        ("message_send", Some("recipient_class_unsupported")) => Some((
+            "recipient_class_unsupported",
+            "remote send reaches `master` for a human workspace owner only; \
+             personal assistants require separate assistant authority, and local \
+             workers use the local-assignment plane",
+        )),
+        ("message_send", Some("message_id_conflict")) => Some((
+            "message_id_conflict",
+            "that --message id was already used with different content (or \
+             belongs to another member) — mint a fresh id; different content \
+             under a reused id is a conflict, never a resubmit",
+        )),
+        ("message_send", Some("rejected")) => Some((
+            "rejected",
+            "the recipient or the --message id was refused — `sys-` ids are \
+             daemon-owned; inspect the selected workspace's master and use a \
+             non-reserved stable message id",
+        )),
+        ("message_send", Some("not_permitted")) => Some((
+            "not_permitted",
+            "remote `send master` requires a verified human workspace owner; \
+             agent, service and ordinary-member credentials do not grant master chat",
+        )),
+        ("message_send", Some("insufficient_scope")) => Some((
+            "insufficient_scope",
+            "this remote login lacks the cli.write grant a send needs — re-login \
+             with write scope, then retry",
+        )),
+        ("message_send", Some("invalid_request")) => Some((
+            "invalid_request",
+            "the send was refused at the request boundary — the remote call \
+             needs a non-empty body and the stable --message id",
+        )),
+        ("message_read", Some("not_permitted")) | ("message_inbox", Some("not_permitted")) => {
+            Some((
+                "not_permitted",
+                "remote message readback requires the sending human's identity; \
+                 passive inbox inspection requires a human workspace owner",
+            ))
+        }
+        ("message_read", Some("not_found")) => Some((
+            "not_found",
+            "no CLI message with that id is visible to this human identity; \
+             reconcile the original workspace and login before retrying the same id",
+        )),
+        _ => None,
+    };
+    match action {
+        Some((wire_code, text)) => {
+            Error::invalid(wire_code, format!("{text} ({wire_code}, HTTP {status})"))
+        }
+        None => base,
+    }
+}
+
 /// Run one allowlisted remote verb: a [`REMOTE_VERBS`] cli verb or a
 /// [`WIKI_ACTIONS`] wiki action. The verb must be in one of them (a bug in
 /// the caller is a local refusal, never a request). The credential is loaded and checked against `target` before
@@ -1865,7 +1942,59 @@ fn call_verb_until_retry(
         }
         let (status, retry_after, body) =
             call_once(target, &cred, surface, verb, &arguments, deadline)?;
+        // A successful status without a usable, correlated enqueue receipt
+        // cannot establish whether the mutation landed. Never call it rejected.
+        if verb == "message_send"
+            && (200..300).contains(&status)
+            && !body.as_ref().is_some_and(|receipt| {
+                arguments
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| {
+                        receipt.get("message").and_then(Value::as_str) == Some(id)
+                            && matches!(
+                                receipt.get("state").and_then(Value::as_str),
+                                Some(
+                                    "queued"
+                                        | "submitting"
+                                        | "running"
+                                        | "completed"
+                                        | "failed"
+                                        | "cancelled"
+                                        | "unknown"
+                                )
+                            )
+                            && receipt.get("duplicate").and_then(Value::as_bool).is_some()
+                    })
+            })
+        {
+            return Err(Error::unknown(
+                "remote send returned no usable correlated receipt — enqueue outcome is unknown",
+            ));
+        }
+        let refusal_code = refusal_fields(body.as_ref()).0.map(str::to_owned);
+        // CAD-1568: a 5xx carrying a worker `state` is a pre-forward
+        // verdict (waking handled below, wake_failed/unavailable = nothing
+        // ran). A 5xx with no `state` may come from the container *after*
+        // the send was attempted — outcome unknown, reconcile by
+        // `arguments.message`, never a blind resubmission.
+        let send_outcome_unknown = verb == "message_send"
+            && status >= 500
+            && body.as_ref().and_then(|b| b["state"].as_str()).is_none();
         match classify(status, retry_after, body) {
+            Verdict::Done(Err(e)) if send_outcome_unknown => {
+                return Err(Error::unknown(format!(
+                    "{e} — the send may or may not have been recorded"
+                )));
+            }
+            Verdict::Done(Err(e)) => {
+                return Err(message_family_refusal(
+                    verb,
+                    status,
+                    refusal_code.as_deref(),
+                    e,
+                ));
+            }
             Verdict::Done(result) => return result.map(RemoteAnswer::Ok),
             Verdict::Conflict(body) => return Ok(RemoteAnswer::Conflict(body)),
             Verdict::Waking(wait) => {
@@ -2993,6 +3122,115 @@ mod tests {
         let envs = envelopes(&requests);
         assert_eq!(envs.len(), 2);
         assert_ne!(envs[0], envs[1], "a wake retry reused the envelope");
+    }
+
+    #[test]
+    fn successful_send_without_a_receipt_is_unknown_and_not_retried() {
+        for receipt in [
+            Value::Null,
+            json!({"message":"lost-receipt","state":"waking","duplicate":false}),
+            json!({"message":"another-request","state":"queued","duplicate":false}),
+        ] {
+            let (out, requests) = run(
+                vec![(200, "", receipt)],
+                "message_send",
+                json!({"alias": "master", "text": "coordinate", "message": "lost-receipt"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                10,
+            );
+            assert_eq!(out.unwrap_err().kind(), "unknown");
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+        }
+    }
+
+    #[test]
+    fn a_send_wake_retry_keeps_its_durable_message_id() {
+        // A pre-forward wake retry needs a fresh envelope but must not
+        // mint another durable message id.
+        let args: Map<String, Value> = json!({
+            "alias": "master",
+            "text": "please coordinate",
+            "message": "cad1568-proof-1",
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let (out, requests) = run(
+            vec![
+                (503, "", json!({"state": "waking", "retry_after_s": 1})),
+                (
+                    200,
+                    "",
+                    json!({"message": "cad1568-proof-1", "state": "queued",
+                    "duplicate": false, "alias": "master"}),
+                ),
+            ],
+            "message_send",
+            args,
+            120,
+        );
+        out.unwrap();
+        let mut calls = 0;
+        for request in requests
+            .iter()
+            .filter(|r| r["path"] == json!("/__platform/cli/call"))
+        {
+            calls += 1;
+            assert_eq!(request["body"]["arguments"]["message"], "cad1568-proof-1");
+        }
+        assert_eq!(calls, 2);
+        let envs = envelopes(&requests);
+        assert_ne!(envs[0], envs[1], "a send retry reused the envelope");
+    }
+
+    #[test]
+    fn cli_message_refusals_map_bounded_codes_never_server_text() {
+        // CAD-1568: the container's `cli_fail` body is
+        // `{ok:false,error:{code,message}}` and `message` is arbitrary
+        // server text — the client answers the bounded code with its own
+        // actionable text, and the server string never surfaces.
+        let poisonous = |code: &str| {
+            json!({"ok": false, "error": {
+                "code": code,
+                "message": "internal-server-text /private/path"}})
+        };
+        for (verb, status, code) in [
+            ("message_send", 400u16, "recipient_class_unsupported"),
+            ("message_send", 400, "message_id_conflict"),
+            ("message_send", 403, "not_permitted"),
+            ("message_read", 404, "not_found"),
+        ] {
+            let (out, requests) = run(vec![(status, "", poisonous(code))], verb, Map::new(), 10);
+            let err = out.unwrap_err();
+            let shown = err.to_string();
+            assert_eq!(
+                err.code(),
+                Some(code),
+                "{verb}: machine-readable refusal code changed"
+            );
+            assert!(
+                !shown.contains("internal-server-text") && !shown.contains("/private/path"),
+                "{verb} {code} leaked server text: {shown}"
+            );
+            assert_eq!(
+                hits(&requests, "/__platform/cli/call"),
+                1,
+                "a refusal was retried"
+            );
+        }
+        // An unlisted code on a message verb keeps the generic refusal —
+        // never a fabricated action.
+        let (out, _) = run(
+            vec![(400, "", poisonous("some_future_code"))],
+            "message_send",
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("unknown"), "{shown}");
+        assert!(!shown.contains("internal-server-text"), "{shown}");
     }
 
     #[test]

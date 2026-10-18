@@ -8217,3 +8217,10 @@ fn platform_provision_live_denial_creates_no_binding_or_files() {
     );
     let _ = rig_shared;
 }
+
+include!("cad1568_independent_acceptance.rs");
+
+// CAD-1568 second-signer guard acceptance: the child-agent principal boundary
+// for remote CLI messaging, authored independently of the implementer and the
+// ticket author's check above.
+include!("cad1568_reviewer_acceptance.rs");
