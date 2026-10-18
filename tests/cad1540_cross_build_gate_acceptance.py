@@ -21,11 +21,13 @@ import subprocess
 import sys
 
 import yaml
+
 REPO = pathlib.Path(__file__).resolve().parents[1]
 GATE = REPO / "scripts" / "cross-build-gate.sh"
 WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
 
 GATE_JOB = "cross-build-required"
+
 # matrix result -> may the gate pass?
 OUTCOMES = {"success": True, "skipped": True, "failure": False, "cancelled": False}
 
@@ -87,6 +89,7 @@ def check_wiring(workflow: str) -> list[str]:
         if isinstance(step, dict)
     ):
         failures.append(f"`{GATE_JOB}` does not run scripts/cross-build-gate.sh")
+
     return failures
 
 
