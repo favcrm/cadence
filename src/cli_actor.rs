@@ -73,6 +73,7 @@ pub enum Verb {
     IssueComment,
     IssueSet,
     MessageSend,
+    ProjectPolicy,
 }
 
 /// The `cli.*` scope a verb needs — `cli.write` never implies
@@ -102,6 +103,7 @@ impl Verb {
             "issue_comment" => Verb::IssueComment,
             "issue_set" => Verb::IssueSet,
             "message_send" => Verb::MessageSend,
+            "project_policy" => Verb::ProjectPolicy,
             _ => return None,
         })
     }
@@ -117,9 +119,11 @@ impl Verb {
             | Verb::MessageRead
             | Verb::MessageInbox
             | Verb::TeamList => Scope::Read,
-            Verb::IssueNew | Verb::IssueComment | Verb::IssueSet | Verb::MessageSend => {
-                Scope::Write
-            }
+            Verb::IssueNew
+            | Verb::IssueComment
+            | Verb::IssueSet
+            | Verb::MessageSend
+            | Verb::ProjectPolicy => Scope::Write,
         }
     }
 }
@@ -193,6 +197,11 @@ pub struct CliActor {
     /// `claims.actor` verbatim — `operator`, `users/<sub>`,
     /// `service/<sub>` or `agents/<id>` (the schema bounds each).
     pub actor: String,
+    /// `claims.role_at_issue` — the issuer-side membership role at mint
+    /// (`owner` | `member`). The route reads it for the verbs the
+    /// contract reserves to the Owner, so those verbs refuse without
+    /// re-reading any platform state. Never a request field.
+    pub role_at_issue: String,
     /// The granted cli scopes, each already narrowed to the
     /// `{cli.read, cli.write}` vocabulary.
     pub scopes: Vec<String>,
@@ -414,6 +423,7 @@ pub fn verify(
         handle: handle_of(&claims.actor, &claims.sub),
         sub: claims.sub,
         actor: claims.actor,
+        role_at_issue: claims.role_at_issue,
         scopes: claims.scope,
         jti: claims.jti,
         exp: claims.exp,

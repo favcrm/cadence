@@ -694,6 +694,63 @@ fn dispatch(
             }
             (Err(resp), _) | (_, Err(resp)) => resp,
         },
+        // Owner-only, and the role is the verified envelope's
+        // (`role_at_issue`), never an argument: the record this verb
+        // writes decides who may read the project, so a member must not
+        // be able to widen it, grant itself access, or grant anyone
+        // else. For the same reason this arm does not consult the
+        // project's own restriction — administering a policy cannot
+        // depend on the policy it is administering.
+        Verb::ProjectPolicy => {
+            if actor.role_at_issue != "owner" {
+                return cli_fail(
+                    403,
+                    "not_permitted",
+                    "project_policy is owner-only — a member cannot record project access",
+                );
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct PolicyReq {
+                project: String,
+                visibility: Option<String>,
+                grants: Option<Vec<String>>,
+            }
+            let req: PolicyReq = match serde_json::from_value(args.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    return cli_fail(400, "invalid_request", &format!("project_policy: {e}"));
+                }
+            };
+            let visibility = match req.visibility.as_deref() {
+                None | Some("workspace-visible") => {
+                    crate::issue::project::Visibility::WorkspaceVisible
+                }
+                Some("private") => crate::issue::project::Visibility::Private,
+                Some(other) => {
+                    return cli_fail(
+                        400,
+                        "invalid_request",
+                        &format!(
+                            "project_policy: unknown visibility `{other}` — \
+                             workspace-visible or private"
+                        ),
+                    );
+                }
+            };
+            match pm_at(pm_dir) {
+                Err(resp) => resp,
+                Ok(pm) => match issue_write::set_project_policy(
+                    &pm,
+                    &req.project,
+                    visibility,
+                    &req.grants.unwrap_or_default(),
+                ) {
+                    Ok(out) => json_ok(out),
+                    Err(e) => write_err(&e),
+                },
+            }
+        }
         Verb::MessageSend => match (arg_str(args, "alias"), arg_str(args, "text")) {
             (Ok(Some(alias)), Ok(Some(text))) => {
                 if text.trim().is_empty() {
@@ -727,15 +784,22 @@ fn dispatch(
 mod policy_tests {
     use super::*;
 
-    fn actor(spelling: &str) -> CliActor {
+    fn actor_with_role(spelling: &str, role: &str) -> CliActor {
         CliActor {
             sub: "sub".into(),
             actor: spelling.into(),
+            role_at_issue: role.into(),
             scopes: vec!["cli.read".into(), "cli.write".into()],
             jti: "jti".into(),
             exp: i64::MAX,
             handle: "handle".into(),
         }
+    }
+
+    /// A member envelope — the role the gate must refuse for the verbs
+    /// the contract reserves to the Owner.
+    fn actor(spelling: &str) -> CliActor {
+        actor_with_role(spelling, "member")
     }
 
     fn pm_with(policy: &str) -> (tempfile::TempDir, Pm) {
@@ -790,11 +854,130 @@ mod policy_tests {
         assert!(readable_projects(&pm, &actor("mystery")).is_empty());
     }
 
+    /// Recording access is the Owner's alone, and the record it writes is
+    /// the one the read guard then consults.
     #[test]
-    fn a_project_without_a_recorded_policy_stays_readable() {
+    fn recording_a_policy_is_owner_only_and_advances_the_record() {
         let (_dir, pm) = pm_with("");
-        assert!(restricted(&pm, "demo", &actor("users/anyone")).is_none());
-        assert!(readable_projects(&pm, &actor("users/anyone")).contains("demo"));
+        let state = tempfile::tempdir().unwrap();
+        let opts = ServeOpts::default();
+        // A project with no recorded policy has no version on disk: the
+        // first recorded policy is 1, and only a later write advances it.
+        let policy_of = || {
+            crate::issue::project::load(&pm.dir.join("demo").join("project.yaml"))
+                .expect("project.yaml loads")
+                .policy
+        };
+        let call = |actor: &CliActor, args: Value| {
+            dispatch(
+                Verb::ProjectPolicy,
+                &args,
+                actor,
+                state.path(),
+                &pm.dir,
+                &opts,
+            )
+            .status_code()
+        };
+
+        // The gate reads the role the envelope was minted with, so every
+        // member spelling is refused — including one that looks like a
+        // grant a policy might carry, and the reserved namespaces.
+        for spelling in ["users/mia", "agents/dev", "service/svc", "mystery"] {
+            for args in [
+                json!({"project": "demo"}),
+                json!({"project": "demo", "visibility": "private"}),
+                json!({"project": "demo", "grants": ["users/mia"]}),
+            ] {
+                assert_eq!(
+                    call(&actor(spelling), args.clone()),
+                    403,
+                    "{spelling} {args}"
+                );
+            }
+        }
+        // …and none of those refusals reached the tracker: the project is
+        // left with no recorded policy at all, not a widened one.
+        assert!(policy_of().is_none(), "a refused call wrote a policy");
+
+        // The Owner's write lands. A first policy is version 1, and a
+        // second effective change advances it — the monotonic advance a
+        // stale projection relies on to refuse the previous policy.
+        let owner = actor_with_role("users/owner", "owner");
+        assert_eq!(
+            call(&owner, json!({"project": "demo", "grants": ["users/mia"]})),
+            200
+        );
+        let first = policy_of().expect("policy recorded");
+        assert_eq!(first.version, 1);
+        assert_eq!(
+            first.visibility,
+            crate::issue::project::Visibility::WorkspaceVisible
+        );
+        assert_eq!(
+            first
+                .members
+                .iter()
+                .map(crate::issue::project::Grant::as_str)
+                .collect::<Vec<_>>(),
+            vec!["users/mia"]
+        );
+
+        assert_eq!(
+            call(
+                &owner,
+                json!({"project": "demo", "grants": ["users/mia", "users/dev"]})
+            ),
+            200
+        );
+        let second = policy_of().expect("policy recorded");
+        assert_eq!(second.version, 2);
+        assert_eq!(
+            second
+                .members
+                .iter()
+                .map(crate::issue::project::Grant::as_str)
+                .collect::<Vec<_>>(),
+            vec!["users/mia", "users/dev"]
+        );
+
+        // The isolation gate holds for the Owner too, and a refused
+        // activation leaves the recorded policy exactly as it was.
+        assert_eq!(
+            call(&owner, json!({"project": "demo", "visibility": "private"})),
+            400
+        );
+        assert_eq!(policy_of().expect("policy recorded"), second);
+    }
+
+    /// A malformed call is refused before any write, and the two spellings
+    /// of "no change to visibility" are the only ones accepted.
+    #[test]
+    fn a_policy_call_naming_an_unknown_field_or_visibility_is_refused() {
+        let (_dir, pm) = pm_with("");
+        let state = tempfile::tempdir().unwrap();
+        let opts = ServeOpts::default();
+        let owner = actor_with_role("operator", "owner");
+        for args in [
+            json!({"project": "demo", "visibility": "public"}),
+            json!({"project": "demo", "member": "users/mia"}),
+            json!({"project": "demo", "grants": ["everyone"]}),
+            json!({"grants": ["users/mia"]}),
+        ] {
+            let refusal = dispatch(
+                Verb::ProjectPolicy,
+                &args,
+                &owner,
+                state.path(),
+                &pm.dir,
+                &opts,
+            );
+            assert_eq!(refusal.status_code(), 400, "{args}");
+        }
+        // A denied call is not a partial one: the record is untouched.
+        let project = crate::issue::project::load(&pm.dir.join("demo").join("project.yaml"))
+            .expect("project.yaml loads");
+        assert!(project.policy.is_none(), "a refused call wrote a policy");
     }
 }
 
