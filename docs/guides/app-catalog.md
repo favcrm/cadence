@@ -98,6 +98,20 @@ answers for the catalog ids a historical `Source::Builtin` install or an
 open install request names — a tombstone row with the retired reason and
 the install's real state — and refuses anything else.
 
+The directory is rendered by the Cadence UI, not by the catalogue API or a
+separate server-rendered page. Its browser requests stay on the board origin
+(`/api/public-apps` and `/api/public-apps/<id>`); the board reads catalogue JSON.
+Hosted boards use `http://api.internal` for listing data. Their edge serves
+reviewed release bytes on the board origin without sending them through that
+container-internal transport.
+
+Browse-only releases remain visible with their description and availability;
+they never acquire an Install action merely because their listing is valid.
+An invalid catalogue answer is an error, not an empty list. An unavailable
+installed-app check is not proof that an app is missing, so installation stays
+off until the check succeeds. Anonymous visitors can browse and follow the
+sign-in link; mutation authorization remains on the existing operator routes.
+
 Legacy rule: while no workspace catalog exists, any unmigrated legacy
 `<project>/apps/<name>` installation blocks every workspace install, not only
 one of the same name, until `cadence app catalog migrate` has catalogued it.

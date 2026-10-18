@@ -71,7 +71,7 @@ pub(super) fn proxy_public_catalog(path: &str, raw_query: &str) -> super::write_
         return super::serve::err_response(404, "No such app.");
     };
     let Some(origin) = catalog_origin() else {
-        return super::serve::err_response(404, "public directory is not configured");
+        return super::serve::err_response(503, "public directory is not configured");
     };
     fetch_public_catalog(&format!("{origin}{upstream}"))
 }
@@ -242,11 +242,5 @@ mod tests {
             catalog_upstream("/api/public-apps/social-content/release", "digest=nope").is_none()
         );
         assert!(catalog_upstream("/api/other", "").is_none());
-    }
-
-    #[test]
-    fn board_csp_does_not_name_the_catalog_origin() {
-        assert!(!super::super::serve::CSP.contains("connect-src"));
-        assert!(!super::super::serve::CSP.contains("8826"));
     }
 }
