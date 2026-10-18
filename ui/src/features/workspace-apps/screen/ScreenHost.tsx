@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState, type ComponentProps, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { readWorkspaceAppSnapshot, readWorkspaceAppSnapshotFresh, workspaceApps, type Installation, type AppContext, type AppBinding, type WorkspaceAppSnapshot } from "../workspaceApps";
 import { runCall, makePlanner } from "./screenActions";
 import { useHref } from "../../../lib/useLocation";
 import ScreenOutlet from "./ScreenOutlet";
-import { screenProjection, type ScreenExtras } from "./screenProjection";
+import { screenProjection } from "./screenProjection";
+import { useScreenExtras } from "./useScreenExtras";
 import type { AssetLoader, ScreenActions } from "./screenLifecycle";
 import type { ScreenPush } from "./screenProtocol";
 
@@ -41,17 +42,32 @@ export function InstalledScreenOutlet({ installation, contexts, contextId, admit
   // snapshot arrives the previous empty projection stands: mounting behaviour is
   // unchanged, it simply gains rows once they are known.
   const [snapshot, setSnapshot] = useState<WorkspaceAppSnapshot | null>(() => readWorkspaceAppSnapshot(installation.install_id));
+  // Runs progress and reviewers approve out of band, so the screen follows its
+  // scope the way the native workspace does: a fresh read now, another every
+  // five seconds while the tab is visible, and one straight after an action.
+  const reread = useRef<() => void>(() => undefined);
   useEffect(() => {
-    const controller = new AbortController();
-    readWorkspaceAppSnapshotFresh(installation.install_id, controller.signal).then(setSnapshot, () => undefined);
-    return () => controller.abort();
+    let controller = new AbortController();
+    const read = () => {
+      controller.abort();
+      controller = new AbortController();
+      readWorkspaceAppSnapshotFresh(installation.install_id, controller.signal).then(
+        (next) => { if (!controller.signal.aborted) setSnapshot(next); },
+        () => undefined,
+      );
+    };
+    reread.current = read;
+    read();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== "hidden") read();
+    }, 5000);
+    return () => { window.clearInterval(timer); controller.abort(); };
   }, [installation.install_id]);
   // Approved text for the pushed runs, resolved the way `read.run` resolves it: the
   // run's reviewer-approved text artifact, read by id. Bindings come from the same
   // read the native path uses; `workers` stays null — "unknown", as the type states —
   // rather than asserted, so nothing here claims a scope the host did not state.
   const [bindings, setBindings] = useState<AppBinding[]>([]);
-  const [texts, setTexts] = useState<Map<string, string>>(() => new Map());
   useEffect(() => {
     if (!admitted) return;
     const controller = new AbortController();
@@ -59,28 +75,20 @@ export function InstalledScreenOutlet({ installation, contexts, contextId, admit
       .then((rows) => { if (!controller.signal.aborted) setBindings(rows); }, () => undefined);
     return () => controller.abort();
   }, [installation.install_id, contextId, admitted]);
-  useEffect(() => {
-    if (!admitted || snapshot === null) return;
-    const wanted: string[] = [];
-    for (const run of Array.isArray(snapshot.runs) ? snapshot.runs : []) {
-      if (run.install_id !== installation.install_id) continue;
-      if (contextId && run.context_id !== contextId) continue;
-      const approved = run.reviews.find((review) => review.decision === "approve");
-      const artifact = approved && run.artifacts.find((value) => value.digest === approved.artifact_digest && value.media_type.startsWith("text/"));
-      if (artifact) wanted.push(artifact.id);
-    }
-    if (wanted.length === 0) { setTexts(new Map()); return; }
-    const controller = new AbortController();
-    Promise.all(wanted.map((id) => workspaceApps.artifact(id, controller.signal).then(
-      (artifact) => (artifact.id === id && typeof artifact.text === "string" ? ([id, artifact.text] as const) : null),
-      () => null,
-    ))).then((rows) => {
-      if (controller.signal.aborted) return;
-      setTexts(new Map(rows.filter((row): row is readonly [string, string] => row !== null)));
-    }, () => undefined);
-    return () => controller.abort();
-  }, [snapshot, installation.install_id, contextId, admitted]);
-  const extras: ScreenExtras = { installId: installation.install_id, contextId, bindings, workers: null, texts };
+  // Approved text and the image loader come from the same bounded readers the
+  // native workspace uses — the newest 32 runs, 600 characters each, read in
+  // sequence and cached by artifact id — so the generic path inherits that
+  // budget instead of fetching every artifact the scope holds.
+  const { extras, loadAsset } = useScreenExtras({
+    enabled: admitted,
+    installation,
+    installId: installation.install_id,
+    contextId: contextId || "",
+    runs: Array.isArray(snapshot?.runs) ? snapshot.runs : [],
+    bindings,
+    workers: null,
+    onDenied: () => undefined,
+  });
   const projection = useMemo<ScreenPush>(() => {
     const empty: ScreenPush = {
       v: 2, op: "screen", install_id: installation.install_id, digest: installation.digest, tag: tag ?? "", context_id: contextId,
@@ -89,20 +97,20 @@ export function InstalledScreenOutlet({ installation, contexts, contextId, admit
       runs: [], outbox: [], publish_intents: { status: "ok", withheld: 0, rows: [] }, readiness: { ok: true, blockers: [] }, actions: [], now: Math.floor(Date.now() / 1000),
     };
     if (snapshot === null || tag === null) return empty;
-    // Intent state is publish-intent state (social's concern) and no approved-text
-    // extras are resolved here yet. Both stay absent rather than guessed — the
-    // same state the native path settles to when its own reads fail.
+    // Intent state is publish-intent state (social's concern) and stays absent
+    // rather than guessed — the same state the native path settles to when its
+    // own reads fail. Approved text arrives through `extras`.
     try {
       return screenProjection(snapshot.installation, tag, contextId, snapshot.contexts, Array.isArray(snapshot.runs) ? snapshot.runs : [], Array.isArray(snapshot.effects) ? snapshot.effects : [], undefined, extras) ?? empty;
     } catch {
       // An oversized or otherwise unavailable scope keeps today's behaviour.
       return empty;
     }
-  }, [snapshot, installation, contexts, contextId, tag, bindings, texts]);
+  }, [snapshot, installation, contexts, contextId, tag, extras]);
   const actions = useMemo(() => {
-    const ctx = () => ({ installation, installId: installation.install_id, contextId, runs: snapshot?.runs ?? [], onChanged: () => undefined });
+    const ctx = () => ({ installation, installId: installation.install_id, contextId, runs: snapshot?.runs ?? [], onChanged: () => reread.current() });
     return { call: (verb: Parameters<typeof runCall>[1], args: Parameters<typeof runCall>[2], ui: Parameters<typeof runCall>[3]) => runCall(ctx(), verb, args, ui), planner: makePlanner(ctx) };
   }, [installation, contextId, snapshot]);
   return admitted && liveContext && tag && installation.executable && installation.approval.state === "approved" && installation.removed == null
-    ? <ScreenHost projection={projection} fallback={fallback} actions={actions} {...callbacks} /> : fallback;
+    ? <ScreenHost projection={projection} fallback={fallback} loadAsset={loadAsset} actions={actions} {...callbacks} /> : fallback;
 }
