@@ -122,6 +122,7 @@ impl Shared {
         let expected = required_str(params, "expected_revision")?;
         let profile = required_str(params, "profile")?;
         let harness = required_str(params, "harness")?;
-        crate::agent_settings::preview(&self.store, expected, profile, harness)
+        let pm = self.pm()?;
+        crate::agent_settings::preview(&pm.dir, &self.store, expected, profile, harness)
     }
 }

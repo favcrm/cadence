@@ -2068,6 +2068,9 @@ but cannot mutate settings. Catalog Refresh reads the supported
 source and fetch time; discovered models are not launch permission. Import
 adds missing rows to the draft with Pi permission off. Picking a combobox row
 fills metadata; opening an existing row preserves its saved values.
+Provider pins accept `name@version` or `name version`; Save stores the canonical
+`name@version` form. The legacy model-defaults writer preserves the Agents
+overlay and refuses edits to it; use Agents Save for those fields.
 
 At daemon startup, legacy `pm.yaml [pi]` and non-master
 `agents/<profile>/AGENT.md` definitions are imported once. The SQLite settings
@@ -2088,6 +2091,8 @@ Pi policy. Existing sessions retain their stored instructions. New or changed
 jobs must fit both the AGENT.md character cap and the 32,000 UTF-8 byte launch
 instruction limit. Larger imported jobs remain preserved; Preview and launch
 explain the refusal until they are shortened.
+Profile usage lists active sessions. Stopped/offline sessions retain their
+snapshots and audit history but do not prevent profile deletion.
 
 Sync writes supported derived `.pi/agents/<id>.md` and
 `.claude/agents/<id>.md` exports under the PM root. It preserves unmanaged files,
@@ -2096,7 +2101,8 @@ Managed updates write the validated, single-link file descriptor rather than
 replacing its path; their ownership header survives partial writes, allowing
 a later Sync to repair an interrupted derived export. These files are not the
 canonical launch source. Preview reports the saved selection, compatibility,
-installation and permission refusals without starting an agent session.
+installation and permission refusals, including host Pi-confinement defaults,
+without starting an agent session.
 
 The SPA has real routes (CAD-326, `ui/src/lib/router.ts`): `/` Home,
 `/overview` (the team overview: needs, drift, monitors, projects),

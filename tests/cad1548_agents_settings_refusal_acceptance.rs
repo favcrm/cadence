@@ -2262,5 +2262,254 @@ mod acceptance {
         portable_settings_authority_is_omitted_and_unknown_columns_refuse();
         assert_eq!(fx.snapshot()["revision"], held.revision);
         assert_eq!(fx.live_agents(), 0);
+
+        // A saved allowlisted model is still refused by the host's actual
+        // confinement default. Preview must explain that same refusal,
+        // without starting an agent or changing the saved authority.
+        let model = "devin/swe-2-high";
+        let profile_id = "confined-preview";
+        let mut config = held.config.clone();
+        config["providers"].as_array_mut().unwrap().push(json!({
+            "id": "devin-preview",
+            "label": "Devin preview acceptance",
+            "kind": "Pi extension",
+            "pin": "",
+            "gate": true,
+            "paid": false,
+            "note": ""
+        }));
+        config["models"].as_array_mut().unwrap().push(json!({
+            "id": model,
+            "provider": "devin-preview",
+            "ctx": "",
+            "out": "",
+            "thinking": null,
+            "images": null
+        }));
+        config["scope"][model] = json!("worker");
+        profiles(&mut config).push(json!({
+            "id": profile_id,
+            "role": "worker",
+            "model": model,
+            "job": "Preview must not launch this confined Devin worker."
+        }));
+        let saved = fx.op(SAVE, save_body(&held.revision, config));
+        let stored = authority(&fx.state());
+        let policy: cadence_agent::pi_policy::PiPolicy =
+            serde_json::from_str(stored.pi.as_deref().expect("saved Pi policy")).unwrap();
+        cadence_agent::pi_policy::require_allowed(Some(&policy), "worker", model)
+            .expect("the preview model must be allowed by canonical worker policy");
+
+        let pm_yaml = fx.pm().join("pm.yaml");
+        let mut yaml: serde_yaml::Value =
+            serde_yaml::from_slice(&std::fs::read(&pm_yaml).unwrap()).unwrap();
+        yaml["host"] = serde_yaml::from_str("confine_pi_workers: true\n").unwrap();
+        std::fs::write(&pm_yaml, serde_yaml::to_string(&yaml).unwrap()).unwrap();
+        // The earlier symlink exercise intentionally replaced the export
+        // fixture. Capture its current tree, including missing entries and
+        // symlink targets, rather than requiring the original files again.
+        let export_files = || {
+            let mut files = BTreeMap::new();
+            for name in [".pi", ".claude"] {
+                walk_files(&fx.pm().join(name), name, &mut files);
+            }
+            files
+        };
+        let guarded_exports = export_files();
+        let guarded_sources = source_files(&fx.pm());
+        let guarded_pm_yaml = std::fs::read(&pm_yaml).unwrap();
+        let guarded_authority = authority(&fx.state());
+        let assert_guarded = || {
+            let snapshot = fx.snapshot();
+            assert_eq!(snapshot["revision"], saved["revision"]);
+            assert_eq!(snapshot["config"], saved["config"]);
+            assert_eq!(authority(&fx.state()), guarded_authority);
+            assert_eq!(std::fs::read(&pm_yaml).unwrap(), guarded_pm_yaml);
+            assert_eq!(source_files(&fx.pm()), guarded_sources);
+            assert_eq!(export_files(), guarded_exports);
+            assert!(agent_aliases(&fx.state()).is_empty());
+            assert_eq!(fx.live_agents(), 0);
+        };
+        assert!(agent_aliases(&fx.state()).is_empty());
+
+        let err = fx
+            .rpc(
+                Asserted::Operator,
+                "agent_register",
+                json!({
+                    "alias": "c1548-confined-preview",
+                    "provider": "pi",
+                    "endpoint_kind": "managed",
+                    "role": "worker",
+                    "cwd": fx.pm().to_string_lossy(),
+                    "profile": profile_id,
+                }),
+            )
+            .expect_err("the real host confinement guard accepted Devin");
+        let refusal = err.to_string().to_lowercase();
+        assert!(
+            refusal.contains("confined") && refusal.contains("devin"),
+            "registration failed for a different reason: {err}"
+        );
+        assert!(agent_aliases(&fx.state()).is_empty());
+        assert_guarded();
+
+        let body = json!({
+            "expected_revision": saved["revision"],
+            "profile": profile_id,
+            "harness": "pi",
+        });
+        let rpc_preview = fx.op(PREVIEW, body.clone());
+        let (status, reply, _) = fx.http_post(
+            &Asserted::Operator,
+            ROUTE_PREVIEW,
+            &body,
+            Some(&fx.operator_session()),
+        );
+        assert_eq!(status, 200, "confined preview HTTP response: {reply}");
+        for preview in [rpc_preview, parse_json(&reply)] {
+            assert_eq!(preview["model"], json!(model));
+            assert_eq!(preview["allowed"], json!(false), "{preview}");
+            assert!(preview["command"].is_null(), "{preview}");
+            assert!(
+                preview["reasons"].as_array().is_some_and(|reasons| {
+                    reasons.iter().filter_map(Value::as_str).any(|reason| {
+                        let reason = reason.to_lowercase();
+                        reason.contains("confined") && reason.contains("devin")
+                    })
+                }),
+                "preview omitted the real host confinement refusal: {preview}"
+            );
+        }
+        assert!(
+            agent_aliases(&fx.state()).is_empty(),
+            "preview created an agent"
+        );
+        assert_guarded();
+
+        // The supported legacy writer edits model defaults, not the Agents
+        // overlay. Exercise its real RPC and HTTP peer after every assertion
+        // bound to `held`: each positive control advances the shared revision.
+        let session = fx.operator_session();
+        let settings_audit = || -> Vec<(i64, String, String, u64)> {
+            let conn = open_state(&fx.state());
+            let mut stmt = conn
+                .prepare(
+                    "SELECT seq, kind, payload, at FROM events
+                     WHERE kind IN ('model_defaults_updated', 'settings_updated',
+                                    'settings_legacy_imported') ORDER BY seq",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get::<_, f64>(3)?.to_bits(),
+                    ))
+                })
+                .unwrap();
+            rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        for via_http in [false, true] {
+            let before = authority(&fx.state());
+            let original: Value = serde_json::from_str(&before.defaults_document).unwrap();
+            assert!(original["agent_settings"].is_object());
+            let mut core = original.clone();
+            core.as_object_mut().unwrap().remove("agent_settings");
+            let positive = json!({
+                "expected_revision": before.defaults_revision,
+                "config": core,
+            });
+            // Establish that the core envelope is valid independently of
+            // overlay rejection; do not pre-validate the malformed overlay.
+            cadence_agent::model_defaults::parse_settings_document(&positive.to_string())
+                .expect("legacy positive control must be a valid ModelDefaults document");
+            let audit_before = settings_audit();
+            let sources_before = source_files(&fx.pm());
+            if via_http {
+                let (status, reply, _) = fx.http_post(
+                    &Asserted::Operator,
+                    "/api/settings/model-defaults",
+                    &positive,
+                    Some(&session),
+                );
+                assert_eq!(status, 200, "valid legacy HTTP update: {reply}");
+            } else {
+                fx.op(
+                    "model_defaults_set",
+                    json!({"document": positive.to_string()}),
+                );
+            }
+            let accepted = authority(&fx.state());
+            assert_eq!(accepted.defaults_revision, before.defaults_revision + 1);
+            let accepted_document: Value =
+                serde_json::from_str(&accepted.defaults_document).unwrap();
+            assert_eq!(
+                accepted_document, original,
+                "legacy update changed the overlay"
+            );
+            assert_eq!(accepted.pi, before.pi);
+            assert_eq!(accepted.profiles, before.profiles);
+            assert_eq!(accepted.legacy_imported, before.legacy_imported);
+            assert_eq!(source_files(&fx.pm()), sources_before);
+            let audit_accepted = settings_audit();
+            assert_eq!(audit_accepted.len(), audit_before.len() + 1);
+            assert_eq!(
+                &audit_accepted[..audit_before.len()],
+                audit_before.as_slice(),
+                "legacy positive update rewrote earlier audit"
+            );
+            assert_eq!(audit_accepted.last().unwrap().1, "model_defaults_updated");
+
+            let visible = fx.snapshot();
+            let audit_held = settings_audit();
+            let mut invalid = positive.clone();
+            invalid["expected_revision"] = json!(accepted.defaults_revision);
+            invalid["config"]["agent_settings"] = json!({"models": [null]});
+            let refusal = if via_http {
+                let (status, reply, _) = fx.http_post(
+                    &Asserted::Operator,
+                    "/api/settings/model-defaults",
+                    &invalid,
+                    Some(&session),
+                );
+                assert_eq!(status, 400, "malformed legacy overlay HTTP update: {reply}");
+                reply
+            } else {
+                fx.rpc(
+                    Asserted::Operator,
+                    "model_defaults_set",
+                    json!({"document": invalid.to_string()}),
+                )
+                .expect_err("legacy RPC accepted a malformed Agents overlay")
+                .to_string()
+            };
+            let lower = refusal.to_ascii_lowercase();
+            assert!(
+                lower.contains("agent_settings") || lower.contains("overlay"),
+                "legacy refusal was not about the overlay: {refusal}"
+            );
+            assert_eq!(
+                authority(&fx.state()),
+                accepted,
+                "refused legacy write persisted"
+            );
+            assert_eq!(
+                settings_audit(),
+                audit_held,
+                "refused legacy write changed audit"
+            );
+            let reloaded = fx.snapshot();
+            assert_eq!(reloaded["revision"], visible["revision"]);
+            assert_eq!(reloaded["config"], visible["config"]);
+            assert_eq!(source_files(&fx.pm()), sources_before);
+            assert_eq!(
+                fx.live_agents(),
+                0,
+                "legacy settings write launched an agent"
+            );
+        }
     }
 }

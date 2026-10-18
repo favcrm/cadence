@@ -367,7 +367,13 @@ pub fn sync(
     }))
 }
 
-pub fn preview(store: &Store, expected: &str, profile_id: &str, harness_id: &str) -> Result<Value> {
+pub fn preview(
+    pm_dir: &Path,
+    store: &Store,
+    expected: &str,
+    profile_id: &str,
+    harness_id: &str,
+) -> Result<Value> {
     let current = store.settings()?;
     let profiles = profiles_from(&current.doc.profiles)?;
     let policy = current.doc.pi.clone();
@@ -469,6 +475,15 @@ pub fn preview(store: &Store, expected: &str, profile_id: &str, harness_id: &str
             policy.as_ref(),
             &profile.role,
         ));
+        if spec.is_some_and(|item| item.provider == "pi") {
+            let confined = crate::doctor::host::read_host_overrides(pm_dir)
+                .map_err(Error::rejected)?
+                .and_then(|overrides| overrides.confine_pi_workers)
+                == Some(true);
+            if let Err(err) = crate::adapter::pi::refuse_confined_devin(profile_id, confined, id) {
+                reasons.push(err.to_string());
+            }
+        }
     }
     if model_id.is_some()
         && spec.is_some_and(|item| {
@@ -704,7 +719,7 @@ fn parse_overlay(config: &Value) -> Result<Overlay> {
         check_ident("provider", &id)?;
         let label = str_field(provider, "label")?;
         let kind = str_field(provider, "kind")?;
-        let pin = str_field(provider, "pin")?;
+        let mut pin = str_field(provider, "pin")?;
         let gate = bool_req(provider, "gate")?;
         let paid = bool_req(provider, "paid")?;
         let note = str_field(provider, "note")?;
@@ -724,7 +739,11 @@ fn parse_overlay(config: &Value) -> Result<Overlay> {
             ));
         }
         if !pin.is_empty() {
-            parse_pin_text(&pin)?;
+            if pin.contains('@') {
+                parse_pin_text(&pin)?;
+            } else {
+                pin = normalize_pin(&pin)?;
+            }
         }
         if !seen_p.insert(id.clone()) {
             return Err(Error::invalid(
@@ -1518,7 +1537,7 @@ fn build_snapshot(
             .collect();
         let used: Vec<&str> = agents
             .iter()
-            .filter(|a| agent_profile(a) == Some(profile.id.as_str()))
+            .filter(|a| active(a) && agent_profile(a) == Some(profile.id.as_str()))
             .map(|a| a.alias.as_str())
             .collect();
         profile_obs.insert(

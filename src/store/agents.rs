@@ -874,6 +874,11 @@ impl Store {
             // that omits it (serde default null) must not wipe the object.
             if write.config.agent_settings.is_null() {
                 write.config.agent_settings = current.config.agent_settings.clone();
+            } else if write.config.agent_settings != current.config.agent_settings {
+                return Err(Error::invalid(
+                    "invalid_config",
+                    "model_defaults_set cannot edit agent_settings; use Agents settings",
+                ));
             }
             super::settings_authority::reject_nested_authority(&write.config)?;
             let (_, _, authority) = super::settings_authority::load_model_defaults_row(&tx)?;
