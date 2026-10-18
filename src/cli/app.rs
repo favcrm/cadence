@@ -810,6 +810,41 @@ fn install_source(source: &str) -> Result<String> {
         .into_owned())
 }
 
+fn catalogue_params(
+    params: &mut Value,
+    id: &Option<String>,
+    version: &Option<String>,
+    digest: &Option<String>,
+    resolution: &Option<String>,
+) -> Result<()> {
+    let locator = match (id, version, digest) {
+        (None, None, None) => None,
+        (Some(id), Some(version), Some(digest)) => {
+            Some(json!({"id": id, "version": version, "digest": digest}))
+        }
+        _ => {
+            return Err(Error::rejected(
+                "catalogue id, version and digest must be set together",
+            ))
+        }
+    };
+    if locator.is_some() && resolution.is_some() {
+        return Err(Error::rejected(
+            "catalogue locator and manual resolution are mutually exclusive",
+        ));
+    }
+    if let Some(resolution) = resolution {
+        if resolution != "manual" {
+            return Err(Error::rejected("catalogue resolution must be manual"));
+        }
+        params["catalogue_resolution"] = json!("manual");
+    }
+    if let Some(locator) = locator {
+        params["catalogue"] = locator;
+    }
+    Ok(())
+}
+
 fn read_record_csv(path: &Path) -> Result<String> {
     use std::io::Read;
     const MAX_CSV_BYTES: usize = 256 * 1024;
@@ -1430,10 +1465,30 @@ pub(crate) enum CatalogAction {
         /// returned by `install-check`. Omitted: install whatever resolves.
         #[arg(long)]
         expected_digest: Option<String>,
+        /// Catalogue id, with `--catalogue-version` and `--catalogue-digest`.
+        #[arg(long)]
+        catalogue_id: Option<String>,
+        #[arg(long)]
+        catalogue_version: Option<String>,
+        #[arg(long)]
+        catalogue_digest: Option<String>,
+        /// `manual` clears catalogue provenance on a non-catalogue install.
+        #[arg(long)]
+        catalogue_resolution: Option<String>,
     },
     /// Read-only: resolve and validate a bundle exactly as install would and
     /// return its digest, name, version and file list. Writes nothing.
-    InstallCheck { source: String },
+    InstallCheck {
+        source: String,
+        #[arg(long)]
+        catalogue_id: Option<String>,
+        #[arg(long)]
+        catalogue_version: Option<String>,
+        #[arg(long)]
+        catalogue_digest: Option<String>,
+        #[arg(long)]
+        catalogue_resolution: Option<String>,
+    },
     /// Replace one exact workspace bundle while keeping its installation ID.
     /// The current digest and catalog generation must match the inspected row.
     UpgradeCheck {
@@ -1443,6 +1498,15 @@ pub(crate) enum CatalogAction {
         expected_digest: String,
         #[arg(long)]
         expected_generation: String,
+        #[arg(long)]
+        catalogue_id: Option<String>,
+        #[arg(long)]
+        catalogue_version: Option<String>,
+        #[arg(long)]
+        catalogue_digest: Option<String>,
+        /// `manual` when this source is not a catalogue release.
+        #[arg(long)]
+        catalogue_resolution: Option<String>,
     },
     /// Apply an inspected upgrade, pinned to both old and proposed bytes.
     Upgrade {
@@ -1456,6 +1520,14 @@ pub(crate) enum CatalogAction {
         expected_new_digest: String,
         #[arg(long)]
         request_id: String,
+        #[arg(long)]
+        catalogue_id: Option<String>,
+        #[arg(long)]
+        catalogue_version: Option<String>,
+        #[arg(long)]
+        catalogue_digest: Option<String>,
+        #[arg(long)]
+        catalogue_resolution: Option<String>,
     },
     /// Resume a retained workspace upgrade after interrupted Git delivery.
     UpgradeRecover {
@@ -1813,17 +1885,42 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                 CatalogAction::Install {
                     source,
                     expected_digest,
+                    catalogue_id,
+                    catalogue_version,
+                    catalogue_digest,
+                    catalogue_resolution,
                 } => {
                     let source = install_source(source)?;
                     let mut params = json!({"source":source});
                     if let Some(digest) = expected_digest {
                         params["expected_digest"] = json!(digest);
                     }
+                    catalogue_params(
+                        &mut params,
+                        catalogue_id,
+                        catalogue_version,
+                        catalogue_digest,
+                        catalogue_resolution,
+                    )?;
                     ("app_workspace_install", params)
                 }
-                CatalogAction::InstallCheck { source } => {
+                CatalogAction::InstallCheck {
+                    source,
+                    catalogue_id,
+                    catalogue_version,
+                    catalogue_digest,
+                    catalogue_resolution,
+                } => {
                     let source = install_source(source)?;
-                    ("app_workspace_install_check", json!({"source":source}))
+                    let mut params = json!({"source":source});
+                    catalogue_params(
+                        &mut params,
+                        catalogue_id,
+                        catalogue_version,
+                        catalogue_digest,
+                        catalogue_resolution,
+                    )?;
+                    ("app_workspace_install_check", params)
                 }
                 CatalogAction::Upgrade {
                     install_id,
@@ -1832,6 +1929,10 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     expected_generation,
                     expected_new_digest,
                     request_id,
+                    catalogue_id,
+                    catalogue_version,
+                    catalogue_digest,
+                    catalogue_resolution,
                 } => {
                     let source = if source.contains("://")
                         || source.starts_with("git@")
@@ -1858,25 +1959,39 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                         .to_string_lossy()
                         .into_owned()
                     };
-                    (
-                        "app_workspace_upgrade",
-                        json!({"install_id":install_id,"source":source,
+                    let mut params = json!({"install_id":install_id,"source":source,
                         "expected_digest":expected_digest,"expected_generation":expected_generation,
-                        "expected_new_digest":expected_new_digest,"request_id":request_id}),
-                    )
+                        "expected_new_digest":expected_new_digest,"request_id":request_id});
+                    catalogue_params(
+                        &mut params,
+                        catalogue_id,
+                        catalogue_version,
+                        catalogue_digest,
+                        catalogue_resolution,
+                    )?;
+                    ("app_workspace_upgrade", params)
                 }
                 CatalogAction::UpgradeCheck {
                     install_id,
                     source,
                     expected_digest,
                     expected_generation,
+                    catalogue_id,
+                    catalogue_version,
+                    catalogue_digest,
+                    catalogue_resolution,
                 } => {
                     let source = install_source(source)?;
-                    (
-                        "app_workspace_upgrade_check",
-                        json!({"install_id":install_id,"source":source,
-                        "expected_digest":expected_digest,"expected_generation":expected_generation}),
-                    )
+                    let mut params = json!({"install_id":install_id,"source":source,
+                        "expected_digest":expected_digest,"expected_generation":expected_generation});
+                    catalogue_params(
+                        &mut params,
+                        catalogue_id,
+                        catalogue_version,
+                        catalogue_digest,
+                        catalogue_resolution,
+                    )?;
+                    ("app_workspace_upgrade_check", params)
                 }
                 CatalogAction::UpgradeRecover {
                     install_id,

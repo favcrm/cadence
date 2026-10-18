@@ -12,6 +12,10 @@
 
 use super::*;
 
+fn install_check(pm: &Pm, source: &str) -> Result<Value> {
+    super::install_check(pm, source, &CatalogueClaim::Absent)
+}
+
 const WORKFLOW: &str = "---\ntitle: \"Post: {{topic}}\"\ngoal: \"Publish {{topic}}\"\n\
 inputs:\n  topic: { ask: \"About what?\" }\n---\n\n\
 Why.\n\n## Do {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance\n- [ ] done\n";

@@ -174,16 +174,17 @@ function textField(row: Record<string, unknown>, key: string): string | null {
 
 /** Confirm, fetch the pinned release with credentials omitted, then the existing upload route. */
 export async function installPublicApp(app: PublicApp, signal: AbortSignal): Promise<InstallOutcome> {
-  if (!app.installable || !app.digest || !DIGEST.test(app.digest)) {
+  if (!app.installable || !app.version || !app.digest || !DIGEST.test(app.digest)) {
     return { state: "refused", message: "This release is listed for browsing only." };
   }
+  const releaseQuery = new URLSearchParams({ version: app.version, digest: app.digest });
   const release = await boardGet(
-    `/api/public-apps/${encodeURIComponent(app.id)}/release?digest=${encodeURIComponent(app.digest)}`,
+    `/api/public-apps/${encodeURIComponent(app.id)}/release?${releaseQuery}`,
     signal,
   );
   if (signal.aborted) return { state: "cancelled" };
   if (release.status === 404) return { state: "refused", message: "That release is not published." };
-  if (release.status === 409) return { state: "refused", message: "That release digest is no longer current." };
+  if (release.status === 409) return { state: "refused", message: "That exact release is not available." };
   if (!release.ok) return { state: "refused", message: "The release could not be read." };
   const body = await release.json() as { files?: unknown; expected_digest?: unknown };
   if (body.expected_digest !== app.digest || !body.files || typeof body.files !== "object" || Array.isArray(body.files)) {
@@ -197,7 +198,11 @@ export async function installPublicApp(app: PublicApp, signal: AbortSignal): Pro
       cache: "no-store",
       signal,
       headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
-      body: JSON.stringify({ files: body.files, expected_digest: body.expected_digest }),
+      body: JSON.stringify({
+        files: body.files,
+        expected_digest: body.expected_digest,
+        catalogue: { id: app.id, version: app.version, digest: app.digest },
+      }),
     });
   } catch (error) {
     if (signal.aborted) return { state: "unknown", message: "Install was cancelled after it started. Check installed apps before trying again." };
@@ -226,7 +231,15 @@ export async function installPublicApp(app: PublicApp, signal: AbortSignal): Pro
   const digest = textField(row, "digest");
   const version = textField(row, "version");
   const id = textField(row, "install_id");
-  if (!id || digest !== app.digest || !version) {
+  const catalogue = row.catalogue;
+  const catalogueRow = catalogue && typeof catalogue === "object" && !Array.isArray(catalogue)
+    ? catalogue as Record<string, unknown>
+    : null;
+  const catalogueMatches = !!catalogueRow
+    && textField(catalogueRow, "id") === app.id
+    && textField(catalogueRow, "version") === app.version
+    && textField(catalogueRow, "digest") === app.digest;
+  if (!id || digest !== app.digest || version !== app.version || !catalogueMatches) {
     return { state: "unknown", message: "Readback did not match the confirmed release. It was not retried." };
   }
   notifyAppsChanged();

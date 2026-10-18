@@ -16,6 +16,8 @@ export interface Installation {
   summary: string; digest: string; catalog_generation: string; storage_kind: "workspace" | "legacy";
   /** The install's recorded upstream — `kind` is path/git/builtin (CAD-1129). */
   source?: { kind?: string; url?: string; sha?: string; dir?: string; path?: string; id?: string };
+  /** Catalogue release locator recorded after an exact metadata match. Null on a path or Git install. */
+  catalogue?: { id: string; version: string; digest: string } | null;
   project_link: string | null; approved: boolean | null; executable: boolean;
   /** CAD-1129 soft remove: epoch seconds of the mark, and when Restore stops working. */
   removed?: number | null; restore_after?: number | null;
@@ -295,9 +297,9 @@ export const workspaceApps = {
     request<{ binding: AppBinding }>(`${installation(id)}/publishing/use`, undefined, body),
   installations: (signal?: AbortSignal) => request<Installation[]>("/api/app-installations", signal),
   detail: (id: string, signal?: AbortSignal) => request<Installation>(installation(id), signal),
-  upgradeCheck: (id: string, body: { source: string; expected_digest: string; expected_generation: string }) =>
+  upgradeCheck: (id: string, body: { source: string; expected_digest: string; expected_generation: string; catalogue?: { id: string; version: string; digest: string }; catalogue_resolution?: "manual" }) =>
     request<UpgradeProposal>(`${installation(id)}/upgrade/check`, undefined, body),
-  upgrade: (id: string, body: { source: string; expected_digest: string; expected_generation: string; expected_new_digest: string; request_id: string }) =>
+  upgrade: (id: string, body: { source: string; expected_digest: string; expected_generation: string; expected_new_digest: string; request_id: string; catalogue?: { id: string; version: string; digest: string }; catalogue_resolution?: "manual" }) =>
     request<Installation>(`${installation(id)}/upgrade`, undefined, body),
   contexts: async (id: string, signal?: AbortSignal) => (await request<{ contexts: AppContext[] }>(`${installation(id)}/contexts`, signal)).contexts,
   bindings: async (id: string, contextId?: string, signal?: AbortSignal) => (await request<{ bindings: AppBinding[] }>(contextId ? `${installation(id)}/contexts/${part(contextId)}/bindings` : `${installation(id)}/bindings`, signal)).bindings,

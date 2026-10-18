@@ -1,6 +1,7 @@
 //! CAD-630 foundation: explicit single-workspace installation catalog.
 //! No daemon/HTTP routing, execution or grant translation is enabled here.
 pub mod builtin;
+pub(crate) mod catalogue;
 mod fs;
 pub mod workspace;
 use serde::{Deserialize, Serialize};

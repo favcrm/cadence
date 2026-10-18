@@ -16,7 +16,7 @@ CAD-631/CAD-632 work. Custom app UI remains separate CAD-633 work.
 
 | Command | Behavior |
 | --- | --- |
-| `cadence app catalog install-check <source>` | Read-only. Resolve and validate the bundle exactly as install would; return `schema`, `name`, `version`, `source`, `digest`, the `files` list, `committed` (always `false`), `notes` and `secret_warnings`. Writes no catalog, journal or record. |
+| `cadence app catalog install-check <source>` | Read-only. Resolve and validate the bundle exactly as install would; return `schema`, `name`, `version`, `source`, `digest`, the `files` list, `committed` (always `false`), `readiness` (`{"ready": true, "reason": null}` — a fresh install has no active work), `access_diff`, `notes` and `secret_warnings`. Writes no catalog, journal or record. |
 | `cadence app catalog approve <install-id> --digest <digest>` | Operator-only. Approve the exact current installed digest for supported local artifact steps, after validating its local execution contract. Refuses a stale digest. |
 | `cadence app catalog revoke <install-id> --digest <digest>` | Operator-only. The digest pins the request to the current installed bundle; stale digests are refused. Revoke removes local capability authority installation-wide, revoking historical epochs and invalidating effects for every version, including completed historical work. Does not change legacy project approvals. |
 | `cadence app catalog install <source> [--expected-digest sha256:…]` | Validate and copy a local bundle or Git repository root into the workspace; return a new immutable installation ID. With `--expected-digest` the install is refused, before any write, unless the resolved bytes hash to that digest. |
@@ -82,11 +82,28 @@ refused with the catalog, journal and records untouched. Omitting
 relay `POST /api/app-installations` (and `/upload`) accepts the same optional
 `expected_digest` field with the same refusal.
 
+An optional `catalogue` object `{id, version, digest}` may travel with
+`install`, `install-check`, `upgrade` and `upgrade-check` (CLI flags
+`--catalogue-id`, `--catalogue-version` and `--catalogue-digest`, all three
+together). It names a directory release. It is not a grant, and the daemon
+stores it only when the package version and digest match the locator and the
+closed directory `/public/apps/<id>/versions` metadata lists that exact release
+as installable. A fresh install may use an older installable release. A
+catalogue update refuses an older `MAJOR.MINOR.PATCH` version, and refuses
+versions that cannot be ordered. Omitting `catalogue` does not record an
+origin and does not strip one that is already stored. A path or Git update
+that intentionally leaves the catalogue sends `catalogue_resolution: "manual"`
+(`--catalogue-resolution manual`), which is mutually exclusive with the
+locator and clears the stored origin. Unavailable or unreadable metadata does
+not authorize the claim. A direct path or Git install without these fields is
+unchanged and records no catalogue origin.
+
 The board's install review (Explorer, app detail and "Add from Git URL") is
 never unpinned: it calls `POST /api/app-installations/check` first, shows the
 name, version, digest, file list, notes and secret warnings, and then installs
-with the checked digest. The check route takes exactly `{"source"}` (a repeated
-or unknown key is refused), is operator-only like install, and relays
+with the checked digest. The check route takes `source` plus the optional
+catalogue locator or `catalogue_resolution` (a repeated or unknown key is
+refused), is operator-only like install, and relays
 `app_workspace_install_check`; it creates no catalog. A bundle that
 changed after the check is refused and the review asks for a fresh check.
 
@@ -100,10 +117,16 @@ the install's real state — and refuses anything else.
 
 The directory is rendered by the Cadence UI, not by the catalogue API or a
 separate server-rendered page. Its browser requests stay on the board origin
-(`/api/public-apps` and `/api/public-apps/<id>`); the board reads catalogue JSON.
-Hosted boards use `http://api.internal` for listing data. Their edge serves
-reviewed release bytes on the board origin without sending them through that
-container-internal transport.
+(`/api/public-apps`, `/api/public-apps/<id>` and `/api/public-apps/<id>/versions`);
+the board reads catalogue JSON. `/versions` accepts no query. A release
+document is `/api/public-apps/<id>/release?version=<exact>&digest=<sha256:…>`
+with both keys required, in either order, and no extra or duplicate keys.
+Hosted boards use `http://api.internal` for listing, detail, and versions
+metadata only. The board does not read `/release` bytes from that internal
+directory. A self-hosted catalog origin (`https` or loopback) still proxies
+the pinned release document. The directory install pins that version and
+digest and uploads the same locator; readback must show it. The locator is
+provenance after that match, not a publisher grant.
 
 Browse-only releases remain visible with their description and availability;
 they never acquire an Install action merely because their listing is valid.

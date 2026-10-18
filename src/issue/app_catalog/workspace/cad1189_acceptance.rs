@@ -64,7 +64,14 @@ fn cad1189_reads_never_mix_installation_states_during_upgrades() {
     let pm = Pm::init(pm_dir.path()).unwrap();
     let v1 = sources.path().join("v1");
     bundle(&v1, "race-app", 1);
-    let out = install(&pm, state.path(), v1.to_str().unwrap(), None).unwrap();
+    let out = install(
+        &pm,
+        state.path(),
+        v1.to_str().unwrap(),
+        None,
+        &CatalogueClaim::Absent,
+    )
+    .unwrap();
     let id = out["install_id"].as_str().unwrap().to_string();
     let first = show(&pm, &id).unwrap()["digest"]
         .as_str()
@@ -103,8 +110,15 @@ fn cad1189_reads_never_mix_installation_states_during_upgrades() {
         let generation = current["catalog_generation"].as_str().unwrap().to_string();
         let source = sources.path().join(format!("v{version}"));
         bundle(&source, "race-app", version);
-        let check =
-            upgrade_check(&pm, &id, source.to_str().unwrap(), &digest, &generation).unwrap();
+        let check = upgrade_check(
+            &pm,
+            &id,
+            source.to_str().unwrap(),
+            &digest,
+            &generation,
+            &CatalogueClaim::Absent,
+        )
+        .unwrap();
         let new_digest = check["digest"].as_str().unwrap().to_string();
         digests.lock().unwrap().insert(version, new_digest.clone());
         upgrade(
@@ -116,6 +130,8 @@ fn cad1189_reads_never_mix_installation_states_during_upgrades() {
                 expected_generation: &generation,
                 expected_new_digest: &new_digest,
                 request_id: &format!("accept-up-{version}"),
+                catalogue: &CatalogueClaim::Absent,
+                directory: CatalogueDirectory::Configured,
             },
             |_, _| Ok((json!({}), Default::default())),
             |_| Ok(Vec::new()),
@@ -314,7 +330,14 @@ fn cad1212_runtime_read_never_hands_out_a_bundle_edited_mid_read() {
     let pm = Pm::init(pm_dir.path()).unwrap();
     let v1 = sources.path().join("v1");
     bundle(&v1, "seam-app", 1);
-    let out = install(&pm, state.path(), v1.to_str().unwrap(), None).unwrap();
+    let out = install(
+        &pm,
+        state.path(),
+        v1.to_str().unwrap(),
+        None,
+        &CatalogueClaim::Absent,
+    )
+    .unwrap();
     let id = out["install_id"].as_str().unwrap().to_string();
     let manifest = pm
         .dir

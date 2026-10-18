@@ -57,13 +57,43 @@ const BODY_CAP: u64 = 4 * 1024;
 const UPLOAD_WIRE_CAP: u64 = 8 * 1024 * 1024;
 /// Decoded ceiling for the whole bundle (matches `app::MAX_APP_BYTES`).
 const UPLOAD_TOTAL_BYTES: u64 = crate::issue::app::MAX_APP_BYTES;
-/// CAD-1194: the install-check body — exactly `{"source": …}`. The derive
-/// refuses unknown keys and a repeated `source`, which a `Value` parse
-/// would silently collapse to the last one.
+/// Optional catalogue locator. Every field is required when the object is
+/// present; unknown keys are refused. It names a release, it does not grant
+/// permission.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogueWire {
+    id: String,
+    version: String,
+    digest: String,
+}
+
+fn catalogue_wire_ok(wire: &CatalogueWire) -> bool {
+    !wire.id.is_empty() && !wire.version.is_empty() && !wire.digest.is_empty()
+}
+
+/// CAD-1194: the install-check body. `source` is required. `catalogue` and
+/// `catalogue_resolution` are optional and mutually exclusive.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallCheckBody {
     source: String,
+    #[serde(default)]
+    catalogue: Option<CatalogueWire>,
+    #[serde(default)]
+    catalogue_resolution: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallBody {
+    source: String,
+    #[serde(default)]
+    expected_digest: Option<String>,
+    #[serde(default)]
+    catalogue: Option<CatalogueWire>,
+    #[serde(default)]
+    catalogue_resolution: Option<String>,
 }
 
 /// At most this many files — the same bound `snapshot` enforces on disk.
@@ -79,6 +109,8 @@ struct UploadBody {
     files: Vec<(String, String)>,
     /// CAD-1186: optional pin on the staged bundle's digest.
     expected_digest: Option<String>,
+    catalogue: Option<CatalogueWire>,
+    catalogue_resolution: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for UploadBody {
@@ -98,7 +130,23 @@ impl<'de> Deserialize<'de> for UploadBody {
             {
                 let mut files: Option<Vec<(String, String)>> = None;
                 let mut expected_digest: Option<String> = None;
+                let mut catalogue: Option<CatalogueWire> = None;
+                let mut catalogue_resolution: Option<String> = None;
                 while let Some(key) = map.next_key::<String>()? {
+                    if key == "catalogue" {
+                        if catalogue.is_some() {
+                            return Err(serde::de::Error::duplicate_field("catalogue"));
+                        }
+                        catalogue = Some(map.next_value::<CatalogueWire>()?);
+                        continue;
+                    }
+                    if key == "catalogue_resolution" {
+                        if catalogue_resolution.is_some() {
+                            return Err(serde::de::Error::duplicate_field("catalogue_resolution"));
+                        }
+                        catalogue_resolution = Some(map.next_value::<String>()?);
+                        continue;
+                    }
                     if key == "expected_digest" {
                         if expected_digest.is_some() {
                             return Err(serde::de::Error::duplicate_field("expected_digest"));
@@ -113,7 +161,12 @@ impl<'de> Deserialize<'de> for UploadBody {
                     if key != "files" {
                         return Err(serde::de::Error::unknown_field(
                             &key,
-                            &["files", "expected_digest"],
+                            &[
+                                "files",
+                                "expected_digest",
+                                "catalogue",
+                                "catalogue_resolution",
+                            ],
                         ));
                     }
                     if files.is_some() {
@@ -128,9 +181,16 @@ impl<'de> Deserialize<'de> for UploadBody {
                 if files.is_empty() {
                     return Err(serde::de::Error::custom("files map is empty"));
                 }
+                if catalogue.is_some() && catalogue_resolution.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "catalogue locator and manual resolution are mutually exclusive",
+                    ));
+                }
                 Ok(UploadBody {
                     files,
                     expected_digest,
+                    catalogue,
+                    catalogue_resolution,
                 })
             }
         }
@@ -197,6 +257,8 @@ impl<'de> Deserialize<'de> for FilesMap {
 struct UpgradeWire {
     files: Option<Vec<(String, String)>>,
     source: Option<Value>,
+    catalogue: Option<CatalogueWire>,
+    catalogue_resolution: Option<String>,
     fields: serde_json::Map<String, Value>,
 }
 
@@ -212,6 +274,8 @@ impl<'de> Deserialize<'de> for UpgradeWire {
             "expected_generation",
             "expected_new_digest",
             "request_id",
+            "catalogue",
+            "catalogue_resolution",
         ];
         struct WireVisitor;
         impl<'de> Visitor<'de> for WireVisitor {
@@ -225,6 +289,8 @@ impl<'de> Deserialize<'de> for UpgradeWire {
             {
                 let mut files: Option<Vec<(String, String)>> = None;
                 let mut source: Option<Value> = None;
+                let mut catalogue: Option<CatalogueWire> = None;
+                let mut catalogue_resolution: Option<String> = None;
                 let mut fields = serde_json::Map::new();
                 let mut seen: HashSet<String> = HashSet::new();
                 while let Some(key) = map.next_key::<String>()? {
@@ -241,14 +307,27 @@ impl<'de> Deserialize<'de> for UpgradeWire {
                         "source" => {
                             source = Some(map.next_value::<Value>()?);
                         }
+                        "catalogue" => {
+                            catalogue = Some(map.next_value::<CatalogueWire>()?);
+                        }
+                        "catalogue_resolution" => {
+                            catalogue_resolution = Some(map.next_value::<String>()?);
+                        }
                         _ => {
                             fields.insert(key, map.next_value::<Value>()?);
                         }
                     }
                 }
+                if catalogue.is_some() && catalogue_resolution.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "catalogue locator and manual resolution are mutually exclusive",
+                    ));
+                }
                 Ok(UpgradeWire {
                     files,
                     source,
+                    catalogue,
+                    catalogue_resolution,
                     fields,
                 })
             }
@@ -351,6 +430,32 @@ fn stage_files(files: &[(String, String)]) -> Result<(tempfile::TempDir, String)
     Ok((staging, source))
 }
 
+/// Attach a catalogue locator or an explicit manual resolution. Neither is
+/// authority: the daemon re-checks the package and the closed directory.
+fn catalogue_params(
+    catalogue: Option<CatalogueWire>,
+    resolution: Option<String>,
+) -> std::result::Result<Value, &'static str> {
+    match (catalogue, resolution.as_deref()) {
+        (Some(wire), None) if catalogue_wire_ok(&wire) => Ok(json!({
+            "catalogue": {"id": wire.id, "version": wire.version, "digest": wire.digest}
+        })),
+        (None, Some("manual")) => Ok(json!({"catalogue_resolution": "manual"})),
+        (None, None) => Ok(json!({})),
+        _ => Err(
+            "catalogue requires id, version and digest together, or catalogue_resolution \"manual\", never both",
+        ),
+    }
+}
+
+fn merge_catalogue(params: &mut Value, extra: Value) {
+    if let (Some(dest), Some(src)) = (params.as_object_mut(), extra.as_object()) {
+        for (key, value) in src {
+            dest.insert(key.clone(), value.clone());
+        }
+    }
+}
+
 /// Stage the validated file-map to a server-derived temp dir OUTSIDE the PM
 /// tracker (`workspace.rs` refuses a source inside `pm.dir` — the tracker is
 /// never its own source), then hand its absolute path to the unchanged
@@ -358,6 +463,18 @@ fn stage_files(files: &[(String, String)]) -> Result<(tempfile::TempDir, String)
 /// every return path; it is provenance (`Source::Path`) only — a one-shot,
 /// not a reusable update URL.
 pub(super) fn workspace_upload(request: &mut Request, state: &std::path::Path) -> HttpResp {
+    workspace_upload_with_mode(request, state, false)
+}
+
+pub(super) fn workspace_upload_check(request: &mut Request, state: &std::path::Path) -> HttpResp {
+    workspace_upload_with_mode(request, state, true)
+}
+
+fn workspace_upload_with_mode(
+    request: &mut Request,
+    state: &std::path::Path,
+    check_only: bool,
+) -> HttpResp {
     let bytes = match read_body(request, UPLOAD_WIRE_CAP) {
         Ok(b) => b,
         Err(resp) => return resp,
@@ -397,12 +514,33 @@ pub(super) fn workspace_upload(request: &mut Request, state: &std::path::Path) -
     // `installed_by`/`approved` come from the proven operator connection, never
     // the body. `staging` (a TempDir) is removed on drop, success or failure.
     let mut params = json!({"source": source});
-    if let Some(digest) = &body.expected_digest {
+    if let Some(digest) = body.expected_digest.as_ref().filter(|_| !check_only) {
         params["expected_digest"] = json!(digest);
     }
-    match client::rpc(state, "app_workspace_install", params) {
-        Ok(value) => json_response(value),
-        Err(error) => home::rpc_err(&error, "app_workspace_install"),
+    match catalogue_params(body.catalogue, body.catalogue_resolution) {
+        Ok(extra) => merge_catalogue(&mut params, extra),
+        Err(message) => return err_response(400, message),
+    }
+    let method = if check_only {
+        "app_workspace_install_check"
+    } else {
+        "app_workspace_install"
+    };
+    match client::rpc(state, method, params) {
+        Ok(value) => {
+            if check_only
+                && body.expected_digest.as_deref().is_some_and(|expected| {
+                    value.get("digest").and_then(Value::as_str) != Some(expected)
+                })
+            {
+                return err_response(
+                    409,
+                    "checked package digest does not match the selected release",
+                );
+            }
+            json_response(value)
+        }
+        Err(error) => home::rpc_err(&error, method),
     }
 }
 
@@ -421,8 +559,14 @@ fn workspace_upgrade_transport(
     let UpgradeWire {
         files,
         source,
+        catalogue,
+        catalogue_resolution,
         fields,
     } = wire;
+    let catalogue = match catalogue_params(catalogue, catalogue_resolution) {
+        Ok(extra) => extra,
+        Err(message) => return Err(err_response(400, message)),
+    };
     if files.is_some() && source.is_some() {
         return Err(err_response(
             400,
@@ -485,6 +629,7 @@ fn workspace_upgrade_transport(
         let mut params = Value::Object(fields);
         params["source"] = json!(source);
         params["install_id"] = json!(id);
+        merge_catalogue(&mut params, catalogue);
         Ok((params, Some(staging)))
     } else {
         // Legacy `source` mode — the validated path/URL passes through
@@ -499,6 +644,7 @@ fn workspace_upgrade_transport(
         let mut params = Value::Object(fields);
         params["source"] = source;
         params["install_id"] = json!(id);
+        merge_catalogue(&mut params, catalogue);
         Ok((params, None))
     }
 }
@@ -1119,20 +1265,30 @@ pub(super) fn workspace(
             json!({})
         }
     } else if method == "app_workspace_install_check" {
-        // CAD-1194: the read-only digest proposal an install pins. The
-        // body is exactly `{source}` — decoded STRICTLY, so a repeated or
-        // unknown key is refused instead of collapsing to the last one;
-        // identity, approval and digest are never caller fields here.
+        // CAD-1194: the read-only digest proposal an install pins.
+        // `source` is required. An optional catalogue locator or
+        // `catalogue_resolution` may name provenance; a repeated or
+        // unknown key is refused. Identity and approval are never caller
+        // fields here.
         let bytes = match read_body(request, BODY_CAP) {
             Ok(bytes) => bytes,
             Err(response) => return response,
         };
         match serde_json::from_slice::<InstallCheckBody>(&bytes) {
-            Ok(body) if !body.source.is_empty() => json!({"source":body.source}),
+            Ok(body) if !body.source.is_empty() => {
+                match catalogue_params(body.catalogue, body.catalogue_resolution) {
+                    Ok(extra) => {
+                        let mut params = json!({"source": body.source});
+                        merge_catalogue(&mut params, extra);
+                        params
+                    }
+                    Err(message) => return err_response(400, message),
+                }
+            }
             _ => {
                 return err_response(
                     400,
-                    "install check body admits only a non-empty source; identity and approval are never caller fields",
+                    "install check body admits a non-empty source and an optional catalogue locator; identity and approval are never caller fields",
                 )
             }
         }
@@ -1141,29 +1297,31 @@ pub(super) fn workspace(
             Ok(bytes) => bytes,
             Err(response) => return response,
         };
-        let value: Value = match serde_json::from_slice(&bytes) {
-            Ok(value) => value,
-            Err(_) => return err_response(400, "install body must be an object containing source"),
+        let body: InstallBody = match serde_json::from_slice::<InstallBody>(&bytes) {
+            Ok(body) if !body.source.is_empty() => body,
+            _ => {
+                return err_response(
+                    400,
+                    "install body admits source, an optional expected_digest, and an optional catalogue locator; identity and approval are never caller fields",
+                )
+            }
         };
-        let valid = value.as_object().is_some_and(|fields| {
-            fields
-                .get("source")
-                .and_then(Value::as_str)
-                .is_some_and(|source| !source.is_empty())
-                && fields
-                    .keys()
-                    .all(|k| k == "source" || k == "expected_digest")
-                && fields
-                    .get("expected_digest")
-                    .is_none_or(|d| d.as_str().is_some_and(|d| !d.is_empty()))
-        });
-        if !valid {
-            return err_response(
-                400,
-                "install body admits only source and an optional expected_digest; identity and approval are never caller fields",
-            );
+        if body
+            .expected_digest
+            .as_ref()
+            .is_some_and(|digest| digest.is_empty())
+        {
+            return err_response(400, "expected_digest is empty");
         }
-        value
+        let mut params = json!({"source": body.source});
+        if let Some(digest) = body.expected_digest {
+            params["expected_digest"] = json!(digest);
+        }
+        match catalogue_params(body.catalogue, body.catalogue_resolution) {
+            Ok(extra) => merge_catalogue(&mut params, extra),
+            Err(message) => return err_response(400, message),
+        }
+        params
     } else if let Some(id) = id {
         json!({"install_id":id})
     } else {

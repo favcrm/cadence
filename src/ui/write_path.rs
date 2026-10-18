@@ -1644,12 +1644,16 @@ pub(crate) fn write_route(
     // staged to a server-derived external temp dir (NOT under pm.dir, which
     // the installer refuses as a source), then installed via the unchanged
     // source-path installer. OperatorOnly in WRITE_ROUTES.
-    if path == "/api/app-installations/upload" {
+    if path == "/api/app-installations/upload" || path == "/api/app-installations/upload/check" {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let response = apps::workspace_upload(&mut request, state_dir);
+        let response = if path.ends_with("/check") {
+            apps::workspace_upload_check(&mut request, state_dir)
+        } else {
+            apps::workspace_upload(&mut request, state_dir)
+        };
         send(request, response);
         return;
     }

@@ -31,6 +31,51 @@ async function main() {
   globalThis.fetch = (async () => { calls++; throw new Error("browse-only app must not fetch a release"); }) as typeof fetch;
   const outcome = await directory.installPublicApp(app, new AbortController().signal);
   assert(outcome.state === "refused" && calls === 0, "a browse-only release cannot reach the install transport");
+  const digest = `sha256:${"ab".repeat(32)}`;
+  const installable = { ...app, version: "1.2.3", digest, installable: true };
+  const seen: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    seen.push(`${url} ${init?.method ?? "GET"}`);
+    if (url.includes("/release?")) {
+      const query = new URL(url, "http://localhost").searchParams;
+      assert(query.get("version") === "1.2.3" && query.get("digest") === digest, "the release fetch pins both version and digest");
+      assert(query.getAll("version").length === 1 && query.getAll("digest").length === 1, "the release query has no duplicate pins");
+      return new Response(JSON.stringify({ files: { "app.md": "guide" }, expected_digest: digest }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url.endsWith("/api/app-installations/upload")) {
+      const body = JSON.parse(String(init?.body)) as { expected_digest?: string; catalogue?: { id: string; version: string; digest: string } };
+      assert(body.expected_digest === digest, "the upload pins the release digest");
+      assert(body.catalogue?.id === installable.id && body.catalogue.version === "1.2.3" && body.catalogue.digest === digest, "the upload names the catalogue release");
+      return new Response(JSON.stringify({ install_id: "install-1" }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url.endsWith("/api/app-installations/install-1")) {
+      return new Response(JSON.stringify({
+        install_id: "install-1", version: "1.2.3", digest, approval: "unapproved",
+        catalogue: { id: installable.id, version: "1.2.3", digest },
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  }) as typeof fetch;
+  const installed = await directory.installPublicApp(installable, new AbortController().signal);
+  assert(installed.state === "installed" && installed.installId === "install-1", "a pinned catalogue install reads the recorded origin back");
+  assert(seen.filter((line) => line.includes("/upload")).length === 1, "a successful catalogue install uploads once");
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.includes("/release?")) {
+      return new Response(JSON.stringify({ files: { "app.md": "guide" }, expected_digest: digest }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url.endsWith("/api/app-installations/upload")) {
+      return new Response(JSON.stringify({ install_id: "install-2" }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url.endsWith("/api/app-installations/install-2")) {
+      return new Response(JSON.stringify({ install_id: "install-2", version: "1.2.3", digest, approval: "unapproved" }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (init?.method === "POST") throw new Error("a mismatched readback must not be retried");
+    throw new Error(`unexpected fetch ${url}`);
+  }) as typeof fetch;
+  const mismatched = await directory.installPublicApp(installable, new AbortController().signal);
+  assert(mismatched.state === "unknown", "readback without the catalogue locator is not treated as installed");
   globalThis.fetch = (async () => new Response(JSON.stringify({ ok: true, data: { app: { ...app, id: "another-app" } } }), { status: 200 })) as typeof fetch;
   let refused = false;
   try { await directory.loadPublicApp(app.id, new AbortController().signal); } catch { refused = true; }
