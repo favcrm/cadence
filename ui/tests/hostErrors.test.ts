@@ -1,6 +1,5 @@
 import { ApiError } from "../src/lib/api";
 import { friendlyAudienceError } from "../src/features/app-shell/segmentGrammar";
-import { friendlyCampaignError } from "../src/features/app-shell/campaignGrammar";
 import { friendlySendError } from "../src/features/app-shell/sendClient";
 import { friendlyError } from "../src/features/app-shell/customerProfile";
 import {
@@ -14,7 +13,7 @@ function equal(actual: unknown, expected: unknown, why: string): void {
   if (actual !== expected) throw new Error(`${why}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
 
-const fns = [friendlyAudienceError, friendlyCampaignError, friendlySendError, friendlyError];
+const fns = [friendlyAudienceError, friendlySendError, friendlyError];
 for (const fn of fns) {
   // Expired hosted session: fetch throws a TypeError or a bare object, or a 401.
   equal(fn(new TypeError("Failed to fetch")), SESSION_EXPIRED_TEXT, "a network/redirect TypeError reads as an expired session");

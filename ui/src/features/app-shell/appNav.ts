@@ -1,4 +1,3 @@
-import { CRM_SECTIONS, crmSectionHref, type AppMenuSection } from "./CrmOutlet";
 import { onPrivateSessionReset } from "../../lib/privateSession";
 import type { ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
 
@@ -10,8 +9,15 @@ export interface AppNavEntry {
   href: string;
   /** The app on screen right now. */
   current: boolean;
-  /** Section rows, shown for the active or last-used app; null when the kind declares none. */
+  /** Section rows, shown for the active or last-used app; null when its screen declares none. */
   sections: AppMenuSection[] | null;
+}
+
+/** One section row under an app in the Apps menu. */
+export interface AppMenuSection {
+  label: string;
+  href: string;
+  current: boolean;
 }
 
 /** Shown under Apps when the installed-app list could not be refreshed. */
@@ -36,9 +42,7 @@ export interface VerifiedApp {
   navigation?: ScreenNavigation | null;
 }
 
-/** Per-kind section declarations. This table is the one place that names a
- *  kind; the CAD-811 surface declaration replaces it. Kinds without an
- *  entry (Social today) get only their app link. */
+/** Section rows for an app whose mounted screen declares navigation. */
 interface KindSections {
   sections: [string, string][];
   /** The section the URL query names; the default when it names none. */
@@ -46,18 +50,7 @@ interface KindSections {
   href: (base: string, section: string) => string;
 }
 
-const SECTIONS_BY_KIND: Record<string, KindSections> = {
-  crm: {
-    sections: CRM_SECTIONS,
-    fromSearch: (search) => {
-      const q = new URLSearchParams(search).get("crm");
-      return q === "segments" || q === "campaigns" ? q : "customers";
-    },
-    href: (base, section) => crmSectionHref(base, section as Parameters<typeof crmSectionHref>[1]),
-  },
-};
-
-/** The section the URL is on, for a kind that declares sections. */
+/** The section the URL is on, for a screen that declares sections. */
 function declaredSections(navigation: ScreenNavigation): KindSections {
   return {
     sections: navigation.sections.map(s => [s.id, s.label]),
@@ -74,8 +67,8 @@ function declaredSections(navigation: ScreenNavigation): KindSections {
     },
   };
 }
-export function sectionFromSearch(kind: string, search: string, navigation?: ScreenNavigation | null): string | null {
-  return (navigation ? declaredSections(navigation) : SECTIONS_BY_KIND[kind])?.fromSearch(search) ?? null;
+export function sectionFromSearch(search: string, navigation?: ScreenNavigation | null): string | null {
+  return navigation ? declaredSections(navigation).fromSearch(search) : null;
 }
 
 export interface LastApp {
@@ -139,7 +132,7 @@ export function buildAppNav(input: {
   const expandedId = onAppScreen ? activeId : last?.installId ?? null;
   return {
     apps: apps.map((app) => {
-      const decl = app.navigation ? declaredSections(app.navigation) : SECTIONS_BY_KIND[app.kind];
+      const decl = app.navigation ? declaredSections(app.navigation) : null;
       const active = onAppScreen && app.installId === activeId;
       let sections: AppMenuSection[] | null = null;
       let href = active ? activeHref : installHref(app.installId);
