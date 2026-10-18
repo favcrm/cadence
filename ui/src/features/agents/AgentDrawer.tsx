@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { fmtTime } from "../../lib/fmt";
 import { provenanceDetail } from "./modelProvenance";
@@ -7,6 +7,7 @@ import Button from "../../ui/Button";
 import AgentAvatar, { lookFor } from "./AgentAvatar";
 import { AgentActivity, AgentQueue, WorkBlock } from "./AgentBlocks";
 import { agentHoldsWorkButDead, lifecycleOf } from "./agentView";
+import { WriteGate } from "../auth/WriteGate";
 import { useTranslate } from "../../lib/locale";
 import type { Agent, AgentDetail, UsageLimit } from "../../lib/types";
 
@@ -221,6 +222,7 @@ export default function AgentDrawer({
   onClose: () => void;
   onOpenIssue: (id: string) => void;
 }) {
+  const writeBlock = useContext(WriteGate);
   const t = useTranslate();
   const [detail, setDetail] = useState<AgentDetail | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -324,6 +326,17 @@ export default function AgentDrawer({
             </p>
           )}
         </div>
+        {/* Threads resolves the alias: the existing You ↔ agent conversation
+            opens; otherwise `?dm=` starts a local draft — nothing is sent
+            and no server row is created until the operator writes. */}
+        <Button
+          size="sm"
+          href={`/threads?dm=${encodeURIComponent(alias)}`}
+          disabled={writeBlock !== null}
+          title={writeBlock ?? t("Open the direct conversation with this agent")}
+        >
+          {t("Message")}
+        </Button>
         <Button
           icon={<IconClose />}
           aria-label={t("Close agent details")}

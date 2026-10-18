@@ -90,6 +90,23 @@ are distinct, and **Retry search** repeats a failed search without losing picks.
 The server rechecks sign-in and live workspace membership on every search and
 creation request; search results never grant access.
 
+From **Agents**, choose **Message** to open that agent's conversation in
+Threads. The recipient and any recorded work context stay visible. Delivery
+labels describe the stored message state, not whether someone read it or
+finished the work. A refused or uncertain send keeps the draft; check the
+history before explicitly retrying an uncertain send.
+
+**Home** remains the Assistant chat with its docked composer. The compact
+**Since you left** summary expands into real issue links; the separate
+**To do / Updates** rail keeps operator actions apart from information.
+**Ask the Assistant** prefills a draft for inspection and editing, never
+sends it automatically, and does not resolve the item.
+
+An issue's **Overview** brings its current result, next action, output links
+and verification together. A worker report is not independent review,
+merge or deployment evidence. Activity, Conversation, Pull request and
+Evidence remain the detailed views; feedback uses the existing conversation.
+
 ## What it gives you
 
 - **Durable messaging** — every assignment, acknowledgement and result is a

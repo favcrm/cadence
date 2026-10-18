@@ -92,14 +92,37 @@ export interface ConversationListFilter {
   include_system?: boolean;
 }
 
+/** One routed copy nested under the message it answers (`origin`). */
+export interface RoutedCopy {
+  id: string;
+  seq: number;
+  origin: string | null;
+  /** The recorded send path (`worker_result`, `worker_notice`, `job_event`). */
+  source: string;
+  state: DeliveryState | string;
+  error: string | null;
+  created: number;
+}
+
 /** One message from `work_conversation_read` (FINAL). `issue` and
- *  `task_id` are the existing refs when present, else null. */
+ *  `task_id` are the existing refs when present, else null. `origin`
+ *  marks a routed copy: the id of the message it answers. `routed`
+ *  lists the copies that answer this message. */
 export interface ThreadMessage {
   id: string;
   seq: number;
   conversation: string;
   sender: Participant;
   origin: string | null;
+  /** The recorded recipient; `kind: "unknown"` when none was recorded. */
+  recipient?: Participant | null;
+  /** The recorded send path (`user`, `worker_result`, …) — evidence,
+   *  never a claim of intent. */
+  source?: string;
+  /** Routed copies that answered this message, when the daemon sent any. */
+  routed?: RoutedCopy[];
+  /** The daemon's stored refusal/failure text, when one was recorded. */
+  error?: string | null;
   body: string;
   state: DeliveryState;
   issue: string | null;

@@ -22,6 +22,7 @@ import { Activity } from "./Activity";
 import { PrPanel } from "./PrPanel";
 import { Evidence } from "./Evidence";
 import { Fields } from "./Fields";
+import { WorkResult } from "./WorkResult";
 import { Links } from "./Links";
 import { type IssuePageProps as Props } from "./issuePageProps";
 import { useLocale } from "../../lib/locale";
@@ -190,6 +191,11 @@ function PageBody({
     return issuePath(card?.project ?? project, issueId);
   };
 
+  const composeWith = (mode: "ask" | "instruct") => {
+    setCompose(mode);
+    navigate(tabHref("conversation"));
+  };
+
   const patch = (body: Parameters<typeof api.patch>[1], verb: string) => {
     api
       .patch(id, body, detail.rev)
@@ -293,6 +299,19 @@ function PageBody({
             </section>
           )}
           {tab === "overview" && (
+            <WorkResult
+              detail={detail}
+              lane={lane}
+              checksDone={done}
+              checksTotal={items.length}
+              blocked={blocked}
+              tabHref={tabHref}
+              onCompose={composeWith}
+              onKickoff={() => setKickoff(true)}
+              onOpen={onOpen}
+            />
+          )}
+          {tab === "overview" && (
             <section className="issue-description grid gap-4">
               {items.length > 0 && (
                 <div className="issue-acceptance-progress">
@@ -361,10 +380,7 @@ function PageBody({
               issue={id}
               lane={lane?.lane ?? null}
               providers={lane?.providers ?? []}
-              onCompose={(mode) => {
-                setCompose(mode);
-                navigate(tabHref("conversation"));
-              }}
+              onCompose={composeWith}
               onChanged={reloadLane}
             />
           )}

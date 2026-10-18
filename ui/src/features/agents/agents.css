@@ -317,7 +317,8 @@
   inset: 0;
   z-index: 1;
 }
-.agent-card button:not(.agent-name) {
+.agent-card button:not(.agent-name),
+.agent-card a {
   position: relative;
   z-index: 2;
 }
@@ -453,6 +454,12 @@
 .agent-qchip.hot {
   background: color-mix(in srgb, var(--color-warn) 14%, transparent);
   color: var(--color-warn);
+}
+.agent-foot-side {
+  display: inline-flex;
+  align-items: center;
+  gap: .4rem;
+  flex-shrink: 0;
 }
 
 /* Drawer lifecycle banner + stub action row. */
