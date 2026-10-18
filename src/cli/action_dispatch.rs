@@ -412,6 +412,10 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         | Commands::Web { .. } => {
             unreachable!("auth or web dispatched before state-dir")
         }
+        Commands::InspectPortable { source } => {
+            print_json(&cadence_agent::backup::portable::inspect_portable(&source)?);
+            Ok(0)
+        }
         Commands::Doctor {
             host,
             json,
@@ -434,7 +438,8 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             portable,
             tracker,
             apps,
-        } => export::run(state_dir, out, portable, tracker, apps),
+            snapshot_working_tree,
+        } => export::run(state_dir, out, portable, tracker, apps, snapshot_working_tree),
         Commands::Restore {
             source,
             repos,

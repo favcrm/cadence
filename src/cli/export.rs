@@ -11,6 +11,7 @@ pub(super) fn run(
     portable: bool,
     tracker: Option<PathBuf>,
     apps: Vec<String>,
+    snapshot_working_tree: bool,
 ) -> Result<i32> {
     if !portable {
         print_json(&cadence_agent::backup::export(&state_dir, &out)?);
@@ -21,8 +22,13 @@ pub(super) fn run(
         scope: cadence_agent::backup::portable::Scope::Coordination,
         tracker,
     };
-    print_json(&cadence_agent::backup::portable::export_portable_selected(
-        &state_dir, &out, &opts, &apps,
-    )?);
+    let report = if snapshot_working_tree {
+        cadence_agent::backup::portable::export_portable_snapshot_selected(
+            &state_dir, &out, &opts, &apps,
+        )?
+    } else {
+        cadence_agent::backup::portable::export_portable_selected(&state_dir, &out, &opts, &apps)?
+    };
+    print_json(&report);
     Ok(0)
 }

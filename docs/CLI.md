@@ -260,6 +260,64 @@ terminal watch without JSON still redraws the table in place.
 stays a failure receipt; it is not rewritten as a success sentence.
 `build-slot acquire` without `--json` is still the bare token.
 
+## Portable coordination export and inspection
+
+Use the native exporter for an authorized local source. A dirty tracker can
+be captured privately without committing, stashing, or changing its live
+HEAD, index, hooks, or files:
+
+```sh
+cadence export --state-dir /path/to/source-state \
+  --portable --tracker /path/to/source-tracker \
+  --snapshot-working-tree --out /private/new-package
+
+cadence --org local inspect-portable /private/new-package
+```
+
+`--snapshot-working-tree` includes tracked modifications and deletions plus
+non-ignored untracked regular files. Ignored tracked files remain included.
+File/directory replacements are captured as deleted tracked files plus new
+regular files, not rejected as directory members.
+It preserves raw bytes and executable-bit semantics; source hooks and Git
+filters never run. Linked worktrees, custom hooks, filter configuration,
+unmerged/sparse index entries, symlinks, hardlinks, nonregular files and
+unrepresentable paths refuse rather than being silently omitted. The output
+must be new and outside the source tracker, including through symlinked
+parents. Without the flag, the existing clean-tracker export is unchanged.
+
+The capture is a private clean Git snapshot, not a change to the source.
+The existing exporter takes its online database snapshot, applies the
+coordination projection and credential scrub/scan, and builds the package.
+Independent package validation, comparison with the captured tracker inventory,
+and a final source-tracker recheck must pass before no-replace publication.
+Owned temporary capture and staging directories are cleaned on refusal.
+A source-change refusal is not an automatic retry.
+
+Success prints JSON with `manifest_sha256`, `exporter_revision`, schema,
+tracker revision, member count/bytes, exclusions, and `source_capture`
+(original HEAD, snapshot HEAD, file/byte counts, inventory SHA-256 and capture
+policy). Keep this receipt privately alongside, not inside, the package. The database and
+tracker are **not a transactionally atomic snapshot**; the receipt explicitly
+sets `atomic_database_and_tracker=false`.
+
+`inspect-portable` independently checks an existing package's exact file set,
+paths, hashes and sizes, then SQLite integrity, catalog/schema and the
+inactive authority exclusions. It refuses WAL-mode database headers before
+opening SQLite, preventing sidecar writes into the supplied package; native
+exports use rollback mode. It prints JSON and does not restore or start a
+daemon. It uses the normal local command authorization path; `--org local`
+avoids a saved remote-org default. It neither authenticates the producer nor
+proves present-day source fidelity, and always reports `import_ready=false`.
+Destination compatibility and owner authorization remain separate checks.
+
+This is a **coordination package, not a full workspace backup**:
+`full_workspace=false`. App/business data, credentials/grants, local
+checkouts and runtime files are excluded; execution authority is removed
+and imported actors/dispatch disabled. Manifest SHA-256 detects changed
+bytes, not a producer who rewrites both the package and its manifest.
+Neither command grants an agent new source access or production privileges,
+uploads data, imports a tenant, reconnects executors or activates a root.
+
 ## Exit codes
 
 A failure prints one JSON object on stderr (`{"error", "kind"}`) and exits

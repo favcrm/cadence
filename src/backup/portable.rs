@@ -32,6 +32,10 @@ use crate::error::{Error, Result};
 use crate::rollout::db_file;
 use crate::secret::Allowlist;
 
+mod capture;
+#[cfg(test)]
+mod capture_acceptance;
+
 pub const PORTABLE_FORMAT: &str = "cadence.portable/1";
 pub const INACTIVE_MARKER: &str = "portable-restore.json";
 const PKG_DB: &str = "cadence.sqlite3";
@@ -1042,6 +1046,149 @@ pub fn export_portable_selected(
     export_portable(state_dir, out, opts)
 }
 
+/// Capture a dirty working tree privately, then use the same native package
+/// builder. Publication follows independent package validation and a final
+/// source check; the source database and tracker are not one atomic snapshot.
+pub fn export_portable_snapshot_selected(
+    state_dir: &Path,
+    out: &Path,
+    opts: &PortableExportOptions,
+    apps: &[String],
+) -> Result<Value> {
+    if !apps.is_empty() {
+        return export_portable_selected(state_dir, out, opts, apps);
+    }
+    refuse_existing(out)?;
+    refuse_output_in_tracker(out, &opts.tracker)?;
+    let live = db_file(state_dir);
+    if !live.is_file() {
+        return Err(Error::rejected(
+            "portable export source database is missing",
+        ));
+    }
+    let allow = Allowlist::load(state_dir)?;
+    let captured = capture::TrackerCapture::new(&opts.tracker)?;
+    let head = admit_tracker(captured.path())?;
+    let staging = private_staging(out)?;
+    let result = (|| {
+        let manifest = build_package(&live, &staging, captured.path(), &head, &allow)?;
+        let mut report = inspect_portable(&staging)?;
+        captured.verify_package(&staging, &manifest.members)?;
+        captured.verify_unchanged()?;
+        report["source_capture"] = captured.evidence();
+        report["exporter_revision"] = json!(crate::overview::BUILD_COMMIT);
+        report["source_fidelity"] = json!("captured_tracker_matches_package_and_rechecked");
+        report["atomic_database_and_tracker"] = json!(false);
+        report["bundle"] = json!(out);
+        rename_noreplace(&staging, out)?;
+        Ok(report)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+fn refuse_output_in_tracker(out: &Path, tracker: &Path) -> Result<()> {
+    let absolute = std::env::current_dir()?.join(out);
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    while ancestor.symlink_metadata().is_err() {
+        suffix.push(
+            ancestor
+                .file_name()
+                .ok_or_else(|| Error::rejected("output path has no resolvable parent"))?,
+        );
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| Error::rejected("output path has no resolvable parent"))?;
+    }
+    let mut resolved = ancestor.canonicalize()?;
+    for part in suffix.into_iter().rev() {
+        resolved.push(part);
+    }
+    if resolved.starts_with(tracker.canonicalize()?) {
+        return Err(Error::rejected(
+            "snapshot export output must be outside the source tracker",
+        ));
+    }
+    Ok(())
+}
+
+/// Read-only inspection through the same integrity, catalog and authority
+/// checks as inactive restore. A valid manifest is not source authenticity,
+/// present-day source fidelity, or destination/import admission.
+pub fn inspect_portable(source: &Path) -> Result<Value> {
+    if !source.symlink_metadata()?.is_dir() {
+        return Err(Error::rejected("package is not a plain directory"));
+    }
+    require_regular(&source.join(PKG_MANIFEST))?;
+    // Reject linked directories before reading any listed member through them.
+    let mut paths = Vec::new();
+    collect_package_members(source, source, &mut paths)?;
+    let (manifest_sha256, _) = hash_file(&source.join(PKG_MANIFEST))?;
+    let manifest = verify_package(source)?;
+    // Ordinary read-only SQLite opens can still create WAL/SHM files.
+    // Native exports are rollback-journal single-file databases; admit that
+    // header before any SQLite connection touches the supplied package.
+    let mut header = [0u8; 20];
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(source.join(PKG_DB))?
+        .read_exact(&mut header)?;
+    if &header[..16] != b"SQLite format 3\0" || header[18] != 1 || header[19] != 1 {
+        return Err(Error::rejected(
+            "portable inspection requires a single-file rollback-journal SQLite database",
+        ));
+    }
+    validate_staged_store(&source.join(PKG_DB), &manifest)?;
+    let tracker = source.join(PKG_TRACKER);
+    if pm_root_of(&tracker)? != manifest.pm_root {
+        return Err(Error::rejected(
+            "package tracker PM root differs from manifest",
+        ));
+    }
+    if hash_file(&source.join(PKG_MANIFEST))?.0 != manifest_sha256 {
+        return Err(Error::rejected(
+            "package manifest changed during inspection",
+        ));
+    }
+    let bytes = manifest.members.iter().try_fold(0u64, |total, member| {
+        total
+            .checked_add(member.bytes)
+            .ok_or_else(|| Error::rejected("package byte total overflows"))
+    })?;
+    Ok(json!({
+        "status": "verified_coordination_package",
+        "portable": true,
+        "bundle": source,
+        "manifest_sha256": manifest_sha256,
+        "format": manifest.format,
+        "scope": manifest.scope,
+        "full_workspace": manifest.full_workspace,
+        "cadence": manifest.cadence,
+        "inspector_revision": crate::overview::BUILD_COMMIT,
+        "schema_version": manifest.schema_version,
+        "tracker_revision": manifest.tracker_revision,
+        "members": manifest.members.len(),
+        "bytes": bytes,
+        "tables": manifest.tables,
+        "omitted_tables": manifest.omitted_tables,
+        "omitted_rows": manifest.omitted_rows,
+        "nulled_columns": manifest.nulled_columns,
+        "disabled_columns": manifest.disabled_columns,
+        "exclusions": manifest.exclusions,
+        "verification": {
+            "member_paths_hashes_sizes": true,
+            "exact_member_set": true,
+            "database_integrity_catalog_authority": true
+        },
+        "source_fidelity": "not_independently_established",
+        "import_ready": false
+    }))
+}
+
 fn refuse_existing(out: &Path) -> Result<()> {
     if out.symlink_metadata().is_ok() {
         return Err(Error::rejected(format!(
@@ -1328,6 +1475,21 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
 /// no config `include`, no `hooks` entries beyond `.sample`, no symlink or
 /// hardlink inside `.git`. The tracker must be clean. Returns HEAD.
 pub fn admit_tracker(tracker: &Path) -> Result<String> {
+    admit_tracker_metadata(tracker)?;
+    let status = git_plain(
+        tracker,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    if !status.trim().is_empty() {
+        return Err(Error::rejected(format!(
+            "tracker {} refused: not clean; commit or stash before export",
+            tracker.display()
+        )));
+    }
+    git_plain(tracker, &["rev-parse", "--verify", "HEAD"])
+}
+
+fn admit_tracker_metadata(tracker: &Path) -> Result<()> {
     let refuse =
         |why: &str| Error::rejected(format!("tracker {} refused: {why}", tracker.display()));
     let dotgit = tracker.join(".git");
@@ -1357,14 +1519,7 @@ pub fn admit_tracker(tracker: &Path) -> Result<String> {
     }
     check_metadata_tree(&dotgit, tracker)?;
     check_config_keys(&dotgit.join("config"), tracker)?;
-    let status = git_plain(
-        tracker,
-        &["status", "--porcelain=v1", "--untracked-files=all"],
-    )?;
-    if !status.trim().is_empty() {
-        return Err(refuse("not clean; commit or stash before export"));
-    }
-    git_plain(tracker, &["rev-parse", "--verify", "HEAD"])
+    Ok(())
 }
 
 /// Read `.git/config` as keys only, before git loads it. Includes and

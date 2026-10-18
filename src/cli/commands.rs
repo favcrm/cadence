@@ -180,11 +180,23 @@ pub(crate) enum Commands {
         /// `--portable`.
         #[arg(long, requires = "portable")]
         tracker: Option<PathBuf>,
+        /// Privately capture tracked changes/deletions and non-ignored
+        /// untracked files without changing the source tracker. Verify the
+        /// package and recheck the source before publication.
+        #[arg(long, requires = "portable")]
+        snapshot_working_tree: bool,
         /// Repeatable, with `--portable`: an app whose data to include. No
         /// app schema is supported yet, so any selection is refused before
         /// the store or tracker is read or the output is created.
         #[arg(long = "app", value_name = "APP", requires = "portable")]
         apps: Vec<String>,
+    },
+    /// Independently inspect a portable coordination package, read-only.
+    /// Prints JSON integrity, schema and exclusion evidence; does not restore,
+    /// start a daemon, or establish import readiness. Local-only.
+    InspectPortable {
+        /// Existing portable package directory.
+        source: PathBuf,
     },
     /// Restore a backup (its `.manifest.json`) or an export bundle (its
     /// directory) into the state dir. Refuses while a daemon holds the
