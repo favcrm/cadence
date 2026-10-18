@@ -181,7 +181,6 @@ struct Claims {
     /// The exact issuing credential — required in the claim set (a
     /// missing or extra field fails the closed shape); the container
     /// binds nothing further to it, so it is parsed, not read.
-    #[allow(dead_code)]
     credential_id: String,
     iat: i64,
     exp: i64,
@@ -218,6 +217,11 @@ pub struct CliActor {
     /// own subject, so a remote send/comment is never written as the
     /// board's operator handle.
     pub handle: String,
+    /// The verified claims' `credential_id` — the envelope's recorded
+    /// authority provenance a deferred commit may re-prove. No route
+    /// binds authority to it beyond what the closed claim set already
+    /// pins.
+    pub credential_id: String,
 }
 
 impl CliActor {
@@ -439,6 +443,7 @@ pub fn verify(
     }
     Ok(CliActor {
         handle: handle_of(&claims.actor, &claims.sub),
+        credential_id: claims.credential_id,
         sub: claims.sub,
         actor: claims.actor,
         role_at_issue: claims.role_at_issue,
@@ -586,6 +591,7 @@ mod policy_spelling_tests {
             role_at_issue: "member".to_string(),
             principal_kind: "user".to_string(),
             scopes: vec!["cli.read".to_string(), "cli.write".to_string()],
+            credential_id: "cred".to_string(),
             jti: "jti".to_string(),
             exp: i64::MAX,
         }

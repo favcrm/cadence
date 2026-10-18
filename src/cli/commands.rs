@@ -630,6 +630,14 @@ pub(crate) enum Commands {
     /// the body is `--text`, `-m` or `--file`. There are no email-style
     /// `--subject`, `--body` or `--cc` flags.
     ///
+    /// On a remote org (`--org <slug>`) the supported form is the durable
+    /// enqueue only: `--message <id>` is required (the stable id a lost
+    /// reply reconciles by), and `--ready`/`--force`, `--nudge`,
+    /// `--priority`/`--supersedes`, `--reply-to` and `--task` refuse —
+    /// they are local-endpoint surfaces. The recipient is the hosted master
+    /// for a verified human workspace owner; read the outcome with
+    /// `cadence message read <id> --org <slug>`.
+    ///
     /// Multi-topic reports: open the body with a `SUBJECT: <topic>`
     /// line (a single-line pty body leads with `SUBJECT: <topic> —`)
     /// so the recipient can scan topics; there is no subject field.

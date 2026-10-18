@@ -344,6 +344,23 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "platform_assistant_provision",
         Rule::Handler("proven_operator + re-verified member envelope (CAD-1420)"),
     ),
+    // CAD-1568: the remote CLI's principal-bound plane. Every cli_message_*
+    // verb re-binds `cli_envelope` on a proven operator/board relay only and
+    // cryptographically re-verifies it (cli_rpc::cli_caller); the handler's
+    // recipient classes and principal-scoped readback are daemon-enforced —
+    // a request field never widens them.
+    (
+        "cli_message_send",
+        Rule::Handler("cli_caller: re-verified human cli_envelope on a proven board relay; hosted master coordination is human-owner only (CAD-1568)"),
+    ),
+    (
+        "cli_message_read",
+        Rule::Handler("cli_caller + principal-owned messages only (CAD-1568)"),
+    ),
+    (
+        "cli_message_inbox",
+        Rule::Handler("cli_caller: re-verified human-owner cli_envelope for passive inbox inspection (CAD-1568)"),
+    ),
     ("member_assist_state", Rule::Handler("member_caller: member_as on a proven board relay only")),
     ("member_assist_history", Rule::Handler("member_caller: member_as on a proven board relay only")),
     ("member_assist_send", Rule::Handler("member_caller: member_as on a proven board relay only")),

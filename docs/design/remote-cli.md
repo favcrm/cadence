@@ -142,9 +142,29 @@ member or an owner-role agent is refused before a write. The native policy
 commit records `Actor: users/<handle>` from that verified Owner, not the
 container's ambient alias. Local CLI writes retain their existing actor
 resolution. `issue project add` and `issue project ls` stay local.
-`message send` (to a named alias — lands as the cli actor's derived
-handle, never "operator") stays in the server verb table but has no
-client mapping in this build.
+`message send`/`send` (CAD-1568) map to `message_send` (cli.write):
+a durable coordination enqueue to the hosted master for a verified human
+workspace owner. Personal-assistant and local-worker recipients are typed
+unsupported-class refusals: separate assistant authority or local assignments
+are required, never a reroute or generic container execution.
+Arguments are exactly `{alias, text, message}`
+— three strings. `message` is the caller-chosen stable id: required, the
+identifier grammar, never `sys-*`. It is the dedupe and reconciliation key —
+a resubmitted id with identical content is the same message (the reply
+carries `duplicate`), and the same id with different content — or an id
+another member owns — is a typed `message_id_conflict`, never a retry.
+The original signed cli envelope rides to the daemon, which re-verifies it
+and stamps the principal-derived sender (`cli-<handle>`), never "operator"
+and never a caller-named source. The reply is the ordinary
+`{message, state, duplicate}` send receipt. `cadence message read <id>`
+returns only that human's CLI-sent message — the body window plus `state`,
+sanitized `result`, `error`, `alias` and `awaiting_report`. Agent/service
+envelopes do not inherit the parent's `sub` ownership. Absent and foreign IDs
+share `not_found`; browser member-chat records are not CLI-owned. Reconcile
+the original identity and workspace before a same-ID retry; no automatic
+post-forward replay. Passive inbox inspection requires a human owner and
+does not expose managed assistants' private conversation. Accepted/queued
+is not delivery or completion; an offline recipient stays queued.
 
 Client-side refusals (CAD-1179 — refused before any bytes leave the
 process): `issue new` without `--project`, or with `--id`/`--status`;
@@ -156,7 +176,12 @@ the tracker lock via `set_fields_if_rev`, and a stale token answers the
 conflict payload rather than writing). `project_policy` is not retried
 after a refusal, a conflict, or an ambiguous failure — the same wake-only
 retry as the other writes. A malformed project key is rejected by the
-tracker key grammar before any path join.
+tracker key grammar before any path join. Remote `send`/`message send`
+without `--message`, or with `--ready`/`--force`, `--nudge`,
+`--priority`/`--supersedes`, `--reply-to` or `--task` (local-endpoint,
+steering and routing surfaces a remote caller cannot carry) refuse before
+a request; `--file` bodies are read client-side (`-` = stdin) under the
+daemon's enqueue byte cap — an oversized body is refused, never truncated.
 
 Refused remotely (default-deny): every operator-only daemon verb
 (`agent join/stop/resume`, `daemon *`, `operator_*`, `rollout`, `master/*`,

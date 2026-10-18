@@ -96,6 +96,7 @@ mod update_recovery_tests;
 // remote default — the file is owned by its own author.
 #[cfg(all(test, feature = "test-seam"))]
 mod update_routing_acceptance;
+
 mod upgrade;
 mod util;
 mod web;
@@ -107,6 +108,9 @@ mod wiki;
 mod workflow;
 
 pub(crate) use action_dispatch::run;
+#[cfg(all(test, feature = "cli-runtime-test"))]
+#[allow(unused_imports)] // Only the library's runtime fixture invokes this entry.
+pub(crate) use action_dispatch::run_acceptance_argv;
 use agent::AgentAction;
 use agent_uid::AgentUidAction;
 use app::AppAction;

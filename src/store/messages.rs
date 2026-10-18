@@ -1492,7 +1492,19 @@ impl Store {
             }
             self.task_in(tx, task)?;
         }
+        // CAD-1568: a CLI retry must retain its canonical principal, not
+        // merely its lossy display source. Keep the existing local retry
+        // contract: starting a chat may add operator attribution later.
         if let Some(old) = self.message_in(tx, id)? {
+            let same_sender = match sender {
+                Sender::Cli(authority) => {
+                    old.sender.as_deref() == Some(authority.sender_label().as_str())
+                }
+                _ => !old
+                    .sender
+                    .as_deref()
+                    .is_some_and(|label| label.starts_with("cli:")),
+            };
             // `refs` lives on the enqueue's thread-entry payload, not
             // the message row — the stored side is read back so a
             // retry naming different refs conflicts like any field.
@@ -1504,6 +1516,7 @@ impl Store {
                 && old.issue.as_deref() == issue
                 && old.worktree.as_deref() == worktree
                 && old.priority == priority
+                && same_sender
                 && Self::entry_refs_in(tx, id)? == refs.cloned()
                 && Self::entry_app_in(tx, id)? == app.cloned()
                 && Self::entry_attachments_in(tx, id)? == attachments.cloned()
@@ -1517,13 +1530,10 @@ impl Store {
             }
             return Ok((true, old.state));
         }
-        // CAD-819: the participant identity is derived by the daemon from
-        // the connection (`sender`) and the recipient row, never a request
-        // field. An unattributed sender keeps NULL: an unknown sender.
+        let (sender_uid, sender_label) = self.sender_identity_in(tx, sender)?;
         let recipient = self.agent_in(tx, alias)?;
         let recipient_uid = recipient.uid.clone();
         let recipient_label = recipient.alias.clone();
-        let (sender_uid, sender_label) = self.sender_identity_in(tx, sender)?;
         tx.execute(
             "INSERT INTO messages(id,alias,body,reply_to,source,task_id,issue,worktree,priority,created,
                                   sender_uid,recipient_uid,sender,recipient)
@@ -1609,6 +1619,12 @@ impl Store {
             // CAD-1380: a member is attributed by label only, never as the
             // operator and never with an agent uid.
             Sender::Member(_) | Sender::VerifiedMember(_) => (None, Some("member".into())),
+            // CAD-1568: a remote CLI principal is attributed by its
+            // verified canonical `(org, sub)` key, never as the operator
+            // and never with an agent uid — `cli:<canonical>` is the
+            // durable per-principal identity the enqueue dedupe and a
+            // cli-scoped readback own.
+            Sender::Cli(auth) => (None, Some(auth.sender_label())),
             Sender::Unattributed => (None, None),
         })
     }

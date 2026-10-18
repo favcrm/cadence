@@ -2,6 +2,18 @@
 
 use super::*;
 
+#[cfg(all(test, feature = "cli-runtime-test"))]
+#[allow(dead_code)] // Binary tests compile this library-fixture entry too.
+pub(crate) fn run_acceptance_argv(argv: &[&str]) -> Result<i32> {
+    let matches = help::root_command(help::in_pane())
+        .try_get_matches_from(argv)
+        .map_err(|err| Error::usage(err.to_string()))?;
+    let mut cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
+        .map_err(|err| Error::usage(err.to_string()))?;
+    cli.command_line = Some(command_line_ids(&matches));
+    run_cli(cli)
+}
+
 fn show_login_code(url: &str, code: &str, no_open: bool) -> Result<()> {
     eprintln!("Approve hosted Cadence access at: {url}\nCode: {code}");
     if !no_open {

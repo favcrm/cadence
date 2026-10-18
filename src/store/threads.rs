@@ -78,6 +78,45 @@ pub struct MemberAuthority {
     pub credential_id: String,
 }
 
+/// CAD-1568: the daemon-verified remote-CLI principal behind a hosted
+/// `message_send`, retained on the message's durable row. Ids and the
+/// verified claim spellings only, never a token: `sub`/`actor` are the
+/// cli actor envelope's own claims, `credential_id` the issuing
+/// credential's id for later authority provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliAuthority {
+    pub org: String,
+    /// `claims.sub` — the server-issued principal id the cli actor
+    /// envelope was minted for.
+    pub sub: String,
+    /// `claims.actor` verbatim (`users/<h>`, `service/<h>`, `agents/<h>`
+    /// or the owner's `operator`) — never a request field.
+    pub actor: String,
+    /// The `[A-Za-z0-9_-]` attribution handle the verifier derived —
+    /// never "operator" even for an owner.
+    pub handle: String,
+    pub credential_id: String,
+}
+
+impl CliAuthority {
+    /// The canonical `(org, sub)` key — length-prefixed like
+    /// `assistant_principal_cwd`'s digest input so `("a|b","c")` and
+    /// `("a","b|c")` can never encode alike and a `|`/`:` inside a claim
+    /// stays unambiguous.
+    pub fn principal_key(org: &str, sub: &str) -> String {
+        format!("{}:{org}|{}:{sub}", org.len(), sub.len())
+    }
+
+    /// The durable sender label a cli send records on its message row —
+    /// the full verified `(org, sub)` provenance, never a display name,
+    /// so a principal-scoped readback compares real identity and the
+    /// enqueue dedupe can never fold another principal's identical
+    /// envelope into this one's.
+    pub fn sender_label(&self) -> String {
+        format!("cli:{}", Self::principal_key(&self.org, &self.sub))
+    }
+}
+
 /// Who queued a message, for its thread entry. Only the daemon decides
 /// this, from the connection — never a request field.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +139,12 @@ pub enum Sender {
     /// re-verified at the daemon. Built only from `member_caller`; the
     /// authority rides the enqueue entry so a queued turn re-proves it.
     VerifiedMember(MemberAuthority),
+    /// CAD-1568: a remote send whose ORIGINAL cli actor envelope was
+    /// re-verified at the daemon. Built only by `cli_caller`; the
+    /// principal rides the durable row so a principal-scoped readback
+    /// owns its messages and nothing else — it grants no operator
+    /// authority.
+    Cli(CliAuthority),
     /// Internal enqueues (routed results, kickoffs, monitor dispatch)
     /// and callers whose identity was not derived.
     Unattributed,
@@ -114,6 +159,7 @@ impl Sender {
             Sender::Operator | Sender::OperatorChat => "operator",
             Sender::Agent(alias) => alias,
             Sender::Member(_) | Sender::VerifiedMember(_) => "member",
+            Sender::Cli(_) => "cli",
             Sender::Unattributed => "unattributed",
         }
     }
@@ -465,6 +511,17 @@ fn message_entry<'a>(
         Sender::Member(sub) => (
             ROLE_MEMBER,
             json!({"source": source, "from": format!("users/{sub}"), "member": sub}),
+        ),
+        // CAD-1568: a remote CLI send reads as its verified principal —
+        // a member-role entry, like a member assistant's chat, but the
+        // stamp is `cli_authority` so member-authority readers never
+        // mistake it for a bound assistant's stamp.
+        Sender::Cli(auth) => (
+            ROLE_MEMBER,
+            json!({"source": source, "from": format!("cli-{}", auth.handle),
+                   "member": auth.sub,
+                   "cli_authority": {"org": auth.org, "sub": auth.sub,
+                       "actor": auth.actor, "credential_id": auth.credential_id}}),
         ),
         Sender::VerifiedMember(auth) => (
             ROLE_MEMBER,
@@ -1377,6 +1434,9 @@ impl Store {
     /// CAD-1380 R1: the member authority the ORIGINAL enqueue of `message_id`
     /// recorded. Only a member-role message entry in the message's own alias
     /// thread counts; a malformed stamp is an error, never a guess.
+    /// CAD-1568: a `cli_authority`-stamped member entry is a remote CLI
+    /// principal's message, not a bound assistant's — it answers `None`,
+    /// not a malformed member stamp.
     pub fn message_member_authority(&self, message_id: &str) -> Result<Option<MemberAuthority>> {
         let conn = self.conn();
         let row = conn.query_row(
@@ -1401,9 +1461,18 @@ impl Store {
         if role != ROLE_MEMBER || kind != KIND_MESSAGE {
             return Ok(None);
         }
-        let stamp = payload
-            .and_then(|p| serde_json::from_str::<Value>(&p).ok())
-            .and_then(|v| v.get("member_authority").cloned());
+        let payload = payload.and_then(|p| serde_json::from_str::<Value>(&p).ok());
+        // A `cli_authority` stamp is a remote CLI principal's message
+        // (CAD-1568) — member-role for display, but not a bound
+        // assistant's authority, so it is `None` here, never an error.
+        if payload
+            .as_ref()
+            .and_then(|v| v.get("cli_authority"))
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let stamp = payload.and_then(|v| v.get("member_authority").cloned());
         let field = |k: &str| {
             stamp
                 .as_ref()
