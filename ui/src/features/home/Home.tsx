@@ -509,7 +509,19 @@ const ThreadList = memo(function ThreadList({
         activity={(item) => {
           if (!working || activityItem === null || item.key !== activityItem.key) return null;
           const live = <AssistantActivity since={working.since} />;
-          const at = activityEntry ? time(activityEntry.created) : undefined;
+          // The anchored row shows this turn's own newest entry time. A
+          // fallback row rides the tail item, which may belong to an
+          // EARLIER turn (a stale or failed reply), so it is stamped with
+          // the running turn's start — never with that foreign time
+          // (CAD-1533 review, finding 1).
+          const at =
+            anchorItem !== null
+              ? activityEntry
+                ? time(activityEntry.created)
+                : undefined
+              : working.since !== null
+                ? time(new Date(working.since * 1000).toISOString())
+                : undefined;
           // The answer bubble carries the indicator on its own name row;
           // a standalone row covers in-flight steps/commentary that have
           // none of their own, and the running turn when the row it would
@@ -729,13 +741,12 @@ function MasterHome({
     turn.kind === "working"
       ? { message: turn.message, since: typeof turn.since === "number" ? turn.since : null }
       : null;
-  // Same-row growth the ResizeObserver follows re-subscribes when the
-  // name-row indicator appears or clears (its content lives inside the
-  // observed list).
-  const nameRowShown =
-    workingActivity !== null &&
-    (activityAnchor(items, workingActivity.message) !== null ||
-      (items.length > 0 && items[items.length - 1].type !== "answer"));
+  // The ResizeObserver re-subscribes when the name-row indicator appears
+  // or clears (its content lives inside the observed list): a running
+  // turn with any row to ride, whether it anchors to its own entry or
+  // falls back to any tail item — answers included (CAD-1533 review,
+  // finding 2).
+  const nameRowShown = workingActivity !== null && items.length > 0;
 
   // Live entries: the store opened on the newest page, so the stream
   // resumes after its last seq — never a replay of the history. On a

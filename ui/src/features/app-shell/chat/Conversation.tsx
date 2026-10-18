@@ -378,6 +378,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // The last tail item seen: the jump pill is driven by a new tail
   // identity — history prepending above the window never raises it.
   const tailKey = useRef<string | null>(null);
+  // Rows seen at the previous tail change, so a batch of arrivals counts
+  // as a batch instead of one (CAD-1533 review, finding 3).
+  const prevItems = useRef(0);
   // The reader's anchor for a prepend: captured before older rows are
   // inserted, restored in the layout pass after they render.
   const anchorRef = useRef<{ key: string; top: number } | null>(null);
@@ -543,11 +546,19 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     if (next.unseen !== prev) setUnseen(next.unseen);
   }, []);
   // A send pins before the pending row paints (CAD-610's rule, shared
-  // with Home): the row that lands right after is then followed.
+  // with Home): the row that lands right after is then followed. A glide
+  // that cannot move fires no `scrollend`, so the lock would stay set and
+  // swallow every later follow — already at the tail means there is
+  // nothing to glide to (CAD-1533 review, finding 4; Home's own guard).
   const engage = useCallback(() => {
     const next = onSend(follow.current);
     follow.current = next.state;
     setUnseen(0);
+    const el = listRef.current;
+    if (el && Math.abs(el.scrollTop - tailTop(el.scrollHeight, el.clientHeight)) <= 1) {
+      follow.current = { ...follow.current, pinned: true, programmatic: false };
+      return;
+    }
     scrollPanel(next.scroll);
   }, [scrollPanel]);
   const onListScroll = () => {
@@ -640,12 +651,18 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     const tail = items[items.length - 1]?.key ?? null;
     if (tail === tailKey.current) return;
     const first = tailKey.current === null;
+    // A poll or a batch can land several rows at once: count the arrivals
+    // (never a hardcoded one) so the pill tells the truth. The tail-key
+    // guard above already excludes a prepended page (CAD-1533 review,
+    // finding 3).
+    const arrivals = Math.max(1, items.length - prevItems.current);
+    prevItems.current = items.length;
     tailKey.current = tail;
     if (first) {
       scrollPanel("jump");
       return;
     }
-    const next = onTailChange(follow.current, 1);
+    const next = onTailChange(follow.current, arrivals);
     applyFollow(next.state);
     if (next.scroll === "jump") scrollPanel("jump");
   }, [items, applyFollow, scrollPanel]);
