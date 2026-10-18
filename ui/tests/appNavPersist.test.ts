@@ -1,8 +1,10 @@
 export {};
 /**
  * CAD-1116: the sidebar Apps item lists the installed apps from the
- * verified installation list on every screen, and the last-used app keeps
- * its sections (and last section) off the app screens. Mounts the real App.
+ * verified installation list on every screen, and the last-used app link
+ * survives leaving the app and a reload. CAD-1519: sections come only from
+ * a mounted screen's declared navigation, so an app that has not declared
+ * any (here: no screen mounts) shows none. Mounts the real App.
  */
 declare function require(name: string): any;
 
@@ -100,27 +102,26 @@ assert(listCalls > 0, "the list came from GET /api/app-installations");
 equal(appLink("Social Content")!.getAttribute("href"), "/apps/social-content", "app links to its readable key");
 assert(sections().length === 0, "no sections before any app was used");
 
-// (a) Visit CRM on its Segments section; the sections stay on Settings.
+// (a) Visit CRM; the host names no sections of its own for it.
 await go("/apps/crm?crm=segments&ctx=crm-context&conversation=crm-conversation&keep=1");
-await settle(() => assert(sections().length === 3, "CRM sections show on the CRM screen"));
-assert(appLink("CRM")!.getAttribute("aria-current") === "true", "the open app is highlighted");
+await settle(() => assert(appLink("CRM")!.getAttribute("aria-current") === "page", "the open app is highlighted as the current page"));
+assert(sections().length === 0, "no host-named sections without a declared screen navigation");
 equal(appLink("Social Content")!.getAttribute("href"), "/apps/social-content?keep=1", "switching apps drops installation-scoped query but preserves unrelated state");
 await go("/settings/email-sending");
 await settle(() => assert(location.pathname.startsWith("/settings"), "on Settings"));
-await settle(() => assert(sections().length === 3, "CRM sections stay visible on Settings"));
+assert(sections().length === 0, "still no host-named sections on Settings");
 
-// (c) The last section is restored: the app link and the Segments row
-// return to Segments, and a fresh mount (reload) remembers it.
-equal(appLink("CRM")!.getAttribute("href"), "/apps/crm?crm=segments", "app link returns to the last section");
+// (c) The last-used app link survives leaving the app and a reload.
+equal(appLink("CRM")!.getAttribute("href"), "/apps/crm", "app link returns to the app");
 await React.act(async () => { root.unmount(); });
 const root2 = createRoot(host);
 history.pushState(null, "", "/");
 await React.act(async () => { root2.render(React.createElement(LocaleProvider, null, React.createElement(App))); });
-await settle(() => assert(sections().length === 3, "sections restored after reload"));
-equal(appLink("CRM")!.getAttribute("href"), "/apps/crm?crm=segments", "last section survives a reload");
+await settle(() => assert(appLink("CRM"), "apps listed after reload"));
+equal(appLink("CRM")!.getAttribute("href"), "/apps/crm", "app link survives a reload");
 const clicked = appLink("CRM")!;
 await React.act(async () => { clicked.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
-await settle(() => assert(location.search.includes("crm=segments"), "clicking returns to CRM at Segments"));
+await settle(() => assert(location.pathname === "/apps/crm", "clicking returns to CRM"));
 
 // (b) CAD-1438: a forged installation id on the retired route yields the
 // retired page — no entry, no sections, and no protected read is issued.

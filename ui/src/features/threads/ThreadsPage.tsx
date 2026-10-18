@@ -7,7 +7,7 @@ import { navigate, useHref } from "../../lib/useLocation";
 import { fmtTime } from "../../lib/fmt";
 import { useWriteBlock } from "../auth/WriteGate";
 import { useTranslate } from "../../lib/locale";
-import { displayUiNotice, type UiNotice } from "../app-shell/campaign/useEmailDraft";
+import { displayUiNotice, type UiNotice } from "../../lib/uiNotice";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import NewHumanConversation from "./NewHumanConversation";

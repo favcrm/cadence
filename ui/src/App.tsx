@@ -680,7 +680,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   };
   const [last, setLast] = useState<LastApp | null>(() => readLastApp());
   const selectedMenuApp = menuApps.find((app) => app.installId === activeId);
-  const activeSection = selectedMenuApp ? sectionFromSearch(selectedMenuApp.kind, search, selectedMenuApp.navigation) : null;
+  const activeSection = selectedMenuApp ? sectionFromSearch(search, selectedMenuApp.navigation) : null;
   useEffect(() => {
     if (activeId === null) return;
     setLast((prev) => {
