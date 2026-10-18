@@ -1196,7 +1196,7 @@ impl Shared {
         producer_bundle: &Value,
         producer_files: &BTreeMap<String, String>,
     ) -> Result<Value> {
-        self.app_binding_receipt_current(
+        self.app_binding_receipt_library_source(
             &expected.install_id,
             expected.context_id.as_deref(),
             &expected.slot,
@@ -1291,7 +1291,7 @@ impl Shared {
                     let (producer_bundle, producer_files) = producer.ok_or_else(|| {
                         Error::rejected("reference producer snapshot is unavailable")
                     })?;
-                    self.app_binding_receipt_current(
+                    self.app_binding_receipt_library_source(
                         &original.install_id,
                         original.context_id.as_deref(),
                         &original.slot,

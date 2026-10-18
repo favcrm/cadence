@@ -238,6 +238,31 @@ fn canonical_sha256(digest: &str) -> Option<&str> {
     .then_some(hex)
 }
 
+fn shown_sha256(digest: &str) -> &str {
+    if canonical_sha256(digest).is_some() {
+        digest
+    } else {
+        "unrecognized"
+    }
+}
+
+/// Names the pinned digest, the stored custody digest, and the original
+/// producer digest the pin is required to use.
+fn media_pin_digest_refusal(pin: &str, original: &str, custody: &str) -> String {
+    let pin_shown = shown_sha256(pin);
+    let original_shown = shown_sha256(original);
+    let custody_shown = shown_sha256(custody);
+    if pin == custody && canonical_sha256(pin).is_some() {
+        format!(
+            "media reference does not match the retained original: pin {pin_shown} is the stored custody digest {custody_shown}; the required digest is the original producer digest {original_shown}"
+        )
+    } else {
+        format!(
+            "media reference does not match the retained original: pin {pin_shown} matches neither digest; the required digest is the original producer digest {original_shown} (stored custody digest is {custody_shown})"
+        )
+    }
+}
+
 /// The validated provenance behind one eligible `media.generated.image`
 /// receipt: the derivative descriptor agrees with the retained custody
 /// BLOB the record carries, and the closed original descriptor's ref
@@ -633,7 +658,9 @@ impl Store {
     /// is store-wide and the caller-side proof lives in the mount.
     /// CAD-1482: catalog revision plus the stored original digest, with no
     /// provider traffic. A missing asset, a stale revision or a digest that
-    /// is not the retained original refuses.
+    /// is not the retained original refuses. CAD-1508: a pin of the stored
+    /// custody derivative names that digest and the original producer digest
+    /// the pin must use.
     pub(crate) fn app_media_pin(
         &self,
         asset_id: &str,
@@ -641,7 +668,14 @@ impl Store {
         sha256: &str,
     ) -> Result<MediaOriginalProof> {
         let image = self.app_media_context_image(asset_id)?;
-        if image.asset.revision != revision || image.original.sha256 != sha256 {
+        if image.original.sha256 != sha256 {
+            return Err(Error::rejected(media_pin_digest_refusal(
+                sha256,
+                &image.original.sha256,
+                &image.digest,
+            )));
+        }
+        if image.asset.revision != revision {
             return Err(Error::rejected(
                 "media reference does not match the retained original",
             ));
