@@ -4,6 +4,18 @@ A context groups content defaults and run history within one workspace-owned
 app installation. It needs no project. Contexts do not grant provider access,
 choose a team or approve a run. Existing context-free runs remain supported.
 
+The board has one selected app scope for the assistant, screen and new local
+runs, including Social Content. A fresh visit can select the sole active
+context. A remembered nonempty scope that is no longer active is not silently
+replaced: pick an active scope explicitly. The picker remains available to
+recover even when only one active context remains.
+
+The assistant's **General** conversation is shared across the installation,
+not a separate history for each selected context. Subject/context-bound
+conversations keep their own binding; changing the picker does not retarget
+their history. This conversation distinction is separate from a context
+whose label happens to be “General”. Ordinary chat does not start an app run.
+
 An installed workflow must explicitly declare which content inputs can receive
 context defaults, for example:
 

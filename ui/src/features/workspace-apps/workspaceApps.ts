@@ -32,7 +32,7 @@ export interface Installation {
    * no separate approve round. `"agent"` (the default, and what an older
    * daemon that omits the field means) keeps the worker path.
    */
-  workflows?: { name: string; source_digest?: string; label?: string | null; capability_slots?: string[]; distinct?: string[]; execution?: "agent" | "host"; inputs: { name: string; default?: string | null; context_default?: boolean }[] }[];
+  workflows?: { name: string; source_digest?: string; label?: string | null; capability_slots?: string[]; distinct?: string[]; execution?: "agent" | "host"; inputs: { name: string; ask?: string | null; optional?: boolean; kind?: string | null; example?: string | null; default?: string | null; context_default?: boolean }[] }[];
 }
 /** One declared `needs.capabilities` slot: the result the app needs. Reviewed providers own the matching tools. */
 export interface SlotDeclaration {

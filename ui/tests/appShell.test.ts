@@ -493,11 +493,10 @@ equal(chatBinding({ installId: "i", wanted: "gone", known: true, activeIds: ["a"
 assert(chatBinding({ installId: "i", wanted: "gone", known: true, activeIds: ["a"] }).error?.includes("not active"), "stale scope explains itself");
 equal(chatBinding({ installId: "i", wanted: "gone", known: false, activeIds: [] }).scope, { install_id: "i", context_id: "gone" }, "unknown receipts defer to the server");
 
-// Social-content owns its context selector: the shell shows none and
-// claims no context in the chat label. The existing mounted social
-// flow (workspaceAppView suite) proves that selector still works.
-// The stub below mimics WorkspaceApp's picker exactly (local state +
-// rememberContext, no parent rerender): the shell must observe the
+// Social-content uses the same shell-owned scope as every other app:
+// the shell renders one selector and hands the verified context to the
+// workspace. The stub below mimics WorkspaceApp's picker exactly
+// (rememberContext, no parent state): the shell must observe the
 // switch in the same tab and send the new scope immediately.
 const { rememberContext: rememberCtx } = require("../src/features/workspace-apps/contextSelection");
 function StubPicker({ installId }: { installId: string }) {
@@ -522,7 +521,7 @@ await React.act(async () => {
   })));
 });
 await flush(); await flush(); await flush();
-assert(!host.querySelector('[aria-label="App context"]'), "no shell selector — social workspace owns its own");
+assert(!host.querySelector('[aria-label="App context"]'), "no stale selector name");
 assert(host.querySelector("#brand"), "the workspace keeps its own selector");
 // The Social private screen renders its own chrome — the shell must NOT
 // emit the technical `installId · version · context` subtitle.

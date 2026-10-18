@@ -26,6 +26,18 @@ loader.prototype.require = function(this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const WorkspaceApp = (require("../src/features/workspace-apps/WorkspaceApp") as typeof import("../src/features/workspace-apps/WorkspaceApp")).default;
+// CAD-1560: the workspace takes its scope from an owner (AppShell in
+// production); this harness owns the selection the same way — resolve
+// the remembered/active defaults once and follow emitted picks.
+const { initialContext, rememberedContext, subscribeContext } = require("../src/features/workspace-apps/contextSelection");
+function ScopeOwner({ installId, activeIds, children }: { installId: string; activeIds: string[]; children: (contextId: string) => any }) {
+  const [contextId, setContextId] = React.useState(() => initialContext(rememberedContext(installId), activeIds));
+  React.useEffect(() => subscribeContext((changed: string, next: string | null) => {
+    if (changed === installId) setContextId(next ?? "");
+  }), [installId]);
+  return children(contextId);
+}
+const mountApp = (viewer: any) => React.createElement(LocaleProvider, null, React.createElement(ScopeOwner, { installId: "install-a", activeIds: [], children: (contextId: string) => React.createElement(WorkspaceApp, { installId: "install-a", contextId, viewer }) }));
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 
@@ -78,7 +90,7 @@ function noTabBar(why: string) {
   assert(!control("App view") && !control("Native controls"), `${why}: no App view / Native controls tabs`);
 }
 async function render(operator = true) {
-  await React.act(async () => root.render(React.createElement(LocaleProvider, null, React.createElement(WorkspaceApp, { installId: "install-a", viewer: { operator, readOnly: false } }))));
+  await React.act(async () => root.render(mountApp({ operator, readOnly: false })));
   await flush(); await flush();
 }
 

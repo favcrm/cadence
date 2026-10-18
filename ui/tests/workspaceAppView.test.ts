@@ -19,6 +19,18 @@ loader.prototype.require = function(this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const WorkspaceApp = (require("../src/features/workspace-apps/WorkspaceApp") as typeof import("../src/features/workspace-apps/WorkspaceApp")).default;
+// CAD-1560: the workspace takes its scope from an owner (AppShell in
+// production); this harness owns the selection the same way — resolve
+// the remembered/active defaults once and follow emitted picks.
+const { initialContext, rememberedContext, subscribeContext } = require("../src/features/workspace-apps/contextSelection");
+function ScopeOwner({ installId, activeIds, children }: { installId: string; activeIds: string[]; children: (contextId: string) => any }) {
+  const [contextId, setContextId] = React.useState(() => initialContext(rememberedContext(installId), activeIds));
+  React.useEffect(() => subscribeContext((changed: string, next: string | null) => {
+    if (changed === installId) setContextId(next ?? "");
+  }), [installId]);
+  return children(contextId);
+}
+const mountApp = (viewer: any) => React.createElement(LocaleProvider, null, React.createElement(ScopeOwner, { installId: "install-a", activeIds: ["context-b"], children: (contextId: string) => React.createElement(WorkspaceApp, { installId: "install-a", contextId, viewer }) }));
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const installation = { install_id: "install-a", title: "Social Content", name: "social-content", version: "0.2.0", digest: "bundle-digest", catalog_generation: "catalog-generation", approved: true, storage_kind: "workspace", files: ["workflows/instagram.md", "workflows/facebook.md"], capabilities: { publication: { schema: 1, capability: "text.publish", version: 1, action: "publish", resource_kind: "connection_account", effect: "send" } }, connection_slots: ["cms"] };
 let simulatedInstallation: typeof installation | null = null;
@@ -131,7 +143,7 @@ async function click(element: Element | undefined | null) {
   await React.act(async () => { element.dispatchEvent(new MouseEvent("click", { bubbles: true })); }); await flush();
 }
 async function render(operator = true, readOnly = false) {
-  await React.act(async () => root.render(React.createElement(LocaleProvider, null, React.createElement(WorkspaceApp, { installId: "install-a", viewer: { operator, readOnly } })))); await flush();
+  await React.act(async () => root.render(mountApp({ operator, readOnly }))); await flush();
 }
 async function fresh(operator = true, readOnly = false) {
   await React.act(async () => root.unmount()); root = createRoot(host); reads.length = writes.length = 0; await render(operator, readOnly);

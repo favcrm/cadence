@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { Agent } from "../../lib/types";
-import { navigate, useHref } from "../../lib/useLocation";
+import { useHref } from "../../lib/useLocation";
 import type { Viewer } from "../projects/work";
 import { ApiError } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
@@ -45,7 +45,7 @@ import { retainedRequest, completeRequest } from "./requests";
 import PublishPanel, { type PublishCandidate } from "./PublishPanel";
 import ScheduleCalendar from "./ScheduleCalendar";
 import { conversationList } from "../app-shell/conversationClient";
-import { forgetContext, initialContext, rememberedContext, rememberContext, screenContext, subscribeContext } from "./contextSelection";
+import { forgetContext, rememberContext } from "./contextSelection";
 import { promptError } from "./promptFields";
 import "./workspace-apps.css";
 import ScreenHost from "./screen/ScreenHost";
@@ -198,44 +198,23 @@ function parseSocialDestination(href: string, installId: string, appKey?: string
   return { contextId: contextIds[0], conversationId: conversationIds[0] };
 }
 
-function withoutSocialDestination(href: string, installId: string, appKey?: string): string | null {
-  const hashStart = href.indexOf("#");
-  const withoutHash = hashStart < 0 ? href : href.slice(0, hashStart);
-  const hash = hashStart < 0 ? "" : href.slice(hashStart);
-  const queryStart = withoutHash.indexOf("?");
-  const path = queryStart < 0 ? withoutHash : withoutHash.slice(0, queryStart);
-  if (!workspaceHrefMatches(path, installId, appKey)) return null;
-  if (queryStart < 0) return null;
-  let removed = false;
-  const kept = withoutHash.slice(queryStart + 1).split("&").filter(part => {
-    const separator = part.indexOf("=");
-    const rawName = separator < 0 ? part : part.slice(0, separator);
-    let name: string;
-    try {
-      name = decodeURIComponent(rawName.replace(/\+/g, " "));
-    } catch {
-      return true;
-    }
-    if (name !== "ctx" && name !== "conversation") return true;
-    removed = true;
-    return false;
-  });
-  if (!removed) return null;
-  const query = kept.filter(part => part !== "").join("&");
-  return `${withoutHash.slice(0, queryStart)}${query ? `?${query}` : ""}${hash}`;
-}
 
 export default function WorkspaceApp({
   installId,
   viewer,
   onBack,
   appKey,
+  contextId,
   onMediaAttach,
 }: {
   installId: string;
   viewer: Viewer;
   onBack?: () => void;
   appKey?: string;
+  /** CAD-1560: the shell-owned app scope. This workspace never resolves or
+   *  stores the selection itself — in-workspace choices go through
+   *  `rememberContext`, and the owner hands the verified value back here. */
+  contextId: string;
   onMediaAttach?: MediaChatAttach;
 }) {
   const t = useTranslate();
@@ -249,7 +228,6 @@ export default function WorkspaceApp({
   /** True while a revalidation runs behind painted data — the subtle cue. */
   const refreshing = loading && data !== null;
   const [section, setSection] = useState<Section>("Board");
-  const [contextId, setContextId] = useState(() => rememberedContext(installId) ?? "");
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const [verifiedImage, setVerifiedImage] = useState<VerifiedImage | null>(null);
   const [creating, setCreating] = useState(false);
@@ -292,6 +270,10 @@ export default function WorkspaceApp({
   const conversationInFlightSeen = useRef<string | null>(null);
   const [destinationProof, setDestinationProof] = useState<DestinationProof | null>(null);
   const supersedeDestinationWithUserChoice = useCallback((expected?: { visitKey: string | null; selectionEpoch: number }) => {
+    // A deliberate in-workspace choice retires the pending destination:
+    // bump the intent epoch so an in-flight proof can no longer adopt the
+    // linked scope, mark the visit consumed, and drop the proof. The URL
+    // strip is the scope owner's job (its context emit rewrites the link).
     if (expected && (
       destinationVisitRef.current !== expected.visitKey ||
       userContextIntentEpoch.current !== expected.selectionEpoch
@@ -299,10 +281,8 @@ export default function WorkspaceApp({
     userContextIntentEpoch.current += 1;
     consumedDestinationVisit.current = destinationVisitRef.current;
     setDestinationProof(null);
-    const nextHref = withoutSocialDestination(hrefRef.current, installId, appKey);
-    if (nextHref && nextHref !== hrefRef.current) navigate(nextHref, { replace: true });
     return true;
-  }, [installId, appKey]);
+  }, []);
   const [artifact, setArtifact] = useState<TextArtifact | null>(null);
   const [artifactError, setArtifactError] = useState<string | null>(null);
   const [artifactLoading, setArtifactLoading] = useState(false);
@@ -361,7 +341,7 @@ export default function WorkspaceApp({
     setBrandName(""); setBrandVoice(""); setProtectedTerms("");
     setContentPrompt(""); setImagePrompt(""); setEditingContextId("");
     forgetContext(installId);
-    setContextId(""); setImporting(false); setSelectedSource(null);
+    setImporting(false); setSelectedSource(null);
     setUpgradeSource(""); setUpgradeProposal(null);
     setData(null); setSelectedRun(null); setSelectedArtifact(""); setArtifact(null);
     setVerifiedImage(null);
@@ -414,7 +394,6 @@ export default function WorkspaceApp({
     setContentPrompt(""); setImagePrompt(""); setEditingContextId("");
     setImporting(false); setSelectedSource(null);
     setUpgradeSource(""); setUpgradeProposal(null);
-    setContextId(rememberedContext(installId) ?? "");
     setSelectedRun(null);
     setVerifiedImage(null);
     setSelectedEffectId("");
@@ -432,24 +411,6 @@ export default function WorkspaceApp({
       activeRead.current?.abort();
     };
   }, [refresh]);
-  // The shell's header-row context choice (2+ active contexts) is announced
-  // through the remembered selection; follow it, and let the reconcile
-  // effect below validate it against the active contexts.
-  useEffect(() => subscribeContext((changed, next) => {
-    if (changed === installId && next !== null) setContextId(next);
-  }), [installId]);
-  useEffect(() => {
-    if (!data || data.installation.install_id !== installId) return;
-    const active = data.contexts.filter(value => value.state === "active").map(value => value.id);
-    // A private screen offers no context picker: exactly one active context
-    // is the workspace's single company and is selected for it; none leaves
-    // the app to render its own not-set-up state; several keep the
-    // explicit-choice behaviour.
-    const selected = screenTag(data.installation) !== null
-      ? screenContext(installId, active)
-      : initialContext(installId, active);
-    if (selected !== contextId) setContextId(selected);
-  }, [data, contextId, installId]);
   useEffect(() => {
     const visitKey = destinationVisitKey;
     if (!visitKey || !destination || !viewer.operator || busy || mutationLock.current || loading || accessDenied) return;
@@ -541,11 +502,9 @@ export default function WorkspaceApp({
       resourceState.asOf !== proof.conversationAsOf || !resourceState.data || resourceState.data.legacy ||
       conversationMatches.length !== 1
     ) return;
-
     consumedDestinationVisit.current = proof.visitKey;
     setDestinationProof(null);
     if (contextId !== proof.contextId) {
-      setContextId(proof.contextId);
       setEditingContextId("");
       setBrandName(""); setBrandVoice(""); setProtectedTerms("");
       setContentPrompt(""); setImagePrompt("");
@@ -554,6 +513,8 @@ export default function WorkspaceApp({
       setSelectedArtifact("");
       setActionError(null);
     }
+    // Persist + emit: the shell applies the proven scope and rewrites the
+    // link; no selection state lives here anymore.
     rememberContext(installId, proof.contextId);
   }, [
     destinationProof, destinationVisitKey, destinationOwnerSignature, installId, viewer.operator,
@@ -703,9 +664,7 @@ export default function WorkspaceApp({
       saved.install_id !== action.installId || saved.state !== "active" ||
       typeof saved.id !== "string" || saved.id.length === 0
     ) return;
-
     userContextIntentEpoch.current += 1;
-    const nextHref = withoutSocialDestination(hrefRef.current, action.installId, appKey);
     if (invocation.visitKey) consumedDestinationVisit.current = invocation.visitKey;
     setDestinationProof(null);
     if (contextId !== saved.id) {
@@ -717,9 +676,8 @@ export default function WorkspaceApp({
       setSelectedArtifact("");
       setActionError(null);
     }
-    setContextId(saved.id);
+    // Persist + emit: the shell owns the selection and the URL strip.
     rememberContext(action.installId, saved.id);
-    if (nextHref && nextHref !== hrefRef.current) navigate(nextHref, { replace: true });
   };
   const screenActions = useMemo(() => viewer.operator && !viewer.readOnly ? {
     call: (verb: Parameters<typeof runCall>[1], args: Record<string, unknown>, ui: Parameters<typeof runCall>[3]) => {
@@ -1020,7 +978,6 @@ export default function WorkspaceApp({
       value={contextId}
       onChange={(value) => {
         supersedeDestinationWithUserChoice();
-        setContextId(value);
         rememberContext(installId, value);
         setEditingContextId("");
         setBrandName(""); setBrandVoice(""); setProtectedTerms("");
@@ -1449,7 +1406,6 @@ export default function WorkspaceApp({
                           mountedOwner.current && identity.current === installId &&
                           supersedeDestinationWithUserChoice(selectionAtSubmit)
                         ) {
-                          setContextId(context.id);
                           rememberContext(installId, context.id);
                           setEditingContextId("");
                           setBrandName("");

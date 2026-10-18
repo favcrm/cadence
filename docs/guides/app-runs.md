@@ -64,6 +64,36 @@ release authority.
 
 ## Operator flow
 
+### Start from the board
+
+An installed app can expose a host-owned **New …** workflow action, such as
+Meeting minutes' consolidation flow. This launcher uses verified workflow
+metadata and supports capability-free local-text workflows. Host execution
+and priced capability calls keep their existing approval surfaces.
+
+Open the action in the intended app scope, enter the declared text inputs,
+and confirm **Start**. The app must have a configured default team; if it is
+missing, the form offers the existing team settings first. The owner PM and
+team-covered roles come from that configuration. Any remaining worker roles
+must use eligible registered workers in the same owner group, with distinct
+writer and reviewer assignments where the workflow requires them. The form
+does not choose models, enroll workers or grant provider access.
+
+Start uses the existing operator-only create/approve/dispatch lifecycle.
+The confirmed input and selected scope are captured for that request.
+Moving scope while the form is open closes it; a request already in flight
+remains bound to its original scope. Text is not silently truncated to fit
+an input field: the server refuses inputs outside its limits while the form
+retains the entered text. A retry of an uncertain request retains its request
+ID for the same intent.
+
+The app's read-only screen displays the resulting run and reviewed artifact
+when its declared projection supports them. Neither the screen nor ordinary
+assistant chat starts a run. This flow adds no recording, speech-to-text,
+external publication or automatic project-task creation.
+
+### Start from the CLI
+
 Use a trusted source checkout and an owned test daemon for development.
 The catalog installation command returns a stable installation ID:
 
