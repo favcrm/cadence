@@ -36,7 +36,10 @@ fn assertion(
         }))
         .unwrap(),
     );
-    let sub = actor.rsplit('/').next().unwrap_or(actor);
+    let sub = match actor {
+        "operator" => "owner",
+        _ => actor.rsplit('/').next().unwrap_or(actor),
+    };
     let claims = URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&json!({
             "iss": issuer,
@@ -274,14 +277,7 @@ fn signed_project_policy_admits_a_human_owner_and_refuses_the_rest() {
     assert!(body.get("issue").is_none());
     assert!(body.get("card").is_none());
 
-    let owner_replace = assertion(
-        &key,
-        &issuer,
-        "users/owner",
-        "user",
-        "owner",
-        "aos274-replace",
-    );
+    let owner_replace = assertion(&key, &issuer, "operator", "user", "owner", "aos274-replace");
     let (status, body) = call(
         port,
         &owner_replace,
@@ -293,6 +289,11 @@ fn signed_project_policy_admits_a_human_owner_and_refuses_the_rest() {
         body["policy"]["members"],
         json!(["operator"]),
         "grants replace the recorded list"
+    );
+    let journal = crate::issue::git(&pm.dir, &["log", "-1", "--format=%B"]).unwrap();
+    assert!(
+        journal.lines().any(|line| line == "Actor: users/owner"),
+        "the policy journal did not identify the authenticated Owner: {journal}"
     );
 
     jwks_thread.join().unwrap();

@@ -136,12 +136,13 @@ isolation gate passes), and `grants` is the full replacement member list
 (`users/<handle>` or `operator`), not a merge. The success body is
 `{project, policy, committed}` — a policy record, not an issue card.
 Human Owner only (`role_at_issue=owner` and `principal_kind=user`); a
-member or an owner-role agent is refused before a write. `issue project
-add` and `issue project ls` stay local.
+member or an owner-role agent is refused before a write. The native policy
+commit records `Actor: users/<handle>` from that verified Owner, not the
+container's ambient alias. Local CLI writes retain their existing actor
+resolution. `issue project add` and `issue project ls` stay local.
 `message send` (to a named alias — lands as the cli actor's derived
 handle, never "operator") stays in the server verb table but has no
-client mapping in this build — the milestone sends the three `issue_*`
-write verbs only.
+client mapping in this build.
 
 Client-side refusals (CAD-1179 — refused before any bytes leave the
 process): `issue new` without `--project`, or with `--id`/`--status`;

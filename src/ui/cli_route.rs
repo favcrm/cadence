@@ -746,6 +746,7 @@ fn dispatch(
                     &req.project,
                     visibility,
                     &req.grants.unwrap_or_default(),
+                    &format!("users/{}", actor.handle),
                 ) {
                     Ok(out) => json_ok(out),
                     Err(e) => write_err(&e),

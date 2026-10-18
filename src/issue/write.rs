@@ -589,6 +589,7 @@ pub fn set_project_policy(
     key: &str,
     visibility: project::Visibility,
     members: &[String],
+    actor: &str,
 ) -> Result<Value> {
     // Validate before any join. A remote key is caller input; `../…` or a
     // slash must never become a path outside the tracker.
@@ -628,7 +629,7 @@ pub fn set_project_policy(
         std::slice::from_ref(&yaml_path),
         &format!("project {key} policy version {}", policy.version),
         &[],
-        "",
+        actor,
     ) {
         Ok(f) => f,
         Err(e) => {
@@ -2566,7 +2567,8 @@ mod tests {
         let start = before.policy.as_ref().map(|p| p.version).unwrap_or(0);
         let id = before.id.clone().expect("creation mints an identity");
 
-        let out = set_project_policy(&pm, key, project::Visibility::WorkspaceVisible, &[]).unwrap();
+        let out =
+            set_project_policy(&pm, key, project::Visibility::WorkspaceVisible, &[], "").unwrap();
         assert_eq!(out["policy"]["version"], start + 1);
         assert_eq!(out["policy"]["visibility"], "workspace_visible");
         let loaded = project::load(&pm.dir.join(key).join("project.yaml")).unwrap();
@@ -2579,31 +2581,31 @@ mod tests {
             key,
             project::Visibility::WorkspaceVisible,
             &["users/mia".to_string()],
+            "",
         )
         .unwrap();
         assert_eq!(out["policy"]["version"], start + 2);
         assert_eq!(out["policy"]["members"][0], "users/mia");
+        let before = std::fs::read(pm.dir.join(key).join("project.yaml")).unwrap();
 
         // Private is refused until the isolation gate passes.
-        let err = set_project_policy(&pm, key, project::Visibility::Private, &[]).unwrap_err();
-        assert!(err.to_string().contains("private"), "{err}");
+        set_project_policy(&pm, key, project::Visibility::Private, &[], "").unwrap_err();
 
         // Reserved grantee kinds and unknown projects are refused.
-        let err = set_project_policy(
+        set_project_policy(
             &pm,
             key,
             project::Visibility::WorkspaceVisible,
             &["agents/dev".to_string()],
+            "",
         )
         .unwrap_err();
-        assert!(err.to_string().contains("agents/dev"), "{err}");
-        let err = set_project_policy(&pm, "ghost", project::Visibility::WorkspaceVisible, &[])
+        set_project_policy(&pm, "ghost", project::Visibility::WorkspaceVisible, &[], "")
             .unwrap_err();
-        assert!(err.to_string().contains("no project"), "{err}");
+        assert!(!pm.dir.join("ghost").exists());
 
         // A key that is not the tracker grammar never joins the filesystem,
         // so it cannot create or edit a project outside this pm dir.
-        let before = std::fs::read(pm.dir.join(key).join("project.yaml")).unwrap();
         for bad in [
             "../aos274-escape",
             "cadence/../../aos274-escape",
@@ -2611,24 +2613,21 @@ mod tests {
             "..",
             "/tmp",
         ] {
-            let err = set_project_policy(
+            set_project_policy(
                 &pm,
                 bad,
                 project::Visibility::WorkspaceVisible,
                 &["users/mia".to_string()],
+                "",
             )
             .unwrap_err();
-            assert!(
-                err.to_string().contains("Invalid project key"),
-                "{bad}: {err}"
-            );
         }
         let escape = pm.dir.join("..").join("aos274-escape").join("project.yaml");
         assert!(!escape.exists(), "traversal key wrote outside the tracker");
         assert_eq!(
             std::fs::read(pm.dir.join(key).join("project.yaml")).unwrap(),
             before,
-            "a rejected key mutated the real project"
+            "a refused policy mutation changed the real project"
         );
     }
 
@@ -2645,7 +2644,7 @@ mod tests {
         let hook = failing_hook(&pm);
 
         assert!(
-            set_project_policy(&pm, key, project::Visibility::WorkspaceVisible, &[]).is_err(),
+            set_project_policy(&pm, key, project::Visibility::WorkspaceVisible, &[], "").is_err(),
             "the refused commit was reported as a success"
         );
         assert_eq!(

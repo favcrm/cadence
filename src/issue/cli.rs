@@ -884,7 +884,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 grants,
             } => {
                 let pm = open_pm()?;
-                let out = write::set_project_policy(&pm, key, visibility.recorded(), grants)?;
+                let out = write::set_project_policy(&pm, key, visibility.recorded(), grants, "")?;
                 print_json(&out);
                 Ok(0)
             }
