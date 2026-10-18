@@ -237,7 +237,12 @@ impl ProviderEnv {
     /// Bind launch policy to the caller's actual workspace store, never an
     /// environment variable a provider or worker can replace.
     pub fn with_settings_store(&self, store: Arc<crate::store::Store>) -> Self {
-        Self(Arc::clone(&self.0), self.1.clone(), self.2.clone(), Some(store))
+        Self(
+            Arc::clone(&self.0),
+            self.1.clone(),
+            self.2.clone(),
+            Some(store),
+        )
     }
 
     pub(crate) fn settings_store(&self) -> Option<&crate::store::Store> {
