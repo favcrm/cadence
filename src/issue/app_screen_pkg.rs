@@ -112,6 +112,22 @@ pub fn tags_in(files: &BTreeMap<String, String>) -> Result<Vec<String>> {
     Ok(tags)
 }
 
+/// CAD-1543: an install is eligible for host SMTP custody only when one
+/// of its integrity-checked screen packages, declared for `app`, lists
+/// `smtp.bind`. Any scan or parse failure reads as not declared.
+pub fn declares_smtp_custody(files: &BTreeMap<String, String>, app: &str) -> bool {
+    tags_in(files).is_ok_and(|tags| {
+        tags.iter().any(|tag| {
+            extract(files, tag).is_ok_and(|pkg| {
+                pkg.app == app
+                    && pkg
+                        .operations
+                        .contains(&app_screen_decl::ScreenOperation::SmtpBind)
+            })
+        })
+    })
+}
+
 /// Re-prove one screen package against the live bundle snapshot.
 ///
 /// Collects the `screens/<tag>/` members from `files`, refuses when the

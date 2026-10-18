@@ -34,7 +34,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
   const navigationCallbacks = useRef({ onRoute, onCommand, onNavigation, onMediaAttach, href });
   navigationCallbacks.current = { onRoute, onCommand, onNavigation, onMediaAttach, href };
   const mounted = useRef<MountReceipt | null>(null);
-  const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, ...(p.installation.name === "crm" && receipt.tag === "crm" ? { presentation_locale: presentationLocale.current } : {}), route: routeFromHref(receipt.navigation, receipt.tag, navigationCallbacks.current.href), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : p;
+  const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, presentation_locale: presentationLocale.current, route: routeFromHref(receipt.navigation, receipt.tag, navigationCallbacks.current.href), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : p;
   const container = useRef<HTMLDivElement>(null);
   const channel = useRef<ScreenChannel | null>(null);
   const latest = useRef(projection);

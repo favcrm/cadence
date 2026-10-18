@@ -73,7 +73,7 @@ async function mount(world: World, viewer = { operator: true, readOnly: false })
     if (method === "POST") world.posts.push({ path: url.pathname, body });
     switch (`${method} ${url.pathname}`) {
       case "GET /api/app-installations":
-        return json([{ install_id: "install-crm", name: "crm", title: "CRM" }, { install_id: "install-social", name: "social-content", title: "Social" }]);
+        return json([{ install_id: "install-crm", name: "crm", title: "CRM", smtp_custody: true }, { install_id: "install-social", name: "social-content", title: "Social" }]);
       case "GET /api/app-installations/install-crm/contexts": return json({ contexts: world.contexts });
       case "GET /api/connections": return json({ connections: world.connections });
       case "POST /api/crm-smtp/show":
