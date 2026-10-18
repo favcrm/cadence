@@ -12,6 +12,7 @@ const CAP: u64 = 16 * 1024;
 #[derive(Clone, Debug)]
 pub struct DeploymentMetadata {
     providers: Vec<ProviderDeployment>,
+    company_master: Option<HostedCompanyMaster>,
 }
 
 #[derive(Deserialize)]
@@ -19,6 +20,8 @@ pub struct DeploymentMetadata {
 struct MetadataFile {
     schema: u32,
     providers: Vec<ProviderDeployment>,
+    #[serde(default, deserialize_with = "parse_master_trust_boundary")]
+    master_trust_boundary: Option<HostedCompanyMaster>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -124,6 +127,26 @@ pub(crate) struct HostedSmtpAdmission {
     _private: (),
 }
 
+/// Image-owned company-container trust boundary, not filesystem confinement.
+/// The hosted Master may read company files, including operational originals.
+/// Only validated deployment metadata can construct this authority.
+#[derive(Clone, Debug)]
+pub(crate) struct HostedCompanyMaster {
+    _private: (),
+}
+
+fn parse_master_trust_boundary<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<HostedCompanyMaster>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match String::deserialize(deserializer)?.as_str() {
+        "company-container@1" => Ok(Some(HostedCompanyMaster { _private: () })),
+        _ => Err(serde::de::Error::custom("unknown Master trust boundary")),
+    }
+}
+
 fn refused() -> Error {
     Error::rejected("trusted provider deployment metadata refused")
 }
@@ -208,8 +231,18 @@ impl DeploymentMetadata {
                 return Err(refused());
             }
         }
+        if metadata.master_trust_boundary.is_some()
+            && !metadata.providers.iter().any(|entry| {
+                entry.provider == "agenticos"
+                    && entry.origin == "http://api.internal"
+                    && entry.manifest_pin == "agenticos-manifest@1/publish_post@2"
+            })
+        {
+            return Err(refused());
+        }
         Ok(Self {
             providers: metadata.providers,
+            company_master: metadata.master_trust_boundary,
         })
     }
 
@@ -256,6 +289,10 @@ impl DeploymentMetadata {
                     )
             })
             .map(|_| HostedBusinessDocumentsAdmission { _private: () })
+    }
+
+    pub(crate) fn hosted_company_master(&self) -> Option<HostedCompanyMaster> {
+        self.company_master.clone()
     }
 
     pub fn pin(&self, provider: &str, origin: &str) -> Option<&str> {

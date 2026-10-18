@@ -64,3 +64,34 @@ the fixed file. This is a programmatic trusted-composition seam, never serialize
 from caller inputs. Deterministic fixtures use that seam; loader unit tests use
 an internal test owner parameter. Production always requires UID 0. These tests
 are not evidence of a root-owned image installation or live hosted operation.
+
+## Hosted company Master trust boundary
+
+An image may explicitly assert the top-level
+`"master_trust_boundary": "company-container@1"`. This is accepted only alongside
+the exact `agenticos` / `http://api.internal` /
+`agenticos-manifest@1/publish_post@2` provider tuple. Absent authority retains the
+normal workspace-confinement refusal; null, unknown versions and mismatched
+tuples refuse startup.
+
+This mode means the company Master is trusted with files inside that company's
+container, **including operational upload originals belonging to company users
+and threads**. It does not promise filesystem privacy against that Master.
+Container/platform isolation between companies is the image owner's deployment
+responsibility, not an isolation fact proved by this assertion. Root ownership
+and descriptor-safe loading protect against unprivileged configuration input;
+they do not make the file immutable against a root process inside the container.
+
+The assertion permits an already operator-selected unconfined Master to launch
+when filesystem confinement is unavailable. It does not select `--unconfined`,
+change providers or models, remove registrations, clear uncertain turns or bypass
+upload HTTP ownership and turn-envelope checks. Effective filesystem confinement
+remains preferred when available. An unconfined launch continues to report
+`confined: false` and the existing warning; company-container authority is never
+reported as filesystem confinement.
+
+The daemon captures this authority at startup outside the mutable provider
+environment map. Environment variables, agent parameters, PM files and serialized
+environment replay cannot grant it. A new daemon boot re-reads the trusted
+composition; it is not a live-revocation protocol. Default and self-hosted
+compositions without the assertion keep their existing behavior.
