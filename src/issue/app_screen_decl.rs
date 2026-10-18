@@ -226,7 +226,7 @@ impl ScreenOperation {
     }
     /// CAD-1537: the closed allowlist a read-only screen (a member or a
     /// `--read-only` board viewer) may call. Every other operation —
-    /// each write, SLOT and host command — is refused for such a mount.
+    /// each write, SLOT and effectful host command — is refused for it.
     pub fn is_screen_read(self) -> bool {
         matches!(
             self,
@@ -248,6 +248,11 @@ impl ScreenOperation {
                 | Self::SendsShow
                 | Self::SmtpShow
                 | Self::OriginShow
+                // Presentation-only host commands: the daemon validates and
+                // echoes them; the host changes its URL or inert preview.
+                | Self::ScreenRoutePatch
+                | Self::ScreenPreviewShow
+                | Self::ScreenPreviewClear
         )
     }
     pub fn args_limit(self) -> usize {

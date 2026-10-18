@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { loadFailureMessage, loadWithBackoff } from "./installationsLoad";
-import { workspaceApps, type Installation } from "./workspaceApps";
+import { appExplorer, workspaceApps, type Installation } from "./workspaceApps";
 
 export interface InstallationsState {
   /** The last good list; `null` until one answer has arrived. Kept across failed refreshes. */
@@ -19,7 +19,24 @@ export interface InstallationsState {
  * refresh keeps the last good list; a busy daemon is retried with bounded
  * backoff before the error is shown. `refreshKey` re-reads on change.
  */
-export function useInstallations(enabled: boolean, refreshKey: unknown): InstallationsState {
+/** CAD-1537: a member's apps come from the member-readable `/api/app-home`
+ *  rows. Only the fields route resolution reads are carried — `install_id`,
+ *  `name` (the key), `title`, `removed` and `project_link`; nothing else of
+ *  the operator's `Installation` is present, so these rows serve app-key
+ *  resolution and the menu only. */
+async function memberRows(signal: AbortSignal): Promise<Installation[]> {
+  const home = await appExplorer.home(signal);
+  if (!Array.isArray(home?.installations)) throw new Error("The server returned an invalid app list.");
+  return home.installations.map((row) => ({
+    install_id: row.install_id,
+    name: row.name,
+    title: row.title,
+    removed: row.attention?.state === "removed" ? 1 : null,
+    project_link: row.project ?? "",
+  }) as unknown as Installation);
+}
+
+export function useInstallations(enabled: boolean, refreshKey: unknown, source: "list" | "home" = "list"): InstallationsState {
   const [list, setList] = useState<Installation[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
@@ -34,7 +51,7 @@ export function useInstallations(enabled: boolean, refreshKey: unknown): Install
     const controller = new AbortController();
     setLoading(true);
     setRetrying(false);
-    loadWithBackoff(() => workspaceApps.installations(controller.signal), {
+    loadWithBackoff(() => source === "home" ? memberRows(controller.signal) : workspaceApps.installations(controller.signal), {
       signal: controller.signal,
       onRetry: () => { if (!controller.signal.aborted) setRetrying(true); },
     }).then(
@@ -50,7 +67,7 @@ export function useInstallations(enabled: boolean, refreshKey: unknown): Install
       },
     );
     return () => controller.abort();
-  }, [enabled, refreshKey, manual]);
+  }, [enabled, refreshKey, manual, source]);
   const retry = useCallback(() => setManual((n) => n + 1), []);
   return { list, error, retrying, loading, retry };
 }

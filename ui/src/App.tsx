@@ -639,8 +639,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     window.addEventListener(APPS_CHANGED_EVENT, bump);
     return () => window.removeEventListener(APPS_CHANGED_EVENT, bump);
   }, []);
-  const listReader = meta?.operator === true || (boardReadOnly && screenReader);
-  const installations = useInstallations(listReader, `${route.screen}:${appsTick}`);
+  const listReader = meta?.operator === true || screenReader;
+  // CAD-1537: a member resolves app keys from `/api/app-home`, never the
+  // operator-only installed-app list.
+  const memberHome = screenReader && !boardReadOnly;
+  const installations = useInstallations(listReader, `${route.screen}:${appsTick}`, memberHome ? "home" : "list");
   // A soft-removed app is not an app to open: drop it from the menu.
   const installed: VerifiedApp[] = useMemo(
     () => (installations.list ?? []).filter((i) => i.removed == null).map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })),
@@ -1066,7 +1069,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             search={search}
             installations={installations}
             viewer={viewer}
-            listReader={listReader}
+            // CAD-1537: a member resolves only the canonical app-key route;
+            // the retired id route stays unavailable to it.
+            listReader={listReader && !(memberHome && route.screen === "workspaceApp")}
             recheckFinished={recheckFinished}
             onRetryWorkspace={reload}
             onInstallation={reportInstallation}
@@ -1196,8 +1201,8 @@ function WorkspaceAppEntry({
   search: string;
   installations: InstallationsState;
   viewer: Viewer;
-  /** CAD-1537: this viewer may read the installed-app list (the operator,
-   *  or a signed-in `--read-only` board viewer). */
+  /** CAD-1537: this viewer may resolve an installed app (the operator, a
+   *  signed-in `--read-only` board viewer, or a member via app-home). */
   listReader: boolean;
   recheckFinished: boolean;
   onRetryWorkspace: () => void;

@@ -675,7 +675,9 @@ export default function AppShell({
   // context can never mint here.
 
   const screenRoute = (patch: RoutePatch, navigation: ScreenNavigation) => {
-    if (receiptReady && contextAdoptionReady && scope.contextId && viewer.operator === true && !viewer.readOnly) writeQuery({ screenRoute: { patch, navigation } }, { replace: patch.replace });
+    // CAD-1537: a route patch only rewrites this page's URL, so a read-only
+    // screen viewer may navigate too.
+    if (receiptReady && contextAdoptionReady && scope.contextId && (viewer.operator === true && !viewer.readOnly || viewer.screenReader === true)) writeQuery({ screenRoute: { patch, navigation } }, { replace: patch.replace });
   };
   const attachMediaReference: MediaChatAttach = async (selected, actionToken, isCurrent) => {
     const target = mediaTarget.current;
