@@ -189,6 +189,8 @@ confinement or hosted write fencing because an outer container exists.
 Daemon startup and the updater share a reader in the lifecycle module.
 A missing `pm.yaml` or absent `hosted:` table leaves hosted lifecycle off;
 other read failures, malformed YAML and invalid `hosted:` tables refuse.
+A present null value or bare `hosted:` key is invalid; use
+`hosted: { lease: off }` to explicitly disable lifecycle.
 Reading this configuration acquires or renews no lease.
 
 ## Recovery / internals: `rollout` and `upgrade`

@@ -410,7 +410,7 @@ pub struct Hosted {
 /// Read the tracker's `hosted:` table. Parse only: no acquire, renew,
 /// or authority check. `Ok(None)` is a missing `pm.yaml` or a missing
 /// table (hosted lifecycle off). Any other I/O failure, invalid YAML,
-/// or a present table that does not deserialize as [`Hosted`]
+/// or a present table that is not a mapping or cannot deserialize as [`Hosted`]
 /// (`deny_unknown_fields`, wrong types) is an error naming the path
 /// and, when one key is the culprit, that key. `none`/`off`/unset
 /// `lease` stays a successful [`Hosted`] value; [`acquire`] enforces
@@ -433,17 +433,18 @@ pub fn read_hosted(pm_dir: &Path) -> Result<Option<Hosted>> {
     let Some(hosted) = yaml.get("hosted") else {
         return Ok(None);
     };
+    let mapping = hosted
+        .as_mapping()
+        .ok_or_else(|| Error::rejected(format!("{} [hosted] must be a mapping", path.display())))?;
     serde_yaml::from_value(hosted.clone())
         .map(Some)
         .map_err(|e| {
-            let culprit = hosted.as_mapping().and_then(|m| {
-                m.iter().find_map(|(k, v)| {
-                    let mut one = serde_yaml::Mapping::new();
-                    one.insert(k.clone(), v.clone());
-                    serde_yaml::from_value::<Hosted>(serde_yaml::Value::Mapping(one))
-                        .is_err()
-                        .then(|| k.as_str().unwrap_or("?").to_string())
-                })
+            let culprit = mapping.iter().find_map(|(k, v)| {
+                let mut one = serde_yaml::Mapping::new();
+                one.insert(k.clone(), v.clone());
+                serde_yaml::from_value::<Hosted>(serde_yaml::Value::Mapping(one))
+                    .is_err()
+                    .then(|| k.as_str().unwrap_or("?").to_string())
             });
             match culprit {
                 Some(key) => Error::rejected(format!("{} [hosted] {key}: {e}", path.display())),

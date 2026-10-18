@@ -939,7 +939,20 @@ fn run_child_state(
     }
 
     let output = run_child_output(sb, exe, args, grant, env)?;
-    let response: ChildState = serde_json::from_slice(&output).map_err(|error| {
+    // Struct decoding also accepts positional arrays; this protocol needs an object.
+    let start = output
+        .iter()
+        .position(|byte| !matches!(*byte, b' ' | b'\n' | b'\r' | b'\t'))
+        .unwrap_or(output.len());
+    let output = &output[start..];
+    if output.first() != Some(&b'{') {
+        return Err(Error::rejected(format!(
+            "`cadence {}` in dev '{}' returned invalid startup state: expected a JSON object",
+            args.join(" "),
+            sb.name
+        )));
+    }
+    let response: ChildState = serde_json::from_slice(output).map_err(|error| {
         Error::rejected(format!(
             "`cadence {}` in dev '{}' returned invalid startup state: {error}",
             args.join(" "),

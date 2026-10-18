@@ -8,13 +8,16 @@
 //! selector refusal stay in force.
 //!
 //! `read_hosted` fails closed on a non-NotFound read, bad YAML, and a hosted
-//! table that is not the hosted record; a missing file or table is off.
+//! table that is not the hosted record, including `hosted: null` and a bare
+//! `hosted:`. A missing file or table is off.
 //! A foreground `daemon run` must surface that unusable config itself.
 //!
 //! `dev up --build` talks only to an owned `cadence-fixture` child. `issue
 //! init` may exit 0 with no output. `daemon start` must report one JSON
 //! object whose `state` is a nonempty string; anything else refuses and
-//! must not reach `ui start`. A state object with extra fields may pass.
+//! must not reach `ui start`, including a root array such as `["started"]`.
+//! A state object with extra fields may pass, including one space, tab,
+//! CR, and LF before `{`.
 //! A child stderr frame whose `kind` is already `ui_bind_in_use` still
 //! follows the parent's existing retry classification. That does not
 //! prove own-child provenance. The fixture is not a service and not a
@@ -407,7 +410,7 @@ fn read_hosted_rejects_unusable_config_and_absent_table_is_off() {
     assert_eq!(hosted.lease_renew_secs, None);
     assert_eq!(hosted.flush_timeout_secs, None);
 
-    let cases: [(&str, Option<&str>, &[&str]); 7] = [
+    let cases: [(&str, Option<&str>, &[&str]); 9] = [
         ("directory", None, &["pm.yaml", "cannot read", "refusing"]),
         ("malformed", Some("hosted: [\n"), &["pm.yaml", "YAML"]),
         ("scalar", Some("hosted: off\n"), &["pm.yaml", "hosted"]),
@@ -427,6 +430,8 @@ fn read_hosted_rejects_unusable_config_and_absent_table_is_off() {
             Some("hosted:\n  lease_ttl_secs: later\n"),
             &["pm.yaml", "hosted", "lease_ttl_secs"],
         ),
+        ("null", Some("hosted: null\n"), &["pm.yaml", "hosted"]),
+        ("empty", Some("hosted:\n"), &["pm.yaml", "hosted"]),
     ];
     for (name, body, needles) in cases {
         let _ = fs::remove_dir_all(pm.join("pm.yaml"));
@@ -630,6 +635,7 @@ fn dev_up_fixture_requires_startup_state_and_keeps_bind_retries() {
         ("missing", "jmiss", "invalid startup state"),
         ("nonstring", "jtype", "invalid startup state"),
         ("blank", "jblank", "empty startup state"),
+        ("array", "jarray", "invalid startup state"),
     ];
     for (mode, name, needle) in bad {
         let _ = fs::remove_file(&log);
@@ -781,7 +787,9 @@ daemon)
     missing) printf '%s' '{"ready":true}'; exit 0 ;;
     nonstring) printf '%s' '{"state":false,"extra":1}'; exit 0 ;;
     blank) printf '%s' '{"state":"  "}'; exit 0 ;;
-    retry) printf '%s' '{"state":"started","note":"kept","pid":0}'; exit 0 ;;
+    array) printf '%s' '["started"]'; exit 0 ;;
+    # Leading space/tab/CR/LF is valid JSON whitespace before the object.
+    retry) printf ' \t\r\n%s' '{"state":"started","note":"kept","pid":0}'; exit 0 ;;
     *) printf '%s' '{"error":"unknown fixture mode"}' >&2; exit 97 ;;
     esac
     ;;
