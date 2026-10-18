@@ -72,20 +72,25 @@ metadata and supports capability-free local-text workflows. Host execution
 and priced capability calls keep their existing approval surfaces.
 
 Open the action in the intended app scope, enter the declared text inputs,
-and confirm **Start**. The app must have a configured default team; if it is
-missing, the form offers the existing team settings first. The owner PM and
-team-covered roles come from that configuration. Any remaining worker roles
-must use eligible registered workers in the same owner group, with distinct
-writer and reviewer assignments where the workflow requires them. The form
-does not choose models, enroll workers or grant provider access.
+and choose **Prepare**. The app must have a configured default team; if it
+is missing, the form offers the existing team settings first. The displayed
+owner PM and team-covered roles are frozen explicitly into the draft, not
+replaced by a default team saved in another tab. Remaining roles use eligible
+registered workers in the same owner group, with distinct assignments where
+the workflow requires them. No model selection, worker enrollment or provider
+access is granted.
 
-Start uses the existing operator-only create/approve/dispatch lifecycle.
-The confirmed input and selected scope are captured for that request.
-Moving scope while the form is open closes it; a request already in flight
-remains bound to its original scope. Text is not silently truncated to fit
-an input field: the server refuses inputs outside its limits while the form
-retains the entered text. A retry of an uncertain request retains its request
-ID for the same intent.
+Review the server's frozen inputs, assignments and exact snapshot, then
+confirm **Approve and start**. The existing operator-only approval pins its
+snapshot digest, and dispatch rechecks the native installation/context proofs.
+A changed bundle or context receipt cannot silently replace the form's
+confirmed proof. Moving scope closes the dialog and stops further approval
+or dispatch; a request already in flight remains bound to its original scope.
+
+Text is not silently trimmed or textarea-truncated: the server refuses inputs
+outside its limits while the form retains the entered text. Unseen/uncertain
+responses retain their request ID. Retrying first inspects the stored run
+state; only explicitly dismissing a displayed result retires that replay ID.
 
 The app's read-only screen displays the resulting run and reviewed artifact
 when its declared projection supports them. Neither the screen nor ordinary

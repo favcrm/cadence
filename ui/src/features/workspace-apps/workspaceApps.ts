@@ -113,6 +113,7 @@ export interface WorkspaceRun {
   id: string; install_id: string; context_id: string | null; state: string;
   snapshot_digest: string; approved_digest: string | null;
   snapshot: {
+    bundle_digest: string;
     workflow: { title: string; source_digest?: string; execution?: "agent" | "host"; steps: { id: string; kind: string; assignee: string; dependencies: string[]; instruction: string }[]; publication_slot?: string | null }; inputs: Record<string, string>; owner_pm: string;
     context?: { id: string; revision: number; digest: string } | null;
     publication?: { slot: string; binding: { id: string; revision: number; digest: string } | null };
@@ -315,6 +316,7 @@ export const workspaceApps = {
   createBinding: async (id: string, body: BindingCreate) => (await request<{ binding: AppBinding }>(`${installation(id)}/bindings`, undefined, body)).binding,
   updateBinding: async (id: string, bindingId: string, body: { expected_revision: number; connection_id: string }) => (await request<{ binding: AppBinding }>(`${installation(id)}/bindings/${part(bindingId)}/update`, undefined, body)).binding,
   createRun: (body: CreateRun) => request<WorkspaceRun>("/api/app-runs", undefined, body),
+  getRun: (id: string, signal?: AbortSignal) => request<WorkspaceRun>(run(id), signal),
   startRun: (body: StartRun) => request<WorkspaceRun>("/api/app-runs/start", undefined, body),
   team: async (id: string, signal?: AbortSignal) => (await request<{ team: InstallTeam | null }>(`${installation(id)}/team`, signal)).team,
   setTeam: async (id: string, body: { owner_pm: string; roles: Record<string, string>; expected_revision: number }) => (await request<{ team: InstallTeam }>(`${installation(id)}/team`, undefined, body)).team,

@@ -542,7 +542,8 @@ assert(text().includes("not active"), "stale social scope explains itself");
 const pick = host.querySelector<HTMLSelectElement>(".app-shell-crumb select[data-social-context]");
 assert(pick, "a multi-context Social screen offers a selection control in the header row");
 assert(!host.querySelector(".app-shell-outlet select[data-social-context]"), "the control is never inside the screen outlet");
-equal(Array.from(pick.options).map((o) => o.value).filter(Boolean), ["ctx-brand", "ctx-beta"], "the control lists the active contexts");
+equal(pick.value, "ctx-gone", "a stale scope stays visibly selected until an explicit recovery");
+equal(Array.from(pick.options).filter((o) => !o.disabled).map((o) => o.value).filter(Boolean), ["ctx-brand", "ctx-beta"], "only active contexts are selectable");
 await React.act(async () => {
   Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!.set!.call(pick, "ctx-beta");
   pick.dispatchEvent(new Event("change", { bubbles: true }));

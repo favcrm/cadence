@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import { useTranslate } from "../../lib/locale";
 import type { Viewer } from "../projects/work";
-import type { Agent, AppContext, InstallTeam, Installation } from "../workspace-apps/workspaceApps";
+import type { Agent, AppContext, InstallTeam, Installation, WorkspaceRun } from "../workspace-apps/workspaceApps";
 import { workspaceApps } from "../workspace-apps/workspaceApps";
 import { retainedRequest, completeRequest } from "../workspace-apps/requests";
 import { WorkspaceDialog } from "../workspace-apps/WorkspaceDialog";
@@ -13,10 +13,8 @@ import "../workspace-apps/workspace-apps.css";
 
 /** One declared installed workflow as the installation detail reports it. */
 type WorkflowDecl = NonNullable<Installation["workflows"]>[number];
-/** The daemon's contract: `app_run_start` agent runs take the owner PM and
- *  every declared team role from the install's default team — a caller value
- *  for a team role is refused as a forgery. Only inputs the team does not
- *  cover may be collected here. */
+/** Team-covered roles are displayed from the configured team, then frozen
+ * explicitly into the operator's draft before approval. */
 const teamCovered = (team: InstallTeam, name: string) => name in team.roles;
 
 /** Registered, live, managed local workers: the eligibility the social
@@ -38,14 +36,10 @@ const localWorkers = (agents: Agent[]) =>
  * declared label, `inputs` (`ask`/`optional`/`default`/`context_default`)
  * and `distinct` worker-role names — never app-name branches.
  *
- * Scope is the shell's selected context, captured on open and re-checked
- * before the start call: a moved selection aborts honestly instead of
- * starting work under a scope the operator no longer sees. The run is
- * started through the guarded `app_run_start` (create + approve +
- * dispatch in one operator gesture); team roles come from the
- * installation's configured team, and a missing team offers the same
- * TeamSettings the workspace settings use — there is no caller-chosen
- * owner PM path because the daemon refuses one on start.
+ * Preparing creates only a draft. The operator sees its exact frozen inputs
+ * and assignments before approving and dispatching the snapshot. Changed
+ * installation/context receipts refuse; default-team changes cannot silently
+ * replace the assignments the operator saw.
  */
 export default function RunLauncher({
   installation,
@@ -77,6 +71,12 @@ export default function RunLauncher({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<{ id: string; state: string } | null>(null);
+  const [prepared, setPrepared] = useState<{ run: WorkspaceRun; requestKey: string } | null>(null);
+  const mounted = useRef(false);
+  useLayoutEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   // The scope this dialog opened under: the run is pinned to exactly it.
   const scope = useRef({ installId, contextId });
   const denied = (error: unknown) => error instanceof ApiError && [401, 403].includes(error.status);
@@ -87,12 +87,12 @@ export default function RunLauncher({
       workspaceApps.team(installId, controller.signal),
       workspaceApps.agents(controller.signal),
     ]).then(([nextTeam, nextAgents]) => {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || !ownsDialog()) return;
       setTeam(nextTeam);
       setAgents(nextAgents);
       setReadError(null);
     }).catch((reason: unknown) => {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || !ownsDialog()) return;
       if (denied(reason)) { onClose(); return; }
       setReadError(reason instanceof Error ? reason.message : "The app team could not be read.");
     });
@@ -111,6 +111,22 @@ export default function RunLauncher({
     if (!current) onClose();
   }, [current, onClose]);
   if (!current) return null;
+
+  const ownsDialog = () => mounted.current && stillCurrent();
+  const showFailure = (reason: unknown) => {
+    if (!ownsDialog()) return;
+    if (denied(reason)) { onClose(); return; }
+    setError(reason instanceof Error ? reason.message : "The run could not be confirmed.");
+  };
+  const matchesReceipts = (run: WorkspaceRun) =>
+    run.install_id === installId && run.context_id === (scope.current.contextId || null) &&
+    run.snapshot.bundle_digest === installation.digest &&
+    (context === null
+      ? run.snapshot.context == null
+      : run.snapshot.context?.id === context.id &&
+        run.snapshot.context.revision === context.revision && run.snapshot.context.digest === context.digest) &&
+    Object.keys(run.snapshot.capabilities ?? {}).length === 0 &&
+    Object.keys(run.snapshot.quotes ?? {}).length === 0;
 
   const contentInputs = workflow.inputs.filter((input) => roles[input.name] !== true);
   const roleInputs = workflow.inputs.filter((input) => roles[input.name] === true);
@@ -175,48 +191,75 @@ export default function RunLauncher({
         return;
       }
     }
-    if (!stillCurrent()) { onClose(); return; }
+    if (!ownsDialog()) { onClose(); return; }
     setError(null);
     setBusy(true);
-    // Frozen intent: the workflow, its collected non-team inputs, the
-    // retained request id, and the exact scope the operator confirmed.
+    // Preparing freezes the displayed team, not a newer default team that
+    // another tab may have saved. No approval or dispatch occurs here.
     const inputs = collectedInputs();
+    for (const input of workflow.inputs) {
+      if (teamCovered(team, input.name)) inputs[input.name] = team.roles[input.name];
+    }
     const requestKey = JSON.stringify({
       installId, digest: installation.digest, contextId: scope.current.contextId,
       contextRevision: context?.revision, contextDigest: context?.digest,
       workflow: workflow.name, team, inputs,
     });
-    void workspaceApps.startRun({
+    void workspaceApps.createRun({
       install_id: installId,
       workflow: workflow.name,
+      owner_pm: team.owner_pm,
       inputs,
       request_id: retainedRequest(requestKey),
-      expected_quotes: {},
       ...(scope.current.contextId ? { context_id: scope.current.contextId } : {}),
     }).then((run) => {
-      if (!stillCurrent()) {
-        // The scope moved while the start was in flight: the run (when the
-        // server accepted it) is pinned to the context it was created for —
-        // say exactly that instead of pretending nothing happened.
-        setResult(null);
-        setError(`The app scope moved while this run was starting. If the server accepted it, the run belongs to "${context?.config.label ?? scope.current.contextId}" — check that context.`);
-        return;
+      if (!ownsDialog()) return;
+      if (!matchesReceipts(run) || run.snapshot.owner_pm !== team.owner_pm) {
+        throw new Error("The frozen installation or context no longer matches this dialog. No approval or dispatch was sent; reload the app before continuing.");
       }
-      if (typeof run?.id !== "string" || typeof run?.state !== "string") {
-        setError("The start reply could not be confirmed. Check the scope's runs before trying again.");
-        return;
+      setPrepared({ run, requestKey });
+      if (run.state !== "awaiting_approval" && run.state !== "approved") {
+        setResult({ id: run.id, state: run.state });
       }
-      completeRequest(requestKey);
-      setResult({ id: run.id, state: run.state });
-    }).catch((reason: unknown) => {
-      if (denied(reason)) { onClose(); return; }
-      if (!stillCurrent()) { onClose(); return; }
-      setError(reason instanceof Error ? reason.message : "The run could not be started.");
-    }).finally(() => setBusy(false));
+    }).catch(showFailure).finally(() => { if (ownsDialog()) setBusy(false); });
+  };
+
+  const confirm = () => {
+    if (busy || prepared === null || !canWrite || !ownsDialog()) return;
+    const { run, requestKey } = prepared;
+    setError(null);
+    setBusy(true);
+    void (async () => {
+      // Read before retrying an uncertain approval/dispatch, never replay a
+      // side effect merely because its response was not observed.
+      let next = await workspaceApps.getRun(run.id);
+      if (!ownsDialog()) return;
+      if (next.snapshot_digest !== run.snapshot_digest || !matchesReceipts(next)) {
+        throw new Error("The frozen plan no longer matches this dialog. No approval or dispatch was sent.");
+      }
+      if (next.state === "awaiting_approval") {
+        next = await workspaceApps.approveRun(next.id, run.snapshot_digest);
+        if (!ownsDialog()) return;
+      }
+      if (next.state === "approved") {
+        next = await workspaceApps.dispatchRun(next.id);
+        if (!ownsDialog()) return;
+      }
+      setPrepared({ run: next, requestKey });
+      setResult({ id: next.id, state: next.state });
+    })().catch(showFailure).finally(() => { if (ownsDialog()) setBusy(false); });
+  };
+
+  const close = () => {
+    // Only an explicit acknowledgement of a displayed result retires replay
+    // identity. Unmount/scope changes and unseen late responses retain it.
+    if (result !== null && prepared !== null) completeRequest(prepared.requestKey);
+    onClose();
   };
 
   return (
-    <WorkspaceDialog title={title} onClose={onClose}>
+    <WorkspaceDialog title={title} onClose={close}>
+      {error !== null && <p className="wa-alert" data-tone="fail" role="alert">{error}</p>}
       {team === undefined || agents === null ? (
         readError !== null
           ? <div className="wa-stack"><p className="wa-alert" data-tone="fail" role="alert">{readError}</p>
@@ -235,9 +278,12 @@ export default function RunLauncher({
             setBusy(true);
             try {
               await work();
+              if (!ownsDialog()) return;
               const next = await workspaceApps.team(installId);
+              if (!ownsDialog()) return;
               setTeam(next);
             } catch (reason: unknown) {
+              if (!ownsDialog()) return;
               if (denied(reason)) { onClose(); return; }
               setReadError(reason instanceof Error ? reason.message : "The app team could not be confirmed.");
               setTeam(undefined);
@@ -254,15 +300,46 @@ export default function RunLauncher({
               : t("The run was created in {context} with state {state}.").replace("{context}", () => context?.config.label ?? scope.current.contextId).replace("{state}", () => result.state)}
           </p>
           <p className="wa-kicker">{t("Run")} {result.id}</p>
-          <Button onClick={onClose}>{t("Close")}</Button>
+          {prepared?.run.failure && <p className="wa-alert" role="alert">{prepared.run.failure.reason}</p>}
+          <Button onClick={close}>{t("Close")}</Button>
+        </div>
+      ) : prepared !== null ? (
+        <div className="wa-stack">
+          <h2>{t("Review frozen plan")}</h2>
+          <p className="wa-muted">{prepared.run.state === "approved"
+            ? t("Approval is already recorded for this frozen plan. Confirm to dispatch it.")
+            : t("Nothing is dispatched until you approve this exact plan. Changed native receipts refuse approval or dispatch.")}</p>
+          <p className="wa-muted">{t("Owner PM")}: {prepared.run.snapshot.owner_pm}</p>
+          <p className="wa-kicker">{t("Context")}: {context?.config.label ?? t("No context")}</p>
+          {Object.entries(prepared.run.snapshot.inputs).map(([name, value]) => (
+            <div className="wa-field" key={name}>
+              <span>{name.replace(/_/g, " ")}</span>
+              <pre className="wa-preview">{value}</pre>
+            </div>
+          ))}
+          {prepared.run.snapshot.workflow.steps.map((step) => (
+            <div className="wa-step" key={step.id}>
+              <span>{step.kind === "review_text" ? t("Independent review") : t("Write text")} · {step.assignee}</span>
+            </div>
+          ))}
+          <details className="wa-details">
+            <summary>{t("Inspect the exact plan")}</summary>
+            <pre>{JSON.stringify(prepared.run.snapshot, null, 2)}</pre>
+            <p className="wa-digest">{prepared.run.snapshot_digest}</p>
+          </details>
+          <div className="wa-row">
+            <Button onClick={() => setPrepared(null)} disabled={busy}>{t("Edit inputs")}</Button>
+            <Button variant="primary" loading={busy} disabled={!canWrite} onClick={confirm}>
+              {prepared.run.state === "approved" ? t("Start approved plan") : t("Approve and start")}
+            </Button>
+          </div>
         </div>
       ) : (
         <form className="wa-stack" onSubmit={submit}>
           <p className="wa-muted">
-            {t("This run is created in {context} and stays there — switching context while it starts leaves it where it was created.").replace("{context}", () => context?.config.label ?? t("this scope"))}
-            {" "}{t("The team below is this app's configured default; the daemon re-proves every role.")}
+            {t("Prepare a draft in {context}, then review its frozen inputs and assignments before starting it.").replace("{context}", () => context?.config.label ?? t("this scope"))}
+            {" "}{t("The team below is the configured default read for this form; these displayed assignments are frozen into the draft.")}
           </p>
-          {error !== null && <p className="wa-alert" data-tone="fail" role="alert">{error}</p>}
           {contentInputs.map((input) => {
             const id = `wa-run-${input.name}`;
             const label = input.ask?.trim() || input.name.replace(/_/g, " ");
@@ -323,7 +400,7 @@ export default function RunLauncher({
             <p className="wa-alert">{t("No registered worker in this owner group can fill the role. Register one first.")}</p>
           )}
           <Button type="submit" variant="primary" loading={busy} disabled={!canWrite}>
-            {t("Start {label}").replace("{label}", () => title)}
+            {t("Prepare {label}").replace("{label}", () => title)}
           </Button>
         </form>
       )}

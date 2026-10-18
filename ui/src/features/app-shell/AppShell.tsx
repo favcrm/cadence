@@ -822,6 +822,15 @@ export default function AppShell({
   const launchFlow = launcherRun !== null
     ? launchableWorkflows.find((flow) => flow.name === launcherRun.name) ?? null
     : null;
+  const launcherOwnership = useRef<{ intent: typeof launcherRun; current: boolean }>({ intent: null, current: false });
+  const launchContext = launcherRun === null ? undefined : contexts.find((c) => c.id === launcherRun.contextId);
+  launcherOwnership.current.intent = launcherRun;
+  launcherOwnership.current.current = canLaunch && launchFlow !== null && launcherRun !== null &&
+    installation !== null && installation.install_id === installId && installation.digest === launcherRun.installDigest &&
+    contextId === launcherRun.contextId &&
+    (launcherRun.contextRevision === null
+      ? launcherRun.contextId === ""
+      : launchContext?.state === "active" && launchContext.revision === launcherRun.contextRevision && launchContext.digest === launcherRun.contextDigest);
 
   return (
     <div className="app-shell" data-app-shell-outlet={installId}>
@@ -856,6 +865,9 @@ export default function AppShell({
               rememberContext(installId, next);
             }}
           >
+            {contextId !== "" && !activeIds.includes(contextId) && (
+              <option value={contextId} disabled>{t("Unavailable context")}</option>
+            )}
             {isSocial && <option value="">{t("No context")}</option>}
             {!isSocial && (
               <option value="" disabled>
@@ -1130,22 +1142,13 @@ export default function AppShell({
               )}
               {launchFlow !== null && launcherRun !== null && (
                 <RunLauncher
+                  key={`${installId}:${launcherRun.name}:${launcherRun.contextId}:${launcherRun.installDigest}:${launcherRun.contextRevision}`}
                   installation={installation}
                   workflow={launchFlow}
                   contextId={launcherRun.contextId}
                   context={contexts.find((c) => c.id === launcherRun.contextId) ?? null}
                   viewer={viewer}
-                  stillCurrent={() => {
-                    // The frozen receipts at open must still be live:
-                    // install identity+digest, the selected context's
-                    // exact revision/digest, and write authority.
-                    if (installation?.install_id !== installId || installation.digest !== launcherRun.installDigest) return false;
-                    if (contextId !== launcherRun.contextId || viewer.operator !== true || viewer.readOnly) return false;
-                    const live = contexts.find((c) => c.id === launcherRun.contextId);
-                    return launcherRun.contextRevision === null
-                      ? launcherRun.contextId === ""
-                      : live !== undefined && live.revision === launcherRun.contextRevision && live.digest === launcherRun.contextDigest;
-                  }}
+                  stillCurrent={() => launcherOwnership.current.intent === launcherRun && launcherOwnership.current.current}
                   onClose={() => setLauncherRun(null)}
                 />
               )}

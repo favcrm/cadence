@@ -44,6 +44,7 @@ const run = (id: string, context: string | null, state = "running", subject?: st
   id, install_id: INSTALL, context_id: context, state,
   snapshot_digest: `sd-${id}`, approved_digest: null,
   snapshot: {
+    bundle_digest: "bundle-digest",
     workflow: { title: `Wf ${id}`, steps: [] },
     inputs: { subject: subject ?? `Title ${id}` },
     owner_pm: "pm-a", assignments: {},

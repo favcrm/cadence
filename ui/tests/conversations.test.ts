@@ -39,7 +39,7 @@ const { parseSlash, autoSelectCampaignConversation, conversationThread, conversa
 
 equal([parseSlash("/new"), parseSlash(" /CLEAR "), parseSlash("/new now"), parseSlash("hello")], ["new", "new", null, null], "only the bare commands are commands");
 
-const inst = (id: string, name: string) => ({ install_id: id, title: name, name, version: "0.1.0", digest: "d", catalog_generation: "g", approved: true, storage_kind: "workspace", files: [], capabilities: null, connection_slots: [] });
+const inst = (id: string, name: string) => ({ install_id: id, title: name, name, version: "0.1.0", digest: "d", catalog_generation: "g", approved: true, approval: { state: "approved", epoch: 1 }, storage_kind: "workspace", files: [], capabilities: null, connection_slots: [] });
 const ctxs = (id: string) => ({ contexts: [{ id: "ctx-a", install_id: id, revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } }] });
 const ent = (seq: number, role: string, kind: string, text: string, message: string) => ({ seq, role, kind, message, text, created: "2026-10-03T00:00:00Z", payload: null });
 const conv = (id: string, over: object = {}) => ({ id, title: null, subject: null, is_general: false, ...over });
