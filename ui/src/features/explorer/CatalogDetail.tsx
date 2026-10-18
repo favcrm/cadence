@@ -1,189 +1,164 @@
 import { useEffect, useState } from "react";
 import Link from "../../ui/Link";
-import Button from "../../ui/Button";
-import { appExplorer, notifyAppsChanged, type CatalogCard } from "../workspace-apps/workspaceApps";
+import { useTranslate } from "../../lib/locale";
 import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip } from "./shared";
-import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
-import { Loading, Notice } from "../app-shell/shared/States";
-import { useTranslate } from "../../lib/locale";
+import { ErrorNotice, Loading, Notice } from "../app-shell/shared/States";
+import { useHref } from "../../lib/useLocation";
+import { fetchPublicApp, platformLoginHref, unavailableCopy, type PublicApp } from "./publicCatalogue";
 import "./explorer.css";
 
-/** The marketplace hand-off the retired page points at (CAD-1422). */
-const MARKETPLACE_URL = "https://app-v2.agenticos.hk/apps";
+type Phase = "loading" | "ok" | "not_found" | "malformed" | "unavailable";
 
 /**
- * One catalog app's detail (CAD-1129, `/apps/catalog/<id>`). The
- * built-in catalog is retired (CAD-1422): the daemon now answers a
- * tombstone (`retired`, `retired_reason`) for the catalog ids a
- * historical install or an open request still names, so this page shows
- * the retired reason and the install's real state — Open or Restore —
- * and hands fresh installs to the AgenticOS marketplace. It never shows
- * the old store page or an Install action for a retired source.
+ * One public catalogue app (`/apps/catalog/<id>`). The same JSON loads
+ * whether or not the viewer is signed in. Install is not offered.
  */
 export default function CatalogDetail({ id, viewer }: { id: string; viewer: Viewer }) {
   const t = useTranslate();
-  const [card, setCard] = useState<CatalogCard | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
-  const isOp = viewer.operator === true && !viewer.readOnly;
-  const installed = card?.state === "installed" || card?.state === "off";
-  const removed = card?.removed === true;
-  const retired = card?.retired === true;
+  const href = useHref();
+  const [reload, setReload] = useState(0);
+  const [phase, setPhase] = useState<Phase>("loading");
+  const [app, setApp] = useState<PublicApp | null>(null);
+  const confirmed = viewer.operator === true;
 
   useEffect(() => {
-    if (viewer.operator === null) return;
     const controller = new AbortController();
-    setError(null);
-    void appExplorer.entry(id, controller.signal)
-      .then((c) => { if (!controller.signal.aborted) setCard(c); })
-      .catch((e: unknown) => { if (!controller.signal.aborted) setError(appLoadErrorCopy(e, "Could not load the app. Try again in a moment.")); });
+    setPhase("loading");
+    setApp(null);
+    void fetchPublicApp(id, controller.signal)
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        if (result.status === "ok") {
+          setApp(result.app);
+          setPhase("ok");
+        } else {
+          setApp(null);
+          setPhase(result.status);
+        }
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return;
+        setApp(null);
+        setPhase("unavailable");
+      });
     return () => controller.abort();
-  }, [id, viewer.operator]);
+  }, [id, reload]);
 
-  const restore = () => {
-    if (!card?.install_id) return;
-    setBusy(true); setNotice(null);
-    void appExplorer.restore(card.install_id)
-      .then(() => { setNotice("Restored — it's live again."); setCard({ ...card, state: "installed", removed: false, restorable: undefined }); notifyAppsChanged(); })
-      .catch((e: unknown) => setNotice(appErrorCopy(e, "Restore didn't finish. Try again in a moment.")))
-      .finally(() => setBusy(false));
-  };
-
-  if (viewer.operator === null) {
-    return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9" aria-label={t("app catalog detail")}>
-      {viewer.access === "unavailable" ? (
-        <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
-          {t("Access could not be confirmed. Retry the access check before acting.")}
-        </Notice>
-      ) : <Loading>{t("Checking whether this session can act…")}</Loading>}
-    </main>;
+  if (phase === "loading") {
+    return (
+      <main className="apps-detail px-4 lg:px-8 pt-4 pb-9" aria-label={t("app catalog detail")}>
+        <Loading>{t("Loading…")}</Loading>
+      </main>
+    );
   }
-  if (error) {
-    return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9">
-      <div className="card px-4 py-5" role="alert">
-        <h2 className="font-medium text-ink-100 mb-1">{t("Couldn't load the app")}</h2>
-        <p className="text-label text-ink-400 mb-3">{t(error)}</p>
-        <Link href="/apps/explore" className="btn">{t("Back to Explore")}</Link>
-      </div>
-    </main>;
+  if (phase === "not_found") {
+    return (
+      <main className="apps-detail px-4 lg:px-8 pt-4 pb-9" aria-label={t("app catalog detail")}>
+        <div className="card px-4 py-5" role="status">
+          <h2 className="font-medium text-ink-100 mb-1">{t("App not found")}</h2>
+          <p className="text-label text-ink-400 mb-3">{t("This app isn't in the public catalogue.")}</p>
+          <Link href="/apps/explore" className="btn">{t("Back to Explore")}</Link>
+        </div>
+      </main>
+    );
   }
-  if (!card) {
-    return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9">
-      <p className="text-label text-ink-400" role="status">{t("Loading…")}</p>
-    </main>;
+  if (phase === "malformed" || phase === "unavailable" || !app) {
+    return (
+      <main className="apps-detail px-4 lg:px-8 pt-4 pb-9">
+        <ErrorNotice onRetry={() => setReload((n) => n + 1)} retryLabel={t("Try again")}>
+          {phase === "malformed"
+            ? t("The catalogue response couldn't be read.")
+            : t("The public catalogue is unavailable.")}
+        </ErrorNotice>
+      </main>
+    );
   }
 
-  const access = card.access ?? [];
-  const can = card.can ?? card.listing?.can ?? [];
-  const shots = card.screenshots ?? card.listing?.screenshots ?? [];
-  const about = card.about ?? card.listing?.about;
-  const setup = card.setup ?? card.listing?.setup ?? [];
-  const data = card.data ?? card.listing?.data;
+  const why = unavailableCopy(app);
+  const login = platformLoginHref(href);
+  const shots = app.listing.screenshots ?? [];
+  const notes = app.listing.accessNotes ?? [];
+  const setup = app.listing.setup ?? [];
+  const data = app.listing.data;
 
   return (
-    <main className="apps-detail px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={card.title}>
+    <main className="apps-detail px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={app.title}>
       <Link href="/apps/explore" className="text-label text-ink-400 hover:text-ink-100">{t("← Explore")}</Link>
 
+      {viewer.operator === null && viewer.access === "unavailable" && (
+        <Notice className="mt-3" state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
+          {t("Access could not be confirmed. Sign in before installing.")}
+        </Notice>
+      )}
+
       <div className="hero mt-3">
-        <AppGlyph name={card.name} icon={card.listing?.icon} size="lg" />
+        <AppGlyph name={app.title} icon={app.listing.icon} size="lg" />
         <div className="min-w-0">
-          <h1>{card.title}</h1>
-          <p className="tag">{card.listing?.tagline}</p>
+          <h1>{app.title}</h1>
+          <p className="tag">{app.listing.tagline}</p>
           <div className="by">
-            <TrustChip trust={card.trust} />
+            {app.listing.publisher.name === "Cadence" ? <TrustChip trust="cadence" /> : <span>{app.listing.publisher.name}</span>}
             <span>·</span>
-            <span>{card.listing?.category ?? "App"}</span>
-            {installed && <span className="chip ok">{t("Installed")}</span>}
-            {card.state === "off" && <span className="chip">{t("Access off")}</span>}
-            {removed && <span className="chip">{t("Removed")}</span>}
+            <span>{app.listing.category}</span>
           </div>
         </div>
       </div>
-
-      {notice && <div className="alert info mt-4" role="status">{t(notice)}</div>}
-      {retired && (
-        <div className="alert warn mt-4" role="status">
-          {card.retired_reason
-            ? t(card.retired_reason)
-            : t("This built-in catalog app was retired — the host no longer ships it. The app now lives in its own repository and the AgenticOS marketplace.")}
-        </div>
-      )}
-      {card.source_kind === "git" && (
-        <div className="alert warn mt-4">{t("Added from a Git URL by your team. Cadence checked its file list but hasn't reviewed what it does.")}</div>
-      )}
-      {removed && (
-        <div className="alert warn mt-4" role="status">
-          {t(card.restorable ? "{title} was removed. You can restore it, with the same data, for 30 days after it was removed." : "{title} was removed. The 30-day restore window has closed, so it stays removed.").replace("{title}", () => card.title)}
-        </div>
-      )}
-      {card.state === "off" && (
-        <div className="alert warn mt-4">{t("Access is off — {title} can't run or use its connections until it's turned back on.").replace("{title}", () => card.title)}</div>
-      )}
 
       <div className="dgrid">
         <div className="min-w-0">
           {shots.length > 0 && (
             <div className="shots" aria-label={t("Screenshots")}>
-              {shots.map((s, i) => (
+              {shots.map((shot, i) => (
                 <div key={i} className="shot">
                   <div className="mui">{t("screenshot")}</div>
-                  {s.caption && <span className="cap">{s.caption}</span>}
+                  {shot.caption && <span className="cap">{shot.caption}</span>}
                 </div>
               ))}
             </div>
           )}
-          {about && <p className="about">{about}</p>}
+          {app.summary && <p className="about">{app.summary}</p>}
+          {app.listing.about && app.listing.about !== app.summary && <p className="about mt-3">{app.listing.about}</p>}
 
-          {can.length > 0 && (
+          {app.listing.can.length > 0 && (
             <div className="blk">
               <h2>{t("What it can do")}</h2>
               <ul className="can">
-                {can.map((c, i) => <li key={i}><span aria-hidden>✓</span><span>{c}</span></li>)}
+                {app.listing.can.map((line) => <li key={line}><span aria-hidden>✓</span><span>{line}</span></li>)}
               </ul>
             </div>
           )}
 
-          <div className="blk">
-            <h2>{t("What it can access")}</h2>
-            <div className="access">
-              {access.map((row, i) => (
-                <div key={i} className="acc">
-                  <span className="ai" aria-hidden>{row.icon}</span>
-                  <div>
-                    <b>{row.title}</b>
-                    <span>{row.sentence}</span>
-                    {row.note && <span className="block">{row.note}</span>}
-                  </div>
-                </div>
-              ))}
-              <div className="never">
-                <span aria-hidden>⛨</span>
-                <span>{card.never ?? t("It never sees your passwords — your logins stay with Cadence.")}</span>
+          {notes.length > 0 && (
+            <div className="blk">
+              <h2>{t("What it can access")}</h2>
+              <div className="access">
+                {notes.map((line) => (
+                  <div key={line} className="acc"><span className="ai" aria-hidden>·</span><div><span>{line}</span></div></div>
+                ))}
               </div>
             </div>
-          </div>
+          )}
 
-          {setup && setup.length > 0 && (
+          {setup.length > 0 && (
             <div className="blk">
               <h2>{t("Setup")}</h2>
               <ul className="can">
-                {setup.map((s, i) => (
-                  <li key={i}>
+                {setup.map((step) => (
+                  <li key={step.label}>
                     <span aria-hidden>◦</span>
-                    <span><b>{s.label}</b>{s.help && <span className="block text-ink-500">{s.help}</span>}</span>
+                    <span><b>{step.label}</b>{step.help && <span className="block text-ink-500">{step.help}</span>}</span>
                   </li>
                 ))}
               </ul>
             </div>
           )}
 
-          {data && (data.stores?.length || data.personal) && (
+          {data && ((data.stores && data.stores.length > 0) || data.personal) && (
             <div className="blk">
               <h2>{t("Your data")}</h2>
               <div className="access">
-                {(data.stores ?? []).map((r, i) => <div key={`r${i}`} className="acc"><span className="ai">●</span><div><b>{t("Keeps")}</b><span>{r}</span></div></div>)}
+                {(data.stores ?? []).map((row) => <div key={row} className="acc"><span className="ai">●</span><div><b>{t("Keeps")}</b><span>{row}</span></div></div>)}
                 {data.personal && <div className="alert warn mt-2">{t("Holds personal data.")}</div>}
               </div>
             </div>
@@ -191,49 +166,29 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
         </div>
 
         <aside className="card side-card p-4 flex flex-col gap-3">
-          {installed && card.install_id ? (
-            <>
-              <Link className="btn btn-primary btn-lg" href={`/app-installations/${card.install_id}`}>Open {card.title}</Link>
-              {isOp && <Link className="btn" href={`/apps/manage/${card.install_id}`}>Manage</Link>}
-              {!isOp && <span className="text-micro text-ink-500">Ask an admin to manage access.</span>}
-            </>
-          ) : removed ? (
-            isOp && card.restorable ? (
-              <>
-                <Button className="btn-primary btn-lg" disabled={busy} onClick={restore}>{busy ? "Restoring…" : "Restore"}</Button>
-                <span className="text-micro text-ink-500">Brings back {card.title} with its data.</span>
-              </>
-            ) : (
-              <span className="text-micro text-ink-500">{isOp ? "The restore window has closed." : "This app was removed. Ask an admin."}</span>
-            )
-          ) : retired ? (
-            <>
-              <a className="btn btn-primary btn-lg" href={MARKETPLACE_URL} target="_blank" rel="noopener noreferrer">
-                {t("Find it in the AgenticOS marketplace")}
-              </a>
-              <span className="text-micro text-ink-500">
-                {isOp
-                  ? t("The built-in source is retired — install the current release from the marketplace or a trusted Git checkout.")
-                  : t("The built-in source is retired — ask an admin about the current release.")}
-              </span>
-            </>
-          ) : card.requested_by_me || card.state === "requested" ? (
-            <>
-              <Button className="btn-lg" disabled>Asked</Button>
-              <span className="text-micro text-ink-500">Your admin will see the request.</span>
-            </>
-          ) : (
-            <>
-              <Button className="btn-lg" disabled>{t("Install unavailable")}</Button>
-              <span className="text-micro text-ink-500">{t("This catalog entry is retired — see the notice above.")}</span>
-            </>
+          {viewer.operator !== null && (
+            <Link className="btn" href="/apps">{t("Your installed apps")}</Link>
           )}
+          {!confirmed ? (
+            <a
+              className="btn btn-primary btn-lg"
+              href={login}
+              onClick={(event) => {
+                if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                event.preventDefault();
+                window.location.assign(login);
+              }}
+            >
+              {t("Sign in")}
+            </a>
+          )}
+          <span className="text-micro text-ink-500">
+            {why ?? t("Installing from this catalogue isn't available on this page.")}
+          </span>
           <dl className="dl mt-3">
-            <dt>Made by</dt><dd><TrustChip trust={card.trust} /></dd>
-            {card.version && <><dt>Version</dt><dd>{card.version}</dd></>}
-            {card.listing?.category && <><dt>Category</dt><dd>{card.listing.category}</dd></>}
-            {retired && <><dt>Source</dt><dd>{t("Retired built-in catalog")}</dd></>}
-            {isOp && card.digest && <><dt>Digest</dt><dd className="num break-all">{card.digest}</dd></>}
+            <dt>{t("Made by")}</dt><dd>{app.listing.publisher.name}</dd>
+            {app.version && <><dt>{t("Version")}</dt><dd>{app.version}</dd></>}
+            <dt>{t("Category")}</dt><dd>{app.listing.category}</dd>
           </dl>
         </aside>
       </div>

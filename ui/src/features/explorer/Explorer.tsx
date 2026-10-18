@@ -1,203 +1,243 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import { useTranslate } from "../../lib/locale";
 import { appExplorer, notifyAppsChanged, type CatalogCard } from "../workspace-apps/workspaceApps";
 import type { Viewer } from "../projects/work";
-import { AppGlyph, TrustChip, InstallStateChip, useEscape } from "./shared";
-import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
+import { AppGlyph, TrustChip, useEscape } from "./shared";
+import { appErrorCopy } from "./appErrors";
 import { displayUiNotice, type UiNotice } from "../app-shell/campaign/useEmailDraft";
 import InstallCheckPanel from "./InstallCheckPanel";
-import { Loading, Notice } from "../app-shell/shared/States";
-import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
-import { navigate } from "../../lib/useLocation";
+import { EmptyState, ErrorNotice, Loading, Notice } from "../app-shell/shared/States";
+import { navigate, useHref } from "../../lib/useLocation";
+import {
+  fetchPublicApps,
+  platformLoginHref,
+  unavailableCopy,
+  type PublicApp,
+} from "./publicCatalogue";
 import "./explorer.css";
 
-/** The AgenticOS marketplace's Apps page — discovery and installs of
- * canonical app releases moved here (CAD-1422); the host's embedded
- * catalog is retired. Public origin proven by the provider's deploy
- * config (`agenticos-v2-web` custom domain `app-v2.agenticos.hk`). */
-const MARKETPLACE_URL = "https://app-v2.agenticos.hk/apps";
+function SignInLink({ pageHref }: { pageHref: string }) {
+  const t = useTranslate();
+  const href = platformLoginHref(pageHref);
+  return (
+    <a
+      className="btn btn-sm"
+      href={href}
+      onClick={(event) => {
+        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        event.preventDefault();
+        window.location.assign(href);
+      }}
+    >
+      {t("Sign in")}
+    </a>
+  );
+}
+
+function readFilters(href: string): { q: string; cat: string } {
+  const search = href.includes("?") ? href.slice(href.indexOf("?") + 1) : "";
+  const params = new URLSearchParams(search);
+  return { q: params.get("q") ?? "", cat: params.get("cat") ?? "" };
+}
+
+function writeFilters(q: string, cat: string) {
+  const params = new URLSearchParams();
+  if (q) params.set("q", q);
+  if (cat) params.set("cat", cat);
+  const search = params.toString();
+  navigate(`/apps/explore${search ? `?${search}` : ""}`, { replace: true });
+}
+
+function matches(app: PublicApp, q: string, cat: string): boolean {
+  if (cat && app.listing.category.toLowerCase() !== cat.toLowerCase()) return false;
+  const needle = q.trim().toLowerCase();
+  if (!needle) return true;
+  const hay = [app.title, app.summary, app.listing.tagline, app.listing.about, app.listing.publisher.name, app.listing.category, app.id]
+    .join("\n")
+    .toLowerCase();
+  return hay.includes(needle);
+}
 
 /**
- * The Apps Explorer (CAD-1422, `/apps/explore`). The host no longer
- * ships a built-in catalog: browsing and marketplace installs happen in
- * AgenticOS, so this page hands discovery off there and keeps the
- * operator's local sources — a checked Git URL — plus tombstone rows
- * for catalog ids a historical install or an open request still names.
+ * Public catalogue at `/apps/explore`. Listing data loads for every
+ * visitor. Install from the catalogue is not offered. Operators keep
+ * the checked Git URL install.
  */
 export default function Explorer({ viewer }: { viewer: Viewer }) {
   const t = useTranslate();
-  const [revision, setRevision] = useState(0);
+  const href = useHref();
+  const { q, cat } = readFilters(href);
+  const [reload, setReload] = useState(0);
+  const [menuOpen, setMenuOpen] = useState(false);
   const [gitOpen, setGitOpen] = useState(false);
-  const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [notice, setNotice] = useState<UiNotice | null>(null);
+  const [phase, setPhase] = useState<"loading" | "ok" | "malformed" | "unavailable">("loading");
+  const [apps, setApps] = useState<PublicApp[] | null>(null);
 
   const isOp = viewer.operator === true && !viewer.readOnly;
+  const confirmed = viewer.operator === true;
 
-  // The retired catalog still answers: tombstones for ids history names,
-  // never a fake "no apps" or up-to-date state. A failed read is shown.
-  const catalogLoad = useBackoffLoad((signal) => appExplorer.catalog(signal).then((r) => r.catalog), revision, viewer.operator !== null);
-  const requestsLoad = useBackoffLoad((signal) => appExplorer.requests(signal).then((r) => r.requests), revision, isOp);
-  const catalog = catalogLoad.data;
-  const requests = requestsLoad.data;
-  const error = catalogLoad.error === null ? null : appLoadErrorCopy(catalogLoad.error, "The catalog didn't load.");
+  useEffect(() => {
+    const controller = new AbortController();
+    setPhase("loading");
+    void fetchPublicApps(controller.signal)
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        if (result.status === "ok") {
+          setApps(result.apps);
+          setPhase("ok");
+        } else {
+          setApps(null);
+          setPhase(result.status);
+        }
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return;
+        setApps(null);
+        setPhase("unavailable");
+      });
+    return () => controller.abort();
+  }, [reload]);
 
-  const tombstones = useMemo(() => catalog ?? [], [catalog]);
+  const categories = useMemo(() => {
+    const names = new Set((apps ?? []).map((app) => app.listing.category));
+    return [...names].sort((a, b) => a.localeCompare(b));
+  }, [apps]);
 
-  // A removed app comes back with Restore, never a second Install.
-  const restore = (card: CatalogCard) => {
-    if (!card.install_id) return;
-    const id = card.id;
-    setBusy((b) => ({ ...b, [id]: true }));
-    void appExplorer.restore(card.install_id)
-      .then(() => { setNotice({ key: "Restored — {title} is live again.", slots: { title: card.title } }); setRevision((r) => r + 1); notifyAppsChanged(); })
-      .catch((e: unknown) => setNotice(appErrorCopy(e, "Restore didn't finish. Try again in a moment.")))
-      .finally(() => setBusy((b) => ({ ...b, [id]: false })));
-  };
-
-  if (viewer.operator === null) {
-    return (
-      <main className="apps-explore px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="explore apps">
-        <h1 className="text-section font-semibold text-ink-100 mb-4">{t("Explore apps")}</h1>
-        {viewer.access === "unavailable" ? (
-          <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
-            Access could not be confirmed. Retry the access check before acting.
-          </Notice>
-        ) : <Loading>{t("Checking whether this session can act…")}</Loading>}
-      </main>
-    );
-  }
+  const visible = useMemo(
+    () => (apps ?? []).filter((app) => matches(app, q, cat)),
+    [apps, q, cat],
+  );
 
   return (
     <main className="apps-explore px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="explore apps">
       <div className="ohead flex flex-wrap items-center gap-3 mb-2">
         <h1 className="text-section font-semibold text-ink-100">{t("Explore apps")}</h1>
         <span className="grow" />
+        {viewer.operator !== null && (
+          <Link href="/apps" className="btn btn-sm">{t("Your installed apps")}</Link>
+        )}
+        {!confirmed && <SignInLink pageHref={href} />}
         <div className="popwrap relative">
-          <Button className="btn-sm" onClick={() => setGitOpen((v) => !v)} aria-expanded={gitOpen}>
+          <Button className="btn-sm" onClick={() => setMenuOpen((v) => !v)} aria-expanded={menuOpen}>
             More ▾
           </Button>
-          {gitOpen && (
+          {menuOpen && (
             <div className="pmenu" role="menu">
               {isOp ? (
-                <button className="w-full text-left" onClick={() => setGitOpen(false)} data-git>
+                <button
+                  className="w-full text-left"
+                  onClick={() => { setMenuOpen(false); setGitOpen(true); }}
+                  data-git
+                >
                   {t("Add from Git URL…")}<small className="block text-ink-500">{t("For custom apps your team built")}</small>
                 </button>
               ) : (
                 <button className="w-full text-left opacity-50" disabled>
-                  Add from Git URL<small className="block text-ink-500">Admins only</small>
+                  Add from Git URL<small className="block text-ink-500">{confirmed ? "Admins only" : "Sign in as an admin"}</small>
                 </button>
               )}
-              <Link href="/apps" className="block">Your installed apps</Link>
             </div>
           )}
         </div>
       </div>
       <p className="text-secondary text-ink-400 mb-4">
-        {t("Apps add new skills to your workspace. Browse and install them from the AgenticOS marketplace.")}
+        {t("Apps add new skills to your workspace. Browse the public catalogue here.")}
       </p>
 
-      <div className="card p-4 mb-5" role="group" aria-label={t("AgenticOS marketplace")}>
-        <h2 className="text-cardtitle font-medium text-ink-100 mb-1">{t("The app marketplace moved")}</h2>
-        <p className="text-label text-ink-400 mb-3">
-          {t("The built-in catalog is retired. Discover reviewed releases on your company's Apps page in AgenticOS. Marketplace installs belong to your AgenticOS workspace; use a checked package or Git source to install on this Cadence host.")}
-        </p>
-        <a className="btn btn-primary btn-sm" href={MARKETPLACE_URL} target="_blank" rel="noopener noreferrer">
-          {t("Open the AgenticOS marketplace")}
-        </a>
-        <p className="text-micro text-ink-500 mt-2">
-          {t("Sign in with your company account; the marketplace handles install approval.")}
-        </p>
-      </div>
+      {viewer.operator === null && viewer.access === "unavailable" && (
+        <Notice className="mb-4" state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
+          {t("Access could not be confirmed. The public catalogue is still listed. Sign in before installing.")}
+        </Notice>
+      )}
 
       {isOp && gitOpen && (
         <GitAdd
-          onDone={() => { setGitOpen(false); setNotice("Installed — it's in your apps now."); setRevision((r) => r + 1); notifyAppsChanged(); }}
+          onDone={() => { setGitOpen(false); setNotice("Installed — it's in your apps now."); notifyAppsChanged(); }}
           onClose={() => setGitOpen(false)}
         />
       )}
 
       {notice && <div className="alert info mb-4" role="status">{displayUiNotice(notice, t)}</div>}
 
-      {isOp && requests && requests.length > 0 && (
-        <div className="alert info mb-4" role="status">
-          {t(requests.length === 1 ? "{count} teammate asked for an app — see the request count on its card." : "{count} teammates asked for an app — see the request count on its card.").replace("{count}", String(requests.length))}
+      <div className="flex flex-wrap items-center gap-3 mb-4">
+        <input
+          className="field"
+          value={q}
+          placeholder={t("Search apps")}
+          aria-label={t("Search apps")}
+          onChange={(event) => writeFilters(event.target.value, cat)}
+        />
+        <div className="cats flex flex-wrap gap-2" role="group" aria-label={t("Category")}>
+          <button type="button" className={cat ? "cat" : "cat on"} onClick={() => writeFilters(q, "")}>
+            {t("All")}
+          </button>
+          {categories.map((name) => (
+            <button
+              key={name}
+              type="button"
+              className={cat.toLowerCase() === name.toLowerCase() ? "cat on" : "cat"}
+              onClick={() => writeFilters(q, name)}
+            >
+              {name}
+            </button>
+          ))}
         </div>
-      )}
+      </div>
 
-      {error !== null && (
-        <div className="err card px-4 py-3 mb-4 text-label text-ink-400" role="alert">
-          <b className="text-ink-100">{t("Couldn't load the app catalog.")}</b> {t(error)} <Button onClick={() => setRevision((r) => r + 1)}>{t("Try again")}</Button>
+      {phase === "loading" && <Loading>{t("Loading the public catalogue…")}</Loading>}
+      {phase === "malformed" && (
+        <ErrorNotice onRetry={() => setReload((n) => n + 1)} retryLabel={t("Try again")}>
+          {t("The catalogue response couldn't be read.")}
+        </ErrorNotice>
+      )}
+      {phase === "unavailable" && (
+        <ErrorNotice onRetry={() => setReload((n) => n + 1)} retryLabel={t("Try again")}>
+          {t("The public catalogue is unavailable.")}
+        </ErrorNotice>
+      )}
+      {phase === "ok" && apps && apps.length === 0 && (
+        <EmptyState title={t("No public apps are listed.")} />
+      )}
+      {phase === "ok" && apps && apps.length > 0 && visible.length === 0 && (
+        <EmptyState title={t("No apps match this search.")} />
+      )}
+      {phase === "ok" && visible.length > 0 && (
+        <div className="cgrid grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          {visible.map((app) => (
+            <CatalogueCard key={app.id} app={app} />
+          ))}
         </div>
-      )}
-      {catalogLoad.retrying && <p className="text-label text-ink-400 mb-2" role="status">{t("The workspace is busy. Retrying…")}</p>}
-
-      {tombstones.length > 0 && (
-        <section className="sec" aria-label={t("Earlier catalog apps")}>
-          <h2 className="text-cardtitle font-medium text-ink-100 mb-3">{t("From the retired catalog")}</h2>
-          <div className="cgrid grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-            {tombstones.map((c) => (
-              <TombstoneCard key={c.id} card={c} isOp={isOp} busy={busy[c.id]} onRestore={() => restore(c)} />
-            ))}
-          </div>
-        </section>
       )}
     </main>
   );
 }
 
-/** A retired catalog entry: why the source is gone, plus the install's
- * real state — Open when live, Restore inside the window, never an
- * Install action. */
-function TombstoneCard({ card, isOp, busy, onRestore }: {
-  card: CatalogCard; isOp: boolean; busy?: boolean; onRestore: () => void;
-}) {
+function CatalogueCard({ app }: { app: PublicApp }) {
   const t = useTranslate();
+  const why = unavailableCopy(app);
   return (
-    <div className="card ccard p-4 flex flex-col gap-2" role="button" tabIndex={0}
-      onClick={() => navigate(`/apps/catalog/${encodeURIComponent(card.id)}`)}
-      onKeyDown={(event) => {
-        if (event.target === event.currentTarget && event.key === "Enter") navigate(`/apps/catalog/${encodeURIComponent(card.id)}`);
-      }}>
+    <Link href={`/apps/catalog/${encodeURIComponent(app.id)}`} className="card ccard p-4 flex flex-col gap-2 no-underline">
       <div className="flex items-start gap-3">
-        <AppGlyph name={card.name} icon={card.listing?.icon} />
+        <AppGlyph name={app.title} icon={app.listing.icon} />
         <div className="min-w-0">
-          <div className="nm text-cardtitle font-medium text-ink-100 truncate">{card.title}</div>
+          <div className="nm text-cardtitle font-medium text-ink-100">{app.title}</div>
           <div className="pub text-micro text-ink-500">
-            <TrustChip trust={card.trust} /> · {t("Retired source")}
+            {app.listing.publisher.name === "Cadence" ? <TrustChip trust="cadence" /> : <span>{app.listing.publisher.name}</span>}
+            {" · "}{app.listing.category}
+            {app.version ? ` · ${app.version}` : ""}
           </div>
         </div>
       </div>
-      <p className="text-label text-ink-400 flex-1">
-        {card.retired_reason ?? t("Its built-in catalog entry was retired. Update or reinstall it from the app's own repository.")}
-      </p>
-      <div className="flex items-center justify-between mt-1">
-        <InstallStateChip state={card.removed ? "removed" : card.state} />
-        {busy ? (
-          <Button className="btn-sm btn-primary" disabled>{t("Working…")}</Button>
-        ) : card.removed ? (
-          isOp && card.restorable
-            ? <Button className="btn-sm" onClick={(event) => { event.stopPropagation(); onRestore(); }}>{t("Restore")}</Button>
-            : <span className="text-micro text-ink-500">{isOp ? t("Restore window closed") : t("Removed")}</span>
-        ) : card.state === "installed" || card.state === "off" ? (
-          <Link className="btn btn-sm" href={`/app-installations/${card.install_id}`} onClick={(event) => event.stopPropagation()}>{t("Open")}</Link>
-        ) : (
-          <span className="text-micro text-ink-500">{t("Retired")}</span>
-        )}
-      </div>
-      {isOp && (card.request_count ?? 0) > 0 && (
-        <div className="text-micro text-ink-500">{card.request_count} teammate{card.request_count === 1 ? "" : "s"} asked for this</div>
-      )}
-    </div>
+      <p className="text-label text-ink-400 flex-1">{app.listing.tagline || app.summary}</p>
+      {why && <p className="text-micro text-ink-500">{t(why)}</p>}
+    </Link>
   );
 }
 
-/** The operator's "Add from Git URL" — a live check against the repo
- * (HTTPS, public host), then the install review: the daemon's
- * install-check shows exactly what would be installed and the install
- * sends that digest. Never a catalog row: it ships nothing to the
- * catalog list. */
+/** The operator's "Add from Git URL" — a live check, then install review. */
 function GitAdd({ onDone, onClose }: { onDone: () => void; onClose: () => void }) {
   const t = useTranslate();
   const [url, setUrl] = useState("");

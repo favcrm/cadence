@@ -18,6 +18,7 @@
   background: none; color: var(--color-ink-400); font-size: var(--text-label); cursor: pointer;
 }
 .apps-explore .cats .cat.on { background: var(--color-accent, #6d8dff); color: #fff; border-color: transparent; }
+.apps-explore a.ccard { color: inherit; text-decoration: none; }
 .apps-explore .ccard { transition: border-color .15s; }
 .apps-explore .ccard:hover { border-color: var(--color-ink-600, #444); }
 .apps-explore .ccard .nm { white-space: normal; }

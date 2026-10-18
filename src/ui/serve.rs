@@ -854,6 +854,16 @@ fn legacy_task_view(state_dir: &Path, alias: &str) -> (Value, Vec<String>) {
     (tasks, issues)
 }
 
+/// One file of the build, answered the way the SPA expects it. Both the shared
+/// dispatch and the public directory's anonymous shell path send static bytes
+/// through here, so the two cannot drift.
+fn send_static(request: Request, name: &str, bytes: Vec<u8>, head_only: bool) {
+    let mut resp = Response::from_data(bytes);
+    resp.add_header(Header::from_bytes("Content-Type", content_type(name)).unwrap());
+    resp.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
+    send(request, resp, head_only);
+}
+
 fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
     // CAD-482: a seam-armed board honors the assertion headers; the
     // scope makes the asserted identity visible to attribution and to
@@ -1069,22 +1079,36 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             );
             return;
         }
-        // The public directory is the same catalog for every reader: a visitor
-        // browses it, a live session installs from its own apps page. `/` and
-        // `/apps` are the board's own front door and keep the session gate,
-        // and every other read still needs that session.
-        if matches!(method, Method::Get | Method::Head)
-            && super::public_directory::is_public_route(&path)
-        {
-            let viewer = match operator::public_session(&request, state_dir, opts) {
-                Ok(Some(_)) => super::public_directory::Viewer::SignedIn,
-                _ => super::public_directory::Viewer::Anonymous,
-            };
-            let page_url = format!("{}://{}{}", operator::public_scheme(&host), host, raw_url);
-            if let Some(resp) =
-                super::public_directory::response(&path, raw_query, &page_url, viewer)
-            {
+        // The directory is a page in this board's own UI. Anyone may load its
+        // shell and the build files that shell needs, and read the catalogue
+        // through this board — the browser cannot reach the catalogue itself.
+        // `/` and `/apps` are the board's own front door, and every other read
+        // still needs a session.
+        if matches!(method, Method::Get | Method::Head) {
+            if let Some(resp) = super::public_directory::data_response(&path) {
                 send(request, resp);
+                return;
+            }
+            if path.starts_with("/assets/")
+                || matches!(path.as_str(), "/favicon.svg" | "/icon.svg" | "/apple-touch-icon.png")
+            {
+                if let Some((name, bytes)) = static_file(opts.dist.as_deref(), &path) {
+                    send_static(request, &name, bytes, head_only);
+                } else {
+                    send(request, err_response(404, "no such file"));
+                }
+                return;
+            }
+            if super::public_directory::is_directory_page(&path) {
+                match static_answer_for(
+                    opts.dist.as_deref(),
+                    &path,
+                    header_value(&request, "Accept").as_deref(),
+                ) {
+                    StaticAnswer::File(name, bytes) => send_static(request, &name, bytes, head_only),
+                    StaticAnswer::Missing => send(request, err_response(404, "no such file")),
+                    StaticAnswer::NoBuild => send(request, err_response(503, "no SPA build")),
+                }
                 return;
             }
         }
@@ -1107,6 +1131,13 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             }
         }
         // Signed-in reads fall through to the shared dispatch below.
+    }
+
+    if !public_host && matches!(method, Method::Get | Method::Head) {
+        if let Some(resp) = super::public_directory::data_response(&path) {
+            send(request, resp);
+            return;
+        }
     }
 
     if is_write {
@@ -2002,14 +2033,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 &path,
                 header_value(&request, "Accept").as_deref(),
             ) {
-                StaticAnswer::File(name, bytes) => {
-                    let mut resp = Response::from_data(bytes);
-                    resp.add_header(
-                        Header::from_bytes("Content-Type", content_type(&name)).unwrap(),
-                    );
-                    resp.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
-                    send(request, resp);
-                }
+                StaticAnswer::File(name, bytes) => send_static(request, &name, bytes, head_only),
                 StaticAnswer::Missing => send(request, err_response(404, "no such file")),
                 StaticAnswer::NoBuild => send(
                     request,
