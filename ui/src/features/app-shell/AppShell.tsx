@@ -10,7 +10,9 @@ import { WorkspaceAppCachedPreview } from "../workspace-apps/WorkspaceApp";
 import { chatScreenFor } from "./chatScreen";
 import { screenTag } from "../workspace-apps/screen/screenProjection";
 import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
-import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
+import ScreenUnavailable from "../workspace-apps/screen/ScreenUnavailable";
+import { isSocialContent } from "../workspace-apps/socialContentSupport";
+import { sectionFromSearch } from "./appNav";
 import Conversation from "./chat/Conversation";
 import { beginLibraryImagePin, composerScope, settleLibraryImagePin } from "./chat/composerStore";
 import { useAppChatProjection } from "./chat/descriptorClient";
@@ -30,6 +32,7 @@ import { purgeDisplayCache } from "../workspace-apps/screen/screenDisplayCache";
 import "./app-shell.css";
 
 type ParsedConversationLink = Omit<ConversationLinkRequest, "visit"> & { key: string };
+type OutletView = "list" | "new";
 
 function rawQueryValues(rawQuery: string, parameter: string): (string | null)[] {
   const values: (string | null)[] = [];
@@ -222,7 +225,7 @@ export default function AppShell({
   const currentReadComplete = completedReceiptKey === receiptKey;
   const loadError = loadFailure?.key === receiptKey ? loadFailure.message : null;
   const socialSelectionReady =
-    installation?.name !== "social-content" || socialContextInstall === installId;
+    !isSocialContent(installation) || socialContextInstall === installId;
   const loading = viewer.operator === true
     ? requestLoading || !currentReadComplete || !socialSelectionReady
     : requestLoading;
@@ -236,12 +239,6 @@ export default function AppShell({
   // direct links and browser back keep scope.
   const view: OutletView = query.get("appview") === "new" ? "new" : "list";
   const recordId = query.get("record");
-  // CRM nested sections (CAD-784): Apps → CRM → Customers/Segments/
-  // Campaigns. Only the CRM outlet reads this — every other App keeps
-  // its generic list/detail/new shape untouched.
-  const rawSection = query.get("crm");
-  const crmSection: CrmSection =
-    rawSection === "segments" || rawSection === "campaigns" ? rawSection : "customers";
   // Narrow widths: one full-width panel at a time (the approved mock's
   // Assistant | Workspace switch). Both stay mounted — only CSS hides the
   // other — so draft, stream and workspace state survive switching.
@@ -297,8 +294,7 @@ export default function AppShell({
     ctx: string | null,
     record: string | null,
     appview: string | null,
-    crm: string | null,
-  ) => `${installId}|${ctx ?? ""}|${record ?? ""}|${appview ?? ""}|${crm ?? ""}`;
+  ) => `${installId}|${ctx ?? ""}|${record ?? ""}|${appview ?? ""}`;
   const writeQuery = useCallback(
     (
       patch: {
@@ -306,7 +302,6 @@ export default function AppShell({
         appview?: OutletView | null;
         record?: string | null;
         conversation?: string | null;
-        crm?: CrmSection | null;
         clearContractPreview?: boolean;
         screenRoute?: { patch: RoutePatch; navigation: ScreenNavigation };
       },
@@ -333,10 +328,6 @@ export default function AppShell({
         if (patch.conversation === null) q.delete("conversation");
         else q.set("conversation", patch.conversation);
       }
-      if (patch.crm !== undefined) {
-        if (patch.crm === null || patch.crm === "customers") q.delete("crm");
-        else q.set("crm", patch.crm);
-      }
       if (patch.screenRoute) {
         const { patch: route, navigation } = patch.screenRoute;
         // Closed app-local selectors only. Native scope, session, conversation
@@ -359,7 +350,7 @@ export default function AppShell({
         q.delete("contract-preview");
         q.delete("contract-preview-view");
       }
-      const adoptedKey = queryKey(q.get("ctx"), q.get("record"), q.get("appview"), q.get("crm"));
+      const adoptedKey = queryKey(q.get("ctx"), q.get("record"), q.get("appview"));
       handledQuery.current = adoptedKey;
       setAdoptedContextKey(adoptedKey);
       const s = q.toString();
@@ -422,13 +413,15 @@ export default function AppShell({
     };
   }, [installId, receiptKey, viewer.operator]);
 
-  // CRM's existing first-load General setup is retriable in place. The
-  // request identity is installation-stable; its result is adopted only
-  // while this verified receipt is still current.
+  // CAD-1519: an app with a mountable screen and no active context gets its
+  // General context on the operator's first open (Social Content owns its
+  // own contexts). The setup is retriable in place; the request identity
+  // is installation-stable and its result is adopted only while this
+  // verified receipt is still current.
   useEffect(() => {
     if (
       !receiptReady ||
-      installation?.name !== "crm" ||
+      !wantsGeneralContext(installation) ||
       contexts.some((context) => context.state === "active") ||
       viewer.operator !== true ||
       viewer.readOnly
@@ -446,7 +439,7 @@ export default function AppShell({
         : null;
       if (!isCurrent()) return;
       if (row === null) {
-        setGeneralSetup({ key: setupScopeKey, error: "CRM setup did not return an active context. Retry setup or ask an administrator to review this installation." });
+        setGeneralSetup({ key: setupScopeKey, error: "App setup did not return an active context. Retry setup or ask an administrator to review this installation." });
         return;
       }
       if (query.get("ctx") === null) rememberContext(installId, row.id);
@@ -458,8 +451,8 @@ export default function AppShell({
       setGeneralSetup({
         key: setupScopeKey,
         error: error instanceof Error
-          ? `CRM setup failed: ${error.message}`
-          : "CRM setup failed. Retry setup or ask an administrator to review this installation.",
+          ? `App setup failed: ${error.message}`
+          : "App setup failed. Retry setup or ask an administrator to review this installation.",
       });
     });
     return () => { current = false; };
@@ -511,7 +504,7 @@ export default function AppShell({
     setLoadFailure(null);
     setLinkNotice(null);
     setContextId("");
-    writeQuery({ ctx: null, appview: null, record: null, conversation: null, crm: null, clearContractPreview: true }, { replace: true });
+    writeQuery({ ctx: null, appview: null, record: null, conversation: null, clearContractPreview: true }, { replace: true });
     // The strip marks the emptied query handled: unmark so adoption
     // still runs once the new installation's contexts load.
     handledQuery.current = undefined;
@@ -524,7 +517,7 @@ export default function AppShell({
     [contexts, receiptReady],
   );
   const activeIds = useMemo(() => activeContexts.map((c) => c.id), [activeContexts]);
-  const crmNeedsSetup = receiptReady && installation?.name === "crm" && activeIds.length === 0;
+  const needsSetup = receiptReady && wantsGeneralContext(installation) && activeIds.length === 0;
   const generalSetupError = generalSetup?.key === setupScopeKey ? generalSetup.error : null;
   const canRetryGeneralSetup = viewer.operator === true && !viewer.readOnly;
 
@@ -541,11 +534,10 @@ export default function AppShell({
     // Social-content owns its context end to end (the shell renders
     // no selector there): adoption must not read, write, or clear its
     // remembered selection.
-    if (installation.name === "social-content") return;
+    if (isSocialContent(installation)) return;
     const urlCtx = query.get("ctx");
     const urlRecord = query.get("record");
     const urlView = query.get("appview");
-    const urlCrm = query.get("crm");
     // A rewrite this pass emits is still "external" until adoption has
     // run against it: marking only the pre-write URL handled and
     // returning would let the next pass re-enter, and marking the
@@ -553,17 +545,13 @@ export default function AppShell({
     // never adopt the surviving ctx (the cold deep-link defect). So
     // adoption is fall-through, not early-return: normalize each
     // param, then act on the still-valid remainder.
-    const incomingQueryKey = queryKey(urlCtx, urlRecord, urlView, urlCrm);
+    const incomingQueryKey = queryKey(urlCtx, urlRecord, urlView);
     if (handledQuery.current === incomingQueryKey) {
       setAdoptedContextKey(incomingQueryKey);
       return;
     }
     handledQuery.current = incomingQueryKey;
     setAdoptedContextKey(incomingQueryKey);
-    // An unknown CRM section never renders: strip it back to the
-    // default instead of guessing a section. The explicit default
-    // (`crm=customers`) is already canonical, so it is not rewritten.
-    const badCrm = urlCrm !== null && urlCrm !== "customers" && urlCrm !== "segments" && urlCrm !== "campaigns";
     let badRecord = false;
     if (urlRecord !== null) {
       try {
@@ -580,11 +568,7 @@ export default function AppShell({
     const scopelessRecord = urlCtx === null && urlRecord !== null && !badRecord && !soleContext;
     if (staleCtx) {
       setContextId(fallbackContext());
-      setLinkNotice(
-        installation.name === "crm"
-          ? "This link names a scope that is not active in this CRM installation, so nothing was opened. Ask an administrator to review the installation's CRM setup."
-          : "The linked context is not active in this installation — the selection was cleared.",
-      );
+      setLinkNotice("The linked context is not active in this installation — the selection was cleared.");
     } else if (soleContext) {
       setContextId(activeIds[0]);
       rememberContext(installId, activeIds[0]);
@@ -592,11 +576,7 @@ export default function AppShell({
     } else if (scopelessRecord) {
       // A record link without scope is ambiguous: refuse it with a
       // notice rather than guessing which context it names.
-      setLinkNotice(
-        installation.name === "crm"
-          ? "This link does not say which scope the record belongs to, so nothing was opened. Ask an administrator to review the installation's CRM setup."
-          : "The record link names no context — the selection was cleared.",
-      );
+      setLinkNotice("The record link names no context — the selection was cleared.");
       setContextId(fallbackContext());
     } else if (urlCtx !== null) {
       // The URL's ctx+record/appview are adopted verbatim: they were
@@ -616,13 +596,12 @@ export default function AppShell({
     // handled mark leaves the surviving ctx adoptable on the next
     // pass — but adoption already ran on it above, so no second
     // effect turn is needed and the URL settles in a single replace.
-    if (badCrm || badRecord || staleCtx || scopelessRecord || soleContext) {
+    if (badRecord || staleCtx || scopelessRecord || soleContext) {
       writeQuery(
         {
           // Preserve a stale ctx selector alongside a conversation link so
           // its target can fail visibly instead of becoming contextless.
           ctx: soleContext ? activeIds[0] : staleCtx && !hasConversationLink ? null : undefined,
-          crm: badCrm ? null : undefined,
           record: badRecord || staleCtx || scopelessRecord ? null : undefined,
           appview: staleCtx ? null : undefined,
         },
@@ -651,10 +630,10 @@ export default function AppShell({
   // send early with a clear message; the server re-proves every
   // binding on send regardless.
   const verified = receiptReady === true && installation !== null && installation.install_id === installId;
-  const contextAdoptionReady = installation?.name === "social-content"
+  const contextAdoptionReady = isSocialContent(installation)
     ? socialContextInstall === installId
-    : adoptedContextKey === queryKey(query.get("ctx"), query.get("record"), query.get("appview"), query.get("crm"));
-  const wantedContext = receiptsPending || !contextAdoptionReady ? "" : installation?.name === "social-content" ? socialContext || "" : contextId;
+    : adoptedContextKey === queryKey(query.get("ctx"), query.get("record"), query.get("appview"));
+  const wantedContext = receiptsPending || !contextAdoptionReady ? "" : isSocialContent(installation) ? socialContext || "" : contextId;
   const bindingUnavailableError = loadError ??
     (viewer.operator === false
       ? "Sign in as the operator to verify this app context before sending."
@@ -753,11 +732,11 @@ export default function AppShell({
     }
   };
   const title = installation?.title || installation?.name || "App";
-  const isSocial = installation !== null && installation.name === "social-content";
-  // A non-CRM app whose approved, executable package declares one screen
-  // mounts that screen (presentation only; authorization stays in the
+  const isSocial = isSocialContent(installation);
+  // An app whose approved, executable package declares one screen mounts
+  // that screen (presentation only; authorization stays in the
   // session/epoch/digest gates). Social keeps its legacy outlet.
-  const hasPortableScreen = installation !== null && installation.name !== "crm" && screenTag(installation) !== null;
+  const hasPortableScreen = installation !== null && screenTag(installation) !== null;
   const screenOutlet = isSocial || hasPortableScreen;
   const cachedPreviewSnapshot = !receiptReady && viewer.operator === true && loadError === null
     ? readWorkspaceAppSnapshot(installId)
@@ -775,31 +754,32 @@ export default function AppShell({
   // The chat's descriptor comes from the installation's own approved package
   // (served pinned to its digest); with none, the pane is plain shared chat.
   // CAD-1174: with a single active scope the context concept is not a
-  // choice — the operator never sees it. `General` is the one scope a
-  // CRM installation gets (created below when it has none); every
-  // other app keeps the surfaces it has today.
-  const singleScope = verified && installation.name === "crm" && activeContexts.length <= 1;
+  // choice — the operator never sees it. `General` is the one scope an
+  // installation gets when it has none (created above).
+  const singleScope = verified && activeContexts.length <= 1;
   const chatProjection = useAppChatProjection(
     installId,
     verified ? installation.digest : null,
     verified ? installation.name : null,
   );
   const chatDescriptor = chatProjection.projection?.chat ?? null;
-  // The shell's own screen ids (D5): the CRM outlet's sections, or the generic
-  // outlet's `list` and `new`; the private-screen app owns its own and has none.
-  const chatScreen = chatScreenFor(installation, verified, crmSection, view);
-  // `open-view` card action: navigate within this installation and context.
+  // The chat descriptor's screen id (D5): the mounted screen's declared
+  // section when it declares navigation, else its screen tag.
+  const section = screenNavigation ? sectionFromSearch(href.split("?")[1] ?? "", screenNavigation) : null;
+  const chatScreen = chatScreenFor(installation, verified, section, view);
+  // `open-view` card action: a declared section of the mounted screen, or
+  // the generic list/new view, within this installation and context.
   const openView = useCallback(
     (target: string) => {
-      if (installation?.name === "crm") {
-        if (target === "customers" || target === "segments" || target === "campaigns") {
-          writeQuery({ crm: target, appview: null, record: null });
+      if (screenNavigation) {
+        if (screenNavigation.sections.some((s) => s.id === target)) {
+          writeQuery({ screenRoute: { patch: { section: target, view: "list", record_id: null }, navigation: screenNavigation } });
         }
       } else if (target === "list" || target === "new") {
         writeQuery({ appview: target === "list" ? null : target, record: null });
       }
     },
-    [installation, writeQuery],
+    [screenNavigation, writeQuery],
   );
 
   return (
@@ -909,7 +889,7 @@ export default function AppShell({
         </div>
         <section id="app-shell-workspace" className="app-shell-outlet" aria-label={`${title} ${t("workspace")}`}>
           {cachedPreviewSnapshot?.installation.install_id === installId &&
-            cachedPreviewSnapshot.installation.name === "social-content" && loading ? (
+            isSocialContent(cachedPreviewSnapshot.installation) && loading ? (
               <WorkspaceAppCachedPreview
                 snapshot={cachedPreviewSnapshot}
                 contextId={cachedPreviewContextId}
@@ -968,7 +948,7 @@ export default function AppShell({
             </main>
           )}
           {receiptReady && installation && (
-            crmNeedsSetup ? (
+            needsSetup ? (
               generalSetupError !== null ? (
                 <ErrorNotice
                   onRetry={canRetryGeneralSetup ? () => {
@@ -979,10 +959,10 @@ export default function AppShell({
                   {generalSetupError}
                 </ErrorNotice>
               ) : canRetryGeneralSetup ? (
-                <Loading>{t("Setting up the General CRM context…")}</Loading>
+                <Loading>{t("Setting up this app's General context…")}</Loading>
               ) : (
                 <Notice state="read-only">
-                  {t("CRM setup is required before records can open. Setup is unavailable in this read-only view; ask an administrator to review the installation.")}
+                  {t("This app needs setup before it can open. Setup is unavailable in this read-only view; ask an administrator to review the installation.")}
                 </Notice>
               )
             ) : <>
@@ -990,14 +970,6 @@ export default function AppShell({
                 // The private-screen frame owns its own chrome — the
                 // shell shows no installId/version/context subtitle.
                 null
-              ) : installation.name === "crm" ? (
-                // Single-company CRM (CAD-1008): a bound scope shows no
-                // context/scope subtitle at all — the page is the
-                // company's records. Only the exceptional unbound
-                // ambiguous state below names a setup action.
-                contextId === "" && activeIds.length > 1 ? (
-                  <p className="text-micro text-ink-500">{t("CRM setup is required before records open.")}</p>
-                ) : null
               ) : (
                 <p className="num text-micro text-ink-500">
                   {activeContexts.find((c) => c.id === contextId)?.config.label ?? t("No context")} · {installation.version}
@@ -1019,13 +991,8 @@ export default function AppShell({
                   `navigate` no-op that keeps the open record, the New
                   view and any unsaved draft instead of resetting the
                   outlet. Single-context installs keep the entry hidden
-                  — no link clutter.
-                  CAD-1008: a bound CRM scope shows no switch links at
-                  all — the single-company surface never offers a scope
-                  control. Only the exceptional unbound multi-context
-                  legacy install keeps the explicit entry; Social and
-                  generic Apps are unchanged. */}
-              {!screenOutlet && activeIds.length > 1 && (installation?.name !== "crm" || contextId === "") && (
+                  — no link clutter. */}
+              {!screenOutlet && activeIds.length > 1 && (
                 <nav
                   className={
                     contextId === ""
@@ -1040,12 +1007,8 @@ export default function AppShell({
                     }
                   >
                     {contextId === ""
-                      ? installation.name === "crm"
-                        ? t("This CRM installation is not bound to a scope yet — administrator CRM setup is required before records open.")
-                        : t("Choose a context to open {title}'s records.").replace("{title}", () => title)
-                      : installation.name === "crm"
-                        ? t("Scope:")
-                        : t("Context:")}
+                      ? t("Choose a context to open {title}'s records.").replace("{title}", () => title)
+                      : t("Context:")}
                   </p>
                   <ul
                     className={
@@ -1095,26 +1058,10 @@ export default function AppShell({
                 <InstalledScreenOutlet installation={installation} contexts={contexts} contextId={scope.contextId}
                   admitted={receiptReady && contextAdoptionReady && viewer.operator === true && !viewer.readOnly}
                   onRoute={screenRoute} onCommand={screenCommand} onNavigation={setScreenNavigation} onMediaAttach={attachMediaReference}
-                  fallback={<CrmOutlet
-                  key={`${installId}:${contextId}`}
-                  scope={scope}
-                  installationTitle={title}
-                  appKind={installation.name === "crm" ? "crm" : "generic"}
-                  view={view}
-                  recordId={recordId}
-                  section={crmSection}
-                  viewer={viewer}
-                  onView={(v) => writeQuery({ appview: v === "list" ? null : v })}
-                  onSelect={(id) => writeQuery({ record: id })}
-                  // Section moves ride real submenu links (CrmOutlet):
-                  // their hrefs already clear the record view and
-                  // drafts, so no callback is needed here.
-                  // Created records land on list + details in ONE query
-                  // write. Two sequential writes would each start from the
-                  // stale render's href, so the second would re-apply the
-                  // first's pre-image and retain `appview=new` (CAD-781 F1).
-                  onRecordCreated={(id) => writeQuery({ appview: null, record: id })}
-                />} />
+                  fallback={contextAdoptionReady
+                    ? <ScreenUnavailable installation={installation} contexts={contexts} contextId={scope.contextId}
+                        admitted={viewer.operator === true && !viewer.readOnly} operator={viewer.operator === true} />
+                    : <Loading>{t("Loading this app…")}</Loading>} />
               )}
             </>
           )}
@@ -1143,6 +1090,12 @@ export function chatBinding({ installId, wanted, known, activeIds }: {
     };
   }
   return { scope: { install_id: installId, context_id: wanted }, error: null };
+}
+
+/** The apps the shell sets up a General context for: an approved,
+ *  executable, installed screen it can mount (Social Content owns its own). */
+function wantsGeneralContext(installation: Installation | null): installation is Installation {
+  return installation !== null && installation.removed == null && !isSocialContent(installation) && screenTag(installation) !== null;
 }
 
 function contextLabel(contexts: AppContext[], contextId: string): string | null {

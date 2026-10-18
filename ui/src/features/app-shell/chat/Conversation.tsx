@@ -34,7 +34,7 @@ import {
 } from "../../home/thread";
 import type { Viewer } from "../../projects/work";
 import { useLocale } from "../../../lib/locale";
-import { displayUiNotice, type UiNotice } from "../campaign/useEmailDraft";
+import { displayUiNotice, type UiNotice } from "../../../lib/uiNotice";
 import {
   QUEUED_NOTICE,
   conversationLabel,

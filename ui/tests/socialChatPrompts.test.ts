@@ -10,12 +10,12 @@ const descriptor = parseAppChat({ contract: "app-chat/v1", app: "social-content"
   contexts: [{ id: "main", label: "Social Content", prompts: ["Fetch posts", "Draft a post from the newest", "What's ready to publish?"]}],
   attachments: [], directives: [], subjects: [] });
 
-const screen = chatScreenFor(installation({}), true, "customers", "list");
+const screen = chatScreenFor(installation({}), true, null, "list");
 check(screen === "main", "the Social screen maps to its declared chat context id");
 check(JSON.stringify(chatContext(descriptor, screen, false)?.prompts) === JSON.stringify(["Fetch posts", "Draft a post from the newest", "What's ready to publish?"]),
   "the app's declared prompts show for the Social screen");
-check(chatScreenFor(installation({}), false, "customers", "list") === null, "an unverified installation matches no chat context");
-check(chatScreenFor(installation({ approved: false }), true, "customers", "list") === null, "an unapproved screen matches no chat context");
-check(chatScreenFor(installation({ files: ["app.md"] }), true, "customers", "list") === null, "an app with no screen gets no prompts");
-check(chatScreenFor(installation({ name: "crm" }), true, "segments", "list") === "segments", "the CRM keeps its section ids");
+check(chatScreenFor(installation({}), false, null, "list") === null, "an unverified installation matches no chat context");
+check(chatScreenFor(installation({ approved: false }), true, null, "list") === null, "an unapproved screen matches no chat context");
+check(chatScreenFor(installation({ files: ["app.md"] }), true, null, "list") === null, "an app with no screen gets no prompts");
+check(chatScreenFor(installation({ name: "crm", files: ["app.md", "screens/crm/screens.json"] }), true, "segments", "list") === "segments", "a screen that declares navigation keys its chat context by the current section");
 console.log("social chat prompt checks pass");
