@@ -135,6 +135,7 @@ struct DoorRecord {
 
 fn media_door(
     original: Vec<u8>,
+    stop: Arc<AtomicBool>,
 ) -> (
     String,
     Arc<Mutex<Vec<DoorRecord>>>,
@@ -150,7 +151,7 @@ fn media_door(
     let worker = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            if Instant::now() > deadline {
+            if stop.load(Ordering::SeqCst) || Instant::now() > deadline {
                 break;
             }
             let request = match server.recv_timeout(Duration::from_millis(200)) {
@@ -273,8 +274,8 @@ impl Fx {
                 model_policy: None,
             })
             .unwrap();
-        let (base, seen, door) = media_door(original.clone());
         let stop = Arc::new(AtomicBool::new(false));
+        let (base, seen, door) = media_door(original.clone(), stop.clone());
         let mut opts = ServeOptions {
             test_seam: true,
             stop: Some(stop.clone()),
