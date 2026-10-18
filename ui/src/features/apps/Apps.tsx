@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { resources } from "../../lib/resources";
-import { ApiError } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
-import { prefetchWorkspaceApp, readInstallationsFresh, readInstallationsSnapshot, dropInstallationsSnapshot, appExplorer, notifyAppsChanged, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
+import { appExplorer, notifyAppsChanged, prefetchWorkspaceApp, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
 import { homeNeeds, type HomeNeed } from "../home/needs";
@@ -16,6 +15,7 @@ import Button from "../../ui/Button";
 import { appErrorCopy, appLoadErrorCopy, UNVERIFIED_APPS_COPY } from "../explorer/appErrors";
 import type { Viewer } from "../projects/work";
 import { AppGlyph } from "../explorer/shared";
+import AppCover from "../explorer/AppCover";
 import PageState from "../../ui/PageState";
 import { IconApps, IconLock } from "../../ui/icons";
 import "../explorer/explorer.css";
@@ -23,8 +23,8 @@ import "../explorer/explorer.css";
 /**
  * The Apps home (CAD-1129, `/apps`): the OS-style landing — a Needs-
  * attention rail, the operator's/member's favorites row, the installed
- * grid and (operator) Recently removed. "Open" opens the app's canonical
- * page (`/apps/<key>` — CAD-1438); "Manage" opens its operator tab.
+ * grid and (operator) Recently removed. Cards open app details; Favorites
+ * keep the canonical app page as the quick-open route.
  *
  * The legacy project-scoped list and the per-project catalog live
  * behind `/apps/<project>/<name>` (unchanged); this screen is the
@@ -140,6 +140,21 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
     return installedAppHref(installation.name);
   };
 
+  /**
+   * An installed card's one destination. A catalogue-backed install
+   * links to its catalogue detail (`/apps/catalog/<catalogue.id>`, the
+   * recorded locator, never a key guessed from the app name) pinned to
+   * this installation. An operator's non-catalogue install goes to the
+   * Manage detail, where access/update/remove and pin live. Everyone
+   * else keeps the canonical `/apps/<key>` open route — `null` means
+   * the card stays a readable tile instead of guessing a page.
+   */
+  const cardHref = (h: HomeInstallation): string | null => {
+    if (h.catalogue?.id) return `/apps/catalog/${encodeURIComponent(h.catalogue.id)}?installation=${encodeURIComponent(h.install_id)}`;
+    if (isOp) return `/apps/manage/${encodeURIComponent(h.install_id)}`;
+    return openHref(h);
+  };
+
   const attentionRow = (h: HomeInstallation) => {
     const s = h.attention.state;
     const label = t(s === "off" ? "Access off" : s === "setup" ? "Finish setup" : s === "update" ? "Update ready" : "Needs attention");
@@ -194,7 +209,6 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
         {!emptyWorkspace && <Button className="btn-primary" href="/apps/explore">{t("Explore apps")}</Button>}
       </div>
 
-      {isOp && <WorkspaceCatalog />}
       {actionError && <div className="alert fail mb-4" role="alert">{actionError}</div>}
       {loadError !== null && (
         <div className="apps-state card mb-4" role="alert">
@@ -241,6 +255,25 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
           <section className="sec" aria-label={t("Favorites")}>
             <div className="sechead">
               <h2>{t("Favorites")}</h2>
+              {live.length > 0 && (
+                <>
+                  <span className="grow" />
+                  <details className="favpick">
+                    <summary>{t("Choose favorites")}</summary>
+                    <div className="favpick-list" role="group" aria-label={t("Choose favorites")}>
+                      {live.map((h) => (
+                        <label key={h.install_id} className="favpick-row">
+                          <input type="checkbox"
+                            checked={favs?.favorites.includes(h.install_id) ?? false}
+                            disabled={favs === null}
+                            onChange={() => pin(h.install_id)} />
+                          <span className="favpick-name">{h.title}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </details>
+                </>
+              )}
             </div>
             {favorites.length > 0 ? (
               <div className="favs">
@@ -273,7 +306,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
             ) : (
               <div className="favempty">
                 <span aria-hidden>★</span>
-                <span>{t("Pin the apps you use every day. Tap the star on any app below and it appears here and in the sidebar.")}</span>
+                <span>{t("Use Choose favorites to keep everyday apps here and in the sidebar.")}</span>
               </div>
             )}
           </section>
@@ -297,45 +330,12 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
                   {noMatchBeforeExplore}<Link href="/apps/explore">{noMatchExploreLabel}</Link>{noMatchAfterExplore}
                 </div>
               ) : (
-                <div className="igrid">
-                  {items.map((h) => {
-                    const pinned = favs?.favorites.includes(h.install_id) ?? false;
-                    const href = openHref(h);
-                    const body = (
-                      <>
-                        <AppGlyph name={h.name} icon={h.icon} size="sm" />
-                        <div className="min-w-0 flex-1">
-                          <div className="nm">{h.title}</div>
-                          <div className="ln">{h.tagline}</div>
-                          {h.project && <div className="ln text-ink-500">{t("Project")}: {h.project}</div>}
-                          {h.attention.state !== "ok" && (
-                            <div className="mt-1"><span className={`chip ${h.attention.state === "update" ? "info" : h.attention.state === "off" ? "" : "warn"}`}>
-                              {t(h.attention.state === "update" ? "Update" : h.attention.state === "off" ? "Access off" : h.attention.state === "setup" ? "Finish setup" : "Needs attention")}
-                            </span></div>
-                          )}
-                          {href === null && <div className="ln text-ink-500">{t("No unique app page — see Manage")}</div>}
-                        </div>
-                      </>
-                    );
-                    return (
-                      <div key={h.install_id} className="card itile">
-                        {href === null ? (
-                          <span className="open" aria-label={`${t("Open")} ${h.title}`}>{body}</span>
-                        ) : (
-                          <Link className="open" href={href}
-                            onClick={() => opened(h.install_id)} aria-label={`${t("Open")} ${h.title}`}>
-                            {body}
-                          </Link>
-                        )}
-                        <div className="acts">
-                          <button className={`star ${pinned ? "pinned" : ""}`} aria-pressed={pinned}
-                            aria-label={`${t(pinned ? "Unpin" : "Pin")} ${h.title}`}
-                            onClick={() => pin(h.install_id)}>{pinned ? "★" : "☆"}</button>
-                          {isOp && <Link className="star" href={`/apps/manage/${h.install_id}`} aria-label={`${t("Manage")} ${h.title}`}>⚙</Link>}
-                        </div>
-                      </div>
-                    );
-                  })}
+                <div className="apps-grid">
+                  {items.map((h) => (
+                    <InstalledCard key={h.install_id} h={h}
+                      href={cardHref(h)}
+                      onOpen={() => opened(h.install_id)} />
+                  ))}
                 </div>
               )}
               <Link href="/apps/explore" className="explore-card mt-3" aria-label={t("Find more apps")}>
@@ -397,63 +397,65 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
     </main>
   );
 }
-
-/** Workspace installations remain visible independently of the legacy project filter. */
-function WorkspaceCatalog() {
+/**
+ * One installed app's gallery card: the whole card is a single link
+ * (no nested buttons or action links), named by its title and
+ * described by its status. Catalogue/listing fields come from the
+ * real `app_home` row — absent fields leave clean slots, never
+ * fixture text.
+ */
+function InstalledCard({ h, href, onOpen }: { h: HomeInstallation; href: string | null; onOpen: () => void }) {
   const t = useTranslate();
-  // CAD-1137: a revisit paints this session's last list at once and
-  // refetches behind it; only the very first read shows the load line.
-  const [rows, setRows] = useState<Installation[] | null>(() =>
-    readInstallationsSnapshot()?.filter(row => row.storage_kind === "workspace") ?? null,
-  );
-  const [error, setError] = useState<string | null>(null);
-  const [revision, setRevision] = useState(0);
-  useEffect(() => {
-    const controller = new AbortController();
-    const cached = readInstallationsSnapshot()?.filter(row => row.storage_kind === "workspace") ?? null;
-    setRows(cached);
-    setError(null);
-    void readInstallationsFresh(controller.signal).then(value => {
-      if (!controller.signal.aborted) setRows(value.filter(row => row.storage_kind === "workspace"));
-    }).catch((cause: unknown) => {
-      if (controller.signal.aborted) return;
-      if (cause instanceof ApiError && [401, 403].includes(cause.status)) {
-        dropInstallationsSnapshot();
-        setRows(null);
-      }
-      setError(cause instanceof Error ? cause.message : "Could not load workspace apps");
-    });
-    return () => controller.abort();
-  }, [revision]);
-  return <section aria-label={t("Workspace apps")} className="mb-5">
-    <h2 className="text-cardtitle font-medium text-ink-100 mb-2">{t("Workspace apps")}</h2>
-    {error && <div className="card px-4 py-3 text-label text-ink-400" role="alert">
-      {error} <Button onClick={() => setRevision(value => value + 1)}>{t("Retry")}</Button>
-    </div>}
-    {rows === null ? error ? null : <p className="text-label text-ink-400" role="status">{t("Loading workspace apps…")}</p> : rows.length === 0 ? <div className="card px-4 py-3 text-label text-ink-400">
-      {t("No workspace apps installed. Install a package with")} <code>cadence app catalog install &lt;path|git-url&gt;</code>.
-    </div> : <ul className="space-y-2.5">{rows.map(row => {
-      // CAD-1438: canonical `/apps/<key>` only — a shared or unsafe key
-      // gets no link instead of a retired ID route.
-      const href = installationAppHref(rows, row.install_id);
-      return <li key={row.install_id} className="card px-3.5 py-3 min-w-0"
-      onMouseEnter={() => prefetchWorkspaceApp(row.install_id)} onFocus={() => prefetchWorkspaceApp(row.install_id)}>
-      <div className="app-card-layout">
-        <AppIcon label={row.title || row.name} />
-        <div className="min-w-0 flex-1">
-          {href === null
-            ? <span className="text-cardtitle font-medium text-ink-100">{row.title || row.name}</span>
-            : <Link href={href} className="text-cardtitle font-medium text-ink-100 hover:text-accent">{row.title || row.name}</Link>}
-          {row.approved !== true && <span className="chip ml-2">{t("Access off")}</span>}
-          <p className="text-label text-ink-400 mt-0.5 break-words">{row.summary}</p>
-          {href === null && <p className="text-micro text-ink-500 mt-0.5">{t("No unique app page — see Manage")}</p>}
+  const state = h.attention.state;
+  const statusKey =
+    state === "off" ? "Access off"
+    : state === "setup" ? "Finish setup"
+    : state === "update" ? "Update ready"
+    : state === "attention" ? "Needs attention"
+    : "Installed";
+  const tone = state === "update" ? "info" : state === "setup" || state === "attention" ? "warn" : "";
+  const nameId = `app-card-name-${h.install_id}`;
+  const statusId = `app-card-status-${h.install_id}`;
+  const listing = h.listing;
+  const category = listing?.category;
+  const summary = listing?.tagline ?? h.tagline;
+  const publisher = listing?.publisher?.name;
+  const body = (
+    <>
+      <AppCover name={h.name} title={h.title} category={category ?? ""} />
+      <div className="app-card-copy">
+        {category && <span className="card-category">{category}</span>}
+        <h3 className="app-card-name" id={nameId}>{h.title}</h3>
+        {summary && <p className="app-card-summary">{summary}</p>}
+        {publisher && <span className="card-publisher">{publisher}</span>}
+        {h.project && <span className="card-publisher">{t("Project")}: {h.project}</span>}
+        <div className="card-footer">
+          <span>{t("Installed")}{h.version ? <> <b>{h.version}</b></> : null}</span>
+          <span className="app-status" id={statusId} data-state={tone}>{t(statusKey)}</span>
         </div>
-        {href !== null && <Button href={href} className="app-card-action">{t("Open app")}</Button>}
       </div>
-    </li>;
-    })}</ul>}
-  </section>;
+    </>
+  );
+  return (
+    <article className="card app-card">
+      {href === null ? (
+        <div className="app-card-link">
+          {body}
+          <div className="app-card-copy-note">{t("No unique app page — see Manage")}</div>
+        </div>
+      ) : (
+        <Link className="app-card-link" href={href}
+          aria-labelledby={nameId} aria-describedby={statusId}
+          onClick={onOpen}
+          onMouseEnter={() => prefetchWorkspaceApp(h.install_id)}
+          onFocus={() => prefetchWorkspaceApp(h.install_id)}>
+          {body}
+        </Link>
+      )}
+    </article>
+  );
 }
+
 /** A monogram tile — the app's first letter, on the board's accent. */
 function AppIcon({ label }: { label: string }) {
   const letter = (label.trim()[0] ?? "A").toUpperCase();

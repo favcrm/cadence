@@ -11,13 +11,18 @@ function toolActionBody<T extends { alias: string }>(body: T): Omit<T, "alias"> 
   if ("tool_alias" in fields) throw new Error("tool_alias is host-owned request data");
   return { ...fields, tool_alias: alias };
 }
+/** The catalogue release an install or an upgrade pins: id + exact
+ * version + digest, always carried together (CAD-1471/CAD-1565). It
+ * names a release; it is never a grant by itself. */
+export interface CatalogueLocator { id: string; version: string; digest: string }
+
 export interface Installation {
   install_id: string; name: string; title: string; version: string;
   summary: string; digest: string; catalog_generation: string; storage_kind: "workspace" | "legacy";
   /** The install's recorded upstream — `kind` is path/git/builtin (CAD-1129). */
   source?: { kind?: string; url?: string; sha?: string; dir?: string; path?: string; id?: string };
   /** Catalogue release locator recorded after an exact metadata match. Null on a path or Git install. */
-  catalogue?: { id: string; version: string; digest: string } | null;
+  catalogue?: CatalogueLocator | null;
   project_link: string | null; approved: boolean | null; executable: boolean;
   /** CAD-1129 soft remove: epoch seconds of the mark, and when Restore stops working. */
   removed?: number | null; restore_after?: number | null;
@@ -81,6 +86,14 @@ export interface AppBinding {
     publish?: { destination_id: string; destination_label: string; toolkit: string } };
   drift?: BindingDrift;
 }
+/** Declared access changed by a checked bundle (CAD-1565): which
+ * connection slots appear/disappear and which capability slot
+ * declarations differ between the installed and checked manifests. */
+export interface AccessDiff {
+  connections: { added: string[]; removed: string[] };
+  capabilities: Record<string, { before: SlotDeclaration | null; after: SlotDeclaration | null }>;
+}
+
 export interface CompatibilityCheck {
   kind: "core" | "contract";
   required: string | number[];
@@ -106,6 +119,10 @@ export interface UpgradeProposal {
   install_id: string; name: string; version: string; digest: string;
   expected_digest: string; expected_generation: string;
   structural_diff: { added: string[]; changed: string[]; removed: string[] };
+  /** The provenance the daemon authorized for this proposal — required
+   *  to equal the locator the caller pinned when one was sent. */
+  catalogue?: CatalogueLocator | null;
+  access_diff?: AccessDiff;
   compatibility?: CompatibilityReceipt; notes?: string[];
   secret_warnings: unknown[];
 }
@@ -297,10 +314,10 @@ export const workspaceApps = {
     request<{ binding: AppBinding }>(`${installation(id)}/publishing/use`, undefined, body),
   installations: (signal?: AbortSignal) => request<Installation[]>("/api/app-installations", signal),
   detail: (id: string, signal?: AbortSignal) => request<Installation>(installation(id), signal),
-  upgradeCheck: (id: string, body: { source: string; expected_digest: string; expected_generation: string; catalogue?: { id: string; version: string; digest: string }; catalogue_resolution?: "manual" }) =>
-    request<UpgradeProposal>(`${installation(id)}/upgrade/check`, undefined, body),
-  upgrade: (id: string, body: { source: string; expected_digest: string; expected_generation: string; expected_new_digest: string; request_id: string; catalogue?: { id: string; version: string; digest: string }; catalogue_resolution?: "manual" }) =>
-    request<Installation>(`${installation(id)}/upgrade`, undefined, body),
+  upgradeCheck: (id: string, body: UpgradeCheckBody, signal?: AbortSignal) =>
+    request<UpgradeProposal>(`${installation(id)}/upgrade/check`, signal, body),
+  upgrade: (id: string, body: UpgradeApplyBody, signal?: AbortSignal) =>
+    request<Installation>(`${installation(id)}/upgrade`, signal, body),
   contexts: async (id: string, signal?: AbortSignal) => (await request<{ contexts: AppContext[] }>(`${installation(id)}/contexts`, signal)).contexts,
   bindings: async (id: string, contextId?: string, signal?: AbortSignal) => (await request<{ bindings: AppBinding[] }>(contextId ? `${installation(id)}/contexts/${part(contextId)}/bindings` : `${installation(id)}/bindings`, signal)).bindings,
   connections: async (signal?: AbortSignal) => (await request<{ connections: Connection[] }>("/api/connections", signal)).connections,
@@ -456,6 +473,10 @@ export interface HomeInstallation {
    *  apart (the old `/apps` list's `Project:` chip). */
   project?: string;
   tagline?: string; icon?: string;
+  /** The readable manifest record, when the row carries one: the
+   *  installed version, the bundle's own listing copy and the recorded
+   *  catalogue locator (null/absent on a path or Git install). */
+  version?: string; listing?: Listing | null; catalogue?: CatalogueLocator | null;
   attention: {
     state: "ok" | "setup" | "update" | "off" | "attention" | "removed";
     message: string | null; action: string | null; count: number;
@@ -506,12 +527,38 @@ export interface RemovePreview {
 }
 
 /** The `install-check` receipt: what an install would admit, before it
- * writes anything (CAD-1186/1194). */
+ * writes anything (CAD-1186/1194). `catalogue`/`access_diff`/
+ * `compatibility` ride the same daemon reply the upgrade proposal reports. */
 export interface InstallCheck {
   schema: number; name: string; version: string; digest: string;
   files: string[]; committed: false; notes: string[];
   secret_warnings: { rule: string; line: number; column: number; redacted: string; severity: string }[];
+  catalogue?: CatalogueLocator | null;
+  access_diff?: AccessDiff;
+  compatibility?: CompatibilityReceipt;
 }
+
+/** The upload transport's body: a flat `{path: utf8}` bundle map plus the
+ * pins it stages under — the selected release's expected digest and the
+ * catalogue locator it claims. `catalogue` is optional on the wire. */
+export interface FilesUploadBody {
+  files: Record<string, string>;
+  expected_digest?: string;
+  catalogue?: CatalogueLocator;
+}
+
+/** An upgrade body is a `files` map OR a legacy `source`, never both —
+ * the same closed shape `workspace_upgrade_transport` admits. */
+export type UpgradeBody = {
+  expected_digest: string; expected_generation: string;
+  catalogue?: CatalogueLocator; catalogue_resolution?: "manual";
+} & ({ files: Record<string, string> } | { source: string });
+
+/** A files-mode upgrade check pins the install's recorded digest and the
+ * catalog generation it was read under; a checked apply adds the new
+ * bundle digest and a retained request id. */
+export type UpgradeCheckBody = UpgradeBody;
+export type UpgradeApplyBody = UpgradeBody & { expected_new_digest: string; request_id: string };
 
 export const appExplorer = {
   catalog: (signal?: AbortSignal) => request<{ catalog: CatalogCard[] }>("/api/app-catalog", signal),
@@ -528,6 +575,16 @@ export const appExplorer = {
    * pinned to the checked digest so changed bytes are refused. */
   installSource: (source: string, expectedDigest: string) =>
     request<Installation>("/api/app-installations", undefined, { source, expected_digest: expectedDigest }),
+  /** The guarded files-mode install check: the board stages the bundle
+   * server-side and the daemon reports what it would admit without
+   * writing anything. The reply's `digest` must equal the release's. */
+  uploadCheck: (body: FilesUploadBody, signal?: AbortSignal) =>
+    request<InstallCheck>("/api/app-installations/upload/check", signal, body),
+  /** The guarded files-mode install: the same staged `files` map, pinned
+   * to the checked `expected_digest` and the catalogue locator. The
+   * reply is the committed installation record. */
+  upload: (body: FilesUploadBody, signal?: AbortSignal) =>
+    request<Installation>("/api/app-installations/upload", signal, body),
   gitCheck: (url: string) => request<CatalogCard>("/api/app-catalog/git-check", undefined, { url }),
   putFavorites: async (installIds: string[]) => favoritesFromDaemon(await request<DaemonFavorites>("/api/app-favorites", undefined, { install_ids: installIds })),
   putFavoritesDefault: async (installIds: string[]) => favoritesFromDaemon(await request<DaemonFavorites>("/api/app-favorites/default", undefined, { install_ids: installIds })),

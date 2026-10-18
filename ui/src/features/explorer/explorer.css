@@ -107,46 +107,4 @@
 .apps-home .sechead .search { flex: 1 1 160px; min-width: 140px; width: auto; }
 .apps-home .sechead .sort { flex: 0 1 auto; width: auto; max-width: 100%; }
 
-/* CAD-1471 public directory. Tokens stay the board's. */
-.pubdir-tools { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 0 0 10px; }
-.pubdir-tools .field { flex: 1 1 220px; width: auto; min-width: min(220px, 100%); }
-.pubdir-category { flex: 1 1 200px; width: min(240px, 100%); max-width: 280px; }
-.pubdir-count { margin: 0 0 12px; }
-.pubdir-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr)); gap: 14px; }
-.pubdir-card { display: flex; flex-direction: column; gap: 12px; padding: 16px; text-align: left; min-width: 0; color: inherit; }
-.pubdir-card:hover { border-color: var(--color-ink-600); background: var(--color-ink-800); }
-.pubdir-card:focus-visible { outline: none; border-color: var(--color-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 10%, transparent); }
-.pubdir-head { display: flex; gap: 12px; align-items: flex-start; min-width: 0; }
-.pubdir-id { min-width: 0; flex: 1; }
-.pubdir-id strong { display: block; color: var(--color-ink-100); }
-.pubdir-id small { display: block; color: var(--color-ink-500); }
-.pubdir-tile { width: 40px; height: 40px; flex: none; border-radius: .4rem; display: grid; place-items: center; background: var(--color-ink-800, #24282f); color: var(--color-ink-100); font-weight: 600; }
-.pubdir-summary { color: var(--color-ink-300); font-size: var(--text-secondary); }
-.pubdir-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: auto; }
-.pubdir-ver { margin-left: auto; font-family: var(--font-mono); color: var(--color-ink-500); font-size: var(--text-label); }
-.pubdir-empty { padding: 28px; text-align: center; color: var(--color-ink-500); }
-.pubdir-split { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 22px; }
-.pubdir-split > * { min-width: 0; }
-.pubdir-hero { display: flex; gap: 14px; align-items: flex-start; margin: 0 0 16px; }
-.pubdir-hero .pubdir-tile { width: 48px; height: 48px; }
-.pubdir-hero h2 { margin: 0; }
-.pubdir-hero .pubdir-summary { margin: 6px 0 0; }
-.pubdir-hero .pubdir-meta { margin-top: 10px; }
-.pubdir-hero .pubdir-ver { margin-left: 0; }
-.pubdir-about { margin: 0 0 18px; max-width: 68ch; }
-.pubdir-sections { display: flex; flex-direction: column; gap: 18px; }
-.pubdir-sections h3 { margin: 0 0 8px; }
-.pubdir-sections ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; }
-.pubdir-sections li { color: var(--color-ink-300); }
-.pubdir-side { display: flex; flex-direction: column; gap: 14px; padding: 18px; position: sticky; top: 16px; }
-.pubdir-side .btn { width: 100%; justify-content: center; }
-.pubdir-installed { margin: 0; color: var(--color-ink-200); }
-.pubdir-kv { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px 12px; margin: 0; }
-.pubdir-kv dd { margin: 0; }
-.pubdir-digest { overflow-wrap: anywhere; font-family: var(--font-mono); font-size: var(--text-label); }
-.pubdir-receipt { overflow-wrap: anywhere; }
-.pubdir-dialog { max-width: min(460px, calc(100% - 32px)); padding: 24px; }
-.pubdir-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
-@media (max-width: 820px) { .pubdir-split { grid-template-columns: minmax(0, 1fr); } }
-@media (prefers-reduced-motion: reduce) { .pubdir-card { transition: none; } }
 

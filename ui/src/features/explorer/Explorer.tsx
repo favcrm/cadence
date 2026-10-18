@@ -3,8 +3,6 @@ import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import { useTranslate } from "../../lib/locale";
 import { appExplorer, notifyAppsChanged, type CatalogCard } from "../workspace-apps/workspaceApps";
-import { useInstallations } from "../workspace-apps/useInstallations";
-import { installationAppHref, installedAppHref } from "../apps/appViewModel";
 import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip, InstallStateChip, useEscape } from "./shared";
 import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
@@ -12,9 +10,9 @@ import { displayUiNotice, type UiNotice } from "../../lib/uiNotice";
 import InstallCheckPanel from "./InstallCheckPanel";
 import { Notice } from "../app-shell/shared/States";
 import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
-import { navigate } from "../../lib/useLocation";
 import "./explorer.css";
 import { PublicDirectory } from "./publicDirectory";
+import AppCover from "./AppCover";
 
 /**
  * The Apps Explorer (CAD-1471, `/apps/explore`). Published apps come from
@@ -25,14 +23,9 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
   const t = useTranslate();
   const [revision, setRevision] = useState(0);
   const [gitOpen, setGitOpen] = useState(false);
-  const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [notice, setNotice] = useState<UiNotice | null>(null);
 
   const isOp = viewer.operator === true && !viewer.readOnly;
-  // CAD-1438: the operator's verified install list decides each Open
-  // link's canonical target; members keep the key route, which proves
-  // the resolution itself.
-  const installs = useInstallations(viewer.operator === true, revision).list;
 
   // The retired catalog still answers: tombstones for ids history names,
   // never a fake "no apps" or up-to-date state. A failed read is shown.
@@ -44,16 +37,6 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
 
   const tombstones = useMemo(() => catalog ?? [], [catalog]);
 
-  // A removed app comes back with Restore, never a second Install.
-  const restore = (card: CatalogCard) => {
-    if (!card.install_id) return;
-    const id = card.id;
-    setBusy((b) => ({ ...b, [id]: true }));
-    void appExplorer.restore(card.install_id)
-      .then(() => { setNotice({ key: "Restored — {title} is live again.", slots: { title: card.title } }); setRevision((r) => r + 1); notifyAppsChanged(); })
-      .catch((e: unknown) => setNotice(appErrorCopy(e, "Restore didn't finish. Try again in a moment.")))
-      .finally(() => setBusy((b) => ({ ...b, [id]: false })));
-  };
 
   if (viewer.operator === null && viewer.access === "unavailable") {
     return (
@@ -119,9 +102,9 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
       {tombstones.length > 0 && (
         <section className="sec" aria-label={t("Earlier catalog apps")}>
           <h2 className="text-cardtitle font-medium text-ink-100 mb-3">{t("From the retired catalog")}</h2>
-          <div className="cgrid grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          <div className="pubdir-grid">
             {tombstones.map((c) => (
-              <TombstoneCard key={c.id} card={c} isOp={isOp} busy={busy[c.id]} onRestore={() => restore(c)} installs={installs} />
+              <TombstoneCard key={c.id} card={c} isOp={isOp} />
             ))}
           </div>
         </section>
@@ -130,62 +113,28 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
   );
 }
 
-/** A retired catalog entry: why the source is gone, plus the install's
- * real state — Open when live, Restore inside the window, never an
- * Install action. */
-function TombstoneCard({ card, isOp, busy, onRestore, installs }: {
-  card: CatalogCard; isOp: boolean; busy?: boolean; onRestore: () => void;
-  installs: readonly { install_id: string; name: string; removed?: number | null }[] | null;
-}) {
+/** Retired listings stay discoverable; Open and Restore live on the detail page. */
+function TombstoneCard({ card, isOp }: { card: CatalogCard; isOp: boolean }) {
   const t = useTranslate();
   return (
-    <div className="card ccard p-4 flex flex-col gap-2" role="button" tabIndex={0}
-      onClick={() => navigate(`/apps/catalog/${encodeURIComponent(card.id)}`)}
-      onKeyDown={(event) => {
-        if (event.target === event.currentTarget && event.key === "Enter") navigate(`/apps/catalog/${encodeURIComponent(card.id)}`);
-      }}>
-      <div className="flex items-start gap-3">
-        <AppGlyph name={card.name} icon={card.listing?.icon} />
-        <div className="min-w-0">
-          <div className="nm text-cardtitle font-medium text-ink-100 truncate">{card.title}</div>
-          <div className="pub text-micro text-ink-500">
-            <TrustChip trust={card.trust} /> · {t("Retired source")}
-          </div>
-        </div>
-      </div>
-      <p className="text-label text-ink-400 flex-1">
-        {card.retired_reason ?? t("Its built-in catalog entry was retired. Update or reinstall it from the app's own repository.")}
-      </p>
-      <div className="flex items-center justify-between mt-1">
-        <InstallStateChip state={card.removed ? "removed" : card.state} />
-        {busy ? (
-          <Button className="btn-sm btn-primary" disabled>{t("Working…")}</Button>
-        ) : card.removed ? (
-          isOp && card.restorable
-            ? <Button className="btn-sm" onClick={(event) => { event.stopPropagation(); onRestore(); }}>{t("Restore")}</Button>
-            : <span className="text-micro text-ink-500">{isOp ? t("Restore window closed") : t("Removed")}</span>
-        ) : card.state === "installed" || card.state === "off" ? (
-          (() => {
-            // CAD-1438: the canonical key route, resolved against the
-            // operator's verified list; members emit the key route and
-            // let it prove the mapping. No resolvable key → no link.
-            const href = isOp && card.install_id
-              ? installationAppHref(installs, card.install_id)
-              : installedAppHref(card.name);
-            return href === null ? (
-              <span className="text-micro text-ink-500">{t("No unique app page")}</span>
-            ) : (
-              <Link className="btn btn-sm" href={href} onClick={(event) => event.stopPropagation()}>{t("Open")}</Link>
-            );
-          })()
-        ) : (
-          <span className="text-micro text-ink-500">{t("Retired")}</span>
-        )}
-      </div>
-      {isOp && (card.request_count ?? 0) > 0 && (
-        <div className="text-micro text-ink-500">{card.request_count} teammate{card.request_count === 1 ? "" : "s"} asked for this</div>
-      )}
-    </div>
+    <article className="pub-card">
+      <Link className="pub-card-link" href={`/apps/catalog/${encodeURIComponent(card.id)}`}
+        aria-labelledby={`retired-name-${card.id}`} aria-describedby={`retired-state-${card.id}`}>
+        <AppCover name={card.name} title={card.title} category={card.listing?.category} />
+        <span className="pub-card-copy">
+          <span className="pub-card-category">{t("Retired source")}</span>
+          <span className="pub-card-title" id={`retired-name-${card.id}`}>{card.title}</span>
+          <span className="pub-card-summary">{card.retired_reason ?? t("Its built-in catalog entry was retired. Update or reinstall it from the app's own repository.")}</span>
+          <span className="pub-card-footer" id={`retired-state-${card.id}`}>
+            <InstallStateChip state={card.removed ? "removed" : card.state} />
+            <span>{t("Retired")}</span>
+          </span>
+          {isOp && (card.request_count ?? 0) > 0 && (
+            <span className="text-micro text-ink-500">{t("{count} app requests").replace("{count}", String(card.request_count))}</span>
+          )}
+        </span>
+      </Link>
+    </article>
   );
 }
 
