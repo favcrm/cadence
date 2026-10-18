@@ -179,7 +179,11 @@ export default function AppShell({
   }
   const conversationRequest = conversationRequestRef.current.request;
   const [screenNavigation, setScreenNavigation] = useState<ScreenNavigation | null>(null);
-  useEffect(() => { if (viewer.operator !== true) purgeDisplayCache(); }, [viewer.operator]);
+  // CAD-1537: the operator, or a proven member/read-only viewer, loads the
+  // receipts and mounts the screen; General setup and diagnostics stay the
+  // operator's.
+  const screenViewer = viewer.operator === true || viewer.screenReader === true;
+  useEffect(() => { if (!screenViewer) purgeDisplayCache(); }, [screenViewer]);
   const [installation, setInstallation] = useState<Installation | null>(null);
   const [contexts, setContexts] = useState<AppContext[]>([]);
   const [loadFailure, setLoadFailure] = useState<{ key: string; message: string } | null>(null);
@@ -206,6 +210,7 @@ export default function AppShell({
   const readInputKey = JSON.stringify([
     installId,
     viewer.operator,
+    screenViewer,
     socialContextInstall === installId,
     socialContextInstall,
     socialContextInstall === installId ? socialContext : null,
@@ -226,11 +231,11 @@ export default function AppShell({
   const loadError = loadFailure?.key === receiptKey ? loadFailure.message : null;
   const socialSelectionReady =
     !isSocialContent(installation) || socialContextInstall === installId;
-  const loading = viewer.operator === true
+  const loading = screenViewer
     ? requestLoading || !currentReadComplete || !socialSelectionReady
     : requestLoading;
   const receiptReady =
-    viewer.operator === true &&
+    screenViewer &&
     currentReadComplete &&
     loadError === null &&
     socialSelectionReady &&
@@ -373,7 +378,7 @@ export default function AppShell({
     // wait for the resolved role rather than painting a sign-in, and
     // never issue the protected detail/context reads before
     // `operator === true`.
-    if (viewer.operator !== true) {
+    if (!screenViewer) {
       setRequestLoading(false);
       return () => {
         current = false;
@@ -411,7 +416,7 @@ export default function AppShell({
       current = false;
       controller.abort();
     };
-  }, [installId, receiptKey, viewer.operator]);
+  }, [installId, receiptKey, screenViewer]);
 
   // CAD-1519: an app with a mountable screen and no active context gets its
   // General context on the operator's first open (Social Content owns its
@@ -670,7 +675,9 @@ export default function AppShell({
   // context can never mint here.
 
   const screenRoute = (patch: RoutePatch, navigation: ScreenNavigation) => {
-    if (receiptReady && contextAdoptionReady && scope.contextId && viewer.operator === true && !viewer.readOnly) writeQuery({ screenRoute: { patch, navigation } }, { replace: patch.replace });
+    // CAD-1537: a route patch only rewrites this page's URL, so a read-only
+    // screen viewer may navigate too.
+    if (receiptReady && contextAdoptionReady && scope.contextId && (viewer.operator === true && !viewer.readOnly || viewer.screenReader === true)) writeQuery({ screenRoute: { patch, navigation } }, { replace: patch.replace });
   };
   const attachMediaReference: MediaChatAttach = async (selected, actionToken, isCurrent) => {
     const target = mediaTarget.current;
@@ -1056,7 +1063,7 @@ export default function AppShell({
                 children(attachMediaReference)
               ) : (
                 <InstalledScreenOutlet installation={installation} contexts={contexts} contextId={scope.contextId}
-                  admitted={receiptReady && contextAdoptionReady && viewer.operator === true && !viewer.readOnly}
+                  admitted={receiptReady && contextAdoptionReady && (viewer.operator === true && !viewer.readOnly || viewer.screenReader === true)}
                   onRoute={screenRoute} onCommand={screenCommand} onNavigation={setScreenNavigation} onMediaAttach={attachMediaReference}
                   fallback={contextAdoptionReady
                     ? <ScreenUnavailable installation={installation} contexts={contexts} contextId={scope.contextId}

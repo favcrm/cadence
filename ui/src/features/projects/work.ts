@@ -138,6 +138,11 @@ export interface Viewer {
   /** CAD-1193: a bounded retry of the access check itself — wired to
    *  the real metadata refresh, never a reload or a sign-in. */
   onRetryAccess?: () => void;
+  /** CAD-1537: a proven non-operator — a signed-in `member` session or a
+   *  viewer of a `--read-only` board — who may load an installed app's
+   *  receipts and mount its screen read-only. Never set while `operator`
+   *  is `null`; the daemon decides what each read-only mount may call. */
+  screenReader?: boolean;
 }
 
 /**

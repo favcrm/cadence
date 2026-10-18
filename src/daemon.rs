@@ -99,6 +99,8 @@ mod cad1473_independent_redispatch;
 mod cad1482_independent_media_refusal;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1518_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1537_acceptance;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
 mod campaign_clone_acceptance;

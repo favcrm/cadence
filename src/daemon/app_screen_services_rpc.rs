@@ -480,21 +480,29 @@ impl Shared {
         let (session, view) = self
             .tool_session(token, key, origin)
             .ok_or_else(|| screen_access_denied("screen service requires live operator session"))?;
-        if origin == Origin::Public
+        let member = origin == Origin::Public
             && !view
                 .user
                 .as_ref()
-                .is_some_and(crate::operator_auth::BoardUser::is_operator)
-        {
-            return Err(screen_access_denied(
-                "screen service requires operator-role public session",
-            ));
-        }
+                .is_some_and(crate::operator_auth::BoardUser::is_operator);
         let context = self
             .tool_context_proven(action_token, &session)
             .map_err(|error| {
                 screen_authority_error(error, "screen mount or session unavailable")
             })?;
+        // CAD-1537: a member uses only a read-only mount, and a read-only
+        // mount admits only the read allowlist — every write, SLOT
+        // (prepare and confirm) and host command is refused here.
+        if member && !context.read_only {
+            return Err(screen_access_denied(
+                "screen service requires operator-role public session",
+            ));
+        }
+        if context.read_only && !operation.is_screen_read() {
+            return Err(screen_access_denied(
+                "a read-only screen admits only read operations",
+            ));
+        }
         if context.context_id.is_none() {
             return Err(screen_access_denied(
                 "screen service requires active context",

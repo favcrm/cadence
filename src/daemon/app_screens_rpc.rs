@@ -4,8 +4,11 @@
 //! session's REAL bearer credential (`token` + `key` + `origin`) and runs
 //! the daemon's native check itself — `Auth::check` for a keyed
 //! loopback/tailnet session or `Auth::check_public` for the `__Host-`
-//! public cookie — resolving the live `SessionView.id` (and, on the public
-//! surface, requiring the asserted user's `BoardUser::is_operator()` role).
+//! public cookie — resolving the live `SessionView.id`. CAD-1537: a public
+//! session without `BoardUser::is_operator()` (a `member`), or a mint the
+//! `--read-only` board relays with `read_only: true`, gets a read-only cap:
+//! its projection and service calls are narrowed to
+//! `ScreenOperation::is_screen_read`, and it carries no tools or media.
 //! A caller-supplied session *id* is never accepted as authority. On
 //! success it recomputes the live `bundle_digest`, requires
 //! `app_capability_status(install_id, live_digest).state == "approved"`,
@@ -63,7 +66,23 @@ pub(crate) struct ScreenCap {
     /// child echoes it in init. NOT the FrameCap bearer in the URL —
     /// the host recognizes its own mount's init by this stored value.
     pub bridge_nonce: String,
+    /// CAD-1537: minted for a member or a `--read-only` board — consume
+    /// narrows the projection to read operations and no tools.
+    pub read_only: bool,
     pub issued: Instant,
+}
+
+/// CAD-1537: the operations a mount may advertise — every declared one
+/// for an operator mount, only the read allowlist for a read-only one.
+fn mount_operations(
+    pkg: &app_screen_pkg::ScreenPackage,
+    read_only: bool,
+) -> Vec<crate::issue::app_screen_decl::ScreenOperation> {
+    pkg.operations
+        .iter()
+        .copied()
+        .filter(|op| !read_only || op.is_screen_read())
+        .collect()
 }
 
 /// Bounded capability map: ≤128 global, ≤4 per install, ≤8 per session.
@@ -118,6 +137,7 @@ struct ToolContextBinding<'a> {
     tag: &'a str,
     generation: u64,
     approval_epoch: i64,
+    read_only: bool,
 }
 
 impl Shared {
@@ -163,11 +183,13 @@ impl Shared {
     /// `session_hash` is the cap's stored FULL credential hash; a
     /// different row sharing the 8-hex display prefix does not satisfy
     /// it. Fail-closed on any lookup error.
-    fn session_id_live(&self, session_hash: &str) -> bool {
+    /// CAD-1537: `read_only` — a read-only cap's public member session
+    /// counts as live; every other cap still needs a current owner.
+    fn session_id_live(&self, session_hash: &str, read_only: bool) -> bool {
         if !session_hash_ok(session_hash) {
             return false;
         }
-        match self.public_row_hash(session_hash) {
+        match self.public_row_hash(session_hash, read_only) {
             Some(public) => public,
             None => {
                 let now = self.operator_now();
@@ -219,8 +241,11 @@ impl Shared {
     }
 
     /// `app_screen_mint {install_id, tag, token, key, origin,
-    /// generation}` — a CLOSED param set: any other field refuses, so a
-    /// forged authority field cannot ride a valid credential.
+    /// generation, read_only?}` — a CLOSED param set: any other field
+    /// refuses, so a forged authority field cannot ride a valid credential.
+    /// `read_only` (CAD-1537) can only narrow: the `--read-only` board
+    /// relays `true`; any other value refuses. A public `member` session
+    /// is read-only whatever the host sends.
     /// `token`/`key`/`origin` are the consuming board request's own
     /// session credentials, relayed so the *daemon* proves them — never
     /// a caller-claimed session id. `generation` is the host's mount
@@ -235,10 +260,16 @@ impl Shared {
             "key",
             "origin",
             "generation",
+            "read_only",
         ];
         let fields = params
             .as_object()
             .ok_or_else(|| Error::rejected("screen mint params must be an object"))?;
+        let host_read_only = match fields.get("read_only") {
+            None => false,
+            Some(Value::Bool(true)) => true,
+            Some(_) => return Err(Error::rejected("screen mint read_only can only be true")),
+        };
         if fields.keys().any(|k| !ALLOWED.contains(&k.as_str())) {
             return Err(Error::rejected(
                 "screen mint params have unsupported fields",
@@ -279,25 +310,19 @@ impl Shared {
             .get("generation")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        // Verify the real credential natively; on the public surface the
-        // session must also carry the operator role — a public `member`
-        // session never mounts a screen.
+        // Verify the real credential natively. CAD-1537: a public session
+        // without the operator role (a `member`) mounts read-only.
         let (session, view) = self
             .session_for_credential(token, key, origin)
             .ok_or_else(|| {
                 Error::rejected("screen mint needs a live operator session — sign in again")
             })?;
-        if origin == Origin::Public {
-            let operator = view
+        let member = origin == Origin::Public
+            && !view
                 .user
                 .as_ref()
                 .is_some_and(crate::operator_auth::BoardUser::is_operator);
-            if !operator {
-                return Err(Error::rejected(
-                    "screen mint needs an operator-role public session",
-                ));
-            }
-        }
+        let read_only = host_read_only || member;
         // `session` is the verified row's full credential hash — the
         // cap's internal binding. Bounded mint-rate gate BEFORE the expensive live digest/approval/
         // package re-proof — the caller is a proven operator + verified
@@ -312,7 +337,18 @@ impl Shared {
         if caps.len() >= CAP_GLOBAL {
             return Err(Error::rejected("screen capability map is full"));
         }
-        if caps.values().filter(|c| c.install_id == install_id).count() >= CAP_PER_INSTALL {
+        // CAD-1537: read-only caps never take the operator's capacity —
+        // they hold at most half the global map, and the per-install bound
+        // counts operator and read-only caps apart.
+        if read_only && caps.values().filter(|c| c.read_only).count() >= CAP_GLOBAL / 2 {
+            return Err(Error::rejected("screen capability map is full"));
+        }
+        if caps
+            .values()
+            .filter(|c| c.install_id == install_id && c.read_only == read_only)
+            .count()
+            >= CAP_PER_INSTALL
+        {
             return Err(Error::rejected(
                 "too many live screen mounts for this installation",
             ));
@@ -347,6 +383,7 @@ impl Shared {
                 tag,
                 generation,
                 approval_epoch,
+                read_only,
             },
             &pkg,
         );
@@ -378,13 +415,14 @@ impl Shared {
                 generation,
                 approval_epoch,
                 bridge_nonce: bridge_nonce.clone(),
+                read_only,
                 issued: Instant::now(),
             },
         );
         // Aliases the screen declared, advertised to the host only when a
         // tool context was actually minted. Naming an alias grants nothing:
         // every invoke still re-proves binding, approval and operator.
-        let tools: Vec<&String> = if action_token.is_null() {
+        let tools: Vec<&String> = if action_token.is_null() || read_only {
             Vec::new()
         } else {
             pkg.tools.keys().collect()
@@ -407,6 +445,7 @@ impl Shared {
         let media = if pkg.host_contract.as_deref()
             == Some(crate::issue::app_screen_decl::HOST_CONTRACT_MEDIA)
             && !action_token.is_null()
+            && !read_only
             && !media_may.is_empty()
         {
             json!({"contract": crate::issue::app_screen_decl::HOST_CONTRACT_MEDIA, "may": media_may})
@@ -428,7 +467,7 @@ impl Shared {
             == Some(crate::issue::app_screen_decl::HOST_CONTRACT_RECORDS)
         {
             receipt["host_contract"] = json!(pkg.host_contract);
-            receipt["operations"] = json!(pkg.operations);
+            receipt["operations"] = json!(mount_operations(&pkg, read_only));
             receipt["navigation"] = json!(pkg.navigation);
             receipt["display_scope_key"] = json!(display_scope_key);
             // Non-authorizing trusted-host metadata; never bootstrap/PUSH.
@@ -487,7 +526,7 @@ impl Shared {
         }
         // The minting session must still be live — a revoke between mint
         // and consume kills the cap. The id was server-resolved at mint.
-        if !self.session_id_live(&cap.session) {
+        if !self.session_id_live(&cap.session, cap.read_only) {
             return Err(Error::rejected("the minting session is no longer live"));
         }
         let pm_dir = self.pm_dir()?;
@@ -520,7 +559,7 @@ impl Shared {
             "bridge_nonce": cap.bridge_nonce,
             "contract": pkg.contract,
             "may": pkg.may,
-            "tools": pkg.tools,
+            "tools": if cap.read_only { json!({}) } else { json!(pkg.tools) },
             "manifest": pkg.manifest,
             "assets": pkg.assets,
             "remote_images": pkg.remote_images,
@@ -529,7 +568,7 @@ impl Shared {
             == Some(crate::issue::app_screen_decl::HOST_CONTRACT_RECORDS)
         {
             result["host_contract"] = json!(pkg.host_contract);
-            result["operations"] = json!(pkg.operations);
+            result["operations"] = json!(mount_operations(&pkg, cap.read_only));
             result["navigation"] = json!(pkg.navigation);
         }
         Ok(result)
@@ -556,6 +595,7 @@ impl Shared {
             tag,
             generation,
             approval_epoch,
+            read_only,
         } = *binding;
         let media_only = pkg.host_contract.as_deref()
             == Some(crate::issue::app_screen_decl::HOST_CONTRACT_MEDIA)
@@ -585,7 +625,12 @@ impl Shared {
                 approval_epoch,
                 mount: None,
                 session: session.to_string(),
-                tools: pkg.tools.clone(),
+                tools: if read_only {
+                    Default::default()
+                } else {
+                    pkg.tools.clone()
+                },
+                read_only,
                 issued: now,
             },
         );

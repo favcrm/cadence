@@ -6,7 +6,8 @@
 //! never by trusting a caller-supplied id:
 //!
 //! - `POST /api/app-installations/<id>/screens/<tag>/mount` —
-//!   `RouteClass::OperatorOnly`, body `{}`. The board takes the request's
+//!   `RouteClass::ScreenRead` (CAD-1537: a member or `--read-only` board
+//!   mounts read-only), body `{}`. The board takes the request's
 //!   session cookie token + `X-Cadence-Session` key (the same credentials
 //!   `check_session` already proves) and relays them to `app_screen_mint`,
 //!   which runs `Auth::check`/`check_public` itself and binds the minted
@@ -110,19 +111,21 @@ pub(super) fn mount(
         return err_response(403, "screen mount needs a live operator session");
     };
     let generation = next_generation();
-    match client::rpc(
-        state_dir,
-        "app_screen_mint",
-        json!({
-            "install_id": install_id,
-            "context_id": if context_id.is_empty() { Value::Null } else { json!(context_id) },
-            "tag": tag,
-            "token": token,
-            "key": key,
-            "origin": origin,
-            "generation": generation,
-        }),
-    ) {
+    let mut params = json!({
+        "install_id": install_id,
+        "context_id": if context_id.is_empty() { Value::Null } else { json!(context_id) },
+        "tag": tag,
+        "token": token,
+        "key": key,
+        "origin": origin,
+        "generation": generation,
+    });
+    // CAD-1537: the `--read-only` board can only narrow its mounts; the
+    // daemon makes a member's mount read-only on its own.
+    if opts.read_only {
+        params["read_only"] = json!(true);
+    }
+    match client::rpc(state_dir, "app_screen_mint", params) {
         Ok(v) => super::json_response(v),
         Err(e) => home::rpc_err(&e, "app_screen_mint"),
     }
@@ -200,11 +203,15 @@ impl<'de> serde::Deserialize<'de> for UniqueServiceJson {
     }
 }
 
+/// `read_only` (CAD-1537): a member or `--read-only` board caller — the
+/// board refuses a non-read operation itself before relaying, as strict
+/// as the daemon's own read-only mount rule.
 pub(super) fn service(
     request: &mut Request,
     state_dir: &std::path::Path,
     opts: &ServeOpts,
     method: &'static str,
+    read_only: bool,
 ) -> HttpResp {
     // One finite read budget before bounded envelope inspection. The named
     // operation then imposes its smaller exact raw-envelope + args budget.
@@ -241,6 +248,14 @@ pub(super) fn service(
         match serde_json::from_value::<crate::issue::app_screen_decl::ScreenOperation>(
             body["operation"].clone(),
         ) {
+            Ok(operation) if read_only && !operation.is_screen_read() => {
+                return super::coded_response(
+                    403,
+                    "forbidden",
+                    "a read-only screen admits only read operations",
+                    None,
+                )
+            }
             Ok(operation) => operation.args_limit(),
             Err(_) => return err_response(400, "unknown screen service operation"),
         }

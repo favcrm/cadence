@@ -224,6 +224,37 @@ impl ScreenOperation {
                 | Self::ChatCampaignBrief
         )
     }
+    /// CAD-1537: the closed allowlist a read-only screen (a member or a
+    /// `--read-only` board viewer) may call. Every other operation —
+    /// each write, SLOT and effectful host command — is refused for it.
+    pub fn is_screen_read(self) -> bool {
+        matches!(
+            self,
+            Self::RecordsList
+                | Self::RecordsShow
+                | Self::SegmentsList
+                | Self::SegmentsShow
+                | Self::ExclusionsList
+                | Self::ExclusionsShow
+                | Self::SuppressionsList
+                | Self::AudiencePreview
+                | Self::ContentList
+                | Self::ContentShow
+                | Self::ContentRender
+                | Self::ProposalsList
+                | Self::ProposalsShow
+                | Self::ProposalsRender
+                | Self::SendsList
+                | Self::SendsShow
+                | Self::SmtpShow
+                | Self::OriginShow
+                // Presentation-only host commands: the daemon validates and
+                // echoes them; the host changes its URL or inert preview.
+                | Self::ScreenRoutePatch
+                | Self::ScreenPreviewShow
+                | Self::ScreenPreviewClear
+        )
+    }
     pub fn args_limit(self) -> usize {
         match self {
             Self::RecordsCsvPreview | Self::RecordsCsvImport | Self::RecordsCsvConfirm => 327_680,

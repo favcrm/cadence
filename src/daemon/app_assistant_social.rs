@@ -559,6 +559,7 @@ impl Shared {
             mount: None,
             session: String::new(),
             tools: BTreeMap::new(),
+            read_only: false,
             issued: Instant::now(),
         }
     }

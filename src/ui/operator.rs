@@ -74,6 +74,12 @@ pub enum RouteClass {
     /// browser/session guard; its handler narrows the verified identity
     /// and action (for example, self-only vs organization operator).
     CallerScoped,
+    /// CAD-1537: an installed app's own screen — the mount and its read
+    /// service calls. The guards run as for a write, and also on a
+    /// `--read-only` board; an operator session (with peer proof) or a
+    /// named member is admitted, never an agent. The daemon decides per
+    /// operation: a member's or read-only board's mount is read-only.
+    ScreenRead,
 }
 
 /// One write route: method, path pattern (`*` is one non-empty
@@ -319,18 +325,20 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-installations/upload",
         RouteClass::OperatorOnly,
     ),
-    // CAD-1006: the screen mint — operator-only like the install routes.
-    // Authority is the proven session credential relayed to the daemon,
-    // never a caller field; the minted nonce is the frame GET's one-use cap.
+    // CAD-1006: the screen mint. Authority is the proven session
+    // credential relayed to the daemon, never a caller field; the minted
+    // nonce is the frame GET's one-use cap. CAD-1537: a member or a
+    // `--read-only` board mounts read-only (`ScreenRead`); the SLOT and
+    // tool routes below stay the operator's.
     route(
         "POST",
         "/api/app-installations/*/screens/*/mount",
-        RouteClass::OperatorOnly,
+        RouteClass::ScreenRead,
     ),
     route(
         "POST",
         "/api/app-screen-services/call",
-        RouteClass::OperatorOnly,
+        RouteClass::ScreenRead,
     ),
     route(
         "POST",
@@ -655,7 +663,7 @@ pub(super) fn admit(
     ) {
         return Ok(None);
     }
-    if opts.read_only {
+    if opts.read_only && class != RouteClass::ScreenRead {
         return Err(guard_fail(
             "read_only",
             "board is read-only — writes are disabled",
@@ -673,6 +681,10 @@ pub(super) fn admit(
     };
     write_guard(request, ct, opts)?;
     let caller = board_caller(request, state_dir, opts, true, None)?;
+    if class == RouteClass::ScreenRead {
+        let what = format!("{method} {path}");
+        return admit_screen_caller(request, state_dir, opts, caller, &what).map(Some);
+    }
     if class == RouteClass::OperatorOnly {
         match &caller {
             Caller::Agent(alias) => {
@@ -758,6 +770,48 @@ pub(super) fn admit_operator_read_caller(
         Caller::Named(_) => Ok(caller),
         Caller::Operator(_) => {
             super::home::prove_operator_peer(request, state_dir, opts, &what, None)?;
+            Ok(caller)
+        }
+    }
+}
+
+/// CAD-1537: a read of an installed app's own screen — its installation
+/// receipt and contexts. Admits the operator (with peer proof, as
+/// [`admit_operator_read`]) or a named member; never an agent.
+pub(super) fn admit_screen_read(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<Caller, HttpResp> {
+    let caller = board_caller(request, state_dir, opts, false, None)?;
+    let what = format!(
+        "GET {}",
+        request.url().split('?').next().unwrap_or_default()
+    );
+    admit_screen_caller(request, state_dir, opts, caller, &what)
+}
+
+/// The [`RouteClass::ScreenRead`] caller rule: an agent is refused, a
+/// named user of either role is admitted (the daemon re-proves the role),
+/// and the operator still needs positive process proof on the peer.
+fn admit_screen_caller(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    caller: Caller,
+    what: &str,
+) -> Result<Caller, HttpResp> {
+    match &caller {
+        Caller::Agent(alias) => Err(guard_fail(
+            "operator_only",
+            &format!(
+                "{what} is a board viewer's read — this request comes from agent \
+                 '{alias}'; open it from a browser"
+            ),
+        )),
+        Caller::Named(_) => Ok(caller),
+        Caller::Operator(_) => {
+            super::home::prove_operator_peer(request, state_dir, opts, what, None)?;
             Ok(caller)
         }
     }

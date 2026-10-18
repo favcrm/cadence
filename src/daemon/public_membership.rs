@@ -427,16 +427,21 @@ impl Shared {
     /// currently an owner by a fresh central decision. Every other public
     /// outcome, including a member, a removed or revoked row, a standalone
     /// refusal, and an outage, is `Some(false)`, with no local fallback.
-    pub(super) fn public_row_hash(&self, hash: &str) -> Option<bool> {
+    /// CAD-1537: `allow_member` (only for a read-only screen cap or
+    /// context) also accepts a current member.
+    pub(super) fn public_row_hash(&self, hash: &str, allow_member: bool) -> Option<bool> {
         self.operator_auth()
             .public_snapshot_by_hash(hash, self.operator_now())?;
-        Some(matches!(
-            self.current_session_for_hash(hash),
+        Some(match self.current_session_for_hash(hash) {
             Ok(Authority::Granted {
                 role: Role::Operator,
                 ..
-            })
-        ))
+            }) => true,
+            Ok(Authority::Granted {
+                role: Role::Member, ..
+            }) => allow_member,
+            _ => false,
+        })
     }
 
     /// Refuse a board realm that does not match the captured native realm
