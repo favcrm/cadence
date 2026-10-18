@@ -1455,10 +1455,14 @@ mod resolve_base_tests {
         let side_sha = rev(&checkout, "HEAD");
         run_git(&checkout, &["fetch", "--quiet", "origin"]);
         // Reproduce a checkout whose clone never recorded origin/HEAD.
+        // `--no-deref` matters: without it `update-ref -d` resolves the symbolic
+        // ref and deletes its *target*, leaving the symref in place — which is
+        // how this fixture passed locally (no symref to begin with) and failed
+        // in CI (a fresh clone writes one).
         let _ = Command::new("git")
             .arg("-C")
             .arg(&checkout)
-            .args(["update-ref", "-d", "refs/remotes/origin/HEAD"])
+            .args(["update-ref", "--no-deref", "-d", "refs/remotes/origin/HEAD"])
             .output();
         let head = Command::new("git")
             .arg("-C")
