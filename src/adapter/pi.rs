@@ -3608,7 +3608,18 @@ mod cad1553_company_authority_acceptance {
             std::fs::create_dir_all(path).unwrap();
         }
         crate::issue::Pm::init(&tracker).unwrap();
-        let mutable = ProviderEnv::refusing_providers();
+        let store = Arc::new(crate::store::Store::open(&state.join("cadence.sqlite3")).unwrap());
+        let mut settings = store.import_legacy_settings(&tracker).unwrap();
+        settings.doc.pi = Some(
+            serde_json::from_value(json!({
+                "models": { "allow": ["fixture/model"] }
+            }))
+            .unwrap(),
+        );
+        store
+            .save_settings(settings.revision, settings.doc, "cad1553-fixture")
+            .unwrap();
+        let mutable = ProviderEnv::refusing_providers().with_settings_store(Arc::clone(&store));
         mutable.set("HOME", home.to_str().unwrap());
         mutable.set("CADENCE_HOME", private.to_str().unwrap());
         mutable.set("CADENCE_PM_DIR", tracker.to_str().unwrap());
@@ -3705,7 +3716,9 @@ mod cad1553_company_authority_acceptance {
 
         // vars() is the actual environment handoff. Re-importing every value
         // must lose the proof rather than serializing company authority.
-        let replayed = ProviderEnv::default().with_workspace(workspace.clone());
+        let replayed = ProviderEnv::default()
+            .with_workspace(workspace.clone())
+            .with_settings_store(Arc::clone(&store));
         for (key, value) in trusted.vars() {
             replayed.set(&key, value);
         }
