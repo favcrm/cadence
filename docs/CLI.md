@@ -278,12 +278,22 @@ cadence --org local inspect-portable /private/new-package
 non-ignored untracked regular files. Ignored tracked files remain included.
 File/directory replacements are captured as deleted tracked files plus new
 regular files, not rejected as directory members.
-It preserves raw bytes and executable-bit semantics; source hooks and Git
-filters never run. Linked worktrees, custom hooks, filter configuration,
-unmerged/sparse index entries, symlinks, hardlinks, nonregular files and
-unrepresentable paths refuse rather than being silently omitted. The output
-must be new and outside the source tracker, including through symlinked
-parents. Without the flag, the existing clean-tracker export is unchanged.
+It preserves raw bytes and executable-bit semantics. Source hooks and
+clean/smudge filters never run. This snapshot does not refuse regular
+installed hooks in `.git/hooks`, or a plain `[core]` `hooksPath` key. The
+`hooksPath` value is ignored rather than followed; hook files and `.git`
+metadata are not package members, and the source checkout is not modified.
+That allowance is snapshot-only. Ordinary export still refuses active hooks
+and `core.hooksPath`. There is no bypass flag and no source-hook cleanup.
+Import, activation, and app-data export are unchanged.
+
+Existing metadata and config restrictions otherwise remain in force:
+linked worktrees, config includes, prohibited path or command config keys,
+Git filters, unmerged or sparse index entries, symlinks,
+hardlinks, nonregular files, and unrepresentable paths still refuse rather
+than being silently omitted. The output must be new and outside the source
+tracker, including through symlinked parents. Without the flag, the existing
+clean-tracker export is unchanged.
 
 The capture is a private clean Git snapshot, not a change to the source.
 The existing exporter takes its online database snapshot, applies the

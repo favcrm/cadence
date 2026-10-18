@@ -35,6 +35,8 @@ use crate::secret::Allowlist;
 mod capture;
 #[cfg(test)]
 mod capture_acceptance;
+#[cfg(test)]
+mod hook_capture_acceptance;
 
 pub const PORTABLE_FORMAT: &str = "cadence.portable/1";
 pub const INACTIVE_MARKER: &str = "portable-restore.json";
@@ -1475,7 +1477,7 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
 /// no config `include`, no `hooks` entries beyond `.sample`, no symlink or
 /// hardlink inside `.git`. The tracker must be clean. Returns HEAD.
 pub fn admit_tracker(tracker: &Path) -> Result<String> {
-    admit_tracker_metadata(tracker)?;
+    admit_tracker_metadata(tracker, Admission::Export)?;
     let status = git_plain(
         tracker,
         &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -1489,7 +1491,16 @@ pub fn admit_tracker(tracker: &Path) -> Result<String> {
     git_plain(tracker, &["rev-parse", "--verify", "HEAD"])
 }
 
-fn admit_tracker_metadata(tracker: &Path) -> Result<()> {
+/// Export refuses active hooks and `core.hooksPath`. Capture admits regular
+/// installed hooks and one plain `core.hooksPath` key. The configured
+/// directory is not read. Source git still forces `core.hooksPath=/dev/null`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Export,
+    Capture,
+}
+
+fn admit_tracker_metadata(tracker: &Path, admission: Admission) -> Result<()> {
     let refuse =
         |why: &str| Error::rejected(format!("tracker {} refused: {why}", tracker.display()));
     let dotgit = tracker.join(".git");
@@ -1513,19 +1524,27 @@ fn admit_tracker_metadata(tracker: &Path) -> Result<()> {
             return Err(refuse(&format!("{banned} is present; unsupported layout")));
         }
     }
-    let hooks = dotgit.join("hooks");
-    if hooks.is_dir() && has_active_hooks(&hooks)? {
-        return Err(refuse("active git hooks"));
+    // Export only. `is_dir` follows links, and the byte compare reads hook
+    // files. Capture must not do either; the metadata walk still refuses a
+    // symlink, hardlink, or special file, including inside `hooks/`.
+    if admission == Admission::Export {
+        let hooks = dotgit.join("hooks");
+        if hooks.is_dir() && has_active_hooks(&hooks)? {
+            return Err(refuse("active git hooks"));
+        }
     }
     check_metadata_tree(&dotgit, tracker)?;
-    check_config_keys(&dotgit.join("config"), tracker)?;
+    check_config_keys(&dotgit.join("config"), tracker, admission)?;
     Ok(())
 }
 
 /// Read `.git/config` as keys only, before git loads it. Includes and
 /// conditional includes refuse, as do keys that name a path or command git
 /// would run or read elsewhere. No values enter any evidence.
-fn check_config_keys(config: &Path, tracker: &Path) -> Result<()> {
+///
+/// Capture ignores a plain `[core]` `hooksPath` key and does not parse its
+/// value. A subsection, or any other path or command key, still refuses.
+fn check_config_keys(config: &Path, tracker: &Path, admission: Admission) -> Result<()> {
     let refuse =
         |why: String| Error::rejected(format!("tracker {} refused: {why}", tracker.display()));
     let text = match fs::read(config) {
@@ -1534,21 +1553,20 @@ fn check_config_keys(config: &Path, tracker: &Path) -> Result<()> {
     };
     let text = String::from_utf8(text).map_err(|_| refuse("non-UTF-8 .git/config".into()))?;
     let mut section = String::new();
+    let mut plain_section = false;
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
         if let Some(head) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            let name = head
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
+            let mut parts = head.split_whitespace();
+            let name = parts.next().unwrap_or_default().to_ascii_lowercase();
             if name == "include" || name == "includeif" {
                 return Err(refuse(format!("config {name} section is not supported")));
             }
             section = name;
+            plain_section = parts.next().is_none();
             continue;
         }
         let key = line
@@ -1558,6 +1576,9 @@ fn check_config_keys(config: &Path, tracker: &Path) -> Result<()> {
             .trim()
             .to_ascii_lowercase();
         let full = format!("{section}.{key}");
+        if admission == Admission::Capture && plain_section && full == "core.hookspath" {
+            continue;
+        }
         const PATH_OR_COMMAND: &[&str] = &[
             "core.worktree",
             "core.hookspath",
@@ -1683,6 +1704,11 @@ fn git_plain(dir: &Path, args: &[&str]) -> Result<String> {
 /// Run git and return raw stdout. No UTF-8 conversion and no trimming, so
 /// a blob's bytes (including trailing newlines and non-UTF-8 content) are
 /// exported exactly as committed.
+///
+/// `-c core.hooksPath=/dev/null` is installed before `args`, with a cleared
+/// environment and a private index. Capture admits a source `core.hooksPath`
+/// key only because every source git command comes through here. A later
+/// `-c core.hooksPath` in `args` would replace the override.
 fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let scratch = std::env::temp_dir().join(format!("cad1163-git-{}", nonce()));
     fs::create_dir_all(&scratch)?;

@@ -5,6 +5,13 @@
 //! worktree, never through clean/smudge filters, and written into a fresh
 //! repository. That repository's HEAD is a normal commit of those bytes so
 //! the existing clean-tracker copy can export it.
+//!
+//! Snapshot admission allows regular files in `.git/hooks` and a plain
+//! `core.hooksPath` key. That setting is ignored rather than followed; the
+//! metadata walk still checks `.git/hooks`. Hook bytes are never run or copied.
+//! Source commands go through `git_bytes` (`core.hooksPath=/dev/null`,
+//! cleared environment, private index). Snapshot commands set the same hooks
+//! override. Clean export keeps the ordinary hook refusal.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -174,7 +181,7 @@ fn refuse_source_filters(source: &Path) -> Result<()> {
 }
 
 fn stamp_source(source: &Path) -> Result<SourceStamp> {
-    super::admit_tracker_metadata(source)?;
+    super::admit_tracker_metadata(source, super::Admission::Capture)?;
     refuse_source_filters(source)?;
     let head = git_source(
         source,
@@ -675,6 +682,8 @@ fn one_hex(bytes: &[u8]) -> Result<String> {
 }
 
 fn git_source(source: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    // `git_bytes` forces `core.hooksPath=/dev/null` before these arguments.
+    // Another `-c core.hooksPath` here would replace that override.
     let mut full = Vec::with_capacity(args.len() + 2);
     full.push("-c");
     full.push("protocol.allow=never");
