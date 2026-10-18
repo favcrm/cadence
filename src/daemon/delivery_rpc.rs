@@ -1869,7 +1869,7 @@ impl Shared {
                         Error::rejected("current profile requirements have no base branch name")
                     })?;
                     if !delivery_requirements_rpc::full_ci_green(self, &slug, number, &live, base, base_ref, false)
-                        .map_err(|_| Error::rejected("current full CI requirements could not be verified; no merge was approved"))?
+                        .map_err(|_| Error::rejected("current required checks or canonical ci.yml run could not be verified; no merge was approved"))?
                     {
                         return Err(Error::rejected("current required checks or canonical ci.yml run are not green; no merge was approved"));
                     }

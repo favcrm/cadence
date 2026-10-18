@@ -1539,8 +1539,8 @@ impl Shared {
     /// Continue (or hold) an `intent` mark: rebuild the same plan with
     /// the same ids and the original proposer, require the rebuilt
     /// canonical to equal the recorded one, then finish exactly once —
-    /// absent files are written, identical files only need the receipt,
-    /// anything else is held, never re-allocated.
+    /// absent files are written; matching files still require the scoped
+    /// commit before the receipt. Divergent files are held, never re-allocated.
     fn recover_mark(
         &self,
         pm: &crate::issue::Pm,

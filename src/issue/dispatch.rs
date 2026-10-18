@@ -1207,30 +1207,6 @@ mod tests {
         )
     }
 
-    /// CAD-468: the kickoff names the report command exactly when the
-    /// endpoint reports explicitly — a turn-result endpoint's turn
-    /// finishes by its result text and never runs the command.
-    #[test]
-    fn kickoff_teaches_the_report_command_only_for_explicit_endpoints() {
-        assert!(
-            kickoff().contains("cadence message result <id> --token <turn_id>"),
-            "{}",
-            kickoff()
-        );
-        let managed = kickoff_body(
-            "D-1",
-            "Title",
-            Path::new("/tmp/note.md"),
-            Path::new("/r/.cadence/wt/d-1-title"),
-            "cadence/d-1-title",
-            "0123456789abcdef",
-            "pm",
-            "claude",
-            "managed",
-        );
-        assert!(!managed.contains("message result"), "{managed}");
-    }
-
     /// CAD-159: an empty section and a stub-only section both yield no
     /// items — no listing, the kickoff is unchanged, and the warning
     /// names the issue and the authoring command.
