@@ -464,6 +464,27 @@ pub fn set_acceptance(pm: &Pm, id: &str, source: &Path, actor: &str) -> Result<V
     Ok(out)
 }
 
+/// `<key>/` inside the PM dir, refusing a symlinked project directory: a
+/// tracker edit must never land outside it.
+fn project_dir(pm: &Pm, key: &str) -> Result<PathBuf> {
+    let dir = pm.dir.join(key);
+    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{key}/ is a symlink — refusing to write outside the PM dir"
+        )));
+    }
+    Ok(dir)
+}
+
+/// Serialize `project` to `path` — the one place a project record is
+/// written, so `project add` and a policy write produce the same file.
+fn write_project_yaml(path: &Path, project: &project::Project) -> Result<()> {
+    let yaml = serde_yaml::to_string(project)
+        .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
+    std::fs::write(path, yaml)?;
+    Ok(())
+}
+
 /// `project add` — create `<pm>/<key>/project.yaml`.
 #[allow(clippy::too_many_arguments)]
 pub fn project_add(
@@ -532,17 +553,11 @@ pub fn project_add(
         id: Some(project::new_id()),
         policy: Some(project::ProjectPolicy::workspace_visible()),
     };
-    let dir = pm.dir.join(key);
-    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-        return Err(Error::rejected(format!(
-            "{key}/ is a symlink — refusing to write outside the PM dir"
-        )));
-    }
+    let dir = project_dir(pm, key)?;
     std::fs::create_dir_all(&dir)?;
-    let yaml = serde_yaml::to_string(&project)
-        .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
     let yaml_path = dir.join("project.yaml");
-    std::fs::write(&yaml_path, yaml)?;
+    let prev = file_preimage(&yaml_path);
+    write_project_yaml(&yaml_path, &project)?;
     let foreign = match commit_scoped(
         pm,
         &lock,
@@ -553,7 +568,7 @@ pub fn project_add(
     ) {
         Ok(f) => f,
         Err(e) => {
-            let _ = std::fs::remove_file(&yaml_path);
+            restore_preimage(&yaml_path, prev);
             return Err(e);
         }
     };
@@ -581,12 +596,7 @@ pub fn set_project_policy(
              only workspace-visible can be recorded",
         ));
     }
-    let dir = pm.dir.join(key);
-    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-        return Err(Error::rejected(format!(
-            "{key}/ is a symlink — refusing to write outside the PM dir"
-        )));
-    }
+    let dir = project_dir(pm, key)?;
     let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     let yaml_path = dir.join("project.yaml");
     if !crate::issue::board::is_real_file(&yaml_path) {
@@ -607,17 +617,25 @@ pub fn set_project_policy(
     if project.id.is_none() {
         project.id = Some(project::new_id());
     }
-    let yaml = serde_yaml::to_string(&project)
-        .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
-    std::fs::write(&yaml_path, yaml)?;
-    let foreign = commit_scoped(
+    let prev = file_preimage(&yaml_path);
+    write_project_yaml(&yaml_path, &project)?;
+    let foreign = match commit_scoped(
         pm,
         &lock,
         std::slice::from_ref(&yaml_path),
         &format!("project {key} policy version {}", policy.version),
         &[],
         "",
-    )?;
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            // A refused commit leaves the record exactly as it was — the
+            // rule every other write in this module follows, and the one
+            // this verb was missing.
+            restore_preimage(&yaml_path, prev);
+            return Err(e);
+        }
+    };
     let mut out = json!({
         "project": key,
         "policy": serde_json::to_value(&policy)
@@ -2579,6 +2597,31 @@ mod tests {
         let err = set_project_policy(&pm, "ghost", project::Visibility::WorkspaceVisible, &[])
             .unwrap_err();
         assert!(err.to_string().contains("no project"), "{err}");
+    }
+
+    /// A commit the tracker refuses leaves the record exactly as it was —
+    /// the rule every other writer here follows, which this verb was
+    /// missing: the version had already been bumped on disk when the
+    /// commit failed, so a refused write looked applied.
+    #[test]
+    fn a_policy_write_whose_commit_is_refused_leaves_the_record_alone() {
+        let (_dir, pm) = tracker();
+        let key = "cadence";
+        let path = pm.dir.join(key).join("project.yaml");
+        let before = std::fs::read(&path).unwrap();
+        let hook = failing_hook(&pm);
+
+        assert!(
+            set_project_policy(&pm, key, project::Visibility::WorkspaceVisible, &[]).is_err(),
+            "the refused commit was reported as a success"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a refused commit left the changed record behind"
+        );
+        assert!(clean(&pm), "a refused policy write left something behind");
+        std::fs::remove_file(hook).unwrap();
     }
 
     /// CAD-908: a created file is whole, a collision renames, and no
