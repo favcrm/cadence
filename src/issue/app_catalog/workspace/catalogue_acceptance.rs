@@ -763,3 +763,141 @@ fn catalogue_checked_access_reports_changed_declarations_not_just_files() {
     assert!(review["capabilities"]["removed"]["after"].is_null());
     assert!(review["capabilities"].get("unchanged").is_none());
 }
+
+#[test]
+fn catalogue_apply_refuses_a_release_disabled_after_successful_check() {
+    // Capture files and directory entries, including otherwise invisible
+    // pending journals or orphan revision directories.
+    fn persisted_entries(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut entries = BTreeMap::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                entries.insert(path.clone(), None);
+                entries.extend(persisted_entries(&path));
+            } else {
+                assert!(kind.is_file(), "unexpected fixture entry: {path:?}");
+                let bytes = std::fs::read(&path).unwrap();
+                entries.insert(path, Some(bytes));
+            }
+        }
+        entries
+    }
+
+    let (pm_dir, state, pm) = workspace();
+    let sources = tempfile::tempdir().unwrap();
+    let current_source = write_bundle(&sources.path().join("v1"), "1.0.0");
+    let next_source = write_bundle(&sources.path().join("v2"), "2.0.0");
+    let old_digest = digest_of(&current_source);
+    let new_digest = digest_of(&next_source);
+    let directory = Directory::start(versions(
+        APP,
+        "2.0.0",
+        vec![
+            release("1.0.0", &old_digest, true),
+            release("2.0.0", &new_digest, true),
+        ],
+    ));
+    let installed = install_at(
+        &pm,
+        state.path(),
+        &current_source,
+        &old_digest,
+        &locator(APP, "1.0.0", &old_digest),
+        &directory.origin,
+    )
+    .unwrap();
+    let id = installed["install_id"].as_str().unwrap().to_string();
+    let before = show(&pm, &id).unwrap();
+    let generation = before["catalog_generation"].as_str().unwrap().to_string();
+    let apps_dir = pm.dir.join(".apps");
+    let persisted_before = persisted_entries(&apps_dir);
+    let head_before = crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+    let next_claim = locator(APP, "2.0.0", &new_digest);
+
+    // Establish that the exact target was eligible and all pins were valid.
+    let checked = upgrade_check_from(
+        &pm,
+        &id,
+        &next_source,
+        &old_digest,
+        &generation,
+        &next_claim,
+        CatalogueDirectory::Origin(&directory.origin),
+    )
+    .unwrap();
+    assert_eq!(checked["committed"], json!(false));
+    assert_eq!(checked["approved"], json!(false));
+    assert_eq!(checked["install_id"], json!(id));
+    assert_eq!(checked["expected_digest"], json!(old_digest));
+    assert_eq!(checked["expected_generation"], json!(generation));
+    assert_eq!(checked["digest"], json!(new_digest));
+    assert_eq!(
+        checked["catalogue"],
+        json!({
+            "id": APP,
+            "version": "2.0.0",
+            "digest": new_digest
+        })
+    );
+    assert_eq!(persisted_entries(&apps_dir), persisted_before);
+    assert_eq!(
+        crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(),
+        head_before
+    );
+
+    // Change eligibility only: identity, version, digest, recommendation,
+    // source bytes, installed digest and catalogue generation stay fixed.
+    directory.set(versions(
+        APP,
+        "2.0.0",
+        vec![
+            release("1.0.0", &old_digest, true),
+            release("2.0.0", &new_digest, false),
+        ],
+    ));
+    assert_eq!(digest_of(&next_source), new_digest);
+
+    let request = UpgradeRequest {
+        id: &id,
+        source: &next_source,
+        expected_digest: checked["expected_digest"].as_str().unwrap(),
+        expected_generation: checked["expected_generation"].as_str().unwrap(),
+        expected_new_digest: checked["digest"].as_str().unwrap(),
+        request_id: "disabled-after-check",
+        catalogue: &next_claim,
+        directory: CatalogueDirectory::Origin(&directory.origin),
+    };
+
+    // Use the actual native boundary, not a mocked eligibility predicate.
+    // A cached Check must not authorize this now-disabled publication.
+    let result = upgrade(
+        &pm,
+        &request,
+        |_, _| panic!("disabled release reached upgrade preflight"),
+        |_| panic!("disabled release reached upgrade delivery"),
+    );
+    refused(result, "catalogue release is not installable");
+
+    // Refusal must retain package bytes, provenance, CAS generation and
+    // installation identity, without a pending or completed upgrade journal.
+    assert_eq!(persisted_entries(&apps_dir), persisted_before);
+    assert_eq!(
+        crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(),
+        head_before
+    );
+    assert_eq!(show(&pm, &id).unwrap(), before);
+    assert_row(
+        &show(&pm, &id).unwrap(),
+        &id,
+        "1.0.0",
+        &old_digest,
+        Some("1.0.0"),
+    );
+
+    // Confirm the retained state survives reopening the workspace.
+    let reopened = Pm::at(pm_dir.path()).unwrap();
+    assert_eq!(show(&reopened, &id).unwrap(), before);
+}
