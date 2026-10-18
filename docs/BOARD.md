@@ -50,7 +50,12 @@ cannot replace the newer result.
 The board derives the owner from its live session and rechecks the caller after
 the read. Query selectors are refused. Local board sessions use the existing
 `operator` attribution; named hosted Owners and Members retain their own user handles.
-This is a personal filter, **not** a new project-visibility or authorization boundary.
+Existing project access is applied before deriving cards, relationships and epic
+roll-ups; being assigned an issue never grants access to its project. Owner
+administrative visibility does not replace the Owner's individual attribution.
+The read is discarded if its project-access set or effective caller authority
+changes while it is being prepared. This personal filter introduces no new grant
+and does not activate Private projects or qualify assistant/filesystem isolation.
 
 `cadence --org <org> my-work` provides the same PM read for a signed-in hosted org
 through the existing `cli.read` actor-envelope protocol. The native server derives

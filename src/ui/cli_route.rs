@@ -418,8 +418,16 @@ fn dispatch(
             if actor.actor != "operator" && !actor.actor.starts_with("users/") {
                 return cli_fail(403, "human_session_required", "my_work requires a user");
             }
-            match super::my_work::payload(state_dir, pm_dir, &actor.handle) {
-                Ok(body) => json_ok(body),
+            let policy_actor = actor.policy_spelling();
+            match super::my_work::Snapshot::load(state_dir, pm_dir, &policy_actor) {
+                Ok(snapshot) => match snapshot.payload(&actor.handle, &policy_actor) {
+                    Some(body) => json_ok(body),
+                    None => cli_fail(
+                        403,
+                        "project_access_changed",
+                        "My work project access changed; refresh",
+                    ),
+                },
                 Err(error) => write_err(&error),
             }
         }
@@ -1208,3 +1216,6 @@ mod aos274_policy_http;
 
 #[cfg(test)]
 mod cad1500_acceptance;
+
+#[cfg(test)]
+mod cad1500_policy_acceptance;
