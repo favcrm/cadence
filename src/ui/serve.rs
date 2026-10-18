@@ -1528,14 +1528,37 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, err_response(400, "bad project key"));
                     return;
                 }
-                // Every project loads so cross-project children count.
+                // Every project loads so cross-project children count, so
+                // the caller's readable set is applied to the view slice
+                // first: a restricted project contributes no epic, child
+                // or count.
                 let read = read_model::get(state_dir, pm_dir).board(&pm, None);
+                let actor = match read_admission
+                    .as_ref()
+                    .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => actor,
+                    Some(Err(resp)) => {
+                        send(request, resp);
+                        return;
+                    }
+                    None => {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    }
+                };
+                let readable = super::project_policy::readable(&pm, &actor);
+                let visible: Vec<&crate::issue::board::View> = read
+                    .views
+                    .iter()
+                    .filter(|v| readable.contains(&v.issue.project))
+                    .collect();
                 send(
                     request,
                     json_response(json!({
                         "epics": crate::issue::work::epics_json(
                             &pm.dir,
-                            &read.views,
+                            &visible,
                             filter.as_deref(),
                             crate::issue::time::now_epoch(),
                             &read.approvals,
