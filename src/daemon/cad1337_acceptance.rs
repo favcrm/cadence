@@ -1179,9 +1179,11 @@ fn cad1553_image_company_authority_is_strict_and_bound_at_shared_boot() {
             std::fs::create_dir(path).unwrap();
         }
         crate::issue::Pm::init(&tracker).unwrap();
-        let mut opts = ServeOptions::default();
-        opts.provider_env = crate::adapter::ProviderEnv::refusing_providers()
-            .with_company_master(trusted.hosted_company_master());
+        let mut opts = ServeOptions {
+            provider_env: crate::adapter::ProviderEnv::refusing_providers()
+                .with_company_master(trusted.hosted_company_master()),
+            ..ServeOptions::default()
+        };
         opts.provider_env.set("HOME", home.to_str().unwrap());
         opts.provider_env
             .set("CADENCE_HOME", private.to_str().unwrap());
