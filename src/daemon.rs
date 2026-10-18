@@ -96,6 +96,8 @@ mod cad1473_host_redispatch;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1473_independent_redispatch;
 #[cfg(all(test, feature = "test-seam"))]
+mod cad1481_independent_media_refusal;
+#[cfg(all(test, feature = "test-seam"))]
 mod cad1482_independent_media_refusal;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1518_acceptance;

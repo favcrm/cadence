@@ -936,6 +936,14 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
 
     let send = |req: Request, resp: HttpResp| send(req, resp, head_only);
 
+    // CAD-1481: agent inspect of a turn-pinned library image. Admitted
+    // before the operator session gate — the daemon proves the live turn.
+    if method == Method::Post && path == "/api/app-media/inspect" {
+        let response = super::app_media::media_inspect(&mut request, state_dir);
+        send(request, response);
+        return;
+    }
+
     // CAD-786: the recipient's unsubscribe confirmation page — the
     // token in the path is the credential, so the page is answered
     // before every session gate, on any host this board serves. The

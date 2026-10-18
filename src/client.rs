@@ -970,6 +970,60 @@ fn rpc_frame_on(
 /// reporting success — a truncated, extra or corrupt body, or any
 /// bytes inside a JSON value, is refused. No other method uses this
 /// path; ordinary JSON framing is unchanged.
+pub fn rpc_app_media_inspect(state_dir: &Path, params: Value) -> Result<(Value, Vec<u8>)> {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufRead, BufReader, Read};
+    const LIMIT: u64 = 10 * 1024 * 1024;
+    let socket = rpc_socket_path(state_dir)?;
+    let mut request = proto::request("app_media_inspect", params);
+    if let Some(test_caller) = crate::test_seam::caller_frame(state_dir)? {
+        request[crate::test_seam::FRAME_FIELD] = test_caller;
+    }
+    let mut body = request.to_string();
+    body.push('\n');
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let stream = connect_bounded(&socket, deadline).map_err(|e| match e {
+        e @ Error::Structured(_) => e,
+        _ => daemon_unreachable(&socket),
+    })?;
+    let fd = stream.as_raw_fd();
+    write_bounded(fd, body.as_bytes(), deadline)?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    stream.set_nonblocking(false)?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let frame: Value = serde_json::from_str(line.trim())
+        .map_err(|_| Error::internal("Daemon returned a malformed response"))?;
+    let result = proto::unwrap(frame)?;
+    let object = result
+        .as_object()
+        .ok_or_else(|| Error::internal("daemon inspect header is not an object"))?;
+    if object.len() != 5
+        || !matches!(
+            result["media_type"].as_str(),
+            Some("image/png" | "image/jpeg" | "image/webp")
+        )
+        || !result["bytes"]
+            .as_u64()
+            .is_some_and(|n| (1..=LIMIT).contains(&n))
+        || result["sha256"].as_str().is_none()
+        || result["asset_id"].as_str().is_none()
+        || !result["revision"].is_i64()
+    {
+        return Err(Error::internal(
+            "daemon inspect header failed its closed checks",
+        ));
+    }
+    let declared = result["bytes"].as_u64().unwrap_or_default() as usize;
+    let mut bytes = vec![0u8; declared];
+    reader.read_exact(&mut bytes)?;
+    if format!("sha256:{:x}", Sha256::digest(&bytes)) != result["sha256"] {
+        return Err(Error::internal("daemon inspect body failed its digest"));
+    }
+    Ok((result, bytes))
+}
+
 pub fn rpc_app_media_original(state_dir: &Path, params: Value) -> Result<(Value, Vec<u8>)> {
     use sha2::{Digest, Sha256};
     const ORIGINAL_LIMIT: u64 = 10 * 1024 * 1024;

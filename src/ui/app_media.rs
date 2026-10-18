@@ -46,6 +46,37 @@ pub(super) fn publish_route(path: &str) -> bool {
     path == "/api/app-media/publish"
 }
 
+/// Agent inspect relay. Body is the closed daemon params
+/// `{asset_id, message, token}`. Success is the raw image; refusal is JSON.
+pub(super) fn media_inspect(request: &mut Request, state_dir: &std::path::Path) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let body: Value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v) if v.is_object() => v,
+        _ => return err_response(400, "media inspect body must be a JSON object"),
+    };
+    if body.as_object().is_some_and(|o| {
+        o.keys()
+            .any(|k| !matches!(k.as_str(), "asset_id" | "message" | "token"))
+    }) {
+        return err_response(400, "media inspect body contains unsupported fields");
+    }
+    match client::rpc_app_media_inspect(state_dir, body) {
+        Ok((header, bytes)) => {
+            let media_type = header["media_type"]
+                .as_str()
+                .unwrap_or("application/octet-stream");
+            let mut resp = HttpResp::from_data(bytes);
+            resp.add_header(tiny_http::Header::from_bytes("Content-Type", media_type).unwrap());
+            resp.add_header(tiny_http::Header::from_bytes("Cache-Control", "no-store").unwrap());
+            resp
+        }
+        Err(e) => home::rpc_err(&e, "app_media_inspect"),
+    }
+}
+
 /// `POST /api/app-media/original` → `true` for exactly that path.
 pub(super) fn original_route(path: &str) -> bool {
     path == "/api/app-media/original"
