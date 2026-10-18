@@ -293,6 +293,12 @@ and a final source-tracker recheck must pass before no-replace publication.
 Owned temporary capture and staging directories are cleaned on refusal.
 A source-change refusal is not an automatic retry.
 
+The coordination projection removes related private rows in one transaction
+on the private database copy. Foreign keys remain enabled; their checks are
+deferred until commit so removing human-room topics and metadata does not
+fail on an intermediate state. A foreign-key failure at commit refuses the
+export without publishing a package. The source database is unchanged.
+
 Success prints JSON with `manifest_sha256`, `exporter_revision`, schema,
 tracker revision, member count/bytes, exclusions, and `source_capture`
 (original HEAD, snapshot HEAD, file/byte counts, inventory SHA-256 and capture

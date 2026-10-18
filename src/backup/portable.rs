@@ -1401,6 +1401,8 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
     let conn = Connection::open(db)?;
     let mut omitted = Vec::new();
     let tx = conn.unchecked_transaction()?;
+    // Related private rows are removed together; enforce their foreign keys at commit.
+    tx.pragma_update(None, "defer_foreign_keys", true)?;
     let mut guard_sql = Vec::new();
     for name in PRIVATE_DELETE_GUARDS {
         guard_sql.push(tx.query_row(
