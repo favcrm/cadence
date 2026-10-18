@@ -563,6 +563,71 @@ pub fn project_add(
     Ok(out)
 }
 
+/// Replace a project's recorded access policy (AOS-274).
+///
+/// Takes the tracker lock, re-reads the project, keeps its identity, bumps
+/// the policy version and commits `project.yaml` only. `Private` is refused
+/// until the isolation gate passes — `workspace-visible` is the only
+/// visibility this build may record.
+pub fn set_project_policy(
+    pm: &Pm,
+    key: &str,
+    visibility: project::Visibility,
+    members: &[String],
+) -> Result<Value> {
+    if visibility == project::Visibility::Private {
+        return Err(Error::rejected(
+            "private projects are not available yet — the isolation gate has not passed; \
+             only workspace-visible can be recorded",
+        ));
+    }
+    let dir = pm.dir.join(key);
+    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{key}/ is a symlink — refusing to write outside the PM dir"
+        )));
+    }
+    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
+    let yaml_path = dir.join("project.yaml");
+    if !crate::issue::board::is_real_file(&yaml_path) {
+        return Err(Error::rejected(format!(
+            "no project '{key}' — register it with `cadence issue project add`"
+        )));
+    }
+    let mut project = project::load(&yaml_path)?;
+    let grants = members
+        .iter()
+        .map(|member| project::Grant::parse(member))
+        .collect::<Result<Vec<_>>>()?;
+    let mut policy = project.policy.clone().unwrap_or_default();
+    policy.version = policy.version.saturating_add(1);
+    policy.visibility = visibility;
+    policy.members = grants;
+    project.policy = Some(policy.clone());
+    if project.id.is_none() {
+        project.id = Some(project::new_id());
+    }
+    let yaml = serde_yaml::to_string(&project)
+        .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
+    std::fs::write(&yaml_path, yaml)?;
+    let foreign = commit_scoped(
+        pm,
+        &lock,
+        std::slice::from_ref(&yaml_path),
+        &format!("project {key} policy version {}", policy.version),
+        &[],
+        "",
+    )?;
+    let mut out = json!({
+        "project": key,
+        "policy": serde_json::to_value(&policy)
+            .map_err(|e| Error::internal(format!("policy: {e}")))?,
+        "committed": true,
+    });
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
+}
+
 /// Allocate the next id under the write lock: `<PREFIX>-<max+1>`.
 pub(crate) fn next_id(dir: &Path, prefix: &str) -> Result<u64> {
     let mut max = 0u64;
@@ -2467,6 +2532,54 @@ pub fn attach_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AOS-274: the recorded policy advances by one version per write,
+    /// keeps the minted identity, refuses private until the isolation
+    /// gate passes, and refuses both an unsupported grant and an unknown
+    /// project.
+    #[test]
+    fn setting_a_policy_bumps_the_version_and_refuses_private() {
+        let (_dir, pm) = tracker();
+        let key = "cadence";
+        let before = project::load(&pm.dir.join(key).join("project.yaml")).unwrap();
+        let start = before.policy.as_ref().map(|p| p.version).unwrap_or(0);
+        let id = before.id.clone().expect("creation mints an identity");
+
+        let out = set_project_policy(&pm, key, project::Visibility::WorkspaceVisible, &[]).unwrap();
+        assert_eq!(out["policy"]["version"], start + 1);
+        assert_eq!(out["policy"]["visibility"], "workspace_visible");
+        let loaded = project::load(&pm.dir.join(key).join("project.yaml")).unwrap();
+        assert_eq!(loaded.id, Some(id), "the identity must not change");
+        assert_eq!(loaded.policy.as_ref().unwrap().version, start + 1);
+
+        // A grant is recorded and the version advances again.
+        let out = set_project_policy(
+            &pm,
+            key,
+            project::Visibility::WorkspaceVisible,
+            &["users/mia".to_string()],
+        )
+        .unwrap();
+        assert_eq!(out["policy"]["version"], start + 2);
+        assert_eq!(out["policy"]["members"][0], "users/mia");
+
+        // Private is refused until the isolation gate passes.
+        let err = set_project_policy(&pm, key, project::Visibility::Private, &[]).unwrap_err();
+        assert!(err.to_string().contains("private"), "{err}");
+
+        // Reserved grantee kinds and unknown projects are refused.
+        let err = set_project_policy(
+            &pm,
+            key,
+            project::Visibility::WorkspaceVisible,
+            &["agents/dev".to_string()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("agents/dev"), "{err}");
+        let err = set_project_policy(&pm, "ghost", project::Visibility::WorkspaceVisible, &[])
+            .unwrap_err();
+        assert!(err.to_string().contains("no project"), "{err}");
+    }
 
     /// CAD-908: a created file is whole, a collision renames, and no
     /// temp file survives either outcome.
