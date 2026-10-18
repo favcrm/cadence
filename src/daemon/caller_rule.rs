@@ -1205,6 +1205,16 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("crm_smtp_revoke", Rule::Handler("rpc_crm_smtp")),
     ("crm_smtp_show", Rule::Handler("rpc_crm_smtp")),
     ("crm_smtp_test_send", Rule::Handler("rpc_crm_smtp")),
+    // CAD-1562: every WhatsApp door verb enters `rpc_whatsapp`, whose
+    // first act is `operator_connection`.
+    ("whatsapp_status", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_connect_session", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_conversations_list", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_conversations_show", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_messages", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_reply_prepare", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_reply_send", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_reply_status", Rule::Handler("rpc_whatsapp")),
     // CAD-786: the send verbs all enter `rpc_crm_send`, whose first
     // act is `operator_connection`.
     ("crm_send_prepare", Rule::Handler("rpc_crm_send")),

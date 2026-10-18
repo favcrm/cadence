@@ -187,6 +187,11 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions, hosted: &crate::lease::Hos
     if lease_is_on(hosted) && opts.hosted_email.is_none() {
         opts.hosted_email = super::hosted_email::HostedEmail::from_env(&base)?;
     }
+    // CAD-1562: the same real lease opens the WhatsApp door; an explicit
+    // URL alone never does.
+    if lease_is_on(hosted) && opts.hosted_whatsapp.is_none() {
+        opts.hosted_whatsapp = Some(super::hosted_whatsapp::HostedWhatsapp::new(&base)?);
+    }
     // CAD-1126: the same real lease routes enrolled SMTP senders
     // through the `smtp.internal` pass-through (no direct socket).
     if lease_is_on(hosted) && opts.smtp_internal.is_none() {

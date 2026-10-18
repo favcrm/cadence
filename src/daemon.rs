@@ -127,6 +127,7 @@ mod identity;
 #[cfg(target_os = "linux")]
 mod installer_client;
 mod installer_enrollment_wire;
+mod whatsapp_rpc;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRecord;
 mod bootstrap_files;
@@ -620,6 +621,9 @@ pub struct Shared {
     /// CAD-1063: the hosted platform email door; `Some` only on a
     /// hosted daemon, where it replaces SMTP egress.
     hosted_email: Option<crate::platform::hosted_email::HostedEmail>,
+    /// CAD-1562: the hosted WhatsApp door; `Some` only on a hosted
+    /// daemon. A self-hosted daemon refuses every WhatsApp verb.
+    hosted_whatsapp: Option<crate::platform::hosted_whatsapp::HostedWhatsapp>,
     /// CAD-1126: `Some` on a hosted daemon — enrolled SMTP senders send
     /// and verify through the `smtp.internal` pass-through instead of
     /// opening a socket the offline container does not have.
@@ -1014,6 +1018,7 @@ impl Shared {
                 opts.crm_send_pending_poll_ms
             }),
             hosted_email: opts.hosted_email.clone(),
+            hosted_whatsapp: opts.hosted_whatsapp.clone(),
             smtp_internal: opts.smtp_internal.clone(),
             unsubscribe_origin: opts.unsubscribe_origin.clone(),
             #[cfg(feature = "test-seam")]
@@ -3182,6 +3187,14 @@ impl Shared {
             "crm_smtp_revoke" => self.rpc_crm_smtp(method, params, peer_pid),
             "crm_smtp_show" => self.rpc_crm_smtp(method, params, peer_pid),
             "crm_smtp_test_send" => self.rpc_crm_smtp(method, params, peer_pid),
+            "whatsapp_status" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_connect_session" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_conversations_list" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_conversations_show" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_messages" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_reply_prepare" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_reply_send" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_reply_status" => self.rpc_whatsapp(method, params, peer_pid),
             "crm_send_prepare" => self.rpc_crm_send(method, params, peer_pid),
             "crm_send_approve" => self.rpc_crm_send(method, params, peer_pid),
             "crm_send_show" => self.rpc_crm_send(method, params, peer_pid),
@@ -4748,6 +4761,10 @@ pub struct ServeOptions {
     /// lease (and by fixtures); `None` keeps the SMTP path. Never
     /// sourced from RPC or PM.
     pub hosted_email: Option<crate::platform::hosted_email::HostedEmail>,
+    /// CAD-1562: the hosted WhatsApp door (`agenticos.whatsapp-door.v1`).
+    /// Set by `platform::agenticos::attach` only on a daemon holding a
+    /// hosted lease (and by fixtures). Never sourced from RPC or PM.
+    pub hosted_whatsapp: Option<crate::platform::hosted_whatsapp::HostedWhatsapp>,
     /// CAD-1126: the hosted `smtp.internal` pass-through. Set by
     /// `platform::agenticos::attach` on a daemon holding a hosted lease
     /// (and by fixtures), or — CAD-1158 — from the dedicated versioned
