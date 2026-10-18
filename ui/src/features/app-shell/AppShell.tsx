@@ -413,16 +413,15 @@ export default function AppShell({
     };
   }, [installId, receiptKey, viewer.operator]);
 
-  // CAD-1519: an app with no active context gets its General context on
-  // the operator's first open (Social Content owns its own contexts). The
-  // setup is retriable in place; the request identity is
-  // installation-stable and its result is adopted only while this verified
-  // receipt is still current.
+  // CAD-1519: an app with a mountable screen and no active context gets its
+  // General context on the operator's first open (Social Content owns its
+  // own contexts). The setup is retriable in place; the request identity
+  // is installation-stable and its result is adopted only while this
+  // verified receipt is still current.
   useEffect(() => {
     if (
       !receiptReady ||
-      installation === null ||
-      isSocialContent(installation) ||
+      !wantsGeneralContext(installation) ||
       contexts.some((context) => context.state === "active") ||
       viewer.operator !== true ||
       viewer.readOnly
@@ -518,7 +517,7 @@ export default function AppShell({
     [contexts, receiptReady],
   );
   const activeIds = useMemo(() => activeContexts.map((c) => c.id), [activeContexts]);
-  const needsSetup = receiptReady && installation !== null && !isSocialContent(installation) && activeIds.length === 0;
+  const needsSetup = receiptReady && wantsGeneralContext(installation) && activeIds.length === 0;
   const generalSetupError = generalSetup?.key === setupScopeKey ? generalSetup.error : null;
   const canRetryGeneralSetup = viewer.operator === true && !viewer.readOnly;
 
@@ -949,7 +948,7 @@ export default function AppShell({
             </main>
           )}
           {receiptReady && installation && (
-            needsSetup && previewKey === null ? (
+            needsSetup ? (
               generalSetupError !== null ? (
                 <ErrorNotice
                   onRetry={canRetryGeneralSetup ? () => {
@@ -1091,6 +1090,12 @@ export function chatBinding({ installId, wanted, known, activeIds }: {
     };
   }
   return { scope: { install_id: installId, context_id: wanted }, error: null };
+}
+
+/** The apps the shell sets up a General context for: an approved,
+ *  executable, installed screen it can mount (Social Content owns its own). */
+function wantsGeneralContext(installation: Installation | null): installation is Installation {
+  return installation !== null && installation.removed == null && !isSocialContent(installation) && screenTag(installation) !== null;
 }
 
 function contextLabel(contexts: AppContext[], contextId: string): string | null {
