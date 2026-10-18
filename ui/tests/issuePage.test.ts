@@ -17,6 +17,7 @@ import {
   refreshIssueIds,
   shownLinks,
   timelineRows,
+  verdictStale,
 } from "../src/features/issues/model";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
@@ -165,4 +166,17 @@ const mixed = timelineRows(detail({ reports: [
   { name: "dated", body: "Recent evidence", at: "2026-09-27T12:00:00Z" },
 ] }), history);
 equal(mixed.map(row => row.detail), ["Recent evidence", "status → doing", "Undated evidence", "Invalid-date evidence"], "undated and invalid-date reports remain after dated events in stable order");
+const reviewed = { name: "review", kind: "verdict", verdict: "pass", sha: "a".repeat(40), at: "2026-09-27T12:00:00Z" };
+const reported = { name: "updated-evidence", kind: "done", sha: reviewed.sha, at: "2026-09-27T13:00:00Z" };
+equal(
+  verdictStale(reviewed, detail({ reports: [reviewed, reported] })),
+  false,
+  "new evidence on the reviewed head does not invalidate that review",
+);
+equal(
+  verdictStale(reviewed, detail({ reports: [reviewed, { ...reported, sha: "b".repeat(40) }] })),
+  true,
+  "a report on a different head leaves review coverage unconfirmed",
+);
+
 console.log("issue page checks passed");

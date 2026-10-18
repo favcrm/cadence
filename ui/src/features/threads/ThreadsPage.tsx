@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { ApiError, api } from "../../lib/api";
-import { withPrivateOperation } from "../../lib/privateSession";
+import { onPrivateSessionReset, withPrivateOperation } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
 import { useResource } from "../../lib/useResource";
 import { navigate, useHref } from "../../lib/useLocation";
@@ -82,6 +82,7 @@ import "./threads.css";
  *  (the daemon's idempotency), not mint a new message. Bounded so a long
  *  session can't grow it without limit. */
 const envelopeIds = new Map<string, { key: string; id: string }>();
+onPrivateSessionReset(() => envelopeIds.clear());
 function envelopeId(scope: string, contentKey: string): string {
   const held = envelopeIds.get(scope);
   if (held && held.key === contentKey) return held.id;

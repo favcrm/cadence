@@ -201,6 +201,15 @@ for (const density of ["full", "compact"] as const) {
   ok((withRefs.match(/class="refchip/g) ?? []).length === 2, `${density}: one chip per ref`);
   const noRefs = render(items.operator, density);
   ok(!noRefs.includes("refchip") && !noRefs.includes("refsrow"), `${density}: operator without refs has no chips`);
+  const pendingRefs = render(
+    {
+      type: "pending",
+      key: "pr",
+      pending: { message: "m2", text: "go", state: "sent", at: 1, refs: [{ kind: "issue", id: "CAD-9" }] },
+    },
+    density,
+  );
+  ok((pendingRefs.match(/class="refchip/g) ?? []).length === 1, `${density}: pending refs render`);
   ok(!render(items.pending, density).includes("refchip"), `${density}: pending without refs has no chips`);
 }
 

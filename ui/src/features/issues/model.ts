@@ -370,12 +370,12 @@ export function reportView(reports: readonly TaskReport[]): ReportView {
 }
 
 /**
- * Anything the issue records that is newer than the verdict means the
- * review may not cover the latest work. Honest flag, not a re-review.
+ * Prefer explicit revision identity. Without both heads, a newer
+ * record makes coverage uncertain; its timestamp does not prove new code.
  */
 export function verdictStale(verdict: TaskReport, detail: IssueDetail): boolean {
   const newer = reportView(detail.reports ?? []).latest;
-  if (newer?.sha && verdict.sha && newer.sha !== verdict.sha) return true;
+  if (newer?.sha && verdict.sha) return newer.sha !== verdict.sha;
   const at = timeKey(verdict.at ?? null);
   if (at === Number.NEGATIVE_INFINITY) return false;
   if (newer && timeKey(newer.at ?? null) > at) return true;

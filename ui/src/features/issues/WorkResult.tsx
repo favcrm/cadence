@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useContext, type ReactNode } from "react";
 import SafeLink from "../../ui/SafeLink";
 import Button from "../../ui/Button";
 import Md from "../../ui/Md";
@@ -6,7 +6,8 @@ import { fmtTime } from "../../lib/fmt";
 import { useLocale } from "../../lib/locale";
 import type { IssueDetail, TaskReport } from "../../lib/types";
 import { stageLabel } from "../projects/work";
-import type { LanePayload } from "./lane";
+import { composerBlocked, type LanePayload } from "./lane";
+import { WriteGate } from "../auth/WriteGate";
 import {
   deployRefs,
   mergeState,
@@ -93,6 +94,7 @@ export function WorkResult({
   onOpen: (id: string) => void;
 }) {
   const { t, formatNumber } = useLocale();
+  const writeBlock = useContext(WriteGate);
   const view = reportView(detail.reports ?? []);
   const pr = prRef(detail.refs);
   const merge = mergeState(detail, pr);
@@ -103,6 +105,7 @@ export function WorkResult({
   const stale = verdict ? verdictStale(verdict, detail) : false;
   const laneView = lane?.lane ?? null;
   const workerOwn = latest?.agent && laneView?.agent === latest.agent;
+  const feedbackBlocked = composerBlocked(laneView?.state) || writeBlock != null;
 
   const rows: { title: string; detail: ReactNode; tone: keyof typeof TONE_DOT }[] = [
     {
@@ -135,7 +138,7 @@ export function WorkResult({
           {verdict.sha && ` · ${t("applies to")} ${verdict.sha.slice(0, 12)}`}
           {stale && (
             <p className="m-0 text-ink-400">
-              {t("Newer work landed after this review — it may not cover the latest revision.")}
+              {t("Review coverage is unconfirmed — compare the recorded revision with newer evidence.")}
             </p>
           )}
         </>
@@ -256,7 +259,7 @@ export function WorkResult({
             {pr && !pr.href && (
               <li className="text-ink-400">{`${pr.label} — ${t("this reference has no URL")}`}</li>
             )}
-            {latest?.pr && !pr?.href && (
+            {latest?.pr && latest.pr !== pr?.href && (
               <li className="num truncate">
                 <SafeLink className="lnk" href={latest.pr}>
                   {`${t("Pull request")} (${t("from the worker report")})`}
@@ -281,7 +284,7 @@ export function WorkResult({
         )}
         <div className="flex flex-wrap gap-2">
           {laneView ? (
-            <Button variant="primary" onClick={() => onCompose("instruct")}>
+            <Button variant="primary" disabled={feedbackBlocked} onClick={() => onCompose("instruct")}>
               {t("Leave feedback in the conversation")}
             </Button>
           ) : (
@@ -296,6 +299,11 @@ export function WorkResult({
             {t("Open evidence")}
           </Button>
         </div>
+        {laneView && composerBlocked(laneView.state) && (
+          <p className="text-secondary text-ink-400 m-0">
+            {t("Feedback is unavailable for this lane state. Open Conversation to read its history; recovery controls, when available, are on the lane card.")}
+          </p>
+        )}
         <p className="text-micro text-ink-500 m-0">
           {t("A worker report is the agent's own statement — not operator approval, not a merge, not a deployment.")}
         </p>
