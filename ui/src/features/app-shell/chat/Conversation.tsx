@@ -667,12 +667,22 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     // real arrival counts those prepended rows too and one message is
     // announced as "21 new" (CAD-1533 spec/security round 2, blocking).
     const arrivals = Math.max(1, items.length - prevItems.current);
-    prevItems.current = items.length;
-    if (stored === storedTailKey.current) return;
+    const grew = items.length > prevItems.current;
+    const anchorMoved = stored !== storedTailKey.current;
     const first = storedTailKey.current === null;
+    prevItems.current = items.length;
     storedTailKey.current = stored;
     if (first) {
       scrollPanel("jump");
+      return;
+    }
+    if (!anchorMoved) {
+      // A pending-only change is never an unseen arrival — the operator's
+      // own message is not "new" — but while pinned its row still has to
+      // stay in view, and the early return used to skip exactly that
+      // (CAD-1533 spec/security round 4, blocking). The resize observer is
+      // no substitute: it re-baselines from the already-updated DOM.
+      if (grew && follow.current.pinned && !follow.current.programmatic) scrollPanel("jump");
       return;
     }
     const next = onTailChange(follow.current, arrivals);
