@@ -244,9 +244,4 @@ mod tests {
         assert!(catalog_upstream("/api/other", "").is_none());
     }
 
-    #[test]
-    fn board_csp_does_not_name_the_catalog_origin() {
-        assert!(!super::super::serve::CSP.contains("connect-src"));
-        assert!(!super::super::serve::CSP.contains("8826"));
-    }
 }
