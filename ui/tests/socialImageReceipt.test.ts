@@ -21,7 +21,7 @@ const bytes = Buffer.from(png, "base64");
 const digest = `sha256:${require("crypto").createHash("sha256").update(bytes).digest("hex")}`;
 const run = {
   id: "image-run", install_id: "install-a", context_id: null, state: "succeeded", snapshot_digest: "snapshot", approved_digest: "snapshot",
-  snapshot: { bundle_digest: "bundle-digest", workflow: { title: "Caption and image", steps: [] }, inputs: { source: "Selected source" }, owner_pm: "pm-a", capabilities: { image: { id: "binding-image", revision: 1, digest: "binding-digest" } }, source: { receipt_id: "source-receipt", post: { id: "post-a", caption: "Original" } }, assignments: {} },
+  snapshot: { workflow: { title: "Caption and image", steps: [] }, inputs: { source: "Selected source" }, owner_pm: "pm-a", capabilities: { image: { id: "binding-image", revision: 1, digest: "binding-digest" } }, source: { receipt_id: "source-receipt", post: { id: "post-a", caption: "Original" } }, assignments: {} },
   steps: [], artifacts: [], reviews: [{ step_id: "review", artifact_digest: "text-digest", reviewer: "reviewer-a", decision: "approve", rationale: "Checked", asset_receipt_id: "image-receipt", asset_digest: digest }],
 };
 const receipt = { id: "image-receipt", run_id: run.id, slot: "image", digest: "receipt-digest", binding_digest: "binding-digest", asset: { media_type: "image/png", digest, size: bytes.length }, result: { schema: 1, kind: "media.generated.image", provider: "agenticos_external", model: "openai/gpt-image-2.5", aspect_ratio: "1:1", job_id: "med_job1", charge: { currency: "USD", scale: 6, amount: "0.031500" }, price_version: "v1", quoted_micros: 31500, repeated: false, asset_sha256: digest, asset_media_type: "image/png", source_receipt_id: "source-receipt", source_post_id: "post-a" } };

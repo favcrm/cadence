@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { navigate, useHref } from "../../lib/useLocation";
 import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
@@ -824,13 +824,20 @@ export default function AppShell({
     : null;
   const launcherOwnership = useRef<{ intent: typeof launcherRun; current: boolean }>({ intent: null, current: false });
   const launchContext = launcherRun === null ? undefined : contexts.find((c) => c.id === launcherRun.contextId);
-  launcherOwnership.current.intent = launcherRun;
-  launcherOwnership.current.current = canLaunch && launchFlow !== null && launcherRun !== null &&
+  const launcherIsCurrent = canLaunch && launchFlow !== null && launcherRun !== null &&
     installation !== null && installation.install_id === installId && installation.digest === launcherRun.installDigest &&
     contextId === launcherRun.contextId &&
     (launcherRun.contextRevision === null
       ? launcherRun.contextId === ""
       : launchContext?.state === "active" && launchContext.revision === launcherRun.contextRevision && launchContext.digest === launcherRun.contextDigest);
+  useLayoutEffect(() => {
+    launcherOwnership.current.intent = launcherRun;
+    launcherOwnership.current.current = launcherIsCurrent;
+    if (launcherRun !== null && !launcherIsCurrent) {
+      setLauncherRun((open) => open === launcherRun ? null : open);
+    }
+    return () => { launcherOwnership.current.current = false; };
+  }, [launcherRun, launcherIsCurrent]);
 
   return (
     <div className="app-shell" data-app-shell-outlet={installId}>
@@ -1140,7 +1147,7 @@ export default function AppShell({
                         admitted={viewer.operator === true && !viewer.readOnly} operator={viewer.operator === true} />
                     : <Loading>{t("Loading this app…")}</Loading>} />
               )}
-              {launchFlow !== null && launcherRun !== null && (
+              {launcherIsCurrent && launchFlow !== null && launcherRun !== null && (
                 <RunLauncher
                   key={`${installId}:${launcherRun.name}:${launcherRun.contextId}:${launcherRun.installDigest}:${launcherRun.contextRevision}`}
                   installation={installation}
@@ -1149,7 +1156,7 @@ export default function AppShell({
                   context={contexts.find((c) => c.id === launcherRun.contextId) ?? null}
                   viewer={viewer}
                   stillCurrent={() => launcherOwnership.current.intent === launcherRun && launcherOwnership.current.current}
-                  onClose={() => setLauncherRun(null)}
+                  onClose={() => setLauncherRun((open) => open === launcherRun ? null : open)}
                 />
               )}
             </>

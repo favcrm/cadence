@@ -113,7 +113,6 @@ export interface WorkspaceRun {
   id: string; install_id: string; context_id: string | null; state: string;
   snapshot_digest: string; approved_digest: string | null;
   snapshot: {
-    bundle_digest: string;
     workflow: { title: string; source_digest?: string; execution?: "agent" | "host"; steps: { id: string; kind: string; assignee: string; dependencies: string[]; instruction: string }[]; publication_slot?: string | null }; inputs: Record<string, string>; owner_pm: string;
     context?: { id: string; revision: number; digest: string } | null;
     publication?: { slot: string; binding: { id: string; revision: number; digest: string } | null };

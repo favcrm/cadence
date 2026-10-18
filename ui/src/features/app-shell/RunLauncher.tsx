@@ -104,14 +104,6 @@ export default function RunLauncher({
   const title = workflow.label?.trim() || `New ${workflow.name}`;
   const canWrite = viewer.operator === true && !viewer.readOnly;
 
-  const current = stillCurrent();
-  useEffect(() => {
-    // The scope moved while the dialog was open: close rather than let a
-    // form filled for one context submit under another.
-    if (!current) onClose();
-  }, [current, onClose]);
-  if (!current) return null;
-
   const ownsDialog = () => mounted.current && stillCurrent();
   const showFailure = (reason: unknown) => {
     if (!ownsDialog()) return;
@@ -120,7 +112,7 @@ export default function RunLauncher({
   };
   const matchesReceipts = (run: WorkspaceRun) =>
     run.install_id === installId && run.context_id === (scope.current.contextId || null) &&
-    run.snapshot.bundle_digest === installation.digest &&
+    "bundle_digest" in run.snapshot && run.snapshot.bundle_digest === installation.digest &&
     (context === null
       ? run.snapshot.context == null
       : run.snapshot.context?.id === context.id &&
@@ -253,7 +245,7 @@ export default function RunLauncher({
   const close = () => {
     // Only an explicit acknowledgement of a displayed result retires replay
     // identity. Unmount/scope changes and unseen late responses retain it.
-    if (result !== null && prepared !== null) completeRequest(prepared.requestKey);
+    if (ownsDialog() && result !== null && prepared !== null) completeRequest(prepared.requestKey);
     onClose();
   };
 
