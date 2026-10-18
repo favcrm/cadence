@@ -83,6 +83,7 @@ const OPERATOR: &[&str] = &[
     "backup",
     "restore",
     "export",
+    "inspect-portable",
     "ui",
     "master",
     "connection",
