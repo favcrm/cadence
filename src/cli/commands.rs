@@ -788,6 +788,10 @@ pub(crate) enum Commands {
         /// their only delivery channel there.
         #[arg(long)]
         instructions_file: Option<PathBuf>,
+        /// Saved Agents settings profile. Its instructions and defaults are
+        /// resolved by the daemon and snapshotted for this new session.
+        #[arg(long, conflicts_with_all = ["instructions_file", "no_bootstrap"])]
+        profile: Option<String>,
         /// Run the worker in an isolated checkout of the PM's repo:
         /// `git worktree add <repo>/.cadence/wt/<name> -b cadence/<name>`.
         #[arg(long)]

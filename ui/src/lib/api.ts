@@ -33,8 +33,11 @@ import type {
   MemoryDetail,
   Meta,
   MilestoneRow,
-  ModelDefaultsConfig,
-  ModelDefaultsSnapshot,
+  AgentCatalog,
+  AgentPreviewResult,
+  AgentSettingsConfig,
+  AgentSettingsSnapshot,
+  AgentSyncResult,
   OutboxDetail,
   UpdateBanner,
   UpdateCheck,
@@ -1006,7 +1009,16 @@ export const api = {
    *  operator-gated; the chip shows the refusal until it lands). */
   masterModels: () => get<MasterModels>("/api/master/models"),
 
-  modelDefaults: () => get<ModelDefaultsSnapshot>("/api/settings/model-defaults"),
+  /** CAD-1548 — harnesses, profiles, providers and models. */
+  agentSettings: () => get<AgentSettingsSnapshot>("/api/settings/agents"),
+  saveAgentSettings: (body: { expected_revision: string; config: AgentSettingsConfig }) =>
+    post<AgentSettingsSnapshot>("/api/settings/agents", body),
+  refreshAgentCatalog: (provider: string) =>
+    post<AgentCatalog>("/api/settings/agents/catalog", { provider }),
+  syncAgentProfiles: (body: { expected_revision: string; profile: string | null }) =>
+    post<AgentSyncResult>("/api/settings/agents/sync", body),
+  previewAgentLaunch: (body: { expected_revision: string; profile: string; harness: string }) =>
+    post<AgentPreviewResult>("/api/settings/agents/preview", body),
   /** CAD-561: the Settings Update card — current version, the last
    *  check, the running update's progress and the drain state. */
   updateStatus: () => get<UpdateStatus>("/api/update"),
@@ -1016,9 +1028,6 @@ export const api = {
   updateCheck: () => post<UpdateCheck>("/api/update/check", {}),
   /** Start the update: the same pipeline as `cadence update`. */
   startUpdate: () => post<{ started: boolean }>("/api/update", {}),
-  saveModelDefaults: (body: { expected_revision: number; config: ModelDefaultsConfig }) =>
-    writeSettings(body),
-
   /** `GET /api/issues/<id>/lane` — the card's live agent, or `lane: null`. */
   lane: (id: string) => get<LanePayload>(`/api/issues/${encodeURIComponent(id)}/lane`),
   /** Ask for status. Optional extra is appended to the `status?` template server-side. */
@@ -1039,10 +1048,3 @@ export const api = {
   laneReassign: (id: string, body: { provider: string; model?: string; effort?: string; note?: string }) =>
     post<Record<string, unknown>>(`/api/issues/${encodeURIComponent(id)}/lane/reassign`, body),
 };
-
-async function writeSettings(body: {
-  expected_revision: number;
-  config: ModelDefaultsConfig;
-}): Promise<ModelDefaultsSnapshot> {
-  return post<ModelDefaultsSnapshot>("/api/settings/model-defaults", body);
-}

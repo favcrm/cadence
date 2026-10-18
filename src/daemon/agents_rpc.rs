@@ -9,11 +9,11 @@ impl Shared {
         let endpoint =
             optional_str(params, "endpoint_kind").unwrap_or(registry::DEFAULT_ENDPOINT_KIND);
         let role = optional_str(params, "role").unwrap_or("worker");
-        let team_role = optional_text(params, "team_role")?;
+        let caller_team_role = optional_text(params, "team_role")?;
         let model_policy = optional_text(params, "model_policy")?;
         let cwd = optional_str(params, "cwd");
         let sandbox = optional_str(params, "sandbox").unwrap_or("read-only");
-        let instructions = optional_str(params, "instructions");
+        let caller_instructions = optional_str(params, "instructions");
         let agent_params = optional_str(params, "params");
         if registry::is_inbox_kind(endpoint) != registry::is_inbox_provider(provider) {
             return Err(Error::rejected(
@@ -53,7 +53,94 @@ impl Shared {
         // param (`--confine`/`--no-confine`, or a caller's own params)
         // always wins. A [host] table that cannot be parsed refuses
         // the register rather than silently landing unconfined.
-        let mut defaulted = false;
+        let requested_profile = optional_str(params, "profile");
+        if requested_profile.is_none()
+            && ["profile", "profile_digest", "profile_revision"]
+                .iter()
+                .any(|key| parsed.get(*key).is_some())
+        {
+            return Err(Error::rejected(
+                "profile provenance is assigned from the settings row, not the caller",
+            ));
+        }
+        if requested_profile.is_some() && caller_instructions.is_some() {
+            return Err(Error::rejected(
+                "profile and instructions are mutually exclusive",
+            ));
+        }
+        let mut profile_job: Option<String> = None;
+        let mut profile_team: Option<String> = None;
+        for key in ["profile", "profile_revision", "profile_digest"] {
+            if parsed.get(key).is_some() {
+                return Err(Error::rejected(
+                    "profile provenance is taken from the settings row, not caller params",
+                ));
+            }
+        }
+        if let Some(profile_id) = requested_profile {
+            // Join sends the profile id and, when briefing, FilesAndMessage.
+            // It does not put a bootstrap flag in params. Only an instructions
+            // file or an explicit skip conflicts with the saved profile body.
+            if parsed.get("instructions_file").is_some()
+                || parsed.get("instructions").is_some()
+                || parsed.get("no_bootstrap").and_then(Value::as_bool) == Some(true)
+            {
+                return Err(Error::rejected(
+                    "a profile launch cannot combine an instructions file or skip bootstrap",
+                ));
+            }
+            let requested_model = parsed
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|model| !model.is_empty());
+            let provider_default = model_policy == Some("provider_default");
+            let explicit_model = requested_model.is_some() || provider_default;
+            let launched = crate::agent_settings::launch_profile(
+                &self.store,
+                profile_id,
+                provider,
+                endpoint,
+                requested_model,
+                provider_default,
+            )?;
+            let mut obj = match parsed {
+                Value::Object(obj) => obj,
+                _ => serde_json::Map::new(),
+            };
+            obj.insert("profile".to_string(), json!(launched.id));
+            obj.insert("profile_revision".to_string(), json!(launched.revision));
+            obj.insert("profile_digest".to_string(), json!(launched.digest));
+            obj.remove("instructions");
+            if !explicit_model
+                && launched.model != "inherit"
+                && registry::supports_model(provider, endpoint)
+            {
+                obj.insert("model".to_string(), json!(launched.model));
+            }
+            parsed = Value::Object(obj);
+            profile_job = Some(launched.job);
+            profile_team = Some(launched.role);
+        }
+        let team_role = if let Some(profile_role) = profile_team.as_deref() {
+            if !crate::model_defaults::canonical_team_role(profile_role) {
+                return Err(Error::rejected(
+                    "profile role is a team-role lookup, not runtime authority, and it is not a team role",
+                ));
+            }
+            if let Some(caller) = caller_team_role {
+                let normalized = crate::model_defaults::normalize_team_role(caller)?;
+                if normalized != profile_role {
+                    return Err(Error::rejected(
+                        "profile role is the team-role lookup and does not match the requested team role",
+                    ));
+                }
+            }
+            Some(profile_role)
+        } else {
+            caller_team_role
+        };
+        let instructions = profile_job.as_deref().or(caller_instructions);
+        let mut defaulted = requested_profile.is_some();
         let pm_dir = self.pm_dir().ok().filter(|d| d.is_dir());
         if provider == "pi" && endpoint == "managed" && parsed.get("confine").is_none() {
             if let Some(pm_dir) = &pm_dir {
@@ -96,7 +183,7 @@ impl Shared {
             {
                 return Err(Error::rejected(
                     "pi has no provider default — pass --model <provider/id> or \
-                     set pi.models.default.* in pm.yaml (CAD-559)",
+                     set the Pi role default in Settings > Agents (CAD-559)",
                 ));
             }
             let defaults = self.store.model_defaults()?;
@@ -123,10 +210,7 @@ impl Shared {
             } else {
                 // No tracker dir means no policy — an absent `[pi]`
                 // allows nothing either way.
-                let policy = match &pm_dir {
-                    Some(dir) => crate::pi_policy::read(dir)?,
-                    None => None,
-                };
+                let policy = self.stored_pi_policy()?;
                 // CAD-575: the allowlist the gate checks is the role's
                 // own when pm.yaml carries one (master_allow /
                 // worker_allow), else `allow`.
@@ -388,6 +472,14 @@ impl Shared {
             self.authorize_agent_mutation(params, peer_pid, "agent set", &agent, mutation)?;
         for (key, value) in patch.as_object().unwrap() {
             proto::param_key(key)?;
+            if matches!(
+                key.as_str(),
+                "profile" | "profile_revision" | "profile_digest"
+            ) {
+                return Err(Error::rejected(
+                    "saved profile provenance is immutable; launch a new session",
+                ));
+            }
             if next_launch {
                 registry::validate_next_launch_param(
                     &agent.provider,
@@ -404,7 +496,7 @@ impl Shared {
         // launch without `--model` would silently fall back. CAD-575:
         // the role's own list applies when pm.yaml carries one.
         if agent.provider == "pi" && patch.as_object().unwrap().contains_key("model") {
-            let policy = crate::pi_policy::read(&self.pm_dir()?)?;
+            let policy = self.stored_pi_policy()?;
             let role = if crate::master::is_master(&agent.alias) {
                 "master"
             } else {

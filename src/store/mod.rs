@@ -16,6 +16,8 @@ use serde_json::json;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod settings_authority;
+pub use settings_authority::{ProfileBody, SettingsDoc, SettingsSnapshot};
 mod platform;
 pub(crate) use platform::{scope_list, scope_name};
 pub use platform::{
@@ -41,6 +43,8 @@ pub use threads::{COMPACTED_EVENT as THREAD_COMPACTED_EVENT, PACK_EVENT as THREA
 mod agents;
 mod cloud_dispatch_outbox;
 pub use agents::{Agent, ModelDefaultsSnapshot, NewAgent, AGENT_STATES};
+
+pub const MAX_INSTRUCTIONS_BYTES: usize = 32_000;
 pub mod activity;
 mod delivery;
 mod events;

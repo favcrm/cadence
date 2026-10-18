@@ -67,7 +67,8 @@ use crate::store::{self, Store};
 /// v50 (CAD-1482) adds retained image source lineage.
 /// v51 (CAD-792) adds `app_run_artifact_fetches`, the successful worker
 /// dependency-fetch receipt.
-pub const SCHEMA_VERSION: i64 = 51;
+/// v52 (CAD-1548) adds `settings_authority` beside `model_defaults`.
+pub const SCHEMA_VERSION: i64 = 52;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

@@ -452,6 +452,22 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/settings/model-defaults",
         RouteClass::OperatorOnly,
     ),
+    route("POST", "/api/settings/agents", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/settings/agents/catalog",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/settings/agents/sync",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/settings/agents/preview",
+        RouteClass::OperatorOnly,
+    ),
     route("POST", "/api/threads/*/messages", RouteClass::OperatorOnly),
     // CAD-810 / CAD-821: every topic write is the operator's. Listed so the
     // classification is reviewed, and unlisted writes fail closed to the same class.

@@ -35,6 +35,7 @@ pub(super) fn run(
     cloud_params: Option<String>,
     confine: bool,
     no_confine: bool,
+    profile: Option<String>,
 ) -> Result<i32> {
     let mut devin = DevinOpts {
         permission_mode: permission_mode.clone(),
@@ -95,5 +96,6 @@ pub(super) fn run(
         },
         team_role,
         provider_default_model,
+        profile,
     )
 }

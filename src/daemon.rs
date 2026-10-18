@@ -443,7 +443,7 @@ type MembershipLookupForTest = Box<
 >;
 
 pub struct Shared {
-    pub store: Store,
+    pub store: Arc<Store>,
     /// Broadcast on any queue/event change.
     changed: Notify,
     pending: Mutex<HashMap<String, PendingRequest>>,
@@ -882,6 +882,14 @@ impl Shared {
             .provider_deployments
             .as_ref()
             .and_then(|metadata| metadata.hosted_business_documents());
+        // Import before serving or actor recovery in a normal workspace.
+        // Portable execution-disabled stores deliberately omit authority;
+        // never reconstruct it from their copied tracker.
+        // Settings GET does not import.
+        if !execution_mode.fenced() {
+            store.import_legacy_settings(&wiki_pm_dir)?;
+        }
+        let store = Arc::new(store);
         let provider_env = opts
             .provider_env
             .with_workspace(upload_workspace_dir.clone())
@@ -889,7 +897,8 @@ impl Shared {
                 opts.provider_deployments
                     .as_ref()
                     .and_then(|metadata| metadata.hosted_company_master()),
-            );
+            )
+            .with_settings_store(Arc::clone(&store));
         // Actors consume Store candidates at open; retain an independent
         // copy until adoption succeeds, refuses, or is skipped entirely.
         let adoptions_pending = store
@@ -2241,6 +2250,14 @@ impl Shared {
             "agent_register" => self.rpc_register(params, peer_pid),
             "model_defaults_get" => self.rpc_model_defaults_get(),
             "model_defaults_set" => self.rpc_model_defaults_set(params, peer_pid),
+            "agent_settings_get" => {
+                self.operator_connection("agent settings get", params, peer_pid)?;
+                self.rpc_agent_settings_get()
+            }
+            "agent_settings_set" => self.rpc_agent_settings_set(params, peer_pid),
+            "agent_settings_catalog" => self.rpc_agent_settings_catalog(params, peer_pid),
+            "agent_settings_sync" => self.rpc_agent_settings_sync(params, peer_pid),
+            "agent_settings_preview" => self.rpc_agent_settings_preview(params, peer_pid),
             "agent_list" => {
                 // CAD-437: repeatable any-of filters, daemon-side.
                 let states = optional_strs(params, "states")?;
@@ -2368,6 +2385,32 @@ impl Shared {
             "agent_show" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
+                let include_profile_instructions = match params.get("include_profile_instructions")
+                {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(include)) => *include,
+                    Some(_) => {
+                        return Err(Error::rejected(
+                            "include_profile_instructions must be a boolean",
+                        ))
+                    }
+                };
+                let profile_snapshot = include_profile_instructions
+                    && agent
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("profile"))
+                        .and_then(Value::as_str)
+                        .is_some();
+                if profile_snapshot {
+                    self.authorize_agent_mutation(
+                        params,
+                        peer_pid,
+                        "profile launch instructions",
+                        &agent,
+                        crate::peer::AgentMutation::SelfService,
+                    )?;
+                }
                 // CAD-879: absent `limit`/`since` keeps the full history
                 // (the board and in-process consumers rely on it); the
                 // CLI sends them to bound what an agent reads.
@@ -2401,6 +2444,9 @@ impl Shared {
                     self.store.messages(&alias)?
                 };
                 let mut agent_json = agent.to_json();
+                if profile_snapshot {
+                    agent_json["instructions"] = json!(agent.instructions);
+                }
                 agent_json["capabilities"] =
                     registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
                 agent_json["native_turn_steering_enabled"] = json!(
@@ -3195,6 +3241,12 @@ impl Shared {
     /// fenced daemon's tracker writes refuse and a leased daemon's
     /// commits carry `Lease-Epoch`. Every RPC `Pm::at(&self.pm_dir())`
     /// goes through here.
+    /// Pi launch policy from the settings row. `None` is an absent policy
+    /// and denies every Pi model. There is no `pm.yaml` fallback.
+    pub(super) fn stored_pi_policy(&self) -> Result<Option<crate::pi_policy::PiPolicy>> {
+        self.store.pi_policy()
+    }
+
     fn pm(&self) -> Result<crate::issue::Pm> {
         self.pm_at(&self.pm_dir()?)
     }
@@ -7831,14 +7883,20 @@ mod tests {
             label: "claude store",
             root,
         }];
+        let before_events = shared.store.events_tail(DAEMON_ALIAS, 1).unwrap();
         let mut watch = WalWatch::default();
         pass(&roots, &HashSet::new(), u64::MAX, &shared, &mut watch);
         assert_eq!(wal_size(&db), before);
-        assert!(shared
-            .store
-            .events_tail(DAEMON_ALIAS, 10)
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            shared
+                .store
+                .events_tail(DAEMON_ALIAS, 1)
+                .unwrap()
+                .last()
+                .map(|event| event.seq),
+            before_events.last().map(|event| event.seq),
+            "a small WAL emits no new event"
+        );
     }
 
     /// A WAL written moments ago means a writer cadence cannot see is

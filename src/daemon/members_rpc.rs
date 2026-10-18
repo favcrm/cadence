@@ -1857,11 +1857,7 @@ impl Shared {
             .and_then(Value::as_str)
             .is_some_and(|m| !m.trim().is_empty());
         if !has_model {
-            let pm_dir = self.pm_dir().ok().filter(|d| d.is_dir());
-            let pi_policy = match &pm_dir {
-                Some(dir) => crate::pi_policy::read(dir)?,
-                None => None,
-            };
+            let pi_policy = self.stored_pi_policy()?;
             let model = crate::pi_policy::resolve_model(pi_policy.as_ref(), "worker", None)
                 .map_err(|e| {
                     Error::rejected(format!(

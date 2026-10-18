@@ -9,6 +9,7 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod adapter;
+pub mod agent_settings;
 pub mod agent_uid;
 pub mod app_assistant;
 pub mod app_preview_export;

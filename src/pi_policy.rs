@@ -1,4 +1,5 @@
-//! `pm.yaml [pi]` — the operator-owned Pi policy (CAD-559).
+//! Pi launch policy (CAD-559). Settings > Agents is the authority.
+//! `pm.yaml [pi]` is only the legacy import source.
 //!
 //! Pi silently falls back: an unavailable model becomes another
 //! provider's, and an unpinned extension loads whatever the operator's
@@ -23,9 +24,9 @@
 //!   extension shells out to a Devin CLI the sandbox cannot
 //!   credential). A role list that is present replaces `allow` for
 //!   that role, including a present-but-empty one; a role without its
-//!   own list falls back to `allow` unchanged. An absent `[pi]`
-//!   allows nothing: every pi launch refuses until the operator pins
-//!   a list.
+//!   own list falls back to `allow` unchanged. An absent policy
+//!   allows nothing: every pi launch refuses until the operator sets
+//!   a list in Settings > Agents.
 //! - `models.default.{master,worker}` is the role fallback when no
 //!   explicit `--model` (and no `model_defaults` role entry) names one.
 //!   There is no "provider default" for pi — that is the silent
@@ -45,7 +46,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
@@ -53,7 +54,7 @@ use crate::error::{Error, Result};
 /// `[pi]` in pm.yaml — everything optional individually; the table's
 /// absence means "no pi policy", which the model gate treats as an
 /// empty allowlist.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PiPolicy {
     /// `name@version` pins for the provider packages Pi may `-e`.
@@ -69,7 +70,7 @@ pub struct PiPolicy {
 }
 
 /// `[pi.models]` — the launch vocabulary and the per-role fallback.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PiModels {
     /// The only `provider/id` values a pi agent may launch on — the
@@ -115,7 +116,7 @@ impl PiModels {
 
 /// `[pi.models.default]` — a fallback per cadence role. A pm-role pi
 /// agent shares `worker`: the master is the only role of its own.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PiRoleDefaults {
     pub master: Option<String>,
@@ -139,7 +140,13 @@ pub fn read(pm_dir: &Path) -> Result<Option<PiPolicy>> {
     let Ok(text) = std::fs::read_to_string(pm_dir.join("pm.yaml")) else {
         return Ok(None);
     };
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&text)
+    parse_text(&text)
+}
+
+/// Parse a legacy pm.yaml document without touching the tracker. Used by
+/// the one-time import and read-only retired-source drift observation.
+pub fn parse_text(text: &str) -> Result<Option<PiPolicy>> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(text)
         .map_err(|e| Error::rejected(format!("pm.yaml is not valid YAML: {e}")))?;
     let Some(pi) = yaml.get("pi") else {
         return Ok(None);
@@ -166,6 +173,10 @@ pub fn read(pm_dir: &Path) -> Result<Option<PiPolicy>> {
 impl PiPolicy {
     /// Every entry is checked at read time — a malformed id or pin is
     /// a config error the operator fixes once, not a per-launch miss.
+    pub(crate) fn validate_public(&self) -> Result<()> {
+        self.validate()
+    }
+
     fn validate(&self) -> Result<()> {
         for provider in &self.agentic_providers {
             if provider.is_empty()
@@ -304,14 +315,14 @@ pub fn require_allowed(policy: Option<&PiPolicy>, role: &str, model: &str) -> Re
         return Ok(());
     }
     let listed = if allow.is_empty() {
-        format!("nothing — pm.yaml has no [pi].models.{key} entries")
+        format!("nothing — Settings > Agents has no Pi {key} entries")
     } else {
         allow.join(", ")
     };
     Err(Error::rejected(format!(
         "pi {role} model '{model}' is not on the operator's allowlist (allowed: \
-         {listed}) — the operator pins the pi model set in pm.yaml \
-         [pi].models.{key} (CAD-559, CAD-575)"
+         {listed}) — set it in Settings > Agents ({key}); pm.yaml is not the \
+         launch authority (CAD-559, CAD-575)"
     )))
 }
 
@@ -527,8 +538,8 @@ pub fn resolve_package(spec: &str, root: &Path) -> Result<ProviderPackage> {
     if installed != pin {
         return Err(Error::rejected(format!(
             "pi provider package '{name}' is installed at version '{installed}', \
-             not the pinned '{pin}' — align the install or the pin in pm.yaml \
-             [pi].providers (CAD-559)"
+             not the pinned '{pin}' — align the install or the pin in \
+             Settings > Agents (CAD-559)"
         )));
     }
     let declared = pkg
@@ -580,7 +591,7 @@ pub fn resolve_package(spec: &str, root: &Path) -> Result<ProviderPackage> {
                 "pi provider package '{spec}': package content drifted from the \
                  pin (pinned {expected}, installed {found}) — reinstall the \
                  pinned package or, after an intentional change, update the \
-                 digest in pm.yaml [pi].providers (CAD-572)"
+                 digest in Settings > Agents (CAD-572)"
             )));
         }
     }

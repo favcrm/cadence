@@ -1117,7 +1117,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <SectionTabs
             label="settings"
             tabs={[
-              { label: "Models", href: hrefFor({ screen: "settings", section: "models" }), on: route.section === "models" },
+              { label: "Agents", href: hrefFor({ screen: "settings", section: "models" }), on: route.section === "models" },
               { label: "Connections", href: hrefFor({ screen: "settings", section: "connections" }), on: route.section === "connections" },
               // CAD-1312: Email sending leaves the settings nav; its
               // /settings/email route and screen remain reachable directly.

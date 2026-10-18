@@ -109,8 +109,28 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "model_defaults_set",
         Rule::Handler("operator_connection (CAD-337)"),
     ),
+    (
+        "agent_settings_get",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
+    (
+        "agent_settings_set",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
+    (
+        "agent_settings_catalog",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
+    (
+        "agent_settings_sync",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
+    (
+        "agent_settings_preview",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
     ("agent_list", Rule::Read),
-    ("agent_show", Rule::Read),
+    ("agent_show", Rule::Handler("read; optional profile instructions require authorize_agent_mutation(SelfService)")),
     // CAD-886: `agent_wait` answers a strict subset of what `agent_show`
     // discloses (state/reason/message/turn/waited_secs) — same visibility.
     ("agent_wait", Rule::Read),

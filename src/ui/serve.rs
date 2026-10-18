@@ -14,8 +14,8 @@ use super::notify_service;
 use super::setup::{board_boot_agent_uid, setup_get, setup_refusal, WRITE_LOCK};
 use super::stream::stream_events;
 use super::write_path::{
-    artifact_response, header_value, model_defaults_get, request_identity, send, with_agents,
-    write_route, HttpResp,
+    agent_settings_get, artifact_response, header_value, model_defaults_get, request_identity,
+    send, with_agents, write_route, HttpResp,
 };
 use super::{
     app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
@@ -1291,6 +1291,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         "/api/settings/model-defaults" => {
             send(request, model_defaults_get(state_dir, opts.read_only));
         }
+        "/api/settings/agents" => match operator::admit_operator_read(&request, state_dir, opts) {
+            Ok(()) => send(request, agent_settings_get(state_dir, opts.read_only)),
+            Err(resp) => send(request, resp),
+        },
         "/api/platform-account" => send(request, platform_account::get(opts)),
         // CAD-1393: operator-only reads of company templates and drafts.
         "/api/templates/show"

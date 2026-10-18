@@ -265,10 +265,7 @@ impl Shared {
     }
 
     fn provider_catalog(&self) -> Result<Vec<Value>> {
-        let policy = match self.pm_dir() {
-            Ok(dir) => crate::pi_policy::read(&dir)?,
-            Err(_) => None,
-        };
+        let policy = self.stored_pi_policy()?;
         let mut providers = Vec::new();
         let mut seen: Vec<&str> = Vec::new();
         for spec in crate::adapter::registry::SPECS {

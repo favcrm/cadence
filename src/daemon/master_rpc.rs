@@ -618,6 +618,17 @@ impl Shared {
         let slug = required_str(params, "agent")?;
         let name = required_str(params, "file")?;
         let text = required_str(params, "text")?;
+        // Master SOUL.md, AGENT.md, and permissions stay on this writer
+        // and its digest record. Only a migrated non-master profile
+        // definition has moved into the settings row.
+        if name == "AGENT.md"
+            && slug != crate::master::ALIAS
+            && self.store.settings()?.legacy_imported
+        {
+            return Err(Error::rejected(
+                "legacy_authority_retired: AGENT.md is a settings export; edit profiles through agent_settings_set",
+            ));
+        }
         let pm = self.pm()?;
         let out = master::write_file(&pm, slug, name, text, "operator")?;
         master::record(&self.state_dir, slug, name, &master::digest(text))?;
@@ -735,7 +746,7 @@ impl Shared {
         // is never used. Whatever wins must be on `[pi].models.allow`.
         let mut pi_selection = None;
         let model = if provider == "pi" {
-            let policy = crate::pi_policy::read(&pm.dir)?;
+            let policy = self.stored_pi_policy()?;
             let chosen = model.as_deref();
             let (resolved, fallback) =
                 crate::pi_policy::resolve_model_with_source(policy.as_ref(), "master", chosen)?;

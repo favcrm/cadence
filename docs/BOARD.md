@@ -2052,20 +2052,63 @@ A successful revoke remains distinct from a failed follow-up read; stale data
 cannot revoke another rule. Existing RPC/HTTP operator proofs, API shapes and
 rule policy remain unchanged. Live permission decisions stay in Home.
 
-Settings → Models is a full-width provider workspace. A compact provider
-selector opens one editor at a time and keeps drafts for every provider.
-The default model applies to newly registered agents across projects; existing
-agents keep their saved selection. A role can inherit that configured default,
-use the provider-native default, or select a specific model. Pi is the exception:
-its default option is labelled Operator policy default and uses the configured
-Pi policy fallback; explicit model IDs still require that policy's allowlist.
-Suggestions remain previously observed IDs, not a provider catalog. Unavailable providers retain
-their limitation text. Save applies all provider drafts with the current
-expected revision; reset omits that provider and discard restores all saved
-values. Read-only/sign-in gates, validation, failed-save drafts and revision
-conflicts remain visible. Initial read failure offers Retry; loading and an
-empty provider list are distinct. Labels and responsive role rows use shared
-controls, theme tokens and keyboard focus.
+Settings → Agents has Harnesses, Profiles, and Providers & models tabs.
+Declarations do not install programs, create adapters, change credentials or
+alter running sessions. Installation, versions and fleet usage are observed
+separately from editable declarations. Native CLI models do not use Pi
+allowlists; Pi scopes distinguish master and worker runtime permissions.
+A profile's team role selects model preferences, never runtime authority.
+Drawers scroll vertically on short or narrow screens so job descriptions,
+model details, file targets and actions remain reachable without clipping.
+
+Save commits harness/provider/model declarations, role defaults, Pi policy,
+pins and profile definitions in one revision-bound SQLite transaction.
+Conflicts and validation failures retain the draft; Discard restores the saved
+revision. Sync and Preview require saved state. Full settings reads include
+profile job bodies, so RPC and HTTP both require operator proof. Read-only
+operator sessions can inspect but cannot mutate settings. Catalog Refresh reads the supported
+`omp models <provider> --json --no-extensions` listing and shows its actual
+source and fetch time; discovered models are not launch permission. Import
+adds missing rows to the draft with Pi permission off. Picking a combobox row
+fills metadata; opening an existing row preserves its saved values.
+Provider pins accept `name@version` or `name version`; Save stores the canonical
+`name@version` form. The legacy model-defaults writer preserves the Agents
+overlay and refuses edits to it; use Agents Save for those fields.
+
+At daemon startup, legacy `pm.yaml [pi]` and non-master
+`agents/<profile>/AGENT.md` definitions are imported once. The SQLite settings
+authority is then used by CLI, daemon and adapter launch paths; subsequent
+file edits do not replace it. Retired-source drift is informational. The
+master's own instructions and integrity protections remain separate.
+Regular files directly under `agents/` are not profile definitions and are
+left untouched. Symlinks, special files and invalid actual profiles still
+refuse import rather than being followed or silently discarded.
+
+Portable coordination exports omit settings authority alongside model defaults.
+An execution-disabled portable restore does not import legacy settings or
+recreate those authority rows. Its existing read-only and no-launch fences
+remain in force.
+
+`cadence join <pm> <provider> --profile <id>` snapshots the saved job, team role,
+model selection, settings revision and profile digest for the new session.
+An explicit model or native provider-default selection can override the
+profile preference, but cannot bypass known model/harness compatibility or
+Pi policy. Existing sessions retain their stored instructions. New or changed
+jobs must fit both the AGENT.md character cap and the 32,000 UTF-8 byte launch
+instruction limit. Larger imported jobs remain preserved; Preview and launch
+explain the refusal until they are shortened.
+Profile usage lists active sessions. Stopped/offline sessions retain their
+snapshots and audit history but do not prevent profile deletion.
+
+Sync writes supported derived `.pi/agents/<id>.md` and
+`.claude/agents/<id>.md` exports under the PM root. It preserves unmanaged files,
+refuses symlinked ancestors and never replaces a concurrently created target.
+Managed updates write the validated, single-link file descriptor rather than
+replacing its path; their ownership header survives partial writes, allowing
+a later Sync to repair an interrupted derived export. These files are not the
+canonical launch source. Preview reports the saved selection, compatibility,
+installation and permission refusals, including host Pi-confinement defaults,
+without starting an agent session.
 
 The SPA has real routes (CAD-326, `ui/src/lib/router.ts`): `/` Home,
 `/overview` (the team overview: needs, drift, monitors, projects),
