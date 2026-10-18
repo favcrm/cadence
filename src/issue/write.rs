@@ -464,6 +464,27 @@ pub fn set_acceptance(pm: &Pm, id: &str, source: &Path, actor: &str) -> Result<V
     Ok(out)
 }
 
+/// `<key>/` inside the PM dir, refusing a symlinked project directory: a
+/// tracker edit must never land outside it.
+fn project_dir(pm: &Pm, key: &str) -> Result<PathBuf> {
+    let dir = pm.dir.join(key);
+    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{key}/ is a symlink — refusing to write outside the PM dir"
+        )));
+    }
+    Ok(dir)
+}
+
+/// Serialize `project` to `path` — the one place a project record is
+/// written, so `project add` and a policy write produce the same file.
+fn write_project_yaml(path: &Path, project: &project::Project) -> Result<()> {
+    let yaml = serde_yaml::to_string(project)
+        .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
+    std::fs::write(path, yaml)?;
+    Ok(())
+}
+
 /// `project add` — create `<pm>/<key>/project.yaml`.
 #[allow(clippy::too_many_arguments)]
 pub fn project_add(
@@ -527,18 +548,17 @@ pub fn project_add(
         build: None,
         memory: None,
         intake: None,
+        // AOS-274: identity is minted once, and every project records an
+        // explicit policy. Only workspace-visible is written until the
+        // isolation gate passes.
+        id: Some(project::new_id()),
+        policy: Some(project::ProjectPolicy::workspace_visible()),
     };
-    let dir = pm.dir.join(key);
-    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-        return Err(Error::rejected(format!(
-            "{key}/ is a symlink — refusing to write outside the PM dir"
-        )));
-    }
+    let dir = project_dir(pm, key)?;
     std::fs::create_dir_all(&dir)?;
-    let yaml = serde_yaml::to_string(&project)
-        .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
     let yaml_path = dir.join("project.yaml");
-    std::fs::write(&yaml_path, yaml)?;
+    let prev = file_preimage(&yaml_path);
+    write_project_yaml(&yaml_path, &project)?;
     let foreign = match commit_scoped(
         pm,
         &lock,
@@ -549,12 +569,84 @@ pub fn project_add(
     ) {
         Ok(f) => f,
         Err(e) => {
-            let _ = std::fs::remove_file(&yaml_path);
+            restore_preimage(&yaml_path, prev);
             return Err(e);
         }
     };
     let mut out = json!({"project": key, "prefix": project.prefix,
               "path": dir, "committed": true});
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
+}
+
+/// Replace a project's recorded access policy (AOS-274).
+///
+/// Takes the tracker lock, re-reads the project, keeps its identity, bumps
+/// the policy version and commits `project.yaml` only. `Private` is refused
+/// until the isolation gate passes — `workspace-visible` is the only
+/// visibility this build may record.
+pub fn set_project_policy(
+    pm: &Pm,
+    key: &str,
+    visibility: project::Visibility,
+    members: &[String],
+    actor: &str,
+) -> Result<Value> {
+    // Validate before any join. A remote key is caller input; `../…` or a
+    // slash must never become a path outside the tracker.
+    let key = crate::issue::model::check_key(key)?;
+    if visibility == project::Visibility::Private {
+        return Err(Error::rejected(
+            "private projects are not available yet — the isolation gate has not passed; \
+             only workspace-visible can be recorded",
+        ));
+    }
+    let dir = project_dir(pm, &key)?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
+    let yaml_path = dir.join("project.yaml");
+    if !crate::issue::board::is_real_file(&yaml_path) {
+        return Err(Error::rejected(format!(
+            "no project '{key}' — register it with `cadence issue project add`"
+        )));
+    }
+    let mut project = project::load(&yaml_path)?;
+    let grants = members
+        .iter()
+        .map(|member| project::Grant::parse(member))
+        .collect::<Result<Vec<_>>>()?;
+    let mut policy = project.policy.clone().unwrap_or_default();
+    policy.version = policy.version.saturating_add(1);
+    policy.visibility = visibility;
+    policy.members = grants;
+    project.policy = Some(policy.clone());
+    if project.id.is_none() {
+        project.id = Some(project::new_id());
+    }
+    let prev = file_preimage(&yaml_path);
+    write_project_yaml(&yaml_path, &project)?;
+    let foreign = match commit_scoped(
+        pm,
+        &lock,
+        std::slice::from_ref(&yaml_path),
+        &format!("project {key} policy version {}", policy.version),
+        &[],
+        actor,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            // A refused commit leaves the record exactly as it was — the
+            // rule every other write in this module follows, and the one
+            // this verb was missing.
+            restore_preimage(&yaml_path, prev);
+            return Err(e);
+        }
+    };
+    let mut out = json!({
+        "project": key,
+        "policy": serde_json::to_value(&policy)
+            .map_err(|e| Error::internal(format!("policy: {e}")))?,
+        "committed": true,
+    });
     attach_foreign(&mut out, &foreign);
     Ok(out)
 }
@@ -2463,6 +2555,107 @@ pub fn attach_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AOS-274: the recorded policy advances by one version per write,
+    /// keeps the minted identity, refuses private until the isolation
+    /// gate passes, and refuses both an unsupported grant and an unknown
+    /// project.
+    #[test]
+    fn setting_a_policy_bumps_the_version_and_refuses_private() {
+        let (_dir, pm) = tracker();
+        let key = "cadence";
+        let before = project::load(&pm.dir.join(key).join("project.yaml")).unwrap();
+        let start = before.policy.as_ref().map(|p| p.version).unwrap_or(0);
+        let id = before.id.clone().expect("creation mints an identity");
+
+        let out =
+            set_project_policy(&pm, key, project::Visibility::WorkspaceVisible, &[], "").unwrap();
+        assert_eq!(out["policy"]["version"], start + 1);
+        assert_eq!(out["policy"]["visibility"], "workspace_visible");
+        let loaded = project::load(&pm.dir.join(key).join("project.yaml")).unwrap();
+        assert_eq!(loaded.id, Some(id), "the identity must not change");
+        assert_eq!(loaded.policy.as_ref().unwrap().version, start + 1);
+
+        // A grant is recorded and the version advances again.
+        let out = set_project_policy(
+            &pm,
+            key,
+            project::Visibility::WorkspaceVisible,
+            &["users/mia".to_string()],
+            "",
+        )
+        .unwrap();
+        assert_eq!(out["policy"]["version"], start + 2);
+        assert_eq!(out["policy"]["members"][0], "users/mia");
+        let before = std::fs::read(pm.dir.join(key).join("project.yaml")).unwrap();
+
+        // Private is refused until the isolation gate passes.
+        set_project_policy(&pm, key, project::Visibility::Private, &[], "").unwrap_err();
+
+        // Reserved grantee kinds and unknown projects are refused.
+        set_project_policy(
+            &pm,
+            key,
+            project::Visibility::WorkspaceVisible,
+            &["agents/dev".to_string()],
+            "",
+        )
+        .unwrap_err();
+        set_project_policy(&pm, "ghost", project::Visibility::WorkspaceVisible, &[], "")
+            .unwrap_err();
+        assert!(!pm.dir.join("ghost").exists());
+
+        // A key that is not the tracker grammar never joins the filesystem,
+        // so it cannot create or edit a project outside this pm dir.
+        for bad in [
+            "../aos274-escape",
+            "cadence/../../aos274-escape",
+            "",
+            "..",
+            "/tmp",
+        ] {
+            set_project_policy(
+                &pm,
+                bad,
+                project::Visibility::WorkspaceVisible,
+                &["users/mia".to_string()],
+                "",
+            )
+            .unwrap_err();
+        }
+        let escape = pm.dir.join("..").join("aos274-escape").join("project.yaml");
+        assert!(!escape.exists(), "traversal key wrote outside the tracker");
+        assert_eq!(
+            std::fs::read(pm.dir.join(key).join("project.yaml")).unwrap(),
+            before,
+            "a refused policy mutation changed the real project"
+        );
+    }
+
+    /// A commit the tracker refuses leaves the record exactly as it was —
+    /// the rule every other writer here follows, which this verb was
+    /// missing: the version had already been bumped on disk when the
+    /// commit failed, so a refused write looked applied.
+    #[test]
+    fn a_policy_write_whose_commit_is_refused_leaves_the_record_alone() {
+        let (_dir, pm) = tracker();
+        let key = "cadence";
+        let path = pm.dir.join(key).join("project.yaml");
+        let before = std::fs::read(&path).unwrap();
+        let hook = failing_hook(&pm);
+
+        assert!(
+            set_project_policy(&pm, key, project::Visibility::WorkspaceVisible, &[], "").is_err(),
+            "the refused commit was reported as a success"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a refused commit left the changed record behind"
+        );
+        assert!(clean(&pm), "a refused policy write left something behind");
+        std::fs::remove_file(hook).unwrap();
+    }
 
     /// CAD-908: a created file is whole, a collision renames, and no
     /// temp file survives either outcome.

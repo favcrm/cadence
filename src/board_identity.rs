@@ -413,24 +413,14 @@ fn signature_ok(parsed: &Parsed, key: &PublicKey) -> bool {
 /// is the durable id; the full email and name ride in the session view
 /// for display.
 fn handle_of(sub: &str, email: &str) -> String {
-    let clean = |raw: &str| -> String {
-        raw.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .take(64)
-            .collect()
-    };
-    let h = clean(sub);
+    let h = crate::ident::sanitized(sub);
     if !h.is_empty() {
         return h;
     }
+    // A subject that sanitizes to nothing — or is absent — falls back to
+    // the email's local part, so the actor still has a handle to land in.
     let local = email.split('@').next().unwrap_or_default();
-    clean(local)
+    crate::ident::sanitized(local)
 }
 
 /// Verify a parsed assertion end to end (contract §4): signature

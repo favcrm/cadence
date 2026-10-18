@@ -2809,6 +2809,8 @@ mod tests {
             build: None,
             memory: None,
             intake: None,
+            id: None,
+            policy: None,
         };
         // Path match against BUILD_ROOT (this crate's checkout) never
         // hits the temp clone — remote match does when remote differs…
@@ -2837,6 +2839,8 @@ mod tests {
             build: None,
             memory: None,
             intake: None,
+            id: None,
+            policy: None,
         };
         assert!(build_repo_match(&[other]).is_none());
     }
