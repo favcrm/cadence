@@ -405,14 +405,39 @@ impl Tracker {
         project: Option<&str>,
         readable: Option<&BTreeSet<String>>,
     ) -> Vec<board::Issue> {
+        let mut visible_ids = HashSet::new();
         let mut issues: Vec<board::Issue> = self
             .entries
             .values()
             .filter_map(|e| e.loaded.as_ref())
             .filter(|(i, _)| project.is_none_or(|p| i.project == p))
             .filter(|(i, _)| readable.is_none_or(|keys| keys.contains(&i.project)))
-            .map(|(i, _)| i.clone())
+            .map(|(i, _)| {
+                if readable.is_some() {
+                    visible_ids.insert(i.front.id.as_str());
+                }
+                i.clone()
+            })
             .collect();
+        if readable.is_some() {
+            // A readable row is not permission to reveal its hidden relationship targets.
+            // Remove those targets before readiness, inverse links and roll-ups derive.
+            for issue in &mut issues {
+                let front = &mut issue.front;
+                for target in [&mut front.parent, &mut front.duplicate_of] {
+                    if target
+                        .as_ref()
+                        .is_some_and(|id| !visible_ids.contains(id.as_str()))
+                    {
+                        *target = None;
+                    }
+                }
+                front
+                    .blocked_by
+                    .retain(|id| visible_ids.contains(id.as_str()));
+                front.relates.retain(|id| visible_ids.contains(id.as_str()));
+            }
+        }
         issues.sort_by_key(|i| board::natural_key(&i.front.id));
         issues
     }

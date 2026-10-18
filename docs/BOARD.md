@@ -53,6 +53,8 @@ the read. Query selectors are refused. Local board sessions use the existing
 Existing project access is applied before deriving cards, relationships and epic
 roll-ups; being assigned an issue never grants access to its project. Owner
 administrative visibility does not replace the Owner's individual attribution.
+Only readable issue targets contribute parent, blocker, related and duplicate
+links. This scoped PM projection is not an execution-eligibility decision.
 The read is discarded if its project-access set or effective caller authority
 changes while it is being prepared. This personal filter introduces no new grant
 and does not activate Private projects or qualify assistant/filesystem isolation.

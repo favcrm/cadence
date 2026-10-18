@@ -1,4 +1,4 @@
-//! Assignment never grants project access, including through a readable epic's card.
+//! Assignment never grants project access, including through readable cards.
 //! Private policies are synthetic tracker fixtures, not product API activation.
 
 use super::*;
@@ -45,6 +45,10 @@ fn fixture_fields(pm: &Pm, id: &str, pairs: &[&str]) {
     issue_write::set_fields(pm, &[id.to_string()], &pairs, "operator", None).unwrap();
 }
 
+fn fixture_link(pm: &Pm, id: &str, kind: &str, target: &str) {
+    issue_write::link(pm, id, kind, target, false, None, "operator", None).unwrap();
+}
+
 fn fixture_private_policy(pm: &Pm, project: &str, version: u64, members: &[&str]) {
     use crate::issue::project::{Grant, ProjectPolicy, Visibility};
 
@@ -61,6 +65,15 @@ fn fixture_private_policy(pm: &Pm, project: &str, version: u64, members: &[&str]
             .collect(),
     });
     std::fs::write(path, serde_yaml::to_string(&recorded).unwrap()).unwrap();
+}
+
+fn card<'a>(body: &'a Value, id: &str) -> &'a Value {
+    body["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"].as_str() == Some(id))
+        .unwrap_or_else(|| panic!("missing card {id}: {body}"))
 }
 
 fn assert_visible_ids(body: &Value, expected: &[&str]) {
@@ -92,6 +105,30 @@ fn assert_no_hidden_values(body: &Value, hidden: &[&str]) {
     }
 }
 
+fn assert_id_list(actual: &Value, expected: &[&str]) {
+    let rows = actual.as_array().expect("relationship array");
+    let ids: BTreeSet<&str> = rows
+        .iter()
+        .map(|value| value.as_str().expect("relationship id"))
+        .collect();
+    let expected: BTreeSet<&str> = expected.iter().copied().collect();
+    assert_eq!(rows.len(), expected.len(), "{actual}");
+    assert_eq!(ids, expected, "{actual}");
+}
+
+fn assert_links(
+    row: &Value,
+    parent: Option<&str>,
+    blocked_by: &[&str],
+    relates: &[&str],
+    duplicate_of: Option<&str>,
+) {
+    assert_eq!(row["parent"], json!(parent), "{row}");
+    assert_id_list(&row["blocked_by"], blocked_by);
+    assert_id_list(&row["relates"], relates);
+    assert_eq!(row["duplicate_of"], json!(duplicate_of), "{row}");
+}
+
 #[test]
 fn cad1500_assignment_does_not_grant_access_and_revocation_fences_my_work() {
     let root = tempfile::tempdir().unwrap();
@@ -113,15 +150,19 @@ fn cad1500_assignment_does_not_grant_access_and_revocation_fences_my_work() {
         &[],
     );
     fixture_fields(&pm, &parent, &["type=epic"]);
+    let excluded_blocker_title = "EXCLUDED_CONFIDENTIAL_BLOCKER";
+    let excluded_blocker =
+        fixture_issue(&pm, "excluded", excluded_blocker_title, "beta", None, &[]);
     // This child is readable but not personally owned: project access, not
     // ownership, determines the context used for the parent's progress.
+    // Its excluded dependency must not make it blocked or taint epic health.
     let public_child = fixture_issue(
         &pm,
         "workspace",
         "Another human's readable child",
         "beta",
         Some(&parent),
-        &[],
+        std::slice::from_ref(&excluded_blocker),
     );
     fixture_fields(&pm, &public_child, &["size=S"]);
     let included_title = "INCLUDED_CONFIDENTIAL_ASSIGNED_CHILD";
@@ -144,6 +185,54 @@ fn cad1500_assignment_does_not_grant_access_and_revocation_fences_my_work() {
         std::slice::from_ref(&public_child),
     );
     fixture_fields(&pm, &excluded, &["size=L", "status=review"]);
+
+    // Separate roots keep all parent trees two levels deep. They are beta's
+    // issues: they belong in readable context, not alpha's personal rows.
+    let included_root_title = "INCLUDED_CONFIDENTIAL_PARENT";
+    let included_root = fixture_issue(&pm, "included", included_root_title, "beta", None, &[]);
+    let excluded_root_title = "EXCLUDED_CONFIDENTIAL_PARENT";
+    let excluded_root = fixture_issue(&pm, "excluded", excluded_root_title, "beta", None, &[]);
+    let public_root = fixture_issue(
+        &pm,
+        "workspace",
+        "Another human's readable parent",
+        "beta",
+        None,
+        &[],
+    );
+    let excluded_links = fixture_issue(
+        &pm,
+        "workspace",
+        "Readable issue with excluded outgoing targets",
+        "alpha",
+        Some(&excluded_root),
+        std::slice::from_ref(&excluded_blocker),
+    );
+    fixture_link(&pm, &excluded_links, "relates", &excluded_root);
+    fixture_link(&pm, &excluded_links, "relates", &public_child);
+    fixture_link(&pm, &excluded_links, "duplicate_of", &excluded_root);
+    let revocable_links = fixture_issue(
+        &pm,
+        "workspace",
+        "Readable issue with revocable outgoing targets",
+        "alpha",
+        Some(&included_root),
+        std::slice::from_ref(&included),
+    );
+    fixture_link(&pm, &revocable_links, "relates", &included_root);
+    fixture_link(&pm, &revocable_links, "relates", &public_child);
+    fixture_link(&pm, &revocable_links, "duplicate_of", &included_root);
+    let public_links = fixture_issue(
+        &pm,
+        "workspace",
+        "Readable issue whose other-owner targets must survive",
+        "alpha",
+        Some(&public_root),
+        std::slice::from_ref(&public_child),
+    );
+    fixture_link(&pm, &public_links, "relates", &public_child);
+    fixture_link(&pm, &public_links, "duplicate_of", &public_child);
+
     fixture_private_policy(&pm, "included", 2, &["users/alpha"]);
     fixture_private_policy(&pm, "excluded", 2, &["users/someone-else"]);
 
@@ -250,14 +339,28 @@ fn cad1500_assignment_does_not_grant_access_and_revocation_fences_my_work() {
     };
 
     let initial = read_my_work();
-    assert_visible_ids(&initial, &[&parent, &included]);
-    assert_no_hidden_values(&initial, &[&excluded, excluded_title]);
-    let epic = initial["issues"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"].as_str() == Some(parent.as_str()))
-        .unwrap();
+    assert_visible_ids(
+        &initial,
+        &[
+            &parent,
+            &included,
+            &excluded_links,
+            &revocable_links,
+            &public_links,
+        ],
+    );
+    assert_no_hidden_values(
+        &initial,
+        &[
+            &excluded,
+            excluded_title,
+            &excluded_root,
+            excluded_root_title,
+            &excluded_blocker,
+            excluded_blocker_title,
+        ],
+    );
+    let epic = card(&initial, &parent);
     assert_eq!(epic["status"], "doing", "{initial}");
     assert_eq!(epic["work"]["progress"]["total_weight"], 2, "{initial}");
     assert_eq!(
@@ -274,8 +377,33 @@ fn cad1500_assignment_does_not_grant_access_and_revocation_fences_my_work() {
     assert_eq!(reasons[0]["issue"], included.as_str(), "{initial}");
     assert_eq!(reasons[0]["owner"], "alpha", "{initial}");
 
-    // Revoke only project membership. Leave the issue, ownership, dependency,
-    // parent relationship, server and already-used read-model cache intact.
+    let excluded_card = card(&initial, &excluded_links);
+    assert_links(excluded_card, None, &[], &[&public_child], None);
+    assert_eq!(excluded_card["blocked"], false, "{initial}");
+    assert_eq!(excluded_card["ready"], true, "{initial}");
+    let revocable_card = card(&initial, &revocable_links);
+    assert_links(
+        revocable_card,
+        Some(&included_root),
+        &[&included],
+        &[&included_root, &public_child],
+        Some(&included_root),
+    );
+    assert_eq!(revocable_card["blocked"], true, "{initial}");
+    assert_eq!(revocable_card["ready"], false, "{initial}");
+    let public_card = card(&initial, &public_links);
+    assert_links(
+        public_card,
+        Some(&public_root),
+        &[&public_child],
+        &[&public_child],
+        Some(&public_child),
+    );
+    assert_eq!(public_card["blocked"], true, "{initial}");
+    assert_eq!(public_card["ready"], false, "{initial}");
+
+    // Revoke only project membership. Leave the issues, ownership, links,
+    // server and already-used read-model cache intact.
     fixture_private_policy(&pm, "included", 3, &[]);
     for id in [&included, &excluded] {
         let issue = crate::issue::board::find_issue(&pm.dir, id).unwrap();
@@ -283,12 +411,26 @@ fn cad1500_assignment_does_not_grant_access_and_revocation_fences_my_work() {
         assert_eq!(issue.front.parent.as_deref(), Some(parent.as_str()));
     }
     let revoked = read_my_work();
-    assert_visible_ids(&revoked, &[&parent]);
+    assert_visible_ids(
+        &revoked,
+        &[&parent, &excluded_links, &revocable_links, &public_links],
+    );
     assert_no_hidden_values(
         &revoked,
-        &[&included, included_title, &excluded, excluded_title],
+        &[
+            &included,
+            included_title,
+            &excluded,
+            excluded_title,
+            &included_root,
+            included_root_title,
+            &excluded_root,
+            excluded_root_title,
+            &excluded_blocker,
+            excluded_blocker_title,
+        ],
     );
-    let epic = &revoked["issues"][0];
+    let epic = card(&revoked, &parent);
     assert_eq!(
         epic["status"], "backlog",
         "hidden children changed roll-up: {revoked}"
@@ -304,4 +446,45 @@ fn cad1500_assignment_does_not_grant_access_and_revocation_fences_my_work() {
     );
     assert_eq!(epic["work"]["health"]["state"], "on_track", "{revoked}");
     assert_eq!(epic["work"]["health"]["reasons"], json!([]), "{revoked}");
+
+    let excluded_card = card(&revoked, &excluded_links);
+    assert_links(excluded_card, None, &[], &[&public_child], None);
+    assert_eq!(excluded_card["blocked"], false, "{revoked}");
+    assert_eq!(excluded_card["ready"], true, "{revoked}");
+    let revocable_card = card(&revoked, &revocable_links);
+    assert_links(revocable_card, None, &[], &[&public_child], None);
+    assert_eq!(revocable_card["blocked"], false, "{revoked}");
+    assert_eq!(revocable_card["ready"], true, "{revoked}");
+    let public_card = card(&revoked, &public_links);
+    assert_links(
+        public_card,
+        Some(&public_root),
+        &[&public_child],
+        &[&public_child],
+        Some(&public_child),
+    );
+    assert_eq!(public_card["blocked"], true, "{revoked}");
+    assert_eq!(public_card["ready"], false, "{revoked}");
+
+    // A read projection must not erase the real links to make the refusal pass.
+    for (id, original_parent, original_blocker) in [
+        (&excluded_links, &excluded_root, &excluded_blocker),
+        (&revocable_links, &included_root, &included),
+    ] {
+        let issue = crate::issue::board::find_issue(&pm.dir, id).unwrap();
+        assert_eq!(issue.front.owner.as_deref(), Some("alpha"));
+        assert_eq!(
+            issue.front.parent.as_deref(),
+            Some(original_parent.as_str())
+        );
+        assert_eq!(issue.front.blocked_by, vec![original_blocker.clone()]);
+        assert_eq!(
+            issue.front.duplicate_of.as_deref(),
+            Some(original_parent.as_str())
+        );
+        assert_eq!(
+            issue.front.relates,
+            vec![original_parent.clone(), public_child.clone()]
+        );
+    }
 }
