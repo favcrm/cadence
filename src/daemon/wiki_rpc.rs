@@ -171,6 +171,22 @@ impl Shared {
         }))
     }
 
+    /// Owner authority for collection workflows comes from a verified session,
+    /// never the shared Wiki writer handle. Keep ordinary Wiki ACLs unchanged.
+    fn knowledge_actor(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+        verb: &str,
+    ) -> Result<(Caller, Option<WikiHuman>)> {
+        let mut caller = self.wiki_caller(params, peer_pid, verb)?;
+        let human = self.wiki_human(params, &caller, verb)?;
+        if human.as_ref().is_some_and(|human| human.role.is_operator()) {
+            caller = Caller::Operator;
+        }
+        Ok((caller, human))
+    }
+
     /// CAD-1374: before a wiki mutation touches the tree, check the EXISTING
     /// allowlist for every path it touches (`wiki::allowed`), then — only for
     /// a proven human — prepare the activity receipt and attach it to the PM.
@@ -226,6 +242,11 @@ impl Shared {
         let path = Self::wiki_path(params)?;
         let offset = wiki::json_u64(params, "offset")?;
         let bytes = wiki::json_u64(params, "bytes")?;
+        if params.get("at").is_some() {
+            return Err(Error::rejected(
+                "wiki read refused: a historical selector uses wiki_read_revision and is never read as the live page",
+            ));
+        }
         let rev = match params.get("rev") {
             None | Some(Value::Null) => None,
             Some(Value::String(rev)) => Some(rev.as_str()),
@@ -436,6 +457,193 @@ impl Shared {
         wiki::history(&self.pm()?, &caller, path, limit)
     }
 
+    pub(super) fn rpc_wiki_collection_get(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        Self::allow_wiki_fields(
+            params,
+            &["path", "wiki_as", "public_session"],
+            "wiki collection",
+        )?;
+        let (caller, _) = self.knowledge_actor(params, peer_pid, "wiki collection")?;
+        let path = Self::wiki_path(params)?;
+        wiki::collection::get(&self.pm()?, &self.state_dir, &caller, path)
+    }
+
+    pub(super) fn rpc_wiki_collection_put(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        Self::allow_wiki_fields(
+            params,
+            &["path", "if_rev", "metadata", "wiki_as", "public_session"],
+            "wiki collection",
+        )?;
+        let (caller, human) = self.knowledge_actor(params, peer_pid, "wiki collection")?;
+        let path = Self::wiki_path(params)?;
+        let if_rev = required_str(params, "if_rev")?;
+        let metadata = params
+            .get("metadata")
+            .ok_or_else(|| Error::rejected("wiki collection refused: metadata is required"))?;
+        let provenance = human
+            .as_ref()
+            .map(|human| human.sub.clone())
+            .filter(|sub| !sub.is_empty())
+            .unwrap_or_else(|| caller.actor());
+        wiki::collection::put(
+            &self.pm()?,
+            &self.state_dir,
+            &caller,
+            path,
+            if_rev,
+            metadata,
+            &provenance,
+        )
+    }
+
+    pub(super) fn rpc_wiki_read_revision(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        Self::allow_wiki_fields(
+            params,
+            &["path", "at", "offset", "bytes", "wiki_as", "public_session"],
+            "wiki revision",
+        )?;
+        if params.get("rev").is_some() {
+            return Err(Error::rejected(
+                "wiki revision refused: the live 'rev' check is not a historical selector",
+            ));
+        }
+        let caller = self.wiki_caller(params, peer_pid, "wiki revision")?;
+        let path = Self::wiki_path(params)?;
+        let at = required_str(params, "at")?;
+        let offset = wiki::json_u64(params, "offset")?;
+        let bytes = wiki::json_u64(params, "bytes")?;
+        let range = if offset.is_some() || bytes.is_some() {
+            Some(wiki::BodyRange {
+                offset: offset.unwrap_or(0),
+                bytes,
+                rev: None,
+            })
+        } else {
+            None
+        };
+        wiki::read_revision(&self.pm()?, &caller, path, at, range)
+    }
+
+    pub(super) fn rpc_wiki_corrections_list(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        Self::allow_wiki_fields(
+            params,
+            &["path", "wiki_as", "public_session"],
+            "wiki correction",
+        )?;
+        let (caller, human) = self.knowledge_actor(params, peer_pid, "wiki correction")?;
+        let mut listed = wiki::correction::list(&self.pm()?, &caller, Self::wiki_path(params)?)?;
+        // Permissions must describe what the review path will actually allow:
+        // without a verified human subject both are refused, so do not offer
+        // the form.
+        if !Self::correction_subject(human.as_ref()) {
+            if let Some(permissions) = listed.get_mut("permissions").and_then(Value::as_object_mut)
+            {
+                permissions.insert("submit".to_string(), Value::Bool(false));
+                permissions.insert("review".to_string(), Value::Bool(false));
+            }
+        }
+        Ok(listed)
+    }
+
+    pub(super) fn rpc_wiki_corrections_submit(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        Self::allow_wiki_fields(
+            params,
+            &["path", "correction", "wiki_as", "public_session"],
+            "wiki correction",
+        )?;
+        let (caller, human) = self.knowledge_actor(params, peer_pid, "wiki correction")?;
+        let human = Self::correction_human(human, "wiki correction")?;
+        wiki::correction::submit(
+            &self.pm()?,
+            &caller,
+            Self::wiki_path(params)?,
+            params.get("correction").ok_or_else(|| {
+                Error::rejected("wiki correction refused: correction report is required")
+            })?,
+            &human,
+        )
+    }
+
+    pub(super) fn rpc_wiki_corrections_review(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        Self::allow_wiki_fields(
+            params,
+            &["path", "correction", "wiki_as", "public_session"],
+            "wiki correction",
+        )?;
+        let (caller, human) = self.knowledge_actor(params, peer_pid, "wiki correction")?;
+        let human = Self::correction_human(human, "wiki correction")?;
+        wiki::correction::review(
+            &self.pm()?,
+            &caller,
+            Self::wiki_path(params)?,
+            params.get("correction").ok_or_else(|| {
+                Error::rejected("wiki correction refused: correction review is required")
+            })?,
+            &human,
+        )
+    }
+
+    /// Same subject grammar as `wiki::correction`'s review gate: absent, empty,
+    /// or the `operator` alias is not a human the review path will accept.
+    fn correction_subject(human: Option<&WikiHuman>) -> bool {
+        let Some(human) = human else {
+            return false;
+        };
+        let sub = human.sub.as_str();
+        !sub.is_empty()
+            && sub.len() <= 64
+            && !sub.eq_ignore_ascii_case("operator")
+            && sub
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    }
+
+    fn correction_human(human: Option<WikiHuman>, verb: &str) -> Result<wiki::correction::Human> {
+        let Some(human) = human else {
+            return Err(Error::rejected(format!(
+                "{verb} refused: a verified human session is required"
+            )));
+        };
+        let display = human
+            .display
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(200)
+            .collect::<String>();
+        let display = if display.trim().is_empty() {
+            human.sub.clone()
+        } else {
+            display
+        };
+        Ok(wiki::correction::Human {
+            sub: human.sub,
+            display,
+        })
+    }
+
+    fn allow_wiki_fields(params: &Value, allowed: &[&str], verb: &str) -> Result<()> {
+        Self::reject_wiki_fields(params)?;
+        let Some(fields) = params.as_object() else {
+            return Err(Error::rejected(format!(
+                "{verb} refused: the request must be an object"
+            )));
+        };
+        if fields.keys().any(|key| !allowed.contains(&key.as_str())) {
+            return Err(Error::rejected(format!(
+                "{verb} refused: the request has an unsupported field"
+            )));
+        }
+        Ok(())
+    }
+
     /// CAD-719: the operator's read-only index health — schema, committed
     /// vs indexed tree, freshness and its reason, indexed counts and the
     /// last refresh outcome. Never rebuilds; operator-scope only.
@@ -471,6 +679,7 @@ impl Shared {
             "path",
             "bytes",
             "rev",
+            "at",
             "wiki_as",
             "public_session",
             "_transfer_binding",
@@ -708,7 +917,21 @@ impl Shared {
                 ))
             }
         };
-        wiki::transfer::export(&self.pm()?, caller, path, offset, bytes, rev)
+        let at = export_at(params)?;
+        wiki::transfer::export(&self.pm()?, caller, path, offset, bytes, rev, at)
+    }
+}
+
+/// The `at` historical selector for a transfer export. Only an omitted key
+/// selects the live export; a present value must be a non-empty revision
+/// selector, never an implicit live read.
+fn export_at(params: &Value) -> Result<Option<&str>> {
+    match params.get("at") {
+        None => Ok(None),
+        Some(Value::String(at)) if !at.is_empty() => Ok(Some(at.as_str())),
+        Some(_) => Err(Error::rejected(
+            "wiki transfer export refused: at must be a non-empty revision selector",
+        )),
     }
 }
 
@@ -720,4 +943,35 @@ fn valid_user_handle(handle: &str) -> bool {
         && handle
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only an omitted `at` selects the live export: a present null, empty
+    /// or non-string is refused rather than silently reading live bytes.
+    #[test]
+    fn export_selector_refuses_a_present_non_string() {
+        assert_eq!(
+            export_at(&serde_json::json!({})).unwrap(),
+            None,
+            "an omitted selector selects the live export"
+        );
+        assert_eq!(
+            export_at(&serde_json::json!({"at": "fnv1a:0123456789abcdef"})).unwrap(),
+            Some("fnv1a:0123456789abcdef")
+        );
+        for bad in [
+            serde_json::json!({"at": null}),
+            serde_json::json!({"at": ""}),
+            serde_json::json!({"at": 7}),
+            serde_json::json!({"at": ["a"]}),
+        ] {
+            assert!(
+                export_at(&bad).is_err(),
+                "{bad} was read as the live export"
+            );
+        }
+    }
 }

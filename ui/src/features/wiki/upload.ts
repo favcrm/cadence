@@ -17,6 +17,8 @@ export interface UploadItem {
   /** 0–100; only meaningful while uploading. */
   progress: number;
   error?: string;
+  /** Server outcome, extraction and index. Absent until the transfer reports them. */
+  detail?: string;
 }
 
 export function capLabel(cap = MAX_UPLOAD_BYTES): string {

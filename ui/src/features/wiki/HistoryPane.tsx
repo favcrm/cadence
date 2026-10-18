@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { Route } from "../../lib/router";
+import Link from "../../ui/Link";
 import { navigate } from "../../lib/useLocation";
 import { wiki } from "./api";
 import { versionRows, versionWho, type WikiVersion } from "./history";
@@ -124,8 +125,8 @@ export default function HistoryPane({
         <div className={canCompare ? "wk-hsplit" : "wk-history-log"}>
           <div className="wk-ver">
             {rows.map((row) => canCompare ? (
+              <div key={row.rev}>
               <button
-                key={row.rev}
                 type="button"
                 className={`wk-vrow${selected === row.rev ? " on" : ""}`}
                 onClick={() => setSelected(row.rev)}
@@ -136,10 +137,13 @@ export default function HistoryPane({
                 </span>
                 {row.summary && <span className="wk-vsum">{row.summary}</span>}
               </button>
+              <Link href={navHref({ screen: "wiki", mode: "browse", path, query: null, at: row.rev })}>{t("Open this revision")}</Link>
+              </div>
             ) : <div key={row.rev} className="wk-vrow">
               <span className="wk-vwho">{versionWho(row)}</span>
               <span className="wk-vwhen">{row.when}</span>
               {row.summary && <span className="wk-vsum">{row.summary}</span>}
+              <Link href={navHref({ screen: "wiki", mode: "browse", path, query: null, at: row.rev })}>{t("Open this revision")}</Link>
             </div>)}
           </div>
           {canCompare && <div className="min-w-0">

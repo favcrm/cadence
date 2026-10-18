@@ -1,9 +1,8 @@
 import { sessionHeaders } from "../../lib/sessionKey";
-import { notifyPrivateSessionRequired, privateFetch, privateReadsAllowed, privateSessionGeneration, usingPrivateOperation, withPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
+import { privateFetch, privateReadsAllowed, privateSessionGeneration, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import type { WikiVersion } from "./history";
 import type { SearchHit } from "./search";
 import { normalizeListing, normalizePage, normalizeSearch, normalizeHistory } from "./wire";
-import { joinPath } from "./paths";
 
 /**
  * The wiki store's HTTP surface (CAD-580) as this screen reads it. One
@@ -12,7 +11,7 @@ import { joinPath } from "./paths";
  *   GET  /api/wiki/ls?path=       a folder's entries — or one entry's kind
  *   GET  /api/wiki/file?path=     text as JSON; blobs streamed (Range)
  *   PUT  /api/wiki/file           {path, text, if_rev}
- *   POST /api/wiki/upload         multipart, one file per request
+ *   POST /api/wiki/transfer       the durable import job (see transfer.ts)
  *   POST /api/wiki/mkdir|mv|rm    {path}, {from, to}, {path}
  *   GET  /api/wiki/search?q=      full-text search
  *   GET  /api/wiki/history?path=  git log (current daemon has no diff/restore)
@@ -63,6 +62,8 @@ export interface WikiPage {
   size?: number;
   mime?: string | null;
   sha256?: string;
+  /** Set when this page was read with an explicit `at` selector. */
+  historical?: boolean;
 }
 
 export interface WikiSearchResponse {
@@ -213,14 +214,6 @@ export function historyQuery(path: string, from?: string, to?: string): string {
   return `/api/wiki/history?${params.toString()}`;
 }
 
-export function uploadTargetPath(dir: string, filename: string): string {
-  return joinPath(dir, filename);
-}
-
-export function uploadQuery(path: string): string {
-  return `/api/wiki/upload?path=${encodeURIComponent(path)}`;
-}
-
 export const mkdirBody = (path: string) => ({ path });
 export const mvBody = (from: string, to: string) => ({ from, to });
 export const rmBody = (path: string) => ({ path });
@@ -239,139 +232,3 @@ export const wiki = {
   restore: (path: string, rev: string) =>
     send<WikiPage>("POST", "/api/wiki/restore", { path, rev }),
 };
-
-/**
- * One upload, with progress (fetch cannot report it). The file part is
- * `file`; the target folder travels in the query and as a `path` field,
- * so either convention the server settles on works. The server's own
- * refusal — size, MIME, secret scan — surfaces as this file's error.
- */
-export interface UploadResult {
-  extraction?: { status: string; reason?: string; path?: string };
-}
-
-function recordField(body: object, key: string): unknown {
-  if (!Object.prototype.hasOwnProperty.call(body, key)) return undefined;
-  return Reflect.get(body, key);
-}
-
-function textField(body: object, key: string): string | undefined {
-  const value = recordField(body, key);
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-/** Local `{error, code}` and hosted `{error:{code,message}}` bodies, guarded. */
-function uploadRefusalBody(body: unknown): unknown {
-  if (body === null || typeof body !== "object" || Array.isArray(body)) return body;
-  const error = recordField(body, "error");
-  if (typeof error === "string" || error === undefined) return body;
-  if (error === null || typeof error !== "object" || Array.isArray(error)) return { error: undefined, code: textField(body, "code") };
-  return {
-    error: textField(error, "message"),
-    code: textField(body, "code") ?? textField(error, "code"),
-  };
-}
-
-function uploadResultFrom(body: unknown): UploadResult | { conflict: "if_rev" } {
-  if (body === null || typeof body !== "object" || Array.isArray(body)) return {};
-  if (textField(body, "conflict") === "if_rev") return { conflict: "if_rev" };
-  const extraction = recordField(body, "extraction");
-  if (extraction === null || typeof extraction !== "object" || Array.isArray(extraction)) return {};
-  const status = textField(extraction, "status");
-  if (status === undefined) return {};
-  return {
-    extraction: {
-      status,
-      reason: textField(extraction, "reason"),
-      path: textField(extraction, "path"),
-    },
-  };
-}
-
-function sendUpload(
-  dir: string,
-  file: File,
-  onProgress: ((percent: number) => void) | undefined,
-  operation: PrivateOperation,
-): Promise<UploadResult> {
-  return new Promise((resolve, reject) => {
-    if (operation.signal.aborted) {
-      reject(new DOMException("upload canceled", "AbortError"));
-      return;
-    }
-    const path = uploadTargetPath(dir, file.name);
-    const form = new FormData();
-    form.append("path", path);
-    form.append("file", file, file.name);
-    const xhr = new XMLHttpRequest();
-    let settled = false;
-    const onAbort = () => xhr.abort();
-    operation.signal.addEventListener("abort", onAbort, { once: true });
-    const detach = () => {
-      operation.signal.removeEventListener("abort", onAbort);
-      xhr.onload = null;
-      xhr.onerror = null;
-      xhr.onabort = null;
-      xhr.upload.onprogress = null;
-    };
-    const settle = (done: () => void) => {
-      if (settled) return;
-      settled = true;
-      detach();
-      done();
-    };
-    xhr.open("POST", uploadQuery(path));
-    xhr.setRequestHeader("X-Cadence-Board", "1");
-    for (const [key, value] of Object.entries(sessionHeaders())) xhr.setRequestHeader(key, value);
-    xhr.upload.onprogress = (event) => {
-      if (settled || operation.signal.aborted || !event.lengthComputable || !onProgress) return;
-      onProgress((event.loaded / event.total) * 100);
-    };
-    xhr.onload = () => {
-      const status = xhr.status;
-      const responseText = xhr.responseText;
-      const stillCurrent = !operation.signal.aborted;
-      let body: unknown = null;
-      try {
-        body = JSON.parse(responseText);
-      } catch {
-        body = null;
-      }
-      settle(() => {
-        if (!stillCurrent) {
-          reject(new DOMException("upload canceled", "AbortError"));
-          return;
-        }
-        if (status >= 200 && status < 300) {
-          const result = uploadResultFrom(body);
-          if ("conflict" in result) {
-            reject(wikiErrorFrom(409, { error: "This file changed during upload", code: "conflict" }));
-            return;
-          }
-          onProgress?.(100);
-          resolve(result);
-          return;
-        }
-        if (status === 401) notifyPrivateSessionRequired(status, body, operation);
-        reject(wikiErrorFrom(status, uploadRefusalBody(body)));
-      });
-    };
-    xhr.onerror = () => {
-      settle(() => reject(new WikiError("upload failed — connection lost", 0)));
-    };
-    xhr.onabort = () => {
-      settle(() => reject(new DOMException("upload canceled", "AbortError")));
-    };
-    xhr.send(form);
-  });
-}
-
-export function uploadFile(
-  dir: string,
-  file: File,
-  onProgress?: (percent: number) => void,
-  operation?: PrivateOperation,
-): Promise<UploadResult> {
-  if (operation) return sendUpload(dir, file, onProgress, operation);
-  return withPrivateOperation((owned) => sendUpload(dir, file, onProgress, owned));
-}

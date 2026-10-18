@@ -2505,6 +2505,11 @@ pub fn attach_bytes(
             "Bad artifact name '{name}' — [A-Za-z0-9._-]{{1,120}}, no leading dot"
         )));
     }
+    if model::reserved_artifact_name(name) {
+        return Err(Error::rejected(format!(
+            "{name} is a tracker-owned record and cannot be attached: only its own workflow writes it"
+        )));
+    }
     if bytes.len() as u64 > pm.config.artifact_max_bytes {
         return Err(Error::rejected(format!(
             "{name} is {} bytes — over the {} cap; link it instead",
@@ -2781,6 +2786,25 @@ mod tests {
     fn clean(pm: &Pm) -> bool {
         crate::issue::git(&pm.dir, &["diff", "--cached", "--quiet"]).is_ok()
             && crate::issue::git(&pm.dir, &["status", "--porcelain"]).is_ok_and(|s| s.is_empty())
+    }
+
+    /// The tracker's own records are not caller attachments: a copy of a
+    /// correction record onto another ticket must not be writable, or a
+    /// listing would read it as that ticket's reviewed correction.
+    #[test]
+    fn attach_refuses_the_tracker_owned_records() {
+        let (_dir, pm) = tracker();
+        for name in model::RESERVED_ARTIFACT_NAMES {
+            assert!(
+                attach_bytes(&pm, "CAD-1", name, b"{}", true, "t").is_err(),
+                "{name} was accepted as a caller attachment"
+            );
+            let (_project, dir) = issue_dir(&pm, "CAD-1").unwrap();
+            assert!(
+                !dir.join("artifacts").join(name).exists(),
+                "{name} was written to artifacts/"
+            );
+        }
     }
 
     /// A forced done over several ids keeps its reason in the commit

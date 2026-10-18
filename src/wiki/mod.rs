@@ -17,6 +17,7 @@
 //!                             the operator administers
 //! .trash/                     `wiki rm` landings (not API-addressable)
 //! .blobs/                     content-addressed binary store
+//! .knowledge/                 collection metadata sidecars (not API-addressable)
 //! ```
 //!
 //! Text files live IN the tracker git: one commit per write with an
@@ -49,9 +50,12 @@ use crate::error::{Error, Result};
 use crate::issue::Pm;
 
 pub mod cli;
+pub mod collection;
+pub mod correction;
 pub mod envelope;
 pub mod index;
 pub mod ingest;
+pub mod revision;
 pub mod transfer;
 pub mod transfer_client;
 pub mod upload;
@@ -62,8 +66,9 @@ pub const ABSENT: &str = "none";
 
 /// Largest accepted `search` answer.
 const SEARCH_CAP: usize = 200;
-/// Largest accepted `history` answer.
-const HISTORY_CAP: usize = 50;
+/// Largest accepted `history` answer. Historical `at` resolution uses the
+/// same bound and reports unavailable past it.
+pub(crate) const HISTORY_CAP: usize = 50;
 /// Longest single path segment (bytes) — the filesystem's own cap.
 const SEG_CAP: usize = 255;
 /// Longest normalized path (bytes).
@@ -351,7 +356,7 @@ fn trash_dir(vault: &Path) -> PathBuf {
 /// `git log`. `None` when the vault is not inside the tracker
 /// (CAD-584's `<home>/vault`; commits then refuse — the tracker git
 /// cannot see them — and the caller reports why).
-fn git_rel(pm: &Pm, abs: &Path) -> Result<PathBuf> {
+pub(crate) fn git_rel(pm: &Pm, abs: &Path) -> Result<PathBuf> {
     abs.strip_prefix(&pm.dir).map(PathBuf::from).map_err(|_| {
         Error::internal(format!(
             "wiki path {} is outside tracker {}",
@@ -365,7 +370,7 @@ fn git_rel(pm: &Pm, abs: &Path) -> Result<PathBuf> {
 /// components — every existing ancestor and the leaf itself must be
 /// a real directory entry. A missing leaf is fine (a write creates
 /// it); a missing ancestor is fine (mkdir -p at write).
-fn resolve(vault: &Path, norm: &str) -> Result<PathBuf> {
+pub(crate) fn resolve(vault: &Path, norm: &str) -> Result<PathBuf> {
     if vault
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink())
@@ -918,8 +923,92 @@ pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
             "kind": "text",
             "text": page.text,
             "rev": page.rev,
+            "sha256": transfer::sha256_bytes(page.text.as_bytes()),
         })),
     }
+}
+
+/// Read `path` at `at`. This does not call [`read`] when the selector
+/// misses: an unknown, ambiguous, or non-commit name is an error.
+pub fn read_revision(
+    pm: &Pm,
+    caller: &Caller,
+    path: &str,
+    at: &str,
+    range: Option<BodyRange<'_>>,
+) -> Result<Value> {
+    let pinned = revision::pin(pm, caller, path, at)?;
+    let mut value = match (&pinned.body, range) {
+        (revision::Body::Dir, Some(_)) => {
+            return Err(Error::rejected(format!(
+                "wiki revision '{path}' refused: a range read needs a text page or blob"
+            )))
+        }
+        (revision::Body::Dir, None) => json!({
+            "path": pinned.path,
+            "kind": "dir",
+            "rev": Value::Null,
+            "sha256": Value::Null,
+        }),
+        (revision::Body::Text(text), None) => json!({
+            "path": pinned.path,
+            "kind": "text",
+            "text": text,
+            "rev": pinned.rev,
+            "sha256": pinned.sha256,
+        }),
+        (revision::Body::Text(text), Some(range)) => {
+            let page = TextPage {
+                path: pinned.path.clone(),
+                text: text.clone(),
+                rev: pinned.rev.clone(),
+            };
+            text_read_range(page, range)?
+        }
+        (revision::Body::Blob(blob), None) => json!({
+            "path": pinned.path,
+            "kind": "blob",
+            "sha256": blob.sha256,
+            "size": blob.size,
+            "mime": blob.mime,
+            "name": blob.name,
+            "rev": pinned.rev,
+        }),
+        (revision::Body::Blob(blob), Some(range)) => {
+            let meta = json!({
+                "path": pinned.path,
+                "kind": "blob",
+                "sha256": blob.sha256,
+                "size": blob.size,
+                "mime": blob.mime,
+                "name": blob.name,
+                "rev": pinned.rev,
+            });
+            blob_read_range(pm, &meta, range)?
+        }
+    };
+    if let Some(obj) = value.as_object_mut() {
+        // `rev` is the selector the caller asked for. A commit name is not
+        // rewritten to the live FNV token, or the board cannot tell this
+        // page from latest. `git` stays the resolved commit.
+        obj.insert("rev".to_string(), json!(at));
+        obj.insert("at".to_string(), json!(at));
+        obj.insert("git".to_string(), json!(pinned.git));
+        if obj.get("sha256").is_none() {
+            obj.insert("sha256".to_string(), json!(pinned.sha256));
+        }
+    }
+    if value.get("range").is_some() || value.get("data_base64").is_some() {
+        let len = serde_json::to_vec(&value)
+            .map(|body| body.len())
+            .unwrap_or(usize::MAX);
+        if len.saturating_add(1) >= NATIVE_TOOL_LINE_BOUND {
+            return Err(Error::rejected(
+                "wiki revision refused: the historical range does not fit the native tool line bound",
+            ));
+        }
+    }
+    Ok(value)
 }
 
 /// Bounded original-body read. Same authorization and sandbox path as
