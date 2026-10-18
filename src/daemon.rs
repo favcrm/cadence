@@ -882,11 +882,13 @@ impl Shared {
             .provider_deployments
             .as_ref()
             .and_then(|metadata| metadata.hosted_business_documents());
-        // Import before the store is bound, before actor recovery, and
-        // before the socket serves. A missing pm.yaml or agents tree is
-        // absence. Unreadable or malformed legacy input refuses startup
-        // and leaves legacy_imported unset. Settings GET does not import.
-        store.import_legacy_settings(&wiki_pm_dir)?;
+        // Import before serving or actor recovery in a normal workspace.
+        // Portable execution-disabled stores deliberately omit authority;
+        // never reconstruct it from their copied tracker.
+        // Settings GET does not import.
+        if !execution_mode.fenced() {
+            store.import_legacy_settings(&wiki_pm_dir)?;
+        }
         let store = Arc::new(store);
         let provider_env = opts
             .provider_env
