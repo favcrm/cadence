@@ -216,6 +216,29 @@ pub struct CliActor {
     pub handle: String,
 }
 
+impl CliActor {
+    /// The project-policy spelling this actor is keyed by: the actor's
+    /// kind with its subject in the sanitized handle form the board
+    /// stores (`board_identity::handle_of`), which is also the only form
+    /// the store accepts — `Grant::parse` refuses a handle outside
+    /// `[A-Za-z0-9_-]{1,200}`.
+    ///
+    /// Deriving it here is what makes a grant recorded on either surface
+    /// match the caller arriving through the other. Keying on `actor`
+    /// verbatim would refuse a member whose subject needs sanitizing a
+    /// project the board admits it to: the envelope's
+    /// `users/auth0|usr:9/x` can never equal the store's
+    /// `users/auth0_usr_9_x`.
+    pub fn policy_spelling(&self) -> String {
+        match self.actor.split_once('/') {
+            Some((kind, _)) => format!("{kind}/{}", self.handle),
+            // `operator` is not a `<kind>/<subject>` spelling; the
+            // verified schema bounds the actor to these four forms.
+            None => self.actor.clone(),
+        }
+    }
+}
+
 /// Extract the compact envelope from `Authorization`: exactly
 /// `Bearer wikienv_<h>.<p>.<s>` — nothing else satisfies this route,
 /// and a bearer meant for another route never parses here.
@@ -290,7 +313,7 @@ fn public_scheme(host: &str) -> &'static str {
 /// `users/<sub>`/`service/<sub>`/`agents/<id>` map to their namespaced
 /// tail so the daemon-visible author can never read as `operator` or
 /// collide with a pane alias it does not own.
-fn handle_of(actor: &str, sub: &str) -> String {
+pub(crate) fn handle_of(actor: &str, sub: &str) -> String {
     let tail = actor.split_once('/').map(|(_, t)| t).unwrap_or(sub);
     tail.chars()
         .map(|c| {
@@ -552,5 +575,45 @@ impl Spent {
         file.sync_all()?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod policy_spelling_tests {
+    use super::*;
+
+    fn actor(spelling: &str, sub: &str) -> CliActor {
+        CliActor {
+            handle: handle_of(spelling, sub),
+            sub: sub.to_string(),
+            actor: spelling.to_string(),
+            role_at_issue: "member".to_string(),
+            scopes: vec!["cli.read".to_string(), "cli.write".to_string()],
+            jti: "jti".to_string(),
+            exp: i64::MAX,
+        }
+    }
+
+    /// The spelling a policy decision keys on is the sanitized subject the
+    /// board stores — not the raw claim, which the store would refuse.
+    #[test]
+    fn the_policy_spelling_is_the_sanitized_subject() {
+        assert_eq!(
+            actor("users/usr_9", "usr_9").policy_spelling(),
+            "users/usr_9"
+        );
+        assert_eq!(
+            actor("users/auth0|usr:9/x", "auth0|usr:9/x").policy_spelling(),
+            "users/auth0_usr_9_x"
+        );
+        // The reserved kinds keep their kind, so a restricted project
+        // still refuses them deliberately.
+        assert_eq!(actor("agents/dev", "dev").policy_spelling(), "agents/dev");
+        assert_eq!(actor("service/svc", "svc").policy_spelling(), "service/svc");
+        // `operator` is not a `<kind>/<subject>` spelling.
+        assert_eq!(actor("operator", "usr_9").policy_spelling(), "operator");
+        // The subject is cut where the attribution handle is cut.
+        let long = actor(&format!("users/{}", "s".repeat(100)), &"s".repeat(100));
+        assert_eq!(long.policy_spelling(), format!("users/{}", "s".repeat(64)));
     }
 }

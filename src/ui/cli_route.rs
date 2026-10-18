@@ -326,7 +326,7 @@ fn pm_at(pm_dir: &Path) -> Result<Pm, HttpResp> {
 /// (AOS-274 / SEC-003). A project that does not exist is left to the
 /// verb's own unknown-project answer; an unreadable tracker refuses.
 fn restricted(pm: &Pm, key: &str, actor: &CliActor) -> Option<HttpResp> {
-    if super::project_policy::refused(pm, key, &actor.actor) {
+    if super::project_policy::refused(pm, key, &actor.policy_spelling()) {
         Some(cli_fail(404, "not_found", "unknown project"))
     } else {
         None
@@ -348,7 +348,7 @@ fn restricted_issue(pm: &Pm, id: &str, actor: &CliActor) -> Option<HttpResp> {
 /// so a listing contributes no row, count or placeholder for a project
 /// the caller may not see.
 fn readable_projects(pm: &Pm, actor: &CliActor) -> std::collections::BTreeSet<String> {
-    super::project_policy::readable(pm, &actor.actor)
+    super::project_policy::readable(pm, &actor.policy_spelling())
 }
 
 /// The verb → the same call the CLI/board makes for it. `actor` is the
@@ -792,7 +792,9 @@ mod policy_tests {
             scopes: vec!["cli.read".into(), "cli.write".into()],
             jti: "jti".into(),
             exp: i64::MAX,
-            handle: "handle".into(),
+            // Exactly what `verify` derives from the claims, so the helper
+            // cannot drift from the production chain.
+            handle: cli_actor::handle_of(spelling, "sub"),
         }
     }
 
@@ -978,6 +980,51 @@ mod policy_tests {
         let project = crate::issue::project::load(&pm.dir.join("demo").join("project.yaml"))
             .expect("project.yaml loads");
         assert!(project.policy.is_none(), "a refused call wrote a policy");
+    }
+
+    /// A project with no recorded policy keeps today's access — it is not
+    /// implicitly private (REQ-007).
+    #[test]
+    fn a_project_without_a_recorded_policy_stays_readable() {
+        let (_dir, pm) = pm_with("");
+        assert!(restricted(&pm, "demo", &actor("users/anyone")).is_none());
+        assert!(readable_projects(&pm, &actor("users/anyone")).contains("demo"));
+    }
+
+    /// The board and the hosted CLI must name the same member, or a grant
+    /// recorded on one surface would refuse the caller arriving through
+    /// the other (AOS-274 adapter mapping).
+    #[test]
+    fn the_cli_keys_a_policy_on_the_spelling_the_board_stores() {
+        // The store holds only the sanitized form — `Grant::parse` refuses
+        // a raw subject — and that is what the board derives from a
+        // session, so it is the only spelling a grant can carry.
+        let (_dir, pm) = pm_with(
+            "policy:\n  version: 1\n  visibility: private\n  members:\n  - users/auth0_usr_9_x\n",
+        );
+        let sanitized = CliActor {
+            sub: "auth0|usr:9/x".into(),
+            actor: "users/auth0|usr:9/x".into(),
+            role_at_issue: "member".into(),
+            scopes: vec!["cli.read".into(), "cli.write".into()],
+            jti: "jti".into(),
+            exp: i64::MAX,
+            handle: cli_actor::handle_of("users/auth0|usr:9/x", "auth0|usr:9/x"),
+        };
+        // The granted member is admitted on the hosted CLI too, though the
+        // envelope's `sub` is not itself handle-shaped.
+        assert!(
+            restricted(&pm, "demo", &sanitized).is_none(),
+            "the granted member was refused through the hosted CLI"
+        );
+        assert!(readable_projects(&pm, &sanitized).contains("demo"));
+
+        // …and it widens nothing: a grant naming someone else still
+        // refuses this caller, on both the read guard and the listing.
+        let (_other_dir, other) =
+            pm_with("policy:\n  version: 1\n  visibility: private\n  members:\n  - users/mia\n");
+        assert!(restricted(&other, "demo", &sanitized).is_some());
+        assert!(readable_projects(&other, &sanitized).is_empty());
     }
 }
 
