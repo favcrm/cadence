@@ -24,6 +24,14 @@ Real numbers on cadence's shard 2 (warm run 39014481055):
 On the *stale-cache* run the same shard compiled **239 units** — the entire
 dep graph rebuilt because restored artifacts fingerprint-missed.
 
+Test duration includes fixture teardown. CAD-1556 found the CAD-1482 media
+refusal fixture joining a provider thread that only stopped at its 60s safety
+deadline. Connecting the existing teardown stop signal reduced the isolated
+test from 60.35s to 0.85s, with all acceptance assertions unchanged. The 60s
+deadline and 200ms receive bound remain. Maintenance of this protected check
+was explicitly operator-authorized and still needs independent review.
+This is test runtime evidence, not a measured whole-CI saving.
+
 ## 2. The rust-cache staleness trap (the real bug)
 
 `Swatinem/rust-cache` **never overwrites an existing key**. The post-action
