@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { navigate, useHref } from "../../lib/useLocation";
 import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
@@ -9,7 +9,7 @@ import { dropWorkspaceAppSnapshot, readWorkspaceAppSnapshot, workspaceApps, type
 import { WorkspaceAppCachedPreview } from "../workspace-apps/WorkspaceApp";
 import { chatScreenFor } from "./chatScreen";
 import { screenTag } from "../workspace-apps/screen/screenProjection";
-import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
+import { initialContext, rememberedContext, rememberContext, screenContext, subscribeContext } from "../workspace-apps/contextSelection";
 import ScreenUnavailable from "../workspace-apps/screen/ScreenUnavailable";
 import { isSocialContent } from "../workspace-apps/socialContentSupport";
 import { sectionFromSearch } from "./appNav";
@@ -25,6 +25,7 @@ import { installedAppHref } from "../apps/appViewModel";
 import { useLocale } from "../../lib/locale";
 import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
 import type { ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
+import RunLauncher from "./RunLauncher";
 import type { MediaChatAttach } from "../workspace-apps/screen/screenLifecycle";
 import { parseRoutePatch, type RoutePatch } from "../workspace-apps/screen/screenRoute";
 import type { HostCommand } from "../workspace-apps/screen/screenServices";
@@ -144,8 +145,9 @@ export default function AppShell({
 }: {
   installId: string;
   viewer: Viewer;
-  /** Installed screen receives only the trusted native chat handoff. */
-  children?: (onMediaAttach: MediaChatAttach) => React.ReactNode;
+  /** Installed screen receives only the trusted native chat handoff and
+   *  the shell's one verified app scope (CAD-1560). */
+  children?: (onMediaAttach: MediaChatAttach, contextId: string) => React.ReactNode;
   /** Board menu wiring: receives the verified installation (or null
    *  while loading, failed, or switched away). The parent matches
    *  installId to its route and compares values before storing. */
@@ -193,11 +195,13 @@ export default function AppShell({
   const [generalSetupAttempt, setGeneralSetupAttempt] = useState(0);
   const [contextId, setContextId] = useState("");
   const [linkNotice, setLinkNotice] = useState<string | null>(null);
-  // Social-content's picker owns its selection; the shell observes it
-  // in the same tab so chat sends carry the current scope, never the
-  // one from the shell's last render.
-  const [socialContext, setSocialContext] = useState<string | null>(null);
-  const [socialContextInstall, setSocialContextInstall] = useState<string | null>(null);
+  // CAD-1560: one shell-owned scope for every active app view. The
+  // in-workspace selection (Social's picker, a screen's saved-context
+  // verb) persists and emits through contextSelection; the subscription
+  // below applies it here, so chat, screen and launcher share exactly
+  // this value — never a second render-time writer.
+  const emitByHost = useRef(false);
+  const [launcherRun, setLauncherRun] = useState<{ name: string; contextId: string; installDigest: string; contextRevision: number | null; contextDigest: string | null } | null>(null);
   // Context receipts are per operator/install/selection and per scoped
   // conversation visit. The browser selection only invalidates a receipt;
   // membership still comes exclusively from the fresh server response.
@@ -211,9 +215,10 @@ export default function AppShell({
     installId,
     viewer.operator,
     screenViewer,
-    socialContextInstall === installId,
-    socialContextInstall,
-    socialContextInstall === installId ? socialContext : null,
+    // The shell's one scope is part of the receipt key: a workspace-emitted
+    // selection (the same mechanism a URL adoption uses) re-proves the
+    // install/context membership instead of trusting the emitted id.
+    contextId,
     scopedConversationVisit,
   ]);
   const readVersionRef = useRef({ inputKey: "", version: 0 });
@@ -229,16 +234,13 @@ export default function AppShell({
   currentReceiptKeyRef.current = receiptKey;
   const currentReadComplete = completedReceiptKey === receiptKey;
   const loadError = loadFailure?.key === receiptKey ? loadFailure.message : null;
-  const socialSelectionReady =
-    !isSocialContent(installation) || socialContextInstall === installId;
   const loading = screenViewer
-    ? requestLoading || !currentReadComplete || !socialSelectionReady
+    ? requestLoading || !currentReadComplete
     : requestLoading;
   const receiptReady =
     screenViewer &&
     currentReadComplete &&
     loadError === null &&
-    socialSelectionReady &&
     installation?.install_id === installId;
   // Outlet state lives in the URL (`ctx`, `appview`, `record`) so
   // direct links and browser back keep scope.
@@ -280,12 +282,13 @@ export default function AppShell({
   // keyed `loadFailure` needs no clearing here — the new route's
   // `loadError` computes to null and the stale entry is overwritten
   // by the switch effect's `setLoadFailure(null)`.
-  if (firstInstall.current !== installId && (installation !== null || contexts.length > 0 || contextId !== "" || linkNotice !== null || loadError !== null)) {
+  if (firstInstall.current !== installId && (installation !== null || contexts.length > 0 || contextId !== "" || linkNotice !== null || loadError !== null || launcherRun !== null)) {
     setInstallation(null);
     setScreenNavigation(null);
     setContexts([]);
     setContextId("");
     setLinkNotice(null);
+    setLauncherRun(null);
   }
   // Receipts count only when they are the current route's verified
   // ones: a departed install's `installation`/`contexts`, or a load
@@ -482,17 +485,24 @@ export default function AppShell({
     }
     return () => onInstallation(null);
   }, [installId, installation, onInstallation, receiptReady, screenNavigation]);
-
+  // In-workspace scope changes (Social's picker, a screen's saved-context
+  // verb) persist and emit through contextSelection. The shell applies the
+  // emission to its own selection — the one scope chat, screen and the run
+  // launcher share — and keeps the URL truthful: a deliberate in-workspace
+  // pick drops a stale conversation/record view that was bound to the
+  // previous scope. Host-driven writes (URL adoption, setup) flag out so
+  // their emit cannot rewrite the authored URL they came from.
   useEffect(() => {
-    setSocialContext(rememberedContext(installId));
-    setSocialContextInstall(installId);
     return subscribeContext((changed, next) => {
-      if (changed === installId) {
-        setSocialContext(next);
-        setSocialContextInstall(installId);
-      }
+      if (changed !== installId) return;
+      setContextId(next ?? "");
+      if (emitByHost.current) return;
+      if (installation?.install_id !== installId) return;
+      const current = query.get("ctx") ?? "";
+      if (next === current) return;
+      writeQuery({ ctx: next || null, record: null, appview: null, conversation: null });
     });
-  }, [installId]);
+  }, [installId, installation, query, writeQuery]);
 
   // Installation switch: stale outlet state must never follow the
   // operator across the boundary. The first mount keeps direct links.
@@ -526,6 +536,33 @@ export default function AppShell({
   const generalSetupError = generalSetup?.key === setupScopeKey ? generalSetup.error : null;
   const canRetryGeneralSetup = viewer.operator === true && !viewer.readOnly;
 
+  // The default selection for this install's screens: a declared screen
+  // has no in-shell picker moment, so a lone active context wins there
+  // over a fresh/empty remembered choice (`screenContext`); the picker
+  // view keeps remembered choice. Stale nonempty ids resolve to the
+  // stale id itself — the binding refuses, never an auto-retarget.
+  // Storage is read here, once, in the owner — resolvers take data only.
+  const fallbackContext = () => {
+    const remembered = rememberedContext(installId);
+    return activeIds.length === 0
+      ? remembered ?? ""
+      : installation !== null && screenTag(installation) !== null
+        ? screenContext(remembered, activeIds)
+        : initialContext(remembered, activeIds);
+  };
+  // Host-driven adoption (the effect below and setup): set the one scope
+  // and persist it, flagging the emission so the subscription does not
+  // rewrite the URL the adoption came from.
+  const adoptScope = (next: string) => {
+    emitByHost.current = true;
+    try {
+      setContextId(next);
+      rememberContext(installId, next);
+    } finally {
+      emitByHost.current = false;
+    }
+  };
+
   // Adopt the URL's context once contexts load, and on later external
   // URL changes (browser back). A linked context must be active here;
   // a stale, inactive or ambiguous link clears the selection with a
@@ -536,10 +573,6 @@ export default function AppShell({
     // the URL already names the next one — adopting there would clear
     // or poison the wrong scope.
     if (!receiptReady || loading || installation === null || installation.install_id !== installId) return;
-    // Social-content owns its context end to end (the shell renders
-    // no selector there): adoption must not read, write, or clear its
-    // remembered selection.
-    if (isSocialContent(installation)) return;
     const urlCtx = query.get("ctx");
     const urlRecord = query.get("record");
     const urlView = query.get("appview");
@@ -572,17 +605,18 @@ export default function AppShell({
     const soleContext = urlCtx === null && urlRecord !== null && !badRecord && activeIds.length === 1;
     const scopelessRecord = urlCtx === null && urlRecord !== null && !badRecord && !soleContext;
     if (staleCtx) {
-      setContextId(fallbackContext());
+      // The linked context died since the link was authored: adopt the
+      // fallback (like returning to the app) and say so.
+      adoptScope(fallbackContext());
       setLinkNotice("The linked context is not active in this installation — the selection was cleared.");
     } else if (soleContext) {
-      setContextId(activeIds[0]);
-      rememberContext(installId, activeIds[0]);
+      adoptScope(activeIds[0]);
       setLinkNotice(null);
     } else if (scopelessRecord) {
       // A record link without scope is ambiguous: refuse it with a
       // notice rather than guessing which context it names.
+      adoptScope(fallbackContext());
       setLinkNotice("The record link names no context — the selection was cleared.");
-      setContextId(fallbackContext());
     } else if (urlCtx !== null) {
       // The URL's ctx+record/appview are adopted verbatim: they were
       // authored together — a deep link, a scoped-entry link, or a
@@ -590,11 +624,10 @@ export default function AppShell({
       // prevented at the transition origin (the scoped-entry links
       // emit a bare `?ctx=` and the section links drop record/appview),
       // not by guessing which arriving params are intentional.
-      setContextId(urlCtx);
-      rememberContext(installId, urlCtx);
+      adoptScope(urlCtx);
       setLinkNotice(null);
     } else {
-      setContextId(fallbackContext());
+      adoptScope(fallbackContext());
     }
     // One normalized write emits every strip at once. Marking the
     // pre-write URL handled (done above) plus this write's own
@@ -614,18 +647,8 @@ export default function AppShell({
       );
     }
   }, [loading, receiptReady, installation, activeIds, query, installId, writeQuery]);
-
-  // The default selection, without persisting an empty choice when
-  // this installation has no active contexts to choose from.
-  const fallbackContext = () =>
-    activeIds.length > 0 ? initialContext(installId, activeIds) : "";
-
-  // The context picker is removed (operator review): context follows
-  // the URL, not a selector.
-
-  // The App binding for chat sends: install plus the concrete context
-  // the shell owns (generic outlet) or the workspace screen owns
-  // (social, observed live via subscription). CAD-1193: receipts
+  // The App binding for chat sends: install plus the one verified
+  // shell scope (every app view, social included). CAD-1193: receipts
   // pending (loading, a failed load, or a departed installation still
   // held on this commit) mean the wanted context is "" — no
   // install/context pair is exposed, so AssistantOperations runs zero
@@ -635,10 +658,8 @@ export default function AppShell({
   // send early with a clear message; the server re-proves every
   // binding on send regardless.
   const verified = receiptReady === true && installation !== null && installation.install_id === installId;
-  const contextAdoptionReady = isSocialContent(installation)
-    ? socialContextInstall === installId
-    : adoptedContextKey === queryKey(query.get("ctx"), query.get("record"), query.get("appview"));
-  const wantedContext = receiptsPending || !contextAdoptionReady ? "" : isSocialContent(installation) ? socialContext || "" : contextId;
+  const contextAdoptionReady = adoptedContextKey === queryKey(query.get("ctx"), query.get("record"), query.get("appview"));
+  const wantedContext = receiptsPending || !contextAdoptionReady ? "" : contextId;
   const bindingUnavailableError = loadError ??
     (viewer.operator === false
       ? "Sign in as the operator to verify this app context before sending."
@@ -789,6 +810,35 @@ export default function AppShell({
     [screenNavigation, writeQuery],
   );
 
+  // Capability-free local-text workflows reuse the guarded start lifecycle.
+  // Host execution and priced capability calls keep their existing approval UI.
+  // `scope.contextId` is exactly the context the run binds to; "" is the
+  // install scope itself.
+  const launchableWorkflows = verified && contextAdoptionReady && !isSocialContent(installation)
+    ? (installation?.workflows ?? []).filter((flow) =>
+      (flow.execution ?? "agent") !== "host" && (flow.capability_slots ?? []).length === 0)
+    : [];
+  const canLaunch = viewer.operator === true && !viewer.readOnly;
+  const launchFlow = launcherRun !== null
+    ? launchableWorkflows.find((flow) => flow.name === launcherRun.name) ?? null
+    : null;
+  const launcherOwnership = useRef<{ intent: typeof launcherRun; current: boolean }>({ intent: null, current: false });
+  const launchContext = launcherRun === null ? undefined : contexts.find((c) => c.id === launcherRun.contextId);
+  const launcherIsCurrent = canLaunch && launchFlow !== null && launcherRun !== null &&
+    installation !== null && installation.install_id === installId && installation.digest === launcherRun.installDigest &&
+    contextId === launcherRun.contextId &&
+    (launcherRun.contextRevision === null
+      ? launcherRun.contextId === ""
+      : launchContext?.state === "active" && launchContext.revision === launcherRun.contextRevision && launchContext.digest === launcherRun.contextDigest);
+  useLayoutEffect(() => {
+    launcherOwnership.current.intent = launcherRun;
+    launcherOwnership.current.current = launcherIsCurrent;
+    if (launcherRun !== null && !launcherIsCurrent) {
+      setLauncherRun((open) => open === launcherRun ? null : open);
+    }
+    return () => { launcherOwnership.current.current = false; };
+  }, [launcherRun, launcherIsCurrent]);
+
   return (
     <div className="app-shell" data-app-shell-outlet={installId}>
       <div className="app-shell-crumb">
@@ -798,32 +848,39 @@ export default function AppShell({
         <span className="truncate text-ink-100 text-cardtitle" aria-current="page">
           {loading ? t("Loading…") : title}
         </span>
+
         <span className="flex-1" />
-        {screenOutlet && activeIds.length > 1 && (
+        {screenOutlet && (activeIds.length > 1 || (contextId !== "" && !activeIds.includes(contextId))) && (
           // A private screen offers no in-outlet picker (the screen is the
           // outlet's first child). With 2+ active contexts the choice lives
-          // here in the header row; 0 or 1 never shows a control.
+          // here; it also appears while a remembered scope is stale — the
+          // operator recovers by picking the sole live context, never by
+          // editing storage. Social's explicit "no context" survives.
           <select
             className="app-shell-context-pick"
             aria-label={t("Context")}
             data-social-context
-            value={isSocial ? (socialContext !== null && activeIds.includes(socialContext) ? socialContext : "") : contextId}
+            value={contextId}
             onChange={(e) => {
               const next = e.target.value;
-              if (next === "") return;
-              if (isSocial) {
-                rememberContext(installId, next);
-                return;
-              }
-              if (!activeIds.includes(next)) return;
-              setContextId(next);
+              if (next === contextId) return;
+              if (next !== "" && !activeIds.includes(next)) return;
+              // One mechanism for both cases: persist + emit; the
+              // subscription applies the selection and keeps the URL in
+              // step, so a scoped conversation/record never survives a
+              // deliberate scope pick.
               rememberContext(installId, next);
-              writeQuery({ ctx: next, appview: null, record: null });
             }}
           >
-            <option value="" disabled>
-              {t("Choose a context")}
-            </option>
+            {contextId !== "" && !activeIds.includes(contextId) && (
+              <option value={contextId} disabled>{t("Unavailable context")}</option>
+            )}
+            {isSocial && <option value="">{t("No context")}</option>}
+            {!isSocial && (
+              <option value="" disabled>
+                {t("Choose a context")}
+              </option>
+            )}
             {contexts
               .filter((c) => c.state === "active")
               .map((c) => (
@@ -833,6 +890,26 @@ export default function AppShell({
               ))}
           </select>
         )}
+        {launchableWorkflows.map((flow) => (
+          <Button
+            key={flow.name}
+            size="sm"
+            disabled={!canLaunch}
+            onClick={() => {
+              const scopeContext = contexts.find((c) => c.id === scope.contextId) ?? null;
+              setLauncherRun({
+                name: flow.name,
+                contextId: scope.contextId,
+                installDigest: installation?.digest ?? "",
+                contextRevision: scopeContext?.revision ?? null,
+                contextDigest: scopeContext?.digest ?? null,
+              });
+            }}
+          >
+            {flow.label?.trim() || `New ${flow.name}`}
+          </Button>
+        ))}
+
         {isDev && installation !== null && (
           <a
             href={contractPreviewHref(href, previewKey === null ? "crm" : null)}
@@ -1049,7 +1126,7 @@ export default function AppShell({
                   exampleKey={previewKey}
                   installationKind={installation.name}
                 />
-              ) : isSocial && children ? (
+              ) : isSocial && children && contextAdoptionReady ? (
                 // Social keeps its legacy native workspace (and its
                 // `?screen=native` back door). Every other app mounts the
                 // screen its own package ships, through
@@ -1060,7 +1137,7 @@ export default function AppShell({
                 // the social-only workspace, which then rendered its
                 // "no supported board workspace" guide instead of the
                 // screen the package declared.
-                children(attachMediaReference)
+                children(attachMediaReference, scope.contextId)
               ) : (
                 <InstalledScreenOutlet installation={installation} contexts={contexts} contextId={scope.contextId}
                   admitted={receiptReady && contextAdoptionReady && (viewer.operator === true && !viewer.readOnly || viewer.screenReader === true)}
@@ -1074,6 +1151,18 @@ export default function AppShell({
           )}
         </section>
       </div>
+      {receiptReady && installation && !needsSetup && launcherIsCurrent && launchFlow !== null && launcherRun !== null && (
+        <RunLauncher
+          key={`${installId}:${launcherRun.name}:${launcherRun.contextId}:${launcherRun.installDigest}:${launcherRun.contextRevision}`}
+          installation={installation}
+          workflow={launchFlow}
+          contextId={launcherRun.contextId}
+          context={contexts.find((c) => c.id === launcherRun.contextId) ?? null}
+          viewer={viewer}
+          stillCurrent={() => launcherOwnership.current.intent === launcherRun && launcherOwnership.current.current}
+          onClose={() => setLauncherRun((open) => open === launcherRun ? null : open)}
+        />
+      )}
     </div>
   );
 }

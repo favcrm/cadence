@@ -1360,6 +1360,14 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
             · {convLabel}
           </span>
         )}
+        {active.state === "ready" && active.selected !== null && active.selected.isGeneral && (
+          // CAD-1560: General is the one conversation shared across the
+          // whole installation — say so next to the scope. Bound
+          // subject/context conversations are never labelled shared.
+          <span className="truncate text-ink-500" data-chat-shared>
+            · {t("Shared across this app")}
+          </span>
+        )}
         {active.state === "ready" &&
           active.selected !== null &&
           !active.selected.isGeneral &&

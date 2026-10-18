@@ -64,6 +64,47 @@ release authority.
 
 ## Operator flow
 
+### Start from the board
+
+An installed app can expose a host-owned **New …** workflow action, such as
+Meeting minutes' consolidation flow. This launcher uses verified workflow
+metadata and supports capability-free local-text workflows. Host execution
+and priced capability calls keep their existing approval surfaces.
+
+Open the action in the intended app scope, enter the declared text inputs,
+and choose **Prepare**. The app must have a configured default team; if it
+is missing, the form offers the existing team settings first. The displayed
+owner PM and team-covered roles are frozen explicitly into the draft, not
+replaced by a default team saved in another tab. Remaining roles use eligible
+registered workers in the same owner group, with distinct assignments where
+the workflow requires them. No model selection, worker enrollment or provider
+access is granted.
+
+Review the server's frozen inputs, assignments and exact snapshot, then
+confirm **Approve and start**. The existing operator-only approval pins its
+snapshot digest, and dispatch rechecks the native installation/context proofs.
+A changed bundle or context receipt cannot silently replace the form's
+confirmed proof. Moving scope closes the dialog and stops further approval
+or dispatch; a request already in flight remains bound to its original scope.
+
+Text is not silently trimmed or textarea-truncated: the server refuses inputs
+outside its limits while the form retains the entered text. Unseen/uncertain
+responses retain their request ID. Retrying first inspects the stored run
+state; only explicitly dismissing a displayed result retires that replay ID.
+
+Workflow inputs, including a transcript, currently require a single visible
+line. Newlines, control characters and leading/trailing whitespace refuse to
+protect the approved plan structure. The form preserves rejected text; it
+does not flatten it. Multiline source needs a separately reviewed input path,
+not removal of that guard.
+
+The app's read-only screen displays the resulting run and reviewed artifact
+when its declared projection supports them. Neither the screen nor ordinary
+assistant chat starts a run. This flow adds no recording, speech-to-text,
+external publication or automatic project-task creation.
+
+### Start from the CLI
+
 Use a trusted source checkout and an owned test daemon for development.
 The catalog installation command returns a stable installation ID:
 

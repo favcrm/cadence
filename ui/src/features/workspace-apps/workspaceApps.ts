@@ -32,7 +32,7 @@ export interface Installation {
    * no separate approve round. `"agent"` (the default, and what an older
    * daemon that omits the field means) keeps the worker path.
    */
-  workflows?: { name: string; source_digest?: string; label?: string | null; capability_slots?: string[]; distinct?: string[]; execution?: "agent" | "host"; inputs: { name: string; default?: string | null; context_default?: boolean }[] }[];
+  workflows?: { name: string; source_digest?: string; label?: string | null; capability_slots?: string[]; distinct?: string[]; execution?: "agent" | "host"; inputs: { name: string; ask?: string | null; optional?: boolean; kind?: string | null; example?: string | null; default?: string | null; context_default?: boolean }[] }[];
 }
 /** One declared `needs.capabilities` slot: the result the app needs. Reviewed providers own the matching tools. */
 export interface SlotDeclaration {
@@ -315,6 +315,7 @@ export const workspaceApps = {
   createBinding: async (id: string, body: BindingCreate) => (await request<{ binding: AppBinding }>(`${installation(id)}/bindings`, undefined, body)).binding,
   updateBinding: async (id: string, bindingId: string, body: { expected_revision: number; connection_id: string }) => (await request<{ binding: AppBinding }>(`${installation(id)}/bindings/${part(bindingId)}/update`, undefined, body)).binding,
   createRun: (body: CreateRun) => request<WorkspaceRun>("/api/app-runs", undefined, body),
+  getRun: (id: string, signal?: AbortSignal) => request<WorkspaceRun>(run(id), signal),
   startRun: (body: StartRun) => request<WorkspaceRun>("/api/app-runs/start", undefined, body),
   team: async (id: string, signal?: AbortSignal) => (await request<{ team: InstallTeam | null }>(`${installation(id)}/team`, signal)).team,
   setTeam: async (id: string, body: { owner_pm: string; roles: Record<string, string>; expected_revision: number }) => (await request<{ team: InstallTeam }>(`${installation(id)}/team`, undefined, body)).team,
