@@ -134,8 +134,10 @@ The old `client-update` command is removed with no alias.
 
 ## Development: `cadence dev`
 
-`cadence dev` (old name: `cadence sandbox`) is a disposable second Cadence
-with its own state dir, tracker and board port (3110-3199).
+`cadence dev` starts a disposable local Cadence with its own state dir,
+tracker and board port (3110-3199). `cadence sandbox` remains a supported
+command alias. This manages a development instance, not containers or VMs;
+per-agent filesystem confinement and provider sandboxes remain separate.
 
 ```
 cadence dev up [--name <n>] [--build <path>]   # create/start; writes the dev marker into the store
@@ -144,9 +146,19 @@ cadence dev reload [--build <path>]            # restart from a local binary
 cadence dev status | down | env | ls | reset <name>
 ```
 
+Dev commands stay local even when the saved org selects hosted production.
+They do not change that selection or access the hosted org's credentials,
+transport or container wake path. An explicitly remote `--org` or
+`CADENCE_ORG` refuses; explicit local state/tracker bindings and managed
+callers' identity restrictions remain in force.
+
 `dev reload` defaults to the newest of the repo's `target/release/cadence` and
 `target/debug/cadence`. It claims no rollout lease, checks no attestation and
 takes no backup.
+
+Daemon and board startup must return valid JSON with a nonempty string
+`state`; malformed or missing startup state is an error, not null success.
+Initialization and stop commands are checked by exit status only.
 
 ### What makes a store a dev store
 
@@ -166,6 +178,20 @@ Production's rules (lease, backup receipt, attestation) are unchanged.
 A sandbox created before the dev marker existed (before #831) loses the
 lease exemption until `cadence dev up` re-marks it: run `cadence dev up` once
 per old sandbox after the update that ships this change.
+
+### Hosted production is not a dev instance
+
+AgenticOS owns an image-managed runtime's binary lifecycle; update its image
+rather than running the native updater inside it. Local development uses
+separate state, tracker and non-production credentials. Do not remove agent
+confinement or hosted write fencing because an outer container exists.
+
+Daemon startup and the updater share a reader in the lifecycle module.
+A missing `pm.yaml` or absent `hosted:` table leaves hosted lifecycle off;
+other read failures, malformed YAML and invalid `hosted:` tables refuse.
+A present null value or bare `hosted:` key is invalid; use
+`hosted: { lease: off }` to explicitly disable lifecycle.
+Reading this configuration acquires or renews no lease.
 
 ## Recovery / internals: `rollout` and `upgrade`
 

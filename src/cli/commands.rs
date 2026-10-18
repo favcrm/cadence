@@ -1565,10 +1565,13 @@ pub(crate) enum Commands {
     /// `CADENCE_PROFILE=sandbox:<name>` — which skips the skill sync
     /// into `$HOME`, refuses `ui tailscale`, and keeps the provider WAL
     /// watcher observe-only. Refuses production's dirs and port 3010.
+    /// Always local: a saved remote default org is ignored, and an
+    /// explicitly remote `--org`/`CADENCE_ORG` refuses before any remote
+    /// transport. `sandbox` remains a supported command alias.
     #[command(name = "dev", visible_alias = "sandbox")]
-    Sandbox {
+    Dev {
         #[command(subcommand)]
-        action: cadence_agent::sandbox::SandboxAction,
+        action: cadence_agent::sandbox::DevAction,
     },
     /// Run a command under a filesystem sandbox (CAD-439): `--read`
     /// paths are readable and executable, `--write` paths fully usable,

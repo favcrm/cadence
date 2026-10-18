@@ -97,29 +97,11 @@ fn refuse_managed_runtime() -> Result<()> {
         }
         _ => cadence_agent::issue::default_dir()?,
     };
-    let path = pm_dir.join("pm.yaml");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => {
-            return Err(Error::rejected(format!(
-                "cadence update cannot read the lifecycle config {} ({e}) — \
-                 refusing rather than guessing whether this runtime is \
-                 image-managed",
-                path.display()
-            )))
-        }
-    };
-    // The `hosted:` table deserializes into the daemon's own
-    // `lease::Hosted` — a present table that is not valid YAML or
-    // carries a wrong-typed key refuses rather than reading as off.
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&text)
-        .map_err(|e| Error::rejected(format!("pm.yaml is not valid YAML: {e}")))?;
-    let Some(hosted) = yaml.get("hosted") else {
+    // Same loader as daemon startup: missing file/table is off; every
+    // other read or parse failure refuses. No lease is taken.
+    let Some(hosted) = cadence_agent::lease::read_hosted(&pm_dir)? else {
         return Ok(());
     };
-    let hosted: cadence_agent::lease::Hosted = serde_yaml::from_value(hosted.clone())
-        .map_err(|e| Error::rejected(format!("pm.yaml [hosted]: {e}")))?;
     if matches!(
         hosted.lease.as_deref().map(str::trim),
         Some(lease) if !lease.is_empty() && lease != "none" && lease != "off"

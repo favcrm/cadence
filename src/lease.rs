@@ -407,6 +407,52 @@ pub struct Hosted {
     pub flush_timeout_secs: Option<u64>,
 }
 
+/// Read the tracker's `hosted:` table. Parse only: no acquire, renew,
+/// or authority check. `Ok(None)` is a missing `pm.yaml` or a missing
+/// table (hosted lifecycle off). Any other I/O failure, invalid YAML,
+/// or a present table that is not a mapping or cannot deserialize as [`Hosted`]
+/// (`deny_unknown_fields`, wrong types) is an error naming the path
+/// and, when one key is the culprit, that key. `none`/`off`/unset
+/// `lease` stays a successful [`Hosted`] value; [`acquire`] enforces
+/// the lease spec.
+pub fn read_hosted(pm_dir: &Path) -> Result<Option<Hosted>> {
+    let path = pm_dir.join("pm.yaml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(Error::rejected(format!(
+                "cannot read lifecycle config {} ({e}) — refusing rather than \
+                 guessing whether hosted lifecycle is configured",
+                path.display()
+            )));
+        }
+    };
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&text)
+        .map_err(|e| Error::rejected(format!("{} is not valid YAML: {e}", path.display())))?;
+    let Some(hosted) = yaml.get("hosted") else {
+        return Ok(None);
+    };
+    let mapping = hosted
+        .as_mapping()
+        .ok_or_else(|| Error::rejected(format!("{} [hosted] must be a mapping", path.display())))?;
+    serde_yaml::from_value(hosted.clone())
+        .map(Some)
+        .map_err(|e| {
+            let culprit = mapping.iter().find_map(|(k, v)| {
+                let mut one = serde_yaml::Mapping::new();
+                one.insert(k.clone(), v.clone());
+                serde_yaml::from_value::<Hosted>(serde_yaml::Value::Mapping(one))
+                    .is_err()
+                    .then(|| k.as_str().unwrap_or("?").to_string())
+            });
+            match culprit {
+                Some(key) => Error::rejected(format!("{} [hosted] {key}: {e}", path.display())),
+                None => Error::rejected(format!("{} [hosted]: {e}", path.display())),
+            }
+        })
+}
+
 /// Which provider a `hosted.lease` spec names.
 enum Spec {
     Off,

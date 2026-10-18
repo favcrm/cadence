@@ -368,12 +368,16 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     let tracker = std::env::var_os("CADENCE_PM_DIR")
         .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
         .transpose()?;
-    // CAD-1355: `update` is local install maintenance, so it resolves
-    // through the updater-only selector — a saved remote default never
-    // routes it, an explicit remote `--org`/`CADENCE_ORG` refuses with
-    // local-only guidance before any transport, credentials or wake.
+    // CAD-1355 / CAD-1545: `update` and `dev` are local maintenance, so
+    // they resolve through the shared local-maintenance selector — a saved
+    // remote default never routes them, and an explicit remote
+    // `--org`/`CADENCE_ORG` refuses with local-only guidance before any
+    // transport, credentials or wake. `dev` also refuses a remote
+    // `CADENCE_ORG` when a local pin is set.
     let resolved = if matches!(cli.command, Commands::Update { .. }) {
         org::resolve_update(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
+    } else if matches!(cli.command, Commands::Dev { .. }) {
+        org::resolve_dev(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
     } else {
         org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
     };
@@ -386,9 +390,9 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             return remote::run(target, cli.command, cli.wake_timeout, cli.state_dir.clone());
         }
     };
-    // CAD-310: a sandbox's state dir decides its profile and tracker,
-    // not the caller's env. `sandbox` verbs resolve their own roots.
-    if !matches!(cli.command, Commands::Sandbox { .. }) {
+    // CAD-310: a dev Cadence's state dir decides its profile and tracker,
+    // not the caller's env. `dev` verbs (alias `sandbox`) resolve their own roots.
+    if !matches!(cli.command, Commands::Dev { .. }) {
         cadence_agent::sandbox::adopt(&state_dir)?;
     }
     // CAD-615: the master retrying an approved command. The daemon
@@ -960,7 +964,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             state_dir, action, check, rollback, drain, now, keep, backup_dir, json, progress, to,
             target,
         ),
-        Commands::Sandbox { action } => sandbox::run(state_dir, action),
+        Commands::Dev { action } => sandbox::run(state_dir, action),
         Commands::Confine {
             read,
             write,
