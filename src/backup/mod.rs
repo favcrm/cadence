@@ -1139,7 +1139,7 @@ pub fn export(state_dir: &Path, out: &Path) -> Result<Value> {
 fn export_into(live: &Path, out: &Path, allow: &Allowlist) -> Result<Value> {
     let partial = out.join(format!(".{BUNDLE_DB}.partial"));
     snapshot(live, &partial)?;
-    let scrub = scrub(&partial)?;
+    let scrub = scrub(&partial, false)?;
     let scrubbed = scrub.columns.clone();
     let scan = scan_db(&partial, allow)?;
     let (integrity, schema) = inspect(&partial)?;
@@ -1201,7 +1201,7 @@ fn export_into(live: &Path, out: &Path, allow: &Allowlist) -> Result<Value> {
 
 /// Null the token-bearing columns, then rebuild the file so freed pages
 /// (deleted rows, old values) are not carried along.
-fn scrub(db: &Path) -> Result<Scrub> {
+fn scrub(db: &Path, redact_history_secrets: bool) -> Result<Scrub> {
     // CAD-1011: a durable-sealed or latch-carrying source must not be
     // copy-transformed into a production-usable db — refuse at the source.
     crate::store::preflight_writer_guard(db)?;
@@ -1213,6 +1213,11 @@ fn scrub(db: &Path) -> Result<Scrub> {
     let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
     crate::store::require_legacy_writer_tx(&tx)?;
     let redaction = redact_turn_tokens(&tx, &shape)?;
+    let redacted_message_bodies = if redact_history_secrets {
+        Some(redact_message_bodies(&tx)?)
+    } else {
+        None
+    };
     let mut scrubbed = Vec::new();
     for (table, column) in SCRUB_COLUMNS {
         if has_column(&tx, table, column)? {
@@ -1230,6 +1235,7 @@ fn scrub(db: &Path) -> Result<Scrub> {
         columns: scrubbed,
         redacted_values: redaction.values,
         redacted_cells: redaction.cells,
+        redacted_message_bodies,
     })
 }
 
@@ -1237,6 +1243,34 @@ struct Scrub {
     columns: Vec<String>,
     redacted_values: usize,
     redacted_cells: u64,
+    redacted_message_bodies: Option<u64>,
+}
+
+/// Sanitize free-form history only on the caller's private export copy.
+/// Other cells still face the final scan. The enclosing scrub VACUUM removes
+/// freed pages after these updates, so old credential bytes cannot survive.
+fn redact_message_bodies(tx: &rusqlite::Transaction<'_>) -> Result<u64> {
+    let mut updates = Vec::new();
+    {
+        let mut stmt = tx.prepare("SELECT rowid, body FROM messages WHERE typeof(body)='text'")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let value = row.get_ref(1)?;
+            let Ok(body) = value.as_str() else {
+                continue;
+            };
+            let redacted = secret::redact_text(body)?;
+            if redacted != body {
+                updates.push((row.get::<_, i64>(0)?, redacted));
+            }
+        }
+    }
+    let mut changed = 0;
+    let mut update = tx.prepare("UPDATE messages SET body=?1 WHERE rowid=?2")?;
+    for (rowid, body) in updates {
+        changed += update.execute(rusqlite::params![body, rowid])? as u64;
+    }
+    Ok(changed)
 }
 
 struct Redaction {

@@ -185,6 +185,11 @@ pub(crate) enum Commands {
         /// package and recheck the source before publication.
         #[arg(long, requires = "portable")]
         snapshot_working_tree: bool,
+        /// Redact credential-shaped spans (including warnings) in message
+        /// bodies on the private export copy only. Source history is unchanged;
+        /// all other fields and the sanitized copy still face normal scanning.
+        #[arg(long, requires = "portable")]
+        redact_history_secrets: bool,
         /// Repeatable, with `--portable`: an app whose data to include. No
         /// app schema is supported yet, so any selection is refused before
         /// the store or tracker is read or the output is created.
