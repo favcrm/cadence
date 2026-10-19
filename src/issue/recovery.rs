@@ -151,8 +151,8 @@ pub fn review(pm: &Pm, blocked_operation: Option<&str>) -> Result<Value> {
         "foreign_count": foreign.len(),
         "named": report.named,
         "hazards": report.hazards,
-        "marker": marker_facts(pm),
-        "snapshot": snapshot_facts(pm),
+        "marker": marker_facts(pm)?,
+        "snapshot": snapshot_facts(pm)?,
         "paths": path_facts(pm, &leftovers)?,
     });
     if let Some(op) = blocked_operation {
@@ -175,6 +175,7 @@ pub fn decide(pm: &Pm, review: &Value, choice: Choice, paths: &[String]) -> Resu
     let leftovers = report.paths;
     let foreign = report.foreign_paths;
     let selected = select_paths(pm, &leftovers, &foreign, paths)?;
+    require_staged_content(pm, choice, &selected)?;
     let current = state_binding(pm, &leftovers, &foreign)?;
     if current != bound {
         return Err(Error::conflict_coded(
@@ -330,6 +331,7 @@ fn execute_inner(
     let confirmed = require_str(decision, "confirmation")?;
     let preview_digest = require_str(decision, "preview_digest")?;
     let selected = select_paths(pm, &leftovers, &foreign, paths)?;
+    require_staged_content(pm, choice, &selected)?;
     if selected != require_str_list(decision, "paths")? {
         return Err(Error::rejected(
             "the confirmed path set does not match the paths being recovered — a decision \
@@ -422,6 +424,7 @@ fn execute_inner(
         "state": bound,
         "choice": choice.as_str(),
         "paths": selected,
+        "outcome": "applied",
         "resolved": resolved,
         "recovery_success": resolved,
         "committed": outcome.committed,
@@ -436,22 +439,81 @@ fn execute_inner(
 pub fn status(pm: &Pm, attempt: &Value) -> Result<Value> {
     let after = pm.interruption_report()?;
     let remaining = after.paths.clone();
+    let hazards = after.hazards.clone();
+    // EVERY blocker counts: the path-local leftovers AND the
+    // Git-global ones. The tracker is not settled while either stands.
+    let blockers = !remaining.is_empty() || !hazards.is_empty();
+    // What the attempt did, historically. A keep or a discard that
+    // landed stays a fact even if a hazard appeared afterwards; what
+    // the CURRENT state allows is a separate question.
+    let outcome = attempt
+        .get("outcome")
+        .and_then(Value::as_str)
+        .unwrap_or("applied");
+    let settled = outcome == "applied"
+        && attempt
+            .get("recovery_success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     let mut out = attempt.clone();
     out["remaining"] = json!(remaining);
+    out["hazards"] = json!(hazards);
     out["foreign_count"] = json!(after.foreign.len());
-    out["hazards"] = json!(after.hazards);
-    out["tracker_resolved"] = json!(remaining.is_empty());
-    let resolved = out["resolved"].as_bool().unwrap_or(false);
-    out["next_action"] = json!(if !resolved {
-        "the interrupted transaction is still unresolved — review the remaining paths and \
-         decide again, or leave them as they are"
-    } else if remaining.is_empty() {
+    out["tracker_resolved"] = json!(!blockers);
+    out["selected_settled"] = json!(settled);
+    out["next_action"] = json!(if !settled {
+        "the recovery did not settle the selected paths — inspect the attempt and the current \
+         state before doing anything else; a blind retry is not safe"
+    } else if blockers {
+        "the selected paths were settled, but the tracker still has blockers — resolve them \
+         and review again; the blocked operation must not be resumed while any blocker remains"
+    } else {
         "the interrupted transaction is settled; the blocked operation can be revalidated and \
          resumed deliberately"
-    } else {
-        "the selected paths are settled, but other leftovers remain unresolved"
     });
     Ok(out)
+}
+
+/// What the index holds for a path: a staged blob, a staged deletion,
+/// or nothing staged at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Staged {
+    Blob(String),
+    /// The path is in HEAD and not in the index: the crash staged the
+    /// removal.
+    Deleted,
+    /// Nothing staged: the path exists only in the working tree.
+    None,
+}
+
+fn staged_state(pm: &Pm, path: &str) -> Staged {
+    if let Some(blob) = staged_blob(pm, path).ok().flatten() {
+        return Staged::Blob(blob);
+    }
+    if git(&pm.dir, &["cat-file", "-e", &format!("HEAD:{path}")]).is_ok() {
+        return Staged::Deleted;
+    }
+    Staged::None
+}
+
+/// A keep commits the STAGED version. A path with nothing staged has
+/// no staged version to keep: keeping it would silently stage the
+/// working tree's content instead, which is not what was reviewed.
+fn require_staged_content(pm: &Pm, choice: Choice, selected: &[String]) -> Result<()> {
+    if choice != Choice::Keep {
+        return Ok(());
+    }
+    for path in selected {
+        if staged_state(pm, path) == Staged::None {
+            return Err(Error::rejected(format!(
+                "there is no inspected staged content for {path} — it exists only in the \
+                 working tree, and a keep commits the staged version, never the working \
+                 tree's. Choose to discard the path, or leave the transaction unresolved. A \
+                 retry unchanged will not help."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// What a decision would do, shown before it does anything. Every
@@ -463,7 +525,7 @@ fn preview_for(pm: &Pm, choice: Choice, selected: &[String]) -> Result<Value> {
     for path in selected {
         let staged = staged_blob(pm, path)?;
         let worktree = worktree_facts(pm, path)?;
-        let head = head_facts(pm, path);
+        let head = head_facts(pm, path)?;
         let effect = match choice {
             Choice::Keep => format!(
                 "commit the staged content of {path} (index blob {}), leaving the working \
@@ -628,11 +690,11 @@ fn state_binding(pm: &Pm, leftovers: &[String], foreign: &[String]) -> Result<St
             .as_bytes(),
     );
     h.update(b"\0index\0");
-    h.update(file_digest(&index_path(pm)?).as_bytes());
+    h.update(file_digest(&index_path(pm)?)?.as_bytes());
     h.update(b"\0marker\0");
-    h.update(marker_facts(pm).to_string().as_bytes());
+    h.update(marker_facts(pm)?.to_string().as_bytes());
     h.update(b"\0snapshot\0");
-    h.update(snapshot_facts(pm).to_string().as_bytes());
+    h.update(snapshot_facts(pm)?.to_string().as_bytes());
     h.update(b"\0leftovers\0");
     for p in leftovers {
         h.update(p.as_bytes());
@@ -664,45 +726,52 @@ fn index_path(pm: &Pm) -> Result<PathBuf> {
 }
 
 /// The crash marker, as facts: it is evidence, never authority.
-fn marker_facts(pm: &Pm) -> Value {
+fn marker_facts(pm: &Pm) -> Result<Value> {
     let path = pm.dir.join(".write.lock");
     match std::fs::symlink_metadata(&path) {
         Ok(meta) => {
             use std::os::unix::fs::MetadataExt;
-            json!({
+            Ok(json!({
                 "present": true,
-                "bytes": file_digest(&path),
+                "bytes": file_digest(&path)?,
                 "size": meta.len(),
                 "mode": meta.mode(),
                 "dev": meta.dev(),
                 "ino": meta.ino(),
                 "content": std::fs::read_to_string(&path).unwrap_or_default(),
-            })
+            }))
         }
-        Err(_) => json!({ "present": false }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({ "present": false })),
+        Err(e) => Err(Error::internal(format!(
+            "{} could not be examined ({e}); the interrupted state cannot be inspected, so no \
+             recovery can be authorized.",
+            path.display()
+        ))),
     }
 }
 
 /// The dirty snapshot: the attribution baseline. It is never rewritten.
-fn snapshot_facts(pm: &Pm) -> Value {
-    let path = match git_dir_of(pm) {
-        Ok(d) => d.join("cadence-write.dirty.v2"),
-        Err(_) => return json!({ "present": false }),
-    };
+fn snapshot_facts(pm: &Pm) -> Result<Value> {
+    let path = git_dir_of(pm)?.join("cadence-write.dirty.v2");
     match std::fs::symlink_metadata(&path) {
         Ok(meta) => {
             use std::os::unix::fs::MetadataExt;
-            json!({
+            Ok(json!({
                 "present": true,
-                "bytes": file_digest(&path),
+                "bytes": file_digest(&path)?,
                 "size": meta.len(),
                 "mtime": meta.mtime(),
                 "mtime_nsec": meta.mtime_nsec(),
                 "dev": meta.dev(),
                 "ino": meta.ino(),
-            })
+            }))
         }
-        Err(_) => json!({ "present": false }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({ "present": false })),
+        Err(e) => Err(Error::internal(format!(
+            "{} could not be examined ({e}); the attribution baseline cannot be read, so no \
+             recovery can be authorized.",
+            path.display()
+        ))),
     }
 }
 
@@ -714,10 +783,10 @@ fn path_facts(pm: &Pm, paths: &[String]) -> Result<Value> {
         out.push(json!({
             "path": path,
             "staged_blob": staged_blob(pm, path)?,
-            "staged_content": staged_content(pm, path),
+            "staged_content": staged_content(pm, path)?,
             "worktree": worktree_facts(pm, path)?,
-            "staged_diff": git(&pm.dir, &["diff", "--cached", "--no-color", "--", path]).ok(),
-            "unstaged_diff": git(&pm.dir, &["diff", "--no-color", "--", path]).ok(),
+            "staged_diff": git(&pm.dir, &["diff", "--cached", "--no-color", "--", path])?,
+            "unstaged_diff": git(&pm.dir, &["diff", "--no-color", "--", path])?,
         }));
     }
     Ok(Value::Array(out))
@@ -751,7 +820,17 @@ fn worktree_facts(pm: &Pm, path: &str) -> Result<Value> {
                 "file"
             };
             let content = if kind == "file" {
-                std::fs::read(&abs).ok()
+                match std::fs::read(&abs) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        return Err(Error::internal(format!(
+                            "{path} could not be read ({e}); its content cannot be inspected, \
+                             so no recovery can be authorized. Restore readable evidence, then \
+                             review again."
+                        )))
+                    }
+                }
             } else {
                 None
             };
@@ -796,14 +875,12 @@ fn content_value(bytes: Option<&[u8]>) -> Value {
 /// The content the index holds for a path: what a keep would commit,
 /// in a form a reviewer can read. A binary blob is shown in hex, not
 /// summarized away.
-fn staged_content(pm: &Pm, path: &str) -> Value {
+fn staged_content(pm: &Pm, path: &str) -> Result<Value> {
     let Some(blob) = staged_blob(pm, path).ok().flatten() else {
-        return Value::Null;
+        return Ok(Value::Null);
     };
-    match git_raw(pm, &["cat-file", "blob", &blob]) {
-        Ok(bytes) => content_value(Some(&bytes)),
-        Err(_) => Value::Null,
-    }
+    let bytes = git_raw(pm, &["cat-file", "blob", &blob])?;
+    Ok(content_value(Some(&bytes)))
 }
 
 /// Git's raw output, without the trimming the text helper does: a
@@ -834,34 +911,57 @@ fn git_raw(pm: &Pm, args: &[&str]) -> Result<Vec<u8>> {
 }
 
 /// The committed state of a path: what a discard would restore it to.
-fn head_facts(pm: &Pm, path: &str) -> Value {
-    if git(&pm.dir, &["cat-file", "-e", &format!("HEAD:{path}")]).is_err() {
-        return json!({
+fn head_facts(pm: &Pm, path: &str) -> Result<Value> {
+    // Whether the path is in HEAD is answered by the TREE, not by
+    // `cat-file -e`: that fails both for a path that is not there and
+    // for an object it cannot read, and the second must not look like
+    // the first.
+    let listing = match git(&pm.dir, &["ls-tree", "HEAD", "--", path]) {
+        Ok(l) => l,
+        Err(e) => {
+            if git(&pm.dir, &["rev-parse", "--verify", "HEAD"]).is_err() {
+                String::new()
+            } else {
+                return Err(Error::internal(format!(
+                    "the committed state of {path} could not be read ({e}); the interrupted \
+                     state cannot be inspected, so no recovery can be authorized."
+                )));
+            }
+        }
+    };
+    if listing.trim().is_empty() {
+        return Ok(json!({
             "present": false,
             "effect": "the path is not in HEAD: the staged addition and the working-tree file \
                        are both removed, and the path is absent afterwards",
-        });
+        }));
     }
-    let blob = git(&pm.dir, &["rev-parse", &format!("HEAD:{path}")]).unwrap_or_default();
-    let mode = git(&pm.dir, &["ls-tree", "HEAD", "--", path])
-        .ok()
-        .and_then(|l| l.split_whitespace().next().map(str::to_string))
+    let blob = git(&pm.dir, &["rev-parse", &format!("HEAD:{path}")])?;
+    let mode = listing
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
         .unwrap_or_default();
     let content = git_raw(pm, &["cat-file", "blob", &format!("HEAD:{path}")]).ok();
-    json!({
+    Ok(json!({
         "present": true,
         "blob": blob,
         "mode": mode,
         "content": content_value(content.as_deref()),
         "effect": "the index entry and the working-tree file are both replaced by this \
                    committed version",
-    })
+    }))
 }
 
-fn file_digest(path: &Path) -> String {
+fn file_digest(path: &Path) -> Result<String> {
     match std::fs::read(path) {
-        Ok(bytes) => format!("{:x}", Sha256::digest(&bytes)),
-        Err(_) => "absent".to_string(),
+        Ok(bytes) => Ok(format!("{:x}", Sha256::digest(&bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("absent".to_string()),
+        Err(e) => Err(Error::internal(format!(
+            "{} could not be read ({e}); the interrupted state cannot be inspected, so no \
+             recovery can be authorized. Restore readable evidence, then review again.",
+            path.display()
+        ))),
     }
 }
 
@@ -905,10 +1005,23 @@ fn commit_index_state(pm: &Pm, paths: &[String], message: &str) -> Result<String
             )?;
         }
     }
+    // The tree this commit would carry, before the hook runs.
+    let expected = run_git(pm, &env, &[Os::new("write-tree")], None)?;
     // The pre-commit hook, exactly as git would run it, against the
     // content this commit is about to carry.
     run_pre_commit_hook(pm, &git_dir, &tmp_index)?;
+    // A hook may change the index — a formatter that stages, a hook
+    // that adds a path. The commit must carry exactly what was
+    // reviewed: HEAD plus the confirmed staged entries, and nothing
+    // else. So the tree is compared, not trusted.
     let tree = run_git(pm, &env, &[Os::new("write-tree")], None)?;
+    if tree != expected {
+        return Err(Error::rejected(
+            "the tracker's pre-commit hook changed the content that was about to be committed. \
+             Nothing was committed. Review again so the confirmed content is what the hook \
+             sees; a retry unchanged will not help.",
+        ));
+    }
     let commit = run_git(
         pm,
         &[],
@@ -979,7 +1092,21 @@ fn discard_paths(pm: &Pm, paths: &[String]) -> Result<()> {
             )?;
             let abs = pm.dir.join(path);
             if abs.exists() || std::fs::symlink_metadata(&abs).is_ok() {
-                let _ = std::fs::remove_file(&abs);
+                // The worktree's copy has to be gone for the previewed
+                // result to be true. A removal that fails is a partial
+                // outcome, not a completed one.
+                if let Err(e) = std::fs::remove_file(&abs) {
+                    if std::fs::symlink_metadata(&abs).is_ok() {
+                        return Err(Error::internal(format!(
+                            "the discard of {path} removed the staged addition but its \
+                             working-tree file could not be removed ({e}). The change is \
+                             PARTLY applied: the index entry is gone and the file is still \
+                             there. Nothing was committed, the crash's marker and snapshot are \
+                             intact, and the file must be removed by hand before this path is \
+                             left alone."
+                        )));
+                    }
+                }
             }
         }
     }

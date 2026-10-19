@@ -1467,6 +1467,11 @@ impl Pm {
     /// writer takes, taken over an interrupted tracker for the one
     /// operation that settles it.
     ///
+    /// The admission does NOT wait: a live writer refuses the recovery
+    /// with `busy` (75) rather than being waited through. A writer
+    /// that releases without changing the bound state must not let the
+    /// recovery mutate with a confirmation made against the old state.
+    ///
     /// It differs from an ordinary write in three deliberate ways: it
     /// publishes no marker (the crash's own marker is the evidence
     /// being acted on), it rewrites no dirty snapshot (the snapshot is
@@ -1479,9 +1484,10 @@ impl Pm {
     /// that is not this build's crash to settle.
     #[track_caller]
     pub fn lock_for_recovery(&self) -> Result<PmLock> {
-        Ok(self
-            .acquire(Some(WAIT), None, true)?
-            .expect("a waiting acquire answers"))
+        match self.acquire(None, None, true)? {
+            Some(lock) => Ok(lock),
+            None => Err(self.busy_error(false)),
+        }
     }
 
     fn busy_error(&self, legacy: bool) -> Error {

@@ -321,6 +321,73 @@ fn a_keep_of_a_settled_leftover_settles_the_transaction() {
     assert_eq!(s["tracker_resolved"], json!(true), "{s}");
 }
 
+/// CAD-1601: a keep needs something STAGED. The untracked fixture
+/// leaves the file in the working tree with nothing staged, so keeping
+/// it would silently stage the working tree's content instead.
+#[test]
+fn a_keep_with_nothing_staged_is_refused() {
+    let (_tmp, pm) = tracker();
+    let (child, _) = spawn_writer(&pm, "hold_untracked", false);
+    sigkill(child);
+    let r = review(&pm, None).unwrap();
+    let paths = vec!["crashed/issue.md".to_string()];
+    let e = decide(&pm, &r, Choice::Keep, &paths)
+        .expect_err("a keep with nothing staged must be refused");
+    assert!(e.to_string().contains("no inspected staged content"), "{e}");
+    // A discard of the same path is allowed: it has no staged content
+    // to keep, and discarding it is a previewed effect.
+    decide(&pm, &r, Choice::Discard, &paths).expect("a discard is allowed");
+}
+
+/// CAD-1601: a live writer refuses the recovery. The recovery must not
+/// wait a writer out and then mutate with a confirmation made against
+/// the old state.
+#[test]
+fn a_live_writer_refuses_the_recovery() {
+    let (_tmp, pm) = tracker();
+    let (child, _) = spawn_writer(&pm, "hold_dirty", false);
+    sigkill(child);
+    let r = review(&pm, None).unwrap();
+    let paths = vec!["crashed/issue.md".to_string()];
+    let d = decide(&pm, &r, Choice::Discard, &paths).unwrap();
+    // A writer holds the tracker lock when the recovery arrives. It
+    // takes a SCOPED lock, because an unscoped one is refused beside
+    // the interruption — which is the guard working, not the fixture.
+    let held = pm
+        .lock_for_paths(std::slice::from_ref(&pm.dir.join("unrelated.txt")))
+        .expect("a disjoint writer is admitted");
+    let e = execute(&pm, &r, &d, Choice::Discard, &paths)
+        .expect_err("a live writer must refuse the recovery");
+    assert_eq!(e.kind(), "busy", "{e}");
+    drop(held);
+}
+
+/// CAD-1601: the status must not offer a resume while any blocker
+/// remains — not even when the selected paths were settled and a
+/// Git-global hazard appeared afterwards.
+#[test]
+fn a_status_with_a_hazard_does_not_offer_a_resume() {
+    let (_tmp, pm) = tracker();
+    let (child, _) = spawn_writer(&pm, "hold_dirty", false);
+    sigkill(child);
+    let r = review(&pm, None).unwrap();
+    let paths = vec!["crashed/issue.md".to_string()];
+    let d = decide(&pm, &r, Choice::Keep, &paths).unwrap();
+    let a = execute(&pm, &r, &d, Choice::Keep, &paths).unwrap();
+    assert_eq!(a["recovery_success"], json!(true), "{a}");
+    // A Git-global hazard appears after the recovery.
+    std::fs::write(pm.dir.join(".git").join("index.lock"), b"").unwrap();
+    let s = status(&pm, &a).unwrap();
+    assert_eq!(s["tracker_resolved"], json!(false), "{s}");
+    assert!(
+        s["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("must not be resumed"),
+        "{s}"
+    );
+}
+
 /// CAD-1601: a tracker with no interrupted write has nothing to
 /// recover, and says so rather than inventing a change set.
 #[test]
