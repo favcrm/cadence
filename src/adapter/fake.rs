@@ -13,6 +13,9 @@
 //!   when the transport is closed (mirrors a provider that ignores
 //!   cancellation but dies with its process).
 //! - `DISCONNECT` — sever the transport; the turn returns `OutcomeUnknown`.
+//! - `CAD225_QUOTA_ERROR` — the provider call itself errors actor-fatally
+//!   (quota/spend denial): `Error::Provider`, fencing the lane with the
+//!   turn's `failed` evidence — the denied counterpart of `DISCONNECT`.
 //! - `FAIL:<text>` — the provider reports a failed turn.
 //! - `BAD_STATUS` — return an unclassifiable completion status.
 //! - `REPORT_SHA:<hex>` anywhere in the prompt — reply echoes the
@@ -242,6 +245,15 @@ impl ProviderAdapter for FakeAdapter {
                 stop_reason: None,
                 error: None,
             });
+        }
+        // CAD-225: an actor-fatal provider error — the provider reports
+        // its quota/spend cap exhausted after the turn was claimed. The
+        // actor's fatal arm fences the lane with `failed` evidence, the
+        // same shape a real quota-denial turn leaves.
+        if prompt == "CAD225_QUOTA_ERROR" {
+            return Err(Error::provider(
+                "provider quota exhausted — spend cap reached; outcome is denied, not unknown",
+            ));
         }
         if prompt == "BAD_STATUS" {
             return Ok(TurnResult {

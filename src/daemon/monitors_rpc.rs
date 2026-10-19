@@ -169,6 +169,10 @@ impl Shared {
         task_id: &str,
         automatic: bool,
     ) -> Result<Value> {
+        let _grant = self
+            .unattended_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         if automatic {
             self.plan_gate_task(task_id)?;
             // Hold the pending-request mutex across the store transaction.

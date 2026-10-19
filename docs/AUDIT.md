@@ -294,6 +294,17 @@ is the operator's alone. No reader counts it as an operator approval:
 delegated approval does not satisfy `enqueue-reviewed` yet — consistent
 with evidence only until CAD-814 slice 2.
 
+**Bounded workflow authority (CAD-225).** Operator-issued unattended workflow
+grants have separate native admission, enqueue-intent and enqueue observations.
+Audit output attributes that scoped authority to its grant, worker, independent
+reviewer, exact report and delivery policy. It does not mint a per-head operator
+approval or an externally verified attestation (`per_head_operator_approval`
+and `verified` remain false). Native scoped review evidence applies only to
+eligible nonhuman delivery classes; it cannot waive sensitive-path or operator
+approval requirements. An intent without a reconciled remote enqueue is not
+proof that a merge executed, and same-second evidence with unknown ordering
+remains unknown.
+
 Residual, stated plainly: the verdict notes are files the agents' uid
 can write. The author or the approver can write both notes, under any
 reviewer names, and the daemon cannot tell. The two-reviewer check

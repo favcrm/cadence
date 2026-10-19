@@ -258,6 +258,7 @@ impl Audience {
             "merge_decision"
             | "review_escalated"
             | "review_unstaffed"
+            | "unattended_held"
             | "auto_merge_on"
             | "delivery_unreadable"
             // CAD-449: a merged ticket the merge could not mark done.
@@ -593,11 +594,40 @@ fn delivery_items(state_dir: &Path, now: i64) -> Vec<Item> {
                     )
                     .about("issue", id)
                     .for_agent(&rec.worker)
+                    .owned_by(Some("operator"))
                     .since(Some(rec.since)),
                 );
             }
         }
         let row = match rec.state {
+            _ if rec.unattended_hold && !rec.state.terminal() => {
+                let mut held = item(
+                    17,
+                    "unattended_held",
+                    &format!(
+                        "{id}: {}",
+                        rec.note
+                            .as_deref()
+                            .unwrap_or("unattended work needs operator verification")
+                    ),
+                    age,
+                    &rec.project,
+                    pr,
+                    "cadence delivery ls",
+                )
+                .about("issue", id)
+                .for_agent(&rec.worker)
+                .owned_by(Some("operator"))
+                .since(Some(rec.since))
+                .with_display(
+                    Some("Unattended work needs your decision"),
+                    rec.note.as_deref(),
+                );
+                if let Some(turn) = rec.unattended_turn.as_deref() {
+                    held.json["unattended_turn"] = json!(turn);
+                }
+                Some(held)
+            }
             crate::delivery::State::Passed if rec.merge_ready() => {
                 let v = rec
                     .verdict

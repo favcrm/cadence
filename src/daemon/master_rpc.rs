@@ -21,6 +21,7 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::unattended::DispatchAuthority;
 use super::{
     optional_str, optional_strs, reject_identity_fields, required_str, Caller, Shared, DAEMON_ALIAS,
 };
@@ -444,6 +445,10 @@ impl Shared {
         // dispatch runs under, so a concurrent second call sees `doing`
         // and is refused having written nothing. The dispatch's own
         // daemon calls (agent_show, dispatch_send) never take this lock.
+        let _grant = self
+            .unattended_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let _serial = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
         // CAD-431: a dispatch the review loop cannot record does not
         // happen — an unreadable delivery.json refuses before anything.
@@ -457,6 +462,9 @@ impl Shared {
         let ticket = issue::board::find_issue(&pm.dir, id)?;
         let front = &ticket.front;
         crate::issue::plan::gate_master(&pm.dir, front, &ticket.body)?;
+        let repo = self
+            .unattended_dispatch_authority(id)?
+            .map(|authority| authority.checkout);
         if front.status != "ready" {
             return Err(Error::invalid(
                 "master_dispatch_state",
@@ -515,7 +523,7 @@ impl Shared {
             note: None,
             name: None,
             base: None,
-            repo: None,
+            repo: repo.map(Into::into),
             reply_to: Some(ALIAS.to_string()),
             summary: None,
             job_spec: None,
@@ -532,7 +540,15 @@ impl Shared {
         // proves in production, rather than leaning on the daemon's own
         // ambient ancestry (which a test pane marks as an agent's).
         let out = crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
-            issue::dispatch::run(&pm, id, &args, ALIAS, &self.state_dir, Some(ALIAS))
+            issue::dispatch::run(
+                &pm,
+                id,
+                &args,
+                ALIAS,
+                &self.state_dir,
+                Some(ALIAS),
+                issue::dispatch::DispatchOrigin::Automatic,
+            )
         })?;
         // Only a real send is the master's dispatch: a duplicate answers
         // with the live kickoff someone else sent (`dispatched: false`),
@@ -551,6 +567,68 @@ impl Shared {
             );
         }
         Ok(out)
+    }
+
+    /// Pin an unattended kickoff to the grant's registered checkout, never
+    /// the controller cwd's default repository in a multi-repository project.
+    /// Carry the live expiry into enqueue for its in-transaction deadline check.
+    pub(super) fn unattended_dispatch_authority(
+        &self,
+        id: &str,
+    ) -> Result<Option<DispatchAuthority>> {
+        let Some(run) = self.unattended_authorization_for_issue(id)? else {
+            return Ok(None);
+        };
+        let pm = self.pm()?;
+        let mut file = pm.dir.join(&run.project);
+        file.push("project.yaml");
+        let project = issue::project::load(&file)?;
+        let remote = format!("github.com/{}", run.repo);
+        let mut selected = None;
+        for repo in &project.repos {
+            if !repo.remote.as_deref().is_some_and(|value| {
+                issue::project::normalize_remote(value).eq_ignore_ascii_case(&remote)
+            }) {
+                continue;
+            }
+            let path = repo.path.as_deref().ok_or_else(|| {
+                Error::rejected("the authorized repository has no registered local checkout")
+            })?;
+            let (root, origin) = issue::project::repo_identity(&issue::project::expand_home(path))
+                .ok_or_else(|| {
+                    Error::rejected("the authorized checkout has no proven Git identity")
+                })?;
+            if !origin
+                .as_deref()
+                .is_some_and(|origin| origin.eq_ignore_ascii_case(&remote))
+            {
+                return Err(Error::rejected(
+                    "the authorized checkout's actual Git origin differs from the registered repository",
+                ));
+            }
+            if selected.as_ref().is_some_and(|previous| previous != &root) {
+                return Err(Error::rejected(
+                    "the authorized repository has multiple local roots; operator must resolve the ambiguity",
+                ));
+            }
+            selected = Some(root);
+        }
+        if crate::issue::time::now_epoch() as f64 >= run.expires_at {
+            return Err(Error::rejected(
+                "the workflow grant expired before dispatch",
+            ));
+        }
+        let root = selected.ok_or_else(|| {
+            Error::rejected("the workflow grant's repository is no longer registered")
+        })?;
+        let root = root
+            .into_os_string()
+            .into_string()
+            .map_err(|_| Error::rejected("the authorized checkout path is not valid UTF-8"))?;
+        Ok(Some(DispatchAuthority {
+            checkout: root,
+            expires_at: run.expires_at,
+        }))
     }
 
     /// `question_escalate` — hand an open question the master cannot

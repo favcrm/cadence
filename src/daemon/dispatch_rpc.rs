@@ -68,6 +68,32 @@ impl Shared {
             )));
         }
         let caller = self.agent_caller(peer_pid, VERB)?;
+        // Only a proven daemon self-peer can mark an automatic send.
+        // The marker requests stricter validation; it never grants authority.
+        let automatic = match params.get("unattended") {
+            None => false,
+            Some(Value::Bool(true))
+                if peer_pid == std::process::id() && matches!(&caller, AgentCaller::Operator) =>
+            {
+                true
+            }
+            Some(_) => {
+                return Err(Error::rejected(format!(
+                    "{VERB}: `unattended` marks the daemon's own automatic \
+                     dispatch — it is not a caller field"
+                )));
+            }
+        };
+        // Automatic callers retain their outer read guard across self-RPC;
+        // do not reacquire it here while a grant writer may be waiting.
+        let _grant = match &caller {
+            AgentCaller::Agent(_) => Some(
+                self.unattended_lock
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner()),
+            ),
+            AgentCaller::Operator => None,
+        };
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let id = issue::model::check_id(required_str(params, "issue")?)?;
         let text = required_str(params, "text")?;
@@ -131,8 +157,39 @@ impl Shared {
             }
         }
         let sender = self.thread_sender(&alias, peer_pid)?;
-        let (duplicate, state) = self.store.enqueue_steered(
+        let gated = (matches!(&caller, AgentCaller::Agent(_)) || automatic)
+            && self.unattended_issue_bound(&id)?;
+        // Grant→tracker order; keep canonical semantics and owner stable
+        // through enqueue. Resolve blocking reads/Git before the live helper,
+        // whose final expiry check must follow all dispatch setup waits.
+        let _tracker = gated.then(|| pm.lock()).transpose()?;
+        let mut authorized_until = None;
+        if gated {
+            let (live_front, _) = issue::write::load_front(&dir)?;
+            let actual = issue::project::repo_identity(&worktree);
+            let authority = self.unattended_dispatch_authority(&id)?.ok_or_else(|| {
+                Error::rejected(
+                    "the unattended run's live authority vanished during dispatch — refused",
+                )
+            })?;
+            if live_front.owner.as_deref() != Some(alias.as_str()) {
+                return Err(Error::rejected(
+                    "an unattended kickoff must target the workflow's authorized worker",
+                ));
+            }
+            let actual = actual.ok_or_else(|| {
+                Error::rejected("the unattended worktree has no proven repository identity")
+            })?;
+            if actual.0.as_path() != Path::new(&authority.checkout) {
+                return Err(Error::rejected(
+                    "the unattended worktree is outside the workflow's authorized repository",
+                ));
+            }
+            authorized_until = Some(authority.expires_at);
+        }
+        let (duplicate, state) = self.store.enqueue_steered_for_with_conversation(
             &alias,
+            None,
             text,
             Some(reply_to),
             &mid,
@@ -145,6 +202,10 @@ impl Shared {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            authorized_until,
         )?;
         self.notify_agent(&alias);
         self.wake();
@@ -513,7 +574,15 @@ impl Shared {
             take_over: None,
         };
         let mut out = crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
-            issue::dispatch::run(&pm, &id, &args, "operator", &self.state_dir, Some(group))
+            issue::dispatch::run(
+                &pm,
+                &id,
+                &args,
+                "operator",
+                &self.state_dir,
+                Some(group),
+                issue::dispatch::DispatchOrigin::Explicit,
+            )
         })?;
         if let Some(note) = &note {
             // A comment on the ticket — never the file the kickoff

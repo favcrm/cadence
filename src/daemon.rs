@@ -103,6 +103,8 @@ mod cad1518_acceptance;
 mod cad1537_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1562_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad225_unattended_acceptance;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
 mod campaign_clone_acceptance;
@@ -171,6 +173,8 @@ mod test_queue_rpc;
 mod threads_rpc;
 mod timers;
 mod topics_rpc;
+mod unattended;
+mod unattended_landing;
 mod watch;
 mod wiki_rpc;
 
@@ -551,6 +555,9 @@ pub struct Shared {
     /// check and its dispatch are one step, so concurrent calls for a
     /// ticket dispatch it once.
     dispatch_lock: Mutex<()>,
+    /// Workflow grant changes are exclusive; consuming dispatch/landing
+    /// holds a read guard before the existing dispatch/delivery locks.
+    unattended_lock: std::sync::RwLock<()>,
     /// CAD-431: serializes every transition of the worker loop's
     /// record (`delivery.json`).
     delivery_lock: Mutex<()>,
@@ -975,6 +982,7 @@ impl Shared {
             reclaim_at: Mutex::new(None),
             perm_exec: Mutex::new(HashMap::new()),
             dispatch_lock: Mutex::new(()),
+            unattended_lock: std::sync::RwLock::new(()),
             delivery_lock: Mutex::new(()),
             delivery_gh: opts
                 .delivery_gh

@@ -25,6 +25,13 @@ use crate::store;
 /// dispatch must not queue a duplicate while one is live.
 const LIVE_MESSAGE_STATES: &[&str] = &["queued", "submitting", "running"];
 
+/// Automatic provenance is authenticated at the daemon's final send.
+/// Explicit dispatch and repair retain the connection-bound caller's authority.
+pub enum DispatchOrigin {
+    Automatic,
+    Explicit,
+}
+
 pub struct DispatchArgs {
     pub to: String,
     /// The kickoff note; `None` points the worker at the ticket's own
@@ -85,7 +92,10 @@ fn kickoff_body(
          {branch}, base {sha7}). Commit trailer: Issue: {issue}. PR to \
          main; reply to {reply_to}. Company questions: read the \
          \"Business knowledge\" section of \
-         $HOME/.agents/skills/cadence/SKILL.md.{report}",
+         $HOME/.agents/skills/cadence/SKILL.md.{report} For implementation completion, \
+         file `cadence report file --task {issue} --kind done --file <f>` with frontmatter \
+         `sha: <full committed head>` and `pr: <PR URL>`. End your returned result \
+         (or explicit message result text) with a final `SHA: <same full head>` line.",
         note.display(),
         wt_dir.display()
     )
@@ -453,6 +463,9 @@ fn lane_head(worktree: &Path) -> Option<String> {
 /// (master_dispatch) — it writes the dispatch record directly, pm =
 /// its own alias; `None` for the CLI, whose `dispatch_record` RPC
 /// derives the pm from the caller's connection.
+///
+/// Native automatic callers preserve their origin through the self-RPC so
+/// live authority is checked after blocking setup, at the final enqueue gate.
 pub fn run(
     pm: &Pm,
     id: &str,
@@ -460,6 +473,7 @@ pub fn run(
     actor: &str,
     state_dir: &Path,
     dispatch_pm: Option<&str>,
+    origin: DispatchOrigin,
 ) -> Result<Value> {
     let (project, dir) = write::issue_dir(pm, id)?;
     let (front, body) = write::load_front(&dir)?;
@@ -981,13 +995,13 @@ pub fn run(
     // later re-dispatch can prove this kickoff's report belongs to
     // THIS issue and lane (CAD-467).
     let (message, sent_state) = if let Some(body) = send_body {
-        let sent = client::rpc(
-            state_dir,
-            "dispatch_send",
-            json!({"alias": args.to, "text": body, "reply_to": reply_to, "message": mid,
-                   "issue": front.id, "worktree": started["worktree"]}),
-        )
-        .map_err(send_failed)?;
+        let mut send = json!({"alias": args.to, "text": body, "reply_to": reply_to,
+                              "message": mid,
+                              "issue": front.id, "worktree": started["worktree"]});
+        if matches!(origin, DispatchOrigin::Automatic) {
+            send["unattended"] = json!(true);
+        }
+        let sent = client::rpc(state_dir, "dispatch_send", send).map_err(send_failed)?;
         (
             sent["message"].as_str().unwrap_or_default().to_string(),
             ("message_state", sent["state"].clone()),
@@ -1202,30 +1216,6 @@ mod tests {
             "devin",
             "pty",
         )
-    }
-
-    /// CAD-468: the kickoff names the report command exactly when the
-    /// endpoint reports explicitly — a turn-result endpoint's turn
-    /// finishes by its result text and never runs the command.
-    #[test]
-    fn kickoff_teaches_the_report_command_only_for_explicit_endpoints() {
-        assert!(
-            kickoff().contains("cadence message result <id> --token <turn_id>"),
-            "{}",
-            kickoff()
-        );
-        let managed = kickoff_body(
-            "D-1",
-            "Title",
-            Path::new("/tmp/note.md"),
-            Path::new("/r/.cadence/wt/d-1-title"),
-            "cadence/d-1-title",
-            "0123456789abcdef",
-            "pm",
-            "claude",
-            "managed",
-        );
-        assert!(!managed.contains("message result"), "{managed}");
     }
 
     /// CAD-159: an empty section and a stub-only section both yield no

@@ -5,6 +5,7 @@ use super::*;
 
 use crate::adapter::InterruptOutcome;
 use crate::adapter::Probe;
+use crate::issue;
 use crate::peer::PeerTies;
 
 /// CAD-565: the largest window one `message read` returns — Unicode
@@ -152,6 +153,183 @@ impl Shared {
             )))
         })
     }
+    /// CAD-225: a daemon follow-up turn on an issue's lane — the
+    /// checkup's fix turn and the delivery loop's revision hand-back.
+    /// Server-only: never an RPC verb, never caller-addressable.
+    ///
+    /// `worker` is the message's target and must be the issue's
+    /// canonical owner; `mid` is the caller's stable correlation id.
+    /// The caller holds `unattended_lock` READ across this call so a
+    /// grant replacement cannot interleave between the revalidation
+    /// and the enqueue (same order as dispatch: grant-read first, then
+    /// deeper locks — never the reverse).
+    ///
+    /// An unbound issue (no native unattended run) takes the ordinary
+    /// `send_as` path unchanged. A bound issue must still authorize:
+    /// `unattended_dispatch_authority` revalidates the live grant and its
+    /// unique registered checkout — a revoked, expired, malformed or
+    /// inconsistent grant is an `Err`, never a quiet fall-back to a
+    /// plain send. The follow-up then carries the lane's `issue`/
+    /// `worktree` tags re-derived from the lane's latest dispatch
+    /// queue tag (`worker_issue_lane`), after proving that worktree
+    /// still resolves inside the grant's registered repository root.
+    /// `worker_issue_turn` correlates the tagged `source='review'` row
+    /// (unattributed sender → `sender_uid` NULL) as the lane's latest
+    /// owned turn — no second correlation path, no caller-supplied
+    /// tags (the CAD-378 guard still refuses `issue`/`worktree` request
+    /// fields; the typed `bound_lane` also carries the live grant deadline).
+    /// Caller holds grant READ then delivery lock and supplies its current
+    /// record. True means a bound follow-up; false preserves legacy sends.
+    pub(super) fn send_issue_followup(
+        self: &Arc<Self>,
+        rec: &crate::delivery::Record,
+        mid: &str,
+        text: &str,
+    ) -> Result<bool> {
+        let issue = rec.issue.as_str();
+        let worker = rec.worker.as_str();
+        let authority = self.unattended_dispatch_authority(issue)?;
+        let sender_of = &|_: &str| Ok(store::Sender::Unattributed);
+        let steer_refused = &|verb: &str| {
+            Err(Error::rejected(format!(
+                "{verb} refused: this send carries no caller to steer with"
+            )))
+        };
+        let Some(authority) = authority else {
+            // Unbound legacy lane — the pre-grant behavior, unchanged.
+            self.send_with(
+                &json!({"alias": worker, "text": text, "message": mid, "source": "review"}),
+                sender_of,
+                steer_refused,
+            )?;
+            return Ok(false);
+        };
+        let root = authority.checkout;
+        // Bound run: the canonical owner is the only worker a follow-up
+        // may target — a reassigned lane ends the run's authority to
+        // enqueue, it never re-aims it.
+        let pm = self.pm()?;
+        let (_project, dir) = issue::write::issue_dir(&pm, issue)?;
+        let (front, _) = issue::write::load_front(&dir)?;
+        if front.owner.as_deref() != Some(worker) {
+            return Err(Error::rejected(format!(
+                "{issue}'s unattended run targets its authorized worker — \
+                 a follow-up to {worker} is refused"
+            )));
+        }
+        // The lane tag comes from the lane's latest dispatch queue
+        // tag — the native record of where this run currently executes.
+        // A bound issue with no dispatch kickoff never got its turn, so
+        // there is no lane to follow up on.
+        let lane = self
+            .store
+            .worker_issue_lane(issue, worker)?
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "{issue}'s unattended run has no native dispatch turn on \
+                     {worker} — a follow-up cannot derive its lane"
+                ))
+            })?;
+        // The recorded lane must still resolve inside the grant's
+        // registered repository checkout — the same proof
+        // `dispatch_send` re-ran on the kickoff itself.
+        let actual = issue::project::repo_identity(Path::new(&lane)).ok_or_else(|| {
+            Error::rejected(format!(
+                "{issue}'s recorded lane has no proven repository identity"
+            ))
+        })?;
+        if actual.0.as_path() != Path::new(&root) {
+            return Err(Error::rejected(format!(
+                "{issue}'s recorded lane resolves outside its grant's \
+                 authorized repository — the follow-up is refused"
+            )));
+        }
+        let head = rec
+            .head
+            .as_deref()
+            .filter(|head| !head.is_empty())
+            .ok_or_else(|| Error::rejected("a bound follow-up needs its current recorded head"))?;
+        if let Some(intent) = self.store.unattended_merge_intent(issue, head)? {
+            let (repo, number) =
+                crate::issue::task_report::parse_pr_url(rec.pr.as_deref().unwrap_or_default())?;
+            if !intent["repo"]
+                .as_str()
+                .is_some_and(|bound| bound.eq_ignore_ascii_case(&repo))
+                || intent["pr"].as_u64() != Some(number)
+                || intent["worker"].as_str() != Some(worker)
+            {
+                return Err(Error::rejected("the recorded merge intent does not bind this follow-up; operator inspection is required"));
+            }
+            let base_ref = intent["base_ref"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| Error::rejected("the recorded merge intent has no target branch; operator inspection is required"))?;
+            let view = crate::delivery::pr_view(&self.delivery_gh.to_string_lossy(), &repo, number)
+                .map_err(|error| Error::rejected(format!("merge-request state is unreadable ({error}); operator must inspect/remove it before repair")))?;
+            if view["headRefOid"].as_str() != Some(head)
+                || view["state"] != "OPEN"
+                || view["baseRefName"] != base_ref
+            {
+                return Err(Error::rejected(
+                    "the PR no longer names this open head; operator must inspect it before repair",
+                ));
+            }
+            // A removed request may have an advanced base, never a different destination.
+            let base = view["baseRefOid"]
+                .as_str()
+                .filter(|oid| !oid.is_empty())
+                .ok_or_else(|| {
+                    Error::rejected("the current PR has no base commit; repair is refused")
+                })?;
+            let auto = view.get("autoMergeRequest").ok_or_else(|| {
+                Error::rejected(
+                    "merge-request evidence is missing; operator must inspect it before repair",
+                )
+            })?;
+            if !auto.is_null() {
+                return Err(Error::rejected("the PR still has an armed auto-merge request; operator must remove it before a new head is produced"));
+            }
+            let entry = super::delivery_requirements_rpc::unattended_queue_entry(
+                self, &repo, number, head, base, base_ref,
+            ).map_err(|error| Error::rejected(format!("queue-removal proof is unreadable ({error}); operator must inspect/remove it before repair")))?;
+            if entry.is_some() {
+                return Err(Error::rejected("the PR still has a native queue entry; operator must remove it before a new head is produced"));
+            }
+        } else if rec.state == crate::delivery::State::Enqueued
+            || rec.unattended_pending
+            || rec.disable_auto
+            || rec.observed.as_ref().is_some_and(|view| view.auto_merge)
+        {
+            return Err(Error::rejected("the lane has merge-request state without a native intent; operator must inspect/remove it before repair"));
+        }
+        // Re-prove authority after network reads; carry that expiry into enqueue.
+        // Same global writer lock as supported tracker edits; unrelated
+        // report files remain outside this read-only snapshot's admission scope.
+        let _tracker = pm.lock_for_paths(&[dir.join("issue.md")])?;
+        let authorized_until = match self.unattended_dispatch_authority(issue)? {
+            Some(reproved) if reproved.checkout == root => reproved.expires_at,
+            _ => {
+                return Err(Error::rejected(
+                    "the bound repository authority changed before follow-up enqueue",
+                ));
+            }
+        };
+        const COMPLETION: &str = " End your returned result (or explicit message result text) with a final `SHA: <same full committed head as the done report>` line.";
+        let mut body = String::with_capacity(text.len() + COMPLETION.len());
+        body.push_str(text);
+        body.push_str(COMPLETION);
+        let mut params = json!({"alias": worker, "message": mid, "source": "review"});
+        params["text"] = Value::String(body);
+        self.send_with_human_expected(
+            &params,
+            sender_of,
+            steer_refused,
+            None,
+            None,
+            Some((issue, lane.as_str(), authorized_until)),
+        )?;
+        Ok(true)
+    }
 
     /// `send_as` with the caller a steering send (CAD-158) is authorized
     /// against, derived from the connection by `steer_caller`.
@@ -161,7 +339,7 @@ impl Shared {
         sender_of: &dyn Fn(&str) -> Result<store::Sender>,
         steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
     ) -> Result<Value> {
-        self.send_with_human_expected(params, sender_of, steer_caller, None, None)
+        self.send_with_human_expected(params, sender_of, steer_caller, None, None, None)
     }
 
     /// [`Self::send_with`] carrying the verified human behind an owner
@@ -175,7 +353,7 @@ impl Shared {
         steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
         human: Option<&Value>,
     ) -> Result<Value> {
-        self.send_with_human_expected(params, sender_of, steer_caller, human, None)
+        self.send_with_human_expected(params, sender_of, steer_caller, human, None, None)
     }
 
     /// CAD-1412: `send_with` with an optional expected recipient uid. The
@@ -189,13 +367,16 @@ impl Shared {
         steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
         expected_uid: Option<&str>,
     ) -> Result<Value> {
-        self.send_with_human_expected(params, sender_of, steer_caller, None, expected_uid)
+        self.send_with_human_expected(params, sender_of, steer_caller, None, expected_uid, None)
     }
 
     /// The one send body (CAD-1374 + CAD-1412): the optional verified
     /// human (typed, daemon-derived) and the optional expected recipient
     /// uid are independent derivations — neither is a request field, and
     /// the recipient uid is never treated as the human performer.
+    /// CAD-225: `bound_lane` is `(issue, worktree, authorized_until)`,
+    /// derived server-side by `send_issue_followup`. Other paths pass
+    /// `None`; request fields cannot set lane tags or the grant deadline.
     fn send_with_human_expected(
         self: &Arc<Self>,
         params: &Value,
@@ -203,6 +384,7 @@ impl Shared {
         steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
         human: Option<&Value>,
         expected_uid: Option<&str>,
+        bound_lane: Option<(&str, &str, f64)>,
     ) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
@@ -280,11 +462,13 @@ impl Shared {
         // CAD-467 wrote `issue`/`worktree` on the message row at send,
         // steer-gated — but the steer gate checks caller-versus-target,
         // never the values, so a PM could mark a send to its own worker
-        // with a forged lane (CAD-378 R6). Now only dispatch paths write
-        // the tags: `dispatch_send` sets them from the lane the daemon
-        // itself resolves, `task_dispatch` from the job's rows. A caller
-        // field is refused outright — silently dropping it would let a
-        // retry pass as untagged and mis-suppress the reported-kickoff
+        // with a forged lane (CAD-378 R6). Now only daemon-derived paths
+        // write the tags: `dispatch_send` sets them from the lane the
+        // daemon itself resolves, `task_dispatch` from the job's rows,
+        // `send_issue_followup` from the lane's latest dispatch tag
+        // through the typed `bound_lane` argument. A caller field is
+        // refused outright — silently dropping it would let a retry
+        // pass as untagged and mis-suppress the reported-kickoff
         // duplicate check, and would hide the forgery attempt.
         if optional_str(params, "issue").is_some() || optional_str(params, "worktree").is_some() {
             let verb = "send --issue/--worktree";
@@ -610,8 +794,8 @@ impl Shared {
             &message,
             source,
             task,
-            None,
-            None,
+            bound_lane.map(|(issue, _, _)| issue),
+            bound_lane.map(|(_, worktree, _)| worktree),
             &sender,
             &steer,
             refs.as_ref(),
@@ -620,6 +804,7 @@ impl Shared {
             home_conversation.as_deref(),
             human,
             media_refs.as_ref(),
+            bound_lane.map(|(_, _, until)| until),
         )?;
         // Each superseded row's `reply_to` got a notice in the same
         // transaction — wake those recipients like `message cancel` does.

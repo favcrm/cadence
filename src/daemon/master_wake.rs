@@ -192,6 +192,19 @@ fn statuses(issues: &[board::Issue]) -> HashMap<&str, &str> {
         .collect()
 }
 
+fn plan_wake_key(epic: &str, decided_at: &str, grant: Option<(&str, f64)>) -> (String, String) {
+    match grant {
+        Some((id, expires_at)) => (
+            format!("{epic}/{id}/{expires_at}"),
+            format!("plan {epic} preauthorized by workflow grant {id} — its tickets are ready."),
+        ),
+        None => (
+            format!("{epic}/{decided_at}"),
+            format!("plan {epic} approved by the operator — its tickets are ready."),
+        ),
+    }
+}
+
 /// Every `ready` ticket of an approved plan (`project` only, when given).
 fn plan_ready<'a>(
     pm_dir: &Path,
@@ -344,6 +357,21 @@ impl Shared {
         Ok((!duplicate).then_some(id))
     }
 
+    fn wake_available(&self, st: &mut WakeState, event: &str, key: &str) -> Result<bool> {
+        let id = wake_id(event, key);
+        if let Some(old) = self.store.message(&id)? {
+            if (old.alias == ALIAS && old.source == master::WAKE_SOURCE)
+                || st.squatted.contains(&id)
+            {
+                return Ok(false);
+            }
+            // One refusal for a squatted id, not an event storm per pass.
+            st.squatted.insert(id);
+            st.save(&self.state_dir)?;
+        }
+        Ok(true)
+    }
+
     /// Wake the master once for `(event, key)`; `true` when queued now.
     /// A failure is logged, never returned: the operator's decision that
     /// caused it already stands.
@@ -412,8 +440,13 @@ impl Shared {
         let epic = out["epic"].as_str().unwrap_or_default();
         let project = out["project"].as_str().unwrap_or_default();
         let decided_at = out["decided_at"].as_str().unwrap_or_default();
-        let head = format!("plan {epic} approved by the operator — its tickets are ready.");
-        let key = format!("{epic}/{decided_at}");
+        let (key, head) = plan_wake_key(
+            epic,
+            decided_at,
+            out["grant_id"]
+                .as_str()
+                .zip(out["grant_expires_at"].as_f64()),
+        );
         let Some((pm_dir, issues)) = self.wake_issues() else {
             let _ = self.wake_master(
                 "plan_approved",
@@ -567,6 +600,61 @@ impl Shared {
             st.save(&self.state_dir)?;
         }
         let mut woken = 0;
+        // Reconstruct a missed admission/renewal hint from native receipts.
+        // The metadata filter only avoids legacy lookups; it grants nothing.
+        let granted: BTreeSet<&str> = issues
+            .iter()
+            .filter(|i| {
+                i.front.plan.as_ref().is_some_and(|plan| {
+                    plan.decided_by
+                        .as_deref()
+                        .is_some_and(|by| by.starts_with("workflow grant "))
+                })
+            })
+            .map(|i| i.front.id.as_str())
+            .collect();
+        let mut checked = BTreeSet::new();
+        for (i, open) in &ready {
+            if woken == WAKES_PER_PASS {
+                break;
+            }
+            let Some(epic) = i
+                .front
+                .plan_epic
+                .as_deref()
+                .filter(|epic| granted.contains(epic))
+            else {
+                continue;
+            };
+            if !open.is_empty() || !checked.insert(epic) {
+                continue;
+            }
+            let Ok(Some(run)) = self.unattended_authorization_for_issue(&i.front.id) else {
+                // An invalid or incomplete receipt is not a ready signal.
+                // It remains held; no guessed scope enters a worker queue.
+                continue;
+            };
+            let (key, head) = plan_wake_key(&run.epic, "", Some((&run.grant_id, run.expires_at)));
+            if !self.wake_available(&mut st, "plan_approved", &key)? {
+                continue;
+            }
+            let text = format!(
+                "{head}\nRe-read this plan and its live authorization. Dispatch ready work once; never resend an in-flight or unknown turn."
+            );
+            if self.wake_master("plan_approved", &run.epic, &key, &text) {
+                woken += 1;
+                for (ticket, blockers) in &ready {
+                    if ticket.front.plan_epic.as_deref() == Some(run.epic.as_str())
+                        && blockers.is_empty()
+                        && !ticket.front.blocked_by.is_empty()
+                    {
+                        let blocker_key = st.blocker_key(ticket);
+                        st.announced.insert(ticket.front.id.clone(), blocker_key);
+                    }
+                }
+                st.save(&self.state_dir)?;
+            }
+        }
         for (i, open) in &ready {
             if !open.is_empty() || i.front.blocked_by.is_empty() {
                 continue;
@@ -578,16 +666,8 @@ impl Shared {
             if st.announced.get(&i.front.id) == Some(&key) {
                 continue;
             }
-            let id = wake_id("blocker_done", &key);
-            if let Some(old) = self.store.message(&id)? {
-                let own = old.alias == ALIAS && old.source == master::WAKE_SOURCE;
-                if own || st.squatted.contains(&id) {
-                    continue;
-                }
-                // Not the wake: `wake_master` refuses it with a
-                // `daemon_message_squatted` event — once.
-                st.squatted.insert(id);
-                st.save(&self.state_dir)?;
+            if !self.wake_available(&mut st, "blocker_done", &key)? {
+                continue;
             }
             let blockers: BTreeSet<&str> = i.front.blocked_by.iter().map(|b| shown_id(b)).collect();
             let project: Vec<Ready<'_>> = ready

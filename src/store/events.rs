@@ -2,7 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::proto::identifier;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -45,6 +45,24 @@ pub const APPROVAL_RECORDED_EVENT: &str = "approval_recorded";
 /// An operator withdrew an earlier approval id. Message delivery state
 /// (a cancelled or superseded queue message) never writes this.
 pub const APPROVAL_REVOKED_EVENT: &str = "approval_revoked";
+
+/// CAD-225: durable marks for an operator-issued workflow grant's ONE
+/// plan admission — `intent` (reserved ids + canonical semantics, before
+/// any tracker file), `admitted` (the run receipt), `held` (a partial
+/// outcome kept explicit for reconciliation). Written only by the
+/// daemon's own admission path; `provenance: "native"` inside.
+pub const UNATTENDED_RUN_EVENT: &str = "unattended_run";
+
+/// CAD-225: the daemon's native intent to enqueue one exact head of an
+/// unattended run's PR — recorded BEFORE the `gh` mutation so a missing
+/// acknowledgement never replays the mutation. One row per
+/// (issue, head); a second intent refuses.
+pub const UNATTENDED_MERGE_INTENT_EVENT: &str = "unattended_merge_intent";
+
+/// CAD-225: the enqueue outcome record — the intent was attempted and
+/// its result observed (`reconciled` when the remote queue already
+/// proved the same-head state). One row per (issue, head).
+pub const UNATTENDED_MERGE_ENQUEUED_EVENT: &str = "unattended_merge_enqueued";
 
 /// One operator approval as `Store::record_approval` persists it: the
 /// operator approved `action` on the exact `head_sha` of PR `pr` in
@@ -491,7 +509,48 @@ impl Store {
     /// `"<project>/<name>"` so a project approval and a workflow
     /// approval never share a row.
     pub fn record_workflow_approval(&self, payload: Value) -> Result<()> {
-        self.write_tx(|conn| Self::event(&conn, APPROVAL_STREAM, WORKFLOW_APPROVED_EVENT, payload))
+        self.write_tx(|conn| {
+            if let (Some(project), Some(name), Some(grant), Some(revision)) = (
+                payload["project"].as_str(),
+                payload["name"].as_str(),
+                payload["unattended"]["grant_id"].as_str(),
+                payload["unattended"]["revision"].as_u64(),
+            ) {
+                let existing: Option<String> = conn
+                    .query_row(
+                        "SELECT payload FROM events WHERE alias=?1 AND kind=?2
+                        AND json_extract(payload,'$.project')=?3
+                        AND json_extract(payload,'$.name')=?4
+                        AND json_extract(payload,'$.unattended.grant_id')=?5
+                        AND json_extract(payload,'$.unattended.revision')=?6
+                        ORDER BY seq LIMIT 1",
+                        params![
+                            APPROVAL_STREAM,
+                            WORKFLOW_APPROVED_EVENT,
+                            project,
+                            name,
+                            grant,
+                            revision
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(existing) = existing {
+                    let existing: Value = serde_json::from_str(&existing).map_err(|error| {
+                        Error::internal(format!("stored workflow approval is malformed: {error}"))
+                    })?;
+                    if existing != payload {
+                        return Err(Error::rejected(
+                            "a grant revision already has different approval evidence",
+                        ));
+                    }
+                    // An exact captured retry must not become the latest
+                    // approval after revocation or a newer renewal.
+                    return Ok(());
+                }
+            }
+            Self::event(conn, APPROVAL_STREAM, WORKFLOW_APPROVED_EVENT, payload)
+        })
     }
 
     /// CAD-487: the latest workflow approval per `"<project>/<name>"`.
@@ -514,6 +573,211 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// A replacement permanently revokes an old grant ID. Reappending a
+    /// captured approval or older renewal cannot restore its authority.
+    pub fn unattended_grant_current(
+        &self,
+        project: &str,
+        name: &str,
+        grant: &str,
+        revision: u32,
+    ) -> Result<bool> {
+        self.read_tx(|conn| {
+            Ok(conn.query_row(
+                "WITH approvals AS (
+                    SELECT seq,
+                        json_extract(payload,'$.unattended.grant_id') AS id,
+                        json_extract(payload,'$.unattended.revision') AS revision,
+                        json_type(payload,'$.unattended.revision') AS revision_type
+                    FROM events WHERE alias=?1 AND kind=?2
+                        AND json_extract(payload,'$.project')=?3
+                        AND json_extract(payload,'$.name')=?4
+                )
+                SELECT EXISTS(SELECT 1 FROM approvals WHERE id=?5)
+                    AND NOT EXISTS(
+                        SELECT 1 FROM approvals
+                        WHERE seq>(SELECT MIN(seq) FROM approvals WHERE id=?5)
+                            AND (id IS NULL OR id<>?5)
+                    )
+                    AND NOT EXISTS(
+                        SELECT 1 FROM approvals WHERE id=?5
+                            AND (revision_type IS NULL OR revision_type<>'integer')
+                    )
+                    AND (SELECT MAX(revision) FROM approvals WHERE id=?5)=?6",
+                params![
+                    APPROVAL_STREAM,
+                    WORKFLOW_APPROVED_EVENT,
+                    project,
+                    name,
+                    grant,
+                    revision
+                ],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
+    /// CAD-225: append a durable `unattended_run` mark (`intent`,
+    /// `admitted` or `held`) on [`APPROVAL_STREAM`]. Native provenance is
+    /// a payload field the daemon's own admission writes — no RPC can
+    /// mint it.
+    pub fn record_unattended_run(&self, payload: Value) -> Result<()> {
+        self.write_tx(|conn| {
+            // The native intent already carries the server-derived deadline.
+            // Recheck after acquiring the SQLite writer, before minting work.
+            if payload["status"] == "intent"
+                && payload["expires_at"].as_f64().is_none_or(|until| {
+                    !until.is_finite() || crate::issue::time::now_epoch() as f64 >= until
+                })
+            {
+                return Err(Error::rejected(
+                    "the bound grant expired before the admission intent — nothing was admitted",
+                ));
+            }
+            Self::event(&conn, APPROVAL_STREAM, UNATTENDED_RUN_EVENT, payload)
+        })
+    }
+
+    /// CAD-225: every `unattended_run` mark in write order. A payload
+    /// that is not valid JSON fails the whole read — a corrupt mark can
+    /// never look like "no binding" to the authorization query.
+    pub fn unattended_run_payloads(&self) -> Result<Vec<Value>> {
+        self.read_tx(|conn| {
+            let raws: Vec<String> = conn.query_vec(
+                "SELECT payload FROM events WHERE alias=?1 AND kind=?2 ORDER BY seq",
+                params![APPROVAL_STREAM, UNATTENDED_RUN_EVENT],
+                |r| r.get(0),
+            )?;
+            raws.iter()
+                .map(|raw| {
+                    serde_json::from_str::<Value>(raw).map_err(|e| {
+                        Error::internal(format!("{UNATTENDED_RUN_EVENT} payload: {e}"))
+                    })
+                })
+                .collect()
+        })
+    }
+
+    /// CAD-225: every issue id any `unattended_run` mark ever bound —
+    /// epics and tickets alike, held marks included. Plan creation
+    /// avoids them so a torn intent can never be silently reused by an
+    /// unrelated plan.
+    pub fn unattended_reserved_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let mut out = std::collections::HashSet::new();
+        for payload in self.unattended_run_payloads()? {
+            if let Some(epic) = payload["epic"].as_str() {
+                out.insert(epic.to_string());
+            }
+            if let Some(tickets) = payload["tickets"].as_array() {
+                for t in tickets {
+                    if let Some(id) = t.as_str() {
+                        out.insert(id.to_string());
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// CAD-225: the recorded enqueue intent for `(issue, head)` — at
+    /// most one row per pair; the dedupe insert keeps that true.
+    pub fn unattended_merge_intent(&self, issue: &str, head: &str) -> Result<Option<Value>> {
+        self.unattended_merge_evidence(issue, head, UNATTENDED_MERGE_INTENT_EVENT)
+    }
+
+    pub fn unattended_merge_enqueued(&self, issue: &str, head: &str) -> Result<Option<Value>> {
+        self.unattended_merge_evidence(issue, head, UNATTENDED_MERGE_ENQUEUED_EVENT)
+    }
+
+    fn unattended_merge_evidence(
+        &self,
+        issue: &str,
+        head: &str,
+        kind: &str,
+    ) -> Result<Option<Value>> {
+        self.read_tx(|conn| {
+            let raws: Vec<String> = conn.query_vec(
+                "SELECT payload FROM events WHERE alias=?1 AND kind=?2 \
+                     AND json_extract(payload,'$.issue')=?3 \
+                     AND json_extract(payload,'$.head')=?4 ORDER BY seq",
+                params![APPROVAL_STREAM, kind, issue, head],
+                |r| r.get(0),
+            )?;
+            if raws.len() > 1 {
+                return Err(Error::internal(format!(
+                    "two {kind} records name {issue}@{head} — held for \
+                     reconciliation"
+                )));
+            }
+            raws.first()
+                .map(|raw| {
+                    serde_json::from_str::<Value>(raw)
+                        .map_err(|e| Error::internal(format!("{kind} payload: {e}")))
+                })
+                .transpose()
+        })
+    }
+
+    /// CAD-225: record the enqueue intent for one exact head —
+    /// atomically inside the write tx. `Ok(false)` when an intent for
+    /// `(issue, head)` already exists: no second mutation is ever
+    /// authorized by a duplicate. `Err` when the payload is malformed or
+    /// its grant is already expired/nonfinite — the insert-time check
+    /// re-proves expiry because the earlier validation can be minutes
+    /// stale by the time `gh` answers.
+    pub fn record_unattended_merge_intent(&self, payload: Value) -> Result<bool> {
+        self.unattended_merge_record(payload, UNATTENDED_MERGE_INTENT_EVENT, true)
+    }
+
+    /// CAD-225: record the enqueue outcome (`issue`, `head`,
+    /// `grant_id`, `reconciled`) — the same one-row-per-(issue,head)
+    /// dedupe as the intent. `Ok(false)` when the outcome is already
+    /// on record.
+    pub fn record_unattended_merge_enqueued(&self, payload: Value) -> Result<bool> {
+        self.unattended_merge_record(payload, UNATTENDED_MERGE_ENQUEUED_EVENT, false)
+    }
+
+    fn unattended_merge_record(
+        &self,
+        payload: Value,
+        kind: &str,
+        check_expiry: bool,
+    ) -> Result<bool> {
+        let (Some(issue), Some(head)) = (payload["issue"].as_str(), payload["head"].as_str())
+        else {
+            return Err(Error::rejected(format!(
+                "{kind} needs string 'issue' and 'head'"
+            )));
+        };
+        let issue = issue.to_string();
+        let head = head.to_string();
+        self.write_tx(|conn| {
+            if check_expiry {
+                match payload["grant_expires_at"].as_f64() {
+                    Some(expires) if expires.is_finite() && expires > super::now() => {}
+                    _ => {
+                        return Err(Error::rejected(
+                            "the unattended grant is expired or its expiry is not a \
+                             finite epoch — the intent is refused, not recorded",
+                        ));
+                    }
+                }
+            }
+            let exists: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind=?2 \
+                     AND json_extract(payload,'$.issue')=?3 \
+                     AND json_extract(payload,'$.head')=?4",
+                params![APPROVAL_STREAM, kind, issue, head],
+                |r| r.get(0),
+            )?;
+            if exists > 0 {
+                return Ok(false);
+            }
+            Self::event(conn, APPROVAL_STREAM, kind, payload)?;
+            Ok(true)
+        })
     }
 
     /// CAD-547: record the operator's approval of an app's structural
@@ -588,6 +852,20 @@ impl Store {
     /// CAD-120: export requires immutable scope recorded by the native
     /// verdict intake. Legacy receipts deliberately cannot be exported.
     pub fn review_export_recorded(&self, record: &crate::delivery::Record) -> Result<bool> {
+        self.review_scope_recorded(record, false)
+    }
+
+    /// Automatic landing additionally needs the independent reviewer's
+    /// explicit non-sensitive declaration, bound to the native receipt.
+    pub fn unattended_review_recorded(&self, record: &crate::delivery::Record) -> Result<bool> {
+        self.review_scope_recorded(record, true)
+    }
+
+    fn review_scope_recorded(
+        &self,
+        record: &crate::delivery::Record,
+        require_auto: bool,
+    ) -> Result<bool> {
         let Some(verdict) = &record.verdict else {
             return Ok(false);
         };
@@ -605,6 +883,7 @@ impl Store {
              AND json_extract(payload,'$.pr')=?7 \
              AND json_extract(payload,'$.project')=?8 \
              AND json_extract(payload,'$.worker')=?9 \
+             AND (?10=0 OR json_extract(payload,'$.risk')='auto') \
              AND seq=(SELECT MAX(seq) FROM events WHERE alias=?1 AND kind=?2 \
                       AND json_extract(payload,'$.issue')=?3)",
             params![
@@ -616,7 +895,8 @@ impl Store {
                 verdict.report,
                 pr,
                 record.project,
-                record.worker
+                record.worker,
+                require_auto
             ],
             |row| row.get(0),
         )?;
