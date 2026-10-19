@@ -25,7 +25,7 @@
     },
     {
       "path": "ui/src/lib/api.ts",
-      "sha256": "a2a58c87190cd51ff5c7dfb0be674089fa9bb600558d08c643bcdf5cf31ea46c"
+      "sha256": "892e191b2f88265e76a4c6155bb8c5da43e8201922d290fa8fbb18b2ef9e37f2"
     },
     {
       "path": "ui/src/lib/conditionalGet.ts",
