@@ -1184,6 +1184,9 @@ impl Store {
             }
             Self::ensure_thread_in(tx, alias)?;
         }
+        if matches!(sender, Sender::Cli(_)) {
+            Self::ensure_thread_in(tx, alias)?;
+        }
         Self::thread_append_in(tx, alias, entry)?;
         Ok(())
     }

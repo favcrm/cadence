@@ -26,6 +26,47 @@
         assert!(s.message("m1").unwrap().unwrap().sender.is_none());
     }
 
+    #[test]
+    fn cad1568_first_cli_enqueue_and_retry_keep_one_fixed_home_message() {
+        let (dir, s) = store();
+        reg(&s, "master", &dir.path().join("w"));
+        assert!(s.thread("master").unwrap().is_none());
+        let sender = Sender::Cli(crate::store::CliAuthority {
+            org: "workspace-a".into(),
+            sub: "owner-a".into(),
+            actor: "users/owner-a".into(),
+            handle: "owner-a".into(),
+            credential_id: "device-a".into(),
+        });
+        let (duplicate, state) = s
+            .enqueue_sent(
+                "master", "first CLI message", None, "cli-first-home",
+                "cli-owner-a", None, &sender,
+            )
+            .unwrap();
+        assert!(!duplicate);
+        assert_eq!(state, "queued");
+        let home = s.thread("master").unwrap().expect("first CLI send must create Home");
+        let bound = s.message_conversation("master", "cli-first-home")
+            .unwrap().expect("enqueue must bind its conversation");
+        assert_eq!(bound.id, home.id);
+        assert!(s.message_member_authority("cli-first-home").unwrap().is_none());
+        let (duplicate, state) = s.enqueue_sent(
+            "master", "first CLI message", None, "cli-first-home",
+            "cli-owner-a", None, &sender,
+        ).unwrap();
+        assert!(duplicate);
+        assert_eq!(state, "queued");
+        assert_eq!(s.queued_count("master").unwrap(), 1);
+        assert_eq!(
+            s.message_conversation("master", "cli-first-home").unwrap().unwrap().id,
+            home.id,
+        );
+        assert_eq!(s.thread_entries("master", 0, 100).unwrap().iter()
+            .filter(|entry| entry.message_id.as_deref() == Some("cli-first-home"))
+            .count(), 1, "a duplicate must not append a second chat entry");
+    }
+
     /// CAD-468: `enqueue_daemon` admits exactly the pairs the daemon
     /// mints — `sys-<source>-…` for a daemon source (`wake`, and `nudge`
     /// for the silent-end report reminder) — and refuses every crossing:

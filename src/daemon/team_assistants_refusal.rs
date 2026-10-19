@@ -8224,3 +8224,4 @@ include!("cad1568_independent_acceptance.rs");
 // for remote CLI messaging, authored independently of the implementer and the
 // ticket author's check above.
 include!("cad1568_reviewer_acceptance.rs");
+include!("cad1568_master_recipient_acceptance.rs");
