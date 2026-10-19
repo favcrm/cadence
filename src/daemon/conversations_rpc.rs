@@ -742,7 +742,10 @@ mod tests {
 
     fn fx() -> Fx {
         let dir = tempfile::tempdir().unwrap();
-        let opts = ServeOptions::default();
+        let opts = ServeOptions {
+            provider_env: crate::adapter::ProviderEnv::refusing_providers(),
+            ..Default::default()
+        };
         opts.provider_env
             .set("CADENCE_PM_DIR", dir.path().join("no-pm").to_str().unwrap());
         let shared = Shared::new(dir.path(), &opts).unwrap();
@@ -758,12 +761,23 @@ mod tests {
                     cwd: &cwd,
                     sandbox: "read-only",
                     instructions: None,
-                    params: None,
+                    params: (alias == "master").then_some(r#"{"model":"fixture/model"}"#),
                     team_role: None,
                     model_policy: None,
                 })
                 .unwrap();
         }
+        let mut settings = shared.store.settings().unwrap();
+        settings.doc.pi = Some(
+            serde_json::from_value(serde_json::json!({
+                "models": {"allow": ["fixture/model"], "default": {"master": "fixture/model"}}
+            }))
+            .unwrap(),
+        );
+        shared
+            .store
+            .save_settings(settings.revision, settings.doc, "conversations-rpc-fixture")
+            .unwrap();
         let ctx = |install: &str, label: &str| {
             let config = ContextConfig::new(label, BTreeMap::new()).unwrap();
             shared

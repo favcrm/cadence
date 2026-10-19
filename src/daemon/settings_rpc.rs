@@ -705,47 +705,43 @@ fn role_resolution(
     })
 }
 
-/// The selector state for one (provider, role): the role's own selector
-/// wins, else the provider baseline — the same precedence `inherit`
-/// applies at launch. `pi_fallback` is the stored pi policy's
-/// runtime-role default (the selector map has no pi row; the saved
-/// policy — never pm.yaml on disk — is its authority).
+/// The selector state for one (provider, role), in launch order: the
+/// role's own selector wins, else the provider baseline - the same
+/// precedence `inherit` applies at launch. A concrete model there is the
+/// answer. A provider_default selector (explicit or absent) yields no
+/// team model, so the stored pi policy's runtime-role worker/master
+/// default (never pm.yaml on disk) applies, exactly as the Pi launch
+/// falls back to it when no model resolves.
 fn provider_role_row(
     defaults: &crate::model_defaults::ModelDefaults,
     provider: &str,
     role: &str,
     pi_fallback: Option<String>,
 ) -> Value {
-    if let Some(pi_model) = pi_fallback {
-        return json!({
-            "model": pi_model,
-            "source": crate::model_defaults::SOURCE_PI_POLICY_DEFAULT,
-        });
-    }
-    let Some(entry) = defaults.providers.get(provider) else {
-        return json!({"model": Value::Null, "source": crate::model_defaults::SOURCE_PROVIDER_DEFAULT});
-    };
-    if let Some(selector) = entry.roles.get(role) {
-        return match selector {
-            crate::model_defaults::ModelSelector::Model { model } => json!({
-                "model": model,
-                "source": crate::model_defaults::SOURCE_ROLE_DEFAULT,
+    let team = defaults.providers.get(provider).map(|entry| {
+        if let Some(selector) = entry.roles.get(role) {
+            (selector, crate::model_defaults::SOURCE_ROLE_DEFAULT)
+        } else {
+            (
+                &entry.default,
+                crate::model_defaults::SOURCE_PROVIDER_BASELINE,
+            )
+        }
+    });
+    match team {
+        Some((crate::model_defaults::ModelSelector::Model { model }, source)) => {
+            json!({"model": model, "source": source})
+        }
+        _ => match pi_fallback {
+            Some(pi_model) => json!({
+                "model": pi_model,
+                "source": crate::model_defaults::SOURCE_PI_POLICY_DEFAULT,
             }),
-            crate::model_defaults::ModelSelector::ProviderDefault => json!({
+            None => json!({
                 "model": Value::Null,
                 "source": crate::model_defaults::SOURCE_PROVIDER_DEFAULT,
             }),
-        };
-    }
-    match &entry.default {
-        crate::model_defaults::ModelSelector::Model { model } => json!({
-            "model": model,
-            "source": crate::model_defaults::SOURCE_PROVIDER_BASELINE,
-        }),
-        crate::model_defaults::ModelSelector::ProviderDefault => json!({
-            "model": Value::Null,
-            "source": crate::model_defaults::SOURCE_PROVIDER_DEFAULT,
-        }),
+        },
     }
 }
 
@@ -2106,7 +2102,10 @@ impl Shared {
             })?;
         let mut bound_body = payload.clone();
         if let Some(object) = bound_body.as_object_mut() {
+            // Both envelope fields are excluded from the approved digest
+            // (`grant.request` hashes the intended payload alone).
             object.remove("grant_id");
+            object.remove("payload_sha256");
         }
         let now = now_epoch();
         let lock = grants_lock(&self.state_dir);

@@ -323,8 +323,11 @@ App-scoped assistant turns gain no settings authority.
 
 `cadence master status [--grant <id>]` reports model selection, configuration
 launch refusal, applicable allowlist and queue state. Unknown authentication
-is reported as unknown. A known configuration-blocked send returns
+is reported as unknown. A new send blocked by known configuration returns
 `master_unlaunchable` before enqueue; a busy master is a different condition.
+An already-accepted stable message ID is reconciled first: an identical
+retry returns its existing receipt even if the master is now blocked, while
+reuse with a different envelope is rejected. Neither retry queues another copy.
 
 After an authorized model-scope repair, `cadence master resume --grant <id>`
 uses an exact `master.resume` grant and the existing resume implementation.

@@ -159,7 +159,11 @@ impl Shared {
         let sender = self.thread_sender(&alias, peer_pid)?;
         // CAD-1586: a dispatch is a master-target send too — the same
         // configuration-unlaunchable refusal, before the enqueue.
-        self.master_send_preflight(&alias)?;
+        // A retry of an ID that already names a row is decided by the
+        // store's exact-envelope comparison; the refusal is for new sends.
+        if crate::master::is_master(&alias) && !self.store.message_exists(&mid)? {
+            self.master_send_preflight(&alias)?;
+        }
         let gated = (matches!(&caller, AgentCaller::Agent(_)) || automatic)
             && self.unattended_issue_bound(&id)?;
         // Grant→tracker order; keep canonical semantics and owner stable

@@ -792,7 +792,11 @@ impl Shared {
         // before the durable enqueue — so no route can queue a turn no
         // launch can deliver. Busy, starting, stopping and
         // offline-but-launchable masters are unaffected.
-        self.master_send_preflight(&alias)?;
+        // A retry of an ID that already names a row is decided by the
+        // store's exact-envelope comparison; the refusal is for new sends.
+        if crate::master::is_master(&alias) && !self.store.message_exists(&message)? {
+            self.master_send_preflight(&alias)?;
+        }
         let (duplicate, state) = self.store.enqueue_steered_for_with_conversation(
             &alias,
             expected_uid,
