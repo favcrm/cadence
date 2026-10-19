@@ -353,6 +353,9 @@
   color: var(--color-ink-300);
   font-size: var(--text-label);
   white-space: pre-wrap;
+  max-height: 6rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   overflow-wrap: anywhere;
 }
 .threads-replyctx-meta {
