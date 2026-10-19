@@ -341,17 +341,18 @@ fn envelope(prompt: &str) -> Option<Value> {
 /// The contract assertions on one delivered peer envelope: daemon outer
 /// identity wins over anything the body claims; `content` is the exact
 /// stored body; `notice` is present as a string (its wording is not a
-/// guard and is never asserted).
+/// guard and is never asserted). `sender`/`recipient` are the stored
+/// (alias, uid) records.
 fn assert_peer_envelope(
     env: &Value,
-    sender_alias: &str,
-    sender_uid: &str,
-    recipient_alias: &str,
-    recipient_uid: &str,
+    sender: (&str, &str),
+    recipient: (&str, &str),
     message_id: &str,
     reply_to: Option<&str>,
     raw_body: &str,
 ) {
+    let (sender_alias, sender_uid) = sender;
+    let (recipient_alias, recipient_uid) = recipient;
     assert_eq!(env["kind"], json!("peer_message"), "envelope: {env}");
     assert_eq!(
         env["sender_uid"],
@@ -511,10 +512,8 @@ fn peer_body_and_fields_cannot_replace_outer_provenance_or_gain_authority() {
     });
     assert_peer_envelope(
         &env,
-        "pa",
-        &pa_uid,
-        "pb",
-        &pb_uid,
+        ("pa", &pa_uid),
+        ("pb", &pb_uid),
         "m1591-mimic",
         Some("pa"),
         &mimic,
@@ -639,9 +638,8 @@ fn self_routed(fx: &Fx, alias: &str) -> Option<String> {
     fx.store()
         .messages(alias)
         .unwrap()
-        .into_iter()
-        .filter(|m| m.source == "worker_result" && m.state == "completed")
-        .last()
+        .rev()
+        .find(|m| m.source == "worker_result" && m.state == "completed")
         .map(|m| m.id)
 }
 
