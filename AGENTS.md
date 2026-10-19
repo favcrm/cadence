@@ -65,7 +65,7 @@ the code you just wrote.
 - The evidence is what the computed class requires. `routine` needs the
   required base CI on the exact head and genuine ticket-outcome evidence
   — no mandatory review, and no fabricated PASS to stand in for one.
-  `consequential` and `sensitive` add one or two independent reviews of
+  `consequential` and `strict` add one or two independent reviews of
   the code against the ticket, as the class states. Do not add routine
   unit tests, snapshot or fixture tests, stress runs, sandbox demos or
   evidence ledgers unless the ticket asks for one. For a bug fix, show
@@ -87,17 +87,19 @@ the code you just wrote.
 
 - **Two axes, and they are independent.** The *delivery class* says what
   evidence a PR needs; the *risk class* says who signs it off. The class
-  comes from the diff, so one repo can be `routine` on one PR and
-  `sensitive` on another.
+  comes from the diff, so one repo can be `routine` on one PR and `strict`
+  on another. The evaluator returns three classes:
   - `routine` — required base CI plus genuine ticket-outcome evidence;
     zero mandatory reviews; no fabricated PASS.
-  - `consequential` — one independent combined review.
-  - `sensitive` — full checks, one security-capable combined review and a
-    real exact-head operator approval.
-  - `strict` — the fail-closed fallback: policy inactive, malformed or
-    unapproved, path lists unreadable, or diff evidence incomplete
-    (deletes, renames, mode or type changes, unknown paths, empty diff).
-    It keeps today's legacy floor and never fewer.
+  - `consequential` — one independent combined review, no operator
+    approval.
+  - `strict` — risk triggers, human-class paths, the one-review excluded
+    paths (trust boundary, identity, secrets) and an oversize diff, plus
+    deletes, renames, mode or type changes, an unreadable path list, or a
+    malformed, unapproved or absent policy. It keeps today's legacy floor
+    and never fewer: one combined review on the one-review list, else two
+    (Standards and Spec/security); the operator floor on human-class paths
+    and over 1500 changed lines; full checks; Browser QA on `ui/**`.
 - One independent review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
   path that does not (trust boundary, identity, secrets, `ui/**`) needs
