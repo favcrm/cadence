@@ -335,6 +335,7 @@ fn rpc(state_dir: &Path, method: &str, params: Value) -> HttpResp {
             let status = match code.as_str() {
                 "capability_unavailable" => 503,
                 "insufficient_scope" | "not_permitted" | "recipient_class_unsupported" => 403,
+                "revision_conflict" => 409,
                 "not_found" => 404,
                 _ => 400,
             };
@@ -588,6 +589,58 @@ fn dispatch(
             "cli_verb_refused",
             "team_list has no local counterpart in this build",
         ),
+        // CAD-1586: settings management relays to the daemon's
+        // `cli_settings_command` — the envelope is forwarded verbatim
+        // (`cli_envelope`) and re-verified against the daemon's own
+        // trust root, so a relayed call can never widen into local
+        // operator authority. The op's settings.* scope and the
+        // principal class are enforced daemon-side; this relay carries
+        // no more than the signed envelope proves.
+        Verb::SettingsAgents => {
+            let mut params = args.clone();
+            if params.get("operation").and_then(Value::as_str).is_none() {
+                return cli_fail(
+                    400,
+                    "invalid_request",
+                    "settings_agents needs arguments.operation",
+                );
+            }
+            params["cli_envelope"] = json!(envelope);
+            rpc(state_dir, "cli_settings_command", params)
+        }
+        // CAD-1586: master launch diagnosis — a strict translation
+        // into the shared settings command path (`master.status` in
+        // the op table), never a separate handler. Args admit only an
+        // optional `grant_id`; anything else is refused before relay.
+        // The envelope rides verbatim and is re-verified daemon-side,
+        // so this relay grants no authority the claim lacks.
+        Verb::MasterStatus => {
+            if let Some(object) = args.as_object() {
+                for key in object.keys() {
+                    if key != "grant_id" {
+                        return cli_fail(
+                            400,
+                            "invalid_request",
+                            "master_status arguments admit only 'grant_id'",
+                        );
+                    }
+                }
+            }
+            let mut op_payload = serde_json::Map::new();
+            if let Some(grant) = args.get("grant_id").and_then(Value::as_str) {
+                op_payload.insert("grant_id".to_string(), json!(grant));
+            }
+            rpc(
+                state_dir,
+                "cli_settings_command",
+                json!({
+                    "cli_envelope": envelope,
+                    "operation": "master.status",
+                    "expected_revision": Value::Null,
+                    "payload": Value::Object(op_payload),
+                }),
+            )
+        }
         // ---- cli.write ----
         Verb::IssueNew => match pm_at(pm_dir) {
             Err(resp) => resp,

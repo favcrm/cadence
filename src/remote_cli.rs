@@ -97,7 +97,37 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_set",
     "project_policy",
     "message_send",
+    // CAD-1586 / AOS-290: scoped settings + master diagnostics.
+    "settings_agents",
+    "master_status",
 ];
+
+/// CAD-1586 / AOS-290: `settings_agents` carries the explicit
+/// `{operation, expected_revision, payload}` resource command for
+/// Settings > Agents — the same object the local `agent_settings_command`
+/// RPC takes, forwarded verbatim to the hosted daemon. `master_status`
+/// takes no arguments. Both mint narrow envelopes (`settings.read` /
+/// `settings.write` per operation; `settings.read` for master status)
+/// instead of the broad cli.* pair the other verbs request.
+pub const REMOTE_SETTINGS_VERB: &str = "settings_agents";
+pub const REMOTE_MASTER_STATUS_VERB: &str = "master_status";
+
+/// The hosted scope a `settings_agents` operation needs — the AOS-290
+/// operation table in `hosted-cadence-auth.ts` classifies the same names;
+/// anything not an explicit read fails closed as a write.
+pub fn settings_op_scope(operation: &str) -> &'static str {
+    match operation {
+        "snapshot" | "history" | "master.status" | "harness.list" | "harness.show"
+        | "provider.list" | "provider.show" | "model.list" | "model.show" | "role.list"
+        | "profile.list" | "profile.show" | "profile.preview" | "pin.list" | "grant.list" => {
+            "settings.read"
+        }
+        // master.resume is write explicitly — it starts a process;
+        // every other non-read fails closed the same way.
+        "master.resume" => "settings.write",
+        _ => "settings.write",
+    }
+}
 
 /// The wiki actions this build sends over `/__platform/wiki/call` (CAD-1401,
 /// CAD-914): `enumerate` is `wiki ls` or `wiki search`, `read` is `wiki cat`,
@@ -274,6 +304,10 @@ const CAPABILITIES: &[&str] = &[
     "wiki.write",
     "web.read",
     "web.prepare",
+    // CAD-1586: settings management scopes are opt-in like wiki — an
+    // existing login without them stays valid for every other verb.
+    "settings.read",
+    "settings.write",
 ];
 const RENEW_BEFORE: u64 = 60;
 const SKEW: u64 = 5;
@@ -1028,6 +1062,17 @@ fn call_once(
     deadline: Instant,
 ) -> Result<(u16, Option<u64>, Option<Value>)> {
     let scopes: &[&str] = match surface {
+        // CAD-1586: the settings verb mints a narrow envelope scoped to
+        // the operation (read vs write); master status exposes the
+        // configured model/allowlist, so it mints settings.read (manager
+        // ruling — generic cli.read never implies Settings access).
+        Surface::Cli if verb == REMOTE_SETTINGS_VERB => &[settings_op_scope(
+            arguments
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )],
+        Surface::Cli if verb == REMOTE_MASTER_STATUS_VERB => &["settings.read"],
         Surface::Cli => &["cli.read", "cli.write"],
         Surface::Wiki if verb == "write" => &["wiki.write"],
         Surface::Wiki => &["wiki.read"],
@@ -1515,11 +1560,17 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
             // — the payload `write_reply` maps a stale `if_rev` to) is a
             // definite "not written" verdict, never a refusal of the
             // call itself and never retried. The body rides up so the
-            // CLI can print `current_rev`/`card` for the caller to
-            // resync on the spot. A 409 without that shape is the same
-            // generic refusal as any other unhandled status.
+            // CLI can resync on the spot. Settings RPC uses the typed
+            // `{ok:false,error:{code:"revision_conflict",message}}` shape.
+            // Other 409 bodies remain generic refusals.
             match body {
-                Some(b) if b.get("conflict").is_some() => Verdict::Conflict(b),
+                Some(b)
+                    if b.get("conflict").is_some()
+                        || b.pointer("/error/code").and_then(Value::as_str)
+                            == Some("revision_conflict") =>
+                {
+                    Verdict::Conflict(b)
+                }
                 _ => Verdict::Done(Err(refusal_error(status, body.as_ref()))),
             }
         }
@@ -1999,6 +2050,36 @@ fn call_verb_until_retry(
                      workspace owner grants with {scope}"
                 )));
             }
+        }
+        // CAD-1586: `settings_agents` needs the operation's narrow
+        // settings.* scope; `master_status` needs settings.read. A login
+        // without the needed scope is refused here, before a request is
+        // built — never downgraded to another verb or the local org.
+        if verb == REMOTE_SETTINGS_VERB && !cred.capabilities.is_empty() {
+            let operation = arguments
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let scope = settings_op_scope(operation);
+            if !cred.capabilities.iter().any(|c| c == scope) {
+                return Err(reject(format!(
+                    "`settings agents` operation '{operation}' needs the {scope} \
+                     capability, which this remote login lacks — nothing was sent. \
+                     `cadence login` does not request settings access by default; \
+                     settings access needs a login the workspace owner grants with {scope}"
+                )));
+            }
+        }
+        if verb == REMOTE_MASTER_STATUS_VERB
+            && !cred.capabilities.is_empty()
+            && !cred.capabilities.iter().any(|c| c == "settings.read")
+        {
+            return Err(reject(
+                "`master status` needs the settings.read capability, which this \
+                 remote login lacks — nothing was sent. `cadence login` does not \
+                 request settings access by default; it needs a login the workspace \
+                 owner grants with settings.read",
+            ));
         }
         if Instant::now() >= deadline {
             return Err(Error::busy_coded(

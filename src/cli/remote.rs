@@ -585,6 +585,34 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             }
             "message_inbox"
         }
+        // CAD-1586: `cadence master status` on a remote org — the hosted
+        // `master_status` verb (settings.read) carrying only an optional
+        // grant id; it translates to the same `master.status` settings
+        // operation the local RPC path takes.
+        Commands::Master {
+            action: MasterAction::Status { grant },
+        } => {
+            if let Some(id) = grant {
+                args.insert("grant_id".into(), json!(id));
+            }
+            "master_status"
+        }
+        // CAD-1586: `cadence master resume` on a remote org — the bounded
+        // recovery action rides the existing `settings_agents` verb as
+        // operation `master.resume` (settings.write; no dedicated hosted
+        // verb, no caller-supplied alias).
+        Commands::Master {
+            action: MasterAction::Resume { grant },
+        } => {
+            args.insert("operation".into(), json!("master.resume"));
+            args.insert("expected_revision".into(), Value::Null);
+            let mut payload = serde_json::Map::new();
+            if let Some(id) = grant {
+                payload.insert("grant_id".into(), json!(id));
+            }
+            args.insert("payload".into(), Value::Object(payload));
+            "settings_agents"
+        }
         _ => return Err(unavailable(command)),
     };
     Ok((verb, args))
@@ -1117,7 +1145,7 @@ fn unavailable(command: &Commands) -> Error {
          issue show, issue log, issue new, issue comment, issue set, \
          send/message send (--message required), message read, inbox (peek), \
          issue project policy, wiki ls, wiki search, wiki cat, \
-         wiki put (text), wiki cp. \
+         wiki put (text), wiki cp, settings agents <verb>, master status. \
          Use `--org local` or `cadence org switch` to run locally.",
         name(command)
     ))
@@ -1155,6 +1183,8 @@ fn name(command: &Commands) -> &'static str {
         Commands::Send { .. } => "send",
         Commands::Inbox { .. } => "inbox",
         Commands::Status { .. } => "status",
+        Commands::Settings { .. } => "settings agents <verb>",
+        Commands::Master { .. } => "master <verb>",
         _ => "<command>",
     }
 }
@@ -1172,6 +1202,49 @@ pub(super) fn run(
 ) -> Result<i32> {
     if let Commands::Org { action } = command {
         return org::run(action);
+    }
+    // CAD-1586: remote settings authority is the stored LOGIN credential —
+    // the gateway mints an envelope from it, and a `user`+`owner` envelope
+    // lands as RemoteOwner: blanket settings authority with no agent
+    // grant binding. A managed caller (CADENCE_ALIAS — worker, master or
+    // a daemon-approved argv child under CADENCE_GRANT_TOKEN) spending it
+    // would impersonate the human owner. There is no client-side
+    // agents/<h> credential path yet (remote_auth notes per-agent
+    // enrollment is not configured), so remote settings verbs are refused
+    // for managed callers outright — never narrowed to "no grant" and
+    // never silently allowed. Operators on their own shell unaffected.
+    if (matches!(&command, Commands::Settings { .. })
+        || matches!(
+            &command,
+            Commands::Master {
+                action: MasterAction::Status { .. } | MasterAction::Resume { .. },
+            }
+        ))
+        && (target.identity.is_some()
+            || std::env::var_os("CADENCE_ALIAS").is_some()
+            || std::env::var_os("CADENCE_GRANT_TOKEN").is_some())
+    {
+        return Err(Error::invalid(
+            "settings_agent_session_required",
+            format!(
+                "remote `{}` refused for a managed caller: the call would spend the \
+             stored owner login — owner-class settings authority an agent can \
+             never hold — and there is no hosted agent-principal credential to \
+             bind a settings grant to yet; the operator runs this from a plain \
+             shell, or grant-bound ops run on the local daemon (`cadence \
+             settings agents grant request …`)",
+                name(&command)
+            ),
+        ));
+    }
+    // CAD-1586: resource commands carry their payloads directly through the
+    // explicit `settings_agents` verb before the generic
+    // verb map; nothing settings-shaped ever falls back to local state.
+    if let Commands::Settings {
+        action: settings::SettingsAction::Agents { action, grant },
+    } = &command
+    {
+        return settings::run_remote(&target, action, grant, wake_timeout, local_state.as_deref());
     }
     if let Commands::LocalAgent { action } = &command {
         return local_agent::run(&target, action, wake_timeout, local_state);
@@ -1331,7 +1404,7 @@ pub(super) fn run(
     }
 }
 
-fn remote_failure(error: Error) -> Result<i32> {
+pub(super) fn remote_failure(error: Error) -> Result<i32> {
     if error.kind() == "busy" && error.code() == Some("waking") {
         eprintln!("{}", json!({"kind": "busy", "state": "waking"}));
         Ok(75)

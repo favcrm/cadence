@@ -202,6 +202,25 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     // campaign before the operator applies it.
     "Bash(cadence app content assistant-proposals *)",
     "Bash(cadence app content assistant-proposal-show *)",
+    // CAD-1586: the bounded Settings > Agents namespace. Every verb is
+    // admitted to the *tool* guard so a granted operation is actually
+    // invocable; authority lives entirely daemon-side — a mutation or
+    // grant decision with no bound settings grant refuses there, so a
+    // broader tool stem cannot widen what an agent may do. The legacy
+    // approved-argv path still never covers settings mutations or
+    // grant verbs (master_perm NEVER list, unchanged).
+    "Bash(cadence settings agents)",
+    "Bash(cadence settings agents *)",
+    // The master's own diagnosis and the granted recovery resume —
+    // `master status` reads only (its daemon op refuses a free agent
+    // read anyway; a designated management agent's exact grant opens
+    // it), `master resume` carries no authority without the bound
+    // `master.resume` settings grant. Neither delegates: argv approval
+    // still cannot mint either (master_perm NEVER list).
+    "Bash(cadence master status)",
+    "Bash(cadence master status *)",
+    "Bash(cadence master resume)",
+    "Bash(cadence master resume *)",
 ];
 
 /// CAD-1098 Gate 1: which tool profile a master session launches with.
@@ -1349,7 +1368,10 @@ fn real_dir(pm_dir: &Path, slug: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn default_template(slug: &str, name: &str) -> Option<&'static str> {
+/// The file `install_defaults` writes when `name` is missing —
+/// `master status` resolves would-be prefs against the same templates
+/// without installing anything.
+pub(crate) fn default_template(slug: &str, name: &str) -> Option<&'static str> {
     match (slug, name) {
         (ALIAS, "SOUL.md") => Some(SOUL_TEMPLATE),
         (ALIAS, "AGENT.md") => Some(AGENT_TEMPLATE),
@@ -1597,6 +1619,27 @@ pub fn verify(state_dir: &Path, slug: &str, files: &[(String, String)]) -> Resul
         record(state_dir, slug, name, &d)?;
     }
     Ok(())
+}
+
+/// The read-only half of [`verify`] (CAD-1586): `Some(reason)` when a
+/// file's current digest contradicts the recorded baseline — the same
+/// refusal `verify` raises — without the trust-once recording `verify`
+/// performs. `master status` reports drift; it never records.
+pub fn tampered_file(state_dir: &Path, slug: &str, files: &[(String, String)]) -> Option<String> {
+    let all = load_records(state_dir);
+    for (name, text) in files {
+        match all[slug][name]["digest"].as_str() {
+            Some(known) if known != digest(text) => {
+                return Some(format!(
+                    "agents/{slug}/{name} changed outside `cadence master edit` — \
+                     `master start` refuses to brief the master from it. Review it, \
+                     then re-save it as the operator: `cadence master edit {name} --file <path>`"
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Longest escalation summary the operator is shown.

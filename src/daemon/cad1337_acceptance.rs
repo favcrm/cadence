@@ -147,12 +147,13 @@ impl Fx {
                     cwd: &cwd,
                     sandbox: "read-only",
                     instructions: None,
-                    params: None,
+                    params: (alias == "master").then_some(r#"{"model":"fixture/model"}"#),
                     team_role: None,
                     model_policy: None,
                 })
                 .unwrap();
         }
+        crate::test_seam::seed_pi_fixture_policy(&shared.store, "fixture/model").unwrap();
         shared
             .store
             .set_identity_with_quota(

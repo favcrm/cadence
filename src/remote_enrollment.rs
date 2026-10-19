@@ -2230,21 +2230,40 @@ pub fn login_browser(
 
 /// Ordinary portal and org-flag logins request CLI and wiki capabilities.
 /// `--web` deliberately requests CLI and Publish Web capabilities instead,
-/// without adding wiki consent. The issuer may narrow the requested set;
-/// accepting a member role never widens it.
+/// without adding wiki consent; `--settings` requests the CLI pair plus the
+/// Settings scopes (`settings.read`, `settings.write` — CAD-1586 remote
+/// `settings agents`/`master status`/`master resume` need them). The two
+/// flags combine. The issuer may narrow the requested set; accepting a
+/// member role never widens it.
 #[derive(Clone, Copy)]
 enum LoginScope {
-    CliAndWiki,
+    Wiki,
     /// CAD-1429: `cadence login --web` asks for the Publish Web scopes on top
     /// of the CLI pair, and only on this explicit request.
-    CliAndWeb,
+    Web,
+    /// CAD-1586: `cadence login --settings` asks for the Settings scopes on
+    /// top of the CLI pair — remote settings verbs refuse without them.
+    Settings,
+    /// Both opt-ins on one consent: `--web --settings`.
+    WebAndSettings,
 }
 
 impl LoginScope {
     fn requested(self) -> Vec<&'static str> {
         match self {
-            LoginScope::CliAndWiki => vec!["cli.read", "cli.write", "wiki.read", "wiki.write"],
-            LoginScope::CliAndWeb => vec!["cli.read", "cli.write", "web.read", "web.prepare"],
+            LoginScope::Wiki => vec!["cli.read", "cli.write", "wiki.read", "wiki.write"],
+            LoginScope::Web => vec!["cli.read", "cli.write", "web.read", "web.prepare"],
+            LoginScope::Settings => {
+                vec!["cli.read", "cli.write", "settings.read", "settings.write"]
+            }
+            LoginScope::WebAndSettings => vec![
+                "cli.read",
+                "cli.write",
+                "web.read",
+                "web.prepare",
+                "settings.read",
+                "settings.write",
+            ],
         }
     }
 }
@@ -2255,17 +2274,19 @@ pub fn login_portal(
     dir: &Path,
     show_code: impl FnOnce(&str, &str) -> Result<()>,
 ) -> Result<LoginGrant> {
-    login_portal_scoped(issuer, hint, dir, show_code, false)
+    login_portal_scoped(issuer, hint, dir, show_code, false, false)
 }
 
-/// The portal login; `web` adds the Publish Web scopes (`cadence login --web`)
-/// and nothing else changes.
+/// The portal login; `web` adds the Publish Web scopes (`cadence login
+/// --web`), `settings` adds the Settings scopes (`cadence login
+/// --settings`), and nothing else changes.
 pub fn login_portal_scoped(
     issuer: &str,
     hint: Option<&str>,
     dir: &Path,
     show_code: impl FnOnce(&str, &str) -> Result<()>,
     web: bool,
+    settings: bool,
 ) -> Result<LoginGrant> {
     let issuer = origin(issuer, cfg!(test))?;
     login_device_flow(
@@ -2275,10 +2296,11 @@ pub fn login_portal_scoped(
         dir,
         show_code,
         &mut RealLoginRuntime,
-        if web {
-            LoginScope::CliAndWeb
-        } else {
-            LoginScope::CliAndWiki
+        match (web, settings) {
+            (true, true) => LoginScope::WebAndSettings,
+            (true, false) => LoginScope::Web,
+            (false, true) => LoginScope::Settings,
+            (false, false) => LoginScope::Wiki,
         },
     )
 }
@@ -2302,7 +2324,7 @@ fn login_browser_with(
         dir,
         show_code,
         runtime,
-        LoginScope::CliAndWiki,
+        LoginScope::Wiki,
     )
 }
 
@@ -4312,7 +4334,7 @@ mod tests {
             dir,
             |_, _| Ok(()),
             &mut runtime,
-            LoginScope::CliAndWiki,
+            LoginScope::Wiki,
         );
         (out, runtime)
     }
@@ -4337,7 +4359,7 @@ mod tests {
             dir,
             |_, _| Ok(()),
             &mut runtime,
-            LoginScope::CliAndWiki,
+            LoginScope::Wiki,
         );
         (out, runtime)
     }
@@ -4746,7 +4768,7 @@ mod tests {
             &dir,
             |_, _| Ok(()),
             &mut runtime,
-            LoginScope::CliAndWeb,
+            LoginScope::Web,
         );
         let granted = out.expect("a full web consent was refused");
         assert!(granted.capabilities.iter().any(|c| c == "web.prepare"));
@@ -4799,7 +4821,7 @@ mod tests {
                 &dir,
                 |_, _| Ok(()),
                 &mut runtime,
-                LoginScope::CliAndWeb,
+                LoginScope::Web,
             );
             assert!(out.is_err(), "web consent case {case} was accepted");
             assert_nothing_stored(&dir);
@@ -4839,7 +4861,7 @@ mod tests {
             &dir,
             |_, _| Ok(()),
             &mut runtime,
-            LoginScope::CliAndWiki,
+            LoginScope::Wiki,
         );
         assert!(out.is_err());
         assert!(runtime.requests.is_empty(), "pin conflict reached issuer");

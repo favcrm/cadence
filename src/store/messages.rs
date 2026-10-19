@@ -2485,6 +2485,21 @@ impl Store {
         self.message_in(&conn, id)
     }
 
+    /// Whether a message row with this id exists. A bare existence probe
+    /// for send paths that must not decode the full row.
+    pub fn message_exists(&self, id: &str) -> Result<bool> {
+        let conn = self.conn();
+        match conn.query_row(
+            "SELECT 1 FROM messages WHERE id=? LIMIT 1",
+            [id],
+            |_| Ok(()),
+        ) {
+            Ok(()) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Whether an agent caller may read this message body. The row must
     /// name the alias, and a known recipient UID must be the alias's
     /// CURRENT UID; a legacy NULL UID counts only from the current

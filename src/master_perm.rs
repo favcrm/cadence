@@ -338,10 +338,13 @@ fn never_why(argv: &[String], cwd: &Path, state_dirs: &[&Path]) -> Option<&'stat
                 || (w[0] == "master"
                     && matches!(
                         w[1],
-                        "allow-once" | "always-allow" | "reject" | "revoke-permission"
+                        "allow-once" | "always-allow" | "reject" | "revoke-permission" | "resume"
                     ))
         })
     {
+        // CAD-1586: `master resume` is lifecycle authority carried by a
+        // settings grant, never by an approved argv — a granted child
+        // runs it only as the bound agent, so it is never requestable.
         return Some("daemon restart and permission decisions are never requestable");
     }
     if cadence
@@ -352,6 +355,22 @@ fn never_why(argv: &[String], cwd: &Path, state_dirs: &[&Path]) -> Option<&'stat
         // CAD-918: a granted child runs with operator authority, so
         // neither an approval nor a designation can be requested.
         return Some("audit approve and audit designate are never requestable");
+    }
+    if cadence && has("settings") {
+        // CAD-1586: reads stay requestable — an approved child may read
+        // settings (argv approval is enough for a read). Mutations, the
+        // catalog fetch and every grant verb are not: argv never binds
+        // payload bytes, and a granted child can never mint settings
+        // delegation.
+        const NEVER_SETTINGS: &[&str] = &[
+            "apply", "put", "remove", "rename", "scope", "set", "clear", "import", "sync", "grant",
+            "refresh",
+        ];
+        if tokens.iter().any(|t| NEVER_SETTINGS.contains(t)) {
+            return Some(
+                "settings mutations, the catalog fetch and grant verbs are never requestable",
+            );
+        }
     }
     if argv.iter().any(|a| protected_file(a)) || edit_target_protected(argv) {
         return Some("the master's SOUL.md, AGENT.md and permissions.yaml are never requestable");

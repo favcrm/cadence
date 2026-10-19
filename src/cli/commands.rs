@@ -54,6 +54,13 @@ pub(crate) enum Commands {
         /// and grants no web authority.
         #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
         web: bool,
+        /// CAD-1586: also request the Settings scopes (`settings.read`,
+        /// `settings.write`) for this consent — required before remote
+        /// `settings agents`, `master status` or `master resume` can run.
+        /// Combines with `--web`; without it the login is unchanged and
+        /// grants no settings authority.
+        #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
+        settings: bool,
     },
     /// Inspect or remove local AgenticOS credentials.
     Auth {
@@ -1293,6 +1300,16 @@ pub(crate) enum Commands {
     Secret {
         #[command(subcommand)]
         action: SecretAction,
+    },
+    /// Settings surfaces. `settings agents` manages the Settings >
+    /// Agents document — harnesses, providers, models, catalogs, role
+    /// defaults, profiles and extension pins — through the daemon's
+    /// revision-checked transaction shared with the board. Every
+    /// mutation takes `--expected-revision` from `settings agents
+    /// show`; a stale token is a conflict, never a silent retry.
+    Settings {
+        #[command(subcommand)]
+        action: settings::SettingsAction,
     },
     /// The read-only board UI + JSON API on loopback.
     Ui {

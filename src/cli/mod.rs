@@ -19,6 +19,8 @@ mod backup;
 mod briefing;
 mod build_slot;
 mod business_templates;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1586_managed_settings_acceptance;
 mod claude;
 mod client_update;
 mod codex;
@@ -73,6 +75,7 @@ mod secret;
 mod self_info;
 mod send;
 mod session;
+mod settings;
 mod setup;
 mod skill;
 mod staging;
@@ -1852,6 +1855,22 @@ fn permission_replay(state_dir: &Path, cli: &Cli) -> Option<i32> {
     // must finish for every tracker write, including verdicts.
     if let Commands::Issue {
         action: cadence_agent::issue::cli::IssueAction::Lint { .. },
+    } = &cli.command
+    {
+        return None;
+    }
+    // CAD-1586: `cadence settings …` and `master status`/`master resume`
+    // carry their own authorization — the daemon's settings grant gate
+    // decides (operator runs free, a designated caller needs a bound
+    // settings grant). `master_perm` never-lists these, so the approved-
+    // argv replay below could only refuse them, which would shadow the
+    // exact-payload grant binding behind a different gate. Nothing else
+    // is exempted: every other master verb still goes through replay.
+    if let Commands::Settings { .. } = &cli.command {
+        return None;
+    }
+    if let Commands::Master {
+        action: master::MasterAction::Status { .. } | master::MasterAction::Resume { .. },
     } = &cli.command
     {
         return None;
