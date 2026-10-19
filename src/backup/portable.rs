@@ -1143,7 +1143,199 @@ fn refuse_output_in_tracker(out: &Path, tracker: &Path) -> Result<()> {
 /// Read-only inspection through the same integrity, catalog and authority
 /// checks as inactive restore. A valid manifest is not source authenticity,
 /// present-day source fidelity, or destination/import admission.
-pub fn inspect_portable(source: &Path) -> Result<Value> {
+/// A portable package that passed every inspection check: the verified
+/// manifest, the exact manifest bytes and their sha256, and the inspection
+/// report `inspect-portable` prints. Transfer callers bind the digest of
+/// these exact bytes — the file is hashed once, never re-read.
+pub struct VerifiedPackage {
+    pub manifest: PortableManifest,
+    pub manifest_bytes: Vec<u8>,
+    pub manifest_sha256: String,
+    pub report: Value,
+}
+
+/// `inspect_portable` plus the verified package internals a remote transfer
+/// needs (the exact manifest bytes and member list). One verification pass.
+pub fn verify_transfer_package(source: &Path) -> Result<VerifiedPackage> {
+    let inspected = inspect_package(source)?;
+    if inspected.manifest_bytes.len() > TRANSFER_MANIFEST_MAX {
+        return Err(Error::rejected(
+            "package manifest exceeds the transfer limit",
+        ));
+    }
+    if inspected.manifest.members.len() > TRANSFER_MEMBERS_MAX {
+        return Err(Error::rejected(
+            "package member count exceeds the transfer limit",
+        ));
+    }
+    admit_transfer_manifest(&inspected.manifest_bytes, &inspected.manifest.members)?;
+    Ok(inspected)
+}
+
+/// Transfer-only admission that mirrors the hosted manifest parser's closed
+/// schema and inventory bounds, so the client never offers a package the
+/// server always refuses. Pure over the manifest bytes: nothing here reads a
+/// member file. Shared local-restore verification is unchanged.
+fn admit_transfer_manifest(manifest_bytes: &[u8], members: &[Member]) -> Result<()> {
+    let raw: Value = serde_json::from_slice(manifest_bytes)
+        .map_err(|_| Error::rejected("package manifest is not valid JSON"))?;
+    let top = raw
+        .as_object()
+        .ok_or_else(|| Error::rejected("package manifest is not a JSON object"))?;
+    if top
+        .keys()
+        .any(|key| !TRANSFER_MANIFEST_KEYS.contains(&key.as_str()))
+    {
+        return Err(Error::rejected(
+            "package manifest has a key the transfer schema does not admit",
+        ));
+    }
+    if let Some(raw_members) = top.get("members").and_then(Value::as_array) {
+        for raw_member in raw_members {
+            let closed = raw_member.as_object().is_some_and(|object| {
+                object.len() == 3
+                    && ["path", "bytes", "sha256"]
+                        .iter()
+                        .all(|key| object.contains_key(*key))
+            });
+            if !closed {
+                return Err(Error::rejected(
+                    "package member has a key the transfer schema does not admit",
+                ));
+            }
+        }
+    }
+    let inventory_bytes = transfer_inventory_bytes(manifest_bytes, members)?;
+    for member in members {
+        if member.path.encode_utf16().count() > TRANSFER_MEMBER_PATH_MAX_UNITS {
+            return Err(Error::rejected(
+                "package member path exceeds the transfer limit",
+            ));
+        }
+        if member.bytes > TRANSFER_MEMBER_MAX_BYTES {
+            return Err(Error::rejected(
+                "package member exceeds the transfer size limit",
+            ));
+        }
+    }
+    if inventory_bytes > TRANSFER_INVENTORY_MAX_BYTES {
+        return Err(Error::rejected(
+            "package inventory exceeds the transfer size limit",
+        ));
+    }
+    Ok(())
+}
+
+/// Hosted inventory total: declared member bytes plus the manifest's own bytes
+/// (the sealed inventory adds `manifest.json` as one more member). The single
+/// source for both transfer admission and the preflight comparison, so the
+/// client refuses exactly what the server refuses. Errors on overflow.
+pub fn transfer_inventory_bytes(manifest_bytes: &[u8], members: &[Member]) -> Result<u64> {
+    members
+        .iter()
+        .try_fold(manifest_bytes.len() as u64, |sum, m| {
+            sum.checked_add(m.bytes)
+        })
+        .ok_or_else(|| Error::rejected("package inventory exceeds the transfer size limit"))
+}
+
+#[cfg(test)]
+mod transfer_admission_tests {
+    use super::*;
+
+    fn manifest_with(members: &str) -> Vec<u8> {
+        format!(
+            "{{\"format\":\"cadence.portable/1\",\"scope\":\"x\",\"full_workspace\":false,\"created_at\":\"2026-01-01T00:00:00Z\",\"source_uuid\":\"u\",\"cadence\":\"1\",\"schema_version\":1,\"tracker_revision\":\"r\",\"pm_root\":null,\"tables\":[],\"omitted_tables\":[],\"omitted_rows\":[],\"nulled_columns\":[],\"disabled_columns\":[],\"exclusions\":[],\"redacted_message_bodies\":null,\"members\":{members}}}"
+        )
+        .into_bytes()
+    }
+
+    fn member(path: &str, bytes: u64) -> Member {
+        Member {
+            path: path.into(),
+            bytes,
+            sha256: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn extra_member_key_is_refused_without_echoing_it() {
+        let bytes =
+            manifest_with("[{\"path\":\"a\",\"bytes\":1,\"sha256\":\"aa\",\"note\":\"secret-x\"}]");
+        let err = admit_transfer_manifest(&bytes, &[member("a", 1)]).unwrap_err();
+        let text = format!("{err:?}");
+        assert!(text.contains("transfer schema does not admit"));
+        assert!(!text.contains("secret-x"));
+    }
+
+    #[test]
+    fn closed_member_object_is_admitted() {
+        let bytes = manifest_with("[{\"path\":\"a\",\"bytes\":1,\"sha256\":\"aa\"}]");
+        assert!(admit_transfer_manifest(&bytes, &[member("a", 1)]).is_ok());
+    }
+
+    #[test]
+    fn long_member_path_is_refused() {
+        let bytes = manifest_with("[]");
+        let long = "x".repeat(TRANSFER_MEMBER_PATH_MAX_UNITS + 1);
+        assert!(admit_transfer_manifest(&bytes, &[member(&long, 1)]).is_err());
+    }
+
+    #[test]
+    fn oversized_member_is_refused() {
+        let bytes = manifest_with("[]");
+        let over = TRANSFER_MEMBER_MAX_BYTES + 1;
+        assert!(admit_transfer_manifest(&bytes, &[member("a", over)]).is_err());
+    }
+
+    #[test]
+    fn inventory_total_includes_manifest_bytes_and_is_capped() {
+        let bytes = manifest_with("[]");
+        // Members sum to exactly the cap, but the manifest's own bytes push it over.
+        let members_sum = TRANSFER_INVENTORY_MAX_BYTES - bytes.len() as u64 + 1;
+        let total = transfer_inventory_bytes(&bytes, &[member("a", members_sum)]).unwrap();
+        assert_eq!(total, TRANSFER_INVENTORY_MAX_BYTES + 1);
+        assert!(admit_transfer_manifest(&bytes, &[member("a", members_sum)]).is_err());
+    }
+}
+/// The 17 top-level keys the hosted manifest parser admits.
+const TRANSFER_MANIFEST_KEYS: &[&str] = &[
+    "format",
+    "scope",
+    "full_workspace",
+    "created_at",
+    "source_uuid",
+    "cadence",
+    "schema_version",
+    "tracker_revision",
+    "pm_root",
+    "tables",
+    "omitted_tables",
+    "omitted_rows",
+    "nulled_columns",
+    "disabled_columns",
+    "exclusions",
+    "redacted_message_bodies",
+    "members",
+];
+/// Hosted member path bound, counted in UTF-16 code units (JavaScript length).
+pub const TRANSFER_MEMBER_PATH_MAX_UNITS: usize = 512;
+/// Hosted per-member byte bound (512 MiB).
+pub const TRANSFER_MEMBER_MAX_BYTES: u64 = 512 * 1024 * 1024;
+/// Hosted inventory total bound (2 GiB): members plus the manifest's own bytes.
+pub const TRANSFER_INVENTORY_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Transfer bounds the hosted packed-v1 endpoint enforces. The CLI refuses a
+/// package outside them before any byte is sent; the server stays the
+/// enforcement of record.
+pub const TRANSFER_MANIFEST_MAX: usize = 4 * 1024 * 1024;
+/// Logical data members cap (19,998). The sealed inventory adds `manifest.json`
+/// as one separate entry (19,999 total), which is not counted here. The hosted
+/// manifest parser admits 19,998 declared members, so this client-side refusal
+/// matches the server bound instead of admitting what the server rejects.
+pub const TRANSFER_MEMBERS_MAX: usize = 19998;
+
+fn inspect_package(source: &Path) -> Result<VerifiedPackage> {
     if !source.symlink_metadata()?.is_dir() {
         return Err(Error::rejected("package is not a plain directory"));
     }
@@ -1151,8 +1343,9 @@ pub fn inspect_portable(source: &Path) -> Result<Value> {
     // Reject linked directories before reading any listed member through them.
     let mut paths = Vec::new();
     collect_package_members(source, source, &mut paths)?;
-    let (manifest_sha256, _) = hash_file(&source.join(PKG_MANIFEST))?;
-    let manifest = verify_package(source)?;
+    let manifest_bytes = fs::read(source.join(PKG_MANIFEST))?;
+    let manifest_sha256 = format!("{:x}", Sha256::digest(&manifest_bytes));
+    let manifest = verify_manifest_bytes(source, &manifest_bytes)?;
     // Ordinary read-only SQLite opens can still create WAL/SHM files.
     // Native exports are rollback-journal single-file databases; admit that
     // header before any SQLite connection touches the supplied package.
@@ -1184,7 +1377,7 @@ pub fn inspect_portable(source: &Path) -> Result<Value> {
             .checked_add(member.bytes)
             .ok_or_else(|| Error::rejected("package byte total overflows"))
     })?;
-    Ok(json!({
+    let report = json!({
         "status": "verified_coordination_package",
         "portable": true,
         "bundle": source,
@@ -1212,7 +1405,20 @@ pub fn inspect_portable(source: &Path) -> Result<Value> {
         },
         "source_fidelity": "not_independently_established",
         "import_ready": false
-    }))
+    });
+    Ok(VerifiedPackage {
+        manifest,
+        manifest_bytes,
+        manifest_sha256,
+        report,
+    })
+}
+
+/// Independently inspect a portable coordination package, read-only. Prints
+/// integrity, schema and exclusion evidence; does not restore, start a daemon,
+/// or establish import readiness.
+pub fn inspect_portable(source: &Path) -> Result<Value> {
+    Ok(inspect_package(source)?.report)
 }
 
 fn refuse_existing(out: &Path) -> Result<()> {
@@ -2289,9 +2495,16 @@ fn publish_stage(stage: &Path, destination: &Path) -> Result<()> {
 /// the exact member set (core store plus tracker files, nothing else),
 /// exact bytes and sha256, and only regular non-linked files.
 fn verify_package(source: &Path) -> Result<PortableManifest> {
-    let text = fs::read_to_string(source.join(PKG_MANIFEST))
+    let bytes = fs::read(source.join(PKG_MANIFEST))
         .map_err(|e| Error::rejected(format!("cannot read manifest: {e}")))?;
-    let manifest: PortableManifest = serde_json::from_str(&text)
+    verify_manifest_bytes(source, &bytes)
+}
+
+/// The manifest bytes parsed and every member check applied.
+/// Verification works on the caller-supplied exact bytes, so the digest a
+/// caller binds is provably the digest of what was checked.
+fn verify_manifest_bytes(source: &Path, manifest_bytes: &[u8]) -> Result<PortableManifest> {
+    let manifest: PortableManifest = serde_json::from_slice(manifest_bytes)
         .map_err(|e| Error::rejected(format!("malformed manifest: {e}")))?;
     if manifest.format != PORTABLE_FORMAT
         || manifest.scope != "coordination"

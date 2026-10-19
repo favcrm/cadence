@@ -488,6 +488,49 @@ bytes, not a producer who rewrites both the package and its manifest.
 Neither command grants an agent new source access or production privileges,
 uploads data, imports a tenant, reconnects executors or activates a root.
 
+## Hosted portable migration
+
+`cadence --org <saved-org> restore --portable` uses the registered issuer's
+`/v1/hosted-cadence/portable-migrations` API. It requires a compatible hosted
+deployment, an enrolled CLI session and current workspace-owner membership;
+the workspace header is a binding, not authority. Local controller admission
+and activation are unchanged.
+
+- `restore --portable /private/package --preflight` verifies the package
+  locally and reads the destination binding without uploading or replacing.
+- `restore --portable /private/package --request-id <stable-id>` uploads an
+  inactive import. Keep the request id before sending anything.
+- Add `--replace` and the exact `--expected-package-digest`,
+  `--expected-destination-digest` and `--expected-generation` from preflight
+  for an explicit replacement. The hosted service retains and verifies the
+  old root before selecting a new epoch.
+- `restore --portable --status <operation-id>` reads durable status.
+  If the begin response was lost, use `--status request:<stable-id>`.
+  Neither status form needs the source package or repeats a mutation.
+- `restore --portable --rollback <operation-id>` restores the retained root
+  with the **original** `--request-id` and the current destination digest and
+  generation from status. Rollback is a separate, explicitly bound action.
+
+The remote destination digest binds workspace/root/generation/lease facts;
+it is not a checksum of destination file bytes. Retained-root byte verification
+is separate. Uploads use the sealed packed-v1 member inventory and are checked
+against the local manifest; the client sends each step at most once. Before any
+manifest or pack upload, the
+client reads `GET /:operationId/inputs` and skips only the manifest and packs
+the server reports as durably completed. Untouched pending spans upload under
+the same operation and request id. An unknown or unrecognized input effect
+stops the upload with no re-send; recover with `--status <operation-id>`
+(or `--status request:<stable-id>`), never by inventing a new id or repeating
+an upload. Packages above 19,998 logical data members are refused; the
+manifest's own inventory entry is the 19,999th.
+
+Imports, replacements and rollbacks remain execution-disabled. A replacement
+does not manufacture native activation receipts, enable imported actors or
+start a master; ordinary wake/store access remains held. A completed mutation
+must carry its terminal receipt. Pending, failed and unknown outcomes exit
+nonzero; a successful status query can report any recorded phase without
+claiming that the migration completed.
+
 ## Exit codes
 
 A failure prints one JSON object on stderr (`{"error", "kind"}`) and exits

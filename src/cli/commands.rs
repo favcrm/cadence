@@ -217,9 +217,16 @@ pub(crate) enum Commands {
     /// state dir, refuses a schema newer than this binary, and refuses to
     /// replace an existing store without `--force`. Repo paths are
     /// rewritten to the `--repo` checkout with the same origin remote.
+    /// On a remote org (`--org`), only `--portable` forms run, against the
+    /// hosted portable-migration contract: `--preflight` is read-only, a
+    /// plain call imports inactive, `--replace` replaces the destination
+    /// with rollback retained, and `--status`/`--rollback` act on a minted
+    /// operation id.
     Restore {
-        /// A backup manifest file, or an export bundle directory.
-        source: PathBuf,
+        /// A backup manifest file, an export bundle directory, or — on a
+        /// remote org — the portable package directory to migrate. Omitted
+        /// only for remote `--status`/`--rollback`.
+        source: Option<PathBuf>,
         /// A checkout on this host, matched to a recorded repo by its
         /// origin remote. Repeat for each repo.
         #[arg(long = "repo")]
@@ -233,47 +240,48 @@ pub(crate) enum Commands {
         /// must be new and empty. `--repo` and `--force` are refused with it.
         /// Replacement (`--replace`) and activation (`--activate`) are
         /// separate actions that need the live controller's operator
-        /// connection.
+        /// connection. On a remote org `--portable` selects the hosted
+        /// migration flow instead.
         #[arg(long)]
         portable: bool,
-        /// With `--portable`: read-only preflight; changes nothing. Needs
-        /// `--controller-state`. Without `--activate` it previews a replacement
-        /// of the offline root at `--state-dir` and prints the package and
-        /// target digests and generation for `--replace`. With `--activate` it
-        /// previews activation and prints `package_digest`,
-        /// `destination_digest`, `destination_generation` and
-        /// `required_reconciliation` (copy its entries into the
-        /// `reconciliation` array of an `--activate` file).
-        #[arg(long, requires = "portable", conflicts_with = "replace")]
+        /// With `--portable`: read-only preflight; changes nothing. Locally
+        /// it needs `--controller-state`; remotely it binds the package
+        /// digest to the destination workspace's digest and generation and
+        /// prints them for `--replace`.
+        #[arg(long, requires = "portable")]
         preflight: bool,
-        /// With `--portable`: replace an offline portable root at
-        /// `--state-dir`. Needs the live controller's operator connection
-        /// (`--controller-state`) and the exact `--expected-*` digests from
-        /// `cadence restore --portable --preflight`. The old root is kept as
-        /// a verified rollback sibling; nothing is deleted.
+        /// With `--portable`: replace the destination root keeping a
+        /// rollback artifact. Locally it replaces the offline root at
+        /// `--state-dir` and needs the live controller's operator connection
+        /// (`--controller-state`). Remotely it needs `--request-id` and the
+        /// exact `--expected-*` digests from `restore --portable
+        /// --preflight`. The old root is kept; nothing is deleted.
         #[arg(long, requires = "portable", conflicts_with = "preflight")]
         replace: bool,
         /// With `--preflight`, `--replace` or `--activate`: the live
         /// controller state dir whose operator connection authorizes the
-        /// request. Never inferred.
+        /// request. Never inferred. Local only — refused on a remote org.
         #[arg(long)]
         controller_state: Option<PathBuf>,
         /// With `--replace` or `--activate` (not `--preflight`): sha256 of the
         /// package `manifest.json`, from the preflight output.
         #[arg(long)]
         expected_package_digest: Option<String>,
-        /// With `--replace` or `--activate` (not `--preflight`): sha256 digest
-        /// of the complete target set, from the preflight output.
+        /// With `--replace`, `--activate` or remote `--rollback`: the
+        /// preflight/status destination digest. Locally it hashes the complete
+        /// target set; remotely it binds the workspace, root, generation and
+        /// lease facts, not the destination's file bytes.
         #[arg(long)]
         expected_destination_digest: Option<String>,
-        /// With `--replace` or `--activate` (not `--preflight`): the target
-        /// generation read by preflight.
+        /// With `--replace`, `--activate` or remote `--rollback`: the target
+        /// generation read by preflight/status.
         #[arg(long)]
         expected_generation: Option<String>,
         /// With `--portable`: activate the inactive root at `--state-dir` in
         /// manual mode, execution disabled. Needs `--controller-state` and the
         /// exact `--expected-*` digests from `--activate --preflight`.
         /// Imported actors stay disabled; nothing is scheduled or dispatched.
+        /// Local only — refused on a remote org.
         #[arg(long, requires = "portable", conflicts_with = "replace")]
         activate: bool,
         /// With `--activate`: JSON reconciliation file. Its `reconciliation`
@@ -281,6 +289,23 @@ pub(crate) enum Commands {
         /// must name each one. Omitted means an empty list.
         #[arg(long, requires = "activate")]
         reconciliation: Option<PathBuf>,
+        /// Remote `--portable` only: the caller-minted stable idempotency id
+        /// the migration operation is bound to. Mandatory for import,
+        /// `--replace` and `--rollback`; rollback reuses the original id.
+        /// Replay only with the identical action body. Status needs no source.
+        #[arg(long, requires = "portable")]
+        request_id: Option<String>,
+        /// Remote `--portable` only: print durable status by operation id,
+        /// or `request:<request-id>` to recover a lost begin response.
+        /// The source package is not needed.
+        #[arg(long, requires = "portable")]
+        status: Option<String>,
+        /// Remote `--portable` only: owner-authorized rollback of a replaced
+        /// hosted workspace to its retained root. Needs `--request-id` and
+        /// the current `--expected-destination-digest`/`--expected-generation`
+        /// (from `--status`).
+        #[arg(long, requires = "portable")]
+        rollback: Option<String>,
     },
     /// Manage registered agents.
     Agent {

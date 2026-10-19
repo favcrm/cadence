@@ -1312,6 +1312,295 @@ fn web_upload_file_path(path: &str) -> bool {
         })
 }
 
+/// CAD-1593: one portable-migration request to the verified issuer origin —
+/// the same origin discipline as a session lifecycle call (`origin`,
+/// `private_dir`, `require_login_issuer`, Access ingress rechecked before and
+/// after), never to the board audience and never a caller-chosen URL. The
+/// namespace is exactly `/v1/hosted-cadence/portable-migrations`; every other
+/// path refuses before a request exists. No retries live here: the caller
+/// decides, and a mutation whose answer was lost stays outcome-unknown for
+/// reconciliation rather than being re-sent.
+pub enum MigrationBody<'a> {
+    /// No body (GET `/:operationId`).
+    None,
+    /// A JSON object body (preflight, begin, commit, rollback).
+    Json(&'a Value),
+    /// Exact manifest bytes (POST `/:operationId/manifest`), already bounded
+    /// by the caller at 4 MiB.
+    Bytes(&'a [u8]),
+    /// A bounded streaming body: a whole pack (PUT `…/input-packs/:index`) or
+    /// one part (PUT `…/input-packs/:index/parts/:part`). The reader must
+    /// produce exactly that many bytes; nothing is buffered whole and the
+    /// caller's `Read` verifies each member hash at its end.
+    Stream(&'a mut dyn Read),
+    /// No body, POST only (POST `/:operationId/input-packs/:index/finalize`).
+    Empty,
+}
+
+/// Per-request timeout class. The commit call bounds to the server's 600 s
+/// applier deadline plus a small transport margin; ordinary JSON and uploads
+/// keep short, bounded caps. These are transport timeouts only — they are not
+/// the `--wake-timeout` budget, and no request is re-sent on expiry.
+#[derive(Clone, Copy)]
+pub enum MigrationTimeout {
+    /// Small JSON calls: preflight, begin, status, rollback.
+    Json,
+    /// POST `/:operationId/manifest` (bounded 4 MiB upload).
+    Manifest,
+    /// PUT `/:operationId/input-packs/:index` (bounded streaming upload).
+    Pack,
+    /// POST `/:operationId/commit` — covers the hosted 600 s apply window.
+    Commit,
+}
+
+impl MigrationTimeout {
+    pub(crate) fn cap(self) -> Duration {
+        match self {
+            Self::Json => Duration::from_secs(30),
+            Self::Manifest => Duration::from_secs(60),
+            Self::Pack => Duration::from_secs(300),
+            Self::Commit => Duration::from_secs(620),
+        }
+    }
+
+    /// Bounded answer size. A pack receipt repeats the sealed member tuple
+    /// list — a full-inventory pack can legitimately fill megabytes — so pack
+    /// answers share the 4 MiB manifest bound; every other answer stays at
+    /// the ordinary small-response cap.
+    pub(crate) fn response_cap(self) -> u64 {
+        match self {
+            Self::Pack => 4 * 1024 * 1024,
+            _ => MAX_RESPONSE,
+        }
+    }
+}
+
+/// The request the native portable-migration flow may send. `workspace` is
+/// the registered workspace id (`X-Cadence-Workspace`), `bearer` the renewed
+pub struct MigrationRequest<'a, 'b> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub workspace: &'a str,
+    pub bearer: &'a str,
+    pub timeout: MigrationTimeout,
+    /// The body borrows the caller's buffer independently — a streamed pack
+    /// reader must not force the header borrows to outlive it.
+    pub body: MigrationBody<'b>,
+}
+
+/// Send one portable-migration request. Returns `(status, body)` with `body`
+/// `None` when the answer is not JSON. Redirects, oversized answers and every
+/// path outside the namespace are refused; the raw failure body is never
+/// surfaced to the caller beyond this function's parsed envelope.
+pub(crate) fn migration_issuer_request(
+    dir: &Path,
+    issuer: &str,
+    request: MigrationRequest<'_, '_>,
+    deadline: Instant,
+) -> Result<(u16, Option<Value>)> {
+    let MigrationRequest {
+        method,
+        path,
+        workspace,
+        bearer,
+        timeout,
+        body,
+    } = request;
+    if !portable_migration_path(path) {
+        return Err(reject("Hosted portable-migration path refused"));
+    }
+    if !matches!(method, "GET" | "POST" | "PUT") || !id(workspace) {
+        return Err(reject("Hosted portable-migration request refused"));
+    }
+    if !matches!(
+        (method, &body),
+        ("GET", MigrationBody::None)
+            | (
+                "POST",
+                MigrationBody::Json(_) | MigrationBody::Bytes(_) | MigrationBody::Empty
+            )
+            | ("PUT", MigrationBody::Stream(_))
+    ) {
+        return Err(reject("Hosted portable-migration request shape refused"));
+    }
+    // The finalize shape is bound to its path: an empty POST only at
+    // `…/finalize`, and `…/finalize` only as an empty POST.
+    if !portable_migration_shape_admitted(path, method, &body) {
+        return Err(reject("Hosted portable-migration request shape refused"));
+    }
+    private_dir(dir, false)?;
+    require_login_issuer(dir, issuer)?;
+    let access = read_access_ingress(dir, issuer)?;
+    confirm_login_access_ingress(dir, issuer, &access)?;
+    let request_deadline = deadline.min(Instant::now() + timeout.cap());
+    if Instant::now() >= request_deadline {
+        return Err(Error::busy_coded(
+            "timeout",
+            "remote command deadline elapsed before the migration request",
+        ));
+    }
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(
+            request_deadline.saturating_duration_since(Instant::now()),
+        ))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None);
+    let agent = issuer_agent(config);
+    let url = format!("{issuer}{path}");
+    let auth = format!("Bearer {bearer}");
+    let response = match (method, body) {
+        ("GET", MigrationBody::None) => {
+            migration_headers(agent.get(&url), &auth, workspace, access.as_ref()).call()
+        }
+        ("POST", MigrationBody::Json(value)) => {
+            migration_headers(agent.post(&url), &auth, workspace, access.as_ref()).send_json(value)
+        }
+        ("POST", MigrationBody::Bytes(bytes)) => {
+            migration_headers(agent.post(&url), &auth, workspace, access.as_ref())
+                .content_type("application/octet-stream")
+                .send(bytes)
+        }
+        ("POST", MigrationBody::Empty) => {
+            migration_headers(agent.post(&url), &auth, workspace, access.as_ref()).send_empty()
+        }
+        ("PUT", MigrationBody::Stream(reader)) => {
+            migration_headers(agent.put(&url), &auth, workspace, access.as_ref())
+                .content_type("application/octet-stream")
+                .send(ureq::SendBody::from_reader(reader))
+        }
+        // Unreachable after the shape check above; refuse, never guess.
+        _ => return Err(reject("Hosted portable-migration request shape refused")),
+    }
+    // A send failure after headers were built is outcome-unknown — the bytes
+    // may have landed. The caller decides; nothing here re-sends.
+    .map_err(|_| Error::unknown("Hosted portable-migration request did not complete"))?;
+    let status = response.status().as_u16();
+    if (300..400).contains(&status) {
+        return Err(reject("Hosted issuer redirect refused"));
+    }
+    let response_cap = timeout.response_cap();
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .as_reader()
+        .take(response_cap + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            Error::unknown("Hosted migration response was interrupted; reconcile before retrying")
+        })?;
+    if bytes.len() as u64 > response_cap {
+        return Err(Error::unknown(
+            "Hosted migration response exceeded its bound; reconcile before retrying",
+        ));
+    }
+    confirm_login_access_ingress(dir, issuer, &access).map_err(|_| {
+        Error::unknown(
+            "Hosted issuer authorization pin changed after the request; reconcile before retrying",
+        )
+    })?;
+    Ok((status, serde_json::from_slice(&bytes).ok()))
+}
+
+/// The headers every portable-migration request carries: the `hct_` bearer,
+/// the registered workspace pin and the pinned issuer's Access ingress pair
+/// when one is configured. `S` stays generic — GET builds `WithoutBody`.
+fn migration_headers<S>(
+    request: ureq::RequestBuilder<S>,
+    auth: &str,
+    workspace: &str,
+    access: Option<&AccessIngress>,
+) -> ureq::RequestBuilder<S> {
+    let request = request
+        .header("Authorization", auth)
+        .header("X-Cadence-Workspace", workspace);
+    match access {
+        Some(access) => request
+            .header("CF-Access-Client-Id", &access.client_id)
+            .header("CF-Access-Client-Secret", &access.client_secret),
+        None => request,
+    }
+}
+
+/// The request-shape decision for the migration family: an empty POST is
+/// admitted only at a `…/finalize` path, and a `…/finalize` path is admitted
+/// only as an empty POST. Pure, so the binding is testable without an issuer.
+fn portable_migration_shape_admitted(path: &str, method: &str, body: &MigrationBody<'_>) -> bool {
+    let empty_post = method == "POST" && matches!(body, MigrationBody::Empty);
+    empty_post == path.ends_with("/finalize") && (!path.ends_with("/finalize") || empty_post)
+}
+
+/// The only paths a portable-migration request may name. Includes read-only
+/// `/by-request/<requestId>` reconciliation after a lost begin response.
+/// Per-operation paths admit manifest, input-packs, inputs (read-only), commit,
+/// rollback and status only. Query, fragment, encoded separators and traversal refuse.
+fn portable_migration_path(path: &str) -> bool {
+    const BASE: &str = "/v1/hosted-cadence/portable-migrations";
+    if !path.starts_with(BASE)
+        || path.len() > 512
+        || path.contains('?')
+        || path.contains('#')
+        || path.contains('\\')
+        || path.contains('%')
+        || path.contains("..")
+        || !path.bytes().all(|b| (0x21..0x7f).contains(&b))
+    {
+        return false;
+    }
+    match &path[BASE.len()..] {
+        "" | "/preflight" => true,
+        rest => {
+            let Some(tail) = rest.strip_prefix('/') else {
+                return false;
+            };
+            if let Some((operation, suffix)) = tail.split_once('/') {
+                if operation == "by-request" {
+                    return id(suffix);
+                }
+                if !id(operation) {
+                    return false;
+                }
+                match suffix {
+                    "manifest" | "commit" | "rollback" | "inputs" => true,
+                    _ => suffix
+                        .strip_prefix("input-packs/")
+                        .is_some_and(valid_pack_suffix),
+                }
+            } else {
+                id(tail)
+            }
+        }
+    }
+}
+
+/// `input-packs/` element after the prefix: `<index>`, `<index>/parts/<part>`
+/// or `<index>/finalize`.
+fn valid_pack_suffix(value: &str) -> bool {
+    match value.split_once('/') {
+        None => valid_pack_index(value),
+        Some((index, "finalize")) => valid_pack_index(index),
+        Some((index, tail)) => {
+            valid_pack_index(index) && tail.strip_prefix("parts/").is_some_and(valid_part_number)
+        }
+    }
+}
+
+/// `^[1-9][0-9]*$` — a 1-based transport part number.
+fn valid_part_number(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 20
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && !value.starts_with('0')
+}
+
+/// `^(0|[1-9][0-9]*)$` — the pack index the server-minted plan assigns.
+fn valid_pack_index(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 20
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+}
+
 /// `upl_` plus the contract's id body: 8 to 80 of `[A-Za-z0-9_-]`.
 fn is_upload_id(value: &str) -> bool {
     value.strip_prefix("upl_").is_some_and(|rest| {
@@ -5704,3 +5993,83 @@ mod cli_lock_acceptance;
 #[cfg(test)]
 #[path = "remote_enrollment_tls_acceptance.rs"]
 mod tls_acceptance;
+
+#[cfg(test)]
+mod portable_migration_gate_tests {
+    use super::*;
+
+    const BASE: &str = "/v1/hosted-cadence/portable-migrations/op-1/input-packs";
+
+    #[test]
+    fn pack_suffix_admits_only_the_three_shapes() {
+        for ok in [
+            "/v1/hosted-cadence/portable-migrations/op-1/input-packs/0",
+            "/v1/hosted-cadence/portable-migrations/op-1/input-packs/12",
+            "/v1/hosted-cadence/portable-migrations/op-1/input-packs/0/parts/1",
+            "/v1/hosted-cadence/portable-migrations/op-1/input-packs/12/parts/3",
+            "/v1/hosted-cadence/portable-migrations/op-1/input-packs/0/finalize",
+        ] {
+            assert!(portable_migration_path(ok), "should admit {ok}");
+        }
+        for tail in [
+            "0/parts/0",
+            "0/parts/01",
+            "00",
+            "0/parts/1/extra",
+            "0/finalize/extra",
+            "0/parts",
+            "0/parts/1/2",
+            "-1",
+            "0x1",
+            "/parts/1",
+            "0/partsx/1",
+            "0/parts/",
+            "0/finalize/",
+            "01",
+        ] {
+            let path = format!("{BASE}/{tail}");
+            assert!(!portable_migration_path(&path), "should refuse {tail}");
+        }
+        assert!(!portable_migration_path(
+            "/v1/hosted-cadence/portable-migrations/op-1/input-packs"
+        ));
+        assert!(!portable_migration_path(
+            "/v1/hosted-cadence/portable-migrations/op-1/other/0"
+        ));
+    }
+
+    #[test]
+    fn empty_post_is_admitted_only_at_finalize() {
+        let finalize = format!("{BASE}/0/finalize");
+        let pack = format!("{BASE}/0");
+        assert!(portable_migration_shape_admitted(
+            &finalize,
+            "POST",
+            &MigrationBody::Empty
+        ));
+        // Empty POST refused at a non-finalize path.
+        assert!(!portable_migration_shape_admitted(
+            &pack,
+            "POST",
+            &MigrationBody::Empty
+        ));
+        // A finalize path refused with any body other than an empty POST.
+        let body = json!({"x": 1});
+        assert!(!portable_migration_shape_admitted(
+            &finalize,
+            "POST",
+            &MigrationBody::Json(&body)
+        ));
+        assert!(!portable_migration_shape_admitted(
+            &finalize,
+            "POST",
+            &MigrationBody::Bytes(b"x")
+        ));
+        let mut stream: &[u8] = b"x";
+        assert!(!portable_migration_shape_admitted(
+            &finalize,
+            "PUT",
+            &MigrationBody::Stream(&mut stream)
+        ));
+    }
+}

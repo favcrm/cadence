@@ -72,6 +72,7 @@ pub mod releases;
 pub mod remote_auth;
 pub mod remote_cli;
 pub mod remote_enrollment;
+pub mod remote_migration;
 pub mod remote_result_outbox;
 pub mod review;
 pub mod rollout;
