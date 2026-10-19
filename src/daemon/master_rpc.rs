@@ -21,6 +21,7 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::unattended::DispatchAuthority;
 use super::{
     optional_str, optional_strs, reject_identity_fields, required_str, Caller, Shared, DAEMON_ALIAS,
 };
@@ -461,7 +462,9 @@ impl Shared {
         let ticket = issue::board::find_issue(&pm.dir, id)?;
         let front = &ticket.front;
         crate::issue::plan::gate_master(&pm.dir, front, &ticket.body)?;
-        let repo = self.unattended_dispatch_repo(id)?;
+        let repo = self
+            .unattended_dispatch_authority(id)?
+            .map(|authority| authority.checkout);
         if front.status != "ready" {
             return Err(Error::invalid(
                 "master_dispatch_state",
@@ -568,7 +571,11 @@ impl Shared {
 
     /// Pin an unattended kickoff to the grant's registered checkout, never
     /// the controller cwd's default repository in a multi-repository project.
-    pub(super) fn unattended_dispatch_repo(&self, id: &str) -> Result<Option<String>> {
+    /// Carry the live expiry into enqueue for its in-transaction deadline check.
+    pub(super) fn unattended_dispatch_authority(
+        &self,
+        id: &str,
+    ) -> Result<Option<DispatchAuthority>> {
         let Some(run) = self.unattended_authorization_for_issue(id)? else {
             return Ok(None);
         };
@@ -618,7 +625,10 @@ impl Shared {
             .into_os_string()
             .into_string()
             .map_err(|_| Error::rejected("the authorized checkout path is not valid UTF-8"))?;
-        Ok(Some(root))
+        Ok(Some(DispatchAuthority {
+            checkout: root,
+            expires_at: run.expires_at,
+        }))
     }
 
     /// `question_escalate` — hand an open question the master cannot

@@ -120,10 +120,17 @@ approval cannot resurrect a replaced grant or roll back a newer renewal,
 including a deliberately shortened lifetime. This relies on intact native
 history; it is not confinement against arbitrary same-UID database rewrites.
 
+Issue semantics use deterministic JSON of the selected identity, plan,
+dependency and body fields, with sorted dependency IDs. Escaped strings and
+typed options/arrays keep multiline content and metadata boundaries unambiguous;
+runtime-status changes remain excluded.
+
 Canonical issue dispatch and its native revision/CI-fix turns recheck current
 authority and use the recorded issue's repository and worker lane. Automatic
 dispatch preserves daemon-authenticated origin through its self-RPC and
 revalidates at the final enqueue gate, after blocking worktree/Git setup.
+Bound kickoff and follow-up writes carry the server-derived grant deadline
+into the queue transaction; connection/SQLite writer waits cannot extend it.
 The tracker snapshot stays locked through enqueue; explicit operator
 hand-dispatch and repair retain their existing authority. A done report alone
 cannot start review: the owned queue turn must have completed

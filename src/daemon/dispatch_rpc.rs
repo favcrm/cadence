@@ -163,10 +163,11 @@ impl Shared {
         // through enqueue. Resolve blocking reads/Git before the live helper,
         // whose final expiry check must follow all dispatch setup waits.
         let _tracker = gated.then(|| pm.lock()).transpose()?;
+        let mut authorized_until = None;
         if gated {
             let (live_front, _) = issue::write::load_front(&dir)?;
             let actual = issue::project::repo_identity(&worktree);
-            let root = self.unattended_dispatch_repo(&id)?.ok_or_else(|| {
+            let authority = self.unattended_dispatch_authority(&id)?.ok_or_else(|| {
                 Error::rejected(
                     "the unattended run's live authority vanished during dispatch — refused",
                 )
@@ -179,14 +180,16 @@ impl Shared {
             let actual = actual.ok_or_else(|| {
                 Error::rejected("the unattended worktree has no proven repository identity")
             })?;
-            if actual.0.as_path() != Path::new(&root) {
+            if actual.0.as_path() != Path::new(&authority.checkout) {
                 return Err(Error::rejected(
                     "the unattended worktree is outside the workflow's authorized repository",
                 ));
             }
+            authorized_until = Some(authority.expires_at);
         }
-        let (duplicate, state) = self.store.enqueue_steered(
+        let (duplicate, state) = self.store.enqueue_steered_for_with_conversation(
             &alias,
+            None,
             text,
             Some(reply_to),
             &mid,
@@ -199,6 +202,10 @@ impl Shared {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            authorized_until,
         )?;
         self.notify_agent(&alias);
         self.wake();

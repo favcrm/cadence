@@ -959,38 +959,55 @@ pub fn create_plan(
 /// moving `ready` → `doing` is still the same work; a changed title,
 /// body, owner, size, dependency or plan membership is not.
 pub(crate) fn granted_semantics(front: &Front, body: &str) -> String {
-    let mut out = format!(
-        "id={}\ntitle={}\npriority={}\nowner={}\nsize={}\nparent={}\nplan_epic={}\ntype={}\n",
-        front.id,
-        front.title,
-        front.priority,
-        front.owner.as_deref().unwrap_or("-"),
-        front.size.as_deref().unwrap_or("-"),
-        front.parent.as_deref().unwrap_or("-"),
-        front.plan_epic.as_deref().unwrap_or("-"),
-        front.item_type.as_deref().unwrap_or("-"),
-    );
-    let mut blocked_by = front.blocked_by.clone();
-    blocked_by.sort();
-    out.push_str(&format!("blocked_by={}\n", blocked_by.join(",")));
-    if let Some(plan) = &front.plan {
-        out.push_str(&format!(
-            "plan.state={}\nplan.proposed_by={}\nplan.decided_by={}\nplan.workflow={}\n\
-             plan.tickets={}\nplan.reason={}\n",
-            plan.state,
-            plan.proposed_by,
-            plan.decided_by.as_deref().unwrap_or("-"),
-            plan.workflow.as_deref().unwrap_or("-"),
-            plan.tickets.join(","),
-            plan.reason.as_deref().unwrap_or("-"),
-        ));
-    } else {
-        out.push_str("plan=-\n");
+    #[derive(serde::Serialize)]
+    struct CanonicalPlan<'a> {
+        state: &'a str,
+        proposed_by: &'a str,
+        decided_by: Option<&'a str>,
+        workflow: Option<&'a str>,
+        tickets: &'a [String],
+        reason: Option<&'a str>,
     }
-    out.push_str("body=\n");
-    out.push_str(body);
-    out.push_str("\n/");
-    out
+
+    #[derive(serde::Serialize)]
+    struct CanonicalIssue<'a> {
+        id: &'a str,
+        title: &'a str,
+        priority: &'a str,
+        owner: Option<&'a str>,
+        size: Option<&'a str>,
+        parent: Option<&'a str>,
+        plan_epic: Option<&'a str>,
+        item_type: Option<&'a str>,
+        blocked_by: Vec<&'a str>,
+        plan: Option<CanonicalPlan<'a>>,
+        body: &'a str,
+    }
+
+    let mut blocked_by: Vec<&str> = front.blocked_by.iter().map(String::as_str).collect();
+    blocked_by.sort_unstable();
+    let canonical = CanonicalIssue {
+        id: &front.id,
+        title: &front.title,
+        priority: &front.priority,
+        owner: front.owner.as_deref(),
+        size: front.size.as_deref(),
+        parent: front.parent.as_deref(),
+        plan_epic: front.plan_epic.as_deref(),
+        item_type: front.item_type.as_deref(),
+        blocked_by,
+        plan: front.plan.as_ref().map(|plan| CanonicalPlan {
+            state: &plan.state,
+            proposed_by: &plan.proposed_by,
+            decided_by: plan.decided_by.as_deref(),
+            workflow: plan.workflow.as_deref(),
+            tickets: &plan.tickets,
+            reason: plan.reason.as_deref(),
+        }),
+        body,
+    };
+    serde_json::to_string(&canonical)
+        .expect("canonical semantic strings, slices and options serialize without failure")
 }
 
 /// The reserved ids and canonical semantics of a grant admission,

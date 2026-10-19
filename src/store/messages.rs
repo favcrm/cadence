@@ -688,6 +688,7 @@ impl Store {
             None,
             human,
             None,
+            None,
         )
     }
 
@@ -727,9 +728,12 @@ impl Store {
             conversation,
             None,
             None,
+            None,
         )
     }
 
+    /// `authorized_until` is daemon-derived and checked after acquiring
+    /// the queue writer. Ordinary sends pass `None`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_steered_for_with_conversation(
         &self,
@@ -750,6 +754,7 @@ impl Store {
         conversation: Option<&str>,
         human: Option<&Value>,
         media_refs: Option<&Value>,
+        authorized_until: Option<f64>,
     ) -> Result<(bool, String)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
@@ -786,6 +791,16 @@ impl Store {
                     .map(|m| self.supersedable_in(&tx, alias, m))
                     .collect::<Result<Vec<_>>>()?
             };
+            // Existing-envelope retries mint no work; new turns must still
+            // be authorized after the connection and SQLite writer waits.
+            if !retry
+                && authorized_until
+                    .is_some_and(|until| crate::issue::time::now_epoch() as f64 >= until)
+            {
+                return Err(Error::rejected(
+                    "the bound grant expired before the queue write — nothing was queued",
+                ));
+            }
             let out = self.enqueue_tx_with_conversation(
                 &tx,
                 alias,

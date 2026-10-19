@@ -166,7 +166,7 @@ impl Shared {
     ///
     /// An unbound issue (no native unattended run) takes the ordinary
     /// `send_as` path unchanged. A bound issue must still authorize:
-    /// `unattended_dispatch_repo` revalidates the live grant and its
+    /// `unattended_dispatch_authority` revalidates the live grant and its
     /// unique registered checkout — a revoked, expired, malformed or
     /// inconsistent grant is an `Err`, never a quiet fall-back to a
     /// plain send. The follow-up then carries the lane's `issue`/
@@ -177,7 +177,7 @@ impl Shared {
     /// (unattributed sender → `sender_uid` NULL) as the lane's latest
     /// owned turn — no second correlation path, no caller-supplied
     /// tags (the CAD-378 guard still refuses `issue`/`worktree` request
-    /// fields; these go through the typed `native_tags` argument).
+    /// fields; the typed `bound_lane` also carries the live grant deadline).
     /// Caller holds grant READ then delivery lock and supplies its current
     /// record. True means a bound follow-up; false preserves legacy sends.
     pub(super) fn send_issue_followup(
@@ -188,14 +188,14 @@ impl Shared {
     ) -> Result<bool> {
         let issue = rec.issue.as_str();
         let worker = rec.worker.as_str();
-        let root = self.unattended_dispatch_repo(issue)?;
+        let authority = self.unattended_dispatch_authority(issue)?;
         let sender_of = &|_: &str| Ok(store::Sender::Unattributed);
         let steer_refused = &|verb: &str| {
             Err(Error::rejected(format!(
                 "{verb} refused: this send carries no caller to steer with"
             )))
         };
-        let Some(root) = root else {
+        let Some(authority) = authority else {
             // Unbound legacy lane — the pre-grant behavior, unchanged.
             self.send_with(
                 &json!({"alias": worker, "text": text, "message": mid, "source": "review"}),
@@ -204,6 +204,7 @@ impl Shared {
             )?;
             return Ok(false);
         };
+        let root = authority.checkout;
         // Bound run: the canonical owner is the only worker a follow-up
         // may target — a reassigned lane ends the run's authority to
         // enqueue, it never re-aims it.
@@ -287,12 +288,15 @@ impl Shared {
         {
             return Err(Error::rejected("the lane has merge-request state without a native intent; operator must inspect/remove it before repair"));
         }
-        // Network reads may outlast the grant or a checkout identity.
-        if self.unattended_dispatch_repo(issue)?.as_deref() != Some(root.as_str()) {
-            return Err(Error::rejected(
-                "the bound repository authority changed before follow-up enqueue",
-            ));
-        }
+        // Re-prove authority after network reads; carry that expiry into enqueue.
+        let authorized_until = match self.unattended_dispatch_authority(issue)? {
+            Some(reproved) if reproved.checkout == root => reproved.expires_at,
+            _ => {
+                return Err(Error::rejected(
+                    "the bound repository authority changed before follow-up enqueue",
+                ));
+            }
+        };
         const COMPLETION: &str = " End your returned result (or explicit message result text) with a final `SHA: <same full committed head as the done report>` line.";
         let mut body = String::with_capacity(text.len() + COMPLETION.len());
         body.push_str(text);
@@ -305,7 +309,7 @@ impl Shared {
             steer_refused,
             None,
             None,
-            Some((issue, lane.as_str())),
+            Some((issue, lane.as_str(), authorized_until)),
         )?;
         Ok(true)
     }
@@ -353,9 +357,9 @@ impl Shared {
     /// human (typed, daemon-derived) and the optional expected recipient
     /// uid are independent derivations — neither is a request field, and
     /// the recipient uid is never treated as the human performer.
-    /// CAD-225: `native_tags` is `(issue, worktree)` derived server-side
-    /// by `send_issue_followup`; every other path passes `None` — no
-    /// request field can set a lane tag (the CAD-378 guard below).
+    /// CAD-225: `bound_lane` is `(issue, worktree, authorized_until)`,
+    /// derived server-side by `send_issue_followup`. Other paths pass
+    /// `None`; request fields cannot set lane tags or the grant deadline.
     fn send_with_human_expected(
         self: &Arc<Self>,
         params: &Value,
@@ -363,7 +367,7 @@ impl Shared {
         steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
         human: Option<&Value>,
         expected_uid: Option<&str>,
-        native_tags: Option<(&str, &str)>,
+        bound_lane: Option<(&str, &str, f64)>,
     ) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
@@ -445,7 +449,7 @@ impl Shared {
         // write the tags: `dispatch_send` sets them from the lane the
         // daemon itself resolves, `task_dispatch` from the job's rows,
         // `send_issue_followup` from the lane's latest dispatch tag
-        // through the typed `native_tags` argument. A caller field is
+        // through the typed `bound_lane` argument. A caller field is
         // refused outright — silently dropping it would let a retry
         // pass as untagged and mis-suppress the reported-kickoff
         // duplicate check, and would hide the forgery attempt.
@@ -773,8 +777,8 @@ impl Shared {
             &message,
             source,
             task,
-            native_tags.map(|(issue, _)| issue),
-            native_tags.map(|(_, worktree)| worktree),
+            bound_lane.map(|(issue, _, _)| issue),
+            bound_lane.map(|(_, worktree, _)| worktree),
             &sender,
             &steer,
             refs.as_ref(),
@@ -783,6 +787,7 @@ impl Shared {
             home_conversation.as_deref(),
             human,
             media_refs.as_ref(),
+            bound_lane.map(|(_, _, until)| until),
         )?;
         // Each superseded row's `reply_to` got a notice in the same
         // transaction — wake those recipients like `message cancel` does.

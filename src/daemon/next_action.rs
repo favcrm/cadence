@@ -591,7 +591,9 @@ impl Shared {
                 format!("{} went busy between the check and the lock", agent.alias),
             ));
         }
-        let repo = self.unattended_dispatch_repo(id)?;
+        let repo = self
+            .unattended_dispatch_authority(id)?
+            .map(|authority| authority.checkout);
         let upstream = agent_upstream(agent).unwrap_or(DAEMON_ALIAS);
         let out = match &self.checkup_dispatch {
             Some(dispatch) => dispatch(self, &pm.dir, id, &agent.alias)?,

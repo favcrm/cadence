@@ -33,14 +33,15 @@
 //! The checkout's `origin` is seeded so `issue start` resolves a real
 //! base offline: a `url.<file>.insteadOf` rewrite keeps
 //! `remote.origin.url` reading as `https://github.com/acme/widgets`
-//! (what `project.yaml` recorded and what `unattended_dispatch_repo`
+//! (what `project.yaml` recorded and what `unattended_dispatch_authority`
 //! matches the grant against) while `fetch`/`ls-remote` reach the
-//! on-disk seed. `gh` never runs on this path — `unattended_dispatch_repo`
+//! on-disk seed. `gh` never runs on this path — `unattended_dispatch_authority`
 //! only matches the registered project repo — and `dispatch::run`'s
 //! launcher skips `dispatch_send` when the issue already holds an open
 //! worktree ref.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -658,7 +659,7 @@ impl Drop for RemoteRelease {
 /// enough for the granted TTL to lapse, then lets git proceed. On the
 /// flawed path the operator-classified self-RPC send still enqueues.
 /// The `up-call` marker proves the ordering — nothing before
-/// `unattended_dispatch_repo`'s bound-repo selection touches `origin`,
+/// `unattended_dispatch_authority`'s bound-repo selection touches `origin`,
 /// so the parked call can only be `resolve_base` running AFTER the
 /// live-grant preflight, inside `issue::dispatch::run`.
 #[test]
@@ -822,5 +823,626 @@ fn cad225_expired_authority_must_not_dispatch_after_blocking_setup() {
     assert_eq!(
         rows, 0,
         "a refused automatic dispatch wrote a kickoff turn for {ticket}"
+    );
+}
+
+// ---- CAD-225 revision blockers ---------------------------------------------
+//
+// Two review findings this file independently encodes:
+//
+// 1. The bound deadline is proved BEFORE the queue write transaction —
+//    `dispatch_send`/`send_issue_followup` check `unattended_dispatch_authority`
+//    while `enqueue_steered`'s `BEGIN IMMEDIATE` can still be parked behind
+//    a writer the daemon does not control. A second, isolated SQLite
+//    connection holding `BEGIN IMMEDIATE` past the grant expiry must make
+//    the admission refuse at the writer boundary — never write the row.
+// 2. `granted_semantics` appends the epic body after a bare `body=`
+//    delimiter, so moving the body's head into `plan.reason` (a field that
+//    legitimately parses multiline values) leaves the canonical string —
+//    and therefore the fingerprint — byte-identical. The admission's
+//    semantic guard must refuse the moved body anyway.
+
+/// A real second write connection to the world's SQLite store: the same
+/// file, a fresh `BEGIN IMMEDIATE`, held open until `release_at`, then
+/// rolled back. This is a foreign writer competing for the daemon's one
+/// database writer slot — the boundary `enqueue_steered`'s `write_tx`
+/// waits on — never a stubbed or test-only seam inside the daemon.
+struct StoreWriterHold {
+    armed: mpsc::Receiver<Result<()>>,
+    released: mpsc::Receiver<Instant>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StoreWriterHold {
+    /// Opens `<state>/cadence.sqlite3` and takes its write lock. `start`
+    /// returns only once `BEGIN IMMEDIATE` holds (or failed), so the
+    /// caller knows the lock is owned before the operation under test
+    /// begins — it can never "race ahead" of this fixture.
+    fn start(db: PathBuf, release_at: Instant) -> Self {
+        let (armed_tx, armed) = mpsc::channel();
+        let (released_tx, released) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let held = (|| -> rusqlite::Result<rusqlite::Connection> {
+                let conn = rusqlite::Connection::open(&db)?;
+                conn.busy_timeout(Duration::from_millis(250))?;
+                conn.execute_batch("BEGIN IMMEDIATE")?;
+                Ok(conn)
+            })();
+            match held {
+                Ok(conn) => {
+                    let _ = armed_tx.send(Ok(()));
+                    let now = Instant::now();
+                    if release_at > now {
+                        std::thread::sleep(release_at - now);
+                    }
+                    // The reported instant is the PRE-unlock lower
+                    // bound, taken before ROLLBACK is issued — an answer
+                    // stamped before it provably never crossed the
+                    // writer boundary; one after it waited for or
+                    // arrived at a lock this fixture had already begun
+                    // releasing.
+                    let pre_release = Instant::now();
+                    let _ = conn.execute_batch("ROLLBACK");
+                    let _ = released_tx.send(pre_release);
+                    return;
+                }
+                Err(e) => {
+                    let _ = armed_tx.send(Err(e.into()));
+                }
+            }
+            let _ = released_tx.send(Instant::now());
+        });
+        let me = Self {
+            armed,
+            released,
+            join: Some(join),
+        };
+        me.armed
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the fixture writer reported back")
+            .expect("the fixture's BEGIN IMMEDIATE acquired the write lock");
+        me
+    }
+
+    /// The instant the write lock actually went away — proof an answer
+    /// received after this point could only have been computed on the
+    /// far side of the writer boundary.
+    fn release_proof(&self) -> Instant {
+        self.released
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the fixture writer released its transaction")
+    }
+}
+
+impl Drop for StoreWriterHold {
+    fn drop(&mut self) {
+        let _ = self.released.recv_timeout(Duration::from_secs(30));
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Arm the foreign writer at `expires_at - arm_before` and release it at
+/// `expires_at + release_after`: the store's queue write then waits on a
+/// live boundary whose release lands AFTER the grant's deadline, inside
+/// the 5s busy_timeout, so only a deadline checked inside the write can
+/// refuse it.
+fn hold_writer_past_grant(
+    world: &World,
+    expires_at: f64,
+    arm_before: f64,
+    release_after: f64,
+) -> StoreWriterHold {
+    let arm_at = Instant::now()
+        + Duration::from_secs_f64((expires_at - now_secs() - arm_before).clamp(0.0, 20.0));
+    let release_at = Instant::now()
+        + Duration::from_secs_f64((expires_at - now_secs() + release_after).max(0.0));
+    let now = Instant::now();
+    if arm_at > now {
+        std::thread::sleep(arm_at - now);
+    }
+    StoreWriterHold::start(world.root.path().join("cadence.sqlite3"), release_at)
+}
+
+/// The typed server refusal the deadline guard must answer with —
+/// `rejected`/`gate`/`conflict` are authority answers; `busy`,
+/// `internal` and `unknown` are contention, local failure and lost
+/// transport and can never count as the queue refusing the turn.
+/// `answered` is the instant the call returned — it must sit on the far
+/// side of the writer's pre-release mark: an answer the daemon produced
+/// before the foreign `BEGIN IMMEDIATE` began releasing never crossed
+/// the queue's write boundary.
+fn assert_deadline_refused<T: std::fmt::Debug>(
+    outcome: &Result<T>,
+    answered: Instant,
+    released: Instant,
+) {
+    assert!(
+        answered >= released,
+        "the admission answered before the queue writer began releasing — \
+         it never waited at the store's write boundary: {outcome:?}"
+    );
+    assert!(
+        matches!(outcome, Err(e) if matches!(e.kind(), "rejected" | "gate" | "conflict")),
+        "admission after an expired grant must be a typed refusal, not a \
+         queued turn and not a busy/internal/unknown transport failure: {outcome:?}"
+    );
+}
+
+/// Review blocker 1, initial admission: the master's automatic dispatch
+/// (real `master_dispatch` -> `issue::dispatch::run` -> socketed
+/// `dispatch_send`, unattended kickoff) reaches `enqueue_steered` while a
+/// foreign SQLite writer owns the store's write lock. The lock is
+/// released only after the grant's deadline, inside the writer's busy
+/// window, so the enqueue genuinely ran `BEGIN IMMEDIATE` during a live
+/// grant and acquired it over a dead one. Only an inside-the-transaction
+/// bound-deadline check can refuse it: no kickoff row, no
+/// `master_dispatched` event, and a closed `message` ref that counts no
+/// live binding.
+#[test]
+fn cad225_grant_deadline_binds_the_kickoff_queue_write() {
+    let world = World::open();
+    let state = world.root.path();
+    world.register("master", "pm");
+    seed_checkout_history(&world);
+    let _daemon = Served::start(state);
+    // The home-thread turn `master_policy` requires before a master's
+    // `master_dispatch` is in scope — planted after `Served::start` so the
+    // boot sweep does not fence it `unknown` (chain-test pattern).
+    let (dup, _state) = world
+        .shared
+        .store
+        .enqueue_steered(
+            "master",
+            "home thread turn",
+            None,
+            "cad225-home-turn",
+            "chat",
+            None,
+            None,
+            None,
+            &Sender::Unattributed,
+            &crate::store::Steer::NONE,
+            None,
+            None,
+            None,
+        )
+        .expect("the master's home turn enqueues");
+    assert!(!dup, "home turn id must not collide");
+    world
+        .shared
+        .store
+        .mark_running("cad225-home-turn", "cad225-home")
+        .expect("the home turn runs");
+
+    // Grant (short TTL) and admit the exact bound render over the real
+    // socket — authority identical to the chain test.
+    let granted = rpc(
+        state,
+        Asserted::Operator,
+        "workflow_approve",
+        world.unattended(&[PATH], bound_inputs(), Some(12), None),
+    )
+    .expect("operator unattended grant");
+    let grant_id = world.require_native_grant(&granted);
+    let proposed = rpc(
+        state,
+        Asserted::Operator,
+        "plan_propose",
+        json!({
+            "project": PROJECT,
+            "workflow": WORKFLOW,
+            "inputs": bound_inputs(),
+        }),
+    )
+    .expect("exact render admits");
+    let epic = proposed["epic"].as_str().unwrap().to_string();
+    let plan = world.issue(&epic).front.plan.expect("epic plan");
+    assert_eq!(plan.tickets.len(), 1);
+    let ticket = plan.tickets[0].clone();
+    let run = world
+        .shared
+        .unattended_authorization_for_issue(&ticket)
+        .expect("bound run reads")
+        .expect("admitted ticket is bound");
+    assert_eq!(run.grant_id, grant_id);
+    assert!(
+        run.expires_at > now_secs() + 2.0,
+        "the fixture grant must still be comfortably live at dispatch"
+    );
+
+    // The store's writer boundary is held from just before expiry to just
+    // past it. `dispatch_send`'s enqueue is the only store write inside
+    // `master_dispatch` before the record/event tail, so whatever still
+    // waits once the foreign lock falls IS the queue admission — the
+    // preflight expiry checks happen on read connections this writer
+    // never blocks.
+    let block = hold_writer_past_grant(&world, run.expires_at, 2.5, 0.7);
+    let (done_tx, done) = mpsc::channel();
+    let state_dir = state.to_path_buf();
+    let dispatch_ticket = ticket.clone();
+    let call = std::thread::spawn(move || {
+        let outcome = rpc(
+            &state_dir,
+            Asserted::Agent("master".into()),
+            "master_dispatch",
+            json!({"issue": dispatch_ticket, "to": "worker"}),
+        );
+        let _ = done_tx.send((outcome, Instant::now()));
+    });
+    // While the foreign writer still owns the lock AND the grant is
+    // already dead, the admission must still be parked at the boundary —
+    // an answer inside the hold proves an earlier refusal path, never
+    // the queue's write wait.
+    let probe_at =
+        Instant::now() + Duration::from_secs_f64((run.expires_at - now_secs() + 0.15).max(0.0));
+    if probe_at > Instant::now() {
+        std::thread::sleep(probe_at - Instant::now());
+    }
+    assert!(
+        done.try_recv().is_err(),
+        "the dispatch answered while the store writer was still held — \
+         it refused at the preflight gate, never reaching the queue write"
+    );
+    let released = block.release_proof();
+    let (outcome, answered) = done
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the dispatch answered once the write lock fell");
+    call.join().expect("dispatch thread");
+    assert_deadline_refused(&outcome, answered, released);
+
+    let rows = world
+        .shared
+        .store
+        .messages("worker")
+        .expect("worker lane reads")
+        .iter()
+        .filter(|m| m.issue.as_deref() == Some(ticket.as_str()))
+        .count();
+    assert_eq!(
+        rows, 0,
+        "the expired grant's automatic kickoff still enqueued for {ticket}"
+    );
+    assert!(
+        world
+            .shared
+            .store
+            .events_tail(crate::store::Store::DAEMON_STREAM, 100)
+            .unwrap()
+            .iter()
+            .all(|e| !(e.kind == "master_dispatched"
+                && e.payload["issue"].as_str() == Some(ticket.as_str()))),
+        "a refused automatic dispatch recorded a master_dispatched event"
+    );
+    assert!(
+        world
+            .issue(&ticket)
+            .front
+            .refs
+            .iter()
+            .all(|r| r.kind != "message" || r.closed == Some(true)),
+        "the refused kickoff's tracker ref stayed closed history, never a live binding"
+    );
+    // The grant is spent, not consumed by this attempt — revalidation
+    // reads it as dead authority, the same `Err` a revoked grant gives.
+    world.assert_invalid_run(&ticket);
+}
+
+/// Review blocker 1, native follow-up: `send_issue_followup` is the
+/// follow-up queue admission a bound run performs — a genuinely
+/// different consumer of the same enqueue than the kickoff
+/// (daemon-derived `source='review'` row, owned issue/worktree tags).
+/// The test drives the producer itself so the refusal lands as the
+/// typed `Err` `send_issue_followup` returns — never prose `fix_turn`
+/// folds it into; `checkup_idle_lane` then supplies the real operator
+/// surface (checkup event, parked delivery). With the store's write
+/// lock held across the grant's deadline, the follow-up must refuse at
+/// the writer boundary too: the row never exists.
+#[test]
+fn cad225_grant_deadline_binds_the_followup_queue_write() {
+    let world = World::open();
+    let admitted = world.grant_and_admit(Some(12));
+    // The lane's original dispatch kickoff, run and completed — the
+    // native queue record `send_issue_followup` derives its lane tags
+    // from.
+    world.dispatch_turn(&admitted.ticket, 1, true, Some(Some(HEAD)));
+    // Red CI on the recorded head is the checkup's one fix trigger.
+    world.save_red(&admitted.ticket);
+    let run = world
+        .shared
+        .unattended_authorization_for_issue(&admitted.ticket)
+        .expect("bound run reads")
+        .expect("admitted ticket is bound");
+    assert!(
+        run.expires_at > now_secs() + 2.0,
+        "the fixture grant must still be live when the follow-up arrives"
+    );
+
+    // The real mid `fix_turn` would use — `checkup-fix-<ticket>-<head>` —
+    // so `send_issue_followup` derives the same lane and writes (or, on
+    // a correct daemon, refuses) the same row the checkup would.
+    let mid = format!(
+        "checkup-fix-{}-{}",
+        admitted.ticket.to_lowercase(),
+        &HEAD[..12]
+    );
+    let report = world.lane_done_ref(&admitted.ticket, 2_000, HEAD);
+    let rec = record(&world, &admitted.ticket);
+    let block = hold_writer_past_grant(&world, run.expires_at, 2.5, 0.7);
+    let (done_tx, done) = mpsc::channel();
+    let shared = world.shared.clone();
+    let send_mid = mid.clone();
+    let call = std::thread::spawn(move || {
+        // The same production boundary `checkup_idle_lane`'s fix path
+        // reaches — the typed `Err` it returns is the producer's own
+        // refusal signal, before any prose wrapping.
+        let outcome = shared.send_issue_followup(
+            &rec,
+            &send_mid,
+            "fix the red ci check on the recorded head",
+        );
+        let _ = done_tx.send((outcome, Instant::now()));
+    });
+    // While the foreign writer still owns the lock AND the grant is
+    // already dead, the producer must still be parked at the boundary —
+    // an answer inside the hold proves an earlier refusal path, never
+    // the queue's write wait.
+    let probe_at =
+        Instant::now() + Duration::from_secs_f64((run.expires_at - now_secs() + 0.15).max(0.0));
+    if probe_at > Instant::now() {
+        std::thread::sleep(probe_at - Instant::now());
+    }
+    assert!(
+        done.try_recv().is_err(),
+        "the follow-up answered while the store writer was still held — \
+         it refused before the queue write wait"
+    );
+    let released = block.release_proof();
+    let (outcome, answered) = done
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the follow-up answered once the write lock fell");
+    call.join().expect("follow-up thread");
+    assert_deadline_refused(&outcome, answered, released);
+
+    // The record as the checkup receives it — the refusal path must
+    // leave every field it does not own exactly here (see below).
+    let pre = record(&world, &admitted.ticket);
+
+    // The real operator surface: with no fix row queued, the checkup
+    // visit on the same report escalates the lane and parks its
+    // delivery record — `fix_turn` hits the same refusal and records it.
+    world
+        .shared
+        .checkup_idle_lane(&world.worker_agent(), &[report])
+        .expect("the checkup visit answers");
+    assert!(
+        world
+            .shared
+            .store
+            .message(&mid)
+            .expect("turn reads")
+            .is_none(),
+        "the expired grant's bound follow-up still enqueued as {mid}"
+    );
+    let checkups: Vec<Value> = world
+        .shared
+        .store
+        .events_tail("worker", 20)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "checkup")
+        .map(|e| e.payload)
+        .collect();
+    assert_eq!(
+        checkups.len(),
+        1,
+        "the checkup records exactly one outcome for the held lane"
+    );
+    assert_eq!(
+        checkups[0]["outcome"].as_str(),
+        Some("escalate"),
+        "the deadline refusal escalates to the operator, never dispatches a fix: {checkups:?}"
+    );
+    let rec = record(&world, &admitted.ticket);
+    assert!(
+        rec.unattended_hold,
+        "the bound lane is held for the operator after the refused follow-up"
+    );
+    // The refusal path marks the hold and leaves the record otherwise
+    // untouched — the fix arm's success bookkeeping (`enter(Working)`
+    // plus clearing verdict/readiness/pending) never ran. `save_red`
+    // already plants `Working`, so the honest no-restart marker is the
+    // record's entry stamp and readiness fields sitting exactly where
+    // the fixture put them, not a state change.
+    assert_eq!(
+        rec.state, pre.state,
+        "the refused follow-up moved the lane's state"
+    );
+    assert_eq!(
+        rec.since, pre.since,
+        "the refused follow-up re-stamped a state entry"
+    );
+    assert!(
+        rec.verdict == pre.verdict
+            && rec.ready_evidence == pre.ready_evidence
+            && rec.ready_binding == pre.ready_binding
+            && rec.unattended_pending == pre.unattended_pending
+            && rec.rounds == pre.rounds,
+        "the refused follow-up ran the fix arm's restart bookkeeping anyway: {rec:?}"
+    );
+    // The grant is spent, not consumed — revalidation reads it as dead
+    // authority.
+    world.assert_invalid_run(&admitted.ticket);
+}
+
+/// Review blocker 2: the canonical-semantics collision. The bound
+/// workflow's `goal` embeds a literal `\nbody=\n` (legitimate multiline
+/// frontmatter text), so the admitted epic's real body is
+/// `P\nbody=\nQ`. The mutation moves the body's head `P` into
+/// `plan.reason` — a field that parses multiline values — leaving
+/// `reason="-\nbody=\n"+P` and `body=Q`: every other field identical,
+/// the file written through the tracker's own `save_front` + scoped
+/// commit and still parsed by the real loader. `granted_semantics`'s
+/// `plan.reason=-\nbody=\nP\nbody=\nQ\n/` encodes the mutated issue
+/// byte-identically to the admitted one, so a native authorization that
+/// still accepts the run is the encoder bug's proof, not a pass. The
+/// stored marks and fingerprints are never touched — this is tracker
+/// content changed inside a bound run, the class the semantic check
+/// exists to refuse.
+#[test]
+fn cad225_moved_epic_body_tail_refuses_native_authorization() {
+    let delimiter = "\nbody=\n";
+    let world = World::open();
+    // A legitimate multiline workflow goal, stored BEFORE issuance —
+    // changing the template afterwards would void the grant for an
+    // unrelated reason and prove the wrong guard.
+    world.write_workflow(
+        "---\ntitle: \"Ship {{topic}}\"\ngoal: |\n  Land {{topic}} through the granted path\n  body=\n  this tail is the epic body text\ninputs:\n  topic:\n    ask: \"What ships?\"\n---\n\nContext for {{topic}}.\n\n## Land {{topic}}\nagent: worker\nsize: S\n\nDo the landing work.\n\n### Acceptance\n- [ ] diff stays on src/ship.rs\n",
+        false,
+    );
+    let admitted = world.grant_and_admit(None);
+
+    let epic_issue = world.issue(&admitted.epic);
+    let (original_front, original_body) =
+        crate::issue::write::load_front(&epic_issue.dir).expect("epic reads");
+    assert_eq!(
+        original_front
+            .plan
+            .as_ref()
+            .and_then(|p| p.reason.as_deref()),
+        None,
+        "the admitted epic carries no plan reason — the collision needs None"
+    );
+    let (head, tail) = original_body.split_once(delimiter).unwrap_or_else(|| {
+        panic!("the bound render's epic body must embed `body=`: {original_body}")
+    });
+    let moved_reason = format!("-{delimiter}{head}");
+    let moved_body = tail.to_string();
+
+    // The mutation is the tracker's own write path: load the file, move
+    // the head into the parsed `plan.reason`, save and commit it under
+    // the scoped PM lock — no store row, mark or fingerprint is touched.
+    let pm = crate::issue::Pm::at(&world.pm()).expect("open PM");
+    let file = epic_issue.dir.join("issue.md");
+    let lock = pm
+        .lock_for_paths(std::slice::from_ref(&file))
+        .expect("tracker lock");
+    let mut moved = original_front.clone();
+    moved.plan.as_mut().expect("epic plan").reason = Some(moved_reason.clone());
+    crate::issue::write::save_front(&epic_issue.dir, &moved, &moved_body)
+        .expect("the tracker's own writer saves the moved file");
+    crate::issue::write::commit_scoped(
+        &pm,
+        &lock,
+        std::slice::from_ref(&file),
+        &format!("{}: move body head into plan reason", admitted.epic),
+        &[admitted.epic.as_str()],
+        "operator",
+    )
+    .expect("the moved file commits");
+    drop(lock);
+
+    // The attack stays genuinely parsed and valid: the real loader reads
+    // the mutated file back, the moved fields land exactly, and every
+    // other semantic field is byte-identical to the admitted epic.
+    let (mutated_front, mutated_body) =
+        crate::issue::write::load_front(&epic_issue.dir).expect("mutated epic parses");
+    assert_eq!(mutated_body, moved_body, "the moved body reads back");
+    let moved_plan = mutated_front.plan.clone().expect("plan still parses");
+    assert_eq!(
+        moved_plan.reason.as_deref(),
+        Some(moved_reason.as_str()),
+        "the moved reason parses as a multiline plan field"
+    );
+    let mut reason_restored = moved_plan.clone();
+    reason_restored.reason = None;
+    assert_eq!(
+        reason_restored,
+        original_front.plan.clone().unwrap(),
+        "every other plan field is unchanged — the reason moved the body, not metadata"
+    );
+    for field in [
+        (
+            mutated_front.title.as_str(),
+            original_front.title.as_str(),
+            "title",
+        ),
+        (
+            mutated_front.owner.as_deref().unwrap_or("-"),
+            original_front.owner.as_deref().unwrap_or("-"),
+            "owner",
+        ),
+        (
+            mutated_front.priority.as_str(),
+            original_front.priority.as_str(),
+            "priority",
+        ),
+        (
+            mutated_front.status.as_str(),
+            original_front.status.as_str(),
+            "status",
+        ),
+    ] {
+        assert_eq!(
+            field.0, field.1,
+            "the mutation must leave {} unchanged",
+            field.2
+        );
+    }
+    assert_eq!(mutated_front.blocked_by, original_front.blocked_by);
+    assert_eq!(mutated_front.parent, original_front.parent);
+    assert_eq!(mutated_front.plan_epic, original_front.plan_epic);
+    assert_eq!(mutated_front.item_type, original_front.item_type);
+
+    // The native authorization the bound run consumes — the same gate
+    // `dispatch_send`/`send_issue_followup`/`try_unattended_enqueue` all
+    // sit behind — must refuse the changed body through the semantics
+    // check, not through a fingerprint mismatch we forged (none) or an
+    // unrelated guard.
+    let refusal = world
+        .shared
+        .unattended_authorization_for_issue(&admitted.ticket)
+        .err()
+        .expect("a moved epic body is changed work — the bound grant must not authorize it");
+    assert!(
+        matches!(refusal.kind(), "rejected" | "gate"),
+        "the refusal is a typed authority answer, not a fault: {refusal:?}"
+    );
+    assert_eq!(
+        refusal.code(),
+        Some("unattended_mismatch"),
+        "the refusal is the semantic-mismatch guard's own coded answer, \
+         not prose and not an unrelated check: {refusal:?}"
+    );
+
+    // The real consumer proves the refusal end-to-end: the checkup's
+    // native follow-up admission must not queue a fix turn over an
+    // authorization the moved body voided.
+    world.dispatch_turn(&admitted.ticket, 1, true, Some(Some(HEAD)));
+    world.save_red(&admitted.ticket);
+    let report = world.lane_done_ref(&admitted.ticket, 2_000, HEAD);
+    world
+        .shared
+        .checkup_idle_lane(&world.worker_agent(), &[report])
+        .expect("the checkup visit answers");
+    let mid = format!(
+        "checkup-fix-{}-{}",
+        admitted.ticket.to_lowercase(),
+        &HEAD[..12]
+    );
+    assert!(
+        world
+            .shared
+            .store
+            .message(&mid)
+            .expect("turn reads")
+            .is_none(),
+        "a run whose authorized body moved must not queue its follow-up as {mid}"
+    );
+    let rec = record(&world, &admitted.ticket);
+    assert!(
+        rec.unattended_hold,
+        "the lane is held for the operator — the run's authority cannot be read as live"
     );
 }

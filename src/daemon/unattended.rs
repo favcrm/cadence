@@ -678,6 +678,12 @@ pub(super) struct AuthorizedRun {
     pub expires_at: f64,
 }
 
+/// Live authority carried into a bound queue write, never from request fields.
+pub(super) struct DispatchAuthority {
+    pub checkout: String,
+    pub expires_at: f64,
+}
+
 /// Validated workflow and worker snapshot shared by issuance and renewal.
 struct ApprovalContext<'a> {
     pm_dir: &'a Path,
