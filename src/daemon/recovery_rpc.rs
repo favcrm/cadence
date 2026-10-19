@@ -164,7 +164,11 @@ impl Shared {
         };
         match outcome.error {
             Some(e) => Err(with_attempt_path(e, recorded.as_deref())),
-            None => Ok(attempt),
+            None => Ok({
+                let mut attempt = attempt;
+                attempt["record"] = json!(recorded.as_deref().map(|p| p.display().to_string()));
+                attempt
+            }),
         }
     }
 
@@ -228,7 +232,41 @@ impl Shared {
         params: &Value,
         _peer_pid: u32,
     ) -> Result<Value> {
-        let attempt = required_object(params, "attempt")?;
-        recovery::status(&self.pm()?, attempt)
+        // The status is computed from the daemon's OWN record: a caller
+        // must not be able to hand in an attempt that claims success.
+        let raw = required_str(params, "attempt_path")?;
+        let root = self
+            .state_dir
+            .join("recovery")
+            .canonicalize()
+            .map_err(|e| {
+                Error::rejected(format!(
+                "the daemon has no recovery records to read ({e}); only an attempt it recorded \
+                 can be inspected"
+            ))
+            })?;
+        let path = std::path::Path::new(raw).canonicalize().map_err(|e| {
+            Error::rejected(format!(
+                "{raw} is not a readable recovery attempt ({e}); pass the path the daemon \
+                 printed after `recover execute`"
+            ))
+        })?;
+        if !path.starts_with(&root) {
+            return Err(Error::rejected(format!(
+                "{raw} is not one of the daemon's own recovery records; pass the path it \
+                 printed after `recover execute`"
+            )));
+        }
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            Error::rejected(format!(
+                "the recovery attempt {raw} could not be read ({e})"
+            ))
+        })?;
+        let attempt: Value = serde_json::from_str(&text).map_err(|e| {
+            Error::rejected(format!(
+                "the recovery attempt {raw} is not valid JSON ({e})"
+            ))
+        })?;
+        recovery::status(&self.pm()?, &attempt)
     }
 }

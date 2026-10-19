@@ -100,11 +100,26 @@ pub fn run_recover(action: &RecoverAction, state_dir: &Path) -> Result<i32> {
                 "paths": path,
             }),
         )?,
-        RecoverAction::Status { attempt } => client::rpc(
-            state_dir,
-            "tracker_recovery_status",
-            json!({"attempt": read_json_file(attempt, "--attempt")?}),
-        )?,
+        RecoverAction::Status { attempt } => {
+            // The daemon reads its OWN record: a caller cannot hand in
+            // an attempt that claims success.
+            let recorded = read_json_file(attempt, "--attempt")?
+                .get("record")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    crate::error::Error::rejected(format!(
+                        "{} carries no `record` path — pass the attempt JSON the daemon \
+                         printed after `recover execute`",
+                        attempt.display()
+                    ))
+                })?;
+            client::rpc(
+                state_dir,
+                "tracker_recovery_status",
+                json!({"attempt_path": recorded}),
+            )?
+        }
     };
     print_json(&out);
     Ok(0)

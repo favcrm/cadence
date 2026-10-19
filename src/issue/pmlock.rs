@@ -426,10 +426,10 @@ pub struct InterruptionReport {
     /// Git-global hazards (`index.lock`, a merge/rebase/cherry-pick
     /// state). A path-local recovery cannot settle them.
     pub hazards: Vec<String>,
-    /// When the crashed writer took the lock, from its marker trailer.
-    /// A path the crash demonstrably wrote is attributable to it; one
-    /// that was already there is not (CAD-1601).
-    pub crash_started_at: Option<i64>,
+    /// The scan stopped at its cap: the names are a SAMPLE, not the
+    /// complete leftover set. A recovery must not authorize a decision
+    /// from a sample (CAD-1601).
+    pub sampled: bool,
 }
 
 /// CAD-1234: the acquiring call site of every lock this process holds,
@@ -730,6 +730,8 @@ struct Interruption {
     /// state. Kept apart from `named` so a caller can name them
     /// exactly (CAD-1601).
     hazards: Vec<String>,
+    /// The file scan stopped at its cap: the names are a sample.
+    sampled: bool,
 }
 
 fn open_coordination(path: &Path, create: bool) -> std::io::Result<Option<File>> {
@@ -806,17 +808,17 @@ fn read_snapshot(git_dir: &Path) -> Result<Option<HashSet<String>>> {
 
 /// When the dirty-path snapshot was written: the moment the last
 /// writer that rewrote it took the lock. `None` without a snapshot.
+/// A file older than it is treated as pre-existing — a tie is read as
+/// new, the refusing side. This only ever excludes a path from the
+/// diagnostic name list; it never authorizes a recovery action.
 fn snapshot_time(git_dir: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(git_dir.join(DIRTY_FILE))
         .and_then(|m| m.modified())
         .ok()
 }
 
-/// Files under `root/rel` (a directory that was already untracked when
-/// the snapshot was taken) modified at or after `since`: a crashed
-/// writer's output inside a foreign directory. `>=` because file times
-/// are coarse; a tie is read as new, the refusing side. Bounded, and
-/// symlinks are not followed.
+/// Files under `root/rel` modified at or after `since`. Symlinks are
+/// not followed.
 ///
 /// Returns true when the scan stopped early: the names are then only
 /// a sample, and the caller must block the whole directory.
@@ -858,6 +860,14 @@ fn write_snapshot(git_dir: &Path, tree: &Tree) -> Result<()> {
         content.push_str(p);
         content.push('\0');
     }
+    // The STAGED set too (CAD-1601): a path staged when the crash took
+    // the lock is positive evidence that the crash did not stage it.
+    // Without it, a path staged before the acquisition could be blamed
+    // on the crash by a timestamp alone.
+    for p in &tree.staged {
+        content.push_str(p);
+        content.push('\0');
+    }
     let _ = std::fs::remove_file(&tmp);
     create_exclusive(&tmp, &content).map_err(|e| io_unknown(&tmp, "the dirty-path snapshot", e))?;
     std::fs::rename(&tmp, &path).map_err(|e| {
@@ -883,7 +893,9 @@ fn classify(
     tree: &Tree,
     snapshot: Option<&HashSet<String>>,
     inside: &[String],
+    ambiguous: &[String],
     whole: &[String],
+    sampled: bool,
 ) -> Option<Interruption> {
     let mut named: Vec<String> = Vec::new();
     let mut foreign: Vec<String> = Vec::new();
@@ -893,8 +905,22 @@ fn classify(
         named.push(format!("git state {s}"));
     }
     for p in &tree.staged {
-        named.push(format!("staged {p}"));
-        paths.push(p.clone());
+        // Positive provenance, not a timestamp: a path already dirty
+        // when the crash took the lock is in the snapshot, so the crash
+        // did not create it. Without a snapshot (an older build's
+        // crash) nothing is proven, and the path is protected.
+        if snapshot.is_some_and(|s| !s.contains(p)) {
+            named.push(format!("staged {p}"));
+            paths.push(p.clone());
+        } else {
+            // Staged before the crash took the lock (or with no
+            // snapshot): it blocks and is named, but no provenance
+            // proves the crash staged it, so it is protected too.
+            named.push(format!("staged {p}"));
+            foreign.push(format!("staged {p}"));
+            foreign_paths.push(p.clone());
+            paths.push(p.clone());
+        }
     }
     for (kind, p) in &tree.loose {
         if snapshot.is_none() && *kind == "untracked" {
@@ -915,7 +941,22 @@ fn classify(
         }
     }
     for p in inside {
+        if snapshot.is_some_and(|s| !s.contains(p)) {
+            named.push(format!("untracked {p}"));
+            paths.push(p.clone());
+        } else {
+            foreign.push(format!("untracked {p}"));
+            foreign_paths.push(p.clone());
+        }
+    }
+    // Files under a directory that was ALREADY dirty when the crash
+    // took the lock: they block and they are named, but no timestamp
+    // proves the crash wrote them, so they are also protected — a
+    // recovery may not act on one.
+    for p in ambiguous {
         named.push(format!("untracked {p}"));
+        foreign.push(format!("untracked {p}"));
+        foreign_paths.push(p.clone());
         paths.push(p.clone());
     }
     // Names are a capped sample; a directory scanned in part blocks
@@ -933,6 +974,7 @@ fn classify(
             foreign_paths,
             paths,
             hazards: tree.git_state.clone(),
+            sampled,
         })
     }
 }
@@ -1138,31 +1180,44 @@ impl Pm {
     /// with the kernel lock held.
     fn interruption(&self, git_dir: &Path, tree: &Tree) -> Result<Option<Interruption>> {
         let Some(snapshot) = read_snapshot(git_dir)? else {
-            return Ok(classify(tree, None, &[], &[]));
+            // An older build's crash: no snapshot means no provenance,
+            // so classify protects every path it cannot prove.
+            return Ok(classify(tree, None, &[], &[], &[], false));
         };
-        // An untracked directory is one `dir/` line. A new one is the
-        // crash's: name the files in it, as the per-file listing did.
-        // One already in the snapshot cannot be told apart from a crashed
-        // writer's new file inside it by the listing; files modified
-        // since the snapshot can.
+        // An untracked directory is one `dir/` line. A NEW one is the
+        // crash's: every file in it is its work, so they are named and
+        // may be recovered. One already in the snapshot cannot be told
+        // apart from a crashed writer's write inside it by anything
+        // better than a coarse mtime: its files block and are named,
+        // but they are protected, and the operator settles them by
+        // hand. `whole` keeps the bound past the scan cap.
         let mut inside = Vec::new();
+        let mut ambiguous = Vec::new();
         let mut whole = Vec::new();
-        let taken = snapshot_time(git_dir);
+        let mut sampled = false;
+        let taken = snapshot_time(git_dir).unwrap_or(std::time::UNIX_EPOCH);
         for (kind, p) in &tree.loose {
             if *kind != "untracked" || !p.ends_with('/') {
                 continue;
             }
             if !snapshot.contains(p) {
-                // A new directory is the crash's: block all of it.
-                files_since(&self.dir, p, std::time::UNIX_EPOCH, &mut inside);
-                whole.push(p.clone());
-            } else if let Some(since) = taken {
-                if files_since(&self.dir, p, since, &mut inside) {
-                    whole.push(p.clone());
+                if files_since(&self.dir, p, std::time::UNIX_EPOCH, &mut inside) {
+                    sampled = true;
                 }
+            } else {
+                let _ = files_since(&self.dir, p, taken, &mut ambiguous);
+                ambiguous.retain(|f| !snapshot.contains(f));
             }
+            whole.push(p.clone());
         }
-        Ok(classify(tree, Some(&snapshot), &inside, &whole))
+        Ok(classify(
+            tree,
+            Some(&snapshot),
+            &inside,
+            &ambiguous,
+            &whole,
+            sampled,
+        ))
     }
 
     /// One acquisition attempt. `declared` (repo-relative or absolute
@@ -1684,6 +1739,31 @@ impl Pm {
             Err(e) => return Err(Error::internal(format!("{}: {e}", flock_path.display()))),
         };
         let tree = self.tree_state(&git_dir)?;
+        // The marker this flow acts on must be this build's and
+        // readable: a foreign or unreadable one is a different refusal,
+        // and it must not degrade into "no start time" (CAD-1601).
+        match self.legacy_file() {
+            Ok(Some((MarkerClass::Foreign, _))) => {
+                return Err(Error::gate_coded(
+                    "legacy_write_lock",
+                    format!(
+                        "the tracker's write marker ({}) is not one this build wrote; an older \
+                         writer may be live or may have crashed holding it. This build will not \
+                         act on it, and retrying will not help: the rollout owner clears it in \
+                         a quiescent migration after every pre-flock cadence process stops",
+                        self.dir.join(MARKER_LOCK_FILE).display()
+                    ),
+                ))
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(Error::internal(format!(
+                    "the tracker's write marker could not be read ({e}); the interrupted state \
+                     is unknown, so no recovery can be authorized. Restore readable evidence, \
+                     then review again."
+                )))
+            }
+        }
         Ok(match self.interruption(&git_dir, &tree)? {
             Some(i) => InterruptionReport {
                 paths: i.paths,
@@ -1691,12 +1771,7 @@ impl Pm {
                 foreign_paths: i.foreign_paths,
                 named: i.named,
                 hazards: i.hazards,
-                crash_started_at: self.legacy_file().ok().flatten().and_then(|(class, _)| {
-                    match class {
-                        MarkerClass::Ours(meta) => meta.and_then(|m| m.started_at),
-                        MarkerClass::Foreign => None,
-                    }
-                }),
+                sampled: i.sampled,
             },
             None => InterruptionReport::default(),
         })

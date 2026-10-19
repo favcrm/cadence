@@ -136,6 +136,15 @@ pub fn review(pm: &Pm, blocked_operation: Option<&str>) -> Result<Value> {
             report.hazards.join(", ")
         )));
     }
+    if report.sampled {
+        return Err(Error::rejected(
+            "the crashed writer's leftovers are too many to review as a complete set: the scan \
+             stopped at its cap, so the names are a sample. A recovery will not authorize a \
+             keep or discard from a sample — a path it did not list could be left behind or \
+             changed without being reviewed. Settle this transaction by hand. A retry will not \
+             help.",
+        ));
+    }
     let leftovers = report.paths.clone();
     let foreign = report.foreign.clone();
     let foreign_paths = report.foreign_paths.clone();
@@ -172,10 +181,17 @@ pub fn decide(pm: &Pm, review: &Value, choice: Choice, paths: &[String]) -> Resu
     // from the caller's review: a hand-written review must not be able
     // to make a protected path look like the crashed writer's.
     let report = pm.interruption_report()?;
+    if !report.hazards.is_empty() {
+        return Err(Error::rejected(format!(
+            "the tracker has a Git-global state that a path-local recovery cannot settle: {}. \
+             Resolve the Git operation itself first (finish or abort the merge/rebase, or clear \
+             the stale index.lock), then review and decide again. A retry will not help.",
+            report.hazards.join(", ")
+        )));
+    }
     let leftovers = report.paths;
     let foreign = report.foreign_paths;
-    let started = report.crash_started_at;
-    let selected = select_paths(pm, &leftovers, &foreign, paths, started)?;
+    let selected = select_paths(pm, &leftovers, &foreign, paths)?;
     require_staged_content(pm, choice, &selected)?;
     let current = state_binding(pm, &leftovers, &foreign)?;
     if current != bound {
@@ -341,10 +357,17 @@ fn execute_inner(
     let report = pm.interruption_report()?;
     let leftovers = report.paths;
     let foreign = report.foreign_paths;
-    let started = report.crash_started_at;
+    if !report.hazards.is_empty() {
+        return Err(Error::rejected(format!(
+            "the tracker has a Git-global state that a path-local recovery cannot settle: {}. \
+             Resolve the Git operation itself first (finish or abort the merge/rebase, or clear \
+             the stale index.lock), then review and decide again. A retry will not help.",
+            report.hazards.join(", ")
+        )));
+    }
     let confirmed = require_str(decision, "confirmation")?;
     let preview_digest = require_str(decision, "preview_digest")?;
-    let selected = select_paths(pm, &leftovers, &foreign, paths, started)?;
+    let selected = select_paths(pm, &leftovers, &foreign, paths)?;
     require_staged_content(pm, choice, &selected)?;
     if selected != require_str_list(decision, "paths")? {
         return Err(Error::rejected(
@@ -461,14 +484,20 @@ fn execute_inner(
     })()?; // The guard is released; the report below is a fresh observation.
     let after = pm.interruption_report()?;
     let remaining: Vec<String> = after.paths.clone();
-    let resolved = outcome.resolved && remaining.is_empty();
+    // Two questions, two answers: the selected paths' completion, and
+    // the tracker's settlement (no leftover and no hazard).
+    let selected_settled = selected.iter().all(|p| !remaining.contains(p));
+    let recovery_success =
+        outcome.resolved && selected_settled && remaining.is_empty() && after.hazards.is_empty();
+    let resolved = recovery_success;
     Ok(json!({
         "state": bound,
         "choice": choice.as_str(),
         "paths": selected,
         "outcome": "applied",
         "resolved": resolved,
-        "recovery_success": resolved,
+        "selected_settled": selected_settled,
+        "recovery_success": recovery_success,
         "committed": outcome.committed,
         "removed_blobs": outcome.removed,
         "message": outcome.message,
@@ -493,18 +522,23 @@ pub fn status(pm: &Pm, attempt: &Value) -> Result<Value> {
         .get("outcome")
         .and_then(Value::as_str)
         .unwrap_or("applied");
-    let settled = outcome == "applied"
+    // The selected paths' completion and the tracker's settlement are
+    // two questions: an attempt that settled its own paths is not a
+    // success while another blocker stands.
+    let selected_settled = outcome == "applied"
         && attempt
-            .get("recovery_success")
+            .get("selected_settled")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+    let recovery_success = selected_settled && !blockers;
     let mut out = attempt.clone();
     out["remaining"] = json!(remaining);
     out["hazards"] = json!(hazards);
     out["foreign_count"] = json!(after.foreign.len());
     out["tracker_resolved"] = json!(!blockers);
-    out["selected_settled"] = json!(settled);
-    out["next_action"] = json!(if !settled {
+    out["selected_settled"] = json!(selected_settled);
+    out["recovery_success"] = json!(recovery_success);
+    out["next_action"] = json!(if !selected_settled {
         "the recovery did not settle the selected paths — inspect the attempt and the current \
          state before doing anything else; a blind retry is not safe"
     } else if blockers {
@@ -616,7 +650,6 @@ fn select_paths(
     leftovers: &[String],
     foreign: &[String],
     paths: &[String],
-    crash_started_at: Option<i64>,
 ) -> Result<Vec<String>> {
     if paths.is_empty() {
         return Err(Error::rejected(
@@ -723,48 +756,13 @@ fn select_paths(
             selected.push(norm.to_string());
         }
     }
-    // Every selected path must be PROVABLY the crashed writer's. Being
-    // in the blocked set is refusal evidence, not ownership proof: a
-    // path that was already staged before the crash took the lock is
-    // in it too. The crash's own marker says when it started, and a
-    // path it wrote is newer than that.
+    // Every selected path is PROVABLY the crashed writer's: attribution
+    // comes from the acquisition snapshot, in `classify`. Being in the
+    // blocked set is refusal evidence, not ownership proof — a path
+    // already dirty before the crash took the lock is in the snapshot,
+    // and `classify` puts it in the protected set, so it never reaches
+    // this function. A timestamp is not ownership evidence.
     let renames = staged_renames(pm)?;
-    {
-        use std::os::unix::fs::MetadataExt;
-        let index_written = std::fs::metadata(index_path(pm)?)
-            .map(|m| m.mtime())
-            .unwrap_or(0);
-        for path in &selected {
-            let Some(started) = crash_started_at else {
-                return Err(Error::rejected(format!(
-                    "the crashed writer's start time is unknown, so {path} cannot be \
-                     attributed to it. A recovery may only act on paths the crash \
-                     demonstrably wrote. Leave the transaction unresolved for this path, or \
-                     settle it by hand. A retry unchanged will not help."
-                )));
-            };
-            // A rename MOVES a file without writing it, so the evidence
-            // for its ends is the index the crash wrote, not the file's
-            // own timestamp.
-            let is_rename_end = renames.iter().any(|(f, t)| f == path || t == path);
-            let written = if is_rename_end {
-                index_written
-            } else {
-                std::fs::symlink_metadata(pm.dir.join(path))
-                    .map(|m| m.mtime())
-                    .unwrap_or(0)
-            };
-            if written < started {
-                return Err(Error::rejected(format!(
-                    "{path} cannot be attributed to the crashed writer: it was last written \
-                     before the crash began, so it was already there and the refusal that \
-                     named it is not proof that the crash made it. A recovery may only act on \
-                     the paths the crash demonstrably wrote. Leave the transaction unresolved \
-                     for this path, or settle it by hand. A retry unchanged will not help."
-                )));
-            }
-        }
-    }
     selected.sort();
     // A staged rename has TWO ends, and both are affected. Selecting
     // one end is not a selection: keeping only the destination would
@@ -794,6 +792,14 @@ fn state_binding(pm: &Pm, leftovers: &[String], foreign: &[String]) -> Result<St
     h.update(b"\0head\0");
     h.update(
         git(&pm.dir, &["rev-parse", "HEAD"])
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    // The SYMBOLIC target too: a symbolic HEAD can move to a different
+    // branch at the same commit without changing the object id.
+    h.update(b"\0symbolic_head\0");
+    h.update(
+        git(&pm.dir, &["symbolic-ref", "-q", "HEAD"])
             .unwrap_or_default()
             .as_bytes(),
     );
@@ -1326,39 +1332,99 @@ fn remove_file_no_follow(root: &Path, path: &str) -> std::io::Result<()> {
 }
 
 /// Write a path inside the tracker without following a symlinked
-/// ancestor: the file is created through a directory descriptor opened
-/// with `O_NOFOLLOW`, and the file itself is opened with `O_NOFOLLOW`
-/// too, so a symlink in place of the file is never written through.
-fn write_file_no_follow(root: &Path, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+/// ancestor, and without truncating a file the path merely shares an
+/// inode with.
+///
+/// The bytes go to a fresh temp file in the same directory (opened
+/// `O_CREAT | O_EXCL | O_NOFOLLOW`), the mode is set on that
+/// descriptor, and the temp is renamed over the path. A rename
+/// replaces the directory entry: a regular file that shares its inode
+/// with another path (a hard link) keeps that other path's bytes
+/// intact, and no pathname is resolved again between the write and the
+/// mode change.
+fn write_file_no_follow(root: &Path, path: &str, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::io::Write;
-    use std::os::unix::io::FromRawFd;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the path is not a literal path inside the tracker",
+        )
+    };
     let (fd, name) = open_parent_no_follow(root, path)?;
-    let c = match CString::new(name) {
+    let name = match CString::new(name) {
         Ok(c) => c,
         Err(_) => {
             unsafe { libc::close(fd) };
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "the path is not a literal path inside the tracker",
-            ));
+            return Err(invalid());
+        }
+    };
+    let tmp = match CString::new(format!(
+        ".cadence-recovery-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    )) {
+        Ok(c) => c,
+        Err(_) => {
+            unsafe { libc::close(fd) };
+            return Err(invalid());
         }
     };
     let file = unsafe {
         libc::openat(
             fd,
-            c.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o644,
+            tmp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            mode as libc::mode_t,
         )
     };
-    unsafe { libc::close(fd) };
     if file < 0 {
+        unsafe { libc::close(fd) };
         return Err(std::io::Error::last_os_error());
     }
     let mut handle = unsafe { std::fs::File::from_raw_fd(file) };
-    handle.write_all(bytes)?;
+    let written = handle
+        .write_all(bytes)
+        .and_then(|_| handle.sync_all())
+        .and_then(|_| {
+            // The mode is set on the descriptor: no pathname is resolved,
+            // so a symlink swapped in cannot redirect it.
+            if unsafe { libc::fchmod(handle.as_raw_fd(), mode as libc::mode_t) } < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    if let Err(e) = written {
+        unsafe { libc::unlinkat(fd, tmp.as_ptr(), 0) };
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    drop(handle);
+    // A rename replaces the directory entry, so a hard-linked sibling
+    // keeps its bytes, and it never follows the target.
+    let rc = unsafe { libc::renameat(fd, tmp.as_ptr(), fd, name.as_ptr()) };
+    unsafe { libc::close(fd) };
+    if rc < 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::unlinkat(fd, tmp.as_ptr(), 0) };
+        return Err(e);
+    }
     Ok(())
+}
+
+/// A suffix unique per process and call, for the temp file the
+/// replacement is built in.
+fn unique_suffix() -> u128 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        + u128::from(n)
 }
 
 /// Restore the selected paths to their committed state: the index entry
@@ -1385,7 +1451,19 @@ fn discard_paths(pm: &Pm, paths: &[String]) -> Result<()> {
                 None,
             )?;
             let content = git_raw(pm, &["cat-file", "blob", &format!("HEAD:{path}")])?;
-            write_file_no_follow(&pm.dir, path, &content).map_err(|e| {
+            // The committed mode, in BOTH directions. It is set on the
+            // descriptor the replacement write already holds, so no
+            // pathname is resolved again after the no-follow checks.
+            let mode = git(&pm.dir, &["ls-tree", "HEAD", "--", path])
+                .ok()
+                .and_then(|l| l.split_whitespace().next().map(str::to_string))
+                .unwrap_or_default();
+            let wanted = if mode.ends_with("755") {
+                0o755u32
+            } else {
+                0o644u32
+            };
+            write_file_no_follow(&pm.dir, path, &content, wanted).map_err(|e| {
                 Error::internal(format!(
                     "the working-tree copy of {path} could not be restored from its committed \
                      version ({e}); the index entry is back and the change is PARTLY applied. \
@@ -1393,27 +1471,6 @@ fn discard_paths(pm: &Pm, paths: &[String]) -> Result<()> {
                      the file must be restored by hand before this path is left alone."
                 ))
             })?;
-            // The committed mode, in BOTH directions: a file the
-            // interrupted change made executable goes back to the
-            // committed 0644, and one the commit made executable goes
-            // back to 0755. A mode that could not be restored is a
-            // partial outcome, not a completed one.
-            let mode = git(&pm.dir, &["ls-tree", "HEAD", "--", path])
-                .ok()
-                .and_then(|l| l.split_whitespace().next().map(str::to_string))
-                .unwrap_or_default();
-            let wanted = if mode.ends_with("755") { 0o755 } else { 0o644 };
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) =
-                std::fs::set_permissions(pm.dir.join(path), std::fs::Permissions::from_mode(wanted))
-            {
-                return Err(Error::internal(format!(
-                    "the working-tree copy of {path} was restored from its committed version but \
-                     its mode could not be restored ({e}). The change is PARTLY applied: the \
-                     content is back and the mode is not. Nothing was committed, the crash's \
-                     marker and snapshot are intact, and the mode must be restored by hand."
-                )));
-            }
         } else {
             // A file the crash added: remove the staged addition and
             // the working tree's copy, so both are absent.
