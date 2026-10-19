@@ -186,7 +186,12 @@ impl Shared {
 
     /// `thread_send` — the operator's chat message to an agent: starts
     /// the alias's thread on first use and queues the text exactly like
-    /// `agent_send`, recorded as an `operator` entry.
+    /// `agent_send`, recorded as an `operator` entry. CAD-1591 adds one
+    /// optional field, `expected_recipient_uid`: the contextual-reply
+    /// recipient constraint — a nonempty uid, never authority, fenced
+    /// against the alias's live row inside the enqueue transaction, so
+    /// a removed or replaced participant can never silently receive the
+    /// send. An omitted field is the ordinary path, unchanged.
     ///
     /// It instructs an agent, so an agent must never reach it: a
     /// connection the daemon attributes to a pane or managed endpoint is
@@ -213,13 +218,15 @@ impl Shared {
                         | "conversation"
                         | "attachments"
                         | "media_refs"
+                        | "expected_recipient_uid"
                         | "public_session"
                         | "session"
                 )
             }) {
                 return Err(Error::rejected(format!(
                     "thread send takes alias, text, message, refs, app, conversation, attachments, \
-                     media_refs and the server-held session proofs only; field '{field}' is not accepted"
+                     media_refs, expected_recipient_uid and the server-held session proofs only; \
+                     field '{field}' is not accepted"
                 )));
             }
         }
@@ -230,6 +237,21 @@ impl Shared {
         self.operator_chat("thread send", peer_pid)?;
         let human = self.verified_owner_human(params)?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // CAD-1591: the contextual-reply recipient constraint — an
+        // optional nonempty uid, checked against the alias's live row
+        // inside the enqueue transaction (never a precheck that can
+        // race). It is a typed argument like `human`: stripped from the
+        // forwarded params, so `expected_recipient_uid` is never a send
+        // request field on any verb.
+        let expected_uid = match params.get("expected_recipient_uid") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(uid)) if !uid.is_empty() => Some(uid.clone()),
+            Some(_) => {
+                return Err(Error::rejected(
+                    "expected_recipient_uid must be a nonempty recipient uid string",
+                ));
+            }
+        };
         // CAD-802: a raw `app` binding rides through; `send_as`
         // proves it against the store and stamps the normalized form
         // on the entry — one proving place for every caller.
@@ -241,8 +263,9 @@ impl Shared {
         // daemon-derived human is a typed argument, never a field of `send`.
         if let Some(obj) = send.as_object_mut() {
             obj.remove("public_session");
+            obj.remove("expected_recipient_uid");
         }
-        let mut receipt = self.send_with_human(
+        let mut receipt = self.send_with_human_expected(
             &send,
             &|_| Ok(store::Sender::OperatorChat),
             &|verb| {
@@ -251,6 +274,8 @@ impl Shared {
                 )))
             },
             human.as_ref(),
+            expected_uid.as_deref(),
+            None,
         )?;
         // The thread the message landed in: its conversation, which is
         // home for an unbound send (CAD-1098).

@@ -510,7 +510,11 @@ export const api = {
    *  master"): they land on the entry's payload, never in the text.
    *  `app` is the shell chat's current installation/context (CAD-802):
    *  never authority — the daemon proves both against its store and
-   *  stamps the verified binding on the entry, refusing anything else. */
+   *  stamps the verified binding on the entry, refusing anything else.
+   *  `expectedRecipientUid` (CAD-1591) is an identity constraint, not
+   *  authority: the contextual Threads reply pins the recorded sender it
+   *  is answering, and the daemon refuses before any side effect when
+   *  the alias now names a different uid. Ordinary sends omit it. */
   threadSend: (
     alias: string,
     text: string,
@@ -521,6 +525,7 @@ export const api = {
     attachments?: { id: string }[],
     operation?: PrivateOperation,
     mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
+    expectedRecipientUid?: string,
   ) =>
     post<Record<string, unknown>>(
       `/api/threads/${encodeURIComponent(alias)}/messages`,
@@ -535,6 +540,7 @@ export const api = {
         // grammar and existence, never the client's metadata.
         ...(attachments && attachments.length > 0 ? { attachments } : {}),
         ...(mediaRefs && mediaRefs.length > 0 ? { media_refs: mediaRefs } : {}),
+        ...(expectedRecipientUid ? { expected_recipient_uid: expectedRecipientUid } : {}),
       },
       operation,
     ),

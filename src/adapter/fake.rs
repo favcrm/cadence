@@ -36,12 +36,18 @@
 //! directive: the fake reports the pack it received verbatim as a
 //! `cadence/fake_pack` event, answers `FAKE_PACK <sha256 prefix>` on the
 //! reply's first line, and reads directives from the message after it.
+//! Peer/unattributed delivery frames carry directives in `content`. Decode
+//! that one outer layer for fixture controls, but keep the full prompt in
+//! ordinary echoes so provenance delivery remains observable. No frame
+//! identity or authority fields are interpreted by this test provider.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -149,6 +155,20 @@ impl ProviderAdapter for FakeAdapter {
         let turn_id = self.turn_id();
         on_started(&turn_id);
         let (pack, prompt) = crate::continuity::split(prompt);
+        #[derive(Deserialize)]
+        struct DeliveryContent<'a> {
+            kind: &'a str,
+            #[serde(borrow)]
+            content: Cow<'a, str>,
+        }
+        let delivery = prompt
+            .starts_with('{')
+            .then(|| serde_json::from_str::<DeliveryContent<'_>>(prompt).ok())
+            .flatten()
+            .filter(|frame| matches!(frame.kind, "peer_message" | "unattributed_message"));
+        let directive = delivery
+            .as_ref()
+            .map_or(prompt, |frame| frame.content.as_ref());
         let pack_line = pack.map(|pack| {
             (self.hooks.on_event)("cadence/fake_pack", json!({ "pack": pack }));
             let digest: String = Sha256::digest(pack.as_bytes())
@@ -158,7 +178,7 @@ impl ProviderAdapter for FakeAdapter {
                 .collect();
             format!("FAKE_PACK {digest}\n")
         });
-        if prompt == "COMPACT" {
+        if directive == "COMPACT" {
             (self.hooks.on_event)(
                 "cadence/session_compacted",
                 json!({"trigger": "fake", "pre_tokens": null}),
@@ -171,13 +191,13 @@ impl ProviderAdapter for FakeAdapter {
                 error: None,
             });
         }
-        if prompt == "DISCONNECT" {
+        if directive == "DISCONNECT" {
             self.disconnected.store(true, Ordering::SeqCst);
             return Err(Error::unknown(
                 "Connection lost during turn; provider outcome is unknown",
             ));
         }
-        if let Some(detail) = prompt.strip_prefix("FAIL:") {
+        if let Some(detail) = directive.strip_prefix("FAIL:") {
             return Ok(TurnResult {
                 turn_id,
                 status: "failed".to_string(),
@@ -186,7 +206,7 @@ impl ProviderAdapter for FakeAdapter {
                 error: Some(detail.to_string()),
             });
         }
-        if let Some(detail) = prompt.strip_prefix("NEED_INPUT:") {
+        if let Some(detail) = directive.strip_prefix("NEED_INPUT:") {
             let request_no = self.next_request.fetch_add(1, Ordering::SeqCst) + 1;
             let request_id = format!("fake-req-{request_no}");
             let (tx, rx) = mpsc::channel();
@@ -224,7 +244,7 @@ impl ProviderAdapter for FakeAdapter {
                 error: None,
             });
         }
-        if let Some(secs) = prompt
+        if let Some(secs) = directive
             .strip_prefix("SLEEP:")
             .and_then(|s| s.parse::<u64>().ok())
         {
@@ -250,12 +270,12 @@ impl ProviderAdapter for FakeAdapter {
         // its quota/spend cap exhausted after the turn was claimed. The
         // actor's fatal arm fences the lane with `failed` evidence, the
         // same shape a real quota-denial turn leaves.
-        if prompt == "CAD225_QUOTA_ERROR" {
+        if directive == "CAD225_QUOTA_ERROR" {
             return Err(Error::provider(
                 "provider quota exhausted — spend cap reached; outcome is denied, not unknown",
             ));
         }
-        if prompt == "BAD_STATUS" {
+        if directive == "BAD_STATUS" {
             return Ok(TurnResult {
                 turn_id,
                 status: "melted".to_string(),
@@ -266,8 +286,8 @@ impl ProviderAdapter for FakeAdapter {
         }
         // CAD-139: the architect turn returns the plan the idea body
         // named, so a test can prove the gate without parsing the echo.
-        if prompt.contains("ROLE:architect") {
-            if let Some(plan) = prompt.split("FAKE_PLAN:").nth(1) {
+        if directive.contains("ROLE:architect") {
+            if let Some(plan) = directive.split("FAKE_PLAN:").nth(1) {
                 let plan = plan.split("END_PLAN").next().unwrap_or("").trim();
                 if !plan.is_empty() {
                     return Ok(TurnResult {
@@ -281,7 +301,7 @@ impl ProviderAdapter for FakeAdapter {
             }
         }
         let mut text = format!("{}FAKE_REPLY: {prompt}", pack_line.unwrap_or_default());
-        if let Some(rest) = prompt.split("REPORT_SHA:").nth(1) {
+        if let Some(rest) = directive.split("REPORT_SHA:").nth(1) {
             let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
             text += &format!("\nSHA: {hex}");
         }

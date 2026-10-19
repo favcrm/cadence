@@ -342,20 +342,6 @@ impl Shared {
         self.send_with_human_expected(params, sender_of, steer_caller, None, None, None)
     }
 
-    /// [`Self::send_with`] carrying the verified human behind an owner
-    /// chat send (CAD-1374). `human` is passed by the daemon's own
-    /// `thread_send` derivation as a typed argument; no request field can
-    /// set it, and every other caller reaches this with `None`.
-    pub(super) fn send_with_human(
-        self: &Arc<Self>,
-        params: &Value,
-        sender_of: &dyn Fn(&str) -> Result<store::Sender>,
-        steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
-        human: Option<&Value>,
-    ) -> Result<Value> {
-        self.send_with_human_expected(params, sender_of, steer_caller, human, None, None)
-    }
-
     /// CAD-1412: `send_with` with an optional expected recipient uid. The
     /// same guards run for every caller (confinement, PTY, control
     /// characters, delivery, steering); the uid is checked only by the
@@ -370,14 +356,17 @@ impl Shared {
         self.send_with_human_expected(params, sender_of, steer_caller, None, expected_uid, None)
     }
 
-    /// The one send body (CAD-1374 + CAD-1412): the optional verified
-    /// human (typed, daemon-derived) and the optional expected recipient
-    /// uid are independent derivations — neither is a request field, and
-    /// the recipient uid is never treated as the human performer.
+    /// The one send body (CAD-1374 + CAD-1412 + CAD-1591): the optional
+    /// verified human (typed, daemon-derived) and the optional expected
+    /// recipient uid are independent derivations — neither is a request
+    /// field, and the recipient uid is never treated as the human
+    /// performer. `thread_send` passes both; every other caller reaches
+    /// this through a wrapper above with `None`/`None` for whichever it
+    /// does not derive.
     /// CAD-225: `bound_lane` is `(issue, worktree, authorized_until)`,
     /// derived server-side by `send_issue_followup`. Other paths pass
     /// `None`; request fields cannot set lane tags or the grant deadline.
-    fn send_with_human_expected(
+    pub(super) fn send_with_human_expected(
         self: &Arc<Self>,
         params: &Value,
         sender_of: &dyn Fn(&str) -> Result<store::Sender>,
@@ -488,6 +477,19 @@ impl Shared {
             return Err(Error::rejected(
                 "send refused: `turn_id` is not a request field — the daemon \
                  binds turns at delivery; forged turn references are refused",
+            ));
+        }
+        // CAD-1591: `expected_recipient_uid` is a typed derivation —
+        // `thread_send` parses, validates and strips it before reaching
+        // this body, so a request still carrying it can only be a
+        // caller-supplied field on another verb. It is refused whole
+        // rather than silently ignored: an agent could otherwise name
+        // the constraint and believe a fence ran that never did.
+        if params.get("expected_recipient_uid").is_some() {
+            return Err(Error::rejected(
+                "send refused: `expected_recipient_uid` is not a request \
+                 field — the recipient constraint is a daemon-typed \
+                 derivation of `thread_send` alone",
             ));
         }
         // A pty endpoint pastes literally and fails a body with control

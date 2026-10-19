@@ -323,6 +323,46 @@
   font-size: var(--text-label);
   color: var(--color-ink-400);
 }
+.threads-msg-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  padding-left: 0.25rem;
+}
+/* CAD-1591 contextual reply banner above the DM composer: the bounded
+   quote and original reference the sent body carries. */
+.threads-replyctx {
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.4rem;
+  padding: 0.5rem 0.75rem;
+  display: grid;
+  gap: 0.4rem;
+}
+.threads-replyctx-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  font-size: var(--text-label);
+}
+.threads-replyctx-quote {
+  margin: 0;
+  padding-left: 0.6rem;
+  border-left: 2px solid var(--color-ink-700);
+  color: var(--color-ink-300);
+  font-size: var(--text-label);
+  white-space: pre-wrap;
+  max-height: 6rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  overflow-wrap: anywhere;
+}
+.threads-replyctx-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.6rem;
+}
 .threads-mode {
   display: flex;
   flex-wrap: wrap;

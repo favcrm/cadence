@@ -1513,7 +1513,7 @@ exactly one git commit whose subject carries the actor:
 | `POST /api/delivery/:id/decline` | `{reason}` — same path and refusals; relays the daemon's operator-only `delivery_decline`; a blank reason is `400 reason_required` | `200` with the loop record |
 | `POST /api/epics/:epic/stage` | `{stage, note?}` — CAD-432: move an epic's stage over the daemon's `epic_stage` (CAD-405); the board never writes the tracker for it. The relay runs on the board's own connection, which the daemon attributes to the operator, so **every** board move needs the operator, not only moves into an `operator_stages` stage: read-only, the write guards, `403 operator_only` for an agent-attributed caller and `403 operator_proof` for a peer without the positive proof — the plan routes' path — before anything is written; no identity field is read (`deny_unknown_fields`). The relay sets `operator_decision: true`, and the daemon then requires the operator on the board's connection for any target, so a board an agent started is refused too (`403 operator_proof`) instead of landing the move as that agent's. Agents move stages with `cadence issue epic stage` over their own connection. The daemon's rules still apply: one step forward, any step back to the floor | `200` `{epic, from, to, forward, needs_operator, by, at, …}`; `400` a skip or unknown stage; `409` already there; `404` unknown epic |
 | `POST /api/issues/:id/answers` | `{question, text}` — the operator's answer (CAD-328) to the open question report `question` on `:id`: an `answer` task report (CAD-341) authored `operator`, never from the request or the board's environment; `403 operator_only` for an agent caller and `403 operator_proof` for a peer that is not provably the operator (same proof as the plan routes); `400` when `question` is not a question report on the ticket or `text` is blank. Then the daemon's `answer_route` (CAD-447) queues one message to the question's author with the answer and the report path — the reply's `route` says whether it was sent (`undeliverable` when the asker is gone; the answer stands either way) — and a best-effort `reports_changed` so the master's report router (CAD-339) picks it up at once | `201` `{issue, card, warnings, route}` |
-| `POST /api/threads/:alias/messages` | `{text, message?}` — the operator's chat message (CAD-319): starts the thread on first use and queues `text` to the agent like `cadence send`. Refused `403 caller_agent` when the caller is attributed to an agent (pane or managed endpoint tool process); the daemon refuses agent connections again. Tied to no agent is the operator by default, not positive proof (CAD-313) | `200` with the send receipt and `thread` |
+| `POST /api/threads/:alias/messages` | `{text, message?, expected_recipient_uid?}` — the operator's chat message (CAD-319): starts the thread on first use and queues `text` to the agent like `cadence send`. `expected_recipient_uid` (CAD-1591) is an optional identity constraint, never authority: a nonempty uid the daemon's enqueue transaction compares to the recipient's current uid — a mismatch refuses before any message or thread side effect, and an omitted field keeps the ordinary path. Refused `403 caller_agent` when the caller is attributed to an agent (pane or managed endpoint tool process); the daemon refuses agent connections again. Tied to no agent is the operator by default, not positive proof (CAD-313) | `200` with the send receipt and `thread` |
 
 Success bodies are `{issue, card, warnings}` — the fresh payloads, so
 the UI needs no second fetch. `warnings` notes a `ready`/`doing`/`review`
@@ -2166,6 +2166,27 @@ either cursor advances. Mark all read dismisses notifications without marking
 unviewed transcript messages read.
 All includes every eligible conversation, not a truncated first page. The bell's
 unread total covers that complete authorized history.
+
+Agent-pair Threads stay read-only (CAD-1591): a message whose recorded
+sender is a still-registered agent carries a "Reply as you" action that
+opens the operator's existing DM to that participant — an operator reply,
+never a reply impersonating either agent. The composer shows a context
+strip with the original message id, a bounded quoted excerpt and a
+backlink to the pair conversation it came from, and the sent body appends
+a `Replying to your message <id>` quote block; the quote is context, never
+a routing field, so origin and reply_to are untouched and the send is an
+ordinary operator DM. The recorded sender's uid rides every attempt as
+`expected_recipient_uid`: a removed or replaced participant is refused by
+the daemon's enqueue transaction before any side effect, never silently
+re-addressed, and a removed, legacy or unproven sender is never offered
+the action at all. The reply draft is scoped to the recorded sender uid
+and original message id (`threads-reply:<uid>:<messageId>`), so it can
+never merge into or displace the ordinary DM draft and clears with a
+private-session reset; it lives in page state, not the URL, so a copied
+link cannot fabricate a reply context. Drafting never sends. After an
+accepted send the context stays until an explicit Cancel — only the exact
+submitted intent is marked sent, nothing is unconditionally cleared — so
+post-submit edits remain visible with their reply context.
 
 Browser alerts require explicit device opt-in through the browser's native
 permission and subscription flow. Alerts are generic by default; opening one
