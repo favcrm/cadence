@@ -113,6 +113,31 @@ impl Shared {
         verb: &str,
         need: crate::cli_actor::Scope,
     ) -> Result<CliPrincipal> {
+        let principal = self.cli_principal(params, peer_pid, verb, need)?;
+        // An enrolled agent may share its parent's `sub`, but does not
+        // inherit that human's private messages or master-chat authority.
+        if principal.actor.principal_kind != "user" {
+            return Err(Error::invalid(
+                "not_permitted",
+                "remote CLI messaging requires a verified human principal",
+            ));
+        }
+        Ok(principal)
+    }
+
+    /// [`Self::cli_caller`] without the human-principal pin: the
+    /// settings command admits verified `agents/<h>` principals under
+    /// their own grant bound (CAD-1586) — the principal kind and scope
+    /// checks move to the verb. Everything else is identical: proven
+    /// relay connection, cryptographic re-verify, per-verb scope,
+    /// subject hygiene.
+    pub(super) fn cli_principal(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+        verb: &str,
+        need: crate::cli_actor::Scope,
+    ) -> Result<CliPrincipal> {
         // The connection itself must be the operator/board relay — the
         // only channel allowed to carry a relayed cli envelope. An
         // agent or unproven connection is refused outright, before the
@@ -155,14 +180,6 @@ impl Shared {
                 format!("{verb} refused: the cli envelope's scopes do not cover this verb"),
             ));
         }
-        // An enrolled agent may share its parent's `sub`, but does not
-        // inherit that human's private messages or master-chat authority.
-        if actor.principal_kind != "user" {
-            return Err(Error::invalid(
-                "not_permitted",
-                "remote CLI messaging requires a verified human principal",
-            ));
-        }
         // The durable sender label is the canonical `cli:<org>|<sub>`
         // key; bound the claim that lands in it — the schema bounds
         // `actor` spellings but not `sub`, and a control character must
@@ -175,6 +192,93 @@ impl Shared {
             ));
         }
         Ok(CliPrincipal { config, actor })
+    }
+
+    /// `cli_settings_command` — the hosted `settings_agents` peer
+    /// (CAD-1586). Same envelope discipline as the message plane:
+    /// proven board relay, re-verified envelope — then the op's scope
+    /// (`settings.read`/`settings.write`, never the cli.* vocabulary)
+    /// and the principal class decide. A verified human owner is
+    /// operator-class for this org's settings; an `agents/<h>`
+    /// principal reaches only the petition verbs and ops bound by a
+    /// hosted grant; anything else is refused.
+    pub(super) fn rpc_cli_settings_command(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        cli_reject_fields(
+            params,
+            &["cli_envelope", "operation", "expected_revision", "payload"],
+            "cli settings command",
+        )?;
+        let op = required_str(params, "operation")?;
+        if !settings_rpc::known_op(op) {
+            return Err(Error::invalid(
+                "invalid_request",
+                format!("unknown settings operation '{op}'"),
+            ));
+        }
+        // The op's exact scope is enforced after re-verify — the
+        // verb-level check here needs either settings scope present
+        // (a caller with NEITHER is refused before the op is read).
+        let principal = self.cli_principal(
+            params,
+            peer_pid,
+            "cli settings command",
+            crate::cli_actor::Scope::SettingsAny,
+        )?;
+        let need = if settings_rpc::op_needs_write(op) {
+            crate::cli_actor::Scope::SettingsWrite
+        } else {
+            crate::cli_actor::Scope::SettingsRead
+        };
+        if !crate::cli_actor::scope_covers(&principal.actor, need) {
+            return Err(Error::invalid(
+                "insufficient_scope",
+                format!(
+                    "cli settings command '{op}' refused: the envelope's scopes \
+                     do not cover it — it needs {}",
+                    if settings_rpc::op_needs_write(op) {
+                        "settings.write"
+                    } else {
+                        "settings.read"
+                    }
+                ),
+            ));
+        }
+        let expected = optional_str(params, "expected_revision");
+        let payload = params.get("payload").cloned().unwrap_or(Value::Null);
+        match principal.actor.principal_kind.as_str() {
+            "user" if principal.actor.role_at_issue == "owner" => self.settings_op_caller(
+                op,
+                expected,
+                &payload,
+                settings_rpc::SettingsCaller::RemoteOwner,
+                &format!("cli:{}|{}", principal.config.company, principal.actor.sub),
+            ),
+            "agent" => {
+                // Hosted agents hold no settings authority on their own:
+                // the petition verbs and grant-bound operations only.
+                self.settings_op_caller(
+                    op,
+                    expected,
+                    &payload,
+                    settings_rpc::SettingsCaller::RemoteAgent {
+                        actor: principal.actor.actor.clone(),
+                        sub: principal.actor.sub.clone(),
+                        org: principal.config.company.clone(),
+                    },
+                    &principal.actor.actor,
+                )
+            }
+            _ => Err(Error::invalid(
+                "not_permitted",
+                "cli settings command requires a verified human owner or a \
+                 hosted agent principal with a settings grant — member users \
+                and service actors are refused",
+            )),
+        }
     }
 
     /// The durable sender key the verified principal's own sends carry —

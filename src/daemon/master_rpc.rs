@@ -87,6 +87,9 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "master_ask_permission",
     "master_peek_grant",
     "master_permission_use",
+    // CAD-1586: petitions and exact operator-approved settings operations.
+    // The handler owns grants; app turns keep their separate allowlist.
+    "agent_settings_command",
     // CAD-1014(b): the master's scoped-chat redeem verbs — a bounded CSV
     // import and a segment save, each redeeming the operator's own
     // stamped scoped chat message on the live assigned turn. Narrow
@@ -139,7 +142,7 @@ fn now_epoch() -> i64 {
 /// `preferred` / `fallbacks` of AGENT.md's frontmatter: the provider,
 /// model and effort the master launches with unless the operator names
 /// them. Unreadable frontmatter just yields nothing.
-fn preferred(agent_md: &str) -> Vec<(String, Option<String>, Option<String>)> {
+pub(super) fn preferred(agent_md: &str) -> Vec<(String, Option<String>, Option<String>)> {
     let Ok((yaml, _)) = crate::issue::parse::split_front(agent_md) else {
         return vec![];
     };
@@ -165,7 +168,7 @@ fn preferred(agent_md: &str) -> Vec<(String, Option<String>, Option<String>)> {
 /// `fallbacks` entry, taking the first the daemon accepts
 /// ([`master::PROVIDERS`]); none usable → the first accepted provider
 /// (CAD-322 round 2, I2).
-fn resolve_provider(
+pub(super) fn resolve_provider(
     requested: Option<&str>,
     prefs: &[(String, Option<String>, Option<String>)],
 ) -> String {

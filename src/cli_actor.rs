@@ -74,14 +74,29 @@ pub enum Verb {
     IssueSet,
     MessageSend,
     ProjectPolicy,
+    // settings.read / settings.write — per-op inside the daemon
+    // (CAD-1586): reads and mutations share one verb; the daemon
+    // refuses an op whose required scope the envelope lacks.
+    SettingsAgents,
+    // settings.read — master launch diagnosis for the authorized
+    // management agent (CAD-1586); writes nothing.
+    MasterStatus,
 }
 
-/// The `cli.*` scope a verb needs — `cli.write` never implies
-/// `cli.read` (the contract's `hostedCadenceCliVerbAllowed`).
+/// The scope a verb needs — `cli.write` never implies `cli.read`, and
+/// neither implies a `settings.*` scope (the contract's
+/// `hostedCadenceCliVerbAllowed`, extended for CAD-1586).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     Read,
     Write,
+    SettingsRead,
+    SettingsWrite,
+    /// The route-level gate for verbs whose op decides between
+    /// `settings.read` and `settings.write`: an envelope needs at
+    /// least one settings scope to pass; the daemon enforces the
+    /// per-op requirement.
+    SettingsAny,
 }
 
 impl Verb {
@@ -104,6 +119,8 @@ impl Verb {
             "issue_set" => Verb::IssueSet,
             "message_send" => Verb::MessageSend,
             "project_policy" => Verb::ProjectPolicy,
+            "settings_agents" => Verb::SettingsAgents,
+            "master_status" => Verb::MasterStatus,
             _ => return None,
         })
     }
@@ -124,6 +141,10 @@ impl Verb {
             | Verb::IssueSet
             | Verb::MessageSend
             | Verb::ProjectPolicy => Scope::Write,
+            Verb::SettingsAgents => Scope::SettingsAny,
+            // CAD-1586: master diagnosis is a settings-scoped read —
+            // the management agent needs it, and cli.* never covers it.
+            Verb::MasterStatus => Scope::SettingsRead,
         }
     }
 }
@@ -394,16 +415,17 @@ pub fn verify(
         ));
     }
     // The claim schema's invariants, re-checked against our parse:
-    // every scope is the cli vocabulary; `operator` actor only ever
+    // every scope is the cli/settings vocabulary; `operator` actor only ever
     // rides a verified owner USER; `owner` role never maps a service.
-    if claims
-        .scope
-        .iter()
-        .any(|s| s != "cli.read" && s != "cli.write")
-    {
+    if claims.scope.iter().any(|s| {
+        !matches!(
+            s.as_str(),
+            "cli.read" | "cli.write" | "settings.read" | "settings.write"
+        )
+    }) {
         return Err(Rejection::new(
             "bad_claims",
-            "the envelope carries a scope outside the cli vocabulary",
+            "the envelope carries a scope outside the cli/settings vocabulary",
         ));
     }
     if claims.actor == "operator"
@@ -458,11 +480,16 @@ pub fn verify(
 /// envelope's `scope` is the server's intersected ceiling — this route
 /// never widens it.
 pub fn scope_covers(actor: &CliActor, need: Scope) -> bool {
-    let want = match need {
-        Scope::Read => "cli.read",
-        Scope::Write => "cli.write",
-    };
-    actor.scopes.iter().any(|s| s == want)
+    match need {
+        Scope::Read => actor.scopes.iter().any(|s| s == "cli.read"),
+        Scope::Write => actor.scopes.iter().any(|s| s == "cli.write"),
+        Scope::SettingsRead => actor.scopes.iter().any(|s| s == "settings.read"),
+        Scope::SettingsWrite => actor.scopes.iter().any(|s| s == "settings.write"),
+        Scope::SettingsAny => actor
+            .scopes
+            .iter()
+            .any(|s| s == "settings.read" || s == "settings.write"),
+    }
 }
 
 // ---------- single-use `jti` ----------

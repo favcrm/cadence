@@ -246,6 +246,105 @@ These streams stay raw and are not part of discovery: inbox and events
 NDJSON, logs and content bytes, a bare `build-slot acquire` token, and
 `build-slot run` child stdout.
 
+## Settings > Agents management (CAD-1586)
+
+`cadence settings agents` manages the same authoritative document and revision
+as Settings > Agents. It never writes SQLite, `pm.yaml` or generated profiles
+directly. JSON output separates saved configuration, host observations,
+catalog results and history.
+
+| Family | Operations |
+| --- | --- |
+| `show`, `apply`, `history` | Inspect the snapshot; atomically apply `--file <config.json>` or `--file -`; inspect recorded history |
+| `harness` | `list`, `show`, `put`, `remove`; installed/version/live remain observations |
+| `provider` | `list`, `show`, `put`, `remove`; inference-provider metadata, not connection credentials |
+| `model` | `list`, `show`, `put`, `rename`, `remove`, `scope`; effective Pi master/worker allowlists are reported |
+| `catalog` | `refresh`, `import --model <id>` or `--all-new`; imported Pi models start `off` |
+| `role` | `list`, `set`, `clear`; team-role defaults and inherited provider selections |
+| `profile` | `list`, `show`, `put`, `rename`, `remove`, `preview`, `sync` |
+| `pin` | `list`, `put`, `remove`; metadata only, never package installation |
+| `grant` | `request`, `list`, `allow`, `reject`, `revoke`; exact settings authority, not blanket agent privileges |
+
+Use `cadence schema settings agents <family> <operation>` for exact fields.
+Sparse `put` updates preserve omitted fields; creation requires the fields
+that have no stored value. Pi models created without a scope start `off`.
+Native-CLI models do not use the Pi scope gate.
+
+Document changes require `--expected-revision` from the observed snapshot.
+A stale revision exits 5 without partially updating configuration; the CLI
+does not retry against a newer document. Model renames update settings
+references atomically. Active-use and reference checks remain enforced.
+
+```sh
+REV=$(cadence settings agents show | jq -r '.revision')
+cadence settings agents harness list
+cadence settings agents model list
+REV=$(cadence settings agents profile put review --role dev --model inherit \
+  --job-file review-job.md --expected-revision "$REV" | jq -r '.revision')
+cadence settings agents profile preview review --harness pi \
+  --expected-revision "$REV"
+cadence settings agents profile sync review --expected-revision "$REV"
+```
+
+Capture the new revision after each configuration change. Saving does not
+sync exports. Sync reports per-file status and a `snapshot`; it preserves
+unmanaged files. Preview starts no process and proves neither authentication
+nor future launch success. Launch saved profiles through the existing
+`cadence join ... --profile review` path.
+
+### Managing-agent authorization
+
+An unapproved agent can petition and list its own requests, not read or edit
+organization-wide settings. Grant decisions require proven operator authority
+(a verified, appropriately scoped human owner on the hosted path).
+
+```sh
+# Agent: request the exact operation, payload and observed revision.
+cadence settings agents grant request model.scope --expected-revision "$REV" \
+  --payload '{"id":"vendor/model","scope":"master"}' --reason "Recover master"
+# Operator: inspect the request, then approve it against the observed revision.
+cadence settings agents grant list
+cadence settings agents grant allow "$REQUEST_ID" --expected-revision "$REV"
+# The same agent: execute the approved operation.
+cadence settings agents model scope vendor/model master \
+  --expected-revision "$REV" --grant "$GRANT_ID"
+```
+
+Reads also accept `--grant`. Grants bind the real requester, registration,
+organization, operation, payload and revision; they are single-use, revocable
+and expire after 15 minutes. Requester identity is never a CLI field.
+For `apply` or profile job files, approval binds the payload read from the file,
+not its pathname. Changed content is refused. Optional `--digest sha256:<hex>`
+checks canonical payload JSON, not a raw-file `sha256sum`. An argv-only master
+permission cannot authorize a Settings mutation or issue another grant.
+App-scoped assistant turns gain no settings authority.
+
+### Master recovery and hosted use
+
+`cadence master status [--grant <id>]` reports model selection, configuration
+launch refusal, applicable allowlist and queue state. Unknown authentication
+is reported as unknown. A known configuration-blocked send returns
+`master_unlaunchable` before enqueue; a busy master is a different condition.
+
+After an authorized model-scope repair, `cadence master resume --grant <id>`
+uses an exact `master.resume` grant and the existing resume implementation.
+It resumes queued work without resubmitting messages. It neither unfences an
+unknown outcome nor grants start/stop/deployment authority.
+
+Owner-operated hosted commands use the explicitly selected `--org`. Request
+Settings access with `cadence login --settings`; existing `cli.read`/`cli.write`
+credentials do not imply `settings.read`/`settings.write`. The gateway
+counterpart is AOS-290. Both gateway and native runtime must support the new
+operations; an unavailable or unauthorized remote operation never falls back
+to local settings.
+
+Managed outside workers cannot reuse the stored owner's remote credential:
+these Settings and master operations refuse with
+`settings_agent_session_required` before loading credentials. Agent-specific
+hosted CLI login is deferred to CAD-1592. Managing agents running on the local
+or hosted runtime use that runtime's local daemon and exact grants instead.
+
+
 ## Observation output
 
 `status`, `overview`, `memory ls`, and `build-slot status` print a table

@@ -103,6 +103,11 @@ pub(crate) fn run() -> Result<i32> {
 fn command_line_ids(m: &clap::ArgMatches) -> Vec<String> {
     let typed = m
         .ids()
+        // `ids()` reports propagated global args (e.g. `settings agents`
+        // `--grant`) on nested subcommand matches too, but `value_source`
+        // panics on an id the subcommand never declared. `try_contains_id`
+        // verifies the declaration first; only then is `value_source` safe.
+        .filter(|id| matches!(m.try_contains_id(id.as_str()), Ok(true)))
         .filter(|id| m.value_source(id.as_str()) == Some(clap::parser::ValueSource::CommandLine))
         .map(|id| id.as_str().to_string());
     let nested = m
@@ -200,6 +205,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             no_open,
             auth_dir,
             web,
+            settings,
         } => {
             // `--token-stdin` is the legacy AgenticOS token path, not org login.
             let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
@@ -215,13 +221,14 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             let issuer = issuer
                 .as_deref()
                 .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
-            let grant = if *web {
+            let grant = if *web || *settings {
                 cadence_agent::remote_enrollment::login_portal_scoped(
                     issuer,
                     hint.as_deref().or(slug.as_deref()),
                     &dir,
                     |url, code| show_login_code(url, code, *no_open),
-                    true,
+                    *web,
+                    *settings,
                 )?
             } else if let Some(org) = org.as_deref() {
                 let slug = slug.as_deref().ok_or_else(|| {
@@ -870,6 +877,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         Commands::Template { action } => business_templates::run_template(state_dir, action),
         Commands::Document { action } => business_templates::run_document(state_dir, action),
         Commands::Ui { action } => ui::run(state_dir, action),
+        Commands::Settings { action } => settings::run(&state_dir, action),
         Commands::Status {
             group,
             all,

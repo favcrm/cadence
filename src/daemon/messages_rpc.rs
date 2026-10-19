@@ -786,6 +786,13 @@ impl Shared {
                 "turn_id": stored.turn_id, "delivery": "native_turn_steering", "disposition": stored.result}),
             );
         }
+        // CAD-1586: a fresh send to a master whose stored launch
+        // configuration provably refuses every launch is refused
+        // `master_unlaunchable` here — after every request check,
+        // before the durable enqueue — so no route can queue a turn no
+        // launch can deliver. Busy, starting, stopping and
+        // offline-but-launchable masters are unaffected.
+        self.master_send_preflight(&alias)?;
         let (duplicate, state) = self.store.enqueue_steered_for_with_conversation(
             &alias,
             expected_uid,

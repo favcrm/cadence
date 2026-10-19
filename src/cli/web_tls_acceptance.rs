@@ -124,8 +124,9 @@ fn real_login(auth_dir: &Path, slug: &str) -> LoginGrant {
         auth_dir,
         |_verification, _user_code| Ok(()),
         true,
+        false,
     )
-    .expect("real device-flow login must return a verified grant")
+    .expect("real device-flow login")
 }
 
 /// Read the non-secret release list the production code persisted after a

@@ -143,6 +143,7 @@ mod jobs_rpc;
 mod lane_rpc;
 mod master_rpc;
 mod master_session_rpc;
+mod master_status_rpc;
 mod master_wake;
 mod members_rpc;
 mod memory_rpc;
@@ -161,6 +162,7 @@ mod public_membership;
 mod requests_rpc;
 mod review_evidence_rpc;
 mod serve;
+mod settings_rpc;
 mod slots_rpc;
 mod social_connect_rpc;
 mod social_publish_driver;
@@ -2276,6 +2278,8 @@ impl Shared {
             "agent_settings_catalog" => self.rpc_agent_settings_catalog(params, peer_pid),
             "agent_settings_sync" => self.rpc_agent_settings_sync(params, peer_pid),
             "agent_settings_preview" => self.rpc_agent_settings_preview(params, peer_pid),
+            "agent_settings_command" => self.rpc_agent_settings_command(params, peer_pid),
+            "cli_settings_command" => self.rpc_cli_settings_command(params, peer_pid),
             "agent_list" => {
                 // CAD-437: repeatable any-of filters, daemon-side.
                 let states = optional_strs(params, "states")?;

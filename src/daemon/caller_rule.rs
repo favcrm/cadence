@@ -129,6 +129,18 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "agent_settings_preview",
         Rule::Handler("operator_connection (CAD-1548)"),
     ),
+    (
+        "agent_settings_command",
+        Rule::Handler(
+            "settings_caller: operator, or a settings grant bound to the exact op+payload+revision+agent identity (CAD-1586)",
+        ),
+    ),
+    (
+        "cli_settings_command",
+        Rule::Handler(
+            "cli_caller: re-verified cli_envelope on a proven board relay; human owner or grant-bound agents/<h> principal (CAD-1586)",
+        ),
+    ),
     ("agent_list", Rule::Read),
     ("agent_show", Rule::Handler("read; optional profile instructions require authorize_agent_mutation(SelfService)")),
     // CAD-886: `agent_wait` answers a strict subset of what `agent_show`

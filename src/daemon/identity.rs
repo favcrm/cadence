@@ -985,7 +985,7 @@ impl SlotPeer {
 /// recorded provider pid. A re-registration, a reopen or a closed
 /// endpoint (pid cleared) all change or erase it — `None` means the
 /// owner has no live endpoint to enroll.
-fn owner_generation(agent: &Agent) -> Option<String> {
+pub(super) fn owner_generation(agent: &Agent) -> Option<String> {
     let pid = agent.pid?;
     Some(format!(
         "{:016x}:{}:{pid}",
