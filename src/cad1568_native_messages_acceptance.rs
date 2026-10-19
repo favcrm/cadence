@@ -62,6 +62,7 @@ fn cad1568_peer(root: &Path, port: u16, rig: &Rig, cert: &Path, key: &Path, nonc
             .env("CAD1434_TLS_CERT", cert)
             .env("CAD1434_TLS_KEY", key)
             .env("CAD1434_TOKEN_OUT", root.join("tokens.json"))
+            .env("CAD1568_REQUEST_LEDGER", root.join("requests.jsonl"))
             .env("CAD1434_CONTROL_NONCE", nonce)
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
@@ -230,6 +231,86 @@ fn cad1568_send_argv(id: &str) -> Vec<&str> {
         "--text",
         cad1568_body(id),
     ]
+}
+
+/// The hosted boundary's own record of the requests it was asked to serve:
+/// method, path and status only. The peer appends one JSON line per
+/// proxied request, so the controller can name the hop that actually
+/// handled a request instead of inferring it from a refusal.
+fn hosted_requests(root: &Path) -> Vec<Value> {
+    let Ok(text) = fs::read_to_string(root.join("requests.jsonl")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect()
+}
+
+/// The CLI-surface requests that reached the hosted boundary. A request
+/// that is absent from this record never left the client.
+fn hosted_cli_requests(root: &Path) -> Vec<Value> {
+    hosted_requests(root)
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| path.starts_with("/__platform/cli/"))
+        })
+        .collect()
+}
+
+/// The durable rows this runtime actually holds for `master`, read with
+/// the runtime's own operator-scoped listing RPC. Membership in this set
+/// is the observation: a refused id is simply not among the rows, which
+/// no read error can stand in for.
+fn durable_master_ids(rig: &Rig) -> std::collections::BTreeSet<String> {
+    let listed = scoped(Asserted::Operator, || {
+        client::rpc(
+            &rig.state,
+            "message_list",
+            json!({"to": "master", "limit": 50}),
+        )
+    })
+    .unwrap_or_else(|error| panic!("durable row listing failed: {error}"));
+    let rows = listed
+        .get("messages")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("the durable listing returned no rows: {listed}"));
+    rows.iter()
+        .filter_map(|row| row.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect()
+}
+
+/// What the runtime's own store holds for one durable id.
+enum DurableRow {
+    Present,
+    Absent,
+}
+
+/// The runtime's own store, read with operator scope. The store's own
+/// absent-row answer is the only answer this probe may read as absence:
+/// a transport, deserialization, internal or store failure is a failed
+/// probe and stops the check — it is never evidence that a row does not
+/// exist, and an authorization answer is never absence either.
+fn durable_row(rig: &Rig, id: &str) -> DurableRow {
+    match scoped(Asserted::Operator, || {
+        client::rpc(&rig.state, "message_read", json!({"message": id}))
+    }) {
+        Ok(_) => DurableRow::Present,
+        Err(error) => {
+            let text = error.to_string();
+            if error.kind() == "rejected"
+                && text.contains("No such message")
+                && text.contains(id)
+            {
+                DurableRow::Absent
+            } else {
+                panic!("the store probe for {id} did not answer: {error}");
+            }
+        }
+    }
 }
 
 fn cad1568_hosted_cli_scenario() {
@@ -623,8 +704,12 @@ fn cad1568_hosted_cli_scenario() {
     let error = cli(&owner_auth, "message_send", conflict).unwrap_err();
     assert_eq!(error.code(), Some("message_id_conflict"));
 
-    // Recipient-class boundary through the packaged CLI: a non-master
-    // alias is a typed refusal, never a silent reroute.
+    // Recipient-class boundary through the packaged CLI: the request is
+    // forwarded, and the container's own recipient-class guard refuses it
+    // with its typed code — that code is the native runtime's, not the
+    // board's (a board refusal names `error.hop = "board"` and a reason
+    // instead), and the refusal is never a silent reroute.
+    let before_local = hosted_cli_requests(root.path());
     let local_refused = cli_exe.run(
         &owner_home,
         &owner_cfg,
@@ -643,15 +728,30 @@ fn cad1568_hosted_cli_scenario() {
         cli_exe.refusal(&local_refused),
         "recipient_class_unsupported"
     );
+    assert!(
+        hosted_cli_requests(root.path()).len() > before_local.len(),
+        "the local-recipient send must be forwarded before the container refuses it"
+    );
 
-    // Member home, packaged CLI: send to master is refused by the real
-    // human-role check; the private read is indistinguishable from absent.
+    // Member home, packaged CLI: the request is forwarded, and the
+    // container's role guard refuses it — master coordination needs a
+    // verified human workspace owner. Its code is the container's own
+    // (`not_permitted` is minted only by the container's `cli_recipient`;
+    // a board refusal names `error.hop = "board"` and a reason instead).
+    // The member's own read of the owner's message is privacy evidence:
+    // it is refused as not found and proves nothing about which rows
+    // exist, so it is never used as an enqueue-absence oracle.
+    let before_member = hosted_cli_requests(root.path());
     let member_denied = cli_exe.run(
         &member_home,
         &member_cfg,
         &cad1568_send_argv("cad1568-member-refused"),
     );
     assert_eq!(cli_exe.refusal(&member_denied), "not_permitted");
+    assert!(
+        hosted_cli_requests(root.path()).len() > before_member.len(),
+        "the member's send must be forwarded before the container refuses it"
+    );
     let private_read = cli_exe.run(
         &member_home,
         &member_cfg,
@@ -665,8 +765,32 @@ fn cad1568_hosted_cli_scenario() {
     );
     assert_eq!(cli_exe.refusal(&private_read), "not_found");
 
-    // Wrong-workspace selection: the recorded `other` org reaches the real
-    // handlers, which refuse before any message can exist.
+    // Wrong-workspace selection, case 1: the LOCAL immutable-workspace
+    // credential pin. The `other` connection names a workspace this
+    // principal holds no credential for, and the saved credential for
+    // that org name is planted first: it names the lc workspace while
+    // the destination claims another one. That is the state the pin
+    // exists for — a destination changed under a credential that belongs
+    // somewhere else — and the pin must refuse it on the client, before
+    // anything is forwarded. The pin reads the workspace binding before
+    // the token, so the planted bearer is never examined or sent.
+    private_write(
+        &owner_auth.join("cli-other.json"),
+        json!({
+            "version": "hosted-cadence-auth.v1",
+            "organization_id": WORKSPACE,
+            "organization_slug": SLUG,
+            "audience": BOARD,
+            "issuer": issuer,
+            "subject_id": ready.owner_id,
+            "capabilities": ["cli.read", "cli.write"],
+            "access_token": format!("hct_{}", "P".repeat(43)),
+            "expires_at": crate::issue::time::now_epoch() + 3600,
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let before_pin = hosted_cli_requests(root.path());
     let wrong_workspace = cli_exe.run(
         &owner_home,
         &owner_cfg,
@@ -682,14 +806,22 @@ fn cad1568_hosted_cli_scenario() {
         ],
     );
     assert!(!wrong_workspace.status.success());
+    // The hop that refused, named by what happened rather than by prose:
+    // a local rejection carries no wire code, and no CLI request reached
+    // the hosted boundary. The server was never asked, so this is not a
+    // server-side wrong-workspace refusal.
+    let pin_error = cli_exe.error(&wrong_workspace);
+    assert_eq!(pin_error["kind"], "rejected");
     assert!(
-        cli(
-            &owner_auth,
-            "message_read",
-            json!({"message":"cad1568-other-workspace"})
-        )
-        .is_err(),
-        "wrong-workspace send persisted a durable row"
+        pin_error.get("code").is_none(),
+        "the wrong-workspace refusal must be the local pin, not a hosted wire refusal: \
+         {pin_error}"
+    );
+    let after_pin = hosted_cli_requests(root.path());
+    assert_eq!(
+        after_pin.len(),
+        before_pin.len(),
+        "the local credential pin must refuse before any HTTP forwarding: {after_pin:?}"
     );
 
     // The armed transport must fail closed, not silently degrade to
@@ -819,9 +951,15 @@ fn cad1568_hosted_cli_scenario() {
         conversations["cad1568-packaged-roundtrip"]
     );
 
-    // Signed-envelope authority checks stay on the direct wire: the real
-    // issuer answer is replayed once, an under-scoped minted envelope is
-    // refused, and the wrong-workspace authorize is refused outright.
+    // Signed-envelope authority checks stay on the direct wire, and each
+    // one names the hop that refused it: the container's single-use
+    // envelope check refuses the replayed answer, the board's scope check
+    // refuses the under-scoped envelope, and the board's wrong-workspace
+    // guard refuses an authorize that names another workspace. Each
+    // refusal says which hop produced it — the board's own refusals
+    // carry `error.hop = "board"` and a reason, the container's carry
+    // their own typed code — so a forwarded status is never counted as
+    // another hop's evidence.
     let envelope = authorize(&target, &owner, Surface::Cli, &["cli.read"], AUTH_TIMEOUT).unwrap();
     let read_request = json!({"version":CLI_VERSION,"envelope":envelope,"verb":"message_read", "arguments":{"message":"cad1568-packaged-roundtrip"}});
     let (status, _, _) = post(
@@ -833,7 +971,7 @@ fn cad1568_hosted_cli_scenario() {
     )
     .unwrap();
     assert_eq!(status, 200);
-    let (replay, _, _) = post(
+    let (replay, _, replay_body) = post(
         BOARD,
         "/__platform/cli/call",
         &owner.access_token,
@@ -842,54 +980,154 @@ fn cad1568_hosted_cli_scenario() {
     )
     .unwrap();
     assert_eq!(replay, 401);
+    // The replay is refused by the CONTAINER's single-use envelope check
+    // (ui/cli_route.rs::post consumes the jti and answers
+    // `assertion_replayed`), after the board forwarded the still valid
+    // envelope. The typed code in the relayed body is what binds this
+    // refusal to that hop: a status alone cannot, and a board refusal
+    // carries `error.hop = "board"` with a reason instead of a code.
+    let replay_error = replay_body.unwrap()["error"].clone();
+    assert_eq!(replay_error["code"], "assertion_replayed");
+    assert!(
+        replay_error.get("hop").is_none(),
+        "the replay must be refused by the container, not by the board: {replay_error}"
+    );
     let read_only = authorize(&target, &owner, Surface::Cli, &["cli.read"], AUTH_TIMEOUT).unwrap();
     let (scope_denied, _, scope_body) = post(BOARD, "/__platform/cli/call", &owner.access_token,
         &json!({"version":CLI_VERSION,"envelope":read_only,"verb":"message_send", "arguments":send("cad1568-no-write-grant")}), CALL_TIMEOUT).unwrap();
     // The platform distinguishes this permission failure by reason while
     // retaining its established 401 envelope-authority response status.
+    // The refusal names the hop it came from, so it is the board's own
+    // scope check and not a forwarded container refusal.
     assert_eq!(scope_denied, 401);
-    assert_eq!(scope_body.unwrap()["error"]["reason"], "scope_not_granted");
-    let (wrong_org, _, _) = post(BOARD, "/__platform/cli/authorize", &owner.access_token,
+    let scope_error = scope_body.unwrap()["error"].clone();
+    assert_eq!(scope_error["hop"], "board");
+    assert_eq!(scope_error["reason"], "scope_not_granted");
+    // The server-side wrong-workspace guard: a correctly authenticated
+    // request that names another workspace reaches the hosted boundary
+    // and is refused there by the board's own guard — its refusal names
+    // the hop it came from. No envelope is minted, so no send can follow
+    // it; the durable rows below show that nothing new exists.
+    let before_wrong_org = hosted_cli_requests(root.path());
+    let (wrong_org, _, wrong_org_body) = post(BOARD, "/__platform/cli/authorize", &owner.access_token,
         &json!({"version":CLI_VERSION,"organization_id":"other-workspace","audience":BOARD, "requested_scopes":["cli.write"],"ttl_seconds":MAX_TTL}), AUTH_TIMEOUT).unwrap();
     assert!((400..500).contains(&wrong_org));
+    let wrong_org_error = wrong_org_body.unwrap()["error"].clone();
+    assert_eq!(
+        wrong_org_error["hop"], "board",
+        "the wrong-workspace authorize must be refused by the board's own guard: \
+         {wrong_org_error}"
+    );
+    let after_wrong_org = hosted_cli_requests(root.path());
+    let wrong_org_requests = &after_wrong_org[before_wrong_org.len()..];
+    assert!(
+        wrong_org_requests.iter().any(|entry| {
+            entry.get("path").and_then(Value::as_str) == Some("/__platform/cli/authorize")
+                && entry
+                    .get("status")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|status| (400..500).contains(&status))
+        }),
+        "the wrong-workspace authorize must reach the hosted guard and be refused there: \
+         {wrong_org_requests:?}"
+    );
     let before_removal =
         authorize(&target, &owner, Surface::Cli, &["cli.write"], AUTH_TIMEOUT).unwrap();
     assert_eq!(control(port, &nonce, "revoke_owner_session"), 200);
-    let (removed, _, _) = post(BOARD, "/__platform/cli/call", &owner.access_token,
+    // Membership removed while the credential and the signed envelope are
+    // both retained: the request reaches the hosted boundary and is
+    // refused there for the now-dead membership, not on the client. The
+    // refusal names the hop that produced it, the ledger shows it
+    // reached the boundary, and the durable rows below show that this
+    // attempted id was never stored.
+    let before_removed = hosted_cli_requests(root.path());
+    let (removed, _, removed_body) = post(BOARD, "/__platform/cli/call", &owner.access_token,
         &json!({"version":CLI_VERSION,"envelope":before_removal,"verb":"message_send", "arguments":send("cad1568-removed-owner")}), CALL_TIMEOUT).unwrap();
     assert_eq!(removed, 401);
-    // And the packaged CLI itself cannot use the revoked login.
+    let removed_error = removed_body.unwrap()["error"].clone();
+    assert_eq!(
+        removed_error["hop"], "board",
+        "the retained-envelope call must be refused by the board's live-membership check: \
+         {removed_error}"
+    );
+    let after_removed = hosted_cli_requests(root.path());
+    let removed_requests = &after_removed[before_removed.len()..];
+    assert!(
+        removed_requests.iter().any(|entry| {
+            entry
+                .get("status")
+                .and_then(Value::as_u64)
+                .is_some_and(|status| (400..500).contains(&status))
+        }),
+        "the retained-envelope call must reach the hosted authorization hop: \
+         {removed_requests:?}"
+    );
+    // And the packaged CLI itself cannot use the revoked login. Its
+    // refusal happens at the hosted authorization hop: the bearer no
+    // longer resolves, so the request is refused there — the request
+    // ledger shows it reached the boundary. The owner's own read cannot
+    // stand in for absence here (that read is refused for authorization
+    // now, which says nothing about rows), so the row is observed in the
+    // durable store below.
+    let before_revoked = hosted_cli_requests(root.path());
     let revoked = cli_exe.run(
         &owner_home,
         &owner_cfg,
         &cad1568_send_argv("cad1568-revoked-cli"),
     );
     assert!(!revoked.status.success());
+    let after_revoked = hosted_cli_requests(root.path());
+    let revoked_requests = &after_revoked[before_revoked.len()..];
     assert!(
-        cli(
-            &owner_auth,
-            "message_read",
-            json!({"message":"cad1568-revoked-cli"})
-        )
-        .is_err(),
-        "revoked packaged send persisted a durable row"
+        revoked_requests.iter().any(|entry| {
+            entry
+                .get("status")
+                .and_then(Value::as_u64)
+                .is_some_and(|status| (400..500).contains(&status))
+        }),
+        "the revoked send must reach the hosted authorization hop and be refused there: \
+         {revoked_requests:?}"
     );
-    for id in [
-        "cad1568-member-refused",
-        "cad1568-local-refused",
-        "cad1568-no-write-grant",
-        "cad1568-removed-owner",
+    // The durable rows the runtime actually holds, read with the
+    // runtime's own operator-scoped listing: a refused send is absent
+    // from this set, and a send that really happened is present in it.
+    // Each id is listed with the hop that refused it, so no refusal is
+    // counted as another hop's evidence.
+    let durable = durable_master_ids(&rig);
+    assert!(
+        durable.contains("cad1568-packaged-roundtrip"),
+        "the durable listing must see the message that really was enqueued: {durable:?}"
+    );
+    for (id, hop) in [
+        ("cad1568-member-refused", "container role guard"),
+        ("cad1568-no-write-grant", "board scope check"),
+        ("cad1568-removed-owner", "board live-membership re-check"),
+        ("cad1568-revoked-cli", "board authorization hop"),
+        ("cad1568-other-workspace", "local credential pin"),
     ] {
         assert!(
-            scoped(Asserted::Operator, || client::rpc(
-                &rig.state,
-                "message_read",
-                json!({"message":id})
-            ))
-            .is_err(),
-            "refused send persisted {id}"
+            !durable.contains(id),
+            "the {hop} refused {id} but a durable row exists"
         );
     }
+    // The local recipient is not a listable agent, so its row is probed in
+    // the store directly. The store's own absent-row answer is the only
+    // absence this probe may read; a failed probe stops the check.
+    assert!(
+        matches!(
+            durable_row(&rig, "cad1568-local-refused"),
+            DurableRow::Absent
+        ),
+        "the container's recipient-class guard refused cad1568-local-refused but a durable row \
+         exists"
+    );
+    assert!(
+        matches!(
+            durable_row(&rig, "cad1568-packaged-roundtrip"),
+            DurableRow::Present
+        ),
+        "the store probe must see the message that really was enqueued"
+    );
     assert_eq!(control(port, &nonce, "finish"), 200);
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -900,5 +1138,5 @@ fn cad1568_hosted_cli_scenario() {
         assert!(Instant::now() < deadline, "real hosted peer did not settle");
         std::thread::sleep(Duration::from_millis(50));
     }
-    eprintln!("CAD-1568 packaged-CLI proof: real login -> staged wiki -> --org send naming the kit with workspace/subject/conversation receipt -> own terminal result; distinct concurrent ids -> distinct results; offline queue; lost-receipt reconcile/dedupe; conflict/local/member/private/wrong-workspace/scope/replay/revoked refusals held");
+    eprintln!("CAD-1568 packaged-CLI proof: real login -> staged wiki -> --org send naming the kit with workspace/subject/conversation receipt -> own terminal result; distinct concurrent ids -> distinct results; offline queue; lost-receipt reconcile/dedupe; refusals held at the hop each one exercised (local credential pin; the board's scope, live-membership and authorization checks; the container's own recipient-class, role and single-use-envelope guards) with the durable rows observed absent in the runtime's own store");
 }

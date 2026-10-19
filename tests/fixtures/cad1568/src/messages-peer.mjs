@@ -1,7 +1,7 @@
 // Controlled CAD-1568 peer: actual AgenticOS app/D1 and existing native
 // forwarder. Only account/consent setup and post-commit response loss are
 // synthetic; no production authorization handler or response is replaced.
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const enabled = process.env.CAD1568_NATIVE_CHAIN === "1";
@@ -37,6 +37,7 @@ describe.skipIf(!enabled)("CAD-1568 real hosted messaging authority", () => {
     const port = Number(required("CAD1434_BRIDGE_PORT"));
     const issuer = `https://issuer.board.localhost:${port}`;
     const output = required("CAD1434_TOKEN_OUT");
+    const ledger = process.env.CAD1568_REQUEST_LEDGER;
     const runtime = nativeForwarder({
       nativeOrigin: required("CAD1434_NATIVE_ORIGIN"),
       seamToken: readFileSync(join(dirname(output), "native-seam"), "utf8"),
@@ -134,7 +135,15 @@ describe.skipIf(!enabled)("CAD-1568 real hosted messaging authority", () => {
           return response;
         },
       },
-      observe() {},
+      observe(method, path, status) {
+        // The hosted boundary's own record of what it was asked to serve.
+        // Method, path and status only: no query, bearer, body, cookie,
+        // hash or signed envelope ever reaches this file. The controller
+        // reads it to name the hop that actually handled a request
+        // instead of inferring the hop from a refusal.
+        if (!ledger) return;
+        appendFileSync(ledger, `${JSON.stringify({ method, path, status })}\n`, { mode: 0o600 });
+      },
       async control(op) {
         if (op === "revoke_owner_session") {
           // Authoritative membership removal with the bearer and signed
