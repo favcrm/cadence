@@ -94,18 +94,19 @@ the code you just wrote.
   on another. The evaluator returns three classes:
   - `routine` — required base CI plus genuine ticket-outcome evidence;
     zero mandatory reviews; no fabricated PASS.
-  - `consequential` — one independent combined review, no operator
-    approval.
+  - `consequential` — one independent combined review and the full check
+    floor; no operator approval.
   - `strict` — the floor the evaluator falls back to: any activation other
-    than the default lean policy (a malformed section, a custom section
-    that is not operator-approved or was removed after approval, a legacy
-    profile), path lists that cannot be read, incomplete or unsafe diff
+    than the default lean policy — a malformed section, a custom section
+    that is not operator-approved or was removed after approval, or a
+    policy that is not the default once its solo-operator field is
+    cleared — path lists that cannot be read, incomplete or unsafe diff
     evidence, a delete, rename, type or mode change, and the
     risk-trigger, human-class, one-review-excluded and oversize-diff
     conditions. It keeps today's legacy floor and never fewer: one
     combined review on the one-review list, else two (Standards and
-    Spec/security); the operator floor on human-class paths and over 1500
-    changed lines; full checks; Browser QA on `ui/**`.
+    Spec/security), and the operator floor on human-class paths and over
+    1500 changed lines.
 - One independent review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
   path that does not (trust boundary, identity, secrets, `ui/**`) needs
