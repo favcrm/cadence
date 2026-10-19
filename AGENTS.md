@@ -14,17 +14,30 @@ and discover peers with `cadence agent list`.
 This file holds the principles and the commands, not the policy. Where
 prose and an authoritative source disagree, the source wins.
 
-- Risk classes, triggers, who approves what: `docs/roles/risk-classes.md`.
+- **When a rule is enforced mechanically, name the enforcement, not the
+  rule.** A copied rule is a rule that drifts.
+- **What a PR needs is computed, not described.** The shared evaluator
+  `src/issue/delivery_requirements.rs` turns the resolved delivery policy
+  and the PR's diff into the requirements; read them with
+  `cadence delivery requirements --issue <ID> --pr <url> --head <sha>`.
+  The evaluator reads the path lists at the PR's base, so a PR can never
+  classify itself under rules it edited.
 - The merge gate is mechanical: `scripts/enqueue-reviewed <pr> --head <sha>`
   (`--dry-run` enqueues nothing) refuses with one reason per line for
   everything still missing. Trust it over any prose, this file included.
+- Risk classes, triggers, who approves what: `docs/roles/risk-classes.md`.
 - Path lists: `docs/roles/one-review-paths.toml` (review count),
   `docs/roles/risk-paths.toml` (triggers; the daemon compiles it in).
+- The delivery policy: the default lean policy needs no activation. A
+  project declares its own `delivery:` policy in `<pm>/<key>/PROJECT.md`
+  and the operator approves it with
+  `cadence issue project approve-work <key>` (`docs/BOARD.md`). A custom
+  policy only tightens; a malformed, unapproved or unknown policy fails
+  closed to `strict`.
 - Elsewhere: audit evidence `docs/AUDIT.md`, charter and non-goals
   `docs/CHARTER.md`, dev cycle and the clean-slate transition
-  `docs/DEV-CYCLE.md`, per-project `delivery:` policy and Pi provider
-  mechanics `docs/BOARD.md`, rollout order and rollback
-  `docs/guides/rollout-checklist.md`.
+  `docs/DEV-CYCLE.md`, Pi provider mechanics `docs/BOARD.md`, rollout order
+  and rollback `docs/guides/rollout-checklist.md`.
 
 ## Principles
 
@@ -49,11 +62,14 @@ Done means the ticket's expected result works. Read the acceptance items
 from the ticket and build to them; do not derive the expected result from
 the code you just wrote.
 
-- The evidence is green CI on the exact head plus an independent review of
-  the code against the ticket. Do not add routine unit tests, snapshot or
-  fixture tests, stress runs, sandbox demos or evidence ledgers unless the
-  ticket asks for one. For a bug fix, show the failing case once, then
-  fixed.
+- The evidence is what the computed class requires. `routine` needs the
+  required base CI on the exact head and genuine ticket-outcome evidence
+  — no mandatory review, and no fabricated PASS to stand in for one.
+  `consequential` and `sensitive` add one or two independent reviews of
+  the code against the ticket, as the class states. Do not add routine
+  unit tests, snapshot or fixture tests, stress runs, sandbox demos or
+  evidence ledgers unless the ticket asks for one. For a bug fix, show
+  the failing case once, then fixed.
 - A self-written test proves the author's own assumptions. When a change
   talks to another repo's API, check the request and response against that
   repo's current schema.
@@ -69,6 +85,19 @@ the code you just wrote.
 
 ### Review: what a merge needs
 
+- **Two axes, and they are independent.** The *delivery class* says what
+  evidence a PR needs; the *risk class* says who signs it off. The class
+  comes from the diff, so one repo can be `routine` on one PR and
+  `sensitive` on another.
+  - `routine` — required base CI plus genuine ticket-outcome evidence;
+    zero mandatory reviews; no fabricated PASS.
+  - `consequential` — one independent combined review.
+  - `sensitive` — full checks, one security-capable combined review and a
+    real exact-head operator approval.
+  - `strict` — the fail-closed fallback: policy inactive, malformed or
+    unapproved, path lists unreadable, or diff evidence incomplete
+    (deletes, renames, mode or type changes, unknown paths, empty diff).
+    It keeps today's legacy floor and never fewer.
 - One independent review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
   path that does not (trust boundary, identity, secrets, `ui/**`) needs
@@ -86,15 +115,16 @@ the code you just wrote.
 - A reviewer of a PR that changes or deletes a check states that no gate
   check and no isolation or fail-closed default was weakened, naming what
   was checked.
-- A `human` trigger needs the operator as the second check; the operator's
-  approval substitutes for the second reviewer, never for independence, and
-  never lowers Browser QA, the `qa-verdict` status or the risk class
-  itself. Browser QA at desktop and narrow widths when the PR changes
-  `ui/**`.
-- Delivery classes are routine, consequential and sensitive. The default
-  lean policy needs no activation; an unknown, malformed or unapproved
-  policy fails closed. Classes and triggers: `docs/roles/risk-classes.md`.
-  Gate: `scripts/enqueue-reviewed`.
+- A `human` trigger needs the operator as the second check. One reviewer
+  plus the operator is enough only outside triggers 1 and 3; inside them
+  two independent reviewers are required and the operator's approval does
+  not stand in for the second reviewer. On a project whose `delivery:`
+  policy declares a solo-operator lane, one independent registered-identity
+  reviewer (never the author) may cover both axes when the operator
+  approves that head. The operator's approval substitutes for the second
+  reviewer, never for independence, and never lowers Browser QA, the
+  `qa-verdict` status or the risk class itself. Browser QA at desktop and
+  narrow widths when the PR changes `ui/**`.
 - Bot reviews (Devin Review, CodeRabbit and similar) are advisory: before a
   PASS, the reviewer blocks on or refutes each severe bug and each critical
   security finding. Never make a bot's check a required check, and never
@@ -176,7 +206,8 @@ the code you just wrote.
   must declare its triggers (`Risk: human (4, 7)`); editing the body voids
   the approval (the digest changes); a ticket outside ready, doing or review
   gets no scope approval; a diff touching a trigger 1/3 path always needs
-  the per-head approval. `cadence audit revoke <id>` withdraws it.
+  the per-head approval; and every counted verdict must carry
+  `Scope: in-scope <ID>`. `cadence audit revoke <id>` withdraws it.
 - A `delegated` PR is approved by the designated agent from its own pane:
   `cadence audit approve --pr <n> --head <full-sha> --delegated --source
   "<notes>"`. Triggers 1, 3, 4, 6 and 7 are never delegated, and the
@@ -287,9 +318,9 @@ Cadence's setting is the source of truth; this file names no model.
   Pi request.
 - Provider mechanics — the pinned extension, the content digest, the local
   `ide` patch on a patched install — are in `docs/BOARD.md`. A launch that
-  dies with `Model "devin/…" not found` or "Pi process disconnected" means
-  the running daemon is older than the pin support: check `readlink
-  ~/.local/bin/cadence`.
+  dies with `Model "devin/…" not found` or "Pi process disconnected" has
+  several causes, one of them a running daemon older than the pin support:
+  check `readlink ~/.local/bin/cadence` before blaming the model.
 
 ### Production safety
 
