@@ -347,6 +347,24 @@ function refusedUpload(body: unknown, status: number, statusText: string): { mes
   return { message: fallback, code: topCode };
 }
 
+/** Recorded owner handoff for the current personal assignment, never a Git-author guess. */
+export interface AssignmentContext {
+  kind: "assigned" | "initial_owner";
+  actor: string;
+  at: string;
+  self_assigned: boolean;
+}
+
+export interface MyWorkIssue extends IssueCard {
+  assignment: AssignmentContext | null;
+}
+
+export interface MyWorkPayload {
+  owner: string;
+  issues: MyWorkIssue[];
+}
+
+
 export const api = {
   health: () => get<Health>("/api/health"),
   /** `withOperator` asks the server to run the operator proof (CAD-432) — once per page load.
@@ -355,6 +373,7 @@ export const api = {
   meta: (withOperator = false, signal?: AbortSignal) =>
     get<Meta>(withOperator ? "/api/meta?operator=1" : "/api/meta", signal),
   overview: () => get<Overview>("/api/overview"),
+  myWork: (signal?: AbortSignal) => get<MyWorkPayload>("/api/my-work", signal),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
   projectContext: (project: string, role: ContextRole = "pm", expectedRevision?: string) => {
     const query = new URLSearchParams({ role });

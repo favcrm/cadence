@@ -1,15 +1,10 @@
 import { useWriteBlock } from "../auth/WriteGate";
 import { issuePath } from "../issues/model";
+import { PRIORITY_CHIP } from "../issues/chips";
 import type { IssueCard } from "../../lib/types";
 import Link from "../../ui/Link";
 import { useLocale } from "../../lib/locale";
 
-const PRIORITY_CHIP: Record<string, string> = {
-  P0: "bg-warn/10 text-warn",
-  P1: "bg-ink-800 text-ink-200",
-  P2: "bg-ink-800 text-ink-400",
-  P3: "bg-ink-800 text-ink-500",
-};
 
 function prLabel(issue: IssueCard): string | null {
   const ref = issue.refs.find((r) => r.kind === "pr");

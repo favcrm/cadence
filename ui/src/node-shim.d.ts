@@ -13,6 +13,24 @@ declare module "node:child_process" {
 
 declare module "node:fs" {
   export function readFileSync(path: unknown, encoding: string): string;
+  export function readFileSync(path: unknown): Uint8Array;
+  export function readdirSync(path: string): string[];
+  export function statSync(path: string): { size: number; isDirectory(): boolean };
+  export function writeFileSync(path: string, data: Uint8Array): void;
+}
+
+declare module "node:path" {
+  export function join(...paths: string[]): string;
+  export function resolve(...paths: string[]): string;
+}
+
+declare module "node:zlib" {
+  export const constants: { BROTLI_PARAM_QUALITY: number };
+  export function brotliCompressSync(
+    data: Uint8Array,
+    options?: { params?: Record<number, number> },
+  ): Uint8Array;
+  export function gzipSync(data: Uint8Array, options?: { level?: number }): Uint8Array;
 }
 
 declare module "node:process" {

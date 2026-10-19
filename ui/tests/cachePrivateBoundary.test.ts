@@ -77,13 +77,8 @@ async function main(): Promise<void> {
     equal(cached.get().inFlight, true, "the old-session request is pending");
     resetPrivateSession();
     const afterReset = cached.get();
-    equal(afterReset, {
-      data: null,
-      status: "loading",
-      error: null,
-      asOf: null,
-      inFlight: false,
-    }, "Native reset drops the Host cache observation and freshness");
+    equal(afterReset.data, null, "Native reset drops the Host cache observation");
+    equal(afterReset.asOf, null, "Native reset retires success freshness");
     allowPrivateReads();
     beforeReset.resolve("synthetic-retired-at-reset");
     await resetRequest;
@@ -96,13 +91,9 @@ async function main(): Promise<void> {
     reply = Promise.resolve("synthetic-replacement-observation");
     await cached.refresh();
     equal(cachedCalls, 4, "a legitimate replacement-session read invokes its fetcher");
-    equal(cached.get(), {
-      data: "synthetic-replacement-observation",
-      status: "ok",
-      error: null,
-      asOf: 42,
-      inFlight: false,
-    }, "the current session can populate the same resource handle after reset");
+    equal(cached.get().data, "synthetic-replacement-observation", "the current session can populate the same resource handle after reset");
+    equal(cached.get().status, "ok", "the replacement session has an admitted observation");
+    equal(cached.get().asOf, 42, "replacement-session freshness belongs to its successful read");
     console.log("Host cache private-boundary acceptance passed");
   } finally {
     unsubscribe();

@@ -27,7 +27,7 @@
 //! daemon writes through their RPCs.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -160,6 +160,7 @@ struct Entry {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ViewsKey {
     project: Option<String>,
+    readable: Option<BTreeSet<String>>,
     gen: u64,
     notes: u64,
     /// `None` — derived without job state (the overview's view).
@@ -399,14 +400,44 @@ impl Tracker {
     }
 
     /// The loaded issues, `load_all` order, optionally one project's.
-    fn issues(&self, project: Option<&str>) -> Vec<board::Issue> {
+    fn issues(
+        &self,
+        project: Option<&str>,
+        readable: Option<&BTreeSet<String>>,
+    ) -> Vec<board::Issue> {
+        let mut visible_ids = HashSet::new();
         let mut issues: Vec<board::Issue> = self
             .entries
             .values()
             .filter_map(|e| e.loaded.as_ref())
             .filter(|(i, _)| project.is_none_or(|p| i.project == p))
-            .map(|(i, _)| i.clone())
+            .filter(|(i, _)| readable.is_none_or(|keys| keys.contains(&i.project)))
+            .map(|(i, _)| {
+                if readable.is_some() {
+                    visible_ids.insert(i.front.id.as_str());
+                }
+                i.clone()
+            })
             .collect();
+        if readable.is_some() {
+            // A readable row is not permission to reveal its hidden relationship targets.
+            // Remove those targets before readiness, inverse links and roll-ups derive.
+            for issue in &mut issues {
+                let front = &mut issue.front;
+                for target in [&mut front.parent, &mut front.duplicate_of] {
+                    if target
+                        .as_ref()
+                        .is_some_and(|id| !visible_ids.contains(id.as_str()))
+                    {
+                        *target = None;
+                    }
+                }
+                front
+                    .blocked_by
+                    .retain(|id| visible_ids.contains(id.as_str()));
+                front.relates.retain(|id| visible_ids.contains(id.as_str()));
+            }
+        }
         issues.sort_by_key(|i| board::natural_key(&i.front.id));
         issues
     }
@@ -416,10 +447,12 @@ impl Tracker {
         pm: &Pm,
         project: Option<&str>,
         jobs: Option<(&board::JobOutcomes, u64)>,
+        readable: Option<&BTreeSet<String>>,
     ) -> (u64, Arc<Vec<board::View>>) {
         let notes_dir = pm.config.notes_dir();
         let key = ViewsKey {
             project: project.map(str::to_string),
+            readable: readable.cloned(),
             gen: self.gen,
             notes: notes_stamp(&notes_dir),
             jobs: jobs.map(|(_, fp)| fp),
@@ -430,7 +463,7 @@ impl Tracker {
         if let Some(views) = self.views.get(&key) {
             return (fp, views.clone());
         }
-        let issues = self.issues(project);
+        let issues = self.issues(project, readable);
         let views = Arc::new(match jobs {
             Some((outcomes, _)) => board::views_with_jobs(&notes_dir, issues, outcomes),
             None => board::views(&notes_dir, issues),
@@ -1065,11 +1098,17 @@ impl Model {
         })
     }
 
-    fn board_with(&self, pm: &Pm, project: Option<&str>, snap: &DaemonSnap) -> BoardRead {
+    fn board_with(
+        &self,
+        pm: &Pm,
+        project: Option<&str>,
+        snap: &DaemonSnap,
+        readable: Option<&BTreeSet<String>>,
+    ) -> BoardRead {
         let mut t = lock(&self.tracker);
         t.refresh(&pm.dir);
         let jobs = (&snap.outcomes, snap.jobs_fp.unwrap_or(0));
-        let (_, views) = t.views(pm, project, Some(jobs));
+        let (_, views) = t.views(pm, project, Some(jobs), readable);
         BoardRead {
             views,
             revs: t.revs(),
@@ -1085,7 +1124,13 @@ impl Model {
     /// the agent strip.
     pub(super) fn board(&self, pm: &Pm, project: Option<&str>) -> BoardRead {
         let snap = self.daemon_snap();
-        self.board_with(pm, project, &snap)
+        self.board_with(pm, project, &snap, None)
+    }
+
+    /// Restrict raw issues before deriving relationships, roll-ups and card counts.
+    pub(super) fn board_readable(&self, pm: &Pm, readable: &BTreeSet<String>) -> BoardRead {
+        let snap = self.daemon_snap();
+        self.board_with(pm, None, &snap, Some(readable))
     }
 
     /// `/api/agents`, with the snapshot's [`Self::freshness`] keys:
@@ -1116,7 +1161,7 @@ impl Model {
         let (key, views) = {
             let mut t = lock(&self.tracker);
             t.refresh(&pm.dir);
-            t.views(pm, None, None)
+            t.views(pm, None, None, None)
         };
         let mut h = DefaultHasher::new();
         (key, head_stamp(&pm.dir), self.delivery_stamp()).hash(&mut h);
@@ -1397,7 +1442,7 @@ impl Model {
         let Ok(pm) = Pm::at(&self.pm_dir) else {
             return (HashMap::new(), HashMap::new());
         };
-        let read = self.board_with(&pm, None, snap);
+        let read = self.board_with(&pm, None, snap, None);
         let by_id = read.by_id();
         let ctx = read.ctx(&by_id);
         let mut cards = HashMap::new();

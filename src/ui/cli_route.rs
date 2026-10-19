@@ -409,6 +409,34 @@ fn dispatch(
 ) -> HttpResp {
     match verb {
         // ---- cli.read ----
+        Verb::MyWork => {
+            if !args.as_object().is_some_and(|args| args.is_empty()) {
+                return cli_fail(400, "invalid_request", "my_work accepts no arguments");
+            }
+            // Envelope verification permits `operator` only for an Owner user;
+            // its attribution handle is still derived from that user's sub.
+            if actor.actor != "operator" && !actor.actor.starts_with("users/") {
+                return cli_fail(403, "human_session_required", "my_work requires a user");
+            }
+            let policy_actor = actor.policy_spelling();
+            match super::my_work::Snapshot::load(
+                state_dir,
+                pm_dir,
+                &actor.handle,
+                Some(&actor.sub),
+                &policy_actor,
+            ) {
+                Ok(snapshot) => match snapshot.payload(&actor.handle, &policy_actor) {
+                    Some(body) => json_ok(body),
+                    None => cli_fail(
+                        403,
+                        "project_access_changed",
+                        "My work project access changed; refresh",
+                    ),
+                },
+                Err(error) => write_err(&error),
+            }
+        }
         Verb::Status => {
             // `cadence status` is daemon health plus the agent list —
             // the same pair the board's own header reads.
@@ -1191,3 +1219,9 @@ mod cad1179_acceptance;
 
 #[cfg(test)]
 mod aos274_policy_http;
+
+#[cfg(test)]
+mod cad1500_acceptance;
+
+#[cfg(test)]
+mod cad1500_policy_acceptance;

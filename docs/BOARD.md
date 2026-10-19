@@ -36,6 +36,71 @@ Activation needs an operator-reviewed image/configuration backup and restore
 runbook; a failed guard must not automatically fall back to the sessionless
 local surface.
 
+## My work
+
+My work (`/my-work`) lists PM issues assigned to the signed-in human. It reuses
+the current issue read model and links to the existing Issue page for requirements,
+comments, references and progress. Refresh rereads the tracker; reassignment removes
+the issue from the previous owner's personal result. Loading, empty and unavailable
+states do not invent work. No local agent, model provider or Git repository is needed.
+Refresh retains keyboard focus while its read is pending and announces the busy
+state on the page. Refreshing again cancels the previous read; a late response
+cannot replace the newer result.
+
+Each compact card has an Inspect button and a separate Details link. Inspect
+opens a native modal snapshot; full details, history, evidence and execution
+remain on the existing Issue page. Returning from Details restores the queue's
+scroll and focused item. On narrow screens the drawer fills the viewport, with
+Close and full-details navigation pinned around its scrolling body.
+
+The personal drawer permits two existing revision-bound writes: a comment and
+an explicit status Save. Selecting a status alone never writes, and an unchanged
+status cannot be saved. Derived/container status locks only the status control;
+it does not prohibit an otherwise authorized comment. Current membership,
+write permission and fresh issue reads are required for either action. Failed
+or conflicting writes retain the draft and never replay automatically. Drafts
+and pending submission tokens survive close/reopen in memory, scoped to the
+issue and verified session; changing identity clears them.
+
+A denied issue read (401/403/404) retires its personal card and draft even if
+the drawer has already closed. A write refusal instead triggers fresh reads
+and permission verification: it does not itself prove the issue is unreadable.
+Older projection responses cannot restore a retired row.
+
+Assignment context is optional. A bounded, shared first-parent Git history
+walk proves the current ownership transition against a pinned history head;
+unresolved history, actors, corrupt objects or changed snapshots return
+unavailable context. Git authors and later no-op edits are not assigners.
+Self-assignment requires the exact verified human receipt, never the shared
+`operator` spelling. Provenance work finishes before the final caller/policy
+check and is limited by a shared deadline and object-read budget.
+
+My work remains an assigned-task queue, not a personal read-receipt or follow-up
+list. Status represents shared task progress; opening Inspect changes neither
+status nor attention state. Comment counts are totals, not unread indicators.
+Owned terminal-status issues remain included; no Active/Completed filter or
+personal tracking fields are introduced.
+
+The board derives the owner from its live session and rechecks the caller after
+the read. Query selectors are refused. Local board sessions use the existing
+`operator` attribution; named hosted Owners and Members retain their own user handles.
+Existing project access is applied before deriving cards, relationships and epic
+roll-ups; being assigned an issue never grants access to its project. Owner
+administrative visibility does not replace the Owner's individual attribution.
+Only readable issue targets contribute parent, blocker, related and duplicate
+links. This scoped PM projection is not an execution-eligibility decision.
+The read is discarded if its project-access set or effective caller authority
+changes while it is being prepared. This personal filter introduces no new grant
+and does not activate Private projects or qualify assistant/filesystem isolation.
+
+`cadence --org <org> my-work` provides the same PM read for a signed-in hosted org
+through the existing `cli.read` actor-envelope protocol. The native server derives
+the owner from the verified user actor and accepts no arguments. A local-org CLI
+invocation explains that a hosted org is required. Existing project, issue, setup,
+membership and local-agent commands remain their current interfaces; this feature
+adds no setup/access screens, work-proof format or agent-execution dashboard.
+
+
 ## Issue folder
 
 ```
@@ -1952,6 +2017,14 @@ CADENCE_DEV_BOARD_PORT=3117 npx --yes pnpm@12.2.1 dev  # Vite HMR; /api → isol
 npx --yes pnpm@12.2.1 typecheck  # tsc --noEmit
 npx --yes pnpm@12.2.1 build      # → local ui/dist (--features ui embeds it)
 ```
+
+The UI build also emits precompressed Brotli (`.br`) and gzip (`.gz`)
+siblings. The embedded board negotiates these for its HTML, JavaScript and
+CSS; `--dist` mode uses available sibling files. Compression runs at build
+time, not per request. Static file responses keep `Cache-Control: no-store`
+and vary on `Accept-Encoding`, including raw responses. A client that
+refuses identity and every available coding receives `406`; otherwise a
+missing acceptable compressed sibling falls back to the original bytes.
 
 Start an isolated sandbox board and use the Rust restart loop in
 [CONTRIBUTING.md](../CONTRIBUTING.md#isolated-board-development) before running

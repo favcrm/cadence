@@ -42,6 +42,8 @@ export interface ResourceState<T> {
   status: ResourceStatus;
   /** The last request's failure, kept while `stale` or `failed`. */
   error: string | null;
+  /** A failed read triggered the configured retirement policy; only a fresh success/reset clears it. */
+  discarded?: boolean;
   /** Epoch ms of the last successful load. */
   asOf: number | null;
   /** A request is in flight (also true behind `ok`/`stale` rows). */
@@ -55,6 +57,8 @@ export interface ResourceOptions<T> {
   freshMs?: number;
   /** Protected resources can discard observations on an access refusal. */
   discardOnError?: (error: unknown) => boolean;
+  /** Retire related observations only after a current read triggers discardOnError. */
+  onDiscard?: () => void;
   now?: () => number;
 }
 
@@ -86,6 +90,7 @@ export class Resource<T> {
   private readonly isEmpty: (data: T) => boolean;
   private readonly freshMs: number;
   private readonly discardOnError: (error: unknown) => boolean;
+  private readonly onDiscard: (() => void) | undefined;
   private readonly now: () => number;
 
   constructor(fetcher: () => Promise<T>, opts: ResourceOptions<T> = {}, private readonly readsAllowed: () => boolean = () => true) {
@@ -93,6 +98,7 @@ export class Resource<T> {
     this.isEmpty = opts.isEmpty ?? (() => false);
     this.freshMs = opts.freshMs ?? 0;
     this.discardOnError = opts.discardOnError ?? (() => false);
+    this.onDiscard = opts.onDiscard;
     this.now = opts.now ?? Date.now;
   }
 
@@ -141,6 +147,7 @@ export class Resource<T> {
           data,
           status: this.isEmpty(data) ? "empty" : "ok",
           error: null,
+          discarded: false,
           asOf: this.now(),
         });
       },
@@ -155,7 +162,9 @@ export class Resource<T> {
           asOf: discard ? null : this.state.asOf,
           status: discard || this.state.data === null ? "failed" : "stale",
           error: message(e),
+          discarded: discard || this.state.discarded === true,
         });
+        if (discard) this.onDiscard?.();
       },
     );
     this.inflight = run.finally(() => {
@@ -223,6 +232,7 @@ export class Resource<T> {
       data,
       status: this.isEmpty(data) ? "empty" : "ok",
       error: null,
+      discarded: false,
       asOf: this.now(),
     });
   };
@@ -257,7 +267,7 @@ export class Resource<T> {
   reset = (): void => {
     this.pause();
     this.generation += 1;
-    this.set({ data: null, status: "loading", error: null, asOf: null, inFlight: false });
+    this.set({ data: null, status: "loading", error: null, discarded: false, asOf: null, inFlight: false });
   };
 
   private set(patch: Partial<ResourceState<T>>): void {
@@ -301,11 +311,11 @@ export class QueryCache {
   family<A extends string, T>(
     prefix: string,
     fetcher: (arg: A) => Promise<T>,
-    opts?: ResourceOptions<T>,
+    opts?: ResourceOptions<T> | ((arg: A) => ResourceOptions<T>),
   ): (arg: A) => Resource<T> {
     return (arg) => {
       const key = `${prefix}:${arg}`;
-      const entry = this.resource(key, () => fetcher(arg), opts);
+      const entry = this.resource(key, () => fetcher(arg), typeof opts === "function" ? opts(arg) : opts);
       this.evictable.add(key);
       this.evict();
       return entry;

@@ -4,6 +4,8 @@ use super::*;
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
+    /// List PM issues assigned to your signed-in hosted identity.
+    MyWork,
     /// Retain, inspect or explicitly send a local result to hosted queued custody.
     Remote {
         #[command(subcommand)]
