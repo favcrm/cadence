@@ -220,6 +220,37 @@ pub enum ScreenOperation {
     WhatsappReplySend,
     #[serde(rename = "whatsapp.reply.status")]
     WhatsappReplyStatus,
+    // CAD-1590: door v2 templates and broadcasts.
+    #[serde(rename = "whatsapp.templates.list")]
+    WhatsappTemplatesList,
+    #[serde(rename = "whatsapp.template.show")]
+    WhatsappTemplateShow,
+    #[serde(rename = "whatsapp.template.prepare")]
+    WhatsappTemplatePrepare,
+    #[serde(rename = "whatsapp.template.send")]
+    WhatsappTemplateSend,
+    #[serde(rename = "whatsapp.template.status")]
+    WhatsappTemplateStatus,
+    #[serde(rename = "whatsapp.broadcasts.list")]
+    WhatsappBroadcastsList,
+    #[serde(rename = "whatsapp.broadcast.show")]
+    WhatsappBroadcastShow,
+    #[serde(rename = "whatsapp.broadcast.estimate")]
+    WhatsappBroadcastEstimate,
+    #[serde(rename = "whatsapp.broadcast.results")]
+    WhatsappBroadcastResults,
+    #[serde(rename = "whatsapp.broadcast.draft")]
+    WhatsappBroadcastDraft,
+    #[serde(rename = "whatsapp.broadcast.test.prepare")]
+    WhatsappBroadcastTestPrepare,
+    #[serde(rename = "whatsapp.broadcast.test.send")]
+    WhatsappBroadcastTestSend,
+    #[serde(rename = "whatsapp.broadcast.prepare")]
+    WhatsappBroadcastPrepare,
+    #[serde(rename = "whatsapp.broadcast.send")]
+    WhatsappBroadcastSend,
+    #[serde(rename = "whatsapp.broadcast.stop")]
+    WhatsappBroadcastStop,
 }
 
 impl ScreenOperation {
@@ -240,6 +271,10 @@ impl ScreenOperation {
                 | Self::ChatCampaignOpen
                 | Self::ChatCampaignBrief
                 | Self::WhatsappReplySend
+                | Self::WhatsappTemplateSend
+                | Self::WhatsappBroadcastTestSend
+                | Self::WhatsappBroadcastSend
+                | Self::WhatsappBroadcastStop
         )
     }
     /// CAD-1562: an operation of the hosted WhatsApp door.
@@ -254,6 +289,21 @@ impl ScreenOperation {
                 | Self::WhatsappReplyPrepare
                 | Self::WhatsappReplySend
                 | Self::WhatsappReplyStatus
+                | Self::WhatsappTemplatesList
+                | Self::WhatsappTemplateShow
+                | Self::WhatsappTemplatePrepare
+                | Self::WhatsappTemplateSend
+                | Self::WhatsappTemplateStatus
+                | Self::WhatsappBroadcastsList
+                | Self::WhatsappBroadcastShow
+                | Self::WhatsappBroadcastEstimate
+                | Self::WhatsappBroadcastResults
+                | Self::WhatsappBroadcastDraft
+                | Self::WhatsappBroadcastTestPrepare
+                | Self::WhatsappBroadcastTestSend
+                | Self::WhatsappBroadcastPrepare
+                | Self::WhatsappBroadcastSend
+                | Self::WhatsappBroadcastStop
         )
     }
     /// CAD-1537: the closed allowlist a read-only screen (a member or a
@@ -292,6 +342,15 @@ impl ScreenOperation {
                 | Self::WhatsappConversationsShow
                 | Self::WhatsappMessages
                 | Self::WhatsappReplyStatus
+                // CAD-1590: template and broadcast reads only; drafts,
+                // prepares, sends and stop stay operator-only.
+                | Self::WhatsappTemplatesList
+                | Self::WhatsappTemplateShow
+                | Self::WhatsappTemplateStatus
+                | Self::WhatsappBroadcastsList
+                | Self::WhatsappBroadcastShow
+                | Self::WhatsappBroadcastEstimate
+                | Self::WhatsappBroadcastResults
         )
     }
     pub fn args_limit(self) -> usize {
@@ -302,7 +361,11 @@ impl ScreenOperation {
             | Self::ContentSave
             | Self::ScreenPreviewShow
             | Self::WhatsappReplyPrepare
-            | Self::WhatsappReplySend => 49_152,
+            | Self::WhatsappReplySend
+            | Self::WhatsappTemplatePrepare
+            | Self::WhatsappTemplateSend => 49_152,
+            // CAD-1590: an individual audience holds up to 1000 ids.
+            Self::WhatsappBroadcastDraft => 196_608,
             _ => 16_384,
         }
     }

@@ -33,6 +33,8 @@ use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 const REPLIES_DIR: &str = "whatsapp-replies";
+/// CAD-1590: template-send, broadcast-test and broadcast records.
+const EFFECTS_DIR: &str = "whatsapp-effects";
 /// Serialises the prepared→sending claim within this daemon.
 static REPLY_CLAIM: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -50,11 +52,221 @@ struct ReplyRecord {
 }
 
 fn effect_id_ok(id: &str) -> Result<()> {
-    let hex = id.strip_prefix("wae_").unwrap_or_default();
+    effect_id_of(id, "wae_").map_err(|_| Error::rejected("WhatsApp reply effect id is invalid"))
+}
+
+/// CAD-1590: an effect id is `<prefix><32 hex>`; the prefix names its
+/// kind (`wat_` template send, `wbt_` broadcast test, `wab_` broadcast
+/// send/schedule), so an id never crosses verbs.
+fn effect_id_of(id: &str, prefix: &str) -> Result<()> {
+    let hex = id.strip_prefix(prefix).unwrap_or_default();
     if hex.len() != 32 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        return Err(Error::rejected("WhatsApp reply effect id is invalid"));
+        return Err(Error::rejected("WhatsApp effect id is invalid"));
     }
     Ok(())
+}
+
+/// CAD-1590: one template send, broadcast test or broadcast send. Same
+/// states and claim as [`ReplyRecord`]. `facts` holds only door-sourced
+/// ids, digests, counts and the masked test number — no message text
+/// and no recipient phone number.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EffectRecord {
+    schema: u32,
+    effect_id: String,
+    install_id: String,
+    context_id: String,
+    digest: String,
+    state: String,
+    code: Option<String>,
+    updated: f64,
+    broadcast_id: Option<String>,
+    facts: Value,
+}
+
+fn prefix_of(method: &str) -> &'static str {
+    match method {
+        "whatsapp_template_send" | "whatsapp_template_status" => "wat_",
+        "whatsapp_broadcast_test_send" => "wbt_",
+        _ => "wab_",
+    }
+}
+
+fn mint(prefix: &str) -> String {
+    format!("{prefix}{}", uuid::Uuid::new_v4().simple())
+}
+
+/// `{"1": "...", ...}`: indexes 1–999, values 1–1024 UTF-16 units with no
+/// surrounding whitespace (the contract refuses, never trims).
+fn template_variables(params: &Value) -> Result<std::collections::BTreeMap<u32, String>> {
+    let object = params
+        .get("variables")
+        .and_then(Value::as_object)
+        .ok_or_else(|| Error::rejected("variables must be an object"))?;
+    let mut out = std::collections::BTreeMap::new();
+    for (key, value) in object {
+        let index = key
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (1..=999).contains(n) && key == &n.to_string())
+            .ok_or_else(|| Error::rejected("template variable index is invalid"))?;
+        let value = value
+            .as_str()
+            .ok_or_else(|| Error::rejected("template variable must be a string"))?;
+        let units = value.encode_utf16().count();
+        if units == 0 || units > 1024 || value.trim() != value {
+            return Err(Error::rejected(
+                "template variable must be 1-1024 characters without surrounding spaces",
+            ));
+        }
+        out.insert(index, value.to_string());
+    }
+    Ok(out)
+}
+
+/// Render `{{n}}` exactly as the contract's shared render does.
+fn render_body(body: &str, variables: &std::collections::BTreeMap<u32, String>) -> String {
+    let mut out = String::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && after[digits..].starts_with("}}") {
+            let value = after[..digits]
+                .parse::<u32>()
+                .ok()
+                .and_then(|n| variables.get(&n))
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty());
+            match value {
+                Some(value) => out.push_str(value),
+                None => out.push_str(&rest[start..start + 4 + digits]),
+            }
+            rest = &after[digits + 2..];
+        } else {
+            out.push_str("{{");
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A broadcast draft body in the contract's shape. The door forces the
+/// channel, connection and DRAFT; no status or schedule field exists here.
+fn draft_body(params: &Value) -> Result<Value> {
+    let ids = |value: &Value, max: usize, what: &str| -> Result<Vec<String>> {
+        let list = value
+            .as_array()
+            .filter(|l| l.len() <= max)
+            .ok_or_else(|| Error::rejected(format!("{what} must be a list of at most {max}")))?;
+        list.iter()
+            .map(|v| {
+                let id = v.as_str().unwrap_or_default();
+                door::check_path_id(id, what)?;
+                Ok(id.to_string())
+            })
+            .collect()
+    };
+    let only = |value: &Value, allowed: &[&str], what: &str| -> Result<()> {
+        let fields = value
+            .as_object()
+            .ok_or_else(|| Error::rejected(format!("{what} must be an object")))?;
+        if fields.keys().any(|k| !allowed.contains(&k.as_str())) {
+            return Err(Error::rejected(format!("{what} has unsupported fields")));
+        }
+        Ok(())
+    };
+    let name = required_str(params, "name")?;
+    if name.is_empty() || name.chars().count() > 200 {
+        return Err(Error::rejected("broadcast name must be 1-200 characters"));
+    }
+    let template_id = required_str(params, "template_id")?;
+    door::check_path_id(template_id, "template id")?;
+    let parameters = params
+        .get("body_parameters")
+        .and_then(Value::as_array)
+        .filter(|l| l.len() <= 20)
+        .ok_or_else(|| Error::rejected("body_parameters must be a list of at most 20"))?;
+    for value in parameters {
+        let value = value.as_str().unwrap_or_default();
+        let units = value.encode_utf16().count();
+        if units == 0 || units > 1024 || value.trim() != value {
+            return Err(Error::rejected(
+                "body parameter must be 1-1024 characters without surrounding spaces",
+            ));
+        }
+    }
+    let audience = params
+        .get("audience")
+        .ok_or_else(|| Error::rejected("audience is required"))?;
+    let audience = match audience["source"].as_str() {
+        Some("segment") => {
+            only(audience, &["source", "segment_id"], "audience")?;
+            let segment = required_str(audience, "segment_id")?;
+            door::check_path_id(segment, "segment id")?;
+            json!({"source": "segment", "segmentId": segment})
+        }
+        Some("individual") => {
+            only(audience, &["source", "account_ids"], "audience")?;
+            let accounts = ids(&audience["account_ids"], 1000, "account id")?;
+            if accounts.is_empty() {
+                return Err(Error::rejected("an individual audience needs an account"));
+            }
+            json!({"source": "individual", "accountIds": accounts})
+        }
+        _ => {
+            return Err(Error::rejected(
+                "audience source must be segment or individual",
+            ))
+        }
+    };
+    let mut body = json!({"name": name, "templateId": template_id,
+        "bodyParameters": parameters, "audience": audience});
+    if let Some(id) = optional_str(params, "broadcast_id")? {
+        door::check_path_id(id, "broadcast id")?;
+        body["broadcastId"] = json!(id);
+    }
+    if let Some(url) = optional_str(params, "header_media_url")? {
+        if !url.starts_with("https://") || url.len() > 2048 || url.chars().any(char::is_control) {
+            return Err(Error::rejected("header media URL must be https"));
+        }
+        body["headerMediaUrl"] = json!(url);
+    }
+    if let Some(exclusions) = params.get("exclusions") {
+        only(exclusions, &["account_ids", "campaign_ids"], "exclusions")?;
+        body["exclusions"] = json!({
+            "accountIds": ids(&exclusions["account_ids"], 1000, "account id")?,
+            "campaignIds": ids(&exclusions["campaign_ids"], 50, "campaign id")?,
+        });
+    }
+    Ok(body)
+}
+
+/// Q8: `null` (now, through FavCRM's 60 s buffer) or RFC 3339 from
+/// now + 5 min to now + 7 days.
+fn send_at(params: &Value) -> Result<Option<String>> {
+    let Some(raw) = optional_str(params, "send_at")? else {
+        return Ok(None);
+    };
+    let at = chrono::DateTime::parse_from_rfc3339(raw)
+        .map_err(|_| Error::rejected("send_at must be an RFC 3339 time"))?;
+    let ahead = at.with_timezone(&chrono::Utc) - chrono::Utc::now();
+    if ahead < chrono::Duration::minutes(5) || ahead > chrono::Duration::days(7) {
+        return Err(Error::rejected("send_at must be 5 minutes to 7 days ahead"));
+    }
+    Ok(Some(
+        at.with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    ))
+}
+
+fn expired(iso: &Value) -> bool {
+    iso.as_str()
+        .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+        .is_none_or(|at| at.with_timezone(&chrono::Utc) <= chrono::Utc::now())
 }
 
 fn now_secs() -> f64 {
@@ -97,14 +309,41 @@ fn reply_from(params: &Value, effect_id: &str) -> Result<Reply> {
 }
 
 impl Shared {
-    fn whatsapp_replies_dir(&self) -> Result<std::path::PathBuf> {
-        let dir = self.state_dir.join(REPLIES_DIR);
+    fn whatsapp_dir(&self, name: &str) -> Result<std::path::PathBuf> {
+        let dir = self.state_dir.join(name);
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(Error::internal(format!("WhatsApp reply store: {e}"))),
+            Err(e) => return Err(Error::internal(format!("WhatsApp record store: {e}"))),
         }
         Ok(dir)
+    }
+
+    /// One record's bytes; `None` when it does not exist.
+    fn whatsapp_record_read(&self, name: &str, id: &str) -> Result<Option<Vec<u8>>> {
+        match std::fs::read(self.whatsapp_dir(name)?.join(format!("{id}.json"))) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::internal(format!("WhatsApp record store: {e}"))),
+        }
+    }
+
+    /// Durable, private, atomic replace of one record.
+    fn whatsapp_record_write(&self, name: &str, id: &str, bytes: &[u8]) -> Result<()> {
+        let dir = self.whatsapp_dir(name)?;
+        let path = dir.join(format!("{id}.json"));
+        let tmp = dir.join(format!("{id}.json.tmp"));
+        let _ = std::fs::remove_file(&tmp);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
     }
 
     fn whatsapp_reply_load(
@@ -114,15 +353,10 @@ impl Shared {
         context: &str,
     ) -> Result<ReplyRecord> {
         effect_id_ok(effect_id)?;
-        let path = self
-            .whatsapp_replies_dir()?
-            .join(format!("{effect_id}.json"));
         let unknown =
             || Error::rejected("WhatsApp reply is unknown in this installation and context");
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(unknown()),
-            Err(e) => return Err(Error::internal(format!("WhatsApp reply store: {e}"))),
+        let Some(bytes) = self.whatsapp_record_read(REPLIES_DIR, effect_id)? else {
+            return Err(unknown());
         };
         let record: ReplyRecord = serde_json::from_slice(&bytes)
             .map_err(|_| Error::internal("WhatsApp reply record is unreadable"))?;
@@ -138,20 +372,41 @@ impl Shared {
 
     fn whatsapp_reply_save(&self, record: &ReplyRecord) -> Result<()> {
         effect_id_ok(&record.effect_id)?;
-        let dir = self.whatsapp_replies_dir()?;
-        let path = dir.join(format!("{}.json", record.effect_id));
-        let tmp = dir.join(format!("{}.json.tmp", record.effect_id));
-        let _ = std::fs::remove_file(&tmp);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&tmp)?;
-        file.write_all(&serde_json::to_vec(record)?)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        self.whatsapp_record_write(REPLIES_DIR, &record.effect_id, &serde_json::to_vec(record)?)
+    }
+
+    fn whatsapp_effect_load(
+        &self,
+        effect_id: &str,
+        prefix: &str,
+        install: &str,
+        context: &str,
+    ) -> Result<EffectRecord> {
+        effect_id_of(effect_id, prefix)?;
+        let unknown =
+            || Error::rejected("WhatsApp send is unknown in this installation and context");
+        let Some(bytes) = self.whatsapp_record_read(EFFECTS_DIR, effect_id)? else {
+            return Err(unknown());
+        };
+        let record: EffectRecord = serde_json::from_slice(&bytes)
+            .map_err(|_| Error::internal("WhatsApp send record is unreadable"))?;
+        if record.schema != 1
+            || record.effect_id != effect_id
+            || record.install_id != install
+            || record.context_id != context
+        {
+            return Err(unknown());
+        }
+        Ok(record)
+    }
+
+    fn whatsapp_effect_save(&self, record: &EffectRecord) -> Result<()> {
+        let prefix = record.effect_id.get(..4).unwrap_or_default();
+        if !matches!(prefix, "wat_" | "wbt_" | "wab_") {
+            return Err(Error::rejected("WhatsApp send effect id is invalid"));
+        }
+        effect_id_of(&record.effect_id, prefix)?;
+        self.whatsapp_record_write(EFFECTS_DIR, &record.effect_id, &serde_json::to_vec(record)?)
     }
 
     /// The SLOT card for `whatsapp.reply.send`: the reply the frame names,
@@ -200,6 +455,185 @@ impl Shared {
             "reply_to_message_id": reply.reply_to_message_id,
             "digest": digest,
             "state": record.state,
+        }))
+    }
+
+    /// CAD-1590: the SLOT card for `whatsapp.template.send`. The frame
+    /// re-supplies the prepared template send; the host recomputes the
+    /// digest over the live template's revision and content digest, so a
+    /// changed, unapproved or altered template refuses. The recipient and
+    /// connection come from the live conversation; the window is shown as
+    /// information only — a template is allowed on a closed window.
+    pub(super) fn whatsapp_template_facts(
+        &self,
+        install: &str,
+        context: &str,
+        args: &Value,
+    ) -> Result<Value> {
+        let effect_id = required_str(args, "effect_id")?;
+        let record = self.whatsapp_effect_load(effect_id, "wat_", install, context)?;
+        if !matches!(record.state.as_str(), "prepared" | "pending") {
+            return Err(Error::rejected(
+                "this WhatsApp template send is not awaiting approval",
+            ));
+        }
+        let conversation_id = required_str(args, "conversation_id")?;
+        let template_id = required_str(args, "template_id")?;
+        let variables = template_variables(args)?;
+        let door = self.whatsapp_door()?;
+        let template = door.template(template_id)?;
+        if template["status"] != "APPROVED" {
+            return Err(Error::rejected(
+                "this WhatsApp template is no longer approved",
+            ));
+        }
+        let digest = door::template_digest(
+            conversation_id,
+            template_id,
+            template["revision"].as_str().unwrap_or_default(),
+            template["contentDigest"].as_str().unwrap_or_default(),
+            &variables,
+            effect_id,
+        );
+        if digest != record.digest {
+            return Err(Error::rejected(
+                "the template or its variables changed since it was prepared; prepare it again",
+            ));
+        }
+        let conversation = door.conversation(conversation_id)?;
+        Ok(json!({
+            "effect_id": effect_id,
+            "conversation_id": conversation_id,
+            "recipient": {
+                "name": conversation["contact"]["name"],
+                "phone": conversation["contact"]["phone"],
+            },
+            "connection_id": template["connectionId"],
+            "template": {
+                "template_id": template_id,
+                "name": template["name"],
+                "language": template["language"],
+                "revision": template["revision"],
+            },
+            "variables": variables,
+            "rendered_body": render_body(template["bodyText"].as_str().unwrap_or_default(), &variables),
+            "reply_mode": conversation["replyMode"],
+            "digest": digest,
+            "state": record.state,
+        }))
+    }
+
+    /// CAD-1590: the SLOT card for `whatsapp.broadcast.test.send`: the
+    /// door-masked number from the record, the live draft's template and
+    /// the rendered sample. Only a DRAFT can send a test.
+    pub(super) fn whatsapp_test_facts(
+        &self,
+        install: &str,
+        context: &str,
+        args: &Value,
+    ) -> Result<Value> {
+        let effect_id = required_str(args, "effect_id")?;
+        let record = self.whatsapp_effect_load(effect_id, "wbt_", install, context)?;
+        if !matches!(record.state.as_str(), "prepared" | "pending") {
+            return Err(Error::rejected(
+                "this WhatsApp test is not awaiting approval",
+            ));
+        }
+        let broadcast_id = record.broadcast_id.as_deref().unwrap_or_default();
+        let door = self.whatsapp_door()?;
+        let shown = door.broadcast(broadcast_id)?;
+        if shown["status"] != "DRAFT" {
+            return Err(Error::rejected("only a draft broadcast can send a test"));
+        }
+        let estimate = door.broadcast_estimate(broadcast_id)?;
+        Ok(json!({
+            "effect_id": effect_id,
+            "broadcast_id": broadcast_id,
+            "name": shown["name"],
+            "to": record.facts["to"],
+            "template": shown["template"],
+            "rendered_sample": estimate["preview"]["renderedBody"],
+            "digest": record.digest,
+            "state": record.state,
+            "limit_note": "At most 5 test sends per broadcast per day.",
+        }))
+    }
+
+    /// CAD-1590: the SLOT card for `whatsapp.broadcast.send`: FavCRM's
+    /// frozen snapshot as the door answered it at prepare (connection,
+    /// template and revision, audience, counts, send time), the live
+    /// draft's variables cross-checked against it, and the stale bound.
+    pub(super) fn whatsapp_broadcast_facts(
+        &self,
+        install: &str,
+        context: &str,
+        args: &Value,
+    ) -> Result<Value> {
+        let effect_id = required_str(args, "effect_id")?;
+        let record = self.whatsapp_effect_load(effect_id, "wab_", install, context)?;
+        if !matches!(record.state.as_str(), "prepared" | "pending") {
+            return Err(Error::rejected(
+                "this WhatsApp broadcast is not awaiting approval",
+            ));
+        }
+        let snapshot = &record.facts;
+        if expired(&snapshot["expires_at"]) {
+            return Err(Error::rejected(
+                "this broadcast review expired; prepare it again",
+            ));
+        }
+        let broadcast_id = record.broadcast_id.as_deref().unwrap_or_default();
+        let shown = self.whatsapp_door()?.broadcast(broadcast_id)?;
+        if shown["status"] != "DRAFT"
+            || shown["template"]["templateId"] != snapshot["template"]["templateId"]
+            || shown["template"]["revision"] != snapshot["template"]["revision"]
+        {
+            return Err(Error::rejected(
+                "the broadcast changed since it was reviewed; prepare it again",
+            ));
+        }
+        let counts = &snapshot["counts"];
+        let excluded = [
+            "manuallyExcluded",
+            "missingAddress",
+            "missingConsent",
+            "optedOut",
+        ]
+        .iter()
+        .map(|k| counts[k].as_u64().unwrap_or_default())
+        .sum::<u64>();
+        Ok(json!({
+            "effect_id": effect_id,
+            "broadcast_id": broadcast_id,
+            "name": shown["name"],
+            "snapshot": snapshot,
+            "body_parameters": shown["bodyParameters"],
+            "header_media_url": shown["headerMediaUrl"],
+            "eligible": counts["eligible"],
+            "excluded": excluded,
+            "send_at": snapshot["sendAt"],
+            "digest": record.digest,
+            "state": record.state,
+        }))
+    }
+
+    /// CAD-1590: the SLOT card for `whatsapp.broadcast.stop`: the live
+    /// broadcast and what has already been sent (never recalled).
+    pub(super) fn whatsapp_stop_facts(&self, args: &Value) -> Result<Value> {
+        let broadcast_id = required_str(args, "broadcast_id")?;
+        let shown = self.whatsapp_door()?.broadcast(broadcast_id)?;
+        if !matches!(
+            shown["status"].as_str(),
+            Some("SCHEDULED" | "SENDING" | "PARTIALLY_SENT")
+        ) {
+            return Err(Error::rejected("this broadcast has nothing to stop"));
+        }
+        Ok(json!({
+            "broadcast_id": broadcast_id,
+            "name": shown["name"],
+            "status": shown["status"],
+            "scheduled_at": shown["scheduledAt"],
+            "delivery_stats": shown["deliveryStats"],
         }))
     }
 
@@ -275,6 +709,30 @@ impl Shared {
             "whatsapp_reply_prepare" => &["conversation_id", "text", "reply_to_message_id"],
             "whatsapp_reply_send" => &["effect_id", "digest"],
             "whatsapp_reply_status" => &["effect_id"],
+            // CAD-1590: door v2, templates and broadcasts.
+            "whatsapp_templates_list" => &["status"],
+            "whatsapp_template_show" => &["template_id"],
+            "whatsapp_template_prepare" => &["conversation_id", "template_id", "variables"],
+            "whatsapp_template_send"
+            | "whatsapp_broadcast_test_send"
+            | "whatsapp_broadcast_send" => &["effect_id", "digest"],
+            "whatsapp_template_status" => &["effect_id"],
+            "whatsapp_broadcasts_list" => &["cursor", "limit"],
+            "whatsapp_broadcast_show"
+            | "whatsapp_broadcast_estimate"
+            | "whatsapp_broadcast_stop" => &["broadcast_id"],
+            "whatsapp_broadcast_results" => &["broadcast_id", "cursor", "limit", "status"],
+            "whatsapp_broadcast_draft" => &[
+                "broadcast_id",
+                "name",
+                "template_id",
+                "body_parameters",
+                "header_media_url",
+                "audience",
+                "exclusions",
+            ],
+            "whatsapp_broadcast_test_prepare" => &["broadcast_id", "to"],
+            "whatsapp_broadcast_prepare" => &["broadcast_id", "send_at"],
             _ => return Err(Error::rejected("unknown WhatsApp method")),
         };
         let fields = params
@@ -380,8 +838,200 @@ impl Shared {
                         "code": record.code, "door": recorded}),
                     )
                 }
-                _ => Err(Error::rejected("unknown WhatsApp method")),
+                _ => self.whatsapp_v2(door, method, params, install, context, cursor, limit),
             }
         })
+    }
+
+    /// CAD-1590: the door v2 verbs (`agenticos.whatsapp-door.v2`), inside
+    /// the same fence as v1.
+    #[allow(clippy::too_many_arguments)]
+    fn whatsapp_v2(
+        &self,
+        door: &door::HostedWhatsapp,
+        method: &str,
+        params: &Value,
+        install: &str,
+        context: &str,
+        cursor: Option<&str>,
+        limit: Option<u64>,
+    ) -> Result<Value> {
+        let broadcast = || required_str(params, "broadcast_id");
+        let record = |effect_id: &str, digest: String, broadcast_id: Option<&str>, facts: Value| {
+            self.whatsapp_effect_save(&EffectRecord {
+                schema: 1,
+                effect_id: effect_id.to_string(),
+                install_id: install.to_string(),
+                context_id: context.to_string(),
+                digest,
+                state: "prepared".to_string(),
+                code: None,
+                updated: now_secs(),
+                broadcast_id: broadcast_id.map(str::to_string),
+                facts,
+            })
+        };
+        match method {
+            "whatsapp_templates_list" => door.templates(optional_str(params, "status")?),
+            "whatsapp_template_show" => door.template(required_str(params, "template_id")?),
+            "whatsapp_broadcasts_list" => door.broadcasts(cursor, limit),
+            "whatsapp_broadcast_show" => door.broadcast(broadcast()?),
+            "whatsapp_broadcast_estimate" => door.broadcast_estimate(broadcast()?),
+            "whatsapp_broadcast_results" => {
+                door.broadcast_results(broadcast()?, cursor, limit, optional_str(params, "status")?)
+            }
+            "whatsapp_broadcast_draft" => door.broadcast_draft(&mint("wad_"), &draft_body(params)?),
+            "whatsapp_template_prepare" => {
+                let effect_id = mint("wat_");
+                let conversation_id = required_str(params, "conversation_id")?;
+                let template_id = required_str(params, "template_id")?;
+                let variables = template_variables(params)?;
+                let (staged, digest) = door.template_prepare(
+                    &effect_id,
+                    conversation_id,
+                    template_id,
+                    &variables,
+                    &effect_id,
+                )?;
+                record(&effect_id, digest.clone(), None, Value::Null)?;
+                Ok(json!({
+                    "effect_id": effect_id,
+                    "key": effect_id,
+                    "digest": digest,
+                    "decision": staged["decision"],
+                    "rendered_body": staged["renderedBody"],
+                    "template_name": staged["templateName"],
+                    "language": staged["language"],
+                    "revision": staged["revision"],
+                    "reply_mode": staged["replyMode"],
+                    "expires_at": staged["expiresAt"],
+                }))
+            }
+            "whatsapp_broadcast_test_prepare" => {
+                let broadcast_id = broadcast()?;
+                let to = required_str(params, "to")?;
+                let digits = to.strip_prefix('+').unwrap_or_default();
+                if !(8..=15).contains(&digits.len())
+                    || digits.starts_with('0')
+                    || !digits.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Err(Error::rejected(
+                        "test number must be E.164, for example +85255550999",
+                    ));
+                }
+                let effect_id = mint("wbt_");
+                let staged =
+                    door.broadcast_test_prepare(broadcast_id, &effect_id, to, &effect_id)?;
+                let digest = staged["digest"].as_str().unwrap_or_default().to_string();
+                // Only the door-masked number is kept.
+                record(
+                    &effect_id,
+                    digest.clone(),
+                    Some(broadcast_id),
+                    json!({"to": staged["to"]}),
+                )?;
+                Ok(json!({
+                    "effect_id": effect_id,
+                    "key": effect_id,
+                    "digest": digest,
+                    "decision": staged["decision"],
+                    "to": staged["to"],
+                    "expires_at": staged["expiresAt"],
+                }))
+            }
+            "whatsapp_broadcast_prepare" => {
+                let broadcast_id = broadcast()?;
+                let effect_id = mint("wab_");
+                let at = send_at(params)?;
+                let (staged, digest) =
+                    door.broadcast_prepare(broadcast_id, &effect_id, at.as_deref(), &effect_id)?;
+                let s = &staged["snapshot"];
+                let count = |v: &Value| v.as_array().map_or(0, Vec::len);
+                // Ids, digests and counts only: no variables, no phone numbers.
+                let facts = json!({
+                    "snapshotId": s["snapshotId"],
+                    "snapshotDigest": s["snapshotDigest"],
+                    "expires_at": staged["expiresAt"],
+                    "connection": {"connectionId": s["connection"]["connectionId"]},
+                    "template": s["template"],
+                    "audience": {
+                        "source": s["audience"]["source"],
+                        "segmentId": s["audience"]["segmentId"],
+                        "accounts": count(&s["audience"]["accountIds"]),
+                        "excludedAccounts": count(&s["audience"]["exclusions"]["accountIds"]),
+                        "excludedCampaigns": count(&s["audience"]["exclusions"]["campaignIds"]),
+                    },
+                    "counts": s["counts"],
+                    "audienceDigest": s["audienceDigest"],
+                    "sendAt": s["sendAt"],
+                });
+                record(&effect_id, digest.clone(), Some(broadcast_id), facts)?;
+                Ok(json!({
+                    "effect_id": effect_id,
+                    "key": effect_id,
+                    "digest": digest,
+                    "decision": staged["decision"],
+                    "expires_at": staged["expiresAt"],
+                    "snapshot": staged["snapshot"],
+                }))
+            }
+            "whatsapp_template_send"
+            | "whatsapp_broadcast_test_send"
+            | "whatsapp_broadcast_send" => {
+                let effect_id = required_str(params, "effect_id")?;
+                let digest = required_str(params, "digest")?;
+                let mut record = {
+                    let _claim = REPLY_CLAIM.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut record =
+                        self.whatsapp_effect_load(effect_id, prefix_of(method), install, context)?;
+                    if record.digest != digest {
+                        return Err(Error::rejected(
+                            "digest does not match the prepared WhatsApp send",
+                        ));
+                    }
+                    if !matches!(record.state.as_str(), "prepared" | "pending") {
+                        return Err(Error::rejected(format!(
+                            "this WhatsApp send was already attempted ({}); it is never \
+                             resent — read its status instead",
+                            record.state
+                        )));
+                    }
+                    // Durable before the door call: a crash leaves
+                    // `sending`, which is never sent again.
+                    record.state = "sending".to_string();
+                    record.updated = now_secs();
+                    self.whatsapp_effect_save(&record)?;
+                    record
+                };
+                let broadcast_id = record.broadcast_id.clone().unwrap_or_default();
+                let outcome = match method {
+                    "whatsapp_template_send" => door.template_send(effect_id, digest),
+                    "whatsapp_broadcast_test_send" => {
+                        door.broadcast_test_send(&broadcast_id, effect_id, digest)
+                    }
+                    _ => door.broadcast_send(effect_id, digest),
+                };
+                record.state = outcome.state.as_str().to_string();
+                record.code = outcome.code.clone();
+                record.updated = now_secs();
+                self.whatsapp_effect_save(&record)?;
+                Ok(
+                    json!({"effect_id": effect_id, "key": effect_id, "outcome": outcome.to_json(),
+                    "delivery_claim": "favcrm-acceptance-only"}),
+                )
+            }
+            "whatsapp_template_status" => {
+                let effect_id = required_str(params, "effect_id")?;
+                let record = self.whatsapp_effect_load(effect_id, "wat_", install, context)?;
+                let recorded =
+                    (record.state != "prepared").then(|| door.template_status(effect_id).to_json());
+                Ok(
+                    json!({"effect_id": effect_id, "key": effect_id, "state": record.state,
+                    "code": record.code, "door": recorded}),
+                )
+            }
+            "whatsapp_broadcast_stop" => door.broadcast_stop(broadcast()?, &mint("wbs_")),
+            _ => Err(Error::rejected("unknown WhatsApp method")),
+        }
     }
 }

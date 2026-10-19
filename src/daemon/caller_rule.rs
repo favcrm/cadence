@@ -1242,6 +1242,22 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("whatsapp_reply_prepare", Rule::Handler("rpc_whatsapp")),
     ("whatsapp_reply_send", Rule::Handler("rpc_whatsapp")),
     ("whatsapp_reply_status", Rule::Handler("rpc_whatsapp")),
+    // CAD-1590: door v2 templates and broadcasts, same handler.
+    ("whatsapp_templates_list", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_template_show", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_template_prepare", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_template_send", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_template_status", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcasts_list", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_show", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_estimate", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_results", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_draft", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_test_prepare", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_test_send", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_prepare", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_send", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_broadcast_stop", Rule::Handler("rpc_whatsapp")),
     // CAD-786: the send verbs all enter `rpc_crm_send`, whose first
     // act is `operator_connection`.
     ("crm_send_prepare", Rule::Handler("rpc_crm_send")),

@@ -26,8 +26,12 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 
-/// The pinned door contract every `data` must carry.
+/// The pinned door contract every v1 `data` must carry.
 pub const CONTRACT: &str = "agenticos.whatsapp-door.v1";
+/// CAD-1590: the contract every templates/broadcasts `data` must carry
+/// (`packages/contracts/src/whatsapp-door-v2.ts`, AOS-288). Pinned per
+/// verb: a v1 verb never accepts v2 and a v2 verb never accepts v1.
+pub const CONTRACT_V2: &str = "agenticos.whatsapp-door.v2";
 const PATH: &str = "/v1/runtime/whatsapp";
 const TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_CAP: u64 = 1024 * 1024;
@@ -56,6 +60,9 @@ pub struct Reply {
 pub enum ReplyState {
     Sent,
     Pending,
+    /// CAD-1590: FavCRM accepted a broadcast schedule or a test enqueue.
+    /// Acceptance only — never a delivery.
+    Accepted,
     Failed,
     Refused,
     Uncertain,
@@ -66,6 +73,7 @@ impl ReplyState {
         match self {
             Self::Sent => "sent",
             Self::Pending => "pending",
+            Self::Accepted => "accepted",
             Self::Failed => "failed",
             Self::Refused => "refused",
             Self::Uncertain => "uncertain",
@@ -170,6 +178,71 @@ pub fn check_conversation_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// CAD-1590: a template, broadcast or effect id travels in a URL path;
+/// the contract admits any 1–128 characters, the host only a token.
+pub fn check_path_id(id: &str, what: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+    {
+        return Err(Error::rejected(format!("WhatsApp {what} is invalid")));
+    }
+    Ok(())
+}
+
+/// CAD-1590 v2 template digest: sha256 hex over `JSON.stringify` of
+/// `{v:2,kind:"template",conversationId,templateId,revision,contentDigest,
+/// variables:[[n,value],...] (ascending n),effectId}`.
+pub fn template_digest(
+    conversation_id: &str,
+    template_id: &str,
+    revision: &str,
+    content_digest: &str,
+    variables: &std::collections::BTreeMap<u32, String>,
+    effect_id: &str,
+) -> String {
+    let ordered: Vec<Value> = variables.iter().map(|(n, v)| json!([n, v])).collect();
+    let canonical = format!(
+        "{{\"v\":2,\"kind\":\"template\",\"conversationId\":{},\"templateId\":{},\"revision\":{},\"contentDigest\":{},\"variables\":{},\"effectId\":{}}}",
+        json!(conversation_id),
+        json!(template_id),
+        json!(revision),
+        json!(content_digest),
+        Value::Array(ordered),
+        json!(effect_id),
+    );
+    hex(&Sha256::digest(canonical.as_bytes()))
+}
+
+/// CAD-1590 v2 broadcast digest over FavCRM's single-use snapshot:
+/// `{v:2,kind:"broadcast",broadcastId,snapshotId,snapshotDigest,effectId}`.
+pub fn broadcast_digest(
+    broadcast_id: &str,
+    snapshot_id: &str,
+    snapshot_digest: &str,
+    effect_id: &str,
+) -> String {
+    let canonical = format!(
+        "{{\"v\":2,\"kind\":\"broadcast\",\"broadcastId\":{},\"snapshotId\":{},\"snapshotDigest\":{},\"effectId\":{}}}",
+        json!(broadcast_id),
+        json!(snapshot_id),
+        json!(snapshot_digest),
+        json!(effect_id),
+    );
+    hex(&Sha256::digest(canonical.as_bytes()))
+}
+
+/// Which door answer [`classify_as`] reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Effect {
+    Reply,
+    Template,
+    BroadcastTest,
+    Broadcast,
+}
+
 enum Wire {
     /// The request provably never left this host.
     NotSent,
@@ -241,10 +314,14 @@ impl HostedWhatsapp {
     /// A read (or the connect-session mint): the contract `data`, or a
     /// refusal naming the door's code. Never a fabricated empty answer.
     fn read(wire: Wire) -> Result<Value> {
+        Self::read_pinned(wire, CONTRACT)
+    }
+
+    fn read_pinned(wire: Wire, contract: &str) -> Result<Value> {
         match wire {
             Wire::Answer(_, Some(document)) if document["ok"] == true => {
                 let data = document.get("data").cloned().unwrap_or(Value::Null);
-                if data.get("contract").and_then(Value::as_str) != Some(CONTRACT) {
+                if data.get("contract").and_then(Value::as_str) != Some(contract) {
                     return Err(Error::rejected(
                         "AgenticOS WhatsApp door answered an unpinned contract",
                     ));
@@ -330,6 +407,223 @@ impl HostedWhatsapp {
     pub fn reply_status(&self, key: &str) -> ReplyOutcome {
         classify(key, self.get(&format!("/reply/{key}"), &[]))
     }
+
+    // ---- CAD-1590: door v2 (templates and broadcasts), pinned to v2.
+
+    fn read_v2(wire: Wire) -> Result<Value> {
+        Self::read_pinned(wire, CONTRACT_V2)
+    }
+
+    /// §3.1 `templates.list`: `status` is `approved` (default) or `all`.
+    pub fn templates(&self, status: Option<&str>) -> Result<Value> {
+        let mut query = Vec::new();
+        if let Some(status) = status {
+            if !matches!(status, "approved" | "all") {
+                return Err(Error::rejected("template status must be approved or all"));
+            }
+            query.push(("status", status.to_string()));
+        }
+        Self::read_v2(self.get("/templates", &query))
+    }
+
+    pub fn template(&self, id: &str) -> Result<Value> {
+        check_path_id(id, "template id")?;
+        Self::read_v2(self.get(&format!("/templates/{id}"), &[]))
+    }
+
+    /// §3.2 `template.prepare`. The host reads the template first and
+    /// computes the digest over its revision and content digest; it
+    /// refuses unless the door staged exactly that digest under the key.
+    pub fn template_prepare(
+        &self,
+        key: &str,
+        conversation_id: &str,
+        template_id: &str,
+        variables: &std::collections::BTreeMap<u32, String>,
+        effect_id: &str,
+    ) -> Result<(Value, String)> {
+        check_conversation_id(conversation_id)?;
+        let template = self.template(template_id)?;
+        let (Some(revision), Some(content)) = (
+            template["revision"].as_str(),
+            template["contentDigest"].as_str(),
+        ) else {
+            return Err(Error::rejected(
+                "AgenticOS WhatsApp door answer was not understood (template)",
+            ));
+        };
+        let digest = template_digest(
+            conversation_id,
+            template_id,
+            revision,
+            content,
+            variables,
+            effect_id,
+        );
+        let vars: serde_json::Map<String, Value> = variables
+            .iter()
+            .map(|(n, v)| (n.to_string(), json!(v)))
+            .collect();
+        let body = json!({"conversationId": conversation_id, "templateId": template_id,
+            "variables": vars, "effectId": effect_id});
+        let data = Self::read_v2(self.post("/template/prepare", Some(key), &body))?;
+        Self::staged(&data, key, &digest)?;
+        Ok((data, digest))
+    }
+
+    fn staged(data: &Value, key: &str, digest: &str) -> Result<()> {
+        if data["key"].as_str() != Some(key)
+            || data["digest"].as_str() != Some(digest)
+            || !matches!(
+                data["decision"].as_str(),
+                Some("granted" | "approved" | "pending")
+            )
+        {
+            return Err(Error::rejected(
+                "AgenticOS WhatsApp door staged a different send; nothing was approved",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn template_send(&self, key: &str, digest: &str) -> ReplyOutcome {
+        classify_as(
+            Effect::Template,
+            key,
+            self.post("/template/send", Some(key), &json!({"digest": digest})),
+        )
+    }
+
+    pub fn template_status(&self, key: &str) -> ReplyOutcome {
+        classify_as(
+            Effect::Template,
+            key,
+            self.get(&format!("/template/{key}"), &[]),
+        )
+    }
+
+    pub fn broadcasts(&self, cursor: Option<&str>, limit: Option<u64>) -> Result<Value> {
+        Self::read_v2(self.get("/broadcasts", &page(cursor, limit, 50)?))
+    }
+
+    pub fn broadcast(&self, id: &str) -> Result<Value> {
+        check_path_id(id, "broadcast id")?;
+        Self::read_v2(self.get(&format!("/broadcasts/{id}"), &[]))
+    }
+
+    /// §3.3 `broadcast.estimate` (FavCRM validate; read-only).
+    pub fn broadcast_estimate(&self, id: &str) -> Result<Value> {
+        check_path_id(id, "broadcast id")?;
+        Self::read_v2(self.post(&format!("/broadcasts/{id}/estimate"), None, &json!({})))
+    }
+
+    pub fn broadcast_results(
+        &self,
+        id: &str,
+        cursor: Option<&str>,
+        limit: Option<u64>,
+        status: Option<&str>,
+    ) -> Result<Value> {
+        check_path_id(id, "broadcast id")?;
+        let mut query = page(cursor, limit, 200)?;
+        if let Some(status) = status {
+            check_path_id(status, "result status")?;
+            query.push(("status", status.to_string()));
+        }
+        Self::read_v2(self.get(&format!("/broadcasts/{id}/results"), &query))
+    }
+
+    /// §3.3 `broadcast.draft`: a DRAFT create or update; no external effect.
+    pub fn broadcast_draft(&self, key: &str, body: &Value) -> Result<Value> {
+        Self::read_v2(self.post("/broadcasts/draft", Some(key), body))
+    }
+
+    /// §3.3 test prepare. The test digest covers FavCRM's draft digest,
+    /// which the door does not expose, so the host binds the door's digest.
+    pub fn broadcast_test_prepare(
+        &self,
+        id: &str,
+        key: &str,
+        to: &str,
+        effect_id: &str,
+    ) -> Result<Value> {
+        check_path_id(id, "broadcast id")?;
+        let data = Self::read_v2(self.post(
+            &format!("/broadcasts/{id}/test/prepare"),
+            Some(key),
+            &json!({"to": to, "effectId": effect_id}),
+        ))?;
+        let digest = data["digest"].as_str().unwrap_or_default();
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(Error::rejected(
+                "AgenticOS WhatsApp door staged a malformed test; nothing was approved",
+            ));
+        }
+        Self::staged(&data, key, digest)?;
+        Ok(data)
+    }
+
+    pub fn broadcast_test_send(&self, id: &str, key: &str, digest: &str) -> ReplyOutcome {
+        if check_path_id(id, "broadcast id").is_err() {
+            return ReplyOutcome::bare(ReplyState::Refused, "invalid_request");
+        }
+        classify_as(
+            Effect::BroadcastTest,
+            key,
+            self.post(
+                &format!("/broadcasts/{id}/test/send"),
+                Some(key),
+                &json!({"digest": digest}),
+            ),
+        )
+    }
+
+    /// §3.3 review snapshot. The host recomputes the digest from the
+    /// snapshot FavCRM froze and refuses any other.
+    pub fn broadcast_prepare(
+        &self,
+        id: &str,
+        key: &str,
+        send_at: Option<&str>,
+        effect_id: &str,
+    ) -> Result<(Value, String)> {
+        check_path_id(id, "broadcast id")?;
+        let data = Self::read_v2(self.post(
+            &format!("/broadcasts/{id}/prepare"),
+            Some(key),
+            &json!({"sendAt": send_at, "effectId": effect_id}),
+        ))?;
+        let snapshot = &data["snapshot"];
+        let (Some(snapshot_id), Some(snapshot_digest)) = (
+            snapshot["snapshotId"].as_str(),
+            snapshot["snapshotDigest"].as_str(),
+        ) else {
+            return Err(Error::rejected(
+                "AgenticOS WhatsApp door answer was not understood (snapshot)",
+            ));
+        };
+        let digest = broadcast_digest(id, snapshot_id, snapshot_digest, effect_id);
+        Self::staged(&data, key, &digest)?;
+        Ok((data, digest))
+    }
+
+    pub fn broadcast_send(&self, key: &str, digest: &str) -> ReplyOutcome {
+        classify_as(
+            Effect::Broadcast,
+            key,
+            self.post("/broadcasts/send", Some(key), &json!({"digest": digest})),
+        )
+    }
+
+    /// §3.3 stop: unsent recipients only; final.
+    pub fn broadcast_stop(&self, id: &str, key: &str) -> Result<Value> {
+        check_path_id(id, "broadcast id")?;
+        Self::read_v2(self.post(&format!("/broadcasts/{id}/stop"), Some(key), &json!({})))
+    }
 }
 
 fn page(cursor: Option<&str>, limit: Option<u64>, max: u64) -> Result<Vec<(&'static str, String)>> {
@@ -352,6 +646,12 @@ fn page(cursor: Option<&str>, limit: Option<u64>, max: u64) -> Result<Vec<(&'sta
 /// Map one reply answer. Fails closed: only executed `sent` with an
 /// authorising decision and a provider id is `Sent`.
 fn classify(key: &str, wire: Wire) -> ReplyOutcome {
+    classify_as(Effect::Reply, key, wire)
+}
+
+/// CAD-1590: one classifier for every effect answer, pinned to its
+/// contract. Only an authorised success status is `Sent`/`Accepted`.
+fn classify_as(effect: Effect, key: &str, wire: Wire) -> ReplyOutcome {
     let (http, document) = match wire {
         Wire::NotSent => return ReplyOutcome::bare(ReplyState::Refused, "door_unreachable"),
         Wire::Unknown => return ReplyOutcome::bare(ReplyState::Uncertain, "outcome_unknown"),
@@ -388,7 +688,20 @@ fn classify(key: &str, wire: Wire) -> ReplyOutcome {
                     | "window_closed"
                     | "conversation_not_found"
             )
-        ) || (http == 403 && code.is_some());
+        ) || (effect != Effect::Reply
+            && matches!(
+                code.as_deref(),
+                Some(
+                    "template_not_found"
+                        | "template_not_approved"
+                        | "template_changed"
+                        | "connection_mismatch"
+                        | "campaign_state"
+                        | "test_limit"
+                        | "not_found"
+                )
+            ))
+            || (http == 403 && code.is_some());
         let state = if refused {
             ReplyState::Refused
         } else {
@@ -396,18 +709,36 @@ fn classify(key: &str, wire: Wire) -> ReplyOutcome {
         };
         return ReplyOutcome::bare(state, code.as_deref().unwrap_or("error"));
     };
-    if data["key"].as_str() != Some(key) || !valid_key(key) || data["contract"] != CONTRACT {
+    let contract = if effect == Effect::Reply {
+        CONTRACT
+    } else {
+        CONTRACT_V2
+    };
+    if data["key"].as_str() != Some(key)
+        || !valid_key(key)
+        || data["contract"] != contract
+        || (effect == Effect::Template && data["kind"] != "template")
+    {
         return ReplyOutcome::bare(ReplyState::Uncertain, "answer_not_bound");
     }
     let status = data["status"].as_str().unwrap_or("");
     let executed = data["executed"].as_bool();
     let authorized = matches!(data["decision"].as_str(), Some("granted" | "approved"));
     let provider = id_of(data, "providerMessageId");
-    let state = match status {
-        "sent" if executed == Some(true) && authorized && provider.is_some() => ReplyState::Sent,
-        "pending" if executed == Some(false) => ReplyState::Pending,
-        "failed" if authorized => ReplyState::Failed,
-        "not_executed" => ReplyState::Refused,
+    let message = matches!(effect, Effect::Reply | Effect::Template);
+    let state = match (effect, status) {
+        (Effect::Reply | Effect::Template, "sent")
+            if executed == Some(true) && authorized && provider.is_some() =>
+        {
+            ReplyState::Sent
+        }
+        (Effect::BroadcastTest, "queued") | (Effect::Broadcast, "scheduled") if authorized => {
+            ReplyState::Accepted
+        }
+        (_, "pending") if !message || executed == Some(false) => ReplyState::Pending,
+        // A template `failed` is FavCRM's refusal, never a closed window.
+        (Effect::Reply | Effect::Template, "failed") if authorized => ReplyState::Failed,
+        (_, "not_executed") => ReplyState::Refused,
         _ => ReplyState::Uncertain,
     };
     ReplyOutcome {
@@ -573,6 +904,32 @@ mod tests {
         door.lock().unwrap().window_open = false;
         let closed = client.reply_prepare(&reply("wae_d")).unwrap_err();
         assert!(closed.to_string().contains("window_closed"), "{closed}");
+    }
+
+    /// CAD-1590: the host digests equal the AOS-288 golden vectors
+    /// (`packages/contracts/src/whatsapp-door-v2.test.ts` at d38e9463).
+    #[test]
+    fn cad1590_digests_match_door_v2_golden_vectors() {
+        let variables = std::collections::BTreeMap::from([
+            (10, "ten".to_string()),
+            (2, "多謝".to_string()),
+            (1, "Ada".to_string()),
+        ]);
+        assert_eq!(
+            template_digest(
+                "conv_1",
+                "tpl_1",
+                "2026-10-19T00:00:00.000Z",
+                &"a".repeat(64),
+                &variables,
+                "eff_1"
+            ),
+            "54dddc90108370abd0c63850a8f72d26c7451a734e945f778241d07e57f98105"
+        );
+        assert_eq!(
+            broadcast_digest("cmp_1", "snap_1", &"b".repeat(64), "eff_2"),
+            "bf36c256b002f0b9933542dbae553084442eb0bf376f9edab92052f933e392e8"
+        );
     }
 
     #[test]

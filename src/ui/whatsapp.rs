@@ -26,7 +26,97 @@ pub(super) enum Route {
     ReplyPrepare,
     ReplySend,
     ReplyStatus,
+    /// CAD-1590: a door v2 verb, relayed with exactly its daemon fields.
+    V2(&'static str, &'static [&'static str]),
 }
+
+/// CAD-1590: the door v2 routes, each with the exact field allowlist of
+/// the daemon verb it relays (besides `install_id` and `context_id`).
+const V2_ROUTES: &[(&str, &str, &[&str])] = &[
+    (
+        "/api/whatsapp/templates",
+        "whatsapp_templates_list",
+        &["status"],
+    ),
+    (
+        "/api/whatsapp/template",
+        "whatsapp_template_show",
+        &["template_id"],
+    ),
+    (
+        "/api/whatsapp/template/prepare",
+        "whatsapp_template_prepare",
+        &["conversation_id", "template_id", "variables"],
+    ),
+    (
+        "/api/whatsapp/template/send",
+        "whatsapp_template_send",
+        &["effect_id", "digest"],
+    ),
+    (
+        "/api/whatsapp/template/status",
+        "whatsapp_template_status",
+        &["effect_id"],
+    ),
+    (
+        "/api/whatsapp/broadcasts",
+        "whatsapp_broadcasts_list",
+        &["cursor", "limit"],
+    ),
+    (
+        "/api/whatsapp/broadcast",
+        "whatsapp_broadcast_show",
+        &["broadcast_id"],
+    ),
+    (
+        "/api/whatsapp/broadcast/estimate",
+        "whatsapp_broadcast_estimate",
+        &["broadcast_id"],
+    ),
+    (
+        "/api/whatsapp/broadcast/results",
+        "whatsapp_broadcast_results",
+        &["broadcast_id", "cursor", "limit", "status"],
+    ),
+    (
+        "/api/whatsapp/broadcast/draft",
+        "whatsapp_broadcast_draft",
+        &[
+            "broadcast_id",
+            "name",
+            "template_id",
+            "body_parameters",
+            "header_media_url",
+            "audience",
+            "exclusions",
+        ],
+    ),
+    (
+        "/api/whatsapp/broadcast/test/prepare",
+        "whatsapp_broadcast_test_prepare",
+        &["broadcast_id", "to"],
+    ),
+    (
+        "/api/whatsapp/broadcast/test/send",
+        "whatsapp_broadcast_test_send",
+        &["effect_id", "digest"],
+    ),
+    (
+        "/api/whatsapp/broadcast/prepare",
+        "whatsapp_broadcast_prepare",
+        &["broadcast_id", "send_at"],
+    ),
+    (
+        "/api/whatsapp/broadcast/send",
+        "whatsapp_broadcast_send",
+        &["effect_id", "digest"],
+    ),
+    (
+        "/api/whatsapp/broadcast/stop",
+        "whatsapp_broadcast_stop",
+        &["broadcast_id"],
+    ),
+];
 
 pub(super) fn route(path: &str) -> Option<Route> {
     Some(match path {
@@ -38,7 +128,10 @@ pub(super) fn route(path: &str) -> Option<Route> {
         "/api/whatsapp/reply/prepare" => Route::ReplyPrepare,
         "/api/whatsapp/reply/send" => Route::ReplySend,
         "/api/whatsapp/reply/status" => Route::ReplyStatus,
-        _ => return None,
+        _ => {
+            let (_, method, fields) = V2_ROUTES.iter().find(|(p, _, _)| *p == path)?;
+            Route::V2(method, fields)
+        }
     })
 }
 
@@ -117,6 +210,36 @@ fn typed<T: serde::de::DeserializeOwned + Serialize>(
     Ok(serde_json::to_value(body).expect("typed request serializes"))
 }
 
+/// A door v2 body: an object with string `install_id`/`context_id` and
+/// no field outside the relayed verb's allowlist. The daemon validates
+/// every value again.
+fn v2_body(
+    request: &mut Request,
+    method: &str,
+    fields: &[&str],
+) -> Result<serde_json::Value, HttpResp> {
+    let cap = if method == "whatsapp_broadcast_draft" {
+        200 * 1024
+    } else {
+        BODY_CAP
+    };
+    let body = read_body(request, cap)?;
+    let invalid = || err_response(400, "invalid WhatsApp request schema");
+    let body: serde_json::Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
+    let object = body.as_object().ok_or_else(invalid)?;
+    let scoped = ["install_id", "context_id"]
+        .iter()
+        .all(|k| object.get(*k).is_some_and(serde_json::Value::is_string));
+    if !scoped
+        || object.keys().any(|k| {
+            !matches!(k.as_str(), "install_id" | "context_id") && !fields.contains(&k.as_str())
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(body)
+}
+
 pub(super) fn handle(request: &mut Request, state: &Path, route: Route) -> HttpResp {
     if request
         .url()
@@ -138,6 +261,7 @@ pub(super) fn handle(request: &mut Request, state: &Path, route: Route) -> HttpR
         }
         Route::ReplySend => typed::<ReplySend>(request).map(|p| ("whatsapp_reply_send", p)),
         Route::ReplyStatus => typed::<ReplyStatus>(request).map(|p| ("whatsapp_reply_status", p)),
+        Route::V2(method, fields) => v2_body(request, method, fields).map(|p| (method, p)),
     };
     let (method, params) = match parsed {
         Ok(parsed) => parsed,
