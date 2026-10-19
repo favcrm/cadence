@@ -337,21 +337,66 @@ def workflow_runs_at(repo, head):
 
 
 def current_attempt(runs):
-    """The newest attempt among one workflow's runs, by server-owned ordering."""
-    top = max(runs, key=lambda r: (r["run_number"], r["run_attempt"]))
-    if sum(1 for r in runs if (r["run_number"], r["run_attempt"]) == (top["run_number"], top["run_attempt"])) > 1:
+    """The newest attempt among one workflow's runs, by the attempt's own start.
+
+    `run_number` does not advance when an older run is re-run, so a later
+    attempt of an older run is ordered by when that attempt started. An
+    unorderable tie refuses."""
+    top = max(runs, key=lambda r: (r["run_started_at"], r["run_number"], r["run_attempt"]))
+    if sum(1 for r in runs if r["run_started_at"] == top["run_started_at"]) > 1:
         raise RuntimeError("workflow attempts have ambiguous ordering")
     return top
 
 
-def required_check_reasons(repo, head, required, rollup, runs):
+JOB_ID = re.compile(r"^  ([A-Za-z0-9_.\-]+):")
+JOB_NAME = re.compile(r"^    name:\s*(.+?)\s*(?:#.*)?$")
+
+
+def job_names(text):
+    """The job names a workflow file declares: each job id and each job's
+    display name. Only the top-level `jobs:` block is read."""
+    names, in_jobs = set(), False
+    for line in text.splitlines():
+        if not in_jobs:
+            if line.startswith("jobs:"):
+                in_jobs = True
+            continue
+        if line and not line[0].isspace():
+            break  # the next top-level key ends the jobs block
+        id_match = JOB_ID.match(line)
+        if id_match:
+            names.add(id_match.group(1))
+            continue
+        name_match = JOB_NAME.match(line)
+        if name_match:
+            value = name_match.group(1).strip().strip("\"'")
+            if value:
+                names.add(value)
+    return names
+
+
+def base_declares(repo, base_oid, path, context):
+    """True when the trusted base's own copy of `path` declares a job named
+    `context`. A workflow the base does not carry, or a job the base does not
+    declare, cannot produce that context."""
+    rc, out, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
+                      f"repos/{repo}/contents/{path}?ref={base_oid}"])
+    if rc != 0:
+        return False
+    return context in job_names(out)
+
+
+def required_check_reasons(repo, head, base_oid, required, rollup, runs):
     """(reasons, {required name: proving run url}).
 
-    Every required context is proven by the current attempt of the workflow that
-    produces it: the newest check run of that name, from the required app, inside
-    the current pull_request attempt of its own workflow at this head. A superseded
-    attempt never decides; a current failed, pending, missing, mis-bound, untrusted
-    or ambiguous one refuses."""
+    Every required context is proven by the current attempt of a workflow the
+    TRUSTED BASE declares a job for: the newest check run of that name, from the
+    required app, inside the current pull_request attempt of such a workflow at
+    this head. A workflow the base does not carry, or a context the base does
+    not declare, cannot prove the gate: a same-named check from an unrelated
+    workflow is never a substitute. A superseded attempt never decides; a
+    current failed, pending, missing, mis-bound, untrusted or ambiguous one
+    refuses."""
     reasons, proofs = [], {}
     suite_run = {}
     for r in runs:
@@ -360,6 +405,9 @@ def required_check_reasons(repo, head, required, rollup, runs):
     by_workflow = {}
     for r in pr_runs:
         by_workflow.setdefault(r["workflow_id"], []).append(r)
+    workflow_path = {}
+    for r in runs:
+        workflow_path.setdefault(r["workflow_id"], r["path"])
     statuses = {}
     for e in rollup or []:
         if isinstance(e, dict) and "context" in e:
@@ -398,6 +446,12 @@ def required_check_reasons(repo, head, required, rollup, runs):
         for r, run in bound:
             groups.setdefault(run["workflow_id"], []).append((r, run))
         for wid, group in groups.items():
+            path = workflow_path.get(wid)
+            if not path or not base_declares(repo, base_oid, path, name):
+                # The trusted base does not declare this context in that workflow:
+                # a same-named check from it proves nothing.
+                reasons.append(f"required check '{name}' is not declared by the trusted base in {path or 'its workflow'}")
+                continue
             try:
                 current = current_attempt(by_workflow[wid])
             except RuntimeError as e:
@@ -407,14 +461,15 @@ def required_check_reasons(repo, head, required, rollup, runs):
             if not mine:
                 reasons.append(f"required check '{name}' is not in the current attempt of its workflow at head {head[:12]}")
                 continue
-            top = max(mine, key=lambda pair: (pair[0]["started_at"], pair[0]["id"]))
-            if sum(1 for r, _ in mine if r["started_at"] == top[0]["started_at"]) > 1:
+            # The current attempt's own report decides: the latest check it
+            # reported for that context. A re-run keeps the suite and adds new
+            # checks, so an earlier attempt's check never overrides a newer one.
+            newest = max(r["started_at"] for r, _ in mine)
+            latest = [(r, run) for r, run in mine if r["started_at"] == newest]
+            if len({r.get("conclusion") for r, _ in latest}) > 1:
                 reasons.append(f"required check '{name}' has ambiguous newest runs at head {head[:12]}")
                 continue
-            check = top[0]
-            if check["started_at"] < current["run_started_at"]:
-                reasons.append(f"required check '{name}' is from a superseded attempt at head {head[:12]}")
-                continue
+            check = max(latest, key=lambda pair: pair[0]["id"])[0]
             if check["status"] != "completed":
                 reasons.append(f"required check '{name}' is pending ({check['status']}) at head {head[:12]}")
                 continue
@@ -423,9 +478,9 @@ def required_check_reasons(repo, head, required, rollup, runs):
                 continue
             proofs[name] = current["html_url"]
         if name not in proofs:
-            # A required context with no pull_request evidence at this head is
-            # unproven: it never counts as satisfied by another context's run.
-            reasons.append(f"required check '{name}' has no pull_request evidence at head {head[:12]}")
+            # A required context with no trusted pull_request evidence at this head
+            # is unproven: it never counts as satisfied by another context's run.
+            reasons.append(f"required check '{name}' has no trusted pull_request evidence at head {head[:12]}")
     return reasons, proofs
 
 
@@ -874,7 +929,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         if listed:
             # An empty listing is a read, not a proof: the checks and the canonical
             # run are judged against it and refuse when it holds nothing.
-            rs, proofs = required_check_reasons(repo, head, required, view.get("statusCheckRollup"), ci_runs)
+            rs, proofs = required_check_reasons(repo, head, base_oid, required,
+                                                view.get("statusCheckRollup"), ci_runs)
             reasons += rs
             report.append(f"required checks: {', '.join(sorted(names))}")
             try:
