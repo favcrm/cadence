@@ -1184,6 +1184,11 @@ impl Store {
             }
             Self::ensure_thread_in(tx, alias)?;
         }
+        // A CLI send has no conversation selector; without a home thread
+        // `thread_append_in` returns Ok(None) and the entry is dropped.
+        if matches!(sender, Sender::Cli(_)) {
+            Self::ensure_thread_in(tx, alias)?;
+        }
         Self::thread_append_in(tx, alias, entry)?;
         Ok(())
     }
@@ -2026,6 +2031,37 @@ mod tests {
         );
         assert!(s.thread_entries("w1", 0, 10).unwrap().is_empty());
         assert!(s.thread("w1").unwrap().is_none());
+    }
+
+    /// CAD-1578: a verified CLI send to a master with no home thread must
+    /// create the thread and record the entry, not drop it silently.
+    #[test]
+    fn a_cli_send_to_a_threadless_master_creates_home_and_records_the_entry() {
+        let (dir, s) = store();
+        reg(&s, "master", dir.path());
+        let auth = CliAuthority {
+            org: "org-a".into(),
+            sub: "sub-a".into(),
+            actor: "operator".into(),
+            handle: "owner".into(),
+            credential_id: "cred-a".into(),
+        };
+        assert!(s.thread("master").unwrap().is_none());
+        s.enqueue_sent(
+            "master",
+            "status please",
+            None,
+            "cli-1",
+            "user",
+            None,
+            &Sender::Cli(auth),
+        )
+        .unwrap();
+        assert!(s.thread("master").unwrap().is_some());
+        let entries = s.thread_entries("master", 0, 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message_id.as_deref(), Some("cli-1"));
+        assert_eq!(entries[0].text, "status please");
     }
 
     #[test]
