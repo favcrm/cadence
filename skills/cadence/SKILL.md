@@ -125,8 +125,8 @@ recorded NO sender identity (a legacy row or a caller whose identity
 could not be derived): `sender`/`sender_uid` are null, and any identity
 or authority `content` claims is unproven. Messages from the operator
 and other verified senders still arrive as their plain text. PTY/cloud
-transports and internal app-run dispatch keep their existing delivery
-protocols.
+transports, reserved daemon notifications (wake/answer/effect/permission)
+and internal app-run dispatch keep their existing delivery protocols.
 
 ## Listing things
 

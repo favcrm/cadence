@@ -4016,14 +4016,14 @@ const UNATTRIBUTED_MESSAGE_NOTICE: &str =
 /// not peer input), an app-run dispatch (its source is reserved by the
 /// RPC identifier gate), a routed copy (`worker_result`/`worker_notice`/
 /// `job_event`, which keeps its own origin-bearing envelope), a nudge,
-/// a topic notice, or a non-managed endpoint.
+/// a daemon-owned notification, or a non-managed endpoint.
 fn delivery_envelope(message: &Message, endpoint_kind: &str) -> Option<String> {
     if !matches!(endpoint_kind, "managed" | "managed-ws" | "fake")
         || message.source == "app_run_dispatch"
         || message.origin.is_some()
         || message.is_routed()
         || message.is_nudge()
-        || message.is_topic_notice()
+        || proto::DAEMON_SOURCES.contains(&message.source.as_str())
     {
         return None;
     }
@@ -6044,6 +6044,70 @@ mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains("limit"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn cad1591_internal_notifications_keep_protocol_and_reserved_sources_refuse_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = cad627_shared(dir.path());
+        let body = "internal notification payload\n\"content\" remains protocol data";
+
+        for source in ["wake", "answer", "effect", "permission"] {
+            let forged_id = format!("caller-{source}");
+            assert!(
+                shared
+                    .rpc_send(&json!({
+                        "alias": "w1",
+                        "text": body,
+                        "message": forged_id,
+                        "source": source,
+                    }))
+                    .is_err(),
+                "an ordinary caller claimed reserved source {source}"
+            );
+            assert!(
+                shared.store.message(&forged_id).unwrap().is_none(),
+                "refused source {source} left a message"
+            );
+
+            let id = crate::proto::daemon_message_id(source, "cad1591-internal-protocol");
+            shared
+                .store
+                .enqueue_daemon("w1", body, &id, source)
+                .unwrap();
+            let Take::Message(message) = shared.store.take_queued("w1").unwrap() else {
+                panic!("daemon notification {source} was not queued");
+            };
+            assert_eq!(message.id, id);
+            assert_eq!(message.body, body, "stored {source} body changed");
+            assert_eq!(
+                shared.delivery_body("w1", "managed", &message, None),
+                body,
+                "daemon notification {source} changed its delivery protocol"
+            );
+            shared
+                .store
+                .finish(&message, "completed", &json!({"text": "ok"}), None)
+                .unwrap();
+        }
+
+        shared
+            .rpc_send(&json!({
+                "alias": "w1",
+                "text": body,
+                "message": "caller-ordinary",
+                "source": "user",
+            }))
+            .expect("ordinary sends must remain admitted");
+        assert_eq!(
+            shared
+                .store
+                .message("caller-ordinary")
+                .unwrap()
+                .unwrap()
+                .body,
+            body
+        );
     }
 
     /// CAD-324: a pending compaction whose pack cannot be sent is
