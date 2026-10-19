@@ -3,8 +3,8 @@
 The machine-readable copy of [ADR 0006](../../../docs/adr/0006-connected-platform-contract.md)
 §5.2/§5.4 — the contract two codebases implement: **Cadence** (CAD-366
 credential proxy, CAD-506 effect gate) and **AgenticOS v2** (AOS-49
-credential exchange, AOS-52 tool manifest). Both test suites consume
-this directory so neither side drifts (§5.6).
+credential exchange, AOS-52 tool manifest). This directory supplies shared
+test inputs (§5.6); current Cadence coverage is described below.
 
 ## Contents
 
@@ -117,11 +117,13 @@ it. The DSL, in full:
 
 The behavioural `expect` keys — `result`, `press`, `fired`,
 `executions`, `verified`, `needs_you`, `delivered`, `wait`, `state`,
-`close_reason`, `effect_id` — are asserted by CAD-506 when it executes
-the vectors against the real gate. This directory's own check
-(`tests/contract_fixture.rs`) proves only what data can prove: schema
-conformance, classification coherence (C1–C3, C6), and that specimen
-hashes match the declared source bytes.
+`close_reason`, `effect_id` — describe the expected CAD-506 gate behavior
+when a consumer executes the vectors against the real gate. The retired
+`tests/contract_fixture.rs` driver checked schema conformance,
+classification coherence (C1–C3, C6), and specimen hashes against the
+declared source bytes; it did not prove those runtime behaviors. These
+vectors remain contract inputs, not evidence that the retired driver or
+every scenario currently runs in CI.
 
 ### The scenario list and what each proves
 
