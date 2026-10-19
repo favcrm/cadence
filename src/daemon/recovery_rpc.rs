@@ -9,6 +9,24 @@ use crate::issue::recovery::{self, Choice};
 const DECIDE_VERB: &str = "tracker recovery decide";
 const EXECUTE_VERB: &str = "tracker recovery execute";
 
+/// Name the recorded attempt in the refusal, without changing what the
+/// refusal IS: the kind still decides the exit code, so a caller that
+/// branches on it (busy is retryable, conflict is not) still branches
+/// correctly.
+fn with_attempt_path(e: Error, path: Option<&std::path::Path>) -> Error {
+    let Some(path) = path else {
+        return e;
+    };
+    let msg = format!("{e} (the attempt was recorded at {})", path.display());
+    match e.kind() {
+        "conflict" => Error::conflict_coded("recovery_failed", msg),
+        "busy" => Error::busy_coded("resource_busy", msg),
+        "gate" => Error::gate_coded("recovery_gate", msg),
+        "internal" => Error::internal(msg),
+        _ => Error::rejected(msg),
+    }
+}
+
 /// A required object param (a JSON blob passed through to the core).
 fn required_object<'a>(params: &'a Value, field: &str) -> Result<&'a Value> {
     match params.get(field) {
@@ -96,7 +114,31 @@ impl Shared {
         let decision = required_object(params, "decision")?;
         let choice = required_choice(params)?;
         let paths = required_path_list(params, "paths")?;
-        recovery::execute(&self.pm()?, review, decision, choice, &paths)
+        let outcome = recovery::execute_detailed(&self.pm()?, review, decision, choice, &paths);
+        // The attempt is recorded either way, so a FAILED execution is
+        // still confirmable afterwards: `recover status --attempt <file>`
+        // reads it back. The refusal keeps its own kind, so the exit
+        // code still says whether a retry can help.
+        let recorded = self.record_recovery_attempt(&outcome.attempt);
+        match outcome.error {
+            Some(e) => Err(with_attempt_path(e, recorded.as_deref())),
+            None => Ok(outcome.attempt),
+        }
+    }
+
+    /// Record the attempt under the daemon's state dir. The daemon owns
+    /// that dir, so the record outlives the call that produced it.
+    fn record_recovery_attempt(&self, attempt: &Value) -> Option<std::path::PathBuf> {
+        let dir = self.state_dir.join("recovery");
+        std::fs::create_dir_all(&dir).ok()?;
+        let name = format!(
+            "{}-{}.json",
+            crate::issue::time::basic(crate::issue::time::now_epoch()),
+            std::process::id()
+        );
+        let path = dir.join(name);
+        std::fs::write(&path, attempt.to_string()).ok()?;
+        Some(path)
     }
 
     /// `tracker_recovery_status` — the truthful outcome of a recorded

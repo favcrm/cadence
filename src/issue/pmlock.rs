@@ -614,6 +614,10 @@ pub enum LockState {
     Interrupted {
         paths: Vec<String>,
         foreign: Vec<String>,
+        /// The Git-global hazards (`index.lock`, a merge/rebase/
+        /// cherry-pick state). They are not a path-local interruption
+        /// and no path-scoped recovery can settle them (CAD-1601).
+        hazards: Vec<String>,
     },
     /// A `.write.lock` this build did not write: an older binary may
     /// hold it, or crashed holding it. `holder` names it where the
@@ -1625,6 +1629,7 @@ impl Pm {
                     Ok(Some(i)) => LockState::Interrupted {
                         paths: i.named,
                         foreign: i.foreign,
+                        hazards: i.hazards,
                     },
                     Err(e) => LockState::IoUnknown(e.to_string()),
                 }

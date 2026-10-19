@@ -168,8 +168,12 @@ pub fn review(pm: &Pm, blocked_operation: Option<&str>) -> Result<Value> {
 /// review it was made from.
 pub fn decide(pm: &Pm, review: &Value, choice: Choice, paths: &[String]) -> Result<Value> {
     let bound = require_str(review, "state")?;
-    let leftovers = require_str_list(review, "leftovers")?;
-    let foreign = require_str_list(review, "foreign_paths")?;
+    // The eligible and the protected sets come from the TRACKER, never
+    // from the caller's review: a hand-written review must not be able
+    // to make a protected path look like the crashed writer's.
+    let report = pm.interruption_report()?;
+    let leftovers = report.paths;
+    let foreign = report.foreign_paths;
     let selected = select_paths(pm, &leftovers, &foreign, paths)?;
     let current = state_binding(pm, &leftovers, &foreign)?;
     if current != bound {
@@ -197,6 +201,96 @@ pub fn decide(pm: &Pm, review: &Value, choice: Choice, paths: &[String]) -> Resu
     }))
 }
 
+/// The outcome of an execution, successful or not.
+///
+/// A failed execution still leaves an attempt: what it observed, what
+/// it changed, and what it could not determine. The operator can
+/// confirm it with `recover status --attempt <file>` — a failure is
+/// never a state nobody can look at afterwards.
+pub struct Execution {
+    pub attempt: Value,
+    pub error: Option<Error>,
+}
+
+/// The execution, with the attempt always produced.
+pub fn execute_detailed(
+    pm: &Pm,
+    review: &Value,
+    decision: &Value,
+    choice: Choice,
+    paths: &[String],
+) -> Execution {
+    let mut landed: Option<Outcome> = None;
+    match execute_inner(pm, review, decision, choice, paths, &mut landed) {
+        Ok(attempt) => Execution {
+            attempt,
+            error: None,
+        },
+        Err(e) => {
+            let attempt = failure_attempt(pm, review, choice, paths, &e, landed.as_ref());
+            Execution {
+                attempt,
+                error: Some(e),
+            }
+        }
+    }
+}
+
+/// The attempt a failed execution leaves behind: what was observed,
+/// what was changed, and what is unknown. It never claims success.
+fn failure_attempt(
+    pm: &Pm,
+    review: &Value,
+    choice: Choice,
+    paths: &[String],
+    error: &Error,
+    landed: Option<&Outcome>,
+) -> Value {
+    let bound = review.get("state").and_then(Value::as_str).unwrap_or("");
+    let remaining = pm
+        .interruption_report()
+        .map(|r| r.paths)
+        .unwrap_or_default();
+    let (outcome, committed, message) = match landed {
+        Some(o) => (
+            "applied_but_unconfirmed",
+            o.committed.clone().map(Value::from).unwrap_or(Value::Null),
+            format!(
+                "the change was applied ({}), but the outcome could not be confirmed: {error}. \
+                 The state below is what a fresh observation shows; re-review before doing \
+                 anything else. A blind retry could repeat the change.",
+                o.message
+            ),
+        ),
+        None => (
+            "failed_before_any_change",
+            Value::Null,
+            format!(
+                "the recovery was refused before it changed anything: {error}. Nothing was \
+                 applied, so a retry is safe once the reason is dealt with."
+            ),
+        ),
+    };
+    json!({
+        "state": bound,
+        "choice": choice.as_str(),
+        "paths": paths,
+        "resolved": false,
+        "recovery_success": false,
+        "outcome": outcome,
+        "committed": committed,
+        "message": message,
+        "error": {
+            "kind": error.kind(),
+            "code": error.code(),
+            "message": error.to_string(),
+        },
+        "remaining": remaining,
+        "next_action": "inspect the attempt and the current state before doing anything else; \
+                        a blind retry of the same request is not safe",
+    })
+}
+
 /// Step 3 — the one mutation.
 ///
 /// It re-proves the bound under the real tracker lock, so a state that
@@ -209,9 +303,30 @@ pub fn execute(
     choice: Choice,
     paths: &[String],
 ) -> Result<Value> {
+    match execute_detailed(pm, review, decision, choice, paths) {
+        Execution {
+            attempt,
+            error: None,
+        } => Ok(attempt),
+        Execution { error: Some(e), .. } => Err(e),
+    }
+}
+
+fn execute_inner(
+    pm: &Pm,
+    review: &Value,
+    decision: &Value,
+    choice: Choice,
+    paths: &[String],
+    landed: &mut Option<Outcome>,
+) -> Result<Value> {
     let bound = require_str(review, "state")?;
-    let leftovers = require_str_list(review, "leftovers")?;
-    let foreign = require_str_list(review, "foreign_paths")?;
+    // The eligible and the protected sets come from the TRACKER, never
+    // from the caller's review: a hand-written review must not be able
+    // to make a protected path look like the crashed writer's.
+    let report = pm.interruption_report()?;
+    let leftovers = report.paths;
+    let foreign = report.foreign_paths;
     let confirmed = require_str(decision, "confirmation")?;
     let preview_digest = require_str(decision, "preview_digest")?;
     let selected = select_paths(pm, &leftovers, &foreign, paths)?;
@@ -295,6 +410,9 @@ pub fn execute(
                 }
             }
         };
+        // The change landed: a later failure must say so, not claim
+        // that nothing happened.
+        *landed = Some(outcome.clone());
         Ok(outcome)
     })()?; // The guard is released; the report below is a fresh observation.
     let after = pm.interruption_report()?;
@@ -336,23 +454,29 @@ pub fn status(pm: &Pm, attempt: &Value) -> Result<Value> {
     Ok(out)
 }
 
-/// What a decision would do, shown before it does anything.
+/// What a decision would do, shown before it does anything. Every
+/// selected path carries the exact resulting state of each layer — the
+/// index entry and the working tree — so a destructive choice can
+/// actually be reviewed before it is confirmed.
 fn preview_for(pm: &Pm, choice: Choice, selected: &[String]) -> Result<Value> {
     let mut effects = Vec::new();
     for path in selected {
         let staged = staged_blob(pm, path)?;
         let worktree = worktree_facts(pm, path)?;
+        let head = head_facts(pm, path);
         let effect = match choice {
             Choice::Keep => format!(
                 "commit the staged content of {path} (index blob {}), leaving the working \
-                 tree's own content untouched",
+                 tree's own content untouched; the path's committed state becomes the staged \
+                 one",
                 staged
                     .clone()
-                    .unwrap_or_else(|| "none — the path has no staged content".to_string())
+                    .unwrap_or_else(|| { "none — the path has no staged content".to_string() })
             ),
             Choice::Discard => format!(
-                "restore {path} to its committed state: the staged content and the working \
-                 tree's content are both replaced by the committed version"
+                "restore {path} to its committed state: the index entry and the working \
+                 tree's content are both replaced by the committed version. {}",
+                head["effect"].as_str().unwrap_or_default()
             ),
             Choice::Leave => format!("leave {path} exactly as it is"),
         };
@@ -360,12 +484,14 @@ fn preview_for(pm: &Pm, choice: Choice, selected: &[String]) -> Result<Value> {
             "path": path,
             "staged_blob": staged,
             "worktree": worktree,
+            "head": head,
             "effect": effect,
         }));
     }
     Ok(json!({ "effects": effects }))
 }
 
+#[derive(Clone)]
 struct Outcome {
     resolved: bool,
     committed: Option<String>,
@@ -457,6 +583,28 @@ fn select_paths(
                      directories and the descendants they imply. Select the exact files. A \
                      retry unchanged will not help."
                 )));
+            }
+        }
+        // Every ANCESTOR of the path must be a real directory inside the
+        // tracker: a symlinked ancestor would take the write out of it
+        // even though the path itself is innocent.
+        let mut ancestor = pm.dir.clone();
+        let parts: Vec<&str> = norm.split('/').collect();
+        for part in parts.iter().take(parts.len().saturating_sub(1)) {
+            ancestor = ancestor.join(part);
+            if let Ok(meta) = std::fs::symlink_metadata(&ancestor) {
+                if meta.file_type().is_symlink() {
+                    return Err(Error::rejected(format!(
+                        "{norm} is under a symlinked directory ({}) — a recovery will not \
+                         follow a link out of the tracker. Inspect and resolve it safely \
+                         outside this flow, then obtain a new review. A retry unchanged will \
+                         not help.",
+                        ancestor
+                            .strip_prefix(&pm.dir)
+                            .unwrap_or(&ancestor)
+                            .display()
+                    )));
+                }
             }
         }
         if !selected.iter().any(|s| s == norm) {
@@ -566,6 +714,7 @@ fn path_facts(pm: &Pm, paths: &[String]) -> Result<Value> {
         out.push(json!({
             "path": path,
             "staged_blob": staged_blob(pm, path)?,
+            "staged_content": staged_content(pm, path),
             "worktree": worktree_facts(pm, path)?,
             "staged_diff": git(&pm.dir, &["diff", "--cached", "--no-color", "--", path]).ok(),
             "unstaged_diff": git(&pm.dir, &["diff", "--no-color", "--", path]).ok(),
@@ -612,9 +761,7 @@ fn worktree_facts(pm: &Pm, path: &str) -> Result<Value> {
                 "mode": meta.mode(),
                 "exists": true,
                 "bytes": content.as_ref().map(|c| format!("{:x}", Sha256::digest(c))),
-                "content": content
-                    .as_ref()
-                    .and_then(|c| String::from_utf8(c.clone()).ok()),
+                "content": content_value(content.as_deref()),
                 "link_target": if kind == "symlink" {
                     std::fs::read_link(&abs).ok().map(|p| p.display().to_string())
                 } else {
@@ -624,6 +771,91 @@ fn worktree_facts(pm: &Pm, path: &str) -> Result<Value> {
         }
         Err(_) => Ok(json!({ "kind": "absent", "exists": false })),
     }
+}
+
+/// The bytes of a file, in a form a reviewer can actually read: the
+/// text when it is text, and the hex when it is not. A binary leftover
+/// is never summarized away — the review has to be able to show the
+/// whole thing before anyone decides to keep or discard it.
+fn content_value(bytes: Option<&[u8]>) -> Value {
+    let Some(bytes) = bytes else {
+        return Value::Null;
+    };
+    match std::str::from_utf8(bytes) {
+        Ok(text) => json!({ "utf8": text, "binary": false }),
+        Err(_) => {
+            let mut hex = String::with_capacity(bytes.len() * 2);
+            for b in bytes {
+                hex.push_str(&format!("{b:02x}"));
+            }
+            json!({ "hex": hex, "binary": true })
+        }
+    }
+}
+
+/// The content the index holds for a path: what a keep would commit,
+/// in a form a reviewer can read. A binary blob is shown in hex, not
+/// summarized away.
+fn staged_content(pm: &Pm, path: &str) -> Value {
+    let Some(blob) = staged_blob(pm, path).ok().flatten() else {
+        return Value::Null;
+    };
+    match git_raw(pm, &["cat-file", "blob", &blob]) {
+        Ok(bytes) => content_value(Some(&bytes)),
+        Err(_) => Value::Null,
+    }
+}
+
+/// Git's raw output, without the trimming the text helper does: a
+/// binary blob's bytes must survive intact.
+fn git_raw(pm: &Pm, args: &[&str]) -> Result<Vec<u8>> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(&pm.dir);
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = crate::reaper::spawn(&mut cmd)
+        .map_err(|_| Error::internal("`git` is required and was not found on PATH"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| Error::internal(format!("git could not be run: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::internal(format!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            pm.dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
+/// The committed state of a path: what a discard would restore it to.
+fn head_facts(pm: &Pm, path: &str) -> Value {
+    if git(&pm.dir, &["cat-file", "-e", &format!("HEAD:{path}")]).is_err() {
+        return json!({
+            "present": false,
+            "effect": "the path is not in HEAD: the staged addition and the working-tree file \
+                       are both removed, and the path is absent afterwards",
+        });
+    }
+    let blob = git(&pm.dir, &["rev-parse", &format!("HEAD:{path}")]).unwrap_or_default();
+    let mode = git(&pm.dir, &["ls-tree", "HEAD", "--", path])
+        .ok()
+        .and_then(|l| l.split_whitespace().next().map(str::to_string))
+        .unwrap_or_default();
+    let content = git_raw(pm, &["cat-file", "blob", &format!("HEAD:{path}")]).ok();
+    json!({
+        "present": true,
+        "blob": blob,
+        "mode": mode,
+        "content": content_value(content.as_deref()),
+        "effect": "the index entry and the working-tree file are both replaced by this \
+                   committed version",
+    })
 }
 
 fn file_digest(path: &Path) -> String {
@@ -754,16 +986,27 @@ fn discard_paths(pm: &Pm, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Run the repository's own pre-commit hook against the content the
-/// recovery is about to commit. A hook that refuses refuses the
+/// Run the repository's effective pre-commit hook against the content
+/// the recovery is about to commit. A hook that refuses refuses the
 /// recovery: the check is not weakened by committing a different way.
 fn run_pre_commit_hook(pm: &Pm, git_dir: &Path, tmp_index: &Path) -> Result<()> {
-    let hook = git_dir.join("hooks").join("pre-commit");
+    let Some(hook) = effective_hook(pm) else {
+        return Ok(());
+    };
     let Ok(meta) = std::fs::metadata(&hook) else {
         return Ok(());
     };
     if !meta.is_file() {
         return Ok(());
+    }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Git ignores a hook that is not executable; so does the
+        // recovery, or it would run a check the ordinary commit path
+        // never runs.
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Ok(());
+        }
     }
     let mut cmd = Command::new(&hook);
     cmd.current_dir(&pm.dir)
@@ -785,6 +1028,34 @@ fn run_pre_commit_hook(pm: &Pm, git_dir: &Path, tmp_index: &Path) -> Result<()> 
         )));
     }
     Ok(())
+}
+
+/// The hook Git would run for this repository: `core.hooksPath` when
+/// it is set (a relative path is relative to the repository root),
+/// otherwise the repository's hooks directory. An ordinary commit runs
+/// that hook, so the recovery must run the same one — the recovery
+/// commits through `commit-tree`, which runs no hook of its own.
+fn effective_hook(pm: &Pm) -> Option<PathBuf> {
+    let dir = match git(&pm.dir, &["config", "--get", "core.hooksPath"]) {
+        Ok(p) if !p.trim().is_empty() => {
+            let p = PathBuf::from(p.trim());
+            if p.is_absolute() {
+                p
+            } else {
+                pm.dir.join(p)
+            }
+        }
+        _ => {
+            let rel = git(&pm.dir, &["rev-parse", "--git-path", "hooks"]).ok()?;
+            let p = PathBuf::from(rel);
+            if p.is_absolute() {
+                p
+            } else {
+                pm.dir.join(p)
+            }
+        }
+    };
+    Some(dir.join("pre-commit"))
 }
 
 /// A git argument that may be a flag or a value.

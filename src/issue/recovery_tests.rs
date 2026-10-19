@@ -60,18 +60,26 @@ fn a_review_names_the_leftover_and_protects_the_foreign_path() {
             .contains("reconcile"),
         "the review does not carry the blocked operation: {r}"
     );
-    // The content is shown, not just the name.
+    // The content is shown, not just the name: as text when it is text.
     let facts = r["paths"].as_array().unwrap();
     let fact = facts
         .iter()
         .find(|f| f["path"] == "crashed/issue.md")
         .expect("the leftover's facts are missing");
     assert!(
-        fact["worktree"]["content"]
+        fact["worktree"]["content"]["utf8"]
             .as_str()
             .unwrap_or_default()
             .contains("half a write"),
         "the review does not show the leftover's content: {fact}"
+    );
+    // And so is the content the keep would commit.
+    assert!(
+        fact["staged_content"]["utf8"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("half a write"),
+        "the review does not show the staged content: {fact}"
     );
 }
 
