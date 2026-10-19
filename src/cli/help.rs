@@ -98,6 +98,7 @@ const OPERATOR: &[&str] = &[
     "session",
     "staging",
     "org",
+    "team",
     "settings",
 ];
 

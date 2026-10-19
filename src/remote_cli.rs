@@ -11,19 +11,21 @@
 //!   cli actor envelope. Body is exactly `{version:"hosted-cadence-cli.v1",
 //!   organization_id, audience, requested_scopes:["cli.read","cli.write"],
 //!   ttl_seconds}` (a strict object — an extra key is `invalid_request`).
-//!   The envelope is **single-use** — the container (#744) consumes its `jti`.
-//!   [`call_once`] mints a fresh one for every command invocation, and the wake
-//!   loop re-mints on every retry: a `503 waking` is produced by the worker's
-//!   `wakeBoardRuntime` *before* any container forward, so the just-minted
-//!   envelope's `jti` was never consumed — but re-minting is still the only
-//!   safe posture (a `503` that came later in the pipeline would have burned
-//!   it). An envelope is never reused across calls or retries.
+//!   Container commands consume the envelope's `jti` in the native handler.
+//!   Platform team writes claim a canonical, audited first-mutation receipt;
+//!   roster reads and no-effect lookups do not consume an unused mutation nonce.
+//!   [`call_once`] still mints a fresh envelope for every invocation and retry.
+//!   `503 waking` is returned before any container forward, but a later failure
+//!   can follow a committed effect. Never reuse an envelope or retry an uncertain
+//!   mutation as though it had failed.
 //! - `POST {endpoint}/__platform/cli/call` — same bearer + `{version,
 //!   envelope, verb, arguments?}` — `verb` is one of
-//!   [`REMOTE_VERBS`]; `arguments` is an object the container's
-//!   `/api/cli/<verb>` dispatch consumes. Top-level authority-shaped keys
-//!   (`actor`, `role`, `org`, `user`, `as`, `principal`, `wiki_as`) are
-//!   refused server-side; this client never sends them.
+//!   [`REMOTE_VERBS`]; platform team arguments dispatch in the Worker without
+//!   waking a container; other arguments reach `/api/cli/<verb>`. Authority keys
+//!   (`actor`, `org`, `user`, `as`, `principal`, `wiki_as`) are refused
+//!   server-side; this client never sends them. A team `role` argument is the
+//!   requested *target* role, not caller authority: it is validated against
+//!   `owner`/`member` and never establishes the caller's own role.
 //! - `401/403` — the bearer no longer resolves to a live principal: re-login.
 //! - `503 {"state":"waking","retry_after_s":N}` + `Retry-After` — the company
 //!   container is waking; wait and retry inside the wake budget. A retry is
@@ -61,26 +63,40 @@ pub const WAKE_TIMEOUT_DEFAULT: u64 = 120;
 const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 
 /// The allowlisted remote verbs this build can send — the CAD-1019 contract
-/// ∩ AOS-128's `HOSTED_CADENCE_CLI_VERBS`, minus `team_list` (no local
-/// `team` command exists to map to it): a command not listed here
-/// is refused *locally* and its bytes never leave the process.
+/// ∩ AOS-128's `HOSTED_CADENCE_CLI_VERBS`: a command not listed here is
+/// refused *locally* and its bytes never leave the process.
+///
+/// Platform team verbs are in this allowlist and are not native container
+/// verbs: the hosted call path carries them, and the platform answers them
+/// without a daemon.
+///
+/// Writes ride the same single-use envelope. The caller's authority never
+/// travels as a request field, only inside the envelope [`call_once`] mints
+/// for that attempt. A failed or ambiguous call is never retried: the wake
+/// retry is the only loop, and it fires only on a pre-forward `waking`
+/// verdict, re-minting because that refusal happens before the envelope is
+/// consumed. Anything else stays unresolved.
 ///
 /// The cli.write half (`issue_new`/`issue_comment`/`issue_set`/
-/// `project_policy`/`message_send`) rides the same envelope — the caller's authority
-/// never travels as a request field, only inside the verified, single-use
-/// envelope. A failed or ambiguous call is never retried by the client:
-/// the wake retry is the only loop, and it fires only on a pre-forward
-/// `waking` verdict. Anything else — a timeout, a dropped connection, a
-/// 5xx after forward — stays explicitly unresolved: the mutation may or
-/// may not have landed, so reconcile before blindly re-issuing. For
-/// `project_policy`, reconcile by reading the project record; a refusal
-/// is final. For `message_send`, the caller-chosen `message` id in
+/// `project_policy`/`message_send`/`team_*`) rides the same envelope — the
+/// caller's authority never travels as a request field, only inside the
+/// verified, single-use envelope. A failed or ambiguous call is never retried
+/// by the client: the wake retry is the only loop, and it fires only on a
+/// pre-forward `waking` verdict. Anything else — a timeout, a dropped
+/// connection, a 5xx after forward — stays explicitly unresolved: the
+/// mutation may or may not have landed, so reconcile before blindly
+/// re-issuing. For `project_policy`, reconcile by reading the project record;
+/// a refusal is final. For `message_send`, the caller-chosen `message` id in
 /// `arguments` is the reconciliation key: `message_read` returns the
 /// principal's own durable message by id, and resubmitting the same id
 /// dedupes server-side — never a blind replay. A 2xx proves the enqueue
 /// only as the complete correlated receipt
 /// ([`send_receipt_correlates`]): an absent, malformed or foreign-bound
 /// body is `unknown`, the same unresolved outcome a lost response has.
+///
+/// CAD-1586 / AOS-290: `settings_agents` and `master_status` mint narrow
+/// `settings.*` envelopes (per operation, never the broad `cli.*` pair) —
+/// see [`settings_op_scope`].
 pub const REMOTE_VERBS: &[&str] = &[
     // cli.read
     "status",
@@ -92,16 +108,119 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_history",
     "message_read",
     "message_inbox",
+    "team_list",
+    "team_invites",
     // cli.write
     "issue_new",
     "issue_comment",
     "issue_set",
+    "team_invite",
+    "team_revoke_invite",
+    "team_set_role",
+    "team_remove",
     "project_policy",
     "message_send",
     // CAD-1586 / AOS-290: scoped settings + master diagnostics.
     "settings_agents",
     "master_status",
 ];
+
+/// Scope a cli authorize request asks for. Existing container verbs keep
+/// the historical `cli.read`+`cli.write` pair. Platform team verbs ask only
+/// for the scope that verb requires.
+fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
+    match verb {
+        "team_list" | "team_invites" => &["cli.read"],
+        "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => &["cli.write"],
+        _ => &["cli.read", "cli.write"],
+    }
+}
+
+/// The four team mutations: the Worker commits them in the same D1 batch
+/// that records the receipt, so a lost or ambiguous answer follows a
+/// possible commit exactly as a lost send answer does. The two read-only
+/// team verbs (`team_list`, `team_invites`) change nothing.
+fn team_mutation_verb(verb: &str) -> bool {
+    matches!(
+        verb,
+        "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove"
+    )
+}
+
+/// A verb that can change server state. When the answer to one of these is
+/// lost or ambiguous, the mutation may already have landed, so the outcome
+/// is unknown and the caller must reconcile with a read before repeating it
+/// — never a plain refusal, and never a bare retry.
+///
+/// `message_send` is the historical member of this set; the team mutations
+/// join it for the reason above.
+fn mutating_cli_verb(verb: &str) -> bool {
+    verb == "message_send" || team_mutation_verb(verb)
+}
+
+/// The read a caller must run before repeating a mutating verb whose answer
+/// was lost. A lost response is not a refusal: the write may have landed, so
+/// the next step is a read of the same workspace, never a blind retry.
+/// `message_send` reconciles on its own stable id; the team mutations
+/// reconcile with the directory read.
+fn lost_mutation_note(verb: &str) -> &'static str {
+    if verb == "message_send" {
+        "the send may or may not have been recorded"
+    } else {
+        "the team change may or may not have been applied — inspect `team list` or \
+         `team invites` with the same explicit --org before repeating it"
+    }
+}
+
+/// The board refused the call at its own gate, before the verb reached the
+/// platform. Its refusal carries the `board` hop marker; the platform's own
+/// answers do not. A gate refusal is therefore a definite pre-effect
+/// refusal, not an ambiguous outcome.
+fn board_gate_refused(body: Option<&Value>) -> bool {
+    body.and_then(|b| b.pointer("/error/hop"))
+        .and_then(Value::as_str)
+        == Some("board")
+}
+
+/// Argument keys a platform team verb may carry. Other verbs keep their
+/// existing grammar. An unknown key, a missing key, or a role other than
+/// `owner`/`member` is refused before a credential is loaded. `role` here
+/// is the requested target role, never caller authority.
+fn team_argument_shape(verb: &str, arguments: &Map<String, Value>) -> Result<()> {
+    let allowed: &[&str] = match verb {
+        "team_list" | "team_invites" => &[],
+        "team_invite" => &["email", "role"],
+        "team_revoke_invite" => &["invite_id"],
+        "team_set_role" => &["user_id", "role"],
+        "team_remove" => &["user_id"],
+        _ => return Ok(()),
+    };
+    if let Some(key) = arguments
+        .keys()
+        .find(|key| !allowed.contains(&key.as_str()))
+    {
+        return Err(reject(format!(
+            "team {verb} argument '{key}' is not allowed - never sent"
+        )));
+    }
+    for key in allowed {
+        let Some(value) = arguments.get(*key) else {
+            return Err(reject(format!("team {verb} requires {key} - never sent")));
+        };
+        let Some(text) = value
+            .as_str()
+            .filter(|text| !text.is_empty() && !text.chars().any(|c| c.is_control()))
+        else {
+            return Err(reject(format!(
+                "team {verb} {key} must be a nonempty string - never sent"
+            )));
+        };
+        if *key == "role" && text != "owner" && text != "member" {
+            return Err(reject("team role must be owner or member - never sent"));
+        }
+    }
+    Ok(())
+}
 
 /// CAD-1586 / AOS-290: `settings_agents` carries the explicit
 /// `{operation, expected_revision, payload}` resource command for
@@ -1074,7 +1193,7 @@ fn call_once(
                 .unwrap_or_default(),
         )],
         Surface::Cli if verb == REMOTE_MASTER_STATUS_VERB => &["settings.read"],
-        Surface::Cli => &["cli.read", "cli.write"],
+        Surface::Cli => cli_requested_scopes(verb),
         Surface::Wiki if verb == "write" => &["wiki.write"],
         Surface::Wiki => &["wiki.read"],
     };
@@ -1099,8 +1218,9 @@ fn call_once(
     // CAD-1568: a mutating verb's transport failure after the call was
     // attempted is outcome-unknown, not a rejection — the mutation may
     // have landed, so the caller must reconcile by idempotency key, never
-    // assume nothing landed. `message_send` reconciles on `arguments.message`.
-    let mutating = matches!(surface, Surface::Cli) && verb == "message_send";
+    // assume nothing landed. `message_send` reconciles on `arguments.message`;
+    // the team mutations reconcile with a read (`team list` / `team invites`).
+    let mutating = matches!(surface, Surface::Cli) && mutating_cli_verb(verb);
     post(
         &target.endpoint,
         &format!("{relay}/call"),
@@ -1110,7 +1230,7 @@ fn call_once(
     )
     .map_err(|e| {
         if mutating && e.kind() != "unknown" {
-            Error::unknown(format!("{e} — the send may or may not have been recorded"))
+            Error::unknown(format!("{e} — {}", lost_mutation_note(verb)))
         } else {
             e
         }
@@ -1368,7 +1488,7 @@ enum Verdict {
 ///   and, when proven at that layer, `error.reason` naming a policy outcome;
 /// - a bare `401 unauthorized` without a reason means the bearer did not
 ///   resolve, but the server cannot say whether it expired or was revoked;
-/// - any `5xx` is availability (waking, unavailable, runtime).
+/// - explicit mutation uncertainty is not a safe retry; other 5xx are availability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refusal {
     /// The caller was authenticated and a policy outcome refused the action.
@@ -1380,8 +1500,9 @@ enum Refusal {
     /// A 401 the server did not explain. It is not confirmed expiry or
     /// revocation: diagnose read-only before any login.
     Uncertain,
-    /// Any 5xx: retry later; saved credentials and any pending
-    /// renewal are kept.
+    /// An action may have committed; reconcile it before any repeat.
+    MutationUncertain,
+    /// Other 5xx: retry later; saved credentials and pending renewal are kept.
     Availability,
     /// An answer whose shape we do not recognise. Conservative fallback.
     Unknown,
@@ -1393,6 +1514,7 @@ impl Refusal {
             Self::Authorization => "authorization",
             Self::Authentication => "authentication",
             Self::Uncertain => "uncertain",
+            Self::MutationUncertain => "outcome_unknown",
             Self::Availability => "availability",
             Self::Unknown => "unknown",
         }
@@ -1460,10 +1582,16 @@ fn refusal_correlation(body: Option<&Value>) -> Option<String> {
 /// is returned only when it is a known allowlisted value, never raw server text.
 fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>) {
     let (code, reason) = refusal_fields(body);
+    if matches!(
+        code,
+        Some("mutation_outcome_uncertain" | "invite_email_uncertain")
+    ) {
+        return (Refusal::MutationUncertain, code.map(str::to_owned));
+    }
     let known_reason =
         reason.filter(|r| POLICY_REASONS.contains(r) || ENVELOPE_REASONS.contains(r));
     let category = match status {
-        // Every 5xx is the gateway or runtime being unavailable: retry later.
+        // Explicit post-effect uncertainty was handled above.
         500..=599 => Refusal::Availability,
         // A non-auth refusal keeps its safe code (for example `payload_too_large`
         // or a legacy `too_large`) so the caller sees what was refused. It is not
@@ -1514,6 +1642,11 @@ fn refusal_message(refusal: Refusal, reason: Option<&str>, status: u16) -> Strin
             "the remote did not confirm why it refused the credential ({category}, HTTP {status}{code}); \
              it may or may not be expired — run the read-only diagnosis in docs/REMOTE-AUTH.md \
              before any login. Nothing was retried"
+        ),
+        Refusal::MutationUncertain => format!(
+            "the remote action may already have committed ({category}, HTTP {status}{code}); \
+             inspect `team list` or `team invites` with the same explicit --org before \
+             repeating the mutation. Nothing was retried; saved credentials are kept"
         ),
         Refusal::Availability => format!(
             "the remote is unavailable ({category}, HTTP {status}{code}) — retry later; \
@@ -1590,7 +1723,28 @@ fn refusal_error(status: u16, body: Option<&Value>) -> Error {
     if let Some(correlation) = refusal_correlation(body) {
         text.push_str(&correlation);
     }
-    reject(text)
+    if refusal == Refusal::MutationUncertain {
+        Error::unknown(text)
+    } else {
+        reject(text)
+    }
+}
+
+/// The answer to a mutating verb whose reply was ambiguous: the write may
+/// already have committed, so the outcome is unknown and the caller
+/// reconciles with a read for the same explicit `--org` before repeating
+/// it. It never advises a bare retry, and it never claims the write failed.
+/// `correlation` is the bounded board correlation the refusal may carry.
+fn ambiguous_mutation_error(status: u16, correlation: Option<String>) -> Error {
+    let mut text = format!(
+        "the remote action may already have committed (outcome_unknown, HTTP {status}); \
+         inspect `team list` or `team invites` with the same explicit --org before \
+         repeating the mutation. Nothing was retried; saved credentials are kept"
+    );
+    if let Some(correlation) = correlation {
+        text.push_str(&correlation);
+    }
+    Error::unknown(text)
 }
 
 /// CAD-1568: actionable text for the `cli_message_*` family's typed
@@ -2019,6 +2173,7 @@ fn call_verb_until_retry(
         }
         wiki_transfer_shape(verb, &arguments)?;
     }
+    team_argument_shape(verb, &arguments)?;
     let budget_over = || -> Error {
         Error::busy_coded(
             "waking",
@@ -2113,7 +2268,27 @@ fn call_verb_until_retry(
         let send_outcome_unknown = verb == "message_send"
             && status >= 500
             && body.as_ref().and_then(|b| b["state"].as_str()).is_none();
+        // A team mutation is answered by the Worker itself, in the same D1
+        // batch that records the receipt. A 5xx with no `state` therefore
+        // follows a possible commit: the platform's own explicit
+        // uncertainty codes say so, and a bare one may hide a committed
+        // write behind an unanswerable reply. The board's gate refusal
+        // (`hop: board`) is decided before the verb ran, so it stays a
+        // definite refusal. The platform's explicit uncertainty codes keep
+        // their own decoded message, which names the code.
+        let team_mutation_unknown = team_mutation_verb(verb)
+            && status >= 500
+            && body.as_ref().and_then(|b| b["state"].as_str()).is_none()
+            && !board_gate_refused(body.as_ref())
+            && !matches!(
+                refusal_code.as_deref(),
+                Some("mutation_outcome_uncertain" | "invite_email_uncertain")
+            );
+        let unknown_correlation = refusal_correlation(body.as_ref());
         match classify(status, retry_after, body) {
+            Verdict::Done(Err(_e)) if team_mutation_unknown => {
+                return Err(ambiguous_mutation_error(status, unknown_correlation));
+            }
             Verdict::Done(Err(e)) if send_outcome_unknown => {
                 return Err(Error::unknown(format!(
                     "{e} — the send may or may not have been recorded"
@@ -3859,13 +4034,199 @@ mod tests {
     }
 
     #[test]
-    fn a_transient_503_is_availability_and_keeps_saved_login() {
-        let (refusal, _) = decode_refusal(503, Some(&json!({"state": "wake_failed"})));
-        assert_eq!(refusal, Refusal::Availability);
-        let text = refusal_message(refusal, None, 503);
-        assert!(text.contains("retry later"), "{text}");
-        assert!(text.contains("kept"), "{text}");
-        assert!(!text.contains("cadence login"), "{text}");
+    fn a_team_commit_uncertainty_is_an_unknown_outcome_not_a_refusal() {
+        let answer = classify(
+            503,
+            None,
+            Some(json!({"error": {"code": "mutation_outcome_uncertain"}})),
+        );
+        assert!(matches!(
+            answer,
+            Verdict::Done(Err(Error::OutcomeUnknown(_)))
+        ));
+    }
+
+    /// A relay that answers the authorize mint, then drops the connection
+    /// without answering the call — the response is lost after the request
+    /// was dispatched.
+    fn dropping_worker() -> (TcpListener, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.try_clone().unwrap();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let requests = seen.clone();
+        thread::spawn(move || {
+            loop {
+                let Ok((socket, _)) = server.accept() else {
+                    return;
+                };
+                let (socket, req) = read_request(socket);
+                requests.lock().unwrap().push(json!({
+                    "path": req.path, "body": req.body,
+                }));
+                if req.path == "/__platform/cli/authorize" {
+                    answer(
+                        socket,
+                        "200 OK",
+                        "",
+                        &json!({"version": CLI_VERSION, "envelope": "h.e.1",
+                            "bearer": "wikienv_h.e.1", "expires_at": 0,
+                            "actor": "users/o", "scope": ["cli.read"], "issuer": "i"}),
+                    );
+                    continue;
+                }
+                // The call was dispatched; the answer never comes.
+                drop(socket);
+            }
+        });
+        (listener, seen)
+    }
+
+    /// CAD-1504: a lost response to a team mutation is an unknown outcome,
+    /// not a rejection. The Worker may have committed the write, so the CLI
+    /// must not report it as refused and must not invite a blind retry.
+    #[test]
+    fn a_lost_response_to_a_team_mutation_is_unknown_not_a_refusal() {
+        let (listener, _seen) = dropping_worker();
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        let err = call_verb_in(
+            &target,
+            "team_invite",
+            json!({"email": "new@example.test", "role": "member"})
+                .as_object()
+                .cloned()
+                .unwrap(),
+            10,
+            &dir,
+            |_| {},
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{err}");
+        let text = err.to_string();
+        assert!(text.contains("team list"), "{text}");
+        assert!(!text.contains("retry later"), "{text}");
+    }
+
+    /// A generic 5xx with no worker `state` and no board hop follows a
+    /// possible commit: the platform may have written the membership change
+    /// and then failed to answer. It is an unknown outcome, never an
+    /// availability error that says "retry later".
+    #[test]
+    fn a_bare_5xx_to_a_team_mutation_is_unknown_not_availability() {
+        let body = json!({"ok": false, "error": {"code": "internal_error"}});
+        let (listener, _seen, _server) = fake_worker(vec![(503, "", body)]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        let err = call_verb_in(
+            &target,
+            "team_remove",
+            json!({"user_id": "usr_x"}).as_object().cloned().unwrap(),
+            10,
+            &dir,
+            |_| {},
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{err}");
+        let text = err.to_string();
+        assert!(text.contains("team list"), "{text}");
+        assert!(!text.contains("retry later"), "{text}");
+    }
+
+    /// The board's own gate refusal is decided before the verb ran, so it
+    /// stays a definite refusal — it must not be blurred into "may have
+    /// committed".
+    #[test]
+    fn a_board_gate_refusal_to_a_team_mutation_stays_a_refusal() {
+        let request_id = "12345678-1234-4234-8234-123456789abc";
+        let body = json!({"ok": false, "error": {
+            "code": "runtime_unavailable", "hop": "board", "request_id": request_id,
+            "message": "do-not-print-server-text"}});
+        let (listener, _seen, _server) = fake_worker(vec![(503, "", body)]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        let err = call_verb_in(
+            &target,
+            "team_set_role",
+            json!({"user_id": "usr_x", "role": "member"})
+                .as_object()
+                .cloned()
+                .unwrap(),
+            10,
+            &dir,
+            |_| {},
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "rejected", "{err}");
+        let text = err.to_string();
+        assert!(!text.contains("may already have committed"), "{text}");
+    }
+
+    /// A read-only team verb commits nothing, so a 5xx is plain
+    /// availability — the unknown-outcome treatment is for writes only.
+    #[test]
+    fn a_5xx_to_a_team_read_stays_availability() {
+        let body = json!({"ok": false, "error": {"code": "internal_error"}});
+        let (listener, _seen, _server) = fake_worker(vec![(503, "", body)]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        let err =
+            call_verb_in(&target, "team_list", Map::new(), 10, &dir, |_| {}, |_| {}).unwrap_err();
+        assert_ne!(err.kind(), "unknown", "{err}");
+    }
+
+    /// The platform's own explicit uncertainty code keeps its decoded
+    /// message — it names the code the Worker returned, which is more
+    /// precise than the generic ambiguous-outcome text.
+    #[test]
+    fn an_explicit_uncertainty_code_to_a_team_mutation_keeps_its_code() {
+        let body = json!({"ok": false, "error": {"code": "invite_email_uncertain"}});
+        let (listener, _seen, _server) = fake_worker(vec![(503, "", body)]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        let err = call_verb_in(
+            &target,
+            "team_invite",
+            json!({"email": "new@example.test", "role": "member"})
+                .as_object()
+                .cloned()
+                .unwrap(),
+            10,
+            &dir,
+            |_| {},
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "unknown", "{err}");
+        let text = err.to_string();
+        assert!(text.contains("invite_email_uncertain"), "{text}");
     }
 
     #[test]

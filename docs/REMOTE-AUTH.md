@@ -165,8 +165,9 @@ audience and live bearer before any runtime is resolved or woken; the
 container independently re-verifies the envelope before dispatching the
 verb. `verb` is one of a fixed allowlist — `status`, `agent_list`,
 `agent_show`, `issue_ls`, `issue_show`, `issue_history`, `message_read`,
-`message_inbox`, `issue_new`, `issue_comment`, `issue_set`,
-`project_policy`, `message_send` — and
+`message_inbox`, `team_list`, `team_invites`, `issue_new`, `issue_comment`,
+`issue_set`, `team_invite`, `team_revoke_invite`, `team_set_role`,
+`team_remove`, `project_policy`, `message_send` — and
 `arguments` is a strict per-verb payload. Any
 other command is refused locally and never sent.
 
@@ -200,14 +201,18 @@ The gateway's real refusal shapes (AOS-243):
   server cannot say whether it expired or was revoked.
 - `503` means waking or unavailable. Without JSON, the HTTP status still
   classifies the refusal: `401` is uncertain, `403` is authorization, and any
-  `5xx` is availability. No server reason or correlation is inferred.
+  other `5xx` is availability. No server reason or correlation is inferred.
+- A `503` whose safe `error.code` is `mutation_outcome_uncertain` or
+  `invite_email_uncertain` is the platform stating that a mutation may already
+  have committed. It is its own category, not availability.
 
 | Category | When | Next action |
 | --- | --- | --- |
 | `authorization` | `401` with an allowlisted policy reason (`scope_not_granted`, `grant_narrowed`, `binding_mismatch`); `403` with `insufficient_scope` (container path or scope denial); or any `403` with `forbidden` or no safe code | Not a login problem. Read-only diagnosis (below): check the workspace role and target path. Not retried |
 | `authentication` | A terminal session code: `invalid_token`, `invalid_grant`, `session_expired`, `session_revoked`, `lineage_terminal` | `cadence login` again, once. The only case that names login as the known remedy |
 | `uncertain` | `401` with no reason, `envelope_invalid`, or a non-JSON `401` | Not confirmed expiry or revocation. Run the read-only diagnosis before any login. Not retried |
-| `availability` | any `5xx`, or a renewal that fails transiently | Retry later. Saved credentials and any pending renewal are kept |
+| `outcome_unknown` | `mutation_outcome_uncertain` or `invite_email_uncertain` | The action may have committed. Reconcile with a read (`team list`, `team invites`) for the same explicit `--org`, then decide. Never replay the mutation with a fresh envelope first. Not retried |
+| `availability` | any other `5xx`, or a renewal that fails transiently | Retry later. Saved credentials and any pending renewal are kept |
 | `unknown` | Any other answer. A `400`/`409`/`413`/`422` keeps its safe code, such as `payload_too_large` | Report the status and code. Not retried |
 
 ### Where a write or upload is refused (AOS-243)
@@ -250,9 +255,11 @@ issuer's `invalid_token` (401) and `invalid_grant` (400) ask for a fresh login.
 Any other answer keeps the saved login and the pending operation for a later
 retry, with no consent prompt.
 
-A mutation whose outcome is unknown (a dropped connection after dispatch, or a
-5xx after forward) is never replayed automatically. Reconcile with a read
-(`issue show`, `wiki ls`) before repeating the write.
+A mutation whose outcome is unknown — a dropped connection after dispatch, a
+`5xx` after forward, or the platform's own `mutation_outcome_uncertain` /
+`invite_email_uncertain` — is never replayed automatically. Reconcile with a
+read (`issue show`, `wiki ls`, `team list`, `team invites`) before repeating
+the write.
 
 ### Hosted credential status (CAD-1434)
 
@@ -639,7 +646,9 @@ requires another login:
    diagnostics. `authorization` means check the workspace role and target path
    (a login does not change it); `authentication` names one fresh login as a
    remedy outside this read-only diagnosis; `uncertain` does not prove expiry;
-   `availability` means wait, not replay an uncertain mutation; `unknown` means
+   `outcome_unknown` means the mutation may have committed, so reconcile with a
+   read for the same explicit `--org` before repeating it; `availability` means
+   wait, not replay an uncertain mutation; `unknown` means
    report the safe status and code. Do not blindly repeat login.
 3. Record the captured safe error, org endpoint and client revision
    (`cadence --version`) on the ticket. Keep any already known issuer, gateway

@@ -702,6 +702,15 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: local_agent::LocalAgentAction,
     },
+    /// Administer people on the selected hosted workspace.
+    /// Owner and member can list the directory. Invitations, role
+    /// changes and removal are owner-only and use the hosted CLI call.
+    /// They do not start a daemon. A managed agent cannot borrow a
+    /// saved human login. `--role` is the target role, never the caller.
+    Team {
+        #[command(subcommand)]
+        action: TeamAction,
+    },
     /// One-step issue dispatch: `issue start` (idempotent, owner =
     /// the worker) then exactly one templated kickoff message, a
     /// tracker comment and a `message` ref on the issue. With `--job`
@@ -1676,5 +1685,59 @@ pub(crate) enum Commands {
         /// (`schema issue comment`).
         #[arg(required = true, num_args = 1.., value_name = "COMMAND_PATH")]
         path: Vec<String>,
+    },
+}
+
+/// Workspace role requested for an invite or a role change. This is the
+/// target role only, never the caller's authority.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub(crate) enum TeamRole {
+    Owner,
+    Member,
+}
+
+impl TeamRole {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Member => "member",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub(crate) enum TeamAction {
+    /// List workspace members: subject id, name and role. No email addresses.
+    #[command(alias = "ls")]
+    List,
+    /// List invitations for this workspace. Owner only. No invite tokens.
+    Invites,
+    /// Invite an email address. Owner only. Role defaults to member.
+    Invite {
+        /// Address to invite.
+        email: String,
+        /// Role to grant: `owner` or `member`.
+        #[arg(long, value_enum, default_value = "member")]
+        role: TeamRole,
+    },
+    /// Revoke one invitation by its id. Owner only.
+    #[command(name = "revoke-invite")]
+    RevokeInvite {
+        /// Invitation id returned by `team invites`.
+        invite_id: String,
+    },
+    /// Change one member's role. Owner only. `--role` is required.
+    #[command(name = "set-role")]
+    SetRole {
+        /// Member user id from `team list`.
+        user_id: String,
+        /// New role: `owner` or `member`.
+        #[arg(long, value_enum)]
+        role: TeamRole,
+    },
+    /// Remove one member by user id. Owner only.
+    Remove {
+        /// Member user id from `team list`.
+        user_id: String,
     },
 }

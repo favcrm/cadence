@@ -287,6 +287,29 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         }
         _ => {}
     }
+    // Hosted human team administration. A managed agent is refused before
+    // org resolution, so a saved human login is never loaded. A local org
+    // is a usage error and does not open a daemon. A remote org uses the
+    // existing authorize/call path.
+    if matches!(cli.command, Commands::Team { .. }) {
+        if std::env::var_os("CADENCE_ALIAS").is_some() {
+            return Err(Error::rejected(
+                "a managed agent cannot administer the human team. A saved login is not team authority. Nothing was sent",
+            ));
+        }
+        let tracker = std::env::var_os("CADENCE_PM_DIR")
+            .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
+            .transpose()?;
+        let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
+            org::Resolved::Remote(target) => target,
+            org::Resolved::Local(_) => {
+                return Err(Error::usage(
+                    "team requires a hosted org: pass --org <org> for a logged-in workspace, or switch back from `--org local`. Nothing was sent",
+                ));
+            }
+        };
+        return remote::run(target, cli.command, cli.wake_timeout, cli.state_dir);
+    }
     // CAD-1429: every `web` action is a hosted operation against one pinned
     // remote workspace. Resolve it once here; a local or unselected org
     // refuses before any request is built. It runs before the client-only
@@ -996,6 +1019,9 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         Commands::Attachment { action } => attachment::run(state_dir, action),
         Commands::LocalAgent { .. } => Err(Error::usage(
             "local-agent coordinates a hosted org with this machine. Select that org, or switch back from `--org local`. Nothing was claimed.",
+        )),
+        Commands::Team { .. } => Err(Error::usage(
+            "team requires a hosted org: pass --org <org> for a logged-in workspace, or switch back from `--org local`. Nothing was sent",
         )),
         Commands::Search { .. } | Commands::Schema { .. } => unreachable!(
             "commands and schema return before state resolution"
