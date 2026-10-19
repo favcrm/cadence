@@ -965,8 +965,9 @@ export default function ModelDefaults() {
             {provider?.gate ? <div className="grid2">{field("allow list", <select disabled={frozen} value={draft.scope[model.id] ?? "off"} onChange={(event) => edit((config) => ({ ...config, scope: { ...config.scope, [model.id]: event.target.value as AgentScope } }))}>{SCOPES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>)}</div> : <p className="hint">{provider?.label || "This provider"} has no allow list — its models are always available.</p>}
           </div></section>
           <p className="hint">{users.length ? `Used by ${users.join(", ")}.` : "No profile uses this model yet."}</p>
+          {drawer.idDraft !== undefined && <p className="notice bad" role="alert">{drawer.idDraft.trim() ? `Model '${drawer.idDraft}' already exists.` : "Model needs an id."}</p>}
           <div className="dact">
-            <Button size="sm" variant="primary" disabled={frozen} onClick={() => {
+            <Button size="sm" variant="primary" disabled={frozen || drawer.idDraft !== undefined} onClick={() => {
               const id = model.id.trim();
               if (!id) { setNote("A model needs an id."); return; }
               if (!existing && draft.models.some((item) => item.id === id)) { setNote(`${id} already exists`); return; }
