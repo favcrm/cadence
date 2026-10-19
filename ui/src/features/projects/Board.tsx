@@ -5,6 +5,7 @@ import { boardHeadline, boardScope, boardVisible, issueCounts } from "../../lib/
 import { activeCount, epicProgress, matches, type BoardFilters } from "../../lib/filters";
 import type { ResourceState } from "../../lib/cache";
 import { issuePath } from "../issues/model";
+import { STATUS_CHIP } from "../issues/chips";
 import Link from "../../ui/Link";
 import { agentIsUnassigned, agentMatchesProject, issueIndex } from "../../lib/scope";
 import type { AgentsPayload, Health, IssueCard, Project } from "../../lib/types";
@@ -39,14 +40,6 @@ const AGENT_DOT: Record<string, string> = {
   attention: "bg-fail",
 };
 
-const STATUS_CHIP: Record<string, string> = {
-  backlog: "bg-ink-800 text-ink-400",
-  ready: "bg-ink-800 text-ink-300",
-  doing: "bg-info/10 text-info",
-  review: "bg-warn/10 text-warn",
-  done: "bg-ok/10 text-ok",
-  dropped: "bg-ink-800 text-ink-500",
-};
 
 // The list's default order is attention-first — work in flight, then what
 // could start, then the pile — rather than the kanban's column order.

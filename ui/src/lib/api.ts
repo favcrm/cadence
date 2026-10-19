@@ -347,9 +347,21 @@ function refusedUpload(body: unknown, status: number, statusText: string): { mes
   return { message: fallback, code: topCode };
 }
 
+/** Recorded owner handoff for the current personal assignment, never a Git-author guess. */
+export interface AssignmentContext {
+  kind: "assigned" | "initial_owner";
+  actor: string;
+  at: string;
+  self_assigned: boolean;
+}
+
+export interface MyWorkIssue extends IssueCard {
+  assignment: AssignmentContext | null;
+}
+
 export interface MyWorkPayload {
   owner: string;
-  issues: IssueCard[];
+  issues: MyWorkIssue[];
 }
 
 

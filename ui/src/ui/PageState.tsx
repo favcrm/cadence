@@ -6,6 +6,9 @@ import { IconLock } from "./icons";
  * refusal, an empty workspace — instead of a boxed card among sections.
  * Presentational only: the caller decides when it applies and keeps every
  * gate and fetch. `icon` defaults to the lock; `actions` sits under the copy.
+ * My work supplies Refresh for loading, Warning for unavailable and Checklist
+ * for an empty queue. Keep the default lock for identity/access gates; an empty
+ * personal list is not an access refusal.
  */
 export default function PageState({
   title,

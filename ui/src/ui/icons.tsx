@@ -10,6 +10,7 @@ import {
   ArrowDown01Icon,
   ArrowRight01Icon,
   Cancel01Icon,
+  CheckListIcon,
   CircleArrowUp01Icon,
   ContrastIcon,
   ConnectIcon,
@@ -30,6 +31,7 @@ import {
   Settings02Icon,
   SquareLock01Icon,
   Sun01Icon,
+  Task01Icon,
   Tick02Icon,
   Upload01Icon,
 } from "@hugeicons/core-free-icons";
@@ -63,6 +65,16 @@ function Glyph({
 /** Home — the master chat and the needs-you rail. */
 export const IconHome = ({ size = 15, ...rest }: IconProps = {}) => (
   <Glyph icon={Home01Icon} size={size} {...rest} />
+);
+
+/** My work — issues assigned to the current human. */
+export const IconMyWork = ({ size = 15, ...rest }: IconProps = {}) => (
+  <Glyph icon={Task01Icon} size={size} {...rest} />
+);
+
+/** Empty personal queue — no assigned checks to inspect. */
+export const IconChecklist = ({ size = 15, ...rest }: IconProps = {}) => (
+  <Glyph icon={CheckListIcon} size={size} {...rest} />
 );
 /** Projects — the kanban board. */
 export const IconProjects = ({ size = 15, ...rest }: IconProps = {}) => (

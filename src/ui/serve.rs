@@ -211,15 +211,151 @@ pub(crate) fn static_file(dist: Option<&Path>, path: &str) -> Option<(String, Ve
     None
 }
 
+/// Whether a `q` value carries any positive weight, per the RFC 9110
+/// §12.4.2 grammar: `("0" ["." 0*3DIGIT]) / ("1" ["." 0*3"0"])`. The
+/// `0.` form is positive when a fraction digit is nonzero (`0.` alone
+/// is zero); the `1.` form only when every fraction digit is zero —
+/// including an empty one, `1.` is the full weight. Anything outside
+/// the grammar (non-numeric, NaN/inf, negative, above 1, more than
+/// three fraction digits) is malformed and admits nothing.
+fn qvalue_allowed(raw: &str) -> bool {
+    let (whole, frac) = match raw.split_once('.') {
+        Some((whole, frac)) => (whole, frac),
+        // "1" is the full weight; everything else whole is refused.
+        None => return raw == "1",
+    };
+    if frac.len() > 3 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match whole {
+        "0" => frac.bytes().any(|b| b != b'0'),
+        "1" => frac.bytes().all(|b| b == b'0'),
+        _ => false,
+    }
+}
+
+/// Whether a `;`-separated parameter list's `q` admits the token:
+/// `q=<value>` matches case-insensitively and trims whitespace; a
+/// token with no `q` parameter admits at full weight.
+fn token_allowed(params: &str) -> bool {
+    for param in params.split(';') {
+        let (key, value) = param.split_once('=').unwrap_or((param.trim(), ""));
+        if key.trim().eq_ignore_ascii_case("q") {
+            return qvalue_allowed(value.trim());
+        }
+    }
+    true
+}
+
+/// Whether `Accept-Encoding` allows `want`. An explicit token for `want`
+/// answers with its own q (an explicit `q=0` refuses even when a `*`
+/// offer would count); a positive `*` admits an unlisted coding; no
+/// match at all refuses. `identity` is what the raw file is — a client
+/// can refuse it, and then raw must not be served either.
+pub(crate) fn accepts_encoding(header: Option<&str>, want: &str) -> bool {
+    let Some(header) = header else {
+        return false;
+    };
+    let mut star = false;
+    for part in header.split(',') {
+        let mut it = part.splitn(2, ';');
+        let token = it.next().unwrap_or("").trim();
+        let allowed = it.next().map(token_allowed).unwrap_or(true);
+        if token.eq_ignore_ascii_case(want) {
+            return allowed;
+        }
+        if token == "*" && allowed {
+            star = true;
+        }
+    }
+    star
+}
+
+/// Whether `Accept-Encoding` refuses the raw, identity-coded file. Per
+/// RFC 9110 §12.5.3 a `*;q=0` offer excludes identity too — unless a
+/// more-specific `identity` entry overrides it with its own q (an
+/// explicit `identity;q=0` refuses regardless of `*`, an explicit
+/// positive `identity` allows regardless of `*`; first explicit wins).
+/// A missing header or no matching token allows the raw file. A refused
+/// identity with no acceptable coded answer is a refusal the route
+/// reports (406), never raw bytes against the client's stated rule.
+fn identity_refused(header: Option<&str>) -> bool {
+    let Some(header) = header else {
+        return false;
+    };
+    let mut star_zero = false;
+    for part in header.split(',') {
+        let mut it = part.splitn(2, ';');
+        let token = it.next().unwrap_or("").trim();
+        let allowed = it.next().map(token_allowed).unwrap_or(true);
+        if token.eq_ignore_ascii_case("identity") {
+            return !allowed;
+        }
+        if token == "*" {
+            star_zero = !allowed;
+        }
+    }
+    star_zero
+}
+
+/// The precompressed sibling the build emits (`<file>.br` / `<file>.gz`),
+/// when the client accepts it. Nothing is compressed at request time and
+/// nothing compressed leaves this path: the bytes are the build's own
+/// artifact, and the answer keeps the plain file's name and Content-Type.
+pub(crate) fn encoded_file(
+    dist: Option<&Path>,
+    target: &str,
+    accept_encoding: Option<&str>,
+) -> Option<(String, Vec<u8>, &'static str)> {
+    for (suffix, encoding) in [(".br", "br"), (".gz", "gzip")] {
+        if !accepts_encoding(accept_encoding, encoding) {
+            continue;
+        }
+        if let Some(dist) = dist {
+            // Filesystem mode: the sibling sits beside the file in dist.
+            let compressed = format!("{target}{suffix}");
+            if let Some((_, bytes)) = static_file(Some(dist), &compressed) {
+                return Some((target.to_string(), bytes, encoding));
+            }
+            continue;
+        }
+        #[cfg(feature = "ui")]
+        {
+            // Embedded mode: match the target directly — no path
+            // construction on the request path.
+            let bytes: Option<&[u8]> = match (target, encoding) {
+                ("/assets/index.js", "br") => Some(embedded::JS_BR),
+                ("/assets/index.js", "gzip") => Some(embedded::JS_GZ),
+                ("/assets/index.css", "br") => Some(embedded::CSS_BR),
+                ("/assets/index.css", "gzip") => Some(embedded::CSS_GZ),
+                ("/index.html", "br") => Some(embedded::INDEX_BR),
+                ("/index.html", "gzip") => Some(embedded::INDEX_GZ),
+                _ => None,
+            };
+            if let Some(b) = bytes {
+                return Some((target.to_string(), b.to_vec(), encoding));
+            }
+        }
+        #[allow(unreachable_code)]
+        continue;
+    }
+    None
+}
+
 /// What a non-API GET answers with.
 #[derive(Debug)]
 pub(crate) enum StaticAnswer {
-    /// A file of the build — or the SPA shell (`index.html`) for a client route.
-    File(String, Vec<u8>),
+    /// A file of the build — or the SPA shell (`index.html`) for a client
+    /// route. The `Option<&'static str>` is a `Content-Encoding` name when
+    /// the build's precompressed sibling answers instead of the raw bytes.
+    File(String, Vec<u8>, Option<&'static str>),
     /// A path that names a file the build does not have.
     Missing,
     /// No build to serve at all.
     NoBuild,
+    /// The client refused the only representation the file has
+    /// (`identity;q=0` and no coded sibling it accepts).
+    NotAcceptable,
 }
 
 /// Extensions the build serves as files. A missing one is a 404, never
@@ -246,6 +382,8 @@ pub(crate) fn is_static_ext(ext: &str) -> bool {
             | "map"
             | "json"
             | "webmanifest"
+            | "br"
+            | "gz"
     )
 }
 
@@ -292,24 +430,48 @@ pub(crate) fn prefers_json(accept: Option<&str>) -> bool {
 }
 
 /// A build file when one matches; else the SPA shell for a client route.
-/// `accept` is the request's Accept header. A wiki GET that prefers JSON
-/// stays a 404 so the file API remains `/api/wiki/file`.
+/// `accept` is the request's Accept header and `accept_encoding` its
+/// Accept-Encoding: a precompressed sibling the build emitted answers
+/// only when the client named its coding, else the raw file stands —
+/// unless the client refused identity (`identity;q=0`, or `*;q=0` with
+/// no more-specific identity entry), and then a file with no acceptable
+/// coded answer is a 406, never raw bytes against the client's stated
+/// rule. A wiki GET that prefers JSON stays a 404 so the
+/// file API remains `/api/wiki/file`.
 pub(crate) fn static_answer_for(
     dist: Option<&Path>,
     path: &str,
     accept: Option<&str>,
+    accept_encoding: Option<&str>,
 ) -> StaticAnswer {
     let target = if path == "/" { "/index.html" } else { path };
+    let refuse_raw = identity_refused(accept_encoding);
     if !path.starts_with("/api/") {
+        if let Some((name, bytes, encoding)) = encoded_file(dist, target, accept_encoding) {
+            return StaticAnswer::File(name, bytes, Some(encoding));
+        }
         if let Some((name, bytes)) = static_file(dist, target) {
-            return StaticAnswer::File(name, bytes);
+            return if refuse_raw {
+                StaticAnswer::NotAcceptable
+            } else {
+                StaticAnswer::File(name, bytes, None)
+            };
         }
     }
     if !is_client_route(path) || (is_wiki_path(path) && prefers_json(accept)) {
         return StaticAnswer::Missing;
     }
+    if let Some((name, bytes, encoding)) = encoded_file(dist, "/index.html", accept_encoding) {
+        return StaticAnswer::File(name, bytes, Some(encoding));
+    }
     match static_file(dist, "/index.html") {
-        Some((name, bytes)) => StaticAnswer::File(name, bytes),
+        Some((name, bytes)) => {
+            if refuse_raw {
+                StaticAnswer::NotAcceptable
+            } else {
+                StaticAnswer::File(name, bytes, None)
+            }
+        }
         None => StaticAnswer::NoBuild,
     }
 }
@@ -322,6 +484,13 @@ mod embedded {
     pub const INDEX: &str = include_str!("../../ui/dist/index.html");
     pub const JS: &str = include_str!("../../ui/dist/assets/index.js");
     pub const CSS: &str = include_str!("../../ui/dist/assets/index.css");
+    /// Brotli and gzip siblings the build's precompress step emits beside them.
+    pub const INDEX_BR: &[u8] = include_bytes!("../../ui/dist/index.html.br");
+    pub const INDEX_GZ: &[u8] = include_bytes!("../../ui/dist/index.html.gz");
+    pub const JS_BR: &[u8] = include_bytes!("../../ui/dist/assets/index.js.br");
+    pub const JS_GZ: &[u8] = include_bytes!("../../ui/dist/assets/index.js.gz");
+    pub const CSS_BR: &[u8] = include_bytes!("../../ui/dist/assets/index.css.br");
+    pub const CSS_GZ: &[u8] = include_bytes!("../../ui/dist/assets/index.css.gz");
     pub const FAVICON: &[u8] = include_bytes!("../../ui/dist/favicon.svg");
     pub const ICON: &[u8] = include_bytes!("../../ui/dist/icon.svg");
     pub const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../../ui/dist/apple-touch-icon.png");
@@ -2277,16 +2446,26 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 opts.dist.as_deref(),
                 &path,
                 header_value(&request, "Accept").as_deref(),
+                header_value(&request, "Accept-Encoding").as_deref(),
             ) {
-                StaticAnswer::File(name, bytes) => {
+                StaticAnswer::File(name, bytes, encoding) => {
                     let mut resp = Response::from_data(bytes);
                     resp.add_header(
                         Header::from_bytes("Content-Type", content_type(&name)).unwrap(),
                     );
                     resp.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
+                    // Raw and compressed answers differ on this header,
+                    // so it varies every file answer, not only the coded one.
+                    resp.add_header(Header::from_bytes("Vary", "Accept-Encoding").unwrap());
+                    if let Some(encoding) = encoding {
+                        resp.add_header(Header::from_bytes("Content-Encoding", encoding).unwrap());
+                    }
                     send(request, resp);
                 }
                 StaticAnswer::Missing => send(request, err_response(404, "no such file")),
+                StaticAnswer::NotAcceptable => {
+                    send(request, err_response(406, "no acceptable content encoding"))
+                }
                 StaticAnswer::NoBuild => send(
                     request,
                     err_response(

@@ -846,6 +846,9 @@ pub(super) struct Named {
     pub actor: String,
     /// The `[A-Za-z0-9_-]` comment-author / ack handle.
     pub author: String,
+    /// The assertion's `sub` — the platform's stable person id, the
+    /// only spelling `Activity-Receipt` self-assignment proofs compare.
+    pub sub: String,
     /// `owner`-mapped sessions pass operator-only routes.
     pub operator: bool,
 }
@@ -1673,6 +1676,7 @@ fn held_of(origin: Origin, session: &Value) -> Option<Held> {
                     Held::Named(Named {
                         actor: user.actor(),
                         author: user.handle.clone(),
+                        sub: user.sub.clone(),
                         operator: user.is_operator(),
                     })
                 })
@@ -2617,6 +2621,7 @@ mod tests {
         let named = Caller::Named(Named {
             actor: "Fable Chen <fable@example.com> (board)".into(),
             author: "usr_fable".into(),
+            sub: "sub_fable".into(),
             operator: false,
         });
         assert_eq!(caller_spelling(&named), "users/usr_fable");
@@ -2896,6 +2901,7 @@ mod tests {
             Some(Held::Named(Named {
                 actor: "Fable <f@e.co> (board)".into(),
                 author: "fable".into(),
+                sub: "sub_fable".into(),
                 operator: false,
             }))
         };
@@ -2933,6 +2939,7 @@ mod tests {
             Verdict::Named(Named {
                 actor: "Fable <f@e.co> (board)".into(),
                 author: "fable".into(),
+                sub: "sub_fable".into(),
                 operator: false,
             })
         );
