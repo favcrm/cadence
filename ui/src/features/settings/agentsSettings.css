@@ -18,6 +18,7 @@
 .agents-settings .tabn { display: inline-block; margin-left: 6px; padding: 0 0.3rem; border-radius: 0.2rem; background: var(--color-ink-800); color: var(--color-ink-400); font: var(--text-micro) var(--font-mono); }
 .agents-settings .pane { padding-top: 6px; }
 .agents-settings .card { border: 1px solid var(--color-ink-700); background: var(--color-ink-850); border-radius: 0.5rem; overflow: hidden; }
+.agents-settings .grp { padding: 9px 14px; border-bottom: 1px solid var(--color-ink-700); background: var(--color-ink-875); font: 500 var(--text-micro) var(--font-mono); letter-spacing: 0.07em; text-transform: uppercase; color: var(--color-ink-500); }
 .agents-settings .hrow, .agents-settings .prow { display: grid; gap: 14px; align-items: center; padding: 11px 14px; border-bottom: 1px solid var(--color-ink-800); }
 .agents-settings .hrow { grid-template-columns: minmax(0, 13rem) minmax(0, 1fr) 8rem 6rem; }
 .agents-settings .prow { grid-template-columns: minmax(0, 1fr) 13rem 9rem auto; cursor: pointer; }
@@ -31,6 +32,8 @@
 .agents-settings .hmodels, .agents-settings .hlive, .agents-settings .pmodel, .agents-settings .mid, .agents-settings .meta, .agents-settings .use, .agents-settings .always { font-family: var(--font-mono); }
 .agents-settings .hmodels, .agents-settings .hlive { font-size: var(--text-micro); text-align: right; color: var(--color-ink-400); }
 .agents-settings .pmodel { font-size: var(--text-table); color: var(--color-ink-300); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agents-settings .pfiles { display: flex; gap: 6px; align-items: center; justify-content: flex-start; }
+.agents-settings .pfiles .badge { white-space: nowrap; }
 .agents-settings .pact, .agents-settings .dact, .agents-settings .addrow { display: flex; gap: 8px; align-items: center; }
 .agents-settings .pact { justify-content: flex-end; }
 .agents-settings .addrow { padding: 8px 14px; }
@@ -58,13 +61,22 @@
 .agents-settings .drow:last-child { border-bottom: 0; }
 .agents-settings .drow select { height: 2rem; padding: 0 0.6rem; font: var(--text-table) var(--font-mono); }
 .agents-settings .rlabel { color: var(--color-ink-200); font-size: var(--text-secondary); }
+.agents-settings .drow select.inherit { color: var(--color-ink-400); }
+.agents-settings .drow select.bad { border-color: var(--color-fail); color: var(--color-fail); background: color-mix(in srgb, var(--color-fail) 8%, transparent); }
+.agents-settings .rwhy { display: flex; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end; }
+.agents-settings .rwhy .eff { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: var(--text-table) var(--font-mono); color: var(--color-ink-400); }
+.agents-settings .rhint { grid-column: 1 / -1; margin: 2px 0 0; font: var(--text-micro)/1.5 var(--font-mono); color: var(--color-fail); }
 .agents-settings .pins { margin-top: 12px; }
 .agents-settings .pins summary { cursor: pointer; padding: 10px 14px; font-size: var(--text-secondary); color: var(--color-ink-300); }
 .agents-settings .pins[open] summary { border-bottom: 1px solid var(--color-ink-700); }
-.agents-settings .pinrow { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--color-ink-800); }
+.agents-settings .pinrow { display: grid; grid-template-columns: 12rem 7rem minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--color-ink-800); }
+.agents-settings .pinrow:last-child { border-bottom: 0; }
 .agents-settings .pinrow input { height: 2rem; padding: 0 0.6rem; border: 1px solid var(--color-edge); border-radius: 0.25rem; background: var(--color-ink-900); color: var(--color-ink-100); font-family: var(--font-mono); }
+.agents-settings .pinrow .pkg { color: var(--color-ink-200); }
+.agents-settings .pinrow .ver, .agents-settings .pinrow .path { color: var(--color-ink-500); }
+.agents-settings .pinrow .path { font-family: var(--font-mono); font-size: var(--text-table); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agents-settings .emptyrow { display: flex; align-items: center; gap: 10px; padding: 14px; color: var(--color-ink-400); font-size: var(--text-secondary); }
-.agents-settings .savebar { position: sticky; bottom: 0; z-index: 30; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 16px; padding: 10px 0; border-top: 1px solid var(--color-ink-700); background: color-mix(in srgb, var(--color-ink-900) 92%, transparent); }
+.agents-settings .savebar { position: sticky; bottom: 0; z-index: 30; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 16px; padding: 10px 0; border-top: 1px solid var(--color-ink-700); background: color-mix(in srgb, var(--color-ink-900) 92%, transparent); backdrop-filter: blur(8px); }
 .agents-settings .scrim { position: fixed; inset: 0; z-index: 50; background: var(--color-scrim); }
 .agents-settings .drawer { position: fixed; top: 0; right: 0; bottom: 0; z-index: 60; width: min(32rem, 100%); display: flex; flex-direction: column; border-left: 1px solid var(--color-ink-700); background: var(--color-ink-900); box-shadow: -12px 0 32px rgb(0 0 0 / 0.35); }
 .agents-settings .dhead { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--color-ink-700); }
@@ -90,7 +102,10 @@
 .agents-settings .target:first-child { border-top: 0; }
 .agents-settings .tpath { font: var(--text-micro) var(--font-mono); color: var(--color-ink-300); overflow-wrap: anywhere; }
 .agents-settings .hist { display: grid; gap: 1px; background: var(--color-ink-800); border: 1px solid var(--color-ink-800); border-radius: 0.25rem; overflow: hidden; }
-.agents-settings .hrow2 { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; padding: 7px 10px; background: var(--color-ink-850); }
+.agents-settings .hrow2 { display: grid; grid-template-columns: 5rem minmax(0, 1fr); gap: 10px; padding: 7px 10px; background: var(--color-ink-850); }
+.agents-settings .hrow2 .hv { font: var(--text-micro) var(--font-mono); color: var(--color-ink-100); }
+.agents-settings .hrow2 .hw { font-size: var(--text-micro); color: var(--color-ink-400); }
+.agents-settings .dact .btn-danger { margin-left: auto; }
 .agents-settings .combo { position: relative; }
 .agents-settings .combo .select-pop { position: absolute; left: 0; right: 0; top: calc(100% + 4px); width: auto; max-height: 16rem; z-index: 5; }
 .agents-settings .combo .select-opt { cursor: pointer; }
@@ -107,6 +122,10 @@
   .agents-settings .mrow { grid-template-columns: minmax(0, 1fr) 11rem; row-gap: 4px; }
   .agents-settings .mrow .meta, .agents-settings .mrow .use { display: none; }
   .agents-settings .grid2 { grid-template-columns: minmax(0, 1fr); }
+  .agents-settings .pfiles, .agents-settings .pact { justify-content: flex-start; text-align: left; }
+  .agents-settings .drow .rwhy { justify-content: flex-start; }
+  .agents-settings .pinrow { grid-template-columns: minmax(0, 1fr) auto; }
+  .agents-settings .pinrow .path { grid-column: 1 / -1; }
   .agents-settings .drawer { top: auto; left: 0; width: 100%; height: min(90dvh, 100%); border-left: 0; border-top: 1px solid var(--color-ink-700); }
 }
 @media (max-width: 1000px) {

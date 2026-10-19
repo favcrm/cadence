@@ -31,9 +31,9 @@ const ROLES: Array<[string, string]> = [
 ];
 const SCOPES: Array<[AgentScope, string]> = [
   ["off", "Not allowed"],
-  ["allow", "Allow — master and worker agents"],
-  ["master", "Master agents only"],
-  ["worker", "Worker agents only"],
+  ["allow", "Allow — all roles"],
+  ["master", "Master only"],
+  ["worker", "Worker roles only"],
 ];
 const KINDS: AgentProviderKind[] = ["Pi extension", "native CLI"];
 
@@ -102,6 +102,16 @@ function allowed(config: AgentSettingsConfig, modelId: string): boolean {
   if (!provider?.gate) return true;
   const scope = config.scope[modelId] ?? "off";
   return scope === "allow" || scope === "worker";
+}
+
+/** Mockup "serves" column: which providers a harness can launch on, derived from the draft. */
+function servesOf(config: AgentSettingsConfig, harness: AgentHarness): string {
+  if (harness.id === "pi") {
+    const extensions = config.providers.filter((item) => item.kind === "Pi extension").length;
+    return extensions ? `${extensions} providers` : "—";
+  }
+  const own = config.providers.find((item) => item.id === harness.id && item.kind === "native CLI");
+  return own ? own.label : "—";
 }
 
 function problemsOf(config: AgentSettingsConfig): string[] {
@@ -192,7 +202,7 @@ function ModelIdCombo({
   }, [catalog, value]);
   const exact = (catalog?.models ?? []).find((item) => item.id === value.trim());
   const hint = exact
-    ? `known to ${catalog?.source} · ${catalog ? ago(catalog.fetchedAt) : ""} — pick the row to fill details`
+    ? `known to ${catalog?.source} · ${catalog ? ago(catalog.fetchedAt) : ""}`
     : value.trim()
       ? "not in the catalog — the id and details stay as typed"
       : `type an id, or pick one from ${catalog?.source || "the host catalog"}`;
@@ -397,6 +407,13 @@ export default function ModelDefaults() {
   }, [draft, invalidId, drawer?.kind]);
   const frozen = !saved || readOnly || saving || loading || syncBusy;
 
+  /** Sections that differ from the saved revision — the dirty chip's count. */
+  const changeCount = saved
+    ? (["harnesses", "providers", "models", "profiles", "scope", "roleDefaults", "pins"] as const).filter(
+        (key) => canonicalJson(draft[key]) !== canonicalJson(normalize(saved.config)[key]),
+      ).length + (invalidId !== undefined ? 1 : 0)
+    : 0;
+
   function edit(change: (config: AgentSettingsConfig) => AgentSettingsConfig) {
     setDraft((current) => change(current));
     setSaveError(null);
@@ -427,7 +444,7 @@ export default function ModelDefaults() {
         ...config,
         profiles: [...config.profiles, { id, role: "worker", model: "inherit", job: "" }],
       }));
-      setNote(`${id} created in the draft. Save writes it.`);
+      setNote(`${id} created · Save writes it to the registry`);
       setDrawer({ kind: "profile", id, originId: id });
     }
   }
@@ -448,8 +465,9 @@ export default function ModelDefaults() {
     setSaving(true);
     setSaveError(null);
     try {
-      applySnapshot(await api.saveAgentSettings({ expected_revision: saved.revision, config: draft }));
-      setNote("Saved.");
+      const next = await api.saveAgentSettings({ expected_revision: saved.revision, config: draft });
+      applySnapshot(next);
+      setNote(`saved · revision ${next.revision} · recorded by operator connection`);
     } catch (err) {
       const apiErr = err instanceof ApiError ? err : null;
       if (apiErr?.status === 409) {
@@ -620,7 +638,7 @@ export default function ModelDefaults() {
   function renderHarnesses() {
     return (
       <div>
-        <p className="lead">{t("Launchers. A harness starts an agent; a provider supplies the models. A declaration does not install an adapter.")}</p>
+        <p className="lead">{t("Launchers. A harness starts an agent; a provider supplies the models. Pi launches on the Pi-extension providers — the native CLIs supply their own.")}</p>
         <div className="card">
           {draft.harnesses.map((harness) => {
             const observed = observations.harnesses[harness.id];
@@ -630,7 +648,7 @@ export default function ModelDefaults() {
               <div key={harness.id} className="hrow" role="button" tabIndex={0} aria-label={`Edit harness ${harness.label || harness.id}`} onClick={() => setDrawer({ kind: "harness", id: harness.id })} onKeyDown={(event) => activate(event, () => setDrawer({ kind: "harness", id: harness.id }))}>
                 <div className="hname"><b>{harness.label || harness.id}</b><span>{version}</span></div>
                 <div className="hnote">{harness.note}</div>
-                <div className="hmodels">{harness.cli}</div>
+                <div className="hmodels">{servesOf(draft, harness)}</div>
                 <div className="hlive">{installed}</div>
               </div>
             );
@@ -639,7 +657,7 @@ export default function ModelDefaults() {
             <div className="emptyrow"><span>{t("No harnesses yet.")}</span><Button size="sm" disabled={frozen} onClick={() => openNew("harnesses")}>{t("Add harness")}</Button></div>
           )}
         </div>
-        <p className="hint">{t("Recording is a declaration. Installation and version are read from the host. The adapter name has to already exist in Cadence's registry.")}</p>
+        <p className="hint">{t("Recording is a declaration: the version is read from the host, the endpoint kinds come from Cadence's adapter registry.")}</p>
       </div>
     );
   }
@@ -647,7 +665,7 @@ export default function ModelDefaults() {
   function renderProfiles() {
     return (
       <div>
-        <p className="lead">{t("A profile is a job description and the model it runs on. Sync writes generated files for hand launches. Cadence-managed launches read the saved registry.")}</p>
+        <p className="lead">{t("A profile is a job description and the model it runs on, versioned with the project. Sync writes it into the harness files for launches started by hand.")}</p>
         <div className="card">
           {draft.profiles.map((profile) => {
             const observed = observations.profiles[profile.id];
@@ -659,10 +677,10 @@ export default function ModelDefaults() {
                   <span>{profile.job}</span>
                 </div>
                 <div className="pmodel">{profile.model === "inherit" ? "inherit → role default" : profile.model}</div>
-                <div><span className={`badge ${badge.cls}`}>{badge.text}</span></div>
+                <div className="pfiles"><span className={`badge ${badge.cls}`}>{badge.text}</span></div>
                 <div className="pact">
                   <Button size="sm" disabled={frozen || dirty || syncBusy} title={dirty ? "Save before sync" : undefined} onClick={(event) => { event.stopPropagation(); void sync(profile.id); }}>Sync</Button>
-                  <Button size="sm" disabled={!saved?.config.profiles.length || dirty} title={dirty ? "Save before preview" : undefined} onClick={(event) => { event.stopPropagation(); setDrawer({ kind: "preview", profileId: profile.id, harnessId: saved?.config.harnesses[0]?.id || "" }); }}>Preview</Button>
+                  <Button size="sm" disabled={!saved?.config.profiles.length || dirty} title={dirty ? "Save before preview" : undefined} onClick={(event) => { event.stopPropagation(); setDrawer({ kind: "preview", profileId: profile.id, harnessId: saved?.config.harnesses[0]?.id || "" }); }}>Launch</Button>
                 </div>
               </div>
             );
@@ -671,7 +689,7 @@ export default function ModelDefaults() {
             <div className="emptyrow"><span>{t("No profiles yet.")}</span><Button size="sm" disabled={frozen} onClick={() => openNew("profiles")}>{t("Add profile")}</Button></div>
           )}
         </div>
-        <p className="hint">{t("Edits apply to later sessions. Running agents keep the definition they started with. File sync and preview use the last saved revision.")}</p>
+        <p className="hint">{t("Files exist for hands-on launches only: Cadence-managed launches read the registry, so nothing has to be kept in step. File sync and preview use the last saved revision.")}</p>
       </div>
     );
   }
@@ -680,24 +698,44 @@ export default function ModelDefaults() {
     const roles = ROLES;
     return (
       <div>
-        <p className="lead">{t("Providers first, then the models under each. A Pi extension uses the allow list. Native CLIs do not.")}</p>
+        <p className="lead">{t("Providers first, then the models under each. Toggle a model into the allow list; profiles pick from what is enabled. Native CLIs have no allow list.")}</p>
         <div className="card" style={{ marginBottom: 12 }}>
-          <div className="dtitle">Role defaults</div>
-          {roles.map(([id, label]) => (
-            <div className="drow" key={id}>
-              <span className="rlabel">{label}</span>
-              <select
-                aria-label={`${label} default model`}
-                disabled={frozen}
-                value={draft.roleDefaults[id] ?? ""}
-                onChange={(event) => edit((config) => ({ ...config, roleDefaults: { ...config.roleDefaults, [id]: event.target.value } }))}
-              >
-                <option value="">unset</option>
-                {draft.models.map((model) => <option key={model.id} value={model.id}>{model.id}</option>)}
-              </select>
-              <span className="ref">{draft.roleDefaults[id] ? "explicit default" : "unset"}</span>
-            </div>
-          ))}
+          <div className="grp">{t("Role defaults")}</div>
+          {roles.map(([id, label]) => {
+            const defId = draft.roleDefaults[id] ?? "";
+            const defModel = defId ? draft.models.find((model) => model.id === defId) : undefined;
+            const defProvider = defId ? providerOf(draft, defId) : undefined;
+            const defBad = Boolean(defId) && (!defModel || (defProvider?.gate === true && !allowed(draft, defId)));
+            const eff = !defId
+              ? "unset"
+              : !defModel
+                ? "—"
+                : defProvider?.gate
+                  ? allowed(draft, defId)
+                    ? (draft.scope[defId] ?? "off")
+                    : "not enabled"
+                  : "always available";
+            return (
+              <div className="drow" key={id}>
+                <span className="rlabel">{label}</span>
+                <select
+                  className={defId ? (defBad ? "bad" : "") : "inherit"}
+                  aria-label={`${label} default model`}
+                  disabled={frozen}
+                  value={defId}
+                  onChange={(event) => edit((config) => ({ ...config, roleDefaults: { ...config.roleDefaults, [id]: event.target.value } }))}
+                >
+                  <option value="">unset</option>
+                  {draft.models.map((model) => <option key={model.id} value={model.id}>{model.id}</option>)}
+                  {defId && !defModel && <option value={defId}>{defId}</option>}
+                </select>
+                <span className="rwhy"><span className="eff">{eff}</span></span>
+                {defBad && (
+                  <p className="rhint">{!defModel ? `“${defId}” no longer exists` : `“${defId}” is not enabled for worker agents`}</p>
+                )}
+              </div>
+            );
+          })}
         </div>
         {draft.providers.map((provider) => {
           const models = draft.models.filter((model) => model.provider === provider.id);
@@ -761,11 +799,12 @@ export default function ModelDefaults() {
           <div className="emptyrow"><span>{t("No providers yet.")}</span><Button size="sm" disabled={frozen} onClick={() => openNew("models")}>{t("Add provider")}</Button></div>
         )}
         <details className="card pins">
-          <summary>Pinned Pi extensions — {draft.pins.length} pinned</summary>
+          <summary>{t("Pinned Pi extensions")} — {draft.pins.length} {t("pinned")}</summary>
           {draft.pins.map((pin, index) => (
             <div className="pinrow" key={`${pin.pkg}-${index}`}>
-              <input aria-label="Package" disabled={frozen} value={pin.pkg} onChange={(event) => edit((config) => ({ ...config, pins: config.pins.map((item, itemIndex) => itemIndex === index ? { ...item, pkg: event.target.value } : item) }))} />
-              <input aria-label="Pinned version" disabled={frozen} value={pin.pinned} onChange={(event) => edit((config) => ({ ...config, pins: config.pins.map((item, itemIndex) => itemIndex === index ? { ...item, pinned: event.target.value } : item) }))} />
+              <input className="pkg" aria-label="Package" disabled={frozen} value={pin.pkg} onChange={(event) => edit((config) => ({ ...config, pins: config.pins.map((item, itemIndex) => itemIndex === index ? { ...item, pkg: event.target.value } : item) }))} />
+              <input className="ver" aria-label="Pinned version" disabled={frozen} value={pin.pinned} onChange={(event) => edit((config) => ({ ...config, pins: config.pins.map((item, itemIndex) => itemIndex === index ? { ...item, pinned: event.target.value } : item) }))} />
+              <span className="path">{pin.pkg ? `~/.pi/agent/npm/node_modules/${pin.pkg}` : "install path under the operator's Pi directory"}</span>
               <Button size="sm" variant="danger" disabled={frozen} onClick={() => edit((config) => ({ ...config, pins: config.pins.filter((_, itemIndex) => itemIndex !== index) }))}>Remove</Button>
             </div>
           ))}
@@ -800,21 +839,23 @@ export default function ModelDefaults() {
           <section className="dsec"><div className="dtitle">Identity</div><div className="dinn">
             <div className="grid2">
               {field("label", <input disabled={frozen} value={harness.label} onChange={(event) => set({ label: event.target.value })} />)}
-              {field("adapter", <input disabled={frozen} value={harness.cli} onChange={(event) => set({ cli: event.target.value })} />, "Registered adapter name. This does not install or authorize an arbitrary executable.")}
+              {field("CLI", <input disabled={frozen} value={harness.cli} onChange={(event) => set({ cli: event.target.value })} />)}
             </div>
-            {!existing && field("id", <input disabled={frozen} value={harness.id} placeholder="pi" onChange={(event) => set({ id: event.target.value })} />)}
             <div className="vrow"><span>on this host</span><span className={`badge ${observed?.installed ? "b-ok" : "plain"}`}>{observed?.installed === true ? `installed · ${observed.live} live` : observed?.installed === false ? "not installed" : "unknown"}{observed?.version ? ` · ${observed.version}` : ""}</span></div>
-            <p className="hint">Read from the host, not set here.</p>
+            <p className="hint">Read from the host, not set here — a declared harness that is not installed fences on launch.</p>
           </div></section>
-          {field("note", <textarea disabled={frozen} value={harness.note} onChange={(event) => set({ note: event.target.value })} />)}
+          <section className="dsec"><div className="dinn">
+            {field("note", <textarea disabled={frozen} value={harness.note} onChange={(event) => set({ note: event.target.value })} />)}
+          </div></section>
+          <p className="hint">The endpoint kinds and launch parameters come from Cadence's adapter registry — a provider that is not there needs its adapter before this harness can use it.</p>
           <div className="dact">
-            {!existing && <Button size="sm" variant="primary" disabled={frozen} onClick={() => {
-              const id = slug(harness.id || harness.label);
-              if (!id) { setNote("A harness needs an id."); return; }
+            <Button size="sm" variant="primary" disabled={frozen} onClick={() => {
+              if (existing) { closeDrawer(); return; }
+              const id = slug(harness.id || harness.label) || `harness-${draft.harnesses.length + 1}`;
               edit((config) => ({ ...config, harnesses: [...config.harnesses, { ...harness, id }] }));
               setNote(`${harness.label || id} added to the draft.`);
               closeDrawer();
-            }}>Add harness</Button>}
+            }}>{existing ? "Save harness" : "Add harness"}</Button>
             {existing && <Button size="sm" variant="danger" disabled={frozen} onClick={() => removeHarness(existing.id)}>Remove</Button>}
           </div>
         </>
@@ -837,24 +878,23 @@ export default function ModelDefaults() {
               {field("label", <input disabled={frozen} value={provider.label} onChange={(event) => set({ label: event.target.value })} />)}
               {field("kind", <select disabled={frozen} value={provider.kind} onChange={(event) => set({ kind: event.target.value as AgentProviderKind })}>{KINDS.map((kind) => <option key={kind}>{kind}</option>)}</select>)}
             </div>
-            {!existing && field("id", <input disabled={frozen} value={provider.id} onChange={(event) => set({ id: event.target.value })} />)}
-            {field("pin", <input disabled={frozen} value={provider.pin} placeholder="package version" onChange={(event) => set({ pin: event.target.value })} />, "Supported package pin. Saving does not install it.")}
+            {field("pin (extension package@version, or CLI version)", <input disabled={frozen} value={provider.pin} placeholder="pi-opencode-go 1.3.0" onChange={(event) => set({ pin: event.target.value })} />)}
             <div className="grid2">
               <label className="check"><input type="checkbox" disabled={frozen || provider.kind !== "Pi extension"} checked={provider.gate} onChange={(event) => set({ gate: event.target.checked })} /><span>gated by the allow list</span></label>
-              <label className="check"><input type="checkbox" disabled={frozen} checked={provider.paid} onChange={(event) => set({ paid: event.target.checked })} /><span>paid</span></label>
+              <label className="check"><input type="checkbox" disabled={frozen} checked={provider.paid} onChange={(event) => set({ paid: event.target.checked })} /><span>paid (excluded for workers by default)</span></label>
             </div>
             {field("note", <textarea disabled={frozen} value={provider.note} onChange={(event) => set({ note: event.target.value })} />)}
           </div></section>
-          <p className="hint">A Pi extension is what the Pi launcher loads. A native CLI is served by its own harness and is not on the Pi allow list.</p>
+          <p className="hint">A Pi extension provider is what the pi launcher loads with -e; a native CLI provider is served by the harness itself.</p>
           <div className="dact">
-            {!existing && <Button size="sm" variant="primary" disabled={frozen} onClick={() => {
-              const id = slug(provider.id || provider.label);
-              if (!id) { setNote("A provider needs an id."); return; }
+            <Button size="sm" variant="primary" disabled={frozen} onClick={() => {
+              if (existing) { closeDrawer(); return; }
+              const id = slug(provider.id || provider.label) || `provider-${draft.providers.length + 1}`;
               const next = { ...provider, id, gate: provider.kind === "native CLI" ? false : provider.gate };
               edit((config) => ({ ...config, providers: [...config.providers, next] }));
-              setNote(`${next.label || id} added. Add its models next.`);
+              setNote(`${next.label || id} added · add its models next`);
               closeDrawer();
-            }}>Add provider</Button>}
+            }}>{existing ? "Save provider" : "Add provider"}</Button>
             {existing && <Button size="sm" variant="danger" disabled={frozen} onClick={() => removeProvider(existing.id)}>Remove</Button>}
           </div>
         </>
@@ -918,22 +958,25 @@ export default function ModelDefaults() {
               {field("thinking", <div>{fact(model.thinking)}</div>)}
               {field("images", <div>{fact(model.images)}</div>)}
             </div>
-            {provider?.gate ? field("allow list", <select disabled={frozen} value={draft.scope[model.id] ?? "off"} onChange={(event) => edit((config) => ({ ...config, scope: { ...config.scope, [model.id]: event.target.value as AgentScope } }))}>{SCOPES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>) : <p className="hint">{provider?.label || "This provider"} has no allow list — its models are always available.</p>}
+            {provider?.gate ? <div className="grid2">{field("allow list", <select disabled={frozen} value={draft.scope[model.id] ?? "off"} onChange={(event) => edit((config) => ({ ...config, scope: { ...config.scope, [model.id]: event.target.value as AgentScope } }))}>{SCOPES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>)}</div> : <p className="hint">{provider?.label || "This provider"} has no allow list — its models are always available.</p>}
           </div></section>
           <p className="hint">{users.length ? `Used by ${users.join(", ")}.` : "No profile uses this model yet."}</p>
           <div className="dact">
-            {!existing && <Button size="sm" variant="primary" disabled={frozen} onClick={() => {
+            <Button size="sm" variant="primary" disabled={frozen} onClick={() => {
               const id = model.id.trim();
               if (!id) { setNote("A model needs an id."); return; }
-              if (draft.models.some((item) => item.id === id)) { setNote(`${id} already exists`); return; }
-              edit((config) => ({
-                ...config,
-                models: [...config.models, { ...model, id }],
-                scope: provider?.gate ? { ...config.scope, [id]: config.scope[id] ?? "off" } : config.scope,
-              }));
-              setNote(`${id} added to the draft${provider?.gate ? " as not allowed" : ""}.`);
+              if (!existing && draft.models.some((item) => item.id === id)) { setNote(`${id} already exists`); return; }
+              if (!id.includes("/")) setNote(`note: “${id}” has no provider prefix`);
+              if (!existing) {
+                edit((config) => ({
+                  ...config,
+                  models: [...config.models, { ...model, id }],
+                  scope: provider?.gate ? { ...config.scope, [id]: config.scope[id] ?? "off" } : config.scope,
+                }));
+                setNote(`${id} added to the draft${provider?.gate ? " as not allowed" : ""}.`);
+              }
               closeDrawer();
-            }}>Add model</Button>}
+            }}>{existing ? "Save model" : "Add model"}</Button>
             {existing && <Button size="sm" variant="danger" disabled={frozen} onClick={() => removeModel(existing.id)}>Remove</Button>}
           </div>
         </>
@@ -963,7 +1006,7 @@ export default function ModelDefaults() {
                 }} />)}
                 {field("role", <select disabled={frozen} value={profile.role} onChange={(event) => edit((config) => ({ ...config, profiles: config.profiles.map((item) => item.id === profile.id ? { ...item, role: event.target.value } : item) }))}>{ROLES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>, "The role names the job. It does not grant runtime authority.")}
               </div>
-              {field("job description", <textarea disabled={frozen} value={profile.job} onChange={(event) => edit((config) => ({ ...config, profiles: config.profiles.map((item) => item.id === profile.id ? { ...item, job: event.target.value } : item) }))} />, "The instruction at the next launch, and the body of generated files after save.")}
+              {field("job description", <textarea disabled={frozen} value={profile.job} onChange={(event) => edit((config) => ({ ...config, profiles: config.profiles.map((item) => item.id === profile.id ? { ...item, job: event.target.value } : item) }))} />, "The agent's instruction at launch, and the body of the generated files.")}
             </div></section>
             <section className="dsec"><div className="dtitle">Model</div><div className="dinn">
               {field("model", <select disabled={frozen} value={profile.model} onChange={(event) => edit((config) => ({ ...config, profiles: config.profiles.map((item) => item.id === profile.id ? { ...item, model: event.target.value } : item) }))}>
@@ -971,27 +1014,27 @@ export default function ModelDefaults() {
                 {draft.providers.map((provider) => {
                   const rows = draft.models.filter((model) => model.provider === provider.id);
                   if (!rows.length) return null;
-                  return <optgroup key={provider.id} label={provider.label}>{rows.map((model) => <option key={model.id} value={model.id}>{model.id}{allowed(draft, model.id) ? "" : " — not enabled"}</option>)}</optgroup>;
+                  return <optgroup key={provider.id} label={provider.label}>{rows.map((model) => <option key={model.id} value={model.id}>{model.id}{model.ctx ? ` · ${model.ctx}` : ""}{allowed(draft, model.id) ? "" : "  — not enabled"}</option>)}</optgroup>;
                 })}
               </select>)}
               <div className={`verdict${blocked ? " bad" : ""}`}>
                 <div className="vmodel">{resolved || "unresolved"}</div>
                 <div className="vrow"><span>model from</span><b>{profile.model === "inherit" ? "role default" : "this profile"}</b></div>
                 <div className="vrow"><span>provider</span><b>{providerOf(draft, resolved)?.label || "—"}</b></div>
-                <div className="vrow"><span>allow list</span><b>{providerOf(draft, resolved)?.gate ? (allowed(draft, resolved) ? `yes · ${draft.scope[resolved] ?? "off"}` : "not enabled for worker agents") : "n/a"}</b></div>
-                {blocked && <p className="verr">“{profile.model}” is not enabled for worker agents. A PM profile still uses the worker allow list.</p>}
+                <div className="vrow"><span>allow list</span><b>{providerOf(draft, resolved)?.gate ? (allowed(draft, resolved) ? `yes · ${draft.scope[resolved] ?? "off"}` : "not enabled") : "n/a"}</b></div>
+                {blocked ? <p className="verr">“{profile.model}” is not enabled for worker roles — enable it in Providers &amp; models</p> : <span className="badge b-ok">launches</span>}
               </div>
             </div></section>
             <section className="dsec"><div className="dtitle">Files</div><div className="dinn">
               {(observed?.files ?? []).map((file) => (
-                <div className="target" key={file.path}><span className="tpath">{file.path}</span><span className={`badge ${file.status === "in sync" ? "b-ok" : file.status === "needs sync" || file.status === "unmanaged" ? "b-warn" : "plain"}`}>{file.status}</span></div>
+                <div className="target" key={file.path}><span className="tpath">{file.path}{observed?.version ? ` — cadence:profile ${profile.id}@${observed.version}` : ""}</span><span className={`badge ${file.status === "in sync" ? "b-ok" : file.status === "needs sync" || file.status === "unmanaged" ? "b-warn" : "plain"}`}>{file.status}</span></div>
               ))}
               {!observed?.files?.length && <p className="hint">No generated-file status for this profile yet. Save, then sync, to write managed files.</p>}
             </div></section>
             <section className="dsec"><div className="dtitle">History{observed?.version ? ` · v${observed.version}` : ""}</div><div className="dinn">
               <div className="hist">
                 {(observed?.history ?? []).map((item, index) => (
-                  <div className="hrow2" key={`${item.at}-${index}`}><span>{item.at}</span><span>{item.what}</span></div>
+                  <div className="hrow2" key={`${item.at}-${index}`}><span className="hv">{item.at}</span><span className="hw">{item.what}</span></div>
                 ))}
               </div>
               {!observed?.history?.length && <p className="hint">No history recorded for this profile.</p>}
@@ -1008,13 +1051,13 @@ export default function ModelDefaults() {
     } else {
       const savedConfig = normalize(saved?.config);
       kicker = "preview";
-      title = "Saved launch resolution";
+      title = "What this launch does";
       body = (
         <>
           {dirty && <p className="notice">Preview uses the saved revision. Save or discard the draft first.</p>}
           <div className="grid2">
-            {field("run on harness", <select disabled={!saved || dirty} value={drawer.harnessId} onChange={(event) => setDrawer({ ...drawer, harnessId: event.target.value })}>{(dirty ? draft : savedConfig).harnesses.map((item) => <option key={item.id} value={item.id}>{item.label || item.id}</option>)}</select>)}
-            {field("profile", <select disabled={!saved || dirty} value={drawer.profileId} onChange={(event) => setDrawer({ ...drawer, profileId: event.target.value })}>{(dirty ? draft : savedConfig).profiles.map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}</select>)}
+            {field("run on harness", <select disabled={!saved || dirty} value={drawer.harnessId} onChange={(event) => setDrawer({ ...drawer, harnessId: event.target.value })}>{(dirty ? draft : savedConfig).harnesses.map((item) => { const installed = observations.harnesses[item.id]?.installed; return <option key={item.id} value={item.id}>{item.label || item.id}{installed === true ? " · installed" : installed === false ? " · not installed" : ""}</option>; })}</select>)}
+            {field("profile", <select disabled={!saved || dirty} value={drawer.profileId} onChange={(event) => setDrawer({ ...drawer, profileId: event.target.value })}>{(dirty ? draft : savedConfig).profiles.map((item) => <option key={item.id} value={item.id}>{item.id}{observations.profiles[item.id]?.version ? ` · ${observations.profiles[item.id].version}` : ""}</option>)}</select>)}
           </div>
           {previewLoading && <p className="hint">Resolving the saved profile…</p>}
           {previewError && <p className="notice bad" role="alert">{previewError}</p>}
@@ -1022,15 +1065,15 @@ export default function ModelDefaults() {
             <>
               <pre className="launchline">{preview.command || "No command. This combination is not launched."}</pre>
               <div className={`verdict${preview.allowed ? "" : " bad"}`}>
-                <div className="vmodel">{preview.model || "none"}</div>
-                <div className="vrow"><span>source</span><b>{preview.source || "—"}</b></div>
-                <div className="vrow"><span>profile revision</span><b>{preview.profile_revision || "—"}</b></div>
-                <div className="vrow"><span>permission</span><b>{preview.allowed ? "allowed" : "not allowed"}</b></div>
-                {!!preview.reasons?.length && <p className="verr">{preview.reasons.join("\n")}</p>}
+                <div className="vmodel">{preview.model || "unresolved"}</div>
+                <div className="vrow"><span>model from</span><b>{preview.source || "—"}</b></div>
+                <div className="vrow"><span>provider</span><b>{providerOf(savedConfig, preview.model || "")?.label || "—"}</b></div>
+                <div className="vrow"><span>profile</span><b>{preview.profile_revision ? `v${preview.profile_revision}` : "—"}</b></div>
+                {preview.allowed ? <span className="badge b-ok">would launch</span> : <p className="verr">{(preview.reasons ?? []).join("\n") || "not allowed"}</p>}
               </div>
             </>
           )}
-          <p className="hint">Preview does not start an agent. It resolves the saved profile, harness, model and permission.</p>
+          <p className="hint">Cadence-managed launches need no files: the registry is read at launch. Preview does not start an agent; it resolves the saved profile, harness, model and permission.</p>
         </>
       );
     }
@@ -1062,7 +1105,7 @@ export default function ModelDefaults() {
           <Button disabled={!saved?.config.profiles.length || dirty} title={dirty ? "Save before preview" : undefined} onClick={() => { if (!saved?.config.profiles.length) return; setDrawer({ kind: "preview", profileId: saved.config.profiles[0]?.id || "", harnessId: saved.config.harnesses[0]?.id || "" }); }}>Preview a launch…</Button>
         </div>
       </div>
-      <p className="notice quiet">{t("Harnesses, providers, models and profiles on this page are saved together. Catalog rows are observations, not permission to launch.")}</p>
+      <p className="notice quiet">{t("One registry, versioned with the project. Everything here is created and managed on this page: harnesses, model providers, their models, and the profiles that use them. Catalog rows are observations, not permission to launch.")}</p>
       {readOnly && <p className="notice" role="status">{saved?.read_only || gate === READ_ONLY_REASON ? t("This board is read-only. You can inspect agent settings here.") : t("Sign in using the top bar to edit agent settings.")}</p>}
       {loading && !saved && <p role="status">{t("Loading agent settings…")}</p>}
       {loadError && (
@@ -1095,10 +1138,10 @@ export default function ModelDefaults() {
           )}
           {saveError && !conflict && <p className="notice bad" role="alert">{saveError}</p>}
           <div className="savebar">
-            <span className={`badge ${issues.length ? "b-fail" : dirty ? "b-warn" : "plain"}`}>{issues.length ? `${issues.length} problem${issues.length > 1 ? "s" : ""}` : dirty ? "unsaved changes" : "no changes"}</span>
-            <span className="ref">{readOnly ? "read-only" : `revision ${saved.revision}`}</span>
+            <span className={`badge ${issues.length ? "b-fail" : dirty ? "b-warn" : "plain"}`}>{issues.length ? `${issues.length} problem${issues.length > 1 ? "s" : ""}` : changeCount ? `${changeCount} change${changeCount > 1 ? "s" : ""}` : "no changes"}</span>
+            <span className="ref">{readOnly ? "read-only: saving needs an operator session" : `revision ${saved.revision}`}</span>
             <span className="ref" style={{ marginLeft: "auto" }}>{note}</span>
-            <Button size="sm" disabled={!dirty || saving} onClick={() => { if (saved) { setDraft(normalize(saved.config)); setSaveError(null); setConflict(false); setNote("Draft reset to the last saved revision."); closeDrawer(); } }}>Discard</Button>
+            <Button size="sm" disabled={!dirty || saving} onClick={() => { if (saved) { setDraft(normalize(saved.config)); setSaveError(null); setConflict(false); closeDrawer(); } }}>Discard</Button>
             <Button size="sm" variant="primary" disabled={!dirty || !!issues.length || frozen || conflict} loading={saving} onClick={() => void save()}>Save</Button>
           </div>
         </>
