@@ -343,6 +343,34 @@ CREATE INDEX IF NOT EXISTS app_recordings_recent ON app_recordings(context_id,js
         read_job(&self.conn(), context, id, key)
     }
 
+    /// Jobs this boot may reclaim under their OWN key: persisted by an
+    /// earlier boot and still unfinished. A job of this boot is never
+    /// returned, so an in-flight paid operation is not restarted.
+    pub fn recording_stranded_jobs(
+        &self,
+        context: &str,
+        id: &str,
+        boot: &str,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare("SELECT body FROM app_recording_jobs WHERE context_id=? AND recording_id=?")?;
+        let rows = statement
+            .query_map(params![context, id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        drop(statement);
+        let mut keys = Vec::new();
+        for body in rows {
+            let job: Job = decode(&body)?;
+            if matches!(job.state.as_str(), "queued" | "preparing" | "dispatched")
+                && job.boot != boot
+            {
+                keys.push(job.key);
+            }
+        }
+        Ok(keys)
+    }
+
     pub fn recording_audio(&self, context: &str, id: &str, sequence: u32) -> Result<(String, u32)> {
         self.conn().query_row("SELECT audio,frames FROM app_recording_segments WHERE context_id=? AND recording_id=? AND sequence=?",params![context,id,sequence], |row| Ok((row.get(0)?,row.get(1)?))).map_err(Into::into)
     }

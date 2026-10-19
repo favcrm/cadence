@@ -33,6 +33,12 @@ export function useRecordingSession(base: RecordingBase, consent: RecordingConse
   const retryKey = useRef<string | null>(null);
   const creation = useRef<Parameters<typeof recordingClient.create>[1] | null>(null);
   const captureFailure = useRef(false);
+  const draftTitle = useRef<string | null>(null);
+  const savedTitle = useRef<string | null>(null);
+  const pendingTitle = useRef<{ requestId: string; title: string | null } | null>(null);
+  const titleSaving = useRef<Promise<void> | null>(null);
+  const hasTitleChanges = useCallback(() => creation.current !== null && (pendingTitle.current !== null || draftTitle.current !== savedTitle.current), []);
+  const editTitle = useCallback((title: string) => { draftTitle.current = title.trim() || null; }, []);
   const patch = useCallback((next: Partial<SessionState>) => { if (live.current) setState((old) => ({ ...old, ...next })); }, []);
   const stopCapture = useCallback(async () => {
     if (stopping.current) return stopping.current;
@@ -49,6 +55,35 @@ export function useRecordingSession(base: RecordingBase, consent: RecordingConse
     patch({ phase: "error", error: error instanceof Error ? error.message : "The recording needs attention. Saved transcript remains available." });
     void stopCapture().catch((stopError: unknown) => patch({ error: stopError instanceof Error ? stopError.message : "The last audio block could not be confirmed." }));
   }, [patch, stopCapture]);
+
+  const persistTitle = useCallback((): Promise<void> => {
+    if (titleSaving.current) return titleSaving.current;
+    const run = (async () => {
+      while (!discarding.current && recordingId.current && hasTitleChanges()) {
+        const write = pendingTitle.current ??= { requestId: crypto.randomUUID(), title: draftTitle.current };
+        const response = await recordingClient.rename(base, recordingId.current, write.requestId, write.title);
+        if (discarding.current) return;
+        if (!response.ok) {
+          // Known rejected edits can be corrected. Unknown outcomes keep their
+          // original key before a newer title is allowed to overtake them.
+          if (response.status >= 400 && response.status < 500 && response.status !== 408) pendingTitle.current = null;
+          throw new Error(response.error.text);
+        }
+        savedTitle.current = write.title;
+        pendingTitle.current = null;
+        if (live.current) setState((old) => ({ ...old, detail: {
+          ...response.value.recording,
+          segments: old.detail?.segments ?? response.value.recording.segments,
+        } }));
+      }
+    })();
+    titleSaving.current = run.finally(() => { titleSaving.current = null; });
+    return titleSaving.current;
+  }, [base, hasTitleChanges]);
+  const saveTitle = useCallback(async () => {
+    try { await persistTitle(); }
+    catch (error) { if (!discarding.current) fail(error); }
+  }, [fail, persistTitle]);
 
   const drain = useCallback((): Promise<void> => {
     if (draining.current) return draining.current;
@@ -87,7 +122,7 @@ export function useRecordingSession(base: RecordingBase, consent: RecordingConse
   useEffect(() => {
     live.current = true;
     const beforeUnload = (event: BeforeUnloadEvent) => {
-      if (capture.current || stopping.current || queue.current.length) { event.preventDefault(); event.returnValue = ""; }
+      if (capture.current || stopping.current || queue.current.length || hasTitleChanges()) { event.preventDefault(); event.returnValue = ""; }
     };
     window.addEventListener("beforeunload", beforeUnload);
     return () => {
@@ -95,22 +130,25 @@ export function useRecordingSession(base: RecordingBase, consent: RecordingConse
       window.removeEventListener("beforeunload", beforeUnload);
       // Stop the microphone, then persist already-authorized pending audio;
       // leaving never finalizes minutes or leaves background capture running.
-      void stopCapture().then(drain).catch(() => { /* The server remains unfinished, never falsely complete. */ });
+      void stopCapture().then(() => Promise.all([persistTitle(), drain()])).catch(() => { /* The server remains unfinished, never falsely complete. */ });
     };
-  }, [drain, stopCapture]);
+  }, [drain, hasTitleChanges, persistTitle, stopCapture]);
 
   const create = useCallback(async () => {
     if (!creation.current) throw new Error("No recording was requested.");
     const response = await recordingClient.create(base, creation.current);
     if (!response.ok) throw new Error(response.error.text);
     recordingId.current = response.value.recording.id;
+    savedTitle.current = response.value.recording.title;
     patch({ recordingId: recordingId.current, detail: response.value.recording });
-  }, [base, patch]);
+    await persistTitle();
+  }, [base, patch, persistTitle]);
 
   const start = useCallback(async (title: string, participants: string) => {
     if (busy.current || creation.current || !consent) return;
     busy.current = true;
     patch({ phase: "starting", error: null });
+    draftTitle.current = title.trim() || null;
     try {
       captureFailure.current = false;
       const owner = await startCapture(timeline.current, {
@@ -160,13 +198,14 @@ export function useRecordingSession(base: RecordingBase, consent: RecordingConse
   const finish = useCallback(async () => {
     if (discarding.current) return;
     if (!recordingId.current) throw new Error("The meeting has not been saved yet. Retry the request first.");
+    await persistTitle();
     await drain();
     if (discarding.current) return;
     const response = await recordingClient.finish(base, recordingId.current, { request_id: finishKey, last_sequence: timeline.current.sequence - 1 });
     if (!response.ok) throw new Error(response.error.text);
     patch({ detail: response.value.recording });
     await poll();
-  }, [base, drain, finishKey, patch, poll]);
+  }, [base, drain, finishKey, patch, persistTitle, poll]);
 
   const stopAndWrite = useCallback(async () => {
     if (busy.current) return;
@@ -207,6 +246,7 @@ export function useRecordingSession(base: RecordingBase, consent: RecordingConse
       if (discarding.current) return;
       if (!recordingId.current) await create();
       if (discarding.current) return;
+      await persistTitle();
       retryKey.current ??= crypto.randomUUID();
       const response = await recordingClient.retry(base, recordingId.current!, retryKey.current);
       if (!response.ok) throw new Error(response.error.text);
@@ -214,24 +254,27 @@ export function useRecordingSession(base: RecordingBase, consent: RecordingConse
       await finish();
     } catch (error) { fail(error); }
     finally { busy.current = false; }
-  }, [base, create, fail, finish, patch, stopCapture]);
+  }, [base, create, fail, finish, patch, persistTitle, stopCapture]);
 
   const leave = useCallback(async (): Promise<boolean> => {
-    if (busy.current) return !capture.current && !stopping.current && queue.current.length === 0;
+    if (busy.current) return !capture.current && !stopping.current && queue.current.length === 0 && !hasTitleChanges();
     busy.current = true;
     patch({ phase: "saving", error: null });
     try {
       await stopCapture();
+      await persistTitle();
       await drain();
       if (queue.current.length) throw new Error("This audio has not been saved. Retry the recording or explicitly discard the unsaved audio before leaving.");
       return true;
     }
     catch (error) { fail(error); return false; }
     finally { busy.current = false; }
-  }, [drain, fail, patch, stopCapture]);
+  }, [drain, fail, hasTitleChanges, patch, persistTitle, stopCapture]);
   const discard = useCallback(async () => {
     discarding.current = true;
     queue.current = [];
+    pendingTitle.current = null;
+    draftTitle.current = savedTitle.current;
     await stopCapture().catch(() => {});
     patch({ pendingSegments: 0 });
   }, [patch, stopCapture]);
@@ -242,23 +285,23 @@ export function useRecordingSession(base: RecordingBase, consent: RecordingConse
       if (discarding.current) return true;
       const next = new URL(href, here);
       if (next.pathname === here.pathname && next.searchParams.get("ctx") === here.searchParams.get("ctx")) return true;
-      if (!capture.current && !stopping.current && queue.current.length === 0) return true;
+      if (!capture.current && !stopping.current && queue.current.length === 0 && !hasTitleChanges()) return true;
       if (leavePrompt.current) return false;
       leavePrompt.current = true;
       // Flush the worklet before a dialog can block delivery of its final audio.
       void stopCapture().then(() => {
         if (!live.current || discarding.current) return;
         setState((old) => ({ ...old, phase: old.error ? "error" : "paused", level: 0 }));
-        if (window.confirm("Leave and discard audio not yet saved? Submitted work may finish; confirmed transcript is kept. Cancel keeps the recording paused here.")) {
+        if (window.confirm("Leave and discard unsaved recording changes? Submitted work may finish; saved transcript and title are kept. Cancel keeps the recording paused here.")) {
           discarding.current = true;
           queue.current = [];
           navigate(href);
         } else if (!captureFailure.current) {
-          void drain().catch(fail);
+          void Promise.all([persistTitle(), drain()]).catch(fail);
         }
       }).catch(fail).finally(() => { leavePrompt.current = false; });
       return false;
     });
-  }, [drain, fail, patch, stopCapture]);
-  return { state, start, pause, resume, stopAndWrite, retry, leave, discard, canStart: creation.current === null, canRetry: creation.current !== null };
+  }, [drain, fail, hasTitleChanges, persistTitle, stopCapture]);
+  return { state, start, pause, resume, stopAndWrite, retry, leave, discard, editTitle, saveTitle, canStart: creation.current === null, canRetry: creation.current !== null };
 }

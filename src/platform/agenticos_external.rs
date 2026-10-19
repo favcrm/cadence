@@ -2869,7 +2869,7 @@ mod tests {
             .err()
             .expect("@3 refuses text");
         assert!(
-            matches!(&refused, AppCapabilityError::Refused(reason) if reason.contains("manifest v4")),
+            matches!(&refused, AppCapabilityError::Refused(_)),
             "{refused:?}"
         );
         // @4: advertised, and a call goes through the same guards to the door

@@ -444,13 +444,14 @@ impl Shared {
                         "invalid_request: transcript pagination exceeds its bound",
                     ));
                 }
-                self.recording_reply(
-                    install,
-                    context,
-                    required_str(params, "recording_id")?,
-                    after,
-                    limit,
-                )
+                let id = required_str(params, "recording_id")?;
+                let reply = self.recording_reply(install, context, id, after, limit)?;
+                // Reopening a saved meeting continues work a stopped daemon
+                // left unfinished, under the SAME job keys. The worker
+                // rechecks the authority before it spends anything, so this
+                // never starts a replacement paid operation.
+                self.resume_interrupted_recording(install, context, id);
+                Ok(reply)
             }
             "app_recording_segment" => {
                 let upload: Upload<'_> = body(params)?;
@@ -558,6 +559,37 @@ impl Shared {
             self.spawn_recording_job(install, context, id, &key);
         }
         Ok(())
+    }
+
+    /// Continue recording work a stopped daemon left unfinished. Every
+    /// persisted job of an EARLIER boot is re-claimed under its own key, so
+    /// the paid operation is the same one, never a replacement. A record
+    /// whose final minutes job was never created is scheduled here too.
+    fn resume_interrupted_recording(self: &Arc<Self>, install: &str, context: &str, id: &str) {
+        let records = match open(self, install) {
+            Ok(records) => records,
+            Err(_) => return,
+        };
+        let record = match records.recording_get(context, id) {
+            Ok(record) => record,
+            Err(_) => return,
+        };
+        if record.summary.state == "ready" {
+            return;
+        }
+        if record.error.as_ref().is_some_and(|error| !error.retryable) {
+            return;
+        }
+        let stranded = match records.recording_stranded_jobs(context, id, boot()) {
+            Ok(stranded) => stranded,
+            Err(_) => return,
+        };
+        for key in stranded {
+            self.spawn_recording_job(install, context, id, &key);
+        }
+        if record.final_job.is_none() && record.finish_sequence.is_some() {
+            let _ = self.schedule_recording_minutes(install, context, id);
+        }
     }
 
     fn spawn_recording_job(self: &Arc<Self>, install: &str, context: &str, id: &str, key: &str) {

@@ -109,8 +109,23 @@ fn paid_unpublished_audio_retains_receipt_and_source_across_reopen_without_retry
     let id = "rec-retained";
     let records = RecordStore::open(root.path(), install).unwrap();
     records.recording_schema().unwrap();
+    let mut initial = recording(id);
+    initial.summary.title = None;
+    initial.summary.title_owner = None;
     records
-        .recording_create(context, "create-regression", "create-digest", recording(id))
+        .recording_create(context, "create-regression", "create-digest", initial)
+        .unwrap();
+    let started = records.recording_get(context, id).unwrap();
+    assert_eq!(started.summary.state, "recording");
+    assert!(started.summary.title.is_none());
+    assert!(started.summary.title_owner.is_none());
+    records
+        .recording_rename(
+            context,
+            id,
+            "rename-during-recording",
+            Some("Operator-owned title".into()),
+        )
         .unwrap();
 
     let data_bytes = 128_000_u32 * 2;
