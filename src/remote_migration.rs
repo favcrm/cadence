@@ -23,13 +23,18 @@
 //! - POST `{base}/:operationId/commit` — `{requestId}`; 202 is pending, never
 //!   completion.
 //! - GET `{base}/:operationId` — durable status receipt.
+//! - GET `{base}/:operationId/inputs` — read-only input reconciliation: the
+//!   registered manifest and completed pack indices, bound to the sealed plan.
 //! - POST `{base}/:operationId/rollback` — `{requestId,
 //!   expectedDestinationDigest, expectedGeneration,
 //!   consent:"confirm-rollback-retained-root"}`.
 //!
-//! A lost answer to a mutation is outcome-unknown, never retried: the caller
-//! reconciles through the operation id (`--status`) or replays the identical
-//! request under the same `--request-id` after checking status first.
+//! A lost answer to a mutation is outcome-unknown, never retried. An upload
+//! resumes only through GET `{base}/:operationId/inputs`: a registered manifest
+//! or pack that is durably complete is skipped, untouched spans upload, and an
+//! unknown or unrecognized effect stops the operation for `--status` recovery.
+//! The caller otherwise reconciles through the operation id or replays the
+//! identical request under the same `--request-id` after checking status first.
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -339,26 +344,51 @@ fn transfer(
         return Ok(status);
     }
 
-    // The manifest bytes are pinned to the bound digest again immediately
-    // before send: a swapped manifest after verification is refused here.
-    if sha256_hex(&package.manifest_bytes) != package.manifest_sha256 {
-        return Err(Error::rejected("package manifest changed during transfer"));
-    }
-    let data = call(
+    let plan = plan_input_packs(&package)?;
+    // Reconcile before any admission. A registered manifest or pack is never
+    // re-sent: untouched pending spans upload, durably completed spans are
+    // skipped, and an unknown or unrecognized effect stops with no mutation.
+    let inputs = call(
         dir,
         target,
-        "remote migration manifest",
-        "POST",
-        &operation_path(&operation_id, "/manifest")?,
-        MigrationBody::Bytes(package.manifest_bytes.as_slice()),
-        MigrationTimeout::Manifest,
+        "remote migration input reconciliation",
+        "GET",
+        &operation_path(&operation_id, "/inputs")?,
+        MigrationBody::None,
+        MigrationTimeout::Json,
     )
     .map_err(reconcile)?;
-    let plan = plan_input_packs(&package)?;
-    let descriptor =
-        manifest_data(&data, target, &operation_id, &package, &plan).map_err(reconcile)?;
+    let (descriptor, completed_packs) =
+        match inputs_data(&inputs, target, &operation_id, &package, &plan).map_err(reconcile)? {
+            InputProgress::Unregistered => (
+                upload_manifest(dir, target, &operation_id, &package, &plan).map_err(reconcile)?,
+                Vec::new(),
+            ),
+            InputProgress::Ready {
+                descriptor,
+                manifest_completed,
+                completed_packs,
+            } => {
+                if !manifest_completed {
+                    upload_manifest(dir, target, &operation_id, &package, &plan)
+                        .map_err(reconcile)?;
+                }
+                (descriptor, completed_packs)
+            }
+        };
+    if !completed_packs.is_empty() {
+        note(&format!(
+            "remote migration: {} of {} pack(s) already durably verified; skipping them",
+            completed_packs.len(),
+            plan.packs.len()
+        ));
+    }
 
-    for pack in &plan.packs {
+    for pack in plan
+        .packs
+        .iter()
+        .filter(|pack| completed_packs.binary_search(&pack.index).is_err())
+    {
         note(&format!(
             "remote migration: sending pack {} of {} ({} bytes)",
             pack.index + 1,
@@ -504,6 +534,142 @@ fn manifest_data(
         ));
     }
     Ok(descriptor)
+}
+
+/// Input reconciliation receipt. `Unregistered` means nothing was admitted;
+/// `Ready` means every registered effect is either durably completed (listed
+/// in `completed_packs`) or untouched and uploadable. Anything else stops.
+enum InputProgress {
+    Unregistered,
+    Ready {
+        descriptor: String,
+        manifest_completed: bool,
+        completed_packs: Vec<usize>,
+    },
+}
+
+/// GET `/:operationId/inputs`: the exact server catalog, bound to this
+/// workspace, operation, package digest and deterministic local plan. Pack
+/// indices must be in range, sorted and unique; the descriptor must equal
+/// the seal recomputed locally from the plan.
+fn inputs_data(
+    data: &Value,
+    target: &RemoteTarget,
+    operation_id: &str,
+    package: &VerifiedPackage,
+    plan: &PackPlan<'_>,
+) -> Result<InputProgress> {
+    let object = strict_data(
+        data,
+        &[
+            "format",
+            "workspace",
+            "operationId",
+            "state",
+            "manifestSha256",
+            "descriptorSha256",
+            "packCount",
+            "manifestCompleted",
+            "completedPacks",
+        ],
+    )?;
+    if object["format"].as_str() != Some("cadence.portable-migration-inputs/1")
+        || object["workspace"].as_str() != Some(target.org_id.as_str())
+    {
+        return Err(receipt_error("inputs"));
+    }
+    if object["operationId"].as_str() != Some(operation_id)
+        || object["manifestSha256"].as_str() != Some(package.manifest_sha256.as_str())
+    {
+        return Err(receipt_error("inputs"));
+    }
+    let pack_count = object["packCount"]
+        .as_u64()
+        .ok_or_else(|| receipt_error("inputs"))?;
+    let manifest_completed = object["manifestCompleted"]
+        .as_bool()
+        .ok_or_else(|| receipt_error("inputs"))?;
+    let completed_packs = object["completedPacks"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .map(|v| v.as_u64().and_then(|n| usize::try_from(n).ok()))
+                .collect::<Option<Vec<usize>>>()
+        })
+        .ok_or_else(|| receipt_error("inputs"))?;
+    match object["state"].as_str() {
+        Some("unknown") => Err(input_unknown_error(operation_id)),
+        Some("unregistered") => {
+            if !object["descriptorSha256"].is_null()
+                || pack_count != 0
+                || manifest_completed
+                || !completed_packs.is_empty()
+            {
+                return Err(receipt_error("inputs"));
+            }
+            Ok(InputProgress::Unregistered)
+        }
+        Some("ready") => {
+            let descriptor = object["descriptorSha256"]
+                .as_str()
+                .filter(|v| sha256_shape(v))
+                .ok_or_else(|| receipt_error("inputs"))?;
+            if pack_count != plan.packs.len() as u64
+                || (!manifest_completed && !completed_packs.is_empty())
+                || !completed_packs.windows(2).all(|pair| pair[0] < pair[1])
+                || completed_packs.iter().any(|&i| i as u64 >= pack_count)
+            {
+                return Err(receipt_error("inputs"));
+            }
+            if descriptor != seal_descriptor(target, operation_id, plan) {
+                return Err(Error::rejected(
+                    "remote migration: the server's input seal does not match this package's plan — aborting, nothing retried",
+                ));
+            }
+            Ok(InputProgress::Ready {
+                descriptor: descriptor.to_owned(),
+                manifest_completed,
+                completed_packs,
+            })
+        }
+        _ => Err(receipt_error("inputs")),
+    }
+}
+
+/// Admit the pinned manifest bytes once. The receipt must re-seal the planned
+/// inventory; the returned descriptor is that seal.
+fn upload_manifest(
+    dir: &Path,
+    target: &RemoteTarget,
+    operation_id: &str,
+    package: &VerifiedPackage,
+    plan: &PackPlan<'_>,
+) -> Result<String> {
+    // The manifest bytes are pinned to the bound digest again immediately
+    // before send: a swapped manifest after verification is refused here.
+    if sha256_hex(&package.manifest_bytes) != package.manifest_sha256 {
+        return Err(Error::rejected("package manifest changed during transfer"));
+    }
+    let data = call(
+        dir,
+        target,
+        "remote migration manifest",
+        "POST",
+        &operation_path(operation_id, "/manifest")?,
+        MigrationBody::Bytes(package.manifest_bytes.as_slice()),
+        MigrationTimeout::Manifest,
+    )?;
+    manifest_data(&data, target, operation_id, package, plan)
+}
+
+/// Uncertain input state: an earlier effect may be admitted or unrecognized.
+/// Nothing is re-admitted or re-sent; the operation must be reconciled first.
+fn input_unknown_error(operation_id: &str) -> Error {
+    Error::unknown(format!(
+        "remote migration upload cannot safely continue for operation {operation_id}: \
+         an earlier input effect is unknown or unrecognized; nothing was re-sent — \
+         reconcile with restore --portable --status {operation_id}"
+    ))
 }
 
 /// Pack receipt: exact index, byte count, seal and per-member `(ordinal,

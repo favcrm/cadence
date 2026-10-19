@@ -1510,8 +1510,8 @@ fn migration_headers<S>(
 
 /// The only paths a portable-migration request may name. Includes read-only
 /// `/by-request/<requestId>` reconciliation after a lost begin response.
-/// Per-operation paths admit manifest, input-packs, commit, rollback and
-/// status only. Query, fragment, encoded separators and traversal refuse.
+/// Per-operation paths admit manifest, input-packs, inputs (read-only), commit,
+/// rollback and status only. Query, fragment, encoded separators and traversal refuse.
 fn portable_migration_path(path: &str) -> bool {
     const BASE: &str = "/v1/hosted-cadence/portable-migrations";
     if !path.starts_with(BASE)
@@ -1539,7 +1539,7 @@ fn portable_migration_path(path: &str) -> bool {
                     return false;
                 }
                 match suffix {
-                    "manifest" | "commit" | "rollback" => true,
+                    "manifest" | "commit" | "rollback" | "inputs" => true,
                     _ => suffix
                         .strip_prefix("input-packs/")
                         .is_some_and(valid_pack_index),

@@ -514,9 +514,15 @@ and activation are unchanged.
 The remote destination digest binds workspace/root/generation/lease facts;
 it is not a checksum of destination file bytes. Retained-root byte verification
 is separate. Uploads use the sealed packed-v1 member inventory and are checked
-against the local manifest; the client sends each step at most once.
-After an uncertain answer, reconcile status rather than inventing a new id
-or blindly repeating an upload.
+against the local manifest; the client sends each step at most once. Before any
+manifest or pack upload, the
+client reads `GET /:operationId/inputs` and skips only the manifest and packs
+the server reports as durably completed. Untouched pending spans upload under
+the same operation and request id. An unknown or unrecognized input effect
+stops the upload with no re-send; recover with `--status <operation-id>`
+(or `--status request:<stable-id>`), never by inventing a new id or repeating
+an upload. Packages above 32,768 logical data members are refused; the
+manifest's own inventory entry is the 32,769th.
 
 Imports, replacements and rollbacks remain execution-disabled. A replacement
 does not manufacture native activation receipts, enable imported actors or

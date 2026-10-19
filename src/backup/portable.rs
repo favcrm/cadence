@@ -1163,7 +1163,7 @@ pub fn verify_transfer_package(source: &Path) -> Result<VerifiedPackage> {
             "package manifest exceeds the transfer limit",
         ));
     }
-    if inspected.manifest.members.len() >= TRANSFER_MEMBERS_MAX {
+    if inspected.manifest.members.len() > TRANSFER_MEMBERS_MAX {
         return Err(Error::rejected(
             "package member count exceeds the transfer limit",
         ));
@@ -1175,8 +1175,8 @@ pub fn verify_transfer_package(source: &Path) -> Result<VerifiedPackage> {
 /// package outside them before any byte is sent; the server stays the
 /// enforcement of record.
 pub const TRANSFER_MANIFEST_MAX: usize = 4 * 1024 * 1024;
-/// Sealed input inventory members cap (32,768); `manifest.json` itself is one
-/// of them, so the manifest may list at most this minus one.
+/// Logical data members cap (32,768). The sealed inventory adds `manifest.json`
+/// as one separate entry (32,769 total), which is not counted here.
 pub const TRANSFER_MEMBERS_MAX: usize = 32768;
 
 fn inspect_package(source: &Path) -> Result<VerifiedPackage> {
