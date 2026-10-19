@@ -668,7 +668,7 @@ fn role_resolution(
     pi: Option<&crate::pi_policy::PiPolicy>,
     role: &str,
     claim: &str,
-) -> Value {
+) -> Result<Value> {
     let mut rows = serde_json::Map::new();
     // The launch providers a claim or an inherit can land on: the pi
     // policy when a Pi extension provider exists, plus every native
@@ -676,18 +676,11 @@ fn role_resolution(
     let wants_pi = has_pi_provider(config)
         || !claim.is_empty() && launch_provider_of(config, claim).as_deref() == Some("pi");
     if wants_pi {
-        // pi defaults are runtime-role shaped: every team role runs as
-        // a worker unless it is the master.
-        let fallback = pi.and_then(|p| {
-            if role == "master" {
-                p.models.default.master.clone()
-            } else {
-                p.models.default.worker.clone()
-            }
-        });
+        // Pi defaults are runtime-role shaped; the final resolver also
+        // supplies the platform fallback when no policy default is set.
         rows.insert(
             "pi".to_string(),
-            provider_role_row(defaults, "pi", role, fallback),
+            provider_role_row(defaults, "pi", role, pi)?,
         );
     }
     for provider in crate::adapter::registry::model_provider_ids() {
@@ -696,28 +689,26 @@ fn role_resolution(
         }
         rows.insert(
             provider.to_string(),
-            provider_role_row(defaults, provider, role, None),
+            provider_role_row(defaults, provider, role, None)?,
         );
     }
-    json!({
+    Ok(json!({
         "requested": claim,
         "providers": Value::Object(rows),
-    })
+    }))
 }
 
 /// The selector state for one (provider, role), in launch order: the
 /// role's own selector wins, else the provider baseline - the same
 /// precedence `inherit` applies at launch. A concrete model there is the
-/// answer. A provider_default selector (explicit or absent) yields no
-/// team model, so the stored pi policy's runtime-role worker/master
-/// default (never pm.yaml on disk) applies, exactly as the Pi launch
-/// falls back to it when no model resolves.
+/// answer. With no concrete team model, Pi uses its stored runtime-role
+/// default, then the existing final resolver's platform fallback.
 fn provider_role_row(
     defaults: &crate::model_defaults::ModelDefaults,
     provider: &str,
     role: &str,
-    pi_fallback: Option<String>,
-) -> Value {
+    pi: Option<&crate::pi_policy::PiPolicy>,
+) -> Result<Value> {
     let team = defaults.providers.get(provider).map(|entry| {
         if let Some(selector) = entry.roles.get(role) {
             (selector, crate::model_defaults::SOURCE_ROLE_DEFAULT)
@@ -730,18 +721,38 @@ fn provider_role_row(
     });
     match team {
         Some((crate::model_defaults::ModelSelector::Model { model }, source)) => {
-            json!({"model": model, "source": source})
+            Ok(json!({"model": model, "source": source}))
         }
-        _ => match pi_fallback {
-            Some(pi_model) => json!({
-                "model": pi_model,
-                "source": crate::model_defaults::SOURCE_PI_POLICY_DEFAULT,
-            }),
-            None => json!({
-                "model": Value::Null,
-                "source": crate::model_defaults::SOURCE_PROVIDER_DEFAULT,
-            }),
-        },
+        _ if provider == "pi" => {
+            let runtime_role = if role == "master" { "master" } else { "worker" };
+            let configured = pi.and_then(|policy| {
+                if runtime_role == "master" {
+                    policy.models.default.master.as_deref()
+                } else {
+                    policy.models.default.worker.as_deref()
+                }
+            });
+            if let Some(model) = configured {
+                return Ok(json!({
+                    "model": model,
+                    "source": crate::model_defaults::SOURCE_PI_POLICY_DEFAULT,
+                }));
+            }
+            let (model, platform) =
+                crate::pi_policy::resolve_model_with_source(pi, runtime_role, None)?;
+            Ok(json!({
+                "model": model,
+                "source": if platform {
+                    crate::model_defaults::SOURCE_PLATFORM_DEFAULT
+                } else {
+                    crate::model_defaults::SOURCE_PI_POLICY_DEFAULT
+                },
+            }))
+        }
+        _ => Ok(json!({
+            "model": Value::Null,
+            "source": crate::model_defaults::SOURCE_PROVIDER_DEFAULT,
+        })),
     }
 }
 
@@ -1748,7 +1759,7 @@ impl Shared {
             let claim = requested.get(*role).and_then(Value::as_str).unwrap_or("");
             effective.insert(
                 (*role).to_string(),
-                role_resolution(&config, defaults, pi.as_ref(), role, claim),
+                role_resolution(&config, defaults, pi.as_ref(), role, claim)?,
             );
         }
         Ok(json!({
