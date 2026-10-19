@@ -1662,6 +1662,107 @@ fn with_retired(mut snapshot: Value, sources: Vec<Value>) -> Value {
     snapshot
 }
 
+/// One registered agent reduced to the fields the launch gate reads.
+struct FleetRow<'a> {
+    alias: &'a str,
+    provider: &'a str,
+    model: Option<&'a str>,
+}
+
+/// CAD-1624: evaluate every registered agent against the stored Pi policy —
+/// the same launch check ([`pi_policy::require_allowed`]) — so a policy edit
+/// can be inspected before it strands the fleet.
+///
+/// Read-only: nothing is launched, mutated or written. An agent on an endpoint
+/// that does not consume the Pi policy (a native CLI provider) is counted as
+/// `not_gated`, never as a refusal.
+pub fn fleet_check(policy: Option<&PiPolicy>, agents: &[Agent]) -> Value {
+    let rows: Vec<FleetRow> = agents
+        .iter()
+        .map(|agent| FleetRow {
+            alias: &agent.alias,
+            provider: &agent.provider,
+            // The launch reads `params.model`; the agent's `model` column is
+            // the registration-time label, used only when params carry none.
+            model: agent
+                .params
+                .as_ref()
+                .and_then(|params| params.get("model"))
+                .and_then(Value::as_str)
+                .or(agent.model.as_deref()),
+        })
+        .collect();
+    fleet_verdicts(policy, &rows)
+}
+
+fn fleet_verdicts(policy: Option<&PiPolicy>, rows: &[FleetRow]) -> Value {
+    let gated = |provider: &str| {
+        registry::SPECS.iter().any(|spec| {
+            !spec.internal
+                && spec.provider == provider
+                && spec.capabilities.contains(&"managed_pi_rpc")
+        })
+    };
+    let mut refused = Vec::new();
+    let mut checked = 0usize;
+    let mut not_gated = 0usize;
+    for row in rows {
+        if !gated(row.provider) {
+            not_gated += 1;
+            continue;
+        }
+        checked += 1;
+        // `PiModels::allow_for` treats every non-master role as worker.
+        let role = if row.alias == "master" {
+            "master"
+        } else {
+            "worker"
+        };
+        let (model, refusal) = match row.model {
+            Some(model) => (
+                Some(model),
+                pi_policy::require_allowed(policy, role, model).err(),
+            ),
+            // No explicit model: the launch resolves the role default, so
+            // that default is what the fleet check must judge.
+            None => {
+                let resolved = policy.and_then(|p| p.models.default.for_role(role));
+                (
+                    resolved,
+                    match resolved {
+                        Some(model) => pi_policy::require_allowed(policy, role, model).err(),
+                        None => Some(Error::rejected(format!(
+                            "pi {role} has no model and no role default — the launch refuses"
+                        ))),
+                    },
+                )
+            }
+        };
+        if let Some(err) = refusal {
+            refused.push(json!({
+                "alias": row.alias,
+                "provider": row.provider,
+                "model": model,
+                "role": role,
+                "reason": err.to_string(),
+            }));
+        }
+    }
+    json!({
+        "checked": checked,
+        "launchable": checked.saturating_sub(refused.len()),
+        "refused": refused,
+        "not_gated": not_gated,
+        "policy": policy.map(|p| json!({
+            "providers": p.providers,
+            "allow": p.models.allow,
+            "master_allow": p.models.master_allow,
+            "worker_allow": p.models.worker_allow,
+            "default": {"master": p.models.default.master, "worker": p.models.default.worker},
+        })).unwrap_or(Value::Null),
+    })
+}
+
 fn parse_agent(slug: &str, text: &str) -> Result<Profile> {
     let Some(rest) = text.strip_prefix("---\n") else {
         return Ok(Profile {
@@ -2433,4 +2534,68 @@ fn normalize_pin(pin: &str) -> Result<String> {
         "invalid_config",
         format!("provider pin '{pin}' must be name@version or 'name version'"),
     ))
+}
+
+#[cfg(test)]
+mod fleet_check_tests {
+    use super::*;
+    use crate::pi_policy::{PiModels, PiPolicy};
+
+    fn row<'a>(alias: &'a str, provider: &'a str, model: Option<&'a str>) -> FleetRow<'a> {
+        FleetRow {
+            alias,
+            provider,
+            model,
+        }
+    }
+
+    fn policy() -> PiPolicy {
+        PiPolicy {
+            providers: vec!["pi-devin@0.2.1".to_string()],
+            models: PiModels {
+                allow: vec!["devin/swe-2-high".to_string()],
+                master_allow: Some(vec!["openrouter/z-ai/glm-5.3-flash".to_string()]),
+                worker_allow: Some(vec!["devin/swe-2-high".to_string()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// CAD-1624: the check must name exactly the agents a launch would refuse,
+    /// judging the role the launch uses (master vs worker) — not the
+    /// registration label — and it must skip endpoints that do not consume
+    /// the Pi policy.
+    #[test]
+    fn fleet_check_names_the_agents_the_policy_refuses() {
+        let rows = vec![
+            row("dev-a", "pi", Some("devin/swe-2-high")),
+            row("dev-b", "pi", Some("openrouter/z-ai/glm-5.3-flash")),
+            row("master", "pi", Some("openrouter/z-ai/glm-5.3-flash")),
+            row("codex-a", "codex", Some("openai-codex/gpt-6.1-sol")),
+        ];
+        let report = fleet_verdicts(Some(&policy()), &rows);
+        assert_eq!(report["checked"], 3);
+        assert_eq!(report["not_gated"], 1);
+        assert_eq!(report["launchable"], 2);
+        let refused = report["refused"].as_array().expect("refused rows");
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0]["alias"], "dev-b");
+        assert_eq!(refused[0]["role"], "worker");
+        assert!(refused[0]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("allowlist"));
+    }
+
+    /// An absent policy allows nothing; the check must report that instead of
+    /// a healthy fleet.
+    #[test]
+    fn an_absent_policy_refuses_every_gated_agent() {
+        let rows = vec![row("dev-a", "pi", Some("devin/swe-2-high"))];
+        let report = fleet_verdicts(None, &rows);
+        assert_eq!(report["launchable"], 0);
+        assert_eq!(report["refused"].as_array().map(|rows| rows.len()), Some(1));
+        assert_eq!(report["policy"], Value::Null);
+    }
 }

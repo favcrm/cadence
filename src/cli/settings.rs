@@ -44,6 +44,11 @@ pub(crate) enum AgentsAction {
     /// The full authoritative document: revision, config, observations,
     /// catalogs and history. Machine-readable JSON.
     Show,
+    /// Every registered gated agent evaluated against this authority — who
+    /// would be refused at launch and why, with the effective policy. Read
+    /// only: nothing is launched, mutated or written. Use it before saving a
+    /// policy edit, so a change cannot silently strand the fleet.
+    Fleet,
     /// Replace the whole document atomically from a JSON file (`--file
     /// -` or a pipe reads stdin). The file is the same `config` object
     /// `show` prints — harnesses/providers/models/profiles/scope/
@@ -685,6 +690,7 @@ fn request(
     };
     let mut planned = match action {
         AgentsAction::Show => params("snapshot", None, Map::new())?,
+        AgentsAction::Fleet => params("fleet.check", None, Map::new())?,
         AgentsAction::Apply {
             file,
             mutation,

@@ -71,6 +71,7 @@ pub(super) const READ_OPS: &[&str] = &[
     "profile.show",
     "pin.list",
     "profile.preview",
+    "fleet.check",
 ];
 
 /// Mutating, revision-bound operations (CAS on expected_revision).
@@ -955,6 +956,14 @@ impl Shared {
             }
             // ---- reads ----
             "snapshot" => self.rpc_agent_settings_get(),
+            // CAD-1624: read-only visibility into the launch gate — every
+            // registered agent evaluated against the stored Pi policy, so a
+            // policy edit is inspectable before it strands the fleet.
+            "fleet.check" => {
+                let policy = self.stored_pi_policy()?;
+                let agents = self.store.agents()?;
+                Ok(crate::agent_settings::fleet_check(policy.as_ref(), &agents))
+            }
             "history" => {
                 let snapshot = self.rpc_agent_settings_get()?;
                 Ok(json!({
