@@ -1226,6 +1226,7 @@ mod tests {
             "grant.list",
             "history",
             "profile.preview",
+            "fleet.check",
         ] {
             assert_eq!(
                 cadence_agent::remote_cli::settings_op_scope(op),

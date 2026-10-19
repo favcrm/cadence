@@ -239,9 +239,8 @@ pub fn settings_op_scope(operation: &str) -> &'static str {
     match operation {
         "snapshot" | "history" | "master.status" | "harness.list" | "harness.show"
         | "provider.list" | "provider.show" | "model.list" | "model.show" | "role.list"
-        | "profile.list" | "profile.show" | "profile.preview" | "pin.list" | "grant.list" => {
-            "settings.read"
-        }
+        | "profile.list" | "profile.show" | "profile.preview" | "pin.list" | "grant.list"
+        | "fleet.check" => "settings.read",
         // master.resume is write explicitly — it starts a process;
         // every other non-read fails closed the same way.
         "master.resume" => "settings.write",

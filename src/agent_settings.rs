@@ -1682,14 +1682,13 @@ pub fn fleet_check(policy: Option<&PiPolicy>, agents: &[Agent]) -> Value {
         .map(|agent| FleetRow {
             alias: &agent.alias,
             provider: &agent.provider,
-            // The launch reads `params.model`; the agent's `model` column is
-            // the registration-time label, used only when params carry none.
+            // The launch reads `params.model` only: the registration-time
+            // `model` column is a label, never a fallback (CAD-559).
             model: agent
                 .params
                 .as_ref()
                 .and_then(|params| params.get("model"))
-                .and_then(Value::as_str)
-                .or(agent.model.as_deref()),
+                .and_then(Value::as_str),
         })
         .collect();
     fleet_verdicts(policy, &rows)
@@ -1718,25 +1717,23 @@ fn fleet_verdicts(policy: Option<&PiPolicy>, rows: &[FleetRow]) -> Value {
         } else {
             "worker"
         };
-        let (model, refusal) = match row.model {
+        let (model, refusal) = match row.model.map(str::trim).filter(|m| !m.is_empty()) {
             Some(model) => (
                 Some(model),
                 pi_policy::require_allowed(policy, role, model).err(),
             ),
-            // No explicit model: the launch resolves the role default, so
-            // that default is what the fleet check must judge.
-            None => {
-                let resolved = policy.and_then(|p| p.models.default.for_role(role));
-                (
-                    resolved,
-                    match resolved {
-                        Some(model) => pi_policy::require_allowed(policy, role, model).err(),
-                        None => Some(Error::rejected(format!(
-                            "pi {role} has no model and no role default — the launch refuses"
-                        ))),
-                    },
-                )
-            }
+            // `PiAdapter::open` refuses a row with no `params.model` before
+            // the allowlist check — it never falls back to the registration
+            // label or the role default (CAD-559). Say the same thing.
+            None => (
+                None,
+                Some(Error::rejected(format!(
+                    "pi agent '{}' has no model configured — pass --model <provider/id> \
+                     or configure the {role} default in Settings > Agents; a silent \
+                     provider fallback is never used (CAD-559)",
+                    row.alias
+                ))),
+            ),
         };
         if let Some(err) = refusal {
             refused.push(json!({
@@ -2572,20 +2569,28 @@ mod fleet_check_tests {
             row("dev-a", "pi", Some("devin/swe-2-high")),
             row("dev-b", "pi", Some("openrouter/z-ai/glm-5.3-flash")),
             row("master", "pi", Some("openrouter/z-ai/glm-5.3-flash")),
+            // PiAdapter::open refuses a row with no params.model — the report
+            // must not invent a fallback that the launch never uses.
+            row("dev-c", "pi", None),
             row("codex-a", "codex", Some("openai-codex/gpt-6.1-sol")),
         ];
         let report = fleet_verdicts(Some(&policy()), &rows);
-        assert_eq!(report["checked"], 3);
+        assert_eq!(report["checked"], 4);
         assert_eq!(report["not_gated"], 1);
         assert_eq!(report["launchable"], 2);
         let refused = report["refused"].as_array().expect("refused rows");
-        assert_eq!(refused.len(), 1);
+        assert_eq!(refused.len(), 2);
         assert_eq!(refused[0]["alias"], "dev-b");
         assert_eq!(refused[0]["role"], "worker");
         assert!(refused[0]["reason"]
             .as_str()
             .unwrap_or("")
             .contains("allowlist"));
+        assert_eq!(refused[1]["alias"], "dev-c");
+        assert!(refused[1]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no model configured"));
     }
 
     /// An absent policy allows nothing; the check must report that instead of
