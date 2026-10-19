@@ -15,7 +15,7 @@
 use serde::Deserialize;
 
 use crate::board_identity::{self, PublicKey};
-use crate::cli_actor::{self, Rejection, BEARER_PREFIX, SKEW_SECS};
+use crate::cli_actor::{self, Rejection, SKEW_SECS};
 
 /// `HOSTED_CADENCE_MAX_TTL_SECONDS` — the longest envelope life.
 const MAX_LIFE_SECS: i64 = 300;
@@ -400,9 +400,6 @@ fn parse(envelope: &str) -> Result<(Claims, String, Vec<u8>, String), Rejection>
 pub fn envelope_from_bearer(header: Option<&str>) -> Result<String, Rejection> {
     cli_actor::envelope_from_bearer(header)
 }
-
-/// `BEARER_PREFIX` is part of the shared family spelling.
-pub const SPELLING: &str = BEARER_PREFIX;
 
 #[cfg(test)]
 mod tests {

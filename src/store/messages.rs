@@ -604,48 +604,6 @@ impl Store {
         )
     }
 
-    /// [`Self::enqueue_steered`] with the verified human behind an owner
-    /// chat send (CAD-1374). `human` is the daemon's own derivation,
-    /// `{sub, company, session, display}`; every other caller passes
-    /// `None` through `enqueue_steered`. It lands on the thread entry and
-    /// the `queued` event in this transaction, and a retry compares it.
-    #[allow(clippy::too_many_arguments)]
-    pub fn enqueue_steered_with_human(
-        &self,
-        alias: &str,
-        body: &str,
-        reply_to: Option<&str>,
-        id: &str,
-        source: &str,
-        task_id: Option<&str>,
-        issue: Option<&str>,
-        worktree: Option<&str>,
-        sender: &Sender,
-        steer: &Steer,
-        refs: Option<&Value>,
-        app: Option<&Value>,
-        attachments: Option<&Value>,
-        human: Option<&Value>,
-    ) -> Result<(bool, String)> {
-        self.enqueue_steered_with_human_for(
-            alias,
-            None,
-            body,
-            reply_to,
-            id,
-            source,
-            task_id,
-            issue,
-            worktree,
-            sender,
-            steer,
-            refs,
-            app,
-            attachments,
-            human,
-        )
-    }
-
     /// The one steering-enqueue body (CAD-1374 + CAD-1412): an optional
     /// expected recipient uid checked inside the write transaction AND
     /// the optional verified human stamped on the entry and `queued`
@@ -687,46 +645,6 @@ impl Store {
             attachments,
             None,
             human,
-            None,
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn enqueue_steered_with_conversation(
-        &self,
-        alias: &str,
-        body: &str,
-        reply_to: Option<&str>,
-        id: &str,
-        source: &str,
-        task_id: Option<&str>,
-        issue: Option<&str>,
-        worktree: Option<&str>,
-        sender: &Sender,
-        steer: &Steer,
-        refs: Option<&Value>,
-        app: Option<&Value>,
-        attachments: Option<&Value>,
-        conversation: Option<&str>,
-    ) -> Result<(bool, String)> {
-        self.enqueue_steered_for_with_conversation(
-            alias,
-            None,
-            body,
-            reply_to,
-            id,
-            source,
-            task_id,
-            issue,
-            worktree,
-            sender,
-            steer,
-            refs,
-            app,
-            attachments,
-            conversation,
-            None,
             None,
             None,
         )

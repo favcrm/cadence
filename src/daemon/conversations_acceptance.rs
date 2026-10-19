@@ -719,37 +719,6 @@ fn i11_master_tmp_is_emptied_on_a_conversation_switch() {
     assert!(left.is_empty(), "the next conversation sees {left:?}");
 }
 
-/// Every method name in `Shared::dispatch_method`'s match, parsed from
-/// the source so a method added later is in the table.
-fn dispatch_methods() -> Vec<String> {
-    let src = include_str!("../daemon.rs");
-    let start = src
-        .find("    fn dispatch_method(\n")
-        .expect("dispatch_method");
-    let body = &src[start..];
-    let body = &body[body.find("match method {").expect("match")..];
-    let body = &body[..body
-        .find("other => Err(Error::rejected(format!(\"Unknown method")
-        .expect("end")];
-    let mut out = Vec::new();
-    for line in body.lines() {
-        let t = line.trim_start();
-        if line.len() - t.len() != 12 || !t.starts_with('"') {
-            continue;
-        }
-        let Some((arms, _)) = t.split_once("=>") else {
-            continue;
-        };
-        for arm in arms.split('|') {
-            let name = arm.trim().trim_matches('"');
-            if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
-                out.push(name.to_string());
-            }
-        }
-    }
-    out
-}
-
 /// The ONLY daemon methods a master turn in an app conversation may call,
 /// written out from the ticket's answer 1 (scoped app verbs plus
 /// read-only status for its own turn): the scoped app verbs,
@@ -805,8 +774,10 @@ impl Gx {
 #[test]
 fn gate2_app_conversation_turn_is_an_allowlist_over_every_method() {
     let gx = gx();
-    let table = dispatch_methods();
-    assert!(table.len() > 100, "method table parse: {}", table.len());
+    let table = super::caller_rule::dispatch_methods();
+    // The weak (pre-consolidation) parser saw only 391 of 424 methods; a
+    // floor in the hundreds keeps this completeness check honest.
+    assert!(table.len() > 400, "method table parse: {}", table.len());
     for family in ["agent_", "job_", "monitor_", "wiki_", "master_permission_"] {
         assert!(
             table.iter().any(|m| m.starts_with(family)),

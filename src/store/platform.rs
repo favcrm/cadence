@@ -1180,21 +1180,6 @@ impl Store {
             Ok(rows.flatten().collect())
         })
     }
-
-    /// Revoke every grant an app's approval derived: the `app_grants`
-    /// rows go, and each `(agent, platform, account)`'s `platform_grants`
-    /// scopes shrink by exactly the app's derived set, less whatever
-    /// another approved app still derives — a hand-made grant's other
-    /// scopes survive. Answers the `(agent, platform,
-    /// account)` triples whose platform grant changed, so the caller
-    /// can drain the waiting effects that lost a scope (CAD-506).
-    pub fn app_grants_revoke(&self, app: &str, by: &str) -> Result<Vec<(String, String, String)>> {
-        self.write_tx(|conn| {
-            let tx = &mut *conn;
-            let changed = revoke_derived(&tx, app, by)?;
-            Ok(changed)
-        })
-    }
 }
 
 impl Store {

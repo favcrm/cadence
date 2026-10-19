@@ -74,8 +74,6 @@ pub const SCHEMA_VERSION: i64 = 52;
 /// only this version.
 pub const PRE_LEASE_SCHEMA: i64 = 11;
 
-const DEFAULT_TTL: Duration = Duration::from_secs(12 * 60 * 60);
-
 thread_local! {
     /// Test override so a bootstrap opt-in does not leak across threads
     /// through the process environment.
@@ -116,10 +114,6 @@ fn forwarded_identity() -> Option<String> {
 
 fn read_forwarded(slot: &OnceLock<String>) -> Option<String> {
     slot.get().cloned()
-}
-
-pub fn default_ttl() -> Duration {
-    DEFAULT_TTL
 }
 
 fn bootstrap_requested() -> bool {

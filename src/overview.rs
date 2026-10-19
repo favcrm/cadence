@@ -60,8 +60,6 @@ use github_cache::github_bounded_notify;
 use github_cache::write_cache;
 use github_cache::{cache_file, github, read_cache};
 use main_ci::main_ci_view;
-#[allow(unused_imports)] // Preserve the existing crate-visible type path.
-pub(crate) use main_ci::MainCiAlerts;
 #[cfg(test)]
 use main_ci::{classify_main_ci, main_ci_alerts, CiState, ShaCi};
 pub use monitoring::monitoring;

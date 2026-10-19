@@ -786,17 +786,17 @@ pub fn check_offline(source: &str) -> Result<Value> {
     }
 
     // ---- source → a canonical directory. `builtin:<id>` is retired
-    // (CAD-1422): `builtin::get` returns the retired source refusal, so
-    // it never reaches the inventory stage.
+    // (CAD-1422): `builtin::refuse_retired` returns the retired source
+    // refusal, so it never reaches the inventory stage.
     enum Resolved {
         Dir(PathBuf),
     }
     let resolved = (|| -> Result<(Resolved, app::Source)> {
         if let Some(id) = source.strip_prefix(BUILTIN_SOURCE_PREFIX) {
-            // `get` is the retired refusal; `?` propagates it as this
-            // source's refusal.
-            super::builtin::get(id)?;
-            unreachable!("builtin::get always returns the retired refusal");
+            // `refuse_retired` is the retired refusal; `?` propagates it
+            // as this source's refusal.
+            super::builtin::refuse_retired(id)?;
+            unreachable!("builtin::refuse_retired always returns the retired refusal");
         }
         let path = Path::new(source);
         if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
@@ -2301,16 +2301,16 @@ pub(crate) fn with_completed_bundle_snapshot<T>(
 }
 
 /// CAD-1422: `builtin:<catalog_id>` is the retired embedded-catalog
-/// source form. It is never resolved as a bundle: `builtin::get` is the
-/// explicit retired refusal, so an install or upgrade naming it fails
+/// source form. It is never resolved as a bundle: `builtin::refuse_retired`
+/// is the explicit retired refusal, so an install or upgrade naming it fails
 /// closed before the lock, the catalog read or any write.
 fn builtin_bundle(
     pm: &Pm,
     catalog_id: &str,
 ) -> Result<(BTreeMap<String, String>, app::Validated, app::Source)> {
     let _ = pm;
-    super::builtin::get(catalog_id)?;
-    unreachable!("builtin::get always returns the retired refusal")
+    super::builtin::refuse_retired(catalog_id)?;
+    unreachable!("builtin::refuse_retired always returns the retired refusal")
 }
 
 /// [`install_builtin`] with a guard re-run under the PM lock before the first

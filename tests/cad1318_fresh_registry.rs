@@ -17,7 +17,7 @@
 //! installs and a lock/generation inconsistency — must still refuse, never
 //! be smoothed into an empty array.
 
-#![cfg(all(unix, not(feature = "e2e")))]
+#![cfg(unix)]
 
 use cadence_agent::issue::app_catalog::workspace;
 use cadence_agent::issue::Pm;

@@ -1211,19 +1211,6 @@ fn decide_use(
     Ok(None)
 }
 
-pub fn pending_requests(state_dir: &Path, now: i64) -> Result<Vec<Request>> {
-    let lock = dir_lock(state_dir);
-    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let mut doc = load_doc(state_dir)?;
-    expire(&mut doc, now);
-    save_doc(state_dir, &doc)?;
-    Ok(doc
-        .requests
-        .into_iter()
-        .filter(|r| r.status == "pending")
-        .collect())
-}
-
 /// Requests the board still shows: pending ones, and decided ones that
 /// have not expired, so the chat card and the rail update in place.
 pub fn board_requests(state_dir: &Path, now: i64) -> Result<Vec<Request>> {

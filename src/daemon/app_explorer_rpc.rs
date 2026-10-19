@@ -753,9 +753,9 @@ impl Shared {
             "app_workspace_install_entry" => {
                 let catalog_id = required_str(params, "catalog_id")?;
                 let expected = required_str(params, "expected_digest")?;
-                // CAD-1422: `builtin::get` is the retired refusal —
+                // CAD-1422: `builtin::refuse_retired` is the retired refusal —
                 // catalog install always refuses, before any effect.
-                app_catalog::builtin::get(catalog_id)?;
+                app_catalog::builtin::refuse_retired(catalog_id)?;
                 self.audited_workspace_effect(
                     params,
                     "app_workspace_installed",

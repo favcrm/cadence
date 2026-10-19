@@ -1853,37 +1853,6 @@ mod tests {
         assert_eq!(clip("short", 10), "short");
     }
 
-    /// Every method name in `Shared::dispatch_method`'s match — parsed from the
-    /// source so the test sees methods added later.
-    pub(crate) fn dispatch_methods() -> Vec<String> {
-        let src = include_str!("../daemon.rs");
-        let start = src
-            .find("    fn dispatch_method(\n")
-            .expect("dispatch_method fn");
-        let body = &src[start..];
-        let body = &body[body.find("match method {").expect("match")..];
-        let body = &body[..body
-            .find("other => Err(Error::rejected(format!(\"Unknown method")
-            .expect("end")];
-        let mut out = Vec::new();
-        for line in body.lines() {
-            let t = line.trim_start();
-            if line.len() - t.len() != 12 || !t.starts_with('"') {
-                continue;
-            }
-            let Some((arms, _)) = t.split_once("=>") else {
-                continue;
-            };
-            for arm in arms.split('|') {
-                let name = arm.trim().trim_matches('"');
-                if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
-                    out.push(name.to_string());
-                }
-            }
-        }
-        out
-    }
-
     /// Framed byte streams served in `serve.rs` before `dispatch_method`.
     /// They are real methods, so an allowlist entry may name one, but they
     /// never appear in the JSON dispatch match.
@@ -1913,9 +1882,13 @@ mod tests {
     /// master's own answer names, CAD-447).
     #[test]
     fn master_policy_allowlists_the_method_table() {
-        let table = dispatch_methods();
+        let table = super::super::caller_rule::dispatch_methods();
         let streams = framed_stream_methods();
-        assert!(table.len() > 50, "method table parse: {table:?}");
+        // A parser that misses rustfmt-wrapped `| "next"` arms saw only
+        // 391 of the 424 methods, so a low floor let the completeness
+        // checks below pass while skipping 33 methods. Keep the floor in
+        // the hundreds: the table only grows.
+        assert!(table.len() > 400, "method table parse: {}", table.len());
         assert!(
             streams.contains(&"app_media_inspect".to_string()),
             "retained image inspect must stay a framed stream"
@@ -1926,10 +1899,11 @@ mod tests {
                 "{allowed} not a method"
             );
         }
-        for m in &table {
-            let open = master_may_call(m);
-            assert_eq!(open, MASTER_ALLOWED.contains(&m.as_str()), "{m}");
-        }
+        // `master_may_call` is exactly `MASTER_ALLOWED.contains`, so
+        // comparing the two is a tautology that can never fail. What can
+        // go wrong is the list naming something the daemon no longer
+        // dispatches (checked above) or a reviewed refusal silently
+        // becoming reachable (checked below).
         for never in [
             "shutdown",
             "agent_send",

@@ -979,51 +979,6 @@ impl Auth {
         )
     }
 
-    /// [`Auth::open_public`] for a verified assertion, persisting the
-    /// verified `scope` with the row (CAD-1412). Call only after the
-    /// daemon has verified the assertion against the configured board
-    /// identity; `scope` is never read from request params. The row
-    /// carries no realm: a caller without a verified [`PublicRealm`]
-    /// gets no fabricated one — a bound open derives its scope from the
-    /// realm instead (CAD-1374).
-    pub fn open_public_scoped(
-        &mut self,
-        user: BoardUser,
-        scope: HumanScope,
-        jti: &str,
-        jti_exp: i64,
-        user_agent: &str,
-        now: i64,
-    ) -> Result<Option<Opened>> {
-        self.open_public_row(
-            user,
-            (jti, jti_exp),
-            user_agent,
-            (None, Some(scope), None),
-            now,
-            |_| Ok(()),
-        )
-    }
-
-    pub fn open_public_account(
-        &mut self,
-        user: BoardUser,
-        jti: &str,
-        jti_exp: i64,
-        user_agent: &str,
-        now: i64,
-        account_id: Option<String>,
-    ) -> Result<Option<Opened>> {
-        self.open_public_row(
-            user,
-            (jti, jti_exp),
-            user_agent,
-            (None, None, account_id),
-            now,
-            |_| Ok(()),
-        )
-    }
-
     /// CAD-1374: `open_public` that also saves the platform realm the
     /// assertion was verified under. The daemon passes the same config it
     /// checked the assertion against. The row's `scope` (CAD-1412) is

@@ -1273,30 +1273,6 @@ impl Store {
         })
     }
 
-    /// Pending push intents, oldest first, bounded by attempt count. Each row
-    /// carries only opaque ids, the reason and the attempt count.
-    pub fn push_pending(&self, limit: i64, max_attempts: i64) -> Result<Vec<PushIntent>> {
-        self.read_tx(|conn| {
-            let rows: Vec<PushIntent> = conn.query_vec(
-                "SELECT id,room,post,seq,recipient,reason,attempts FROM human_notification_intents
-                  WHERE attempts < ? ORDER BY id LIMIT ?",
-                params![max_attempts, limit.clamp(1, 100)],
-                |r| {
-                    Ok(PushIntent {
-                        id: r.get(0)?,
-                        room: r.get(1)?,
-                        post: r.get(2)?,
-                        seq: r.get(3)?,
-                        recipient: r.get(4)?,
-                        reason: r.get(5)?,
-                        attempts: r.get(6)?,
-                    })
-                },
-            )?;
-            Ok(rows)
-        })
-    }
-
     /// Read-only candidates for the background initiator: `(intent, device)`
     /// pairs whose device consent is live (not revoked, not expired), whose
     /// recipient is a current human member after the cutoff, whose intent is

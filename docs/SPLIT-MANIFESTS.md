@@ -29,4 +29,7 @@ CAD-621 retired the completed CAD-534 daemon and CAD-535 CLI one-shot
 split generators and their manifests. Daemon and CLI source files are
 maintained directly; do not recreate those manifests to register new items.
 The `PINNED` tables in `scripts/split-integration-tests` and
-`scripts/split-board-tests` likewise belong to retired one-shot generators.
+`scripts/split-board-tests` belonged to those retired one-shot generators
+and the two generators are now removed: their source suites
+(`tests/integration.rs`, `tests/board.rs`) are gone, so neither could
+regenerate anything. Their contracts remain in Git history.
