@@ -55,6 +55,8 @@ const BASE: &str = "/v1/hosted-cadence/portable-migrations";
 const RECEIPT_FORMAT: &str = "cadence.portable-migration/1";
 /// packed-v1: greedy whole-member packs target this many bytes (immutable ABI).
 const PACK_BYTES: u64 = 1_048_576;
+/// The account request-body ceiling; a published part bound above it is refused.
+const REQUEST_BODY_CEILING: u64 = 100 * 1024 * 1024;
 /// Seal text the packed-v1 input descriptor hash is computed over.
 const SEAL_KIND: &str = "portable-restore/input-storage/1";
 const SEAL_LAYOUT: &str = "packed-v1";
@@ -358,22 +360,24 @@ fn transfer(
         MigrationTimeout::Json,
     )
     .map_err(reconcile)?;
-    let (descriptor, completed_packs) =
+    let (descriptor, completed_packs, part_bytes) =
         match inputs_data(&inputs, target, &operation_id, &package, &plan).map_err(reconcile)? {
-            InputProgress::Unregistered => (
+            InputProgress::Unregistered { part_bytes } => (
                 upload_manifest(dir, target, &operation_id, &package, &plan).map_err(reconcile)?,
                 Vec::new(),
+                part_bytes,
             ),
             InputProgress::Ready {
                 descriptor,
                 manifest_completed,
                 completed_packs,
+                part_bytes,
             } => {
                 if !manifest_completed {
                     upload_manifest(dir, target, &operation_id, &package, &plan)
                         .map_err(reconcile)?;
                 }
-                (descriptor, completed_packs)
+                (descriptor, completed_packs, part_bytes)
             }
         };
     if !completed_packs.is_empty() {
@@ -396,25 +400,84 @@ fn transfer(
             pack.bytes
         ));
         let mut reader = PackReader::open(source, pack, &plan.inventory)?;
-        let data = call(
-            dir,
-            target,
-            "remote migration pack",
-            "PUT",
-            &operation_path(&operation_id, &format!("/input-packs/{}", pack.index))?,
-            MigrationBody::Stream(&mut reader),
-            MigrationTimeout::Pack,
-        )
-        .map_err(reconcile)?;
-        pack_data(
-            &data,
-            target,
-            &operation_id,
-            pack,
-            &descriptor,
-            &plan.inventory,
-        )
-        .map_err(reconcile)?;
+        if pack.bytes <= part_bytes {
+            let data = call(
+                dir,
+                target,
+                "remote migration pack",
+                "PUT",
+                &operation_path(&operation_id, &format!("/input-packs/{}", pack.index))?,
+                MigrationBody::Stream(&mut reader),
+                MigrationTimeout::Pack,
+            )
+            .map_err(reconcile)?;
+            pack_data(
+                &data,
+                target,
+                &operation_id,
+                pack,
+                &descriptor,
+                &plan.inventory,
+            )
+            .map_err(reconcile)?;
+        } else {
+            let parts = part_count(pack.bytes, part_bytes);
+            for part in 1..=parts {
+                let bytes = part_bytes_at(pack.bytes, part_bytes, part);
+                let mut body = PackPartReader::new(&mut reader, bytes);
+                let data = call(
+                    dir,
+                    target,
+                    "remote migration pack part",
+                    "PUT",
+                    &operation_path(
+                        &operation_id,
+                        &format!("/input-packs/{}/parts/{part}", pack.index),
+                    )?,
+                    MigrationBody::Stream(&mut body),
+                    MigrationTimeout::Pack,
+                )
+                .map_err(reconcile)?;
+                body.finish_part()?;
+                drop(body);
+                part_data(
+                    &data,
+                    target,
+                    &operation_id,
+                    pack,
+                    &descriptor,
+                    part,
+                    parts,
+                    bytes,
+                )
+                .map_err(reconcile)?;
+            }
+            // Forced end-of-pack read after the last part: verifies the
+            // trailing member digest and refuses a pack longer than the plan.
+            expect_pack_end(&mut reader)?;
+            let data = call(
+                dir,
+                target,
+                "remote migration pack finalize",
+                "POST",
+                &operation_path(
+                    &operation_id,
+                    &format!("/input-packs/{}/finalize", pack.index),
+                )?,
+                MigrationBody::Empty,
+                MigrationTimeout::Pack,
+            )
+            .map_err(reconcile)?;
+            pack_data(
+                &data,
+                target,
+                &operation_id,
+                pack,
+                &descriptor,
+                &plan.inventory,
+            )
+            .map_err(reconcile)?;
+        }
     }
 
     note("remote migration: all packs verified; committing");
@@ -539,12 +602,16 @@ fn manifest_data(
 /// Input reconciliation receipt. `Unregistered` means nothing was admitted;
 /// `Ready` means every registered effect is either durably completed (listed
 /// in `completed_packs`) or untouched and uploadable. Anything else stops.
+/// Both carry the server-published part bound `packPartBytes`.
 enum InputProgress {
-    Unregistered,
+    Unregistered {
+        part_bytes: u64,
+    },
     Ready {
         descriptor: String,
         manifest_completed: bool,
         completed_packs: Vec<usize>,
+        part_bytes: u64,
     },
 }
 
@@ -571,6 +638,7 @@ fn inputs_data(
             "packCount",
             "manifestCompleted",
             "completedPacks",
+            "packPartBytes",
         ],
     )?;
     if object["format"].as_str() != Some("cadence.portable-migration-inputs/1")
@@ -597,6 +665,10 @@ fn inputs_data(
                 .collect::<Option<Vec<usize>>>()
         })
         .ok_or_else(|| receipt_error("inputs"))?;
+    let part_bytes = object["packPartBytes"]
+        .as_u64()
+        .filter(|&m| m > 0 && m <= REQUEST_BODY_CEILING)
+        .ok_or_else(|| receipt_error("inputs"))?;
     match object["state"].as_str() {
         Some("unknown") => Err(input_unknown_error(operation_id)),
         Some("unregistered") => {
@@ -607,7 +679,7 @@ fn inputs_data(
             {
                 return Err(receipt_error("inputs"));
             }
-            Ok(InputProgress::Unregistered)
+            Ok(InputProgress::Unregistered { part_bytes })
         }
         Some("ready") => {
             let descriptor = object["descriptorSha256"]
@@ -630,6 +702,7 @@ fn inputs_data(
                 descriptor: descriptor.to_owned(),
                 manifest_completed,
                 completed_packs,
+                part_bytes,
             })
         }
         _ => Err(receipt_error("inputs")),
@@ -670,6 +743,120 @@ fn input_unknown_error(operation_id: &str) -> Error {
          an earlier input effect is unknown or unrecognized; nothing was re-sent — \
          reconcile with restore --portable --status {operation_id}"
     ))
+}
+
+/// Transport parts of one sealed pack: `max(1, ceil(bytes / bound))`, the
+/// exact server arithmetic. `bound` is the published `packPartBytes`.
+fn part_count(bytes: u64, bound: u64) -> u64 {
+    bytes.div_ceil(bound).max(1)
+}
+
+/// Byte count of 1-based `part`: `min(bound, total - (part-1)*bound)`. Callers
+/// only pass `part` in `1..=part_count`, so the offset is below `total`.
+fn part_bytes_at(total: u64, bound: u64, part: u64) -> u64 {
+    bound.min(total - (part - 1) * bound)
+}
+
+/// Length-limited view over one pack's stream: yields exactly `remain` bytes
+/// of the underlying `PackReader`, which keeps its per-member hash state across
+/// the part boundary. A member may straddle parts.
+struct PackPartReader<'r, 'a, 'p> {
+    inner: &'r mut PackReader<'a, 'p>,
+    remain: u64,
+}
+
+impl<'r, 'a, 'p> PackPartReader<'r, 'a, 'p> {
+    fn new(inner: &'r mut PackReader<'a, 'p>, bytes: u64) -> Self {
+        PackPartReader {
+            inner,
+            remain: bytes,
+        }
+    }
+
+    /// After the part is sent the stream must have yielded exactly its bytes;
+    /// a short part means the pack ended early. Refuse, never retry.
+    fn finish_part(&self) -> Result<()> {
+        if self.remain != 0 {
+            return Err(Error::rejected(
+                "package pack ended before its declared part bytes — nothing retried",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Read for PackPartReader<'_, '_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remain == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let limit = buf.len().min(self.remain as usize);
+        let read = self.inner.read(&mut buf[..limit])?;
+        self.remain -= read as u64;
+        Ok(read)
+    }
+}
+
+/// Part receipt: the exact 11-key strict shape, bound to this operation, pack,
+/// part and computed range. Any mismatch is a receipt refusal.
+#[allow(clippy::too_many_arguments)]
+fn part_data(
+    data: &Value,
+    target: &RemoteTarget,
+    operation_id: &str,
+    pack: &Pack,
+    descriptor: &str,
+    part: u64,
+    part_count: u64,
+    range_bytes: u64,
+) -> Result<()> {
+    let object = strict_data(
+        data,
+        &[
+            "format",
+            "workspace",
+            "operationId",
+            "ok",
+            "inputStorage",
+            "descriptorSha256",
+            "packIndex",
+            "part",
+            "partCount",
+            "bytes",
+            "generation",
+        ],
+    )?;
+    common_binding(object, target)?;
+    if object["ok"] != Value::Bool(true)
+        || object["operationId"].as_str() != Some(operation_id)
+        || object["inputStorage"].as_str() != Some(SEAL_LAYOUT)
+        || object["descriptorSha256"].as_str() != Some(descriptor)
+        || object["packIndex"].as_u64() != Some(pack.index as u64)
+        || object["part"].as_u64() != Some(part)
+        || object["partCount"].as_u64() != Some(part_count)
+        || object["bytes"].as_u64() != Some(range_bytes)
+        || object["generation"].as_u64() != Some(0)
+    {
+        return Err(receipt_error("pack part"));
+    }
+    Ok(())
+}
+
+/// After the last part: one more read on the underlying pack stream. This is
+/// what verifies the trailing member's digest (the reader hashes at member
+/// end), and it must return end-of-file; any byte means the pack is longer
+/// than the plan and is refused.
+fn expect_pack_end(reader: &mut PackReader<'_, '_>) -> Result<()> {
+    let mut probe = [0u8; 1];
+    match reader.read(&mut probe) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(Error::rejected(
+            "package pack is longer than its sealed plan — nothing retried",
+        )),
+        Err(_) => Err(Error::rejected(
+            "package pack failed its sealed member check — nothing retried",
+        )),
+    }
 }
 
 /// Pack receipt: exact index, byte count, seal and per-member `(ordinal,
@@ -752,12 +939,11 @@ fn preflight_data(data: &Value, target: &RemoteTarget, package: &VerifiedPackage
                     .all(|k| o[*k].as_u64().is_some())
         })
         .ok_or_else(|| receipt_error("preflight"))?;
-    let member_bytes = package
-        .manifest
-        .members
-        .iter()
-        .try_fold(0u64, |sum, m| sum.checked_add(m.bytes))
-        .ok_or_else(|| receipt_error("preflight"))?;
+    let inventory_bytes = crate::backup::portable::transfer_inventory_bytes(
+        &package.manifest_bytes,
+        &package.manifest.members,
+    )
+    .map_err(|_| receipt_error("preflight"))?;
     if object["packageManifestSha256"].as_str() != Some(package.manifest_sha256.as_str())
         || object["destinationDigest"]
             .as_str()
@@ -773,7 +959,7 @@ fn preflight_data(data: &Value, target: &RemoteTarget, package: &VerifiedPackage
         || object["replacementSupported"] != Value::Bool(true)
         || limits["manifestBytes"].as_u64().unwrap() < package.manifest_bytes.len() as u64
         || limits["members"].as_u64().unwrap() < package.manifest.members.len() as u64
-        || limits["totalBytes"].as_u64().unwrap() < member_bytes
+        || limits["totalBytes"].as_u64().unwrap() < inventory_bytes
     {
         return Err(receipt_error("preflight"));
     }
@@ -785,7 +971,7 @@ fn preflight_data(data: &Value, target: &RemoteTarget, package: &VerifiedPackage
             "fullWorkspace": package.manifest.full_workspace,
             "schemaVersion": package.manifest.schema_version,
             "members": package.manifest.members.len(),
-            "bytes": member_bytes,
+            "bytes": inventory_bytes,
             "exclusions": package.manifest.exclusions,
             "redactedMessageBodies": package.manifest.redacted_message_bodies,
             "sourceFidelityEstablished": false,
@@ -1422,5 +1608,61 @@ mod tests {
             status_data(&receipt, &target(), "migrate_test", Some("request-test")).unwrap(),
             receipt
         );
+    }
+
+    fn part_pack() -> Pack {
+        Pack {
+            index: 3,
+            bytes: 0,
+            members: 0..1,
+        }
+    }
+
+    fn part_receipt(part: u64, count: u64, bytes: u64) -> Value {
+        json!({
+            "format": RECEIPT_FORMAT,
+            "workspace": target().org_id,
+            "operationId": "op-1",
+            "ok": true,
+            "inputStorage": "packed-v1",
+            "descriptorSha256": "d".repeat(64),
+            "packIndex": 3,
+            "part": part,
+            "partCount": count,
+            "bytes": bytes,
+            "generation": 0,
+        })
+    }
+
+    #[test]
+    fn part_arithmetic_matches_the_published_bound() {
+        let m = 16 * 1024 * 1024;
+        assert_eq!(part_count(m, m), 1);
+        assert_eq!(part_count(m + 1, m), 2);
+        assert_eq!(part_count(1, m), 1);
+        assert_eq!(part_count(0, m), 1);
+        let total: u64 = 272 * 1024 * 1024;
+        let count = part_count(total, m);
+        assert_eq!(count, 17);
+        let sum: u64 = (1..=count).map(|p| part_bytes_at(total, m, p)).sum();
+        assert_eq!(sum, total);
+        assert_eq!(part_bytes_at(total, m, 1), m);
+        assert_eq!(part_bytes_at(total, m, count), total - (count - 1) * m);
+    }
+
+    #[test]
+    fn part_receipt_requires_exact_keys_and_range_bytes() {
+        let t = target();
+        let descriptor = "d".repeat(64);
+        let ok = part_receipt(2, 5, 1024);
+        assert!(part_data(&ok, &t, "op-1", &part_pack(), &descriptor, 2, 5, 1024).is_ok());
+        assert!(part_data(&ok, &t, "op-1", &part_pack(), &descriptor, 3, 5, 1024).is_err());
+        assert!(part_data(&ok, &t, "op-1", &part_pack(), &descriptor, 2, 5, 1023).is_err());
+        let mut extra = ok.clone();
+        extra["surprise"] = json!(1);
+        assert!(part_data(&extra, &t, "op-1", &part_pack(), &descriptor, 2, 5, 1024).is_err());
+        let mut not_ok = ok.clone();
+        not_ok["ok"] = json!(false);
+        assert!(part_data(&not_ok, &t, "op-1", &part_pack(), &descriptor, 2, 5, 1024).is_err());
     }
 }

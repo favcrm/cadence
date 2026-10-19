@@ -1328,10 +1328,13 @@ pub enum MigrationBody<'a> {
     /// Exact manifest bytes (POST `/:operationId/manifest`), already bounded
     /// by the caller at 4 MiB.
     Bytes(&'a [u8]),
-    /// A bounded streaming pack body (PUT `/:operationId/input-packs/:index`).
-    /// The reader must produce exactly the pack's bytes; nothing is buffered
-    /// whole and the caller's `Read` verifies each member hash at its end.
+    /// A bounded streaming body: a whole pack (PUT `…/input-packs/:index`) or
+    /// one part (PUT `…/input-packs/:index/parts/:part`). The reader must
+    /// produce exactly that many bytes; nothing is buffered whole and the
+    /// caller's `Read` verifies each member hash at its end.
     Stream(&'a mut dyn Read),
+    /// No body, POST only (POST `/:operationId/input-packs/:index/finalize`).
+    Empty,
 }
 
 /// Per-request timeout class. The commit call bounds to the server's 600 s
@@ -1412,9 +1415,17 @@ pub(crate) fn migration_issuer_request(
     if !matches!(
         (method, &body),
         ("GET", MigrationBody::None)
-            | ("POST", MigrationBody::Json(_) | MigrationBody::Bytes(_))
+            | (
+                "POST",
+                MigrationBody::Json(_) | MigrationBody::Bytes(_) | MigrationBody::Empty
+            )
             | ("PUT", MigrationBody::Stream(_))
     ) {
+        return Err(reject("Hosted portable-migration request shape refused"));
+    }
+    // The finalize shape is bound to its path: an empty POST only at
+    // `…/finalize`, and `…/finalize` only as an empty POST.
+    if matches!(body, MigrationBody::Empty) != path.ends_with("/finalize") {
         return Err(reject("Hosted portable-migration request shape refused"));
     }
     private_dir(dir, false)?;
@@ -1449,6 +1460,9 @@ pub(crate) fn migration_issuer_request(
             migration_headers(agent.post(&url), &auth, workspace, access.as_ref())
                 .content_type("application/octet-stream")
                 .send(bytes)
+        }
+        ("POST", MigrationBody::Empty) => {
+            migration_headers(agent.post(&url), &auth, workspace, access.as_ref()).send_empty()
         }
         ("PUT", MigrationBody::Stream(reader)) => {
             migration_headers(agent.put(&url), &auth, workspace, access.as_ref())
@@ -1542,13 +1556,33 @@ fn portable_migration_path(path: &str) -> bool {
                     "manifest" | "commit" | "rollback" | "inputs" => true,
                     _ => suffix
                         .strip_prefix("input-packs/")
-                        .is_some_and(valid_pack_index),
+                        .is_some_and(valid_pack_suffix),
                 }
             } else {
                 id(tail)
             }
         }
     }
+}
+
+/// `input-packs/` element after the prefix: `<index>`, `<index>/parts/<part>`
+/// or `<index>/finalize`.
+fn valid_pack_suffix(value: &str) -> bool {
+    match value.split_once('/') {
+        None => valid_pack_index(value),
+        Some((index, "finalize")) => valid_pack_index(index),
+        Some((index, tail)) => {
+            valid_pack_index(index) && tail.strip_prefix("parts/").is_some_and(valid_part_number)
+        }
+    }
+}
+
+/// `^[1-9][0-9]*$` — a 1-based transport part number.
+fn valid_part_number(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 20
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && !value.starts_with('0')
 }
 
 /// `^(0|[1-9][0-9]*)$` — the pack index the server-minted plan assigns.

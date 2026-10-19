@@ -1168,8 +1168,162 @@ pub fn verify_transfer_package(source: &Path) -> Result<VerifiedPackage> {
             "package member count exceeds the transfer limit",
         ));
     }
+    admit_transfer_manifest(&inspected.manifest_bytes, &inspected.manifest.members)?;
     Ok(inspected)
 }
+
+/// Transfer-only admission that mirrors the hosted manifest parser's closed
+/// schema and inventory bounds, so the client never offers a package the
+/// server always refuses. Pure over the manifest bytes: nothing here reads a
+/// member file. Shared local-restore verification is unchanged.
+fn admit_transfer_manifest(manifest_bytes: &[u8], members: &[Member]) -> Result<()> {
+    let raw: Value = serde_json::from_slice(manifest_bytes)
+        .map_err(|_| Error::rejected("package manifest is not valid JSON"))?;
+    let top = raw
+        .as_object()
+        .ok_or_else(|| Error::rejected("package manifest is not a JSON object"))?;
+    if top
+        .keys()
+        .any(|key| !TRANSFER_MANIFEST_KEYS.contains(&key.as_str()))
+    {
+        return Err(Error::rejected(
+            "package manifest has a key the transfer schema does not admit",
+        ));
+    }
+    if let Some(raw_members) = top.get("members").and_then(Value::as_array) {
+        for raw_member in raw_members {
+            let closed = raw_member.as_object().is_some_and(|object| {
+                object.len() == 3
+                    && ["path", "bytes", "sha256"]
+                        .iter()
+                        .all(|key| object.contains_key(*key))
+            });
+            if !closed {
+                return Err(Error::rejected(
+                    "package member has a key the transfer schema does not admit",
+                ));
+            }
+        }
+    }
+    let inventory_bytes = transfer_inventory_bytes(manifest_bytes, members)?;
+    for member in members {
+        if member.path.encode_utf16().count() > TRANSFER_MEMBER_PATH_MAX_UNITS {
+            return Err(Error::rejected(
+                "package member path exceeds the transfer limit",
+            ));
+        }
+        if member.bytes > TRANSFER_MEMBER_MAX_BYTES {
+            return Err(Error::rejected(
+                "package member exceeds the transfer size limit",
+            ));
+        }
+    }
+    if inventory_bytes > TRANSFER_INVENTORY_MAX_BYTES {
+        return Err(Error::rejected(
+            "package inventory exceeds the transfer size limit",
+        ));
+    }
+    Ok(())
+}
+
+/// Hosted inventory total: declared member bytes plus the manifest's own bytes
+/// (the sealed inventory adds `manifest.json` as one more member). The single
+/// source for both transfer admission and the preflight comparison, so the
+/// client refuses exactly what the server refuses. Errors on overflow.
+pub fn transfer_inventory_bytes(manifest_bytes: &[u8], members: &[Member]) -> Result<u64> {
+    members
+        .iter()
+        .try_fold(manifest_bytes.len() as u64, |sum, m| {
+            sum.checked_add(m.bytes)
+        })
+        .ok_or_else(|| Error::rejected("package inventory exceeds the transfer size limit"))
+}
+
+#[cfg(test)]
+mod transfer_admission_tests {
+    use super::*;
+
+    fn manifest_with(members: &str) -> Vec<u8> {
+        format!(
+            "{{\"format\":\"cadence.portable/1\",\"scope\":\"x\",\"full_workspace\":false,\"created_at\":\"2026-01-01T00:00:00Z\",\"source_uuid\":\"u\",\"cadence\":\"1\",\"schema_version\":1,\"tracker_revision\":\"r\",\"pm_root\":null,\"tables\":[],\"omitted_tables\":[],\"omitted_rows\":[],\"nulled_columns\":[],\"disabled_columns\":[],\"exclusions\":[],\"redacted_message_bodies\":null,\"members\":{members}}}"
+        )
+        .into_bytes()
+    }
+
+    fn member(path: &str, bytes: u64) -> Member {
+        Member {
+            path: path.into(),
+            bytes,
+            sha256: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn extra_member_key_is_refused_without_echoing_it() {
+        let bytes =
+            manifest_with("[{\"path\":\"a\",\"bytes\":1,\"sha256\":\"aa\",\"note\":\"secret-x\"}]");
+        let err = admit_transfer_manifest(&bytes, &[member("a", 1)]).unwrap_err();
+        let text = format!("{err:?}");
+        assert!(text.contains("transfer schema does not admit"));
+        assert!(!text.contains("secret-x"));
+    }
+
+    #[test]
+    fn closed_member_object_is_admitted() {
+        let bytes = manifest_with("[{\"path\":\"a\",\"bytes\":1,\"sha256\":\"aa\"}]");
+        assert!(admit_transfer_manifest(&bytes, &[member("a", 1)]).is_ok());
+    }
+
+    #[test]
+    fn long_member_path_is_refused() {
+        let bytes = manifest_with("[]");
+        let long = "x".repeat(TRANSFER_MEMBER_PATH_MAX_UNITS + 1);
+        assert!(admit_transfer_manifest(&bytes, &[member(&long, 1)]).is_err());
+    }
+
+    #[test]
+    fn oversized_member_is_refused() {
+        let bytes = manifest_with("[]");
+        let over = TRANSFER_MEMBER_MAX_BYTES + 1;
+        assert!(admit_transfer_manifest(&bytes, &[member("a", over)]).is_err());
+    }
+
+    #[test]
+    fn inventory_total_includes_manifest_bytes_and_is_capped() {
+        let bytes = manifest_with("[]");
+        // Members sum to exactly the cap, but the manifest's own bytes push it over.
+        let members_sum = TRANSFER_INVENTORY_MAX_BYTES - bytes.len() as u64 + 1;
+        let total = transfer_inventory_bytes(&bytes, &[member("a", members_sum)]).unwrap();
+        assert_eq!(total, TRANSFER_INVENTORY_MAX_BYTES + 1);
+        assert!(admit_transfer_manifest(&bytes, &[member("a", members_sum)]).is_err());
+    }
+}
+/// The 17 top-level keys the hosted manifest parser admits.
+const TRANSFER_MANIFEST_KEYS: &[&str] = &[
+    "format",
+    "scope",
+    "full_workspace",
+    "created_at",
+    "source_uuid",
+    "cadence",
+    "schema_version",
+    "tracker_revision",
+    "pm_root",
+    "tables",
+    "omitted_tables",
+    "omitted_rows",
+    "nulled_columns",
+    "disabled_columns",
+    "exclusions",
+    "redacted_message_bodies",
+    "members",
+];
+/// Hosted member path bound, counted in UTF-16 code units (JavaScript length).
+pub const TRANSFER_MEMBER_PATH_MAX_UNITS: usize = 512;
+/// Hosted per-member byte bound (512 MiB).
+pub const TRANSFER_MEMBER_MAX_BYTES: u64 = 512 * 1024 * 1024;
+/// Hosted inventory total bound (2 GiB): members plus the manifest's own bytes.
+pub const TRANSFER_INVENTORY_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Transfer bounds the hosted packed-v1 endpoint enforces. The CLI refuses a
 /// package outside them before any byte is sent; the server stays the
