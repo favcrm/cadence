@@ -31,15 +31,14 @@ The path is the version: `contracts/connected-platform/v<N>/`.
 
 ## How consumers use it
 
-**Cadence** — `tests/contract_fixture.rs` loads this directory
-(`CARGO_MANIFEST_DIR/contracts/connected-platform/v1/`), validates the
-table and every vector against the schemas, asserts malformed tables
-are really rejected, and checks each vector's expectations against the
-contract's classification rules (C1–C3) and the C6 press-authority
-invariant. A broken vector fails CI. Executing the vectors through the
-real gate is CAD-506's job; the seam is the `step`/`expect` vocabulary
-plus the fake platform (`src/contract_fixture.rs`,
-`FakePlatform::standard()`).
+**Cadence** — the vector driver `tests/contract_fixture.rs` was retired
+under CAD-1073; its absence is not evidence that every vector still runs
+in CI. `src/contract_fixture.rs` retains the production tool-table,
+classification and read-back vocabulary. Its unit check exercises
+fail-closed classification, and the connection-descriptor check uses
+`FakePlatform::standard()` in a test-only build. The shared schemas,
+table and vectors remain available for pinned consumers; the unused Rust
+pending-record mirrors are no longer maintained.
 
 **AgenticOS** (AOS-49/52) — vendor or fetch this directory at a pinned
 cadence commit; treat it as immutable. Validate `vectors.json` and
@@ -150,10 +149,11 @@ hashes match the declared source bytes.
 
 ## The fake adapter
 
-`src/contract_fixture.rs` ships `FakePlatform`: the deterministic
-platform-side double these vectors describe — this directory's
-`fake-tool-table.json` as its declared table, a recorded execution log
-("did it fire?"), idempotency-key dedupe (C9), source artifacts with
-sha256 hashes, and read-back/fault knobs matching `given.adapter`. No
-network, no credentials. Cadence's proxy and effect-gate tests
-(CAD-366/506) drive it; AgenticOS implements the same knobs.
+`src/contract_fixture.rs` provides `FakePlatform` only under `cfg(test)`:
+the deterministic platform-side double these vectors describe — this
+directory's `fake-tool-table.json` as its declared table, a recorded
+execution log ("did it fire?"), idempotency-key dedupe (C9), source
+artifacts with sha256 hashes, and read-back/fault knobs matching
+`given.adapter`. No network, no credentials. AgenticOS implements the
+same knobs; Cadence's active descriptor check does not execute every
+vector or prove all of those simulated behaviors.

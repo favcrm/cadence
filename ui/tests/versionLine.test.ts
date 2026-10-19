@@ -3,7 +3,7 @@ export {};
 declare function require(name: string): any;
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/" });
-for (const key of ["window", "document", "navigator", "HTMLElement", "Node", "Event", "KeyboardEvent", "location", "localStorage"]) {
+for (const key of ["window", "document", "navigator", "HTMLElement", "Node", "Event", "KeyboardEvent", "location", "history", "localStorage"]) {
   Object.defineProperty(globalThis, key, { value: key === "window" ? win : win[key], configurable: true });
 }
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
@@ -96,6 +96,7 @@ assert(runningRelease(null) === null, "no meta -> fallback");
   assert(host.querySelector("[role=dialog] [data-version-line]"), "version line is inside the open dialog");
   act(() => (host.querySelector("[data-version-line]") as HTMLElement).click());
   assert(!host.querySelector("[role=dialog]"), "clicking the version line closes the dialog");
+  assert(win.location.pathname === "/settings/update", `version link navigates to update settings: ${win.location.pathname}`);
   done();
 }
 console.log("versionLine tests passed");

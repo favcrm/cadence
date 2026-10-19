@@ -193,10 +193,6 @@ export function kickoffBlock(items: AcceptanceItem[], writeBlock: string | null)
   return writeBlock;
 }
 
-export function askAgentReason(agentCount: number): string | null {
-  return agentCount > 0 ? null : "No lane yet";
-}
-
 export interface PrRef {
   label: string;
   href: string | null;
@@ -208,17 +204,6 @@ export function prRef(refs: Ref[]): PrRef | null {
   const fromUrl = ref.url?.match(/\/pull\/(\d+)/);
   const label = ref.label ?? (fromUrl ? `PR #${fromUrl[1]}` : "PR");
   return { label, href: ref.url ?? null };
-}
-
-/** Branch ref for the lane card. The card truncates it and keeps the full name on `title`. */
-export function laneBranch(refs: Ref[]): string | null {
-  const branch = refs.find((r) => r.kind === "branch");
-  return branch?.label || branch?.path || null;
-}
-
-export function worktreePath(refs: Ref[]): string | null {
-  const wt = refs.find((r) => r.kind === "worktree");
-  return wt?.path ?? wt?.label ?? null;
 }
 
 /** First plain line of the body, for the peek. Titles and this line render as text. */
