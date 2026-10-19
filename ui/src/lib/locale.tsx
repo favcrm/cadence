@@ -1252,6 +1252,13 @@ Object.assign(zhTW, {
   "Operator (name unknown)": "操作員（姓名未知）",
   "Send refused. Your draft is kept. ": "傳送遭拒絕，已保留草稿。 ",
   "Delivery uncertain — check history before retrying. Your draft is kept. ": "遞送結果不明，請先檢查記錄再重試。已保留草稿。 ",
+  "Back to draft": "返回草稿",
+  "Review before starting": "開始前審查",
+  "Add your details for {context}. You can review everything before starting.": "填寫「{context}」的內容。開始前，你可以審查所有資料。",
+  "Set up this app once before starting. Your draft stays here while you do.": "開始前，請先完成一次應用程式設定。設定期間，草稿會保留在這裡。",
+  "Set up app": "設定應用程式",
+  "App setup": "應用程式設定",
+  "Manage team": "管理團隊",
 });
 
 export function useLocale(): LocaleContextValue {

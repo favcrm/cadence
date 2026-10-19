@@ -107,6 +107,27 @@ and verification together. A worker report is not independent review,
 merge or deployment evidence. Activity, Conversation, Pull request and
 Evidence remain the detailed views; feedback uses the existing conversation.
 
+### Create minutes from a transcript
+
+In an approved Meeting minutes installation, **New minutes** opens the content
+form immediately. The app's declaration controls its field order and defaults:
+app 0.2.3 puts the transcript first and makes the title optional. Paste the
+transcript as one paragraph; native workflow inputs currently reject line breaks
+and unsupported whitespace rather than silently rewriting the text.
+
+If the app has no usable team, you can still enter the draft. **Set up app**
+opens the existing team settings; **Back to draft** keeps the exact entered
+text. Saving a valid team returns to the form without starting work. A configured
+team is reused; its assignments and **Manage team** are under **App setup**.
+Neither the form nor setup automatically chooses workers or providers.
+
+**Review draft** prepares a scope-bound snapshot. Review its inputs and distinct
+writer/reviewer assignments, then explicitly **Approve and start**. Setup alone
+never creates, approves or dispatches a run. Draft text stays in this dialog's
+memory, not browser storage: closing it, losing authorization or changing its
+installation/context ends that draft. Recording and speech-to-text are not part
+of this flow.
+
 ## What it gives you
 
 - **Durable messaging** — every assignment, acknowledgement and result is a
