@@ -411,10 +411,14 @@ name. Never run `rm <scratchpad>/*`.
   scoped lock AND commit through the scoped wrapper. `src/issue/lock_tests.rs`
   has a guard test that fails the build when a function pairs a scoped lock
   with the unscoped commit; extend it when you add a caller.
-- A global Git hazard (`index.lock`, a merge/rebase/cherry-pick state)
-  refuses EVERY write, scoped or not. A legacy or foreign `.write.lock` is
-  not this build's crash to clear: never delete it as routine, and never
-  treat a file's age as authority.
+- While a crashed writer's marker stands, a global Git hazard
+  (`index.lock`, a merge/rebase/cherry-pick state) refuses EVERY write,
+  scoped or not: a path-local recovery cannot settle Git-global state.
+  Without that marker the hazard is NOT an admission refusal — the write
+  is admitted and Git itself refuses the commit, so a write can touch
+  files before it fails. A legacy or foreign `.write.lock` is not this
+  build's crash to clear: never delete it as routine, and never treat a
+  file's age as authority.
 - The operator-facing recovery flow for an interrupted write is a separate
   operator decision, not something an agent performs. Until it exists, the
   only remedy is the tracker's owner settling the leftovers by hand; an
