@@ -343,6 +343,9 @@ canonical `master` agent only: any other recipient spelling is a typed
 refusal, and the daemon resolves the exact `master` agent row — another
 worker's session or thread id that happens to spell `master` is never
 substituted, and no refusal silently reroutes or enqueues elsewhere.
+The selected row's UID is checked inside the enqueue transaction; removing
+or replacing that recipient before enqueue refuses the send rather than
+allowing a later generic lookup to redirect it.
 Personal assistants require separate assistant authority and local workers
 use the `local-agent`/local-assignment plane; both are unsupported
 remote-send recipient classes. Member-to-member remote coordination and

@@ -147,7 +147,9 @@ a durable coordination enqueue to the hosted master for a verified human
 workspace owner. The recipient fence is the canonical `master` agent
 only: the raw spelling must be `master` *and* the daemon resolves the
 exact `master` agent row — a native session/thread id that happens to
-spell `master` never substitutes, and no refusal silently reroutes or
+spell `master` never substitutes. The selected row's UID is retained through
+shared send and checked inside the enqueue transaction, so lifecycle removal
+or replacement cannot redirect the request. No refusal silently reroutes or
 enqueues elsewhere. Personal-assistant and local-worker recipients are
 typed unsupported-class refusals: separate assistant authority or local
 assignments are required, never a reroute or generic container execution.
@@ -184,6 +186,18 @@ the original identity and workspace before a same-ID retry; no automatic
 post-forward replay. Passive inbox inspection requires a human owner and
 does not expose managed assistants' private conversation. Accepted/queued
 is not delivery or completion; an offline recipient stays queued.
+
+Canonical-recipient acceptance is exercised at two boundaries. The independent
+`cad1584_http_master_native_collision_refused_then_canonical_home_preserved`
+check sends signed owner requests through the real isolated HTTP relay,
+requires refusal without a durable enqueue for native-ID collisions, and pairs
+that refusal with canonical-master Home, duplicate and owned-read controls.
+`cad1584_selected_uid_lifecycle_fence_refuses_removal_and_replacement`
+retains the selected UID, removes or replaces its registration, and exercises
+the shared-send transaction fence. The latter proves the selected-row boundary,
+not a deterministic lifecycle interleaving inside the HTTP handler. Run both
+with `cargo test --locked --features test-seam --lib cad1584_ -- --test-threads 2`
+under the repository's build-slot admission.
 
 Client-side refusals (CAD-1179 — refused before any bytes leave the
 process): `issue new` without `--project`, or with `--id`/`--status`;

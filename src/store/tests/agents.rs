@@ -574,33 +574,3 @@
         assert!(err.to_string().contains("unknown team role"), "{err}");
         assert!(s.agent_opt("sneak").unwrap().is_none());
     }
-
-    /// CAD-1578: a native thread id equal to `master` must not resolve to
-    /// that agent by alias. `cli_recipient` resolves `master` with
-    /// `agent_opt` only, so this lookup must miss even though the native
-    /// fallback (`agent_by_native`) would hit.
-    #[test]
-    fn master_alias_lookup_does_not_match_a_native_thread_id() {
-        let (dir, s) = store();
-        let cwd = dir.path().join("w");
-        reg(&s, "worker", &cwd);
-        s.set_identity(
-            "worker",
-            &crate::adapter::Identity {
-                thread_id: "master".into(),
-                session_id: "session".into(),
-                model: None,
-                effort: None,
-                pid: 1,
-                endpoint: None,
-                generation: None,
-                attach: None,
-            },
-        )
-        .unwrap();
-        assert!(s.agent_opt("master").unwrap().is_none());
-        assert_eq!(
-            s.agent_by_native("master").unwrap().unwrap().alias,
-            "worker"
-        );
-    }
