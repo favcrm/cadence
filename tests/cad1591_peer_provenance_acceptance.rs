@@ -766,7 +766,7 @@ fn expected_recipient_uid_fences_recipient_on_rpc_and_http_without_side_effects(
         ("agent:w-other", "t1591-who-agent-http"),
         ("unproven", "t1591-who-unproven-http"),
     ] {
-        let (status, reply) = fx.http(
+        let (status, reply, _) = fx.http(
             who,
             route,
             json!({"text":"x","message":id,"expected_recipient_uid":pc_uid}),
