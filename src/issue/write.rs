@@ -683,10 +683,24 @@ fn lock_for_new_issue(
     explicit_id: Option<&str>,
 ) -> Result<(PmLock, String)> {
     /// Bounded: each round finds the id another writer took, and the
-    /// ids are handed out in order, so this converges.
-    const ROUNDS: usize = 16;
+    /// ids are handed out in order, so this converges. A writer can
+    /// lose once to every writer ahead of it, so the bound is generous
+    /// against realistic concurrency; past it the caller is told to
+    /// retry, not that the creation is refused.
+    const ROUNDS: usize = 64;
+    lock_for_new_issue_rounds(pm, project, explicit_id, ROUNDS)
+}
+
+/// [`lock_for_new_issue`] with the retry bound as a parameter, so the
+/// exhausted case is reachable in a test.
+fn lock_for_new_issue_rounds(
+    pm: &Pm,
+    project: &project::Project,
+    explicit_id: Option<&str>,
+    rounds: usize,
+) -> Result<(PmLock, String)> {
     let root = pm.dir.join(&project.key);
-    for _ in 0..ROUNDS {
+    for _ in 0..rounds {
         let candidate = match explicit_id {
             Some(id) => id.to_string(),
             None => format!("{}-{}", project.prefix, next_id(&root, &project.prefix)?),
@@ -706,7 +720,11 @@ fn lock_for_new_issue(
         // Give the lock back and take the next one.
         drop(lock);
     }
-    Err(Error::rejected(
+    // Contention, not a refusal: another writer took the candidate id
+    // in every round. `busy` (exit 75) is the retryable kind, so a
+    // contract-compliant caller retries instead of treating the
+    // creation as permanently rejected.
+    Err(Error::busy(
         "the tracker is too busy to allocate a new id right now — retry in a moment",
     ))
 }
@@ -3520,6 +3538,28 @@ mod tests {
         assert!(e.to_string().contains("locked"), "{e}");
         assert!(t.elapsed() < std::time::Duration::from_secs(2));
         drop(held);
+    }
+
+    /// CAD-1600: exhausting the id-allocation retries is CONTENTION,
+    /// not a refusal. The error kind must be `busy` (exit 75, the one
+    /// kind a caller may retry blindly) and not `rejected` (exit 3,
+    /// which reads as "this will never work").
+    #[test]
+    fn an_exhausted_id_allocation_is_busy_not_rejected() {
+        let (_dir, pm) = tracker();
+        let project = crate::issue::project::list(&pm.dir)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.key == "cadence")
+            .unwrap();
+        let e = lock_for_new_issue_rounds(&pm, &project, None, 0)
+            .expect_err("no rounds means no allocation");
+        assert_eq!(e.kind(), "busy", "{e}");
+        assert_eq!(
+            crate::error::exit_code_for_kind(e.kind()),
+            75,
+            "a busy allocation must exit 75"
+        );
     }
 
     /// CAD-449: a comment whose commit fails removes its file and its
