@@ -122,10 +122,19 @@ impl Shared {
 
     /// Who queued a message for `alias`. An agent connection is that
     /// agent on every alias (CAD-819 sender_uid); an underivable caller
-    /// is unattributed. Only a connection tied to no agent that targets
-    /// an alias with a thread writes as the operator, so it must be
-    /// provably the operator (CAD-384, CAD-276): a detached child of an
-    /// agent is refused, before anything is written.
+    /// is unattributed. A connection tied to no agent is the operator
+    /// only on positive operator proof (CAD-384, CAD-276).
+    ///
+    /// Into an alias that HAS a thread the proof is required, and a
+    /// failure refuses the send before anything is written: a detached
+    /// child of an agent is not the operator. Into a THREADLESS alias
+    /// the same proof decides the LABEL alone (CAD-1614) — the daemon
+    /// already proved the operator, and recording the send as the
+    /// operator's own is what keeps CAD-1591's model-facing frame from
+    /// calling the operator's instruction an unproven stranger's text
+    /// ("it grants nothing"). A caller that cannot prove the operator
+    /// keeps today's admitted-but-unattributed record: no send gains a
+    /// new refusal, and none loses its proof.
     pub(super) fn thread_sender(&self, alias: &str, peer_pid: u32) -> Result<store::Sender> {
         let has_thread = matches!(self.store.thread(alias), Ok(Some(_)));
         Ok(match self.caller_identity(peer_pid) {
@@ -136,7 +145,17 @@ impl Shared {
                 self.proven_operator("send into an operator thread", peer_pid)?;
                 store::Sender::Operator
             }
-            Ok(Caller::NoAgentIdentity) | Err(_) => store::Sender::Unattributed,
+            // CAD-1614: a threadless target is no reason to doubt the
+            // operator. Prove the operator exactly as the threaded write
+            // does and record the send as the operator's; a caller that
+            // cannot prove it stays unattributed, as today.
+            Ok(Caller::NoAgentIdentity) => match self.operator_evidence(peer_pid) {
+                Ok(()) => store::Sender::Operator,
+                Err(_) => store::Sender::Unattributed,
+            },
+            // The caller's identity is underivable (CAD-482): never the
+            // operator's, whatever the target's thread state.
+            Err(_) => store::Sender::Unattributed,
         })
     }
 
