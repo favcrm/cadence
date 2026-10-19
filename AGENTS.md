@@ -414,11 +414,13 @@ name. Never run `rm <scratchpad>/*`.
 - While a crashed writer's marker stands, a global Git hazard
   (`index.lock`, a merge/rebase/cherry-pick state) refuses EVERY write,
   scoped or not: a path-local recovery cannot settle Git-global state.
-  Without that marker the hazard is NOT an admission refusal — the write
-  is admitted and Git itself refuses the commit, so a write can touch
-  files before it fails. A legacy or foreign `.write.lock` is not this
-  build's crash to clear: never delete it as routine, and never treat a
-  file's age as authority.
+  WITHOUT that marker the hazard is not a refusal at all — the tracker
+  admits the write and hands it to Git, and Git's own answer varies: an
+  `index.lock` makes the commit fail, while a merge or a rebase in
+  progress can accept the commit. Never rely on the tracker to refuse a
+  write because of a Git-global state. A legacy or foreign `.write.lock`
+  is not this build's crash to clear: never delete it as routine, and
+  never treat a file's age as authority.
 - The operator-facing recovery flow for an interrupted write is a separate
   operator decision, not something an agent performs. Until it exists, the
   only remedy is the tracker's owner settling the leftovers by hand; an
