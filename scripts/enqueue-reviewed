@@ -373,6 +373,10 @@ def required_check_reasons(repo, head, required, rollup, runs):
             continue
         if app is not None:
             cruns = [r for r in cruns if r["app"]["id"] == app]
+        bad = sorted({s for s in statuses.get(name, []) if s != "SUCCESS"})
+        if bad:
+            reasons.append(f"required status '{name}' is not successful ({', '.join(bad)}) at head {head[:12]}")
+            continue
         if not cruns:
             if app is None and statuses.get(name):
                 continue  # a successful commit status of an unbound name
@@ -418,6 +422,10 @@ def required_check_reasons(repo, head, required, rollup, runs):
                 reasons.append(f"required check '{name}' is not successful ({check.get('conclusion')}) at head {head[:12]}")
                 continue
             proofs[name] = current["html_url"]
+        if name not in proofs:
+            # A required context with no pull_request evidence at this head is
+            # unproven: it never counts as satisfied by another context's run.
+            reasons.append(f"required check '{name}' has no pull_request evidence at head {head[:12]}")
     return reasons, proofs
 
 
