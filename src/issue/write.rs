@@ -666,9 +666,69 @@ pub(crate) fn next_id(dir: &Path, prefix: &str) -> Result<u64> {
     Ok(max + 1)
 }
 
-/// CAD-614: `issue new` always creates a backlog ticket. The master
-/// may not pass `--owner` or `--id` (those are operator overrides);
-/// any caller passing `--status` other than `backlog` is refused.
+/// CAD-1600: allocate the next id and take the tracker lock scoped to
+/// the new ticket's own directory.
+///
+/// The scope must be known before the lock is taken, and the id is
+/// only known after the project is read. So the candidate id is read
+/// first and re-checked under the lock: every writer serializes on the
+/// same kernel lock, so an id another writer took while we waited is
+/// detected and the allocation is retried with the next one. The
+/// allocation therefore stays unique under concurrency, while the
+/// scope stays narrow: a crashed writer's leftovers on other tickets
+/// do not refuse an unrelated new ticket.
+fn lock_for_new_issue(
+    pm: &Pm,
+    project: &project::Project,
+    explicit_id: Option<&str>,
+) -> Result<(PmLock, String)> {
+    /// Bounded: each round finds the id another writer took, and the
+    /// ids are handed out in order, so this converges. A writer can
+    /// lose once to every writer ahead of it, so the bound is generous
+    /// against realistic concurrency; past it the caller is told to
+    /// retry, not that the creation is refused.
+    const ROUNDS: usize = 64;
+    lock_for_new_issue_rounds(pm, project, explicit_id, ROUNDS)
+}
+
+/// [`lock_for_new_issue`] with the retry bound as a parameter, so the
+/// exhausted case is reachable in a test.
+fn lock_for_new_issue_rounds(
+    pm: &Pm,
+    project: &project::Project,
+    explicit_id: Option<&str>,
+    rounds: usize,
+) -> Result<(PmLock, String)> {
+    let root = pm.dir.join(&project.key);
+    for _ in 0..rounds {
+        let candidate = match explicit_id {
+            Some(id) => id.to_string(),
+            None => format!("{}-{}", project.prefix, next_id(&root, &project.prefix)?),
+        };
+        let dir = root.join(&candidate);
+        let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
+        // Under the lock nobody else can allocate: the id is ours if
+        // it is still the next one.
+        let taken = match explicit_id {
+            Some(id) => id.to_string(),
+            None => format!("{}-{}", project.prefix, next_id(&root, &project.prefix)?),
+        };
+        if taken == candidate {
+            return Ok((lock, candidate));
+        }
+        // Another writer took this id while we waited for the lock.
+        // Give the lock back and take the next one.
+        drop(lock);
+    }
+    // Contention, not a refusal: another writer took the candidate id
+    // in every round. `busy` (exit 75) is the retryable kind, so a
+    // contract-compliant caller retries instead of treating the
+    // creation as permanently rejected.
+    Err(Error::busy(
+        "the tracker is too busy to allocate a new id right now — retry in a moment",
+    ))
+}
+
 /// Refusals name the allowed form.
 pub fn master_issue_new_limits(
     caller_is_master: bool,
@@ -737,15 +797,12 @@ pub fn new_issue(
         check_component(&project, component)?;
     }
     let tags = check_tags(&project, tags)?;
-    let lock = pm.lock_for_paths(std::slice::from_ref(&pm.dir.join(&project.key)))?;
-    let id = match explicit_id {
-        Some(id) => id.to_string(),
-        None => format!(
-            "{}-{}",
-            project.prefix,
-            next_id(&pm.dir.join(&project.key), &project.prefix)?
-        ),
-    };
+    // CAD-1600: the lock is scoped to the new ticket's own directory,
+    // not to the whole project, so a crashed writer's leftovers on
+    // other tickets do not refuse an unrelated allocation. The id is
+    // still allocated under the same real kernel lock, so concurrent
+    // writers keep getting unique ids.
+    let (lock, id) = lock_for_new_issue(pm, &project, explicit_id)?;
     let dir = pm.dir.join(&project.key).join(&id);
     if dir.exists() {
         return Err(Error::rejected(format!(
@@ -2018,10 +2075,18 @@ pub(crate) fn mark_done_on_merge_waiting_with(
     clock: &dyn WaitClock,
 ) -> std::result::Result<Option<String>, DoneWriteFailure> {
     let lock = (|| -> Result<PmLock> {
+        // CAD-1600: this write touches exactly one issue.md, so the
+        // lock is scoped to it. An interrupted writer's leftovers on
+        // other paths no longer refuse the close (see
+        // `Pm::try_lock_for_paths`); overlapping leftovers and global
+        // Git hazards still do.
+        let (_project, dir) = issue_dir(pm, id)?;
+        let file = dir.join("issue.md");
+        let scope = std::slice::from_ref(&file);
         let deadline = clock.now() + wait;
         let mut backoff = Duration::from_millis(50);
         loop {
-            if let Some(lock) = pm.try_lock()? {
+            if let Some(lock) = pm.try_lock_for_paths(scope)? {
                 return Ok(lock);
             }
             let left = deadline.saturating_duration_since(clock.now());
@@ -2040,9 +2105,12 @@ pub(crate) fn mark_done_on_merge_waiting_with(
 
 /// The same status CAS, plan gate and rollback under an already held tracker
 /// lock. Daemon callers validate final native authority in this critical section.
+/// The lock must be scoped to this issue's `issue.md` (see
+/// [`mark_done_on_merge_waiting_with`]); an unscoped `Full` guard commits as
+/// before, but its acquisition is refused beside any interrupted leftovers.
 pub(crate) fn mark_done_on_merge_locked(
     pm: &Pm,
-    _lock: &PmLock,
+    lock: &PmLock,
     id: &str,
     why: &str,
     actor: &str,
@@ -2063,8 +2131,9 @@ pub(crate) fn mark_done_on_merge_locked(
         let file = dir.join("issue.md");
         let original = std::fs::read(&file)?;
         let written = save_front(&dir, &front, &body).and_then(|_| {
-            commit(
+            commit_scoped(
                 pm,
+                lock,
                 std::slice::from_ref(&file),
                 &format!("{id}: set status=done — {why}"),
                 &[id],
@@ -3469,6 +3538,28 @@ mod tests {
         assert!(e.to_string().contains("locked"), "{e}");
         assert!(t.elapsed() < std::time::Duration::from_secs(2));
         drop(held);
+    }
+
+    /// CAD-1600: exhausting the id-allocation retries is CONTENTION,
+    /// not a refusal. The error kind must be `busy` (exit 75, the one
+    /// kind a caller may retry blindly) and not `rejected` (exit 3,
+    /// which reads as "this will never work").
+    #[test]
+    fn an_exhausted_id_allocation_is_busy_not_rejected() {
+        let (_dir, pm) = tracker();
+        let project = crate::issue::project::list(&pm.dir)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.key == "cadence")
+            .unwrap();
+        let e = lock_for_new_issue_rounds(&pm, &project, None, 0)
+            .expect_err("no rounds means no allocation");
+        assert_eq!(e.kind(), "busy", "{e}");
+        assert_eq!(
+            crate::error::exit_code_for_kind(e.kind()),
+            75,
+            "a busy allocation must exit 75"
+        );
     }
 
     /// CAD-449: a comment whose commit fails removes its file and its

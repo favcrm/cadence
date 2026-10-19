@@ -196,7 +196,13 @@ pub fn edit(
 
     // Phase 2 — under the lock, apply every part to the front and body
     // in memory. Nothing is on disk until all of it holds.
-    let _lock = pm.lock()?;
+    //
+    // CAD-1600: the lock is scoped to this ticket's own directory —
+    // the edit writes `issue.md` and files under `artifacts/` and
+    // `comments/`, all inside it. A crashed writer's leftovers on
+    // other tickets no longer refuse an unrelated edit, while a
+    // leftover inside this ticket still does.
+    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
     let (prev, prev_body) = write::load_front(&dir)?;
     let mut front = prev.clone();
     let mut body = prev_body.clone();
@@ -372,7 +378,15 @@ pub fn edit(
         if let Some(reason) = &forced {
             summary.push_str(&format!(" (forced: {reason})"));
         }
-        write::commit_who(pm, &paths, &summary, &ids, actor, spec.author.as_deref())
+        write::commit_who_scoped(
+            pm,
+            &lock,
+            &paths,
+            &summary,
+            &ids,
+            actor,
+            spec.author.as_deref(),
+        )
     })();
     let foreign = match written {
         Ok(f) => f,
