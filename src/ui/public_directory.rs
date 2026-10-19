@@ -25,19 +25,18 @@ pub(super) fn directory_surface(path: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// A hosted board has no internet: when the issuer is exactly
-/// `http://api.internal`, that outbound handler is the catalog. Otherwise the
-/// catalog is whatever `AGENTICOS_BOARD_CATALOG_ORIGIN` names — an operator's
-/// own API, or a loopback rig. `AGENTICOS_BOARD_API_ORIGIN` is the signed-in
-/// web app this board talks back to; it is not a catalog, and reading it here
-/// pointed the public directory at the private app.
+/// Hosted boards retain their internal metadata route. Other boards use the
+/// operator's explicit catalog, or the public AgenticOS catalog by default.
+/// Neither a signed-in web-app origin nor an arbitrary issuer is a catalog.
 pub(super) fn catalog_origin_from(catalog: Option<&str>, issuer: Option<&str>) -> Option<String> {
     if let Some(issuer) = issuer.map(str::trim).filter(|v| !v.is_empty()) {
         if issuer.trim_end_matches('/') == "http://api.internal" {
             return Some("http://api.internal".to_string());
         }
     }
-    let raw = catalog.filter(|v| !v.trim().is_empty())?;
+    let raw = catalog
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or("https://api-v2.agenticos.hk");
     let raw = raw.trim().trim_end_matches('/');
     if raw.contains(['?', '#', '@', ' ']) {
         return None;
@@ -300,8 +299,8 @@ mod tests {
         );
         // A rig or a self-hosted board names its own catalog.
         assert_eq!(
-            catalog_origin_from(Some("https://api-v2.agenticos.hk/"), None).as_deref(),
-            Some("https://api-v2.agenticos.hk")
+            catalog_origin_from(Some("https://catalog.example/"), None).as_deref(),
+            Some("https://catalog.example")
         );
         assert_eq!(
             catalog_origin_from(
@@ -311,13 +310,40 @@ mod tests {
             .as_deref(),
             Some("http://127.0.0.1:8787")
         );
-        // The signed-in web app is not a catalog, and an issuer alone is not one.
-        assert!(catalog_origin_from(None, Some("https://app-v2.agenticos.hk")).is_none());
-        assert!(catalog_origin_from(None, Some("https://ignored.example")).is_none());
-        // Still refused: plain http off loopback and query strings.
-        assert!(catalog_origin_from(Some("http://evil.example"), None).is_none());
-        assert!(catalog_origin_from(Some("https://api.example/?x=1"), None).is_none());
-        assert!(catalog_origin_from(None, Some("http://api.internal.evil")).is_none());
+        // Empty environment overrides behave like an unset override.
+        for catalog in [Some(""), Some("   ")] {
+            assert_eq!(
+                catalog_origin_from(catalog, None).as_deref(),
+                Some("https://api-v2.agenticos.hk")
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_explicit_catalog_refuses_fallback_except_for_hosted_boards() {
+        for invalid in ["http://catalog.example", "https://catalog.example/?x=1"] {
+            for issuer in [
+                None,
+                Some("https://app-v2.agenticos.hk"),
+                Some("http://api.internal.evil"),
+            ] {
+                assert_eq!(
+                    catalog_origin_from(Some(invalid), issuer),
+                    None,
+                    "invalid explicit catalog must refuse: {invalid}, issuer: {issuer:?}"
+                );
+                assert_eq!(
+                    catalog_origin_from(None, issuer).as_deref(),
+                    Some("https://api-v2.agenticos.hk")
+                );
+            }
+
+            assert_eq!(
+                catalog_origin_from(Some(invalid), Some("http://api.internal")).as_deref(),
+                Some("http://api.internal"),
+                "hosted metadata routing must precede explicit catalog validation"
+            );
+        }
     }
 
     #[test]

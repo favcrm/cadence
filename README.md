@@ -78,10 +78,16 @@ deliberately serving a board in the foreground without one already running.
 
 ### Browse and update apps
 
-On a configured host, open **Apps → Explore apps**. Each card opens its full
+Open **Apps → Explore apps**. Each card opens its full
 details; installed apps keep local Open and operator Manage links even when
 the public catalogue is unavailable. **Choose favorites** keeps quick links
 on the Apps page and in the sidebar.
+
+Standalone boards use `https://api-v2.agenticos.hk` for the public catalogue
+by default. Set `AGENTICOS_BOARD_CATALOG_ORIGIN` only for a custom catalogue;
+invalid explicit values are refused, not replaced with the default. Hosted
+boards retain their internal catalogue route. These reads do not grant
+installation, connection or execution approval.
 
 An operator selects a published version, chooses **Review installation** or
 **Review update**, inspects access and compatibility, then confirms the exact
