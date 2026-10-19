@@ -1213,6 +1213,10 @@ mod tests {
             "catalog.import",
             "grant.request",
             "unknown.op",
+            // The hosted contract (AgenticOS) does not carry this read yet, so
+            // a remote call fails closed to the write scope rather than
+            // claiming a settings.read the gateway would reject.
+            "fleet.check",
         ] {
             assert_eq!(
                 cadence_agent::remote_cli::settings_op_scope(op),
@@ -1226,7 +1230,6 @@ mod tests {
             "grant.list",
             "history",
             "profile.preview",
-            "fleet.check",
         ] {
             assert_eq!(
                 cadence_agent::remote_cli::settings_op_scope(op),

@@ -1717,7 +1717,10 @@ fn fleet_verdicts(policy: Option<&PiPolicy>, rows: &[FleetRow]) -> Value {
         } else {
             "worker"
         };
-        let (model, refusal) = match row.model.map(str::trim).filter(|m| !m.is_empty()) {
+        // Trim only to detect a missing/blank model: `PiAdapter::open` passes
+        // the original non-empty string to the exact-membership allowlist
+        // check, so a padded id is refused at launch and must be refused here.
+        let (model, refusal) = match row.model.filter(|model| !model.trim().is_empty()) {
             Some(model) => (
                 Some(model),
                 pi_policy::require_allowed(policy, role, model).err(),
@@ -2572,14 +2575,17 @@ mod fleet_check_tests {
             // PiAdapter::open refuses a row with no params.model — the report
             // must not invent a fallback that the launch never uses.
             row("dev-c", "pi", None),
+            // A padded id is passed to the exact-membership allowlist check at
+            // launch, so trimming it here would report a false launchable.
+            row("dev-d", "pi", Some(" devin/swe-2-high ")),
             row("codex-a", "codex", Some("openai-codex/gpt-6.1-sol")),
         ];
         let report = fleet_verdicts(Some(&policy()), &rows);
-        assert_eq!(report["checked"], 4);
+        assert_eq!(report["checked"], 5);
         assert_eq!(report["not_gated"], 1);
         assert_eq!(report["launchable"], 2);
         let refused = report["refused"].as_array().expect("refused rows");
-        assert_eq!(refused.len(), 2);
+        assert_eq!(refused.len(), 3);
         assert_eq!(refused[0]["alias"], "dev-b");
         assert_eq!(refused[0]["role"], "worker");
         assert!(refused[0]["reason"]
@@ -2591,6 +2597,11 @@ mod fleet_check_tests {
             .as_str()
             .unwrap_or("")
             .contains("no model configured"));
+        assert_eq!(refused[2]["alias"], "dev-d");
+        assert!(refused[2]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("allowlist"));
     }
 
     /// An absent policy allows nothing; the check must report that instead of
