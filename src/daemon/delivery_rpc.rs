@@ -1465,7 +1465,19 @@ impl Shared {
         let pr_ref = rec_pr_ref(rec);
         let actor = format!("operator (delivery {pr_ref})");
         let why = format!("{pr_ref} merged at {head}");
-        let lock = pm.try_lock().and_then(|lock| {
+        // CAD-1609: the close writes ONE issue.md, so the lock is
+        // scoped to it. A crashed writer's leftovers on OTHER paths no
+        // longer refuse the close, while leftovers on this ticket still
+        // do. The daemon never waits for the lock either way.
+        let scoped = crate::issue::write::issue_dir(pm, id)
+            .ok()
+            .map(|(_, dir)| dir.join("issue.md"));
+        let lock = match &scoped {
+            Some(path) => pm.try_lock_for_paths(std::slice::from_ref(path)),
+            // The ticket's folder is gone: the write below says so.
+            None => pm.try_lock(),
+        }
+        .and_then(|lock| {
             lock.ok_or_else(|| {
                 Error::rejected("the tracker is locked by another writer (write lock)")
             })
