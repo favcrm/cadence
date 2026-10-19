@@ -154,11 +154,15 @@ class Case(scope.Case):
                 "title_outcome": "pass", "section_outcome": "pass",
                 "risk": "human", "from": "rev"}
 
+    def effective_rollup(self):
+        """The one rollup both gh endpoints serve: a flip applies from its view count on."""
+        if self.rollup_flip_at is not None and self.view_calls >= self.rollup_flip_at:
+            return [{"name": "ci", "status": "COMPLETED", "conclusion": "FAILURE"}]
+        return self.rollup
+
     def pr_view(self):
         self.view_calls += 1
-        rollup = self.rollup
-        if self.rollup_flip_at is not None and self.view_calls >= self.rollup_flip_at:
-            rollup = [{"name": "ci", "status": "COMPLETED", "conclusion": "FAILURE"}]
+        rollup = self.effective_rollup()
         view = {"number": 5, "state": "OPEN", "title": self.title, "headRefName": self.branch,
                 "headRefOid": HEAD, "baseRefName": self.base_ref, "baseRefOid": BASE,
                 "mergeStateStatus": "CLEAN", "autoMergeRequest": None,
@@ -166,17 +170,20 @@ class Case(scope.Case):
         if self.stale_at is not None and self.view_calls >= self.stale_at:
             view.update(self.stale_fields)
         return 0, json.dumps(view), ""
+
     def check_runs(self):
-        """The required gate, read from the same rollup knob the PR view uses.
+        """The required gate, read from the same effective rollup the PR view uses.
         Shaped like `gh api commits/SHA/check-runs?check_name=...` output."""
         runs = []
-        if self.rollup and self.rollup[0]["conclusion"] is not None:
-            state = self.rollup[0]
+        rollup = self.effective_rollup()
+        if rollup and rollup[0]["conclusion"] is not None:
+            state = rollup[0]
             runs.append({"id": 117992467504, "name": state["name"], "head_sha": HEAD,
                          "status": state["status"].lower(), "conclusion": state["conclusion"].lower(),
                          "started_at": "2026-10-19T09:43:14Z", "completed_at": "2026-10-19T09:43:22Z",
                          "details_url": CI_URL, "app": TRUSTED_APP, "check_suite": {"id": CI_SUITE}})
         return 0, json.dumps({"total_count": len(runs), "check_runs": runs}), ""
+
 
     def run(self, argv, input_text=None):
         if argv[:3] == ["gh", "pr", "view"]:
