@@ -2087,6 +2087,22 @@ allowlists; Pi scopes distinguish master and worker runtime permissions.
 A profile's team role selects model preferences, never runtime authority.
 Drawers scroll vertically on short or narrow screens so job descriptions,
 model details, file targets and actions remain reachable without clipping.
+New harness and provider drawers keep the registry ID separate from the display
+label (for example, `claude` versus “Claude Code”). Closing a drawer keeps edits
+to existing rows in the page draft; Discard resets that draft and its status.
+An existing model's blank or duplicate ID stays visible as a validation error;
+Save model stays disabled until the ID is corrected.
+An empty registry shows empty states, not the mockup's demo rows. Providers &
+models follows the approved mockup without a Role defaults editor; stored
+defaults are preserved and inherited profiles still resolve them. Launch
+eligibility comes from saved-state Preview, not an optimistic unsaved badge.
+The operator-approved clean presentation omits the registry banner, subtitles
+and explanatory paragraphs. Information buttons expose page and field help on
+hover, keyboard focus or tap in styled, viewport-bounded top-layer tooltips.
+Escape dismisses help before closing its drawer; outside taps and scrolling
+dismiss help too. Touch pointers get 44px targets. Validation, failures, live
+status and concise empty states stay visible; Save and Discard remain grouped
+on narrow screens.
 
 Save commits harness/provider/model declarations, role defaults, Pi policy,
 pins and profile definitions in one revision-bound SQLite transaction.
