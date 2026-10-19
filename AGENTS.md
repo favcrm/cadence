@@ -99,14 +99,15 @@ the code you just wrote.
   - `strict` — the floor the evaluator falls back to: any activation other
     than the default lean policy — a malformed section, a custom section
     that is not operator-approved or was removed after approval, or a
-    policy that is not the default once its solo-operator field is
-    cleared — path lists that cannot be read, incomplete or unsafe diff
-    evidence, a delete, rename, type or mode change, and the
-    risk-trigger, human-class, one-review-excluded and oversize-diff
-    conditions. It keeps today's legacy floor and never fewer: one
-    combined review on the one-review list, else two (Standards and
-    Spec/security), and the operator floor on human-class paths and over
-    1500 changed lines.
+    policy that is not the default once its solo-operator and
+    integration-branch fields are cleared — path lists that cannot be
+    read, incomplete or unsafe diff evidence, a delete, rename, type or
+    mode change, a path or change shape outside the known one-review
+    include list, and the risk-trigger, human-class, one-review-excluded
+    and oversize-diff conditions. It keeps today's legacy floor and never
+    fewer: one combined review on the one-review list, else two (Standards
+    and Spec/security), and the operator floor on human-class paths and
+    over 1500 changed lines.
 - One independent review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
   path that does not (trust boundary, identity, secrets, `ui/**`) needs
