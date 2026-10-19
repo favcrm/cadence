@@ -224,7 +224,12 @@ impl Shared {
                 "master coordination requires a verified human workspace owner",
             ));
         }
-        self.resolve_alias(raw)
+        // Alias-only: `resolve_alias` also matches native thread/session ids,
+        // so a native id equal to "master" must not reach the owner's chat.
+        self.store
+            .agent_opt(raw)?
+            .map(|agent| agent.alias)
+            .ok_or_else(|| Error::rejected("Unknown managed agent"))
     }
 
     /// `cli_message_send` — the remote send. Closed params
