@@ -119,7 +119,7 @@ export async function startCapture(timeline: CaptureTimeline, callbacks: Capture
   try {
     await context.resume();
     stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
-    await context.audioWorklet.addModule(new URL("./pcmWorklet.js?no-inline", import.meta.url).href);
+    await context.audioWorklet.addModule("/recording-pcm-worklet.js");
     node = new AudioWorkletNode(context, "cadence-pcm-tap", { channelCount: 1, channelCountMode: "explicit" });
     node.onprocessorerror = () => fail("Audio capture stopped unexpectedly. Retry pending batches before leaving.");
     node.port.onmessage = (event: MessageEvent<{ type: string; samples?: Float32Array; peak?: number }>) => {
