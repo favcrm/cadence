@@ -283,6 +283,7 @@ def required_contexts(repo, base):
 
 
 CHECK_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+CI_WORKFLOW = ".github/workflows/ci.yml"
 
 
 def check_runs_at(repo, head, name):
@@ -308,13 +309,57 @@ def check_runs_at(repo, head, name):
     return runs
 
 
-def required_check_reasons(repo, head, required, rollup):
-    """(reasons, check suite ids of the successful required checks from GitHub Actions).
+def workflow_runs_at(repo, head):
+    """Every workflow run at the exact head, one entry per run id carrying that
+    run's latest attempt; shape-checked; fails closed.
 
-    Per required name only the newest check run from the bound app decides: an older
-    failure is superseded by a newer success, and an older success never hides a newer
-    failed, pending or ambiguous run. Same-named commit statuses must all succeed."""
-    reasons, suites = [], set()
+    The listing spans workflows and events: a check run is bound to the run that
+    produced it, and only a pull_request run is evidence for this PR."""
+    doc = gh_json(["api", f"repos/{repo}/actions/runs?head_sha={head}&per_page=100"])
+    runs = doc.get("workflow_runs") if isinstance(doc, dict) else None
+    total = doc.get("total_count") if isinstance(doc, dict) else None
+    if not isinstance(runs, list) or type(total) is not int or total != len(runs):
+        raise RuntimeError(f"cannot read every workflow run at head {head[:12]}")
+    for r in runs:
+        if not (isinstance(r, dict) and type(r.get("id")) is int and r["id"] > 0
+                and type(r.get("run_number")) is int and r["run_number"] > 0
+                and type(r.get("run_attempt")) is int and r["run_attempt"] > 0
+                and type(r.get("workflow_id")) is int and r["workflow_id"] > 0
+                and isinstance(r.get("path"), str) and r["path"]
+                and type(r.get("check_suite_id")) is int and r["check_suite_id"] > 0
+                and r.get("head_sha") == head and isinstance(r.get("event"), str) and r["event"]
+                and isinstance(r.get("status"), str)
+                and (r.get("conclusion") is None or isinstance(r.get("conclusion"), str))
+                and isinstance(r.get("run_started_at"), str) and CHECK_STAMP.fullmatch(r["run_started_at"])
+                and isinstance(r.get("html_url"), str)):
+            raise RuntimeError(f"malformed workflow run at head {head[:12]}")
+    return runs
+
+
+def current_attempt(runs):
+    """The newest attempt among one workflow's runs, by server-owned ordering."""
+    top = max(runs, key=lambda r: (r["run_number"], r["run_attempt"]))
+    if sum(1 for r in runs if (r["run_number"], r["run_attempt"]) == (top["run_number"], top["run_attempt"])) > 1:
+        raise RuntimeError("workflow attempts have ambiguous ordering")
+    return top
+
+
+def required_check_reasons(repo, head, required, rollup, runs):
+    """(reasons, {required name: proving run url}).
+
+    Every required context is proven by the current attempt of the workflow that
+    produces it: the newest check run of that name, from the required app, inside
+    the current pull_request attempt of its own workflow at this head. A superseded
+    attempt never decides; a current failed, pending, missing, mis-bound, untrusted
+    or ambiguous one refuses."""
+    reasons, proofs = [], {}
+    suite_run = {}
+    for r in runs:
+        suite_run.setdefault(r["check_suite_id"], []).append(r)
+    pr_runs = [r for r in runs if r["event"] == "pull_request"]
+    by_workflow = {}
+    for r in pr_runs:
+        by_workflow.setdefault(r["workflow_id"], []).append(r)
     statuses = {}
     for e in rollup or []:
         if isinstance(e, dict) and "context" in e:
@@ -322,36 +367,58 @@ def required_check_reasons(repo, head, required, rollup):
     for name in sorted(required):
         app = required[name]
         try:
-            runs = check_runs_at(repo, head, name)
+            cruns = check_runs_at(repo, head, name)
         except RuntimeError as e:
             reasons.append(str(e))
             continue
         if app is not None:
-            runs = [r for r in runs if r["app"]["id"] == app]
-        bad = sorted({s for s in statuses.get(name, []) if s != "SUCCESS"})
-        if bad:
-            reasons.append(f"required status '{name}' is not successful ({', '.join(bad)}) at head {head[:12]}")
-        elif not runs:
+            cruns = [r for r in cruns if r["app"]["id"] == app]
+        if not cruns:
             if app is None and statuses.get(name):
                 continue  # a successful commit status of an unbound name
             reasons.append(f"required check '{name}' is missing at head {head[:12]}")
-        else:
-            # Per app, its newest run decides: a success from one app never supersedes a
-            # failed, pending or ambiguous run of another app with the same name.
-            newest = {}
-            for r in runs:
-                newest.setdefault(r["app"]["id"], []).append(r)
-            for group in newest.values():
-                top = max(group, key=lambda r: (r["started_at"], r["id"]))
-                if sum(r["started_at"] == top["started_at"] for r in group) > 1:
-                    reasons.append(f"required check '{name}' has ambiguous newest runs at head {head[:12]}")
-                elif top["status"] != "completed":
-                    reasons.append(f"required check '{name}' is pending ({top['status']}) at head {head[:12]}")
-                elif top.get("conclusion") != "success":
-                    reasons.append(f"required check '{name}' is not successful ({top.get('conclusion')}) at head {head[:12]}")
-                elif top["app"]["slug"] == "github-actions":
-                    suites.add(top["check_suite"]["id"])
-    return reasons, suites
+            continue
+        bound, misbound = [], False
+        for r in cruns:
+            owners = suite_run.get(r["check_suite"]["id"]) or []
+            if len(owners) != 1:
+                reasons.append(f"required check '{name}' is not bound to one run at head {head[:12]}")
+                misbound = True
+                break
+            if owners[0]["event"] == "pull_request":
+                bound.append((r, owners[0]))
+            # A run of another event at this head is not this PR's evidence.
+        if misbound:
+            continue
+        groups = {}
+        for r, run in bound:
+            groups.setdefault(run["workflow_id"], []).append((r, run))
+        for wid, group in groups.items():
+            try:
+                current = current_attempt(by_workflow[wid])
+            except RuntimeError as e:
+                reasons.append(str(e))
+                continue
+            mine = [(r, run) for r, run in group if run["id"] == current["id"]]
+            if not mine:
+                reasons.append(f"required check '{name}' is not in the current attempt of its workflow at head {head[:12]}")
+                continue
+            top = max(mine, key=lambda pair: (pair[0]["started_at"], pair[0]["id"]))
+            if sum(1 for r, _ in mine if r["started_at"] == top[0]["started_at"]) > 1:
+                reasons.append(f"required check '{name}' has ambiguous newest runs at head {head[:12]}")
+                continue
+            check = top[0]
+            if check["started_at"] < current["run_started_at"]:
+                reasons.append(f"required check '{name}' is from a superseded attempt at head {head[:12]}")
+                continue
+            if check["status"] != "completed":
+                reasons.append(f"required check '{name}' is pending ({check['status']}) at head {head[:12]}")
+                continue
+            if check.get("conclusion") != "success":
+                reasons.append(f"required check '{name}' is not successful ({check.get('conclusion')}) at head {head[:12]}")
+                continue
+            proofs[name] = current["html_url"]
+    return reasons, proofs
 
 
 # ---- verdict notes (parsed by `cadence audit verdicts`) --------------------
@@ -779,7 +846,6 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         reasons.append("cannot bind evidence to a full base commit SHA")
 
     # Read only the actual PR target's checks; absent target data must not use main.
-    gate_suites = frozenset()
     if not isinstance(base, str) or not base:
         required = {}
         reasons.append("PR has no valid base branch to bind delivery evidence")
@@ -788,15 +854,21 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         reasons += rs
     names = set(required)
     ci_url = None
+    ci_runs = []
+    proofs = {}
     if names:
-        rs, suites = required_check_reasons(repo, head, required, view.get("statusCheckRollup"))
-        reasons += rs
-        gate_suites = frozenset(suites)
-        report.append(f"required checks: {', '.join(sorted(names))}")
         try:
-            ci_url = green_ci_run(repo, head, gate_suites, names)
+            ci_runs = workflow_runs_at(repo, head)
         except RuntimeError as e:
             reasons.append(str(e))
+        if ci_runs:
+            rs, proofs = required_check_reasons(repo, head, required, view.get("statusCheckRollup"), ci_runs)
+            reasons += rs
+            report.append(f"required checks: {', '.join(sorted(names))}")
+            try:
+                ci_url = green_ci_run(repo, head, ci_runs)
+            except RuntimeError as e:
+                reasons.append(str(e))
 
     # Changed paths (modes included) and size, straight from git.
     try:
@@ -858,7 +930,15 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             if req["activation"] == "active":
                 required_comment_evidence.extend((f"Delivery class: {req['class']}",
                                                   f"Policy digest: {authority['binding']['policy_digest']}"))
+            if ci_url:
+                # Every class binds the evidence comment to the CI run this evaluation
+                # actually read: a comment naming another run is not this evidence.
                 required_comment_evidence.append(f"Green CI run: {ci_url}")
+            for name in sorted(proofs):
+                # A required check proven by another workflow's run names that run, so the
+                # comment cannot claim the canonical run proves a gate it never produced.
+                if proofs[name] != ci_url:
+                    required_comment_evidence.append(f"Required check run: {name} = {proofs[name]}")
             if authority["readiness"]:
                 ready = authority["readiness"]
                 report.append(f"routine outcome: {ready['outcome_report']}; CI run {ready['ci_run_id']} {ready['ci_run_url']}")
@@ -951,41 +1031,22 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                         requirements=authority["requirements"] if authority else None,
                         readiness=authority["readiness"] if authority else None)
         evidence["ci_run"] = ci_url
+        evidence["ci_proofs"] = proofs
     return reasons, report
 
 
-def green_ci_run(repo, head, gate_suites, names):
-    """The URL of the latest ci.yml PR run attempt at this head. That attempt is chosen first,
-    by run_started_at, whatever its gate: it must be a completed success whose check suite is
-    the sole suite holding the required checks `names`. An older successful run never stands in
-    for a newer attempt, and a rerun is judged by its current attempt. Fails closed."""
-    doc = gh_json(["api", f"repos/{repo}/actions/workflows/ci.yml/runs"
-                   f"?head_sha={head}&event=pull_request&per_page=100"])
-    runs = doc.get("workflow_runs") if isinstance(doc, dict) else None
-    total = doc.get("total_count") if isinstance(doc, dict) else None
-    if not isinstance(runs, list) or type(total) is not int or total > len(runs):
-        raise RuntimeError("cannot read the latest ci.yml run for the evidence comment")
-    for r in runs:
-        if not (isinstance(r, dict) and type(r.get("id")) is int and r["id"] > 0
-                and type(r.get("check_suite_id")) is int and r["check_suite_id"] > 0
-                and isinstance(r.get("run_started_at"), str) and CHECK_STAMP.fullmatch(r["run_started_at"])
-                and isinstance(r.get("head_sha"), str) and isinstance(r.get("event"), str)
-                and isinstance(r.get("status"), str)
-                and (r.get("conclusion") is None or isinstance(r.get("conclusion"), str))
-                and isinstance(r.get("html_url"), str)):
-            raise RuntimeError("cannot read the latest ci.yml run for the evidence comment")
-    current = [r for r in runs if r["head_sha"] == head and r["event"] == "pull_request"]
-    if not current:
+def green_ci_run(repo, head, runs):
+    """The URL of the current ci.yml pull_request attempt at this head.
+
+    The canonical workflow is judged on its own current attempt: an older successful
+    ci.yml run never stands in for a newer failed or pending attempt. Fails closed."""
+    ci = [r for r in runs if r["path"] == CI_WORKFLOW and r["event"] == "pull_request"]
+    if not ci:
         raise RuntimeError(f"no ci.yml PR run exists at exact head {head}")
-    latest = max(current, key=lambda r: r["run_started_at"])
-    if sum(r["run_started_at"] == latest["run_started_at"] for r in current) > 1:
-        raise RuntimeError(f"the latest ci.yml PR runs at exact head {head} are ambiguous")
+    latest = current_attempt(ci)
     if (latest["status"] != "completed" or latest.get("conclusion") != "success"
             or latest["html_url"] != f"https://github.com/{repo}/actions/runs/{latest['id']}"):
-        raise RuntimeError(f"the latest ci.yml PR run {latest['id']} at exact head {head} is not a completed success")
-    if gate_suites != {latest["check_suite_id"]}:
-        raise RuntimeError(f"required check(s) {', '.join(sorted(names)) or 'none'} are not held by "
-                           f"the latest ci.yml PR run {latest['id']} at exact head {head}")
+        raise RuntimeError(f"the current ci.yml PR run {latest['id']} at exact head {head} is not a completed success")
     return latest["html_url"]
 
 
@@ -994,8 +1055,12 @@ def evidence_body(evidence):
              f"Head: {evidence['head']}", f"Base: {evidence['base']}",
              f"Base branch: {evidence['base_ref']}",
              f"Green CI run: {evidence['ci_run']}",
-             "Required checks: " + ", ".join(evidence["checks"]),
-             "Verdict notes: " + (", ".join(evidence["notes"]) or "none required")]
+             "Required checks: " + ", ".join(evidence["checks"])]
+    for name in sorted(evidence.get("ci_proofs") or {}):
+        url = evidence["ci_proofs"][name]
+        if url != evidence["ci_run"]:
+            lines.append(f"Required check run: {name} = {url}")
+    lines.append("Verdict notes: " + (", ".join(evidence["notes"]) or "none required"))
     binding = evidence.get("binding")
     if binding:
         lines.extend((f"Delivery class: {evidence['requirements']['class']}",
@@ -1114,8 +1179,10 @@ def main(argv):
                 if (not reasons and (final_evidence.get("binding") != evidence.get("binding")
                                      or final_evidence.get("requirements") != evidence.get("requirements")
                                      or final_evidence.get("readiness") != evidence.get("readiness")
-                                     or final_evidence.get("approval") != evidence.get("approval"))):
-                    reasons.append("delivery policy/base/readiness binding changed after evidence collection; revalidate before enqueue")
+                                     or final_evidence.get("approval") != evidence.get("approval")
+                                     or final_evidence.get("ci_run") != evidence.get("ci_run")
+                                     or final_evidence.get("ci_proofs") != evidence.get("ci_proofs"))):
+                    reasons.append("delivery policy/base/readiness/CI binding changed after evidence collection; revalidate before enqueue")
     except (RuntimeError, KeyError, TypeError) as e:
         reasons, report = [f"cannot read the PR: {e}"], []
     for line in report:
