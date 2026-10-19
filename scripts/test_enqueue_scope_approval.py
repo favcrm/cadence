@@ -32,6 +32,13 @@ BRANCH = "cc13/cad-1106-scope-approval"
 BODY = "## Goal\nApprove once per ticket.\nRisk: human (4, 7)\n"
 OPERATOR = "operator-connection"
 NOTE = "20261003-100000-cad1106-pr5-review-verdict.md"
+CI_SUITE = 106304880676
+CI_URL = "https://github.com/o/r/actions/runs/12345"
+CI_RUN = {"id": 12345, "head_sha": HEAD, "event": "pull_request", "status": "completed",
+          "conclusion": "success", "html_url": CI_URL, "workflow_id": 362543015,
+          "path": ".github/workflows/ci.yml", "check_suite_id": CI_SUITE, "run_attempt": 1, "run_number": 1,
+          "created_at": "2026-10-19T09:35:50Z", "run_started_at": "2026-10-19T09:35:50Z",
+          "updated_at": "2026-10-19T09:43:23Z"}
 
 
 def digest(body):
@@ -67,6 +74,7 @@ class Case:
                           f"Scope: in-scope {ISSUE}\n")
         self.per_head = False
         self.scope_rc = 0
+        self.ci_runs = [dict(CI_RUN)]  # the current ci.yml attempt at HEAD; a suite-matched success
         self.scope_override = None  # a raw reply, to model a lying or broken verb
 
     def note(self):
@@ -92,7 +100,18 @@ class Case:
             url = argv[-1]
             if "/rules/branches/" in url:
                 return 0, json.dumps([{"type": "required_status_checks", "parameters": {
-                    "required_status_checks": [{"context": "ci"}]}}]), ""
+                    "required_status_checks": [{"context": "ci", "integration_id": 15368}]}}]), ""
+            if "/check-runs" in url:
+                return 0, json.dumps({"total_count": 1, "check_runs": [{
+                    "id": 117992467504, "name": "ci", "head_sha": HEAD, "status": "completed",
+                    "conclusion": "success", "started_at": "2026-10-19T09:43:14Z",
+                    "completed_at": "2026-10-19T09:43:22Z", "details_url": "https://github.com/o/r/actions/runs/12345",
+                    "app": {"id": 15368, "slug": "github-actions"}, "check_suite": {"id": 106304880676}}]}), ""
+            if "actions/workflows/ci.yml/runs" in url or "/actions/runs?head_sha=" in url:
+                return 0, json.dumps({"total_count": len(self.ci_runs), "workflow_runs": self.ci_runs}), ""
+            if "/contents/.github/workflows/ci.yml?ref=" in url:
+                # The trusted base's ci.yml declares the gate job the required context names.
+                return 0, "name: CI\njobs:\n  ci:\n    name: ci\n    runs-on: ubuntu-latest\n", ""
             if url.endswith("/protection"):
                 return 1, "", "Branch not protected"
             for f in (enq.ONE_REVIEW_FILE, enq.RISK_PATHS_FILE):  # the REAL lists
@@ -103,7 +122,7 @@ class Case:
             matching = [r for r in self.store if r["issue"].lower() == issue.lower()]
             approval_id = "merge-pr5-aaaa" if self.per_head else (
                 matching[-1]["approval_id"] if matching else "missing")
-            comment = f"{HEAD} {NOTE}\nBase branch: {self.base_ref}\nOperator approval id: {approval_id}"
+            comment = f"{HEAD} {NOTE}\nBase branch: {self.base_ref}\nGreen CI run: {CI_URL}\nOperator approval id: {approval_id}"
             return 0, json.dumps({"id": issue, "project": self.project, "owner": None, "claim": None,
                                   "body": self.ticket_body, "status": self.status, "refs": self.refs,
                                   "comments": [{"body": comment}]}), ""

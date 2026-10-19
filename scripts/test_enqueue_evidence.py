@@ -64,8 +64,15 @@ ISSUE = "CAD-1298"
 NOTE = "20261003-100000-cad1298-pr5-review-verdict.md"
 RUN_ID = 12345
 CI_URL = f"https://github.com/{REPO}/actions/runs/{RUN_ID}"
+CI_SUITE = 106304880676
 CI_RUN = {"id": RUN_ID, "head_sha": HEAD, "event": "pull_request",
-          "status": "completed", "conclusion": "success", "html_url": CI_URL}
+          "status": "completed", "conclusion": "success", "html_url": CI_URL,
+          "workflow_id": 362543015, "path": ".github/workflows/ci.yml",
+          "check_suite_id": CI_SUITE, "run_attempt": 1, "run_number": 1,
+          "created_at": "2026-10-19T09:35:50Z", "run_started_at": "2026-10-19T09:35:50Z",
+          "updated_at": "2026-10-19T09:43:23Z"}
+GATE = "ci"
+TRUSTED_APP = {"id": 15368, "slug": "github-actions"}
 OPERATOR = "operator-connection"
 APPROVAL_ID = "merge-pr5-aaaa"
 
@@ -104,7 +111,7 @@ class Case(scope.Case):
         self.merge_rc = 0
         self.ci_rc = 0
         self.ci_runs = [CI_RUN]
-        self.rollup = [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        self.rollup = [{"name": GATE, "status": "COMPLETED", "conclusion": "SUCCESS"}]
         self.view_calls = 0
         self.stale_at = None                 # apply stale_fields once views reach this
         self.stale_fields = {"headRefOid": "c" * 40}
@@ -147,11 +154,15 @@ class Case(scope.Case):
                 "title_outcome": "pass", "section_outcome": "pass",
                 "risk": "human", "from": "rev"}
 
+    def effective_rollup(self):
+        """The one rollup both gh endpoints serve: a flip applies from its view count on."""
+        if self.rollup_flip_at is not None and self.view_calls >= self.rollup_flip_at:
+            return [{"name": "ci", "status": "COMPLETED", "conclusion": "FAILURE"}]
+        return self.rollup
+
     def pr_view(self):
         self.view_calls += 1
-        rollup = self.rollup
-        if self.rollup_flip_at is not None and self.view_calls >= self.rollup_flip_at:
-            rollup = [{"name": "ci", "status": "COMPLETED", "conclusion": "FAILURE"}]
+        rollup = self.effective_rollup()
         view = {"number": 5, "state": "OPEN", "title": self.title, "headRefName": self.branch,
                 "headRefOid": HEAD, "baseRefName": self.base_ref, "baseRefOid": BASE,
                 "mergeStateStatus": "CLEAN", "autoMergeRequest": None,
@@ -160,12 +171,29 @@ class Case(scope.Case):
             view.update(self.stale_fields)
         return 0, json.dumps(view), ""
 
+    def check_runs(self):
+        """The required gate, read from the same effective rollup the PR view uses.
+        Shaped like `gh api commits/SHA/check-runs?check_name=...` output."""
+        runs = []
+        rollup = self.effective_rollup()
+        if rollup and rollup[0]["conclusion"] is not None:
+            state = rollup[0]
+            runs.append({"id": 117992467504, "name": state["name"], "head_sha": HEAD,
+                         "status": state["status"].lower(), "conclusion": state["conclusion"].lower(),
+                         "started_at": "2026-10-19T09:43:14Z", "completed_at": "2026-10-19T09:43:22Z",
+                         "details_url": CI_URL, "app": TRUSTED_APP, "check_suite": {"id": CI_SUITE}})
+        return 0, json.dumps({"total_count": len(runs), "check_runs": runs}), ""
+
+
     def run(self, argv, input_text=None):
         if argv[:3] == ["gh", "pr", "view"]:
             return self.pr_view()
         if argv[:3] == ["gh", "pr", "merge"]:
             self.merges.append(list(argv))
             return self.merge_rc, "", "merge refused"
+        if argv[:2] == ["gh", "api"] and "/contents/.github/workflows/ci.yml?ref=" in argv[-1]:
+            # The trusted base's ci.yml declares the gate job the required context names.
+            return 0, "name: CI\njobs:\n  ci:\n    name: ci\n    runs-on: ubuntu-latest\n", ""
         if (argv[:2] == ["gh", "api"] and "/contents/" in argv[-1]
                 and any(f in argv[-1] for f in (enq.ONE_REVIEW_FILE, enq.RISK_PATHS_FILE))):
             # The trusted-base lists are served at whatever ref the caller
@@ -176,10 +204,16 @@ class Case(scope.Case):
         if argv[:3] == ["gh", "api", "graphql"]:
             return 0, json.dumps({"data": {"repository": {"pullRequest": {
                 "isInMergeQueue": True, "state": "OPEN"}}}}), ""
-        if argv[:2] == ["gh", "api"] and "actions/workflows/ci.yml/runs" in argv[-1]:
+        if argv[:2] == ["gh", "api"] and "/rules/branches/" in argv[-1]:
+            binding = {"context": GATE, "integration_id": TRUSTED_APP["id"]}
+            return 0, json.dumps([{"type": "required_status_checks", "parameters": {
+                "required_status_checks": [binding]}}]), ""
+        if argv[:2] == ["gh", "api"] and "/check-runs" in argv[-1]:
+            return self.check_runs()
+        if argv[:2] == ["gh", "api"] and ("actions/workflows/ci.yml/runs" in argv[-1] or "/actions/runs?head_sha=" in argv[-1]):
             if self.ci_rc != 0:
                 return self.ci_rc, "", "actions api down"
-            return 0, json.dumps({"workflow_runs": self.ci_runs}), ""
+            return 0, json.dumps({"total_count": len(self.ci_runs), "workflow_runs": self.ci_runs}), ""
         if argv[:3] == ["cadence", "issue", "comment"]:
             if self.comment_rc != 0:
                 return self.comment_rc, "", "tracker write failed"
@@ -241,7 +275,7 @@ class EvidencePosting(unittest.TestCase):
     # ---- dry run -----------------------------------------------------------
 
     def test_dry_run_checks_everything_and_writes_nothing(self):
-        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}\nOperator approval id: {APPROVAL_ID}"}]
+        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}\nGreen CI run: {CI_URL}\nOperator approval id: {APPROVAL_ID}"}]
         rc, out, err = self.run_main("--dry-run")
         self.assertEqual(rc, 0, (out, err))
         self.assertIn("dry run", out)
@@ -250,7 +284,7 @@ class EvidencePosting(unittest.TestCase):
 
     def test_dry_run_accepts_native_authorized_integration_target_without_writes(self):
         self.c.base_ref = "staging"
-        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: staging\nOperator approval id: {APPROVAL_ID}"}]
+        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: staging\nGreen CI run: {CI_URL}\nOperator approval id: {APPROVAL_ID}"}]
         rc, out, err = self.run_main("--dry-run")
         self.assertEqual(rc, 0, (out, err))
         self.assertEqual(self.c.posted, [])
@@ -265,7 +299,7 @@ class EvidencePosting(unittest.TestCase):
         for approval_id in (None, "replaced-approval"):
             with self.subTest(approval_id=approval_id):
                 self.fresh()
-                body = f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}"
+                body = f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}\nGreen CI run: {CI_URL}"
                 if approval_id is not None:
                     body += f"\nOperator approval id: {approval_id}"
                 self.c.comments = [{"body": body}]
@@ -273,7 +307,7 @@ class EvidencePosting(unittest.TestCase):
                 self.assertEqual(rc, 1, (out, err))
                 self.assert_refused_clean(rc, err)
         self.fresh()
-        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}\nOperator approval id: {APPROVAL_ID}"}]
+        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}\nGreen CI run: {CI_URL}\nOperator approval id: {APPROVAL_ID}"}]
         rc, out, err = self.run_main("--dry-run")
         self.assertEqual(rc, 0, (out, err))
         self.assertEqual(self.c.posted, [])

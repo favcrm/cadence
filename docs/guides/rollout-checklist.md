@@ -82,6 +82,26 @@ retarget the PR to work around a refusal. Before rolling back to a daemon
 without this option, remove it and re-approve the policy; integration-target
 delivery then refuses and the repository-default route remains available.
 
+### Current required CI evidence (CAD-1598)
+
+Use `enqueue-reviewed` from the reviewed, merged Cadence revision, not a stale
+shared checkout or the repair PR's own unmerged script to authorize that PR.
+The script reads every workflow run at the exact head, groups them by
+workflow and takes each workflow's current attempt by that attempt's own start
+(a re-run keeps its run number, so its start is what orders it). Each required
+context is proven by the current pull_request attempt of a workflow whose file
+AT THE TRUSTED BASE declares a job with that context's name, so a same-named
+check from an unrelated workflow never proves a gate, while a legitimately
+separate producer still can. The canonical `ci.yml` attempt must be a
+completed success and is the URL the ticket comment names; a context proven by
+another workflow's run names that run too. An older cancelled draft may be
+superseded; a current failed, pending, missing, ambiguous, mis-bound or
+untrusted gate still refuses. Dry-run checks the same proof without posting
+evidence or enqueueing. The canonical ticket comment must name the selected
+CI URL and the exact head, base and base branch.
+For a script-only repair, no daemon restart or image cycle is needed when
+read-only native requirements already supply the matching target binding.
+
 ## App bundle
 
 - **Runner:** operator, using the bundle kit's `run.sh`.
