@@ -201,6 +201,9 @@ pub(crate) fn static_file(dist: Option<&Path>, path: &str) -> Option<(String, Ve
             // CAD-1423: the push/click service worker, served from the root so
             // its scope covers the whole board. Push and click only.
             "/notifications-sw.js" => Some(embedded::NOTIFICATIONS_SW),
+            // CAD-1477: the recorder's AudioWorklet module. Served from the
+            // board's own origin so the browser can load it as a module.
+            "/recording-pcm-worklet.js" => Some(embedded::RECORDING_PCM_WORKLET),
             _ => path
                 .strip_prefix("/assets/")
                 .and_then(|name| embedded::ASSETS.get(name).copied()),
@@ -495,6 +498,11 @@ mod embedded {
     pub const ICON: &[u8] = include_bytes!("../../ui/dist/icon.svg");
     pub const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../../ui/dist/apple-touch-icon.png");
     pub const NOTIFICATIONS_SW: &[u8] = include_bytes!("../../ui/dist/notifications-sw.js");
+    /// CAD-1477: the AudioWorklet module the meeting recorder loads. It is
+    /// a separate file because `AudioWorklet.addModule` fetches it, and it
+    /// must be served from the board's own origin, never a third party.
+    pub const RECORDING_PCM_WORKLET: &[u8] =
+        include_bytes!("../../ui/dist/recording-pcm-worklet.js");
 
     /// The latin woff2 files the CSS references (woff fallbacks are not
     /// embedded — every supported browser takes woff2 first).

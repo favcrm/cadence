@@ -1190,8 +1190,9 @@ cadence ui tailscale status     # sharing state, tailnet URL, identity probe, QR
 
 `run`/`start` take `--dist <dir>` to serve an unpacked SPA. Built with
 `--features ui`, the binary embeds `ui/dist` (index.html,
-assets/index.js, assets/index.css, and the latin woff2 files — Vite
-emits fixed names) so `--dist` is unnecessary. `start` merges flags
+assets/index.js, assets/index.css, the latin woff2 files, and the
+recorder's `recording-pcm-worklet.js` — Vite emits fixed names) so
+`--dist` is unnecessary. `start` merges flags
 over the persisted `ui.json` in the state dir and saves the result —
 a later plain `ui start` reuses it, `--reset` forgets it, and
 `ui status` prints the effective options. Extra flags:

@@ -1771,6 +1771,30 @@ mod tests {
         assert!(!health_supports_model_defaults(&json!({})));
     }
 
+    /// CAD-1477: the recorder's AudioWorklet module must exist in the
+    /// built UI, and the path the recorder requests must be the path the
+    /// board serves — otherwise capture cannot start.
+    #[test]
+    fn the_recorder_worklet_is_served_under_the_path_the_recorder_requests() {
+        const WORKLET: &str = "/recording-pcm-worklet.js";
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = std::fs::read_to_string(root.join("ui/public/recording-pcm-worklet.js"))
+            .expect("recorder worklet source");
+        assert!(source.contains("AudioWorkletProcessor"));
+        let loader =
+            std::fs::read_to_string(root.join("ui/src/features/app-shell/recording/wavCapture.ts"))
+                .expect("recorder capture source");
+        assert!(
+            loader.contains(&format!("addModule(\"{WORKLET}\")")),
+            "the recorder must request the worklet the board serves"
+        );
+        let serve = include_str!("ui/serve.rs");
+        assert!(
+            serve.contains(WORKLET),
+            "the board must serve the recorder worklet under the requested path"
+        );
+    }
+
     /// The embedded build answers the same three paths.
     #[cfg(feature = "ui")]
     #[test]
@@ -1782,6 +1806,24 @@ mod tests {
         }
         let (_, svg) = static_file(None, "/favicon.svg").unwrap();
         assert!(svg.starts_with(b"<svg"));
+    }
+
+    /// CAD-1477: the recorder's AudioWorklet module is served from the
+    /// board's own origin. Without it the embedded build cannot capture.
+    #[cfg(feature = "ui")]
+    #[test]
+    fn embedded_recorder_worklet_is_served_as_a_script() {
+        let (name, bytes) = static_file(None, "/recording-pcm-worklet.js").unwrap();
+        assert_eq!(name, "/recording-pcm-worklet.js");
+        assert!(!bytes.is_empty());
+        assert!(content_type(&name) == "text/javascript; charset=utf-8");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("AudioWorkletProcessor"));
+        // A missing worklet is a 404, never the SPA shell.
+        assert!(matches!(
+            static_answer_for(None, "/recording-pcm-missing.js", None, None),
+            StaticAnswer::Missing
+        ));
     }
 
     /// CAD-336: a proven serve-proxy request writes as its login, and
