@@ -2078,6 +2078,12 @@ allowlists; Pi scopes distinguish master and worker runtime permissions.
 A profile's team role selects model preferences, never runtime authority.
 Drawers scroll vertically on short or narrow screens so job descriptions,
 model details, file targets and actions remain reachable without clipping.
+New harness and provider drawers keep the registry ID separate from the display
+label (for example, `claude` versus “Claude Code”). Closing a drawer keeps edits
+to existing rows in the page draft; Discard resets that draft and its status.
+An empty registry shows empty states, not the mockup's demo rows. Role defaults
+remain editable under Providers & models; launch eligibility comes from the
+saved-state Preview, not an optimistic badge on an unsaved profile.
 
 Save commits harness/provider/model declarations, role defaults, Pi policy,
 pins and profile definitions in one revision-bound SQLite transaction.

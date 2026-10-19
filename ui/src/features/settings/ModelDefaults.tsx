@@ -804,7 +804,7 @@ export default function ModelDefaults() {
             <div className="pinrow" key={`${pin.pkg}-${index}`}>
               <input className="pkg" aria-label="Package" disabled={frozen} value={pin.pkg} onChange={(event) => edit((config) => ({ ...config, pins: config.pins.map((item, itemIndex) => itemIndex === index ? { ...item, pkg: event.target.value } : item) }))} />
               <input className="ver" aria-label="Pinned version" disabled={frozen} value={pin.pinned} onChange={(event) => edit((config) => ({ ...config, pins: config.pins.map((item, itemIndex) => itemIndex === index ? { ...item, pinned: event.target.value } : item) }))} />
-              <span className="path">{pin.pkg ? `~/.pi/agent/npm/node_modules/${pin.pkg}` : "install path under the operator's Pi directory"}</span>
+              <span className="path">Install path not reported</span>
               <Button size="sm" variant="danger" disabled={frozen} onClick={() => edit((config) => ({ ...config, pins: config.pins.filter((_, itemIndex) => itemIndex !== index) }))}>Remove</Button>
             </div>
           ))}
@@ -841,6 +841,7 @@ export default function ModelDefaults() {
               {field("label", <input disabled={frozen} value={harness.label} onChange={(event) => set({ label: event.target.value })} />)}
               {field("CLI", <input disabled={frozen} value={harness.cli} onChange={(event) => set({ cli: event.target.value })} />)}
             </div>
+            {!existing && field("id", <input disabled={frozen} value={harness.id} placeholder="pi" onChange={(event) => set({ id: event.target.value })} />, "Registered adapter ID, independent of the display label.")}
             <div className="vrow"><span>on this host</span><span className={`badge ${observed?.installed ? "b-ok" : "plain"}`}>{observed?.installed === true ? `installed · ${observed.live} live` : observed?.installed === false ? "not installed" : "unknown"}{observed?.version ? ` · ${observed.version}` : ""}</span></div>
             <p className="hint">Read from the host, not set here — a declared harness that is not installed fences on launch.</p>
           </div></section>
@@ -851,7 +852,8 @@ export default function ModelDefaults() {
           <div className="dact">
             <Button size="sm" variant="primary" disabled={frozen} onClick={() => {
               if (existing) { closeDrawer(); return; }
-              const id = slug(harness.id || harness.label) || `harness-${draft.harnesses.length + 1}`;
+              const id = slug(harness.id || harness.label);
+              if (!id) { setNote("A harness needs an id."); return; }
               edit((config) => ({ ...config, harnesses: [...config.harnesses, { ...harness, id }] }));
               setNote(`${harness.label || id} added to the draft.`);
               closeDrawer();
@@ -878,6 +880,7 @@ export default function ModelDefaults() {
               {field("label", <input disabled={frozen} value={provider.label} onChange={(event) => set({ label: event.target.value })} />)}
               {field("kind", <select disabled={frozen} value={provider.kind} onChange={(event) => set({ kind: event.target.value as AgentProviderKind })}>{KINDS.map((kind) => <option key={kind}>{kind}</option>)}</select>)}
             </div>
+            {!existing && field("id", <input disabled={frozen} value={provider.id} onChange={(event) => set({ id: event.target.value })} />, "Provider ID used by model names and the adapter registry.")}
             {field("pin (extension package@version, or CLI version)", <input disabled={frozen} value={provider.pin} placeholder="pi-opencode-go 1.3.0" onChange={(event) => set({ pin: event.target.value })} />)}
             <div className="grid2">
               <label className="check"><input type="checkbox" disabled={frozen || provider.kind !== "Pi extension"} checked={provider.gate} onChange={(event) => set({ gate: event.target.checked })} /><span>gated by the allow list</span></label>
@@ -889,7 +892,8 @@ export default function ModelDefaults() {
           <div className="dact">
             <Button size="sm" variant="primary" disabled={frozen} onClick={() => {
               if (existing) { closeDrawer(); return; }
-              const id = slug(provider.id || provider.label) || `provider-${draft.providers.length + 1}`;
+              const id = slug(provider.id || provider.label);
+              if (!id) { setNote("A provider needs an id."); return; }
               const next = { ...provider, id, gate: provider.kind === "native CLI" ? false : provider.gate };
               edit((config) => ({ ...config, providers: [...config.providers, next] }));
               setNote(`${next.label || id} added · add its models next`);
@@ -1022,12 +1026,12 @@ export default function ModelDefaults() {
                 <div className="vrow"><span>model from</span><b>{profile.model === "inherit" ? "role default" : "this profile"}</b></div>
                 <div className="vrow"><span>provider</span><b>{providerOf(draft, resolved)?.label || "—"}</b></div>
                 <div className="vrow"><span>allow list</span><b>{providerOf(draft, resolved)?.gate ? (allowed(draft, resolved) ? `yes · ${draft.scope[resolved] ?? "off"}` : "not enabled") : "n/a"}</b></div>
-                {blocked ? <p className="verr">“{profile.model}” is not enabled for worker roles — enable it in Providers &amp; models</p> : <span className="badge b-ok">launches</span>}
+                {blocked && <p className="verr">“{profile.model}” is not enabled for worker roles — enable it in Providers &amp; models</p>}
               </div>
             </div></section>
             <section className="dsec"><div className="dtitle">Files</div><div className="dinn">
               {(observed?.files ?? []).map((file) => (
-                <div className="target" key={file.path}><span className="tpath">{file.path}{observed?.version ? ` — cadence:profile ${profile.id}@${observed.version}` : ""}</span><span className={`badge ${file.status === "in sync" ? "b-ok" : file.status === "needs sync" || file.status === "unmanaged" ? "b-warn" : "plain"}`}>{file.status}</span></div>
+                <div className="target" key={file.path}><span className="tpath">{file.path}</span><span className={`badge ${file.status === "in sync" ? "b-ok" : file.status === "needs sync" || file.status === "unmanaged" ? "b-warn" : "plain"}`}>{file.status}</span></div>
               ))}
               {!observed?.files?.length && <p className="hint">No generated-file status for this profile yet. Save, then sync, to write managed files.</p>}
             </div></section>
@@ -1141,7 +1145,7 @@ export default function ModelDefaults() {
             <span className={`badge ${issues.length ? "b-fail" : dirty ? "b-warn" : "plain"}`}>{issues.length ? `${issues.length} problem${issues.length > 1 ? "s" : ""}` : changeCount ? `${changeCount} change${changeCount > 1 ? "s" : ""}` : "no changes"}</span>
             <span className="ref">{readOnly ? "read-only: saving needs an operator session" : `revision ${saved.revision}`}</span>
             <span className="ref" style={{ marginLeft: "auto" }}>{note}</span>
-            <Button size="sm" disabled={!dirty || saving} onClick={() => { if (saved) { setDraft(normalize(saved.config)); setSaveError(null); setConflict(false); closeDrawer(); } }}>Discard</Button>
+            <Button size="sm" disabled={!dirty || saving} onClick={() => { if (saved) { setDraft(normalize(saved.config)); setSaveError(null); setConflict(false); setNote("Draft reset to the last saved revision."); closeDrawer(); } }}>Discard</Button>
             <Button size="sm" variant="primary" disabled={!dirty || !!issues.length || frozen || conflict} loading={saving} onClick={() => void save()}>Save</Button>
           </div>
         </>
