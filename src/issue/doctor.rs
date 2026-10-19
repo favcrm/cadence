@@ -227,7 +227,12 @@ pub fn run(pm: &Pm) -> Result<Value> {
     let lock_ok = write_lock["ok"] == true;
     let write_lock = {
         let mut w = write_lock;
-        w["detail"] = json!(lock.to_string());
+        // The interruption-specific detail is the promised observable.
+        // The generic lock description only fills in when there is
+        // none: overwriting it would hide what the state actually is.
+        if !w["detail"].as_str().is_some_and(|d| !d.is_empty()) {
+            w["detail"] = json!(lock.to_string());
+        }
         w
     };
     let ok = git_dir.is_some() && hooks_ok && lint_ok && push_ok && foreign_ok && lock_ok;

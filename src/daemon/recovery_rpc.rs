@@ -27,6 +27,20 @@ fn with_attempt_path(e: Error, path: Option<&std::path::Path>) -> Error {
     }
 }
 
+/// The error, with a note appended. The kind — and so the exit code —
+/// is preserved: the note adds context, it does not change what
+/// happened.
+fn with_note(e: Error, note: &str) -> Error {
+    let msg = format!("{e} ({note})");
+    match e.kind() {
+        "conflict" => Error::conflict_coded("recovery_failed", msg),
+        "busy" => Error::busy_coded("resource_busy", msg),
+        "gate" => Error::gate_coded("recovery_gate", msg),
+        "internal" => Error::internal(msg),
+        _ => Error::rejected(msg),
+    }
+}
+
 /// A required object param (a JSON blob passed through to the core).
 fn required_object<'a>(params: &'a Value, field: &str) -> Result<&'a Value> {
     match params.get(field) {
@@ -128,7 +142,26 @@ impl Shared {
         // still confirmable afterwards: `recover status --attempt <file>`
         // reads it back. The refusal keeps its own kind, so the exit
         // code still says whether a retry can help.
-        let recorded = self.record_recovery_attempt(&attempt);
+        let recorded = match self.record_recovery_attempt(&attempt) {
+            Ok(path) => Some(path),
+            Err(record_error) => {
+                // The evidence could not be finalized. A change that
+                // landed without a record is NOT a success: the
+                // tracker's state is the only account of what happened.
+                let note = format!(
+                    "the attempt could not be recorded, so there is no durable account of this \
+                     execution ({record_error}); the tracker's state is the only record"
+                );
+                return Err(match outcome.error {
+                    Some(e) => with_note(e, &note),
+                    None => Error::internal(format!(
+                        "the recovery was applied but {note}. Inspect the tracker's state with \
+                         `cadence issue recover review` and settle the paths by hand; a retry is \
+                         not safe before the state is inspected."
+                    )),
+                });
+            }
+        };
         match outcome.error {
             Some(e) => Err(with_attempt_path(e, recorded.as_deref())),
             None => Ok(attempt),
@@ -137,17 +170,55 @@ impl Shared {
 
     /// Record the attempt under the daemon's state dir. The daemon owns
     /// that dir, so the record outlives the call that produced it.
-    fn record_recovery_attempt(&self, attempt: &Value) -> Option<std::path::PathBuf> {
+    ///
+    /// The name is unique per attempt and the file is created
+    /// exclusively: two executions in the same second must never
+    /// overwrite each other's record, and a truncated record would
+    /// point at a different outcome and lose the preimages.
+    fn record_recovery_attempt(&self, attempt: &Value) -> Result<std::path::PathBuf> {
         let dir = self.state_dir.join("recovery");
-        std::fs::create_dir_all(&dir).ok()?;
-        let name = format!(
-            "{}-{}.json",
-            crate::issue::time::basic(crate::issue::time::now_epoch()),
-            std::process::id()
-        );
-        let path = dir.join(name);
-        std::fs::write(&path, attempt.to_string()).ok()?;
-        Some(path)
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            Error::internal(format!(
+                "the recovery attempt could not be recorded: its directory could not be created \
+                 ({e}). The tracker's state is the only record of what happened."
+            ))
+        })?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        for attempt_no in 0..64u32 {
+            let path = dir.join(format!("{nanos}-{}-{attempt_no}.json", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    file.write_all(attempt.to_string().as_bytes())
+                        .map_err(|e| {
+                            Error::internal(format!(
+                                "the recovery attempt could not be written ({e}). The tracker's \
+                             state is the only record of what happened."
+                            ))
+                        })?;
+                    return Ok(path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(Error::internal(format!(
+                        "the recovery attempt could not be recorded ({e}). The tracker's state \
+                         is the only record of what happened."
+                    )));
+                }
+            }
+        }
+        Err(Error::internal(
+            "the recovery attempt could not be recorded: no unique record name was free. The \
+             tracker's state is the only record of what happened."
+                .to_string(),
+        ))
     }
 
     /// `tracker_recovery_status` — the truthful outcome of a recorded

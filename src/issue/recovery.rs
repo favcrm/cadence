@@ -254,6 +254,17 @@ fn failure_attempt(
         .map(|r| r.paths)
         .unwrap_or_default();
     let (outcome, committed, message) = match landed {
+        Some(o) if o.partial => (
+            "partially_applied",
+            o.committed.clone().map(Value::from).unwrap_or(Value::Null),
+            format!(
+                "the recovery PARTLY applied ({}) and did not finish: {error}. The state below \
+                 is what a fresh observation shows. The removed preimages are named, so the \
+                 discarded content stays recoverable from the object store. Re-review before \
+                 doing anything else; a blind retry is not safe.",
+                o.message
+            ),
+        ),
         Some(o) => (
             "applied_but_unconfirmed",
             o.committed.clone().map(Value::from).unwrap_or(Value::Null),
@@ -383,6 +394,7 @@ fn execute_inner(
             Choice::Leave => Outcome {
                 resolved: false,
                 committed: None,
+                partial: false,
                 removed: Vec::new(),
                 message: "left unresolved: the crashed writer's work and every blocker stay as \
                           they are. No tracker content was changed and no recovery succeeded."
@@ -398,6 +410,7 @@ fn execute_inner(
                 Outcome {
                     resolved: true,
                     committed: Some(commit),
+                    partial: false,
                     removed: Vec::new(),
                     message: "kept the inspected staged content: the committed blobs are the \
                               ones the crashed writer staged, and any unstaged content in the \
@@ -413,15 +426,31 @@ fn execute_inner(
                     .iter()
                     .filter_map(|p| staged_blob(pm, p).ok().flatten())
                     .collect();
-                discard_paths(pm, &selected)?;
-                Outcome {
-                    resolved: true,
-                    committed: None,
-                    removed,
-                    message: "discarded the selected changes: the index and the working tree \
-                              for those paths are back to their committed state, and every \
-                              other path is untouched."
-                        .to_string(),
+                match discard_paths(pm, &selected) {
+                    Ok(()) => Outcome {
+                        resolved: true,
+                        committed: None,
+                        partial: false,
+                        removed,
+                        message: "discarded the selected changes: the index and the working tree \
+                                  for those paths are back to their committed state, and every \
+                                  other path is untouched."
+                            .to_string(),
+                    },
+                    Err(e) => {
+                        // The change began: the attempt must say so, and
+                        // it must keep the preimages.
+                        *landed = Some(Outcome {
+                            resolved: false,
+                            committed: None,
+                            partial: true,
+                            removed,
+                            message: "the discard PARTLY applied: some selected paths are back \
+                                      to their committed state and the rest were not touched."
+                                .to_string(),
+                        });
+                        return Err(e);
+                    }
                 }
             }
         };
@@ -571,6 +600,9 @@ fn preview_for(pm: &Pm, choice: Choice, selected: &[String]) -> Result<Value> {
 struct Outcome {
     resolved: bool,
     committed: Option<String>,
+    /// The change began but did not finish. The attempt must say
+    /// PARTLY applied then, never "nothing was applied".
+    partial: bool,
     /// The staged blobs a discard removed: the preimages that keep a
     /// partial discard recoverable.
     removed: Vec<String>,
@@ -1124,6 +1156,18 @@ fn file_digest(path: &Path) -> Result<String> {
 /// builds the tree from the index itself, in a temporary index, and
 /// advances HEAD only if it is still the reviewed one.
 fn commit_index_state(pm: &Pm, paths: &[String], message: &str) -> Result<String> {
+    // The audit trailers an ordinary tracker commit carries: the actor
+    // (this recovery ran on an operator connection) and the lease
+    // epoch, so a reader can order this commit against the others
+    // across a restart or a holdover. The exact-index commit bypasses
+    // [`Pm::commit`], so it has to name them itself.
+    let mut full = format!(
+        "{message}\n\nActor: {}\n",
+        crate::issue::write::actor_who("operator", None)
+    );
+    if let Some(epoch) = pm.lease_epoch() {
+        full.push_str(&format!("Lease-Epoch: {epoch}\n"));
+    }
     let git_dir = git_dir_of(pm)?;
     let head = git(&pm.dir, &["rev-parse", "HEAD"])?;
     let tmp_index = git_dir.join(format!("cadence-recovery-index-{}", std::process::id()));
@@ -1186,7 +1230,7 @@ fn commit_index_state(pm: &Pm, paths: &[String], message: &str) -> Result<String
             Os::new("-p"),
             Os::new(&head),
             Os::new("-m"),
-            Os::new(message),
+            Os::new(&full),
         ],
         None,
     )?;
@@ -1349,17 +1393,26 @@ fn discard_paths(pm: &Pm, paths: &[String]) -> Result<()> {
                      the file must be restored by hand before this path is left alone."
                 ))
             })?;
-            // The committed mode, including the executable bit.
+            // The committed mode, in BOTH directions: a file the
+            // interrupted change made executable goes back to the
+            // committed 0644, and one the commit made executable goes
+            // back to 0755. A mode that could not be restored is a
+            // partial outcome, not a completed one.
             let mode = git(&pm.dir, &["ls-tree", "HEAD", "--", path])
                 .ok()
                 .and_then(|l| l.split_whitespace().next().map(str::to_string))
                 .unwrap_or_default();
-            if mode.ends_with("755") {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    pm.dir.join(path),
-                    std::fs::Permissions::from_mode(0o755),
-                );
+            let wanted = if mode.ends_with("755") { 0o755 } else { 0o644 };
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                std::fs::set_permissions(pm.dir.join(path), std::fs::Permissions::from_mode(wanted))
+            {
+                return Err(Error::internal(format!(
+                    "the working-tree copy of {path} was restored from its committed version but \
+                     its mode could not be restored ({e}). The change is PARTLY applied: the \
+                     content is back and the mode is not. Nothing was committed, the crash's \
+                     marker and snapshot are intact, and the mode must be restored by hand."
+                )));
             }
         } else {
             // A file the crash added: remove the staged addition and

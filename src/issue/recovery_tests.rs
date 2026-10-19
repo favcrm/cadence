@@ -526,6 +526,50 @@ fn a_removal_does_not_follow_a_symlinked_ancestor() {
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep\n");
 }
 
+/// CAD-1601: the doctor keeps the interruption-specific detail. The
+/// generic lock description must not overwrite it.
+#[test]
+fn the_doctor_keeps_the_interruption_detail() {
+    let (_tmp, pm) = tracker();
+    let (child, _) = spawn_writer(&pm, "hold_dirty", false);
+    sigkill(child);
+    let report = crate::issue::doctor::run(&pm).unwrap();
+    let detail = report["write_lock"]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("Interrupted write needs a decision"),
+        "{detail}"
+    );
+}
+
+/// CAD-1601: a discard that began and did not finish is recorded as
+/// PARTLY applied, keeps the preimages, and never claims a retry is
+/// safe.
+#[test]
+fn a_partial_discard_is_recorded_as_partially_applied() {
+    let (_tmp, pm) = tracker();
+    let landed = super::Outcome {
+        resolved: false,
+        committed: None,
+        partial: true,
+        removed: vec!["abc123".to_string()],
+        message: "the discard PARTLY applied".to_string(),
+    };
+    let review = serde_json::json!({ "state": "bound" });
+    let attempt = super::failure_attempt(
+        &pm,
+        &review,
+        super::Choice::Discard,
+        &["crashed/issue.md".to_string()],
+        &crate::error::Error::internal("the write failed"),
+        Some(&landed),
+    );
+    assert_eq!(attempt["outcome"], "partially_applied");
+    assert_eq!(attempt["removed_blobs"][0], "abc123");
+    let message = attempt["message"].as_str().unwrap_or_default();
+    assert!(message.contains("PARTLY applied"), "{message}");
+    assert!(!message.contains("a retry is safe"), "{message}");
+}
+
 /// CAD-1601: a tracker with no interrupted write has nothing to
 /// recover, and says so rather than inventing a change set.
 #[test]

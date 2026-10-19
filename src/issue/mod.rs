@@ -598,6 +598,17 @@ impl Pm {
         Ok(foreign_out(foreign, foreign_extra))
     }
 
+    /// The lease epoch this PM's writes carry, when it is leased. A
+    /// recovery commit that cannot go through [`Pm::commit`] still
+    /// names it, so a reader can order its commit against the others
+    /// across a restart or a holdover.
+    pub fn lease_epoch(&self) -> Option<String> {
+        self.lease
+            .as_ref()
+            .and_then(|lease| lease.epoch())
+            .map(|epoch| epoch.to_string())
+    }
+
     /// CAD-538 — the tracker half of the SIGTERM flush: commit whatever
     /// the index already stages, the pending write a crash or kill left
     /// mid-flight. Never `git add` — worktree dirt and unstaged edits
