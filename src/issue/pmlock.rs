@@ -426,6 +426,10 @@ pub struct InterruptionReport {
     /// Git-global hazards (`index.lock`, a merge/rebase/cherry-pick
     /// state). A path-local recovery cannot settle them.
     pub hazards: Vec<String>,
+    /// When the crashed writer took the lock, from its marker trailer.
+    /// A path the crash demonstrably wrote is attributable to it; one
+    /// that was already there is not (CAD-1601).
+    pub crash_started_at: Option<i64>,
 }
 
 /// CAD-1234: the acquiring call site of every lock this process holds,
@@ -1687,6 +1691,12 @@ impl Pm {
                 foreign_paths: i.foreign_paths,
                 named: i.named,
                 hazards: i.hazards,
+                crash_started_at: self.legacy_file().ok().flatten().and_then(|(class, _)| {
+                    match class {
+                        MarkerClass::Ours(meta) => meta.and_then(|m| m.started_at),
+                        MarkerClass::Foreign => None,
+                    }
+                }),
             },
             None => InterruptionReport::default(),
         })

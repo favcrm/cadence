@@ -174,7 +174,8 @@ pub fn decide(pm: &Pm, review: &Value, choice: Choice, paths: &[String]) -> Resu
     let report = pm.interruption_report()?;
     let leftovers = report.paths;
     let foreign = report.foreign_paths;
-    let selected = select_paths(pm, &leftovers, &foreign, paths)?;
+    let started = report.crash_started_at;
+    let selected = select_paths(pm, &leftovers, &foreign, paths, started)?;
     require_staged_content(pm, choice, &selected)?;
     let current = state_binding(pm, &leftovers, &foreign)?;
     if current != bound {
@@ -328,9 +329,10 @@ fn execute_inner(
     let report = pm.interruption_report()?;
     let leftovers = report.paths;
     let foreign = report.foreign_paths;
+    let started = report.crash_started_at;
     let confirmed = require_str(decision, "confirmation")?;
     let preview_digest = require_str(decision, "preview_digest")?;
-    let selected = select_paths(pm, &leftovers, &foreign, paths)?;
+    let selected = select_paths(pm, &leftovers, &foreign, paths, started)?;
     require_staged_content(pm, choice, &selected)?;
     if selected != require_str_list(decision, "paths")? {
         return Err(Error::rejected(
@@ -567,6 +569,7 @@ fn select_paths(
     leftovers: &[String],
     foreign: &[String],
     paths: &[String],
+    crash_started_at: Option<i64>,
 ) -> Result<Vec<String>> {
     if paths.is_empty() {
         return Err(Error::rejected(
@@ -673,7 +676,65 @@ fn select_paths(
             selected.push(norm.to_string());
         }
     }
+    // Every selected path must be PROVABLY the crashed writer's. Being
+    // in the blocked set is refusal evidence, not ownership proof: a
+    // path that was already staged before the crash took the lock is
+    // in it too. The crash's own marker says when it started, and a
+    // path it wrote is newer than that.
+    let renames = staged_renames(pm)?;
+    {
+        use std::os::unix::fs::MetadataExt;
+        let index_written = std::fs::metadata(index_path(pm)?)
+            .map(|m| m.mtime())
+            .unwrap_or(0);
+        for path in &selected {
+            let Some(started) = crash_started_at else {
+                return Err(Error::rejected(format!(
+                    "the crashed writer's start time is unknown, so {path} cannot be \
+                     attributed to it. A recovery may only act on paths the crash \
+                     demonstrably wrote. Leave the transaction unresolved for this path, or \
+                     settle it by hand. A retry unchanged will not help."
+                )));
+            };
+            // A rename MOVES a file without writing it, so the evidence
+            // for its ends is the index the crash wrote, not the file's
+            // own timestamp.
+            let is_rename_end = renames.iter().any(|(f, t)| f == path || t == path);
+            let written = if is_rename_end {
+                index_written
+            } else {
+                std::fs::symlink_metadata(pm.dir.join(path))
+                    .map(|m| m.mtime())
+                    .unwrap_or(0)
+            };
+            if written < started {
+                return Err(Error::rejected(format!(
+                    "{path} cannot be attributed to the crashed writer: it was last written \
+                     before the crash began, so it was already there and the refusal that \
+                     named it is not proof that the crash made it. A recovery may only act on \
+                     the paths the crash demonstrably wrote. Leave the transaction unresolved \
+                     for this path, or settle it by hand. A retry unchanged will not help."
+                )));
+            }
+        }
+    }
     selected.sort();
+    // A staged rename has TWO ends, and both are affected. Selecting
+    // one end is not a selection: keeping only the destination would
+    // create a file while the source stays, and discarding only one
+    // end would leave the other behind. Both or neither.
+    for (from, to) in &renames {
+        let from_selected = selected.iter().any(|s| s == from);
+        let to_selected = selected.iter().any(|s| s == to);
+        if from_selected != to_selected {
+            return Err(Error::rejected(format!(
+                "the interrupted rename of {from} to {to} has two ends, and both are affected: \
+                 selecting only one would change what the rename meant and leave the other \
+                 end behind. Select both ends, or leave the transaction unresolved. A retry \
+                 unchanged will not help."
+            )));
+        }
+    }
     Ok(selected)
 }
 
@@ -700,6 +761,10 @@ fn state_binding(pm: &Pm, leftovers: &[String], foreign: &[String]) -> Result<St
         h.update(p.as_bytes());
         h.update(b"\0");
         h.update(worktree_facts(pm, p)?.to_string().as_bytes());
+        // The ancestors' identity: a symlink replaced between the
+        // review and the execute changes the binding, so the recovery
+        // refuses instead of writing through it.
+        h.update(ancestor_identity(pm, p)?.as_bytes());
         h.update(b"\0");
     }
     h.update(b"\0foreign\0");
@@ -792,6 +857,77 @@ fn path_facts(pm: &Pm, paths: &[String]) -> Result<Value> {
     Ok(Value::Array(out))
 }
 
+/// The identity of every ancestor of a path, from the tracker root
+/// down. A recovery must not write through a symlinked ancestor, and a
+/// symlink that is REPLACED between the review and the execute has to
+/// change the binding — so the ancestors' identity is part of it.
+fn ancestor_identity(pm: &Pm, path: &str) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = String::new();
+    let mut dir = pm.dir.clone();
+    let parts: Vec<&str> = path.split('/').collect();
+    for part in parts.iter().take(parts.len().saturating_sub(1)) {
+        dir = dir.join(part);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) => {
+                out.push_str(&format!(
+                    "{part}:{}:{}:{}:{};",
+                    meta.dev(),
+                    meta.ino(),
+                    meta.mode(),
+                    meta.file_type().is_symlink()
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                out.push_str(&format!("{part}:absent;"));
+            }
+            Err(e) => {
+                return Err(Error::internal(format!(
+                    "{} could not be examined ({e}); the interrupted state cannot be \
+                     inspected, so no recovery can be authorized.",
+                    dir.display()
+                )))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The staged renames the crashed writer left: (from, to) pairs. Both
+/// ends are affected, so a recovery must select both or neither.
+fn staged_renames(pm: &Pm) -> Result<Vec<(String, String)>> {
+    let out = crate::reaper::output(
+        Command::new("git")
+            .arg("--no-optional-locks")
+            .arg("-C")
+            .arg(&pm.dir)
+            .args(["status", "--porcelain", "-z"]),
+    )
+    .map_err(|e| Error::internal(format!("git status could not be run: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::internal(format!(
+            "git status failed in {}: {}",
+            pm.dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut fields = text.split('\0');
+    let mut renames = Vec::new();
+    while let Some(rec) = fields.next() {
+        if rec.len() < 4 {
+            continue;
+        }
+        let code = &rec[..2];
+        if !(code.starts_with('R') || code.starts_with('C')) {
+            continue;
+        }
+        let to = rec[3..].to_string();
+        let from = fields.next().unwrap_or_default().to_string();
+        renames.push((from, to));
+    }
+    Ok(renames)
+}
 /// The blob the index holds for a path: what a keep would commit.
 fn staged_blob(pm: &Pm, path: &str) -> Result<Option<String>> {
     let out = git(&pm.dir, &["ls-files", "--stage", "--", path])?;

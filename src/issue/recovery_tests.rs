@@ -388,6 +388,85 @@ fn a_status_with_a_hazard_does_not_offer_a_resume() {
     );
 }
 
+/// CAD-1601: a path staged BEFORE the crashed writer took the lock is
+/// in the blocked set, but the blocked set is refusal evidence, not
+/// ownership proof — so it is not attributable and cannot be selected.
+#[test]
+fn a_path_staged_before_the_crash_is_not_attributable() {
+    let (_tmp, pm) = tracker();
+    std::fs::write(pm.dir.join("earlier.txt"), b"staged earlier\n").unwrap();
+    git(&pm.dir, &["add", "--", "earlier.txt"]).unwrap();
+    // The crash starts a second later, so the file's write time is
+    // provably before it.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let (child, _) = spawn_writer(&pm, "hold_dirty", false);
+    sigkill(child);
+    let r = review(&pm, None).unwrap();
+    // It is named in the blocked set...
+    assert!(
+        r["leftovers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "earlier.txt"),
+        "{r}"
+    );
+    // ...but it cannot be attributed to the crash, so it cannot be
+    // selected.
+    let e = decide(&pm, &r, Choice::Discard, &["earlier.txt".to_string()])
+        .expect_err("a path staged before the crash must not be selectable");
+    assert!(e.to_string().contains("cannot be attributed"), "{e}");
+}
+
+/// CAD-1601: a staged rename has two ends and both are affected. One
+/// end alone is refused; both together are allowed.
+#[test]
+fn a_rename_needs_both_ends() {
+    let (_tmp, pm) = tracker();
+    let (child, _) = spawn_writer(&pm, "hold_rename", false);
+    sigkill(child);
+    let r = review(&pm, None).unwrap();
+    let e = decide(&pm, &r, Choice::Discard, &["renamed/moved.txt".to_string()])
+        .expect_err("one end of a rename must be refused");
+    assert!(e.to_string().contains("two ends"), "{e}");
+    decide(
+        &pm,
+        &r,
+        Choice::Discard,
+        &[
+            "renamed/moved.txt".to_string(),
+            "renamed/victim.txt".to_string(),
+        ],
+    )
+    .expect("both ends together are allowed");
+}
+
+/// CAD-1601: an ancestor replaced by a symlink between the review and
+/// the execute must refuse the recovery, and nothing outside the
+/// tracker may be touched.
+#[test]
+fn a_replaced_ancestor_refuses_the_recovery() {
+    let (_tmp, pm) = tracker();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel.txt");
+    std::fs::write(&sentinel, b"untouched\n").unwrap();
+    let (child, _) = spawn_writer(&pm, "hold_dirty", false);
+    sigkill(child);
+    let r = review(&pm, None).unwrap();
+    let paths = vec!["crashed/issue.md".to_string()];
+    let d = decide(&pm, &r, Choice::Discard, &paths).unwrap();
+    // The ancestor is replaced by a symlink pointing outside the
+    // tracker.
+    std::fs::remove_dir_all(pm.dir.join("crashed")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), pm.dir.join("crashed")).unwrap();
+    let e = execute(&pm, &r, &d, Choice::Discard, &paths)
+        .expect_err("a replaced ancestor must refuse the recovery");
+    assert!(e.kind() == "conflict" || e.kind() == "rejected", "{e}");
+    // Nothing outside the tracker was touched.
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"untouched\n");
+    assert!(!outside.path().join("issue.md").exists());
+}
+
 /// CAD-1601: a tracker with no interrupted write has nothing to
 /// recover, and says so rather than inventing a change set.
 #[test]
