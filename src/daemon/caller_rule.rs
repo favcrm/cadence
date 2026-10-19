@@ -595,6 +595,21 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "issue_kickoff_options",
         Rule::Handler("operator_connection (CAD-606)"),
     ),
+    // CAD-1601: the operator recovery of an interrupted tracker write.
+    // The two reads expose the tracker's own state and change nothing;
+    // the two that decide or apply bind the operator from the
+    // connection, so an agent, its detached child and a forged identity
+    // field never reach the tracker.
+    ("tracker_recovery_review", Rule::Read),
+    (
+        "tracker_recovery_decide",
+        Rule::Handler("operator_connection (CAD-1601)"),
+    ),
+    (
+        "tracker_recovery_execute",
+        Rule::Handler("operator_connection (CAD-1601)"),
+    ),
+    ("tracker_recovery_status", Rule::Read),
     // CAD-608: the issue page's lane card. `lane_show` is a read of the
     // issue's own lane. Every mutation is operator-only inside the
     // handler — an agent, its detached child, and a forged identity
