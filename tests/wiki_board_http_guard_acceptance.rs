@@ -208,6 +208,9 @@ fn cookie_authenticated_wiki_reads_succeed_and_invalid_sessions_or_paths_refuse(
         "wrong file contents: {page}"
     );
 
+    // Each refusal is pinned to the guard that produces it, so an unrelated
+    // 4xx cannot satisfy the assertion.
+    let other = fx.operator_session();
     for (label, presented) in [
         ("absent session", None),
         (
@@ -217,11 +220,17 @@ fn cookie_authenticated_wiki_reads_succeed_and_invalid_sessions_or_paths_refuse(
                 session.1.clone(),
             )),
         ),
+        // A real cookie paired with another live session's key.
+        (
+            "mismatched cookie and key",
+            Some(&(session.0.clone(), other.1.clone())),
+        ),
     ] {
         let (status, reply) = fx.request("/api/wiki/ls?path=global", presented);
+        assert_eq!(status, 401, "{label}: {reply}");
         assert!(
-            (400..500).contains(&status),
-            "{label} accepted: {status} {reply}"
+            reply.contains("operator_session_required"),
+            "{label} refused for the wrong reason: {reply}"
         );
     }
 
@@ -230,19 +239,36 @@ fn cookie_authenticated_wiki_reads_succeed_and_invalid_sessions_or_paths_refuse(
     fx.clock
         .store(1_800_000_000 + operator_auth::ABSOLUTE_SECS + 1, SeqCst);
     let (status, reply) = fx.request("/api/wiki/ls?path=global", Some(&session));
+    assert_eq!(status, 401, "expired session: {reply}");
     assert!(
-        (400..500).contains(&status),
-        "expired session accepted: {status} {reply}"
+        reply.contains("operator_session_required"),
+        "expired session refused for the wrong reason: {reply}"
     );
 
     // A fresh session keeps the path refusal independent of the expired
-    // session assertion above.
+    // session assertion above. The valid read first proves that session is
+    // live, so the 400 below can only come from the path guard.
     fx.clock.store(1_800_000_000, SeqCst);
     let fresh = fx.operator_session();
+    let (status, reply) = fx.request("/api/wiki/ls?path=global", Some(&fresh));
+    assert_eq!(
+        status, 200,
+        "fresh session not live before traversal: {reply}"
+    );
+    std::fs::write(
+        fx.root.path().join("outside-secret"),
+        "AOS-137 outside sentinel\n",
+    )
+    .unwrap();
     let (status, reply) = fx.request("/api/wiki/file?path=../../outside-secret", Some(&fresh));
+    assert_eq!(status, 400, "traversal: {reply}");
     assert!(
-        (400..500).contains(&status),
-        "traversal accepted: {status} {reply}"
+        reply.contains("'.' and '..' segments are not allowed"),
+        "traversal refused for the wrong reason: {reply}"
+    );
+    assert!(
+        !reply.contains("outside sentinel"),
+        "traversal leaked the outside sentinel: {reply}"
     );
 }
 
@@ -525,38 +551,68 @@ fn public_workspace_wiki_reads_require_its_real_host_bound_session() {
         assert!(body.contains(evidence), "{path} omitted {evidence}: {body}");
     }
 
-    for (label, host, presented) in [
-        ("absent public session", PUBLIC_HOST, None),
+    let cases: [(&str, &str, Option<&str>, u16, &str); 3] = [
+        (
+            "absent public session",
+            PUBLIC_HOST,
+            None,
+            401,
+            "board_session_required",
+        ),
         (
             "forged public session",
             PUBLIC_HOST,
             Some("__Host-aos-board-session=forged"),
+            401,
+            "board_session_required",
         ),
         // A cookie minted for this workspace is not accepted on a sibling
-        // workspace host: Host resolution is part of the public identity.
+        // workspace host: the Host guard refuses before any session check.
         (
             "cross-workspace cookie replay",
             "other.board.localhost",
             Some(cookie.as_str()),
+            421,
+            "Host not allowed",
         ),
-    ] {
+    ];
+    for (label, host, presented, want, marker) in cases {
         let (status, body) = fx.get(host, "/api/wiki/ls?path=users", presented);
+        assert_eq!(status, want, "{label}: {body}");
         assert!(
-            (400..500).contains(&status),
-            "{label} accepted: {status} {body}"
+            body.contains(marker),
+            "{label} refused for the wrong reason: {body}"
         );
     }
 
     let (status, body) = fx.get(
         PUBLIC_HOST,
+        "/api/wiki/ls?path=users%2Fusr_aos137_member",
+        Some(&cookie),
+    );
+    assert_eq!(
+        status, 200,
+        "public session not live before traversal: {body}"
+    );
+    std::fs::write(
+        fx.root.path().join("outside-secret"),
+        "AOS-137 outside sentinel\n",
+    )
+    .unwrap();
+    let (status, body) = fx.get(
+        PUBLIC_HOST,
         "/api/wiki/file?path=..%2F..%2Foutside-secret",
         Some(&cookie),
     );
+    assert_eq!(status, 400, "traversal: {body}");
     assert!(
-        (400..500).contains(&status),
-        "traversal accepted: {status} {body}"
+        body.contains("'.' and '..' segments are not allowed"),
+        "traversal refused for the wrong reason: {body}"
     );
-
+    assert!(
+        !body.contains("outside sentinel"),
+        "traversal leaked the outside sentinel: {body}"
+    );
     fx.clock.store(
         fx.clock.load(SeqCst) + operator_auth::ABSOLUTE_SECS + 1,
         SeqCst,
@@ -566,8 +622,9 @@ fn public_workspace_wiki_reads_require_its_real_host_bound_session() {
         "/api/wiki/ls?path=users%2Fusr_aos137_member",
         Some(&cookie),
     );
+    assert_eq!(status, 401, "expired public session: {body}");
     assert!(
-        (400..500).contains(&status),
-        "expired public session accepted: {status} {body}"
+        body.contains("board_session_required"),
+        "expired public session refused for the wrong reason: {body}"
     );
 }
