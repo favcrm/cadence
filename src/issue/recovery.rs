@@ -281,6 +281,7 @@ fn failure_attempt(
         "recovery_success": false,
         "outcome": outcome,
         "committed": committed,
+        "removed_blobs": landed.map(|o| o.removed.clone()).unwrap_or_default(),
         "message": message,
         "error": {
             "kind": error.kind(),
@@ -382,6 +383,7 @@ fn execute_inner(
             Choice::Leave => Outcome {
                 resolved: false,
                 committed: None,
+                removed: Vec::new(),
                 message: "left unresolved: the crashed writer's work and every blocker stay as \
                           they are. No tracker content was changed and no recovery succeeded."
                     .to_string(),
@@ -396,6 +398,7 @@ fn execute_inner(
                 Outcome {
                     resolved: true,
                     committed: Some(commit),
+                    removed: Vec::new(),
                     message: "kept the inspected staged content: the committed blobs are the \
                               ones the crashed writer staged, and any unstaged content in the \
                               working tree is untouched."
@@ -403,10 +406,18 @@ fn execute_inner(
                 }
             }
             Choice::Discard => {
+                // The preimages: the staged blobs this discard removes.
+                // They stay in the object store, so naming them makes
+                // a partial discard recoverable.
+                let removed: Vec<String> = selected
+                    .iter()
+                    .filter_map(|p| staged_blob(pm, p).ok().flatten())
+                    .collect();
                 discard_paths(pm, &selected)?;
                 Outcome {
                     resolved: true,
                     committed: None,
+                    removed,
                     message: "discarded the selected changes: the index and the working tree \
                               for those paths are back to their committed state, and every \
                               other path is untouched."
@@ -430,6 +441,7 @@ fn execute_inner(
         "resolved": resolved,
         "recovery_success": resolved,
         "committed": outcome.committed,
+        "removed_blobs": outcome.removed,
         "message": outcome.message,
         "remaining": remaining,
         "foreign_count": after.foreign.len(),
@@ -559,6 +571,9 @@ fn preview_for(pm: &Pm, choice: Choice, selected: &[String]) -> Result<Value> {
 struct Outcome {
     resolved: bool,
     committed: Option<String>,
+    /// The staged blobs a discard removed: the preimages that keep a
+    /// partial discard recoverable.
+    removed: Vec<String>,
     message: String,
 }
 
@@ -1191,12 +1206,128 @@ fn commit_index_state(pm: &Pm, paths: &[String], message: &str) -> Result<String
     Ok(commit)
 }
 
+/// Open the parent directory of `path` inside the tracker, walking
+/// every component with `O_NOFOLLOW`.
+///
+/// The recovery must not write through a symlinked ancestor: a symlink
+/// swapped in between the binding check and the mutation would take the
+/// write outside the tracker. Each component is therefore opened
+/// without following links, and the last one is returned as an open
+/// directory descriptor together with the final name.
+fn open_parent_no_follow(root: &Path, path: &str) -> std::io::Result<(i32, Vec<u8>)> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let bad = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the path is not a literal path inside the tracker",
+        )
+    };
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return Err(bad());
+    }
+    let root_c = CString::new(root.as_os_str().as_bytes()).map_err(|_| bad())?;
+    let mut fd = unsafe {
+        libc::open(
+            root_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    for part in &parts[..parts.len() - 1] {
+        let c = CString::new(part.as_bytes()).map_err(|_| bad())?;
+        let next = unsafe {
+            libc::openat(
+                fd,
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        unsafe { libc::close(fd) };
+        if next < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        fd = next;
+    }
+    let name = parts[parts.len() - 1].as_bytes().to_vec();
+    Ok((fd, name))
+}
+
+/// Remove a path inside the tracker without following a symlinked
+/// ancestor: the removal is an `unlinkat` on a directory descriptor
+/// opened with `O_NOFOLLOW`, so it can only ever remove the file the
+/// path names inside the tracker.
+fn remove_file_no_follow(root: &Path, path: &str) -> std::io::Result<()> {
+    use std::ffi::CString;
+    let (fd, name) = open_parent_no_follow(root, path)?;
+    let c = match CString::new(name) {
+        Ok(c) => c,
+        Err(_) => {
+            unsafe { libc::close(fd) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the path is not a literal path inside the tracker",
+            ));
+        }
+    };
+    let rc = unsafe { libc::unlinkat(fd, c.as_ptr(), 0) };
+    unsafe { libc::close(fd) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Write a path inside the tracker without following a symlinked
+/// ancestor: the file is created through a directory descriptor opened
+/// with `O_NOFOLLOW`, and the file itself is opened with `O_NOFOLLOW`
+/// too, so a symlink in place of the file is never written through.
+fn write_file_no_follow(root: &Path, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::io::Write;
+    use std::os::unix::io::FromRawFd;
+    let (fd, name) = open_parent_no_follow(root, path)?;
+    let c = match CString::new(name) {
+        Ok(c) => c,
+        Err(_) => {
+            unsafe { libc::close(fd) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the path is not a literal path inside the tracker",
+            ));
+        }
+    };
+    let file = unsafe {
+        libc::openat(
+            fd,
+            c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o644,
+        )
+    };
+    unsafe { libc::close(fd) };
+    if file < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut handle = unsafe { std::fs::File::from_raw_fd(file) };
+    handle.write_all(bytes)?;
+    Ok(())
+}
+
 /// Restore the selected paths to their committed state: the index entry
-/// and the working tree's content both go back to HEAD.
+/// and the working tree's content both go back to HEAD. The working
+/// tree's copy is written WITHOUT following a symlinked ancestor, so a
+/// symlink swapped in after the review cannot take the write outside
+/// the tracker.
 fn discard_paths(pm: &Pm, paths: &[String]) -> Result<()> {
     for path in paths {
         let in_head = git(&pm.dir, &["cat-file", "-e", &format!("HEAD:{path}")]).is_ok();
         if in_head {
+            // The index entry only: the working tree's copy is written
+            // below, without following links.
             run_git(
                 pm,
                 &[],
@@ -1204,12 +1335,32 @@ fn discard_paths(pm: &Pm, paths: &[String]) -> Result<()> {
                     Os::new("restore"),
                     Os::new("--source=HEAD"),
                     Os::new("--staged"),
-                    Os::new("--worktree"),
                     Os::new("--"),
                     Os::new(path),
                 ],
                 None,
             )?;
+            let content = git_raw(pm, &["cat-file", "blob", &format!("HEAD:{path}")])?;
+            write_file_no_follow(&pm.dir, path, &content).map_err(|e| {
+                Error::internal(format!(
+                    "the working-tree copy of {path} could not be restored from its committed \
+                     version ({e}); the index entry is back and the change is PARTLY applied. \
+                     Nothing was committed, the crash's marker and snapshot are intact, and \
+                     the file must be restored by hand before this path is left alone."
+                ))
+            })?;
+            // The committed mode, including the executable bit.
+            let mode = git(&pm.dir, &["ls-tree", "HEAD", "--", path])
+                .ok()
+                .and_then(|l| l.split_whitespace().next().map(str::to_string))
+                .unwrap_or_default();
+            if mode.ends_with("755") {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    pm.dir.join(path),
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
         } else {
             // A file the crash added: remove the staged addition and
             // the working tree's copy, so both are absent.
@@ -1226,22 +1377,22 @@ fn discard_paths(pm: &Pm, paths: &[String]) -> Result<()> {
                 ],
                 None,
             )?;
-            let abs = pm.dir.join(path);
-            if abs.exists() || std::fs::symlink_metadata(&abs).is_ok() {
-                // The worktree's copy has to be gone for the previewed
-                // result to be true. A removal that fails is a partial
-                // outcome, not a completed one.
-                if let Err(e) = std::fs::remove_file(&abs) {
-                    if std::fs::symlink_metadata(&abs).is_ok() {
-                        return Err(Error::internal(format!(
-                            "the discard of {path} removed the staged addition but its \
-                             working-tree file could not be removed ({e}). The change is \
-                             PARTLY applied: the index entry is gone and the file is still \
-                             there. Nothing was committed, the crash's marker and snapshot are \
-                             intact, and the file must be removed by hand before this path is \
-                             left alone."
-                        )));
-                    }
+            // The worktree's copy has to be gone for the previewed
+            // result to be true, and the removal must not follow a
+            // symlinked ancestor. A removal that fails is a partial
+            // outcome, not a completed one.
+            match remove_file_no_follow(&pm.dir, path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(Error::internal(format!(
+                        "the discard of {path} removed the staged addition but its \
+                         working-tree file could not be removed ({e}). The change is \
+                         PARTLY applied: the index entry is gone and the file is still \
+                         there. Nothing was committed, the crash's marker and snapshot are \
+                         intact, and the file must be removed by hand before this path is \
+                         left alone."
+                    )));
                 }
             }
         }
@@ -1252,6 +1403,13 @@ fn discard_paths(pm: &Pm, paths: &[String]) -> Result<()> {
 /// Run the repository's effective pre-commit hook against the content
 /// the recovery is about to commit. A hook that refuses refuses the
 /// recovery: the check is not weakened by committing a different way.
+///
+/// The hook must see the STAGED version, not the working tree's: the
+/// two can differ, and the recovery commits the staged one. So the
+/// hook runs against a MATERIALIZED copy of the index, in a directory
+/// of its own, with a gitfile so the hook's own
+/// `git rev-parse --show-toplevel` resolves to that copy. The real
+/// worktree is never handed to the hook and is never touched.
 fn run_pre_commit_hook(pm: &Pm, git_dir: &Path, tmp_index: &Path) -> Result<()> {
     let Some(hook) = effective_hook(pm) else {
         return Ok(());
@@ -1271,16 +1429,18 @@ fn run_pre_commit_hook(pm: &Pm, git_dir: &Path, tmp_index: &Path) -> Result<()> 
             return Ok(());
         }
     }
+    let materialized = materialize_index(pm, git_dir, tmp_index)?;
     let mut cmd = Command::new(&hook);
-    cmd.current_dir(&pm.dir)
+    cmd.current_dir(&materialized)
         .env("GIT_DIR", git_dir)
         .env("GIT_INDEX_FILE", tmp_index)
-        .env("GIT_WORK_TREE", &pm.dir)
+        .env("GIT_WORK_TREE", &materialized)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let out = crate::reaper::output(&mut cmd)
         .map_err(|e| Error::internal(format!("the pre-commit hook could not be run: {e}")))?;
+    let _ = std::fs::remove_dir_all(&materialized);
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(Error::rejected(format!(
@@ -1291,6 +1451,49 @@ fn run_pre_commit_hook(pm: &Pm, git_dir: &Path, tmp_index: &Path) -> Result<()> 
         )));
     }
     Ok(())
+}
+
+/// The index's content, materialized into a directory of its own.
+///
+/// `checkout-index` writes what the INDEX holds — the staged version —
+/// not what the working tree holds, which is the whole point: the hook
+/// must validate the bytes that are about to be committed. A gitfile
+/// points the copy at the real repository, so the hook's own
+/// `git rev-parse --show-toplevel` resolves to the copy and its lint
+/// reads the staged `issue.md` bytes.
+fn materialize_index(pm: &Pm, git_dir: &Path, tmp_index: &Path) -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!(
+        "cadence-recovery-materialized-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let out = crate::reaper::output(
+        Command::new("git")
+            .arg("-C")
+            .arg(&pm.dir)
+            .arg(format!("--git-dir={}", git_dir.display()))
+            .arg(format!("--work-tree={}", dir.display()))
+            .env("GIT_INDEX_FILE", tmp_index)
+            .arg("checkout-index")
+            .arg("-a"),
+    )
+    .map_err(|e| {
+        Error::internal(format!(
+            "the staged content could not be materialized for the pre-commit hook ({e}); \
+             nothing was committed."
+        ))
+    })?;
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(Error::internal(format!(
+            "the staged content could not be materialized for the pre-commit hook: {}. \
+             Nothing was committed.",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    std::fs::write(dir.join(".git"), format!("gitdir: {}\n", git_dir.display()))?;
+    Ok(dir)
 }
 
 /// The hook Git would run for this repository: `core.hooksPath` when

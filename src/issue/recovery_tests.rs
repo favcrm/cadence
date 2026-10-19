@@ -467,6 +467,65 @@ fn a_replaced_ancestor_refuses_the_recovery() {
     assert!(!outside.path().join("issue.md").exists());
 }
 
+/// CAD-1601: the pre-commit hook must validate the STAGED content —
+/// the bytes the recovery is about to commit — not the working tree's.
+/// The `hold_staged_unstaged` fixture leaves the two different.
+#[test]
+fn the_hook_validates_the_staged_content_not_the_working_trees() {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, pm) = tracker();
+    let seen = tmp.path().join("hook-saw.txt");
+    let hook = pm.dir.join(".git").join("hooks").join("pre-commit");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ncat \"$GIT_WORK_TREE/tracked.txt\" > {}\n",
+            seen.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (child, _) = spawn_writer(&pm, "hold_staged_unstaged", false);
+    sigkill(child);
+    assert_eq!(worktree_content(&pm, "tracked.txt"), "working\n");
+    assert_eq!(index_content(&pm, "tracked.txt"), "staged");
+
+    let r = review(&pm, None).unwrap();
+    let paths = vec!["tracked.txt".to_string()];
+    let d = decide(&pm, &r, Choice::Keep, &paths).unwrap();
+    execute(&pm, &r, &d, Choice::Keep, &paths).unwrap();
+
+    // The hook was shown the STAGED content.
+    let saw = std::fs::read_to_string(&seen).unwrap();
+    assert_eq!(saw, "staged\n", "the hook saw: {saw:?}");
+    // And the commit carries it.
+    assert_eq!(head_content(&pm, "tracked.txt"), "staged");
+    // The working tree's own content is untouched.
+    assert_eq!(worktree_content(&pm, "tracked.txt"), "working\n");
+}
+
+/// CAD-1601: the mutation boundary does not follow a symlinked
+/// ancestor. A removal under one fails instead of deleting the file
+/// outside the tracker.
+#[test]
+fn a_removal_does_not_follow_a_symlinked_ancestor() {
+    let (_tmp, pm) = tracker();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("keep.txt");
+    std::fs::write(&sentinel, b"keep\n").unwrap();
+    // A directory inside the tracker that is a symlink to the outside.
+    std::os::unix::fs::symlink(outside.path(), pm.dir.join("link")).unwrap();
+    let e = super::remove_file_no_follow(&pm.dir, "link/keep.txt")
+        .expect_err("a symlinked ancestor must not be followed");
+    assert!(
+        matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)),
+        "{e}"
+    );
+    // The file outside the tracker is untouched.
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep\n");
+}
+
 /// CAD-1601: a tracker with no interrupted write has nothing to
 /// recover, and says so rather than inventing a change set.
 #[test]

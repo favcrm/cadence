@@ -115,14 +115,23 @@ impl Shared {
         let choice = required_choice(params)?;
         let paths = required_path_list(params, "paths")?;
         let outcome = recovery::execute_detailed(&self.pm()?, review, decision, choice, &paths);
+        // The attempt records WHO made it: the daemon's positive
+        // operator proof for THIS connection, never a caller-supplied
+        // name. No token, no argv, no environment.
+        let mut attempt = outcome.attempt;
+        attempt["actor"] = json!({
+            "kind": "operator",
+            "proof": "operator_connection for this connection",
+            "peer_pid": peer_pid,
+        });
         // The attempt is recorded either way, so a FAILED execution is
         // still confirmable afterwards: `recover status --attempt <file>`
         // reads it back. The refusal keeps its own kind, so the exit
         // code still says whether a retry can help.
-        let recorded = self.record_recovery_attempt(&outcome.attempt);
+        let recorded = self.record_recovery_attempt(&attempt);
         match outcome.error {
             Some(e) => Err(with_attempt_path(e, recorded.as_deref())),
-            None => Ok(outcome.attempt),
+            None => Ok(attempt),
         }
     }
 
