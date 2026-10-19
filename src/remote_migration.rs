@@ -439,7 +439,6 @@ fn transfer(
                 )
                 .map_err(reconcile)?;
                 body.finish_part()?;
-                drop(body);
                 part_data(
                     &data,
                     target,
