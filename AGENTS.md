@@ -29,11 +29,14 @@ prose and an authoritative source disagree, the source wins.
 - Path lists: `docs/roles/one-review-paths.toml` (review count),
   `docs/roles/risk-paths.toml` (triggers; the daemon compiles it in).
 - The delivery policy: the default lean policy needs no activation, and an
-  absent `delivery:` section is that default. A project declares its own in
+  absent `delivery:` section is that default — unless a custom section was
+  approved before, in which case that policy stays in force and the
+  delivery counts as unapproved. A project declares its own in
   `<pm>/<key>/PROJECT.md` and the operator approves it with
   `cadence issue project approve-work <key>` (`docs/BOARD.md`). A policy
-  that is not the default is not lean: a malformed section, or a custom
-  section that is not operator-approved, falls back to `strict`.
+  that is not the default is not lean: a malformed section, a custom
+  section that is not operator-approved, or a custom section removed after
+  approval falls back to `strict`.
 - Elsewhere: audit evidence `docs/AUDIT.md`, charter and non-goals
   `docs/CHARTER.md`, dev cycle and the clean-slate transition
   `docs/DEV-CYCLE.md`, Pi provider mechanics `docs/BOARD.md`, rollout order
@@ -95,14 +98,14 @@ the code you just wrote.
     approval.
   - `strict` — the floor the evaluator falls back to: any activation other
     than the default lean policy (a malformed section, a custom section
-    that is not operator-approved, a legacy profile), path lists that
-    cannot be read, incomplete or unsafe diff evidence, a delete, rename,
-    type or mode change, and the risk-trigger, human-class,
-    one-review-excluded and oversize-diff conditions. It keeps today's
-    legacy floor and never fewer: one combined review on the one-review
-    list, else two (Standards and Spec/security); the operator floor on
-    human-class paths and over 1500 changed lines; full checks; Browser
-    QA on `ui/**`.
+    that is not operator-approved or was removed after approval, a legacy
+    profile), path lists that cannot be read, incomplete or unsafe diff
+    evidence, a delete, rename, type or mode change, and the
+    risk-trigger, human-class, one-review-excluded and oversize-diff
+    conditions. It keeps today's legacy floor and never fewer: one
+    combined review on the one-review list, else two (Standards and
+    Spec/security); the operator floor on human-class paths and over 1500
+    changed lines; full checks; Browser QA on `ui/**`.
 - One independent review by default, covering standards and spec, when
   every changed path qualifies under `docs/roles/one-review-paths.toml`. A
   path that does not (trust boundary, identity, secrets, `ui/**`) needs
