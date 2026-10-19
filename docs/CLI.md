@@ -521,8 +521,8 @@ the server reports as durably completed. Untouched pending spans upload under
 the same operation and request id. An unknown or unrecognized input effect
 stops the upload with no re-send; recover with `--status <operation-id>`
 (or `--status request:<stable-id>`), never by inventing a new id or repeating
-an upload. Packages above 32,768 logical data members are refused; the
-manifest's own inventory entry is the 32,769th.
+an upload. Packages above 19,998 logical data members are refused; the
+manifest's own inventory entry is the 19,999th.
 
 Imports, replacements and rollbacks remain execution-disabled. A replacement
 does not manufacture native activation receipts, enable imported actors or

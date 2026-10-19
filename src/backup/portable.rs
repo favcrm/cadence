@@ -1175,9 +1175,11 @@ pub fn verify_transfer_package(source: &Path) -> Result<VerifiedPackage> {
 /// package outside them before any byte is sent; the server stays the
 /// enforcement of record.
 pub const TRANSFER_MANIFEST_MAX: usize = 4 * 1024 * 1024;
-/// Logical data members cap (32,768). The sealed inventory adds `manifest.json`
-/// as one separate entry (32,769 total), which is not counted here.
-pub const TRANSFER_MEMBERS_MAX: usize = 32768;
+/// Logical data members cap (19,998). The sealed inventory adds `manifest.json`
+/// as one separate entry (19,999 total), which is not counted here. The hosted
+/// manifest parser admits 19,998 declared members, so this client-side refusal
+/// matches the server bound instead of admitting what the server rejects.
+pub const TRANSFER_MEMBERS_MAX: usize = 19998;
 
 fn inspect_package(source: &Path) -> Result<VerifiedPackage> {
     if !source.symlink_metadata()?.is_dir() {
