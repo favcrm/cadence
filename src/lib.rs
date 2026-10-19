@@ -100,24 +100,8 @@ pub mod worktree;
 extern crate self as cadence_agent;
 #[cfg(test)]
 mod test_web_issuer_tls;
-#[cfg(all(test, not(feature = "cli-runtime-test")))]
+#[cfg(test)]
 mod web_cli_test_harness;
-
-// Exercise the production CLI parser/router with the library's test-only
-// issuer pin. No CLI module or transport override is added to shipped builds.
-#[cfg(all(test, feature = "cli-runtime-test"))]
-#[allow(dead_code, unused_imports)]
-// Binary entry/help are unused in this test-only library include.
-mod cli {
-    include!("cli/mod.rs");
-
-    // Retain the existing web checks without compiling web.rs twice in
-    // this crate. Ordinary test builds retain the smaller web harness.
-    #[path = "web_tls_acceptance.rs"]
-    mod tls_acceptance;
-    #[path = "web_transport_tests.rs"]
-    mod transport_tests;
-}
 
 pub use error::{Error, Result};
 

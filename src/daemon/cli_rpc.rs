@@ -210,7 +210,7 @@ impl Shared {
     }
 
     /// Master coordination is the existing human-owner chat boundary.
-    fn cli_recipient(&self, principal: &CliPrincipal, raw: &str) -> Result<String> {
+    fn cli_recipient(&self, principal: &CliPrincipal, raw: &str) -> Result<store::Agent> {
         if raw != crate::master::ALIAS {
             return Err(Error::invalid(
                 "recipient_class_unsupported",
@@ -224,7 +224,14 @@ impl Shared {
                 "master coordination requires a verified human workspace owner",
             ));
         }
-        self.resolve_alias(raw)
+        // Alias-only: `resolve_alias` also matches native thread/session ids,
+        // so a native id equal to "master" must not reach the owner's chat.
+        self.store.agent_opt(raw)?.ok_or_else(|| {
+            Error::invalid(
+                "not_found",
+                "Hosted master is not registered in this workspace",
+            )
+        })
     }
 
     /// `cli_message_send` — the remote send. Closed params
@@ -279,25 +286,38 @@ impl Shared {
             }
         };
         let raw = required_str(params, "alias")?;
-        let alias = self.cli_recipient(&principal, raw)?;
+        let recipient = self.cli_recipient(&principal, raw)?;
+        let source = principal.source();
         let send = json!({
-            "alias": alias,
+            "alias": recipient.alias,
             "text": text,
             "message": message,
-            "source": principal.source(),
+            "source": source,
         });
         let auth = store::CliAuthority {
-            org: principal.config.company.clone(),
-            sub: principal.actor.sub.clone(),
-            actor: principal.actor.actor.clone(),
-            handle: principal.actor.handle.clone(),
-            credential_id: principal.actor.credential_id.clone(),
+            org: principal.config.company,
+            sub: principal.actor.sub,
+            actor: principal.actor.actor,
+            handle: principal.actor.handle,
+            credential_id: principal.actor.credential_id,
         };
         let mut receipt = self
-            .send_as(&send, &|_| Ok(store::Sender::Cli(auth.clone())))
+            .send_with_expected(
+                &send,
+                &|_| Ok(store::Sender::Cli(auth.clone())),
+                &|_| Err(Error::rejected("remote CLI send does not support steering")),
+                Some(&recipient.uid),
+            )
             .map_err(|e| self.cli_send_err(e))?;
-        receipt["alias"] = json!(alias);
-        receipt["sender"] = json!(principal.source());
+        let conversation = self
+            .store
+            .message_conversation(&recipient.alias, &message)?
+            .ok_or_else(|| Error::internal("CLI message has no persisted Home conversation"))?;
+        receipt["alias"] = Value::String(recipient.alias);
+        receipt["sender"] = Value::String(source);
+        receipt["workspace_id"] = Value::String(auth.org);
+        receipt["sender_subject"] = Value::String(auth.sub);
+        receipt["conversation"] = Value::String(conversation.id);
         Ok(receipt)
     }
 
@@ -342,7 +362,11 @@ impl Shared {
             .ok()
             .flatten()
             .unwrap_or(Value::Null);
-        Ok(json!({
+        let conversation = self
+            .store
+            .message_conversation(&message.alias, &message.id)?
+            .ok_or_else(|| Error::internal("CLI message has no persisted Home conversation"))?;
+        let mut receipt = json!({
             "message": message.id,
             "alias": message.alias,
             "state": message.state,
@@ -355,7 +379,12 @@ impl Shared {
             "chars_total": total,
             "truncated": offset + text.chars().count() < total,
             "app_context": app_context,
-        }))
+        });
+        receipt["workspace_id"] = Value::String(principal.config.company);
+        receipt["sender_subject"] = Value::String(principal.actor.sub);
+        receipt["sender"] = Value::String(message.source);
+        receipt["conversation"] = Value::String(conversation.id);
+        Ok(receipt)
     }
 
     /// Passive mailbox inspection retains the existing human-owner

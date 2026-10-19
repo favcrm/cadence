@@ -144,27 +144,60 @@ container's ambient alias. Local CLI writes retain their existing actor
 resolution. `issue project add` and `issue project ls` stay local.
 `message send`/`send` (CAD-1568) map to `message_send` (cli.write):
 a durable coordination enqueue to the hosted master for a verified human
-workspace owner. Personal-assistant and local-worker recipients are typed
-unsupported-class refusals: separate assistant authority or local assignments
-are required, never a reroute or generic container execution.
+workspace owner. The recipient fence is the canonical `master` agent
+only: the raw spelling must be `master` *and* the daemon resolves the
+exact `master` agent row — a native session/thread id that happens to
+spell `master` never substitutes. The selected row's UID is retained through
+shared send and checked inside the enqueue transaction, so lifecycle removal
+or replacement cannot redirect the request. No refusal silently reroutes or
+enqueues elsewhere. Personal-assistant and local-worker recipients are
+typed unsupported-class refusals: separate assistant authority or local
+assignments are required, never a reroute or generic container execution.
+Member-to-member remote coordination and the local-worker follow-up
+journey are deferred on the ticket — refused, not silently fulfilled.
 Arguments are exactly `{alias, text, message}`
 — three strings. `message` is the caller-chosen stable id: required, the
 identifier grammar, never `sys-*`. It is the dedupe and reconciliation key —
-a resubmitted id with identical content is the same message (the reply
-carries `duplicate`), and the same id with different content — or an id
+a resubmitted id with identical content is the same message (`duplicate`
+true on the receipt), and the same id with different content — or an id
 another member owns — is a typed `message_id_conflict`, never a retry.
 The original signed cli envelope rides to the daemon, which re-verifies it
 and stamps the principal-derived sender (`cli-<handle>`), never "operator"
-and never a caller-named source. The reply is the ordinary
-`{message, state, duplicate}` send receipt. `cadence message read <id>`
-returns only that human's CLI-sent message — the body window plus `state`,
-sanitized `result`, `error`, `alias` and `awaiting_report`. Agent/service
-envelopes do not inherit the parent's `sub` ownership. Absent and foreign IDs
-share `not_found`; browser member-chat records are not CLI-owned. Reconcile
+and never a caller-named source. The enqueue binds the recipient's Home
+`message_conversation`: a first-ever send creates the master's Home thread
+transactionally with the durable message, and every later send reports the
+same `conversation`. The reply is the complete enqueue receipt —
+`{message, alias, state, duplicate, workspace_id, sender_subject, sender,
+conversation}`: the echoed stable id and canonical `master` alias, the
+lifecycle state and duplicate bool, the verified immutable workspace ID
+(not the slug), the authenticated human's canonical subject, the `cli-*`
+display sender, and the persisted conversation id. The receipt is durable
+enqueue acceptance — never delivery, execution or a result; the outcome is
+`message read`'s report. A 2xx answer missing or falsifying any of those
+correlated fields is `unknown`, the same verdict as a lost reply: never a
+false success, never a blind replay — reconcile by the stable id.
+`cadence message read <id>` returns only that human's CLI-sent message —
+the body window plus `state`, sanitized `result`, `error`, `alias` and
+`awaiting_report` — carrying the same `workspace_id`, `sender_subject`,
+`sender` and `conversation` binding. Agent/service envelopes do not
+inherit the parent's `sub` ownership. Absent and foreign IDs share
+`not_found`; browser member-chat records are not CLI-owned. Reconcile
 the original identity and workspace before a same-ID retry; no automatic
 post-forward replay. Passive inbox inspection requires a human owner and
 does not expose managed assistants' private conversation. Accepted/queued
 is not delivery or completion; an offline recipient stays queued.
+
+Canonical-recipient acceptance is exercised at two boundaries. The independent
+`cad1584_http_master_native_collision_refused_then_canonical_home_preserved`
+check sends signed owner requests through the real isolated HTTP relay,
+requires refusal without a durable enqueue for native-ID collisions, and pairs
+that refusal with canonical-master Home, duplicate and owned-read controls.
+`cad1584_selected_uid_lifecycle_fence_refuses_removal_and_replacement`
+retains the selected UID, removes or replaces its registration, and exercises
+the shared-send transaction fence. The latter proves the selected-row boundary,
+not a deterministic lifecycle interleaving inside the HTTP handler. Run both
+with `cargo test --locked --features test-seam --lib cad1584_ -- --test-threads 2`
+under the repository's build-slot admission.
 
 Client-side refusals (CAD-1179 — refused before any bytes leave the
 process): `issue new` without `--project`, or with `--id`/`--status`;

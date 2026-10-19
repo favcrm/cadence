@@ -338,12 +338,20 @@ Each collaborating writer enrolls independently: a separate
 
 `cadence send` (and its `message send` form) enqueue a durable coordination
 message to the hosted **master**, for a verified human workspace owner.
-This is not generic container execution. Personal assistants require separate
-assistant authority; local workers use the `local-agent`/local-assignment
-plane. Both are unsupported remote-send recipient classes and return a typed
-refusal without enqueueing or rerouting work. Agent/service envelopes cannot
-inherit their parent human's messaging or private readback authority.
-
+This is not generic container execution. The recipient fence is the
+canonical `master` agent only: any other recipient spelling is a typed
+refusal, and the daemon resolves the exact `master` agent row — another
+worker's session or thread id that happens to spell `master` is never
+substituted, and no refusal silently reroutes or enqueues elsewhere.
+The selected row's UID is checked inside the enqueue transaction; removing
+or replacing that recipient before enqueue refuses the send rather than
+allowing a later generic lookup to redirect it.
+Personal assistants require separate assistant authority and local workers
+use the `local-agent`/local-assignment plane; both are unsupported
+remote-send recipient classes. Member-to-member remote coordination and
+the local-worker follow-up journey are explicitly deferred on the ticket —
+refused, not silently fulfilled. Agent/service envelopes cannot inherit
+their parent human's messaging or private readback authority.
 Roll out the matching native-server authorization guard before exposing
 the upgraded CLI to a hosted workspace. A CLI upgrade alone does not
 establish these sender-ownership and private-readback guarantees.
@@ -363,11 +371,26 @@ inputs when the login has only CLI scopes.
 
 `--message <id>` is **required** on a remote send: it is the caller-chosen
 stable id (identifier grammar, never `sys-*`) the send is deduplicated
-and reconciled under. The reply is the ordinary
-`{message, state, duplicate}` receipt — durable acceptance, never
-delivery or completion; an offline recipient stays queued. `message read
-<id>` returns your own sent message's body plus `state`, `result`,
-`error` and `awaiting_report`. Absent and foreign message IDs return the same
+and reconciled under. The send binds the recipient's Home
+`message_conversation` at enqueue: a first-ever send creates the master's
+Home thread transactionally with the durable message, and every later
+send to it reports the same `conversation`. The successful reply is the
+complete enqueue receipt — the echoed stable `message` id, the canonical
+`alias` (`master`), the lifecycle `state`, the `duplicate` bool, the
+immutable `workspace_id` (the workspace ID verified at login, not the
+slug), the authenticated human's canonical `sender_subject`, the `cli-*`
+display `sender`, and the stored `conversation`. That receipt proves
+durable enqueue only — it is never the delivery, execution or result of
+the message, which remain `message read`'s report.
+
+A `2xx` answer without that complete correlated receipt — missing,
+malformed, or bound to another message, alias, workspace or subject — is
+`unknown`, exactly like a lost reply: reconcile by the stable `--message`
+id. It is never reported as a success and never replayed. `message read
+<id>` returns your own sent message's body plus `state`, sanitized
+`result`, `error` and `awaiting_report`, with the same `workspace_id`,
+`sender_subject`, `sender`, `alias` and `conversation` binding the send
+receipt carried. Absent and foreign message IDs return the same
 `not_found` refusal. Browser member-chat messages are not CLI-owned.
 
 `--ready`/`--force`, `--nudge`, `--priority`/`--supersedes`, `--reply-to`
@@ -388,7 +411,8 @@ content or owned by another principal — reconcile or choose a fresh id),
 `not_found` (no CLI message visible to this human under that id).
 
 If a send's outcome is lost (timeout, dropped connection, 5xx after the
-call), do not guess: run `cadence message read <id> --org <org>` using the
+call, or a 2xx whose receipt is not the complete correlated one above),
+do not guess: run `cadence message read <id> --org <org>` using the
 original human login and workspace. `not_found` does not prove that no
 other principal owns the ID. After reconciling the destination and identity,
 retry with the **same** `--message` id: the same principal/id/content does
@@ -405,10 +429,15 @@ Ordinary `test-seam` CI retains the CLI tests in their original binary
 target and still runs the new daemon ownership/refusal acceptance checks.
 
 ```sh
+CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 \
+  cadence --state-dir "$HOME/.local/state/cadence" build-slot run build -- \
+  cargo build --locked --features test-seam --bin cadence
+
 CAD1568_AOS_API_DIR=/absolute/path/to/agenticos-v2/apps/api \
+  CAD1568_CLI="$PWD/target/debug/cadence" \
   CARGO_BUILD_JOBS=2 CARGO_PROFILE_TEST_DEBUG=0 \
   cadence --state-dir "$HOME/.local/state/cadence" build-slot run test -- \
-  cargo test --features cli-runtime-test --lib \
+  cargo test --locked --features cli-runtime-test --lib \
     cad1568_real_hosted_message_roundtrip_and_refusals \
     -- --ignored --test-threads 1 --nocapture
 ```
@@ -417,13 +446,21 @@ Use the local admission broker's actual state directory above. Unlike
 `--org local`, this does not export a local instance binding into the
 tested CLI process; no caller identity variables are cleared.
 
-The fixture compiles the production CLI grammar, argument-source capture
-and routed dispatch into the library test, then sends and reads through
-the real hosted client and native message paths. It is not an installed
-CLI subprocess or a deployed workspace. Its controller primes JWKS caches
-over verified disposable TLS; it does not prove a fresh handler-thread
-JWKS fetch. Production messaging runtimes, credentials and paid providers
-are not exercised.
+The fixture launches that debug executable through its real entry point,
+parser and dispatch for login, wiki staging/reference, send and exact-result
+readback. The library no longer borrows the binary's CLI modules. The
+`test-seam` build adds only an explicitly armed private-CA/loopback transport
+for these subprocesses; certificate-chain, hostname, signed-envelope and
+authority checks remain enabled. Release builds reject `test-seam`.
+The scenario requires an external coordinator and refuses a real parent
+`CADENCE_ALIAS` before constructing isolated synthetic-persona environments;
+never unset a managed identity to run it.
+
+This is not an installed release CLI or a deployed workspace. The controller
+primes CLI and wiki JWKS caches over verified disposable TLS; fresh
+handler-thread JWKS fetching and real master commissioning/model policy are
+not proved. Production messaging runtimes, credentials and providers are not
+exercised.
 
 ## Issuer-bound service enrollment (CAD-717)
 

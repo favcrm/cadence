@@ -77,7 +77,10 @@ const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 /// is final. For `message_send`, the caller-chosen `message` id in
 /// `arguments` is the reconciliation key: `message_read` returns the
 /// principal's own durable message by id, and resubmitting the same id
-/// dedupes server-side — never a blind replay.
+/// dedupes server-side — never a blind replay. A 2xx proves the enqueue
+/// only as the complete correlated receipt
+/// ([`send_receipt_correlates`]): an absent, malformed or foreign-bound
+/// body is `unknown`, the same unresolved outcome a lost response has.
 pub const REMOTE_VERBS: &[&str] = &[
     // cli.read
     "status",
@@ -1870,6 +1873,69 @@ pub(crate) fn call_bounded(
     )
 }
 
+/// CAD-1568 revision: a `message_send` 2xx is a usable receipt only when it
+/// carries the complete correlated enqueue binding:
+///
+/// - `message` — the caller-chosen stable id echoed exactly (the
+///   reconciliation key a lost reply is retried under);
+/// - `state` — a known lifecycle state and `duplicate` — a real bool;
+/// - `alias` — the requested canonical recipient echoed exactly (only
+///   `master` is ever requested);
+/// - `workspace_id` — the immutable organization id for this destination
+///   (the `org_id` pinned at login, never the registry slug);
+/// - `sender_subject` — the authenticated human's canonical subject; when
+///   the saved login recorded one it must be exactly that subject;
+/// - `sender` — the retained `cli-<handle>` display attribution, nonempty;
+/// - `conversation` — the persisted message_conversation Home thread id
+///   the enqueue fixed, nonempty (returned again on duplicates/readback).
+///
+/// Anything less cannot establish that THIS send landed as THIS caller's
+/// message in the target workspace — the outcome is unknown and is
+/// reconciled by the stable id, never called a success or replayed.
+fn send_receipt_correlates(
+    receipt: &Value,
+    arguments: &Map<String, Value>,
+    target: &RemoteTarget,
+    cred: &Credential,
+) -> bool {
+    let bound = |key: &str| {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|expected| {
+                !expected.is_empty() && receipt.get(key).and_then(Value::as_str) == Some(expected)
+            })
+    };
+    bound("message")
+        && bound("alias")
+        && matches!(
+            receipt.get("state").and_then(Value::as_str),
+            Some(
+                "queued"
+                    | "submitting"
+                    | "running"
+                    | "completed"
+                    | "failed"
+                    | "cancelled"
+                    | "unknown"
+            )
+        )
+        && receipt.get("duplicate").and_then(Value::as_bool).is_some()
+        && receipt.get("workspace_id").and_then(Value::as_str) == Some(target.org_id.as_str())
+        && receipt
+            .get("sender_subject")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty() && cred.subject_id.as_deref().is_none_or(|sub| sub == s))
+        && receipt
+            .get("sender")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+        && receipt
+            .get("conversation")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn call_verb_until_retry(
     target: &RemoteTarget,
@@ -1942,31 +2008,15 @@ fn call_verb_until_retry(
         }
         let (status, retry_after, body) =
             call_once(target, &cred, surface, verb, &arguments, deadline)?;
-        // A successful status without a usable, correlated enqueue receipt
-        // cannot establish whether the mutation landed. Never call it rejected.
+        // A successful status without the complete, correlated enqueue
+        // receipt cannot establish whether — or as whose message, in which
+        // workspace and conversation — the mutation landed. Unknown, never
+        // a rejection and never a false success to replay blindly.
         if verb == "message_send"
             && (200..300).contains(&status)
-            && !body.as_ref().is_some_and(|receipt| {
-                arguments
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| {
-                        receipt.get("message").and_then(Value::as_str) == Some(id)
-                            && matches!(
-                                receipt.get("state").and_then(Value::as_str),
-                                Some(
-                                    "queued"
-                                        | "submitting"
-                                        | "running"
-                                        | "completed"
-                                        | "failed"
-                                        | "cancelled"
-                                        | "unknown"
-                                )
-                            )
-                            && receipt.get("duplicate").and_then(Value::as_bool).is_some()
-                    })
-            })
+            && !body
+                .as_ref()
+                .is_some_and(|receipt| send_receipt_correlates(receipt, &arguments, target, &cred))
         {
             return Err(Error::unknown(
                 "remote send returned no usable correlated receipt — enqueue outcome is unknown",
@@ -3124,6 +3174,24 @@ mod tests {
         assert_ne!(envs[0], envs[1], "a wake retry reused the envelope");
     }
 
+    /// The complete correlated receipt a `message_send` 2xx must carry
+    /// (CAD-1568 revision): the request's stable `message` id and canonical
+    /// `alias` echoed, a known lifecycle `state`, a real `duplicate` bool,
+    /// the immutable `workspace_id`, the sender's canonical
+    /// `sender_subject` and the persisted `conversation` Home thread id.
+    fn send_receipt(id: &str) -> Value {
+        json!({
+            "message": id,
+            "alias": "master",
+            "state": "queued",
+            "duplicate": false,
+            "workspace_id": ORG_ID,
+            "sender_subject": "sub_owner_1",
+            "sender": "cli-owner",
+            "conversation": "conv_home_1",
+        })
+    }
+
     #[test]
     fn successful_send_without_a_receipt_is_unknown_and_not_retried() {
         for receipt in [
@@ -3146,6 +3214,124 @@ mod tests {
     }
 
     #[test]
+    fn send_with_a_missing_or_malformed_binding_is_unknown_and_not_retried() {
+        // Each corruption removes or falsifies one correlation field of the
+        // complete receipt: a 2xx carrying it cannot prove THIS send landed
+        // as this caller's message in this workspace's conversation, so the
+        // outcome is `unknown` — and the send is still never replayed.
+        let tampered = |damage: &dyn Fn(&mut Map<String, Value>)| {
+            let mut receipt = send_receipt("lost-receipt");
+            damage(receipt.as_object_mut().unwrap());
+            receipt
+        };
+        let receipts = [
+            tampered(&|r| {
+                r.remove("workspace_id");
+            }),
+            tampered(&|r| {
+                r["workspace_id"] = json!("ws_foreign");
+            }),
+            tampered(&|r| {
+                r["workspace_id"] = json!("");
+            }),
+            tampered(&|r| {
+                r.remove("sender_subject");
+            }),
+            tampered(&|r| {
+                r["sender_subject"] = json!("");
+            }),
+            tampered(&|r| {
+                r.remove("conversation");
+            }),
+            tampered(&|r| {
+                r["conversation"] = json!("");
+            }),
+            tampered(&|r| {
+                r["alias"] = json!("assistant-personal");
+            }),
+            tampered(&|r| {
+                r.remove("sender");
+            }),
+            tampered(&|r| {
+                r["sender"] = json!("");
+            }),
+            tampered(&|r| {
+                r["duplicate"] = json!("yes");
+            }),
+            tampered(&|r| {
+                r["state"] = json!("delivered");
+            }),
+        ];
+        for receipt in receipts {
+            let (out, requests) = run(
+                vec![(200, "", receipt)],
+                "message_send",
+                json!({"alias": "master", "text": "coordinate", "message": "lost-receipt"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                10,
+            );
+            assert_eq!(out.unwrap_err().kind(), "unknown");
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+        }
+    }
+
+    #[test]
+    fn send_without_expected_message_identity_is_unknown_and_not_retried() {
+        let mut receipt = send_receipt("lost-receipt");
+        receipt.as_object_mut().unwrap().remove("message");
+        let (out, requests) = run(
+            vec![(200, "", receipt)],
+            "message_send",
+            json!({"alias": "master", "text": "coordinate"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            10,
+        );
+        assert_eq!(out.unwrap_err().kind(), "unknown");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+
+    #[test]
+    fn send_receipt_for_another_subject_is_unknown_and_not_retried() {
+        // A login that recorded its canonical subject binds the receipt to
+        // it: a 2xx answering a different `sender_subject` cannot be this
+        // send's enqueue proof.
+        let (listener, requests, _s) = fake_worker(vec![(200, "", send_receipt("lost-receipt"))]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        let path = dir.join(format!("cli-{ORG}.json"));
+        let mut cred: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        cred["subject_id"] = json!("sub_the_login");
+        fs::write(&path, serde_json::to_vec(&cred).unwrap()).unwrap();
+        let out = call_verb_in(
+            &target,
+            "message_send",
+            json!({"alias": "master", "text": "coordinate", "message": "lost-receipt"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            10,
+            &dir,
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(out.unwrap_err().kind(), "unknown");
+        assert_eq!(
+            hits(&requests.lock().unwrap(), "/__platform/cli/call"),
+            1,
+            "an unknown send outcome was replayed"
+        );
+    }
+
+    #[test]
     fn a_send_wake_retry_keeps_its_durable_message_id() {
         // A pre-forward wake retry needs a fresh envelope but must not
         // mint another durable message id.
@@ -3160,12 +3346,7 @@ mod tests {
         let (out, requests) = run(
             vec![
                 (503, "", json!({"state": "waking", "retry_after_s": 1})),
-                (
-                    200,
-                    "",
-                    json!({"message": "cad1568-proof-1", "state": "queued",
-                    "duplicate": false, "alias": "master"}),
-                ),
+                (200, "", send_receipt("cad1568-proof-1")),
             ],
             "message_send",
             args,
