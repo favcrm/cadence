@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useContext, useState } from "react";
 import type { ResourceState } from "../../lib/cache";
 import {
   agentIsUnassigned,
@@ -12,6 +12,7 @@ import { useTranslate } from "../../lib/locale";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { IconSearch } from "../../ui/icons";
 import Button from "../../ui/Button";
+import { WriteGate } from "../auth/WriteGate";
 import { activeTasks, AgentActivity, WorkBlock } from "./AgentBlocks";
 import AgentAvatar, { lookFor } from "./AgentAvatar";
 import AgentDrawer from "./AgentDrawer";
@@ -135,6 +136,7 @@ function AgentCard({
   onOpen: () => void;
   onOpenIssue: (id: string) => void;
 }) {
+  const writeBlock = useContext(WriteGate);
   const t = useTranslate();
   const lifecycle = lifecycleOf(a);
   const tone = LIFECYCLE_SECTIONS.find((s) => s.key === lifecycle)!.tone;
@@ -185,8 +187,23 @@ function AgentCard({
           <i aria-hidden="true" />
           {badge.label}
         </span>
-        <span className={`agent-qchip${a.queued >= 100 ? " hot" : ""}`}>
-          {t("{count} queued").replace("{count}", String(a.queued))}
+        <span className="agent-foot-side">
+          {/* Threads resolves the alias: the existing You ↔ agent row opens,
+              else `?dm=` starts a local draft — no server row is created
+              and nothing is sent until the operator writes. */}
+          <Button
+            variant="ghost"
+            size="sm"
+            href={`/threads?dm=${encodeURIComponent(a.alias)}`}
+            disabled={writeBlock !== null}
+            title={writeBlock ?? t("Message {alias}").replace("{alias}", () => a.alias)}
+            aria-label={t("Message {alias}").replace("{alias}", () => a.alias)}
+          >
+            {t("Message")}
+          </Button>
+          <span className={`agent-qchip${a.queued >= 100 ? " hot" : ""}`}>
+            {t("{count} queued").replace("{count}", String(a.queued))}
+          </span>
         </span>
       </div>
     </article>

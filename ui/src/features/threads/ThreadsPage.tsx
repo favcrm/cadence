@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { ApiError, api } from "../../lib/api";
-import { withPrivateOperation } from "../../lib/privateSession";
+import { onPrivateSessionReset, withPrivateOperation } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
 import { useResource } from "../../lib/useResource";
 import { navigate, useHref } from "../../lib/useLocation";
@@ -15,8 +15,12 @@ import Link from "../../ui/Link";
 import PageState from "../../ui/PageState";
 import { issuePath } from "../issues/model";
 import { IconClose, IconRefresh, IconSearch, IconThreads } from "../../ui/icons";
+import type { Agent } from "../../lib/types";
 import Composer from "../app-shell/chat/Composer";
 import { asEntry, newMessageId, type ThreadEntry } from "../home/thread";
+import AgentAvatar, { lookFor } from "../agents/AgentAvatar";
+import { activeTasks } from "../agents/AgentBlocks";
+import { lifecycleBadge, lifecycleOf } from "../agents/agentView";
 import { StageLabel, ThreadComposerFrame, Turn } from "./ThreadChatParts";
 import {
   changeSubscriber,
@@ -40,6 +44,7 @@ import {
 } from "./threadsClient";
 import {
   conversationTitle,
+  dmExpectation,
   kindFilterMatches,
   operatorDmAlias,
   participantLabel,
@@ -70,6 +75,26 @@ import "./threads.css";
  * agent's own page). A group post notifies; Ask agent sends one request to
  * one selected member.
  */
+
+/** Envelope ids per composer scope, surviving a remount: a draft DM that
+ *  lands as a real row swaps components under the same `threads:<alias>`
+ *  key, and a repeat submit of the same envelope must reuse its client id
+ *  (the daemon's idempotency), not mint a new message. Bounded so a long
+ *  session can't grow it without limit. */
+const envelopeIds = new Map<string, { key: string; id: string }>();
+onPrivateSessionReset(() => envelopeIds.clear());
+function envelopeId(scope: string, contentKey: string): string {
+  const held = envelopeIds.get(scope);
+  if (held && held.key === contentKey) return held.id;
+  const id = newMessageId();
+  envelopeIds.delete(scope);
+  envelopeIds.set(scope, { key: contentKey, id });
+  if (envelopeIds.size > 64) {
+    const oldest = envelopeIds.keys().next().value;
+    if (oldest !== undefined) envelopeIds.delete(oldest);
+  }
+  return id;
+}
 
 export default function ThreadsPage({ operator }: { operator: boolean }) {
   const href = useHref();
@@ -168,6 +193,7 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
   const visible = rows
     .filter((r) => kindFilterMatches(url.kind, r.kind))
     .filter((r) => (query.trim() === "" ? true : conversationTitle(r).toLowerCase().includes(query.trim().toLowerCase())));
+
   const open = rows.find((r) => r.id === url.conversation) ?? null;
   // The agents on the board: the live roster the filter and chooser name. A
   // removed agent is absent from it.
@@ -187,6 +213,16 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
 
   const setUrl = (next: Partial<typeof url>) =>
     navigate(`/threads${threadsUrlSearch({ ...url, ...next })}`, { replace: true });
+
+  // A `?dm=<alias>` deep link (from the Agents catalog) lands on the
+  // existing You ↔ agent row when one already exists: the draft state is
+  // only the not-yet-created case. The replace keeps the link copyable.
+  useEffect(() => {
+    if (existingDm && url.conversation === null) {
+      setUrl({ conversation: existingDm.id });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [existingDm, url.conversation]);
   // Open a You ↔ agent conversation by alias: the existing row if one exists,
   // else the local draft (`?dm=`), so the page never creates an empty server row.
   const openDm = (alias: string) => {
@@ -312,6 +348,7 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
               liveStamp={agentsTick}
               threadsTick={threadsTick}
               issueProjects={issueProjects}
+              agents={agentsState.data?.agents ?? null}
               onOpenContext={() => setContextOpen(true)}
               onChanged={() => void loadList()}
               openDm={openDm}
@@ -323,6 +360,8 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
               writeBlock={writeBlock}
               threadsTick={threadsTick}
               liveStamp={agentsTick}
+              issueProjects={issueProjects}
+              agents={agentsState.data?.agents ?? null}
               onSent={() => {
                 // The send created the thread: open its canonical row once listed.
                 void loadList().then((fresh) => {
@@ -337,7 +376,16 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
           ) : (
             <div className="threads-empty">
               <span aria-hidden><IconThreads size={28} /></span>
-              <p>{t("Select a conversation to read it.")}</p>
+              {draftAlias !== null ? (
+                <p>
+                  {agentsState.data === null
+                    ? t("Checking the agent roster…")
+                    : t("No registered agent named {alias} — the draft link may be stale.")
+                        .replace("{alias}", () => draftAlias)}
+                </p>
+              ) : (
+                <p>{t("Select a conversation to read it.")}</p>
+              )}
             </div>
           )}
         </main>
@@ -497,6 +545,7 @@ function Timeline({
   liveStamp,
   threadsTick,
   issueProjects,
+  agents,
   onOpenContext,
   onChanged,
   openDm,
@@ -506,6 +555,9 @@ function Timeline({
   scope: ConversationListFilter;
   writeBlock: string | null;
   issueProjects: IssueProjects;
+  /** The live roster (null while it loads): the DM's recipient context
+   *  strip reads it; a missing alias after load is honestly absent. */
+  agents: Agent[] | null;
   /** The live `agents` payload: a new object on every stream frame. */
   liveStamp: unknown;
   /** The `threads` frame revision: a topic or message change on any thread. */
@@ -644,6 +696,7 @@ function Timeline({
           </Button>
         </div>
       </header>
+      {dm && <DmContext alias={dm} agents={agents} issueProjects={issueProjects} />}
       <div className="threads-messages" aria-live="polite">
         {error ? (
           <p className="threads-note" role="status">{t("This conversation could not load:")} {error}</p>
@@ -655,7 +708,7 @@ function Timeline({
               <Button variant="ghost" size="sm" onClick={() => void loadEarlier()}>{t("Load earlier")}</Button>
             )}
             {dm
-              ? (entries ?? []).map((e) => <EntryRow key={e.seq} entry={e} />)
+              ? (entries ?? []).map((e) => <EntryRow key={e.seq} entry={e} issueProjects={issueProjects} />)
               : isGroup
                 ? (posts ?? []).map((p) => <PostRow key={p.id} post={p} />)
                 : (messages ?? []).map((m) => <MessageRow key={m.id} message={m} issueProjects={issueProjects} />)}
@@ -666,7 +719,12 @@ function Timeline({
         )}
       </div>
       {row.kind === "operator" && dm && (
-        <OperatorComposer alias={dm} writeBlock={writeBlock} onSent={reload} />
+        <OperatorComposer
+          alias={dm}
+          agent={agents?.find((a) => a.alias === dm)}
+          writeBlock={writeBlock}
+          onSent={reload}
+        />
       )}
       {row.kind === "pair" && <ReplyBar row={row} openDm={openDm} />}
       {isGroup && (
@@ -712,21 +770,49 @@ function mergeBySeq<T extends { seq: number }>(cur: T[] | null, incoming: T[]): 
 }
 
 /** Stages the daemon's `payload.delivery` may carry and the page shows. */
-const STAGES = new Set<string>(["queued", "running", "completed", "failed", "unknown", "refused"]);
+const STAGES = new Set<string>(["queued", "claimed", "available", "running", "completed", "failed", "unknown", "refused", "interrupted"]);
 
 /** An operator DM entry from the agent's thread. Its stage is the daemon's
  *  `payload.delivery.state`, present only for a message-linked entry; an
- *  unlinked entry or an unknown state shows no stage. */
-function EntryRow({ entry }: { entry: ThreadEntry }) {
+ *  unlinked entry or an unknown state shows no stage. `payload.refs` are
+ *  the cited subjects the send carried, and a verified `payload.human`
+ *  the recorded owner behind an owner write — both shown, never inferred. */
+function EntryRow({ entry, issueProjects }: { entry: ThreadEntry; issueProjects: IssueProjects }) {
   const t = useTranslate();
-  const who = entry.role === "operator" ? t("You") : entry.role === "agent" ? t("Agent") : t("System");
   const delivery = entry.payload?.delivery as { state?: unknown } | undefined;
   const stage = typeof delivery?.state === "string" && STAGES.has(delivery.state) ? delivery.state : null;
+  const refs = Array.isArray(entry.payload?.refs)
+    ? (entry.payload.refs as { kind?: unknown; id?: unknown }[]).filter(
+        (r): r is { kind: string; id: string } => typeof r?.kind === "string" && typeof r?.id === "string",
+      )
+    : [];
+  const human = entry.payload?.human as { display?: unknown } | null | undefined;
+  const senderName =
+    entry.role === "operator" && typeof human?.display === "string" && human.display.trim() !== ""
+      ? human.display
+      : null;
+  const who = entry.role === "operator"
+    ? senderName ?? t("Operator (name unknown)")
+    : entry.role === "agent" ? t("Agent") : t("System");
   return (
     <article className="threads-msg" data-role={entry.role}>
       <Turn who={who} at={entry.created ? fmtTime(entry.created) : undefined} me={entry.role === "operator"} state={stage}>
         {entry.text}
       </Turn>
+      {refs.length > 0 && (
+        <div className="threads-refs">
+          {refs.map((r) => {
+            const project = r.kind === "issue" ? issueProjects.get(r.id) : undefined;
+            return project ? (
+              <Link key={`${r.kind}:${r.id}`} href={issuePath(project, r.id)} className="threads-ref">{r.id}</Link>
+            ) : (
+              <span key={`${r.kind}:${r.id}`} className="threads-ref">
+                {r.kind === "issue" ? r.id : `${r.kind}:${r.id}`}
+              </span>
+            );
+          })}
+        </div>
+      )}
     </article>
   );
 }
@@ -734,6 +820,11 @@ function EntryRow({ entry }: { entry: ThreadEntry }) {
 function MessageRow({ message, issueProjects }: { message: ThreadMessage; issueProjects: IssueProjects }) {
   const t = useTranslate();
   const issueProject = message.issue ? issueProjects.get(message.issue) : undefined;
+  const routed = (message.routed ?? []).filter((r) => typeof r.id === "string");
+  const recipient =
+    message.recipient && message.recipient.kind !== "unknown"
+      ? participantLabel(message.recipient, t)
+      : null;
   return (
     <article className="threads-msg" data-role={message.sender.kind} data-state={message.state}>
       <Turn
@@ -744,19 +835,48 @@ function MessageRow({ message, issueProjects }: { message: ThreadMessage; issueP
       >
         {message.body}
       </Turn>
-      {(message.issue || message.task_id) && (
+      {(message.issue || message.task_id || message.origin || routed.length > 0 || recipient) && (
         <div className="threads-refs">
+          {recipient && (
+            <span className="threads-ref">
+              {t("To {name}").replace("{name}", () => recipient)}
+            </span>
+          )}
+          {message.origin && (
+            <span className="threads-ref">
+              {t("Reply to message {id}").replace("{id}", () => message.origin as string)}
+            </span>
+          )}
           {message.issue && (issueProject ? (
             <Link href={issuePath(issueProject, message.issue)} className="threads-ref">{message.issue}</Link>
           ) : (
             <span className="threads-ref">{message.issue}</span>
           ))}
           {message.task_id && <span className="threads-ref">{t("task {task}").replace("{task}", () => String(message.task_id))}</span>}
+          {routed.map((r) => (
+            <span key={r.id} className="threads-ref">
+              {t("Reply routed · {source}").replace("{source}", () => t(SOURCE_LABEL[r.source] ?? r.source))}
+              {" — "}
+              <StageLabel state={receiptState(r.state)} />
+            </span>
+          ))}
         </div>
       )}
+      {message.error && <p className="threads-msg-error" role="status">{message.error}</p>}
     </article>
   );
 }
+
+/** A routed copy's `source` as a readable label; unknown values stay verbatim. */
+const SOURCE_LABEL: Record<string, string> = {
+  worker_result: "worker result",
+  worker_notice: "worker notice",
+  job_event: "job event",
+  nudge: "nudge",
+  topic_notice: "topic notice",
+  kickoff: "kickoff",
+  job_dispatch: "job dispatch",
+};
 
 /** Every delivery state, in display order: attention states first. */
 const RECEIPT_ORDER: DeliveryState[] = ["failed", "refused", "interrupted", "unknown", "pending", "queued", "claimed", "running", "available", "completed"];
@@ -833,39 +953,130 @@ function DeliveryFeedback({ deliveries }: { deliveries: PostDelivery[] }) {
 
 function OperatorComposer({
   alias,
+  agent,
   writeBlock,
   onSent,
 }: {
   alias: string;
+  /** The recipient's roster row when it is live, else undefined. */
+  agent?: Agent;
   writeBlock: string | null;
   onSent: () => void;
 }) {
   // One client id per logical envelope: an exact retry after a failed
   // attempt reuses it (one DM, not two); any change to the submitted
-  // body, refs or attachments mints a new id.
-  const envelope = useRef<{ key: string; id: string } | null>(null);
+  // body, refs or attachments mints a new id. The id lives in a module
+  // map, so a draft→row remount of this composer keeps the same id.
   const t = useTranslate();
+  const [notice, setNotice] = useState<UiNotice | null>(null);
+  const scope = `threads:${alias}`;
   return (
-    <Composer
-      density="full"
-      block={writeBlock}
-      storeKey={`threads:${alias}`}
-      onSend={async ({ body, refs, attachments }) => {
-        const key = JSON.stringify({ alias, body: body.trim(), refs, attachments: attachments ?? [] });
-        if (envelope.current?.key !== key) envelope.current = { key, id: newMessageId() };
-        await withPrivateOperation(async (op) => {
-          await api.threadSend(alias, body, envelope.current!.id, refs, undefined, undefined, attachments, op);
-          op.assertCurrent();
-          envelope.current = null;
-          onSent();
-        });
-      }}
-      refocusAfterSend
-      attach
-      ariaLabel={t("Message to {alias}").replace("{alias}", () => alias)}
-      placeholder={t("Message {alias}…").replace("{alias}", () => alias)}
-      className="card p-2.5 relative"
-    />
+    <ThreadComposerFrame
+      showModes={false}
+      allowAsk={false}
+      helper={t(dmExpectation(agent))}
+      notice={notice ? displayUiNotice(notice, t) : null}
+    >
+      <Composer
+        density="full"
+        block={writeBlock}
+        storeKey={scope}
+        onSend={async ({ body, refs, attachments }) => {
+          const key = JSON.stringify({ alias, body: body.trim(), refs, attachments: attachments ?? [] });
+          const id = envelopeId(scope, key);
+          try {
+            await withPrivateOperation(async (op) => {
+              await api.threadSend(alias, body, id, refs, undefined, undefined, attachments, op);
+              op.assertCurrent();
+              envelopeIds.delete(scope);
+              onSent();
+            });
+            setNotice(null);
+          } catch (e) {
+            // A lost response cannot establish whether the server accepted it.
+            setNotice({
+              key: e instanceof ApiError && e.status >= 400 && e.status < 500
+                ? "Send refused. Your draft is kept. "
+                : "Delivery uncertain — check history before retrying. Your draft is kept. ",
+              detail: e instanceof Error ? e.message : String(e),
+            });
+            throw e;
+          }
+        }}
+        onNotice={setNotice}
+        refocusAfterSend
+        attach
+        ariaLabel={t("Message to {alias}").replace("{alias}", () => alias)}
+        placeholder={t("Message {alias}…").replace("{alias}", () => alias)}
+        className="card p-2.5 relative"
+      />
+    </ThreadComposerFrame>
+  );
+}
+
+
+/** The DM's recipient context strip: the live roster's avatar, lifecycle
+ *  badge and first active task as the recorded work context. An agent
+ *  absent from a loaded roster — removed or otherwise unregistered —
+ *  says so; while the roster is still loading nothing is claimed. */
+function DmContext({
+  alias,
+  agents,
+  issueProjects,
+}: {
+  alias: string;
+  /** The live roster; null while it loads. */
+  agents: Agent[] | null;
+  issueProjects: IssueProjects;
+}) {
+  const t = useTranslate();
+  const agent = agents?.find((a) => a.alias === alias);
+  const badge = agent ? lifecycleBadge(agent, t) : null;
+  const task = agent ? activeTasks(agent)[0] : undefined;
+  const issueProject = task?.issue ? issueProjects.get(task.issue) : undefined;
+  return (
+    <div className="threads-recipient">
+      {agent ? (
+        <AgentAvatar
+          slug={lookFor(agent.alias)}
+          active={lifecycleOf(agent) === "active"}
+          still={lifecycleOf(agent) !== "active"}
+          size={26}
+        />
+      ) : (
+        <span aria-hidden className="threads-avatar">{initialOf(alias)}</span>
+      )}
+      <span className="threads-recipient-line">
+        <strong>{t("To {alias}").replace("{alias}", () => alias)}</strong>
+        {badge && (
+          <span className={`stateb tone-${badge.tone}`}>
+            <i aria-hidden="true" />
+            {badge.label}
+          </span>
+        )}
+        {!agent && (
+          <span className="threads-ref">
+            {agents !== null
+              ? t("Not in the live roster — removed or unavailable")
+              : t("Loading roster…")}
+          </span>
+        )}
+      </span>
+      <span className="threads-recipient-work">
+        {task ? (
+          <>
+            {task.issue && issueProject ? (
+              <Link href={issuePath(issueProject, task.issue)} className="threads-ref">{task.issue}</Link>
+            ) : task.issue ? (
+              <span className="threads-ref">{task.issue}</span>
+            ) : null}
+            <span className="threads-ref">{task.title ?? task.task}</span>
+          </>
+        ) : agent ? (
+          <span className="threads-ref">{t("No recorded work context")}</span>
+        ) : null}
+      </span>
+    </div>
   );
 }
 
@@ -930,12 +1141,17 @@ function DraftDm({
   writeBlock,
   threadsTick,
   liveStamp,
+  issueProjects,
+  agents,
   onSent,
 }: {
   alias: string;
   writeBlock: string | null;
   threadsTick: number;
   liveStamp: unknown;
+  issueProjects: IssueProjects;
+  /** The live roster; null while it loads. */
+  agents: Agent[] | null;
   onSent: () => void;
 }) {
   const [entries, setEntries] = useState<ThreadEntry[] | null>(null);
@@ -961,9 +1177,10 @@ function DraftDm({
   return (
     <div className="threads-timeline">
       <header className="threads-head">
-        <div className="threads-kicker">{KIND_LABEL.operator}</div>
+        <div className="threads-kicker">{t(KIND_LABEL.operator)}</div>
         <h2>{t("You ↔ {alias}").replace("{alias}", () => alias)}</h2>
       </header>
+      <DmContext alias={alias} agents={agents} issueProjects={issueProjects} />
       <div className="threads-messages" aria-live="polite">
         {error ? (
           <p className="threads-note" role="status">This conversation could not load: {error}</p>
@@ -971,12 +1188,17 @@ function DraftDm({
           <p className="threads-note">Loading…</p>
         ) : (
           <>
-            {entries.map((e) => <EntryRow key={e.seq} entry={e} />)}
+            {entries.map((e) => <EntryRow key={e.seq} entry={e} issueProjects={issueProjects} />)}
             {entries.length === 0 && <p className="threads-note">{t("No messages yet. Sending starts the thread.")}</p>}
           </>
         )}
       </div>
-      <OperatorComposer alias={alias} writeBlock={writeBlock} onSent={onSent} />
+      <OperatorComposer
+        alias={alias}
+        agent={agents?.find((a) => a.alias === alias)}
+        writeBlock={writeBlock}
+        onSent={onSent}
+      />
     </div>
   );
 }
@@ -1008,8 +1230,6 @@ function GroupComposer({
   const [target, setTarget] = useState("");
   const t = useTranslate();
   const [notice, setNotice] = useState<UiNotice | null>(null);
-  // The id for the current envelope, reused on retry and reset when it changes.
-  const envelope = useRef<{ key: string; id: string } | null>(null);
   const noMembers = members.length === 0;
   const askBlocked = mode === "ask" && (noMembers || !members.some((m) => m.alias === target));
 
@@ -1025,8 +1245,8 @@ function GroupComposer({
       targetOptions={members.map((m) => ({ id: m.alias as string, label: m.alias as string }))}
       targetPlaceholder={noMembers ? t("No current members") : t("Choose a member")}
       helper={mode === "post"
-        ? "A post notifies members. It does not start agents."
-        : "One request, to the member you choose. Nothing else is sent."}
+        ? t("A post notifies members. It does not start agents.")
+        : t("One request, to the member you choose. Nothing else is sent.")}
       notice={notice ? displayUiNotice(notice, t) : null}
     >
       <Composer
@@ -1034,17 +1254,22 @@ function GroupComposer({
         block={writeBlock !== null ? writeBlock : askBlocked ? "Choose a current member to ask" : null}
         storeKey={`threads-group:${row.id}`}
         onSend={async ({ body }) => {
-          const key = groupEnvelopeKey(mode, target, body);
-          if (envelope.current?.key !== key) envelope.current = { key, id: newMessageId() };
-          const id = envelope.current.id;
-          if (mode === "ask") {
-            await requestFromTopic(row.id, target, body, id);
+          const scope = `threads-group:${row.id}`;
+          const id = envelopeId(scope, groupEnvelopeKey(mode, target, body));
+          try {
+            if (mode === "ask") {
+              await requestFromTopic(row.id, target, body, id);
+            } else {
+              await postToTopic(row.id, body, id);
+            }
+            envelopeIds.delete(scope);
+            setNotice(null);
             onSent();
-          } else {
-            await postToTopic(row.id, body, id);
-            onSent();
+          } catch (e) {
+            // The draft stays for an explicit same-id retry; say why it failed.
+            setNotice(e instanceof Error ? e.message : String(e));
+            throw e;
           }
-          envelope.current = null;
         }}
         onNotice={setNotice}
         refocusAfterSend

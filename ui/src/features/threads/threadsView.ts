@@ -1,3 +1,5 @@
+import type { Agent } from "../../lib/types";
+import { lifecycleOf } from "../agents/agentView";
 import type { ConversationKind, ConversationRow, DeliveryState, Participant } from "./threadsClient";
 
 /**
@@ -106,4 +108,36 @@ export function deliveryLabel(
   t: (english: string) => string = (english) => english,
 ): string {
   return t(DELIVERY_LABEL[state as DeliveryState] ?? "Unknown");
+}
+
+/** The composer's honest send expectation for a DM recipient, from the
+ *  roster's lifecycle. Queuing never confirms receipt; a stopped, dead,
+ *  fenced or quota-blocked recipient is never implied reachable, and a
+ *  mailbox is a notice sink with no session. A live running or idle
+ *  session is the only "can deliver" claim the observation supports. */
+export function dmExpectation(a: Agent | undefined): string {
+  if (!a)
+    return "Messages queue for this agent's next turn. Sending does not change its assignment.";
+  const lifecycle = lifecycleOf(a);
+  if (lifecycle === "dead-holding")
+    return "This agent is not running but still holds work — the message queues; it is not received.";
+  if (a.dead || a.fenced)
+    return "This agent is not available — the message queues; it is not received.";
+  if (a.inbox || a.provider === "inbox")
+    return "This recipient is a mailbox — a post is recorded, never delivered to a session.";
+  if (a.state === "stopped")
+    return "This agent is stopped — the message queues; it is not received.";
+  if (
+    a.state === "blocked_by_quota" ||
+    a.quota?.state === "blocked" ||
+    a.usage_limit?.state === "blocked"
+  )
+    return "This agent's provider allowance is blocked — the message queues; it is not received.";
+  if (lifecycle === "active")
+    return "Will queue for the next turn. Sending does not interrupt the current task.";
+  if (a.state === "idle")
+    return "This session is open — the message can start its next turn.";
+  if (lifecycle === "idle-holding")
+    return "This agent is parked on a claim — the message queues; it is not received.";
+  return "Messages queue for this agent's next turn. Sending does not change its assignment.";
 }

@@ -50,32 +50,33 @@ export type ComposerMode = "post" | "ask";
 /** The shared frame above a composer: Post or Ask mode, the Ask target
  *  select, a helper line and a notice. Presentation only: the caller owns
  *  the mode, the target and every send path. `showModes` false drops the
- *  mode bar for a plain direct message. */
+ *  mode bar for a plain direct message — mode and target props unused. */
 export function ThreadComposerFrame({
   showModes = true,
   modeLabel,
   allowAsk,
-  mode,
+  mode = "post",
   onMode,
   targetLabel,
-  target,
+  target = "",
   onTarget,
-  targetOptions,
+  targetOptions = [],
   targetPlaceholder,
   helper,
   notice,
   children,
 }: {
   showModes?: boolean;
-  modeLabel: string;
+  /** Group label for the mode bar; unused when `showModes` is false. */
+  modeLabel?: string;
   allowAsk: boolean;
-  mode: ComposerMode;
-  onMode: (mode: ComposerMode) => void;
-  targetLabel: string;
-  target: string;
-  onTarget: (value: string) => void;
-  targetOptions: { id: string; label: string }[];
-  targetPlaceholder: string;
+  mode?: ComposerMode;
+  onMode?: (mode: ComposerMode) => void;
+  targetLabel?: string;
+  target?: string;
+  onTarget?: (value: string) => void;
+  targetOptions?: { id: string; label: string }[];
+  targetPlaceholder?: string;
   helper?: string;
   notice?: string | null;
   children: ReactNode;
@@ -85,14 +86,14 @@ export function ThreadComposerFrame({
     <div className="threads-composer threads-group">
       {showModes && (
         <div className="threads-mode" role="group" aria-label={modeLabel}>
-          <button type="button" aria-pressed={mode === "post"} onClick={() => onMode("post")}>{t("Post")}</button>
+          <button type="button" aria-pressed={mode === "post"} onClick={() => onMode?.("post")}>{t("Post")}</button>
           {allowAsk && (
-            <button type="button" aria-pressed={mode === "ask"} onClick={() => onMode("ask")}>{t("Ask agent")}</button>
+            <button type="button" aria-pressed={mode === "ask"} onClick={() => onMode?.("ask")}>{t("Ask agent")}</button>
           )}
           {mode === "ask" && (
             <label className="threads-target">
               <span className="sr-only">{targetLabel}</span>
-              <select value={target} onChange={(e) => onTarget(e.target.value)} aria-label={targetLabel}>
+              <select value={target} onChange={(e) => onTarget?.(e.target.value)} aria-label={targetLabel}>
                 <option value="">{targetPlaceholder}</option>
                 {targetOptions.map((o) => (
                   <option key={o.id} value={o.id}>{o.label}</option>

@@ -164,7 +164,7 @@ export function ThreadItemView({
             <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{item.entry.text}</span>
             <AttachmentRows files={entryAttachments(item.entry.payload)} />
           </div>
-          <RefChips refs={entryRefs(item.entry.payload)} />
+          <RefChips refs={entryRefs(item.entry.payload)} onOpenIssue={onOpenIssue} />
         </Bubble>
       );
     case "pending": {
@@ -196,7 +196,7 @@ export function ThreadItemView({
           >
             {item.pending.text}
           </div>
-          <RefChips refs={item.pending.refs ?? []} />
+          <RefChips refs={item.pending.refs ?? []} onOpenIssue={onOpenIssue} />
           {item.pending.state === "failed" && (
             <div className="text-micro text-fail mt-1 break-words">
               {item.pending.delivery === "unconfirmed" ? t("The send may still have been delivered — retry sends the same message once.") : item.pending.error}{" "}
@@ -324,17 +324,28 @@ function SystemNote({
 }
 
 /** The subjects an operator bubble cites (CAD-574 `refs`) — one chip
- *  each under the text. */
-function RefChips({ refs }: { refs: ThreadRef[] }) {
+ *  each under the text. An `issue` ref is a real link to its page so a
+ *  result sent with citations is one tap from the work it names
+ *  (CAD-1574); other kinds stay a label. */
+function RefChips({ refs, onOpenIssue }: { refs: ThreadRef[]; onOpenIssue: (id: string) => void }) {
   const t = useTranslate();
   if (refs.length === 0) return null;
   return (
     <span className="refsrow" aria-label={t("cited rows")}>
-      {refs.map((r) => (
-        <span key={`${r.kind}:${r.id}`} className="refchip num" title={`${r.kind}:${r.id}`}>
-          {r.kind}:{r.id}
-        </span>
-      ))}
+      {refs.map((r) =>
+        r.kind === "issue" ? (
+          <span key={`${r.kind}:${r.id}`} className="refchip num" title={`${r.kind}:${r.id}`}>
+            {r.kind}:
+            <button type="button" className="lnk num" onClick={() => onOpenIssue(r.id)}>
+              {r.id}
+            </button>
+          </span>
+        ) : (
+          <span key={`${r.kind}:${r.id}`} className="refchip num" title={`${r.kind}:${r.id}`}>
+            {r.kind}:{r.id}
+          </span>
+        ),
+      )}
     </span>
   );
 }

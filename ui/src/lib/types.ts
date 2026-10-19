@@ -286,6 +286,11 @@ export interface TaskReport {
   body?: string;
   open?: boolean;
   error?: string;
+  /** Reviewed head and verdict, emitted for daemon-filed reviews. */
+  sha?: string | null;
+  verdict?: string | null;
+  /** Pull request recorded by a completion report. */
+  pr?: string | null;
 }
 
 export interface Project {

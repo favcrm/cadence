@@ -7,6 +7,8 @@ export interface AgentUpdate {
   label: string;
   text: string;
   at: string | null;
+  /** Issue id carried by a stored work-report entry. */
+  issue?: string;
 }
 
 /** Keep provider turn completion distinct from a verified job completion. */
@@ -55,7 +57,7 @@ export function reportedAgentUpdates(entries: unknown[]): Map<string, AgentUpdat
     const [, issue, kind, alias, at] = match;
     const summary = entry.text.split(/\n#+\s*Expected\s*\n/i)[1]?.split(/\n#+\s*Evidence/i)[0]?.trim();
     const rows = reports.get(alias) ?? [];
-    rows.push({ key: `report-${entry.seq}`, label: kind === "done" ? "Work reported" : "Progress report", text: `${issue}${summary ? ` — ${summary}` : " — Report delivered to Master"}`, at });
+    rows.push({ key: `report-${entry.seq}`, label: kind === "done" ? "Work reported" : "Progress report", issue, text: `${issue}${summary ? ` — ${summary}` : " — Report delivered to Master"}`, at });
     reports.set(alias, rows.sort((a, b) => (Date.parse(b.at ?? "") || 0) - (Date.parse(a.at ?? "") || 0)).slice(0, 3));
   }
   return reports;
