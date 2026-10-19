@@ -1309,10 +1309,11 @@ impl Shared {
             // provenance notice (`peer_message`, or `unattributed_message`
             // when no sender identity was recorded, so a forged frame in
             // the body can never masquerade as daemon provenance).
-            // Operator/member/CLI, routed, nudge and topic-notice
-            // deliveries keep the raw body they always had, with no
-            // extra lookup on any path.
-            let mut body = delivery_envelope(message).unwrap_or_else(|| message.body.clone());
+            // Authenticated human, app-dispatch, routed, nudge and topic
+            // deliveries, plus non-managed cloud transports, keep their
+            // existing shape, with no extra lookup on any path.
+            let mut body =
+                delivery_envelope(message, endpoint_kind).unwrap_or_else(|| message.body.clone());
             // CAD-1168: retained attachments the send named ride as a
             // bounded envelope too — metadata and the read verb only,
             // never file bytes or paths in the prompt.
@@ -4012,11 +4013,14 @@ const UNATTRIBUTED_MESSAGE_NOTICE: &str =
 ///
 /// `None` when the delivery keeps its existing shape: a labeled
 /// non-agent sender (operator, member, CLI — verified provenance that is
-/// not peer input), a routed copy (`worker_result`/`worker_notice`/
-/// `job_event`, which keeps its own origin-bearing envelope), a nudge or
-/// a topic notice.
-fn delivery_envelope(message: &Message) -> Option<String> {
-    if message.origin.is_some()
+/// not peer input), an app-run dispatch (its source is reserved by the
+/// RPC identifier gate), a routed copy (`worker_result`/`worker_notice`/
+/// `job_event`, which keeps its own origin-bearing envelope), a nudge,
+/// a topic notice, or a non-managed endpoint.
+fn delivery_envelope(message: &Message, endpoint_kind: &str) -> Option<String> {
+    if !matches!(endpoint_kind, "managed" | "managed-ws" | "fake")
+        || message.source == "app_run_dispatch"
+        || message.origin.is_some()
         || message.is_routed()
         || message.is_nudge()
         || message.is_topic_notice()
@@ -6087,7 +6091,15 @@ mod tests {
         for id in ["k1", "k2"] {
             shared
                 .store
-                .enqueue("lead", "an ask", None, id, "user")
+                .enqueue_sent(
+                    "lead",
+                    "an ask",
+                    None,
+                    id,
+                    "user",
+                    None,
+                    &store::Sender::Operator,
+                )
                 .unwrap();
             let Take::Message(m) = shared.store.take_queued("lead").unwrap() else {
                 panic!("nothing queued");
@@ -6185,7 +6197,15 @@ mod tests {
                 .unwrap();
             shared
                 .store
-                .enqueue(alias, "the ask", None, &format!("{alias}-1"), "user")
+                .enqueue_sent(
+                    alias,
+                    "the ask",
+                    None,
+                    &format!("{alias}-1"),
+                    "user",
+                    None,
+                    &store::Sender::Operator,
+                )
                 .unwrap();
             let Take::Message(message) = shared.store.take_queued(alias).unwrap() else {
                 panic!("nothing queued for {alias}");
