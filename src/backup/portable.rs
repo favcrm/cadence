@@ -1143,7 +1143,43 @@ fn refuse_output_in_tracker(out: &Path, tracker: &Path) -> Result<()> {
 /// Read-only inspection through the same integrity, catalog and authority
 /// checks as inactive restore. A valid manifest is not source authenticity,
 /// present-day source fidelity, or destination/import admission.
-pub fn inspect_portable(source: &Path) -> Result<Value> {
+/// A portable package that passed every inspection check: the verified
+/// manifest, the exact manifest bytes and their sha256, and the inspection
+/// report `inspect-portable` prints. Transfer callers bind the digest of
+/// these exact bytes — the file is hashed once, never re-read.
+pub struct VerifiedPackage {
+    pub manifest: PortableManifest,
+    pub manifest_bytes: Vec<u8>,
+    pub manifest_sha256: String,
+    pub report: Value,
+}
+
+/// `inspect_portable` plus the verified package internals a remote transfer
+/// needs (the exact manifest bytes and member list). One verification pass.
+pub fn verify_transfer_package(source: &Path) -> Result<VerifiedPackage> {
+    let inspected = inspect_package(source)?;
+    if inspected.manifest_bytes.len() > TRANSFER_MANIFEST_MAX {
+        return Err(Error::rejected(
+            "package manifest exceeds the transfer limit",
+        ));
+    }
+    if inspected.manifest.members.len() >= TRANSFER_MEMBERS_MAX {
+        return Err(Error::rejected(
+            "package member count exceeds the transfer limit",
+        ));
+    }
+    Ok(inspected)
+}
+
+/// Transfer bounds the hosted packed-v1 endpoint enforces. The CLI refuses a
+/// package outside them before any byte is sent; the server stays the
+/// enforcement of record.
+pub const TRANSFER_MANIFEST_MAX: usize = 4 * 1024 * 1024;
+/// Sealed input inventory members cap (32,768); `manifest.json` itself is one
+/// of them, so the manifest may list at most this minus one.
+pub const TRANSFER_MEMBERS_MAX: usize = 32768;
+
+fn inspect_package(source: &Path) -> Result<VerifiedPackage> {
     if !source.symlink_metadata()?.is_dir() {
         return Err(Error::rejected("package is not a plain directory"));
     }
@@ -1151,8 +1187,9 @@ pub fn inspect_portable(source: &Path) -> Result<Value> {
     // Reject linked directories before reading any listed member through them.
     let mut paths = Vec::new();
     collect_package_members(source, source, &mut paths)?;
-    let (manifest_sha256, _) = hash_file(&source.join(PKG_MANIFEST))?;
-    let manifest = verify_package(source)?;
+    let manifest_bytes = fs::read(source.join(PKG_MANIFEST))?;
+    let manifest_sha256 = format!("{:x}", Sha256::digest(&manifest_bytes));
+    let manifest = verify_manifest_bytes(source, &manifest_bytes)?;
     // Ordinary read-only SQLite opens can still create WAL/SHM files.
     // Native exports are rollback-journal single-file databases; admit that
     // header before any SQLite connection touches the supplied package.
@@ -1184,7 +1221,7 @@ pub fn inspect_portable(source: &Path) -> Result<Value> {
             .checked_add(member.bytes)
             .ok_or_else(|| Error::rejected("package byte total overflows"))
     })?;
-    Ok(json!({
+    let report = json!({
         "status": "verified_coordination_package",
         "portable": true,
         "bundle": source,
@@ -1212,7 +1249,20 @@ pub fn inspect_portable(source: &Path) -> Result<Value> {
         },
         "source_fidelity": "not_independently_established",
         "import_ready": false
-    }))
+    });
+    Ok(VerifiedPackage {
+        manifest,
+        manifest_bytes,
+        manifest_sha256,
+        report,
+    })
+}
+
+/// Independently inspect a portable coordination package, read-only. Prints
+/// integrity, schema and exclusion evidence; does not restore, start a daemon,
+/// or establish import readiness.
+pub fn inspect_portable(source: &Path) -> Result<Value> {
+    Ok(inspect_package(source)?.report)
 }
 
 fn refuse_existing(out: &Path) -> Result<()> {
@@ -2289,9 +2339,16 @@ fn publish_stage(stage: &Path, destination: &Path) -> Result<()> {
 /// the exact member set (core store plus tracker files, nothing else),
 /// exact bytes and sha256, and only regular non-linked files.
 fn verify_package(source: &Path) -> Result<PortableManifest> {
-    let text = fs::read_to_string(source.join(PKG_MANIFEST))
+    let bytes = fs::read(source.join(PKG_MANIFEST))
         .map_err(|e| Error::rejected(format!("cannot read manifest: {e}")))?;
-    let manifest: PortableManifest = serde_json::from_str(&text)
+    verify_manifest_bytes(source, &bytes)
+}
+
+/// The manifest bytes parsed and every member check applied.
+/// Verification works on the caller-supplied exact bytes, so the digest a
+/// caller binds is provably the digest of what was checked.
+fn verify_manifest_bytes(source: &Path, manifest_bytes: &[u8]) -> Result<PortableManifest> {
+    let manifest: PortableManifest = serde_json::from_slice(manifest_bytes)
         .map_err(|e| Error::rejected(format!("malformed manifest: {e}")))?;
     if manifest.format != PORTABLE_FORMAT
         || manifest.scope != "coordination"

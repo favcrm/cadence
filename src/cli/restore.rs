@@ -25,19 +25,33 @@ pub(super) struct Activation {
 /// Everything `restore` takes besides the destination and the source.
 pub(super) struct Options {
     pub state_dir: PathBuf,
-    pub source: PathBuf,
+    pub source: Option<PathBuf>,
     pub repos: Vec<PathBuf>,
     pub force: bool,
     pub portable: bool,
     pub preflight: bool,
     pub replace: Replace,
     pub activate: Activation,
+    /// Remote-only (`--org`) flags; every local form refuses them.
+    pub request_id: Option<String>,
+    pub status: Option<String>,
+    pub rollback: Option<String>,
 }
 
 /// Refuse every flag combination that does not belong to the chosen action.
 /// Runs before any RPC, file read or write, so a misplaced knob fails as
 /// usage instead of being ignored.
 fn check_flags(o: &Options) -> Result<()> {
+    if o.request_id.is_some() || o.status.is_some() || o.rollback.is_some() {
+        return Err(Error::usage(
+            "--request-id, --status and --rollback are remote `--portable` options; a local restore has no remote operation to run",
+        ));
+    }
+    if o.source.is_none() {
+        return Err(Error::usage(
+            "restore needs a source — a backup manifest, an export bundle, or a portable package directory",
+        ));
+    }
     let digests = o.replace.expected_package_digest.is_some()
         || o.replace.expected_destination_digest.is_some()
         || o.replace.expected_generation.is_some();
@@ -115,7 +129,12 @@ pub(super) fn run(opts: Options) -> Result<i32> {
         preflight,
         replace,
         activate,
+        request_id: _,
+        status: _,
+        rollback: _,
     } = opts;
+    // `check_flags` refused `None`; a local restore always has a source.
+    let source = source.expect("source required by check_flags");
     if !portable {
         let opts = cadence_agent::backup::RestoreOptions { force, repos };
         print_json(&cadence_agent::backup::restore(&source, &state_dir, &opts)?);

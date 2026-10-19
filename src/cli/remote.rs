@@ -5,7 +5,10 @@
 //! `issue project policy` is `project_policy`; project add/list stay local.
 
 use super::*;
+use cadence_agent::remote_cli::RemoteTarget;
+use cadence_agent::remote_migration::MigrationCommand;
 use cadence_agent::wiki::cli::WikiAction;
+use std::path::PathBuf;
 
 fn unsupported(verb: &str, flag: &str, why: &str) -> Error {
     Error::rejected(format!("remote `{verb}` cannot {flag} — {why}"))
@@ -1250,6 +1253,44 @@ pub(super) fn run(
     if let Commands::LocalAgent { action } = &command {
         return local_agent::run(&target, action, wake_timeout, local_state);
     }
+    if let Commands::Restore {
+        source,
+        repos,
+        force,
+        portable,
+        preflight,
+        replace,
+        controller_state,
+        expected_package_digest,
+        expected_destination_digest,
+        expected_generation,
+        activate,
+        reconciliation,
+        request_id,
+        status,
+        rollback,
+    } = command
+    {
+        return remote_restore(
+            target,
+            portable,
+            preflight,
+            replace,
+            source,
+            repos,
+            force,
+            controller_state,
+            expected_package_digest,
+            expected_destination_digest,
+            expected_generation,
+            activate,
+            reconciliation,
+            request_id,
+            status,
+            rollback,
+            local_state,
+        );
+    }
     if let Commands::Dispatch { issue, to, job, .. } = &command {
         if *job {
             return Err(Error::usage(
@@ -1402,6 +1443,199 @@ pub(super) fn run(
             );
             Ok(5)
         }
+    }
+}
+
+/// CAD-1593: `restore` against a remote org. Only `--portable` forms exist
+/// remotely — everything else refuses before a request is built, exactly
+/// like the local flag checks, so a misplaced knob is a usage error, never
+/// a silently ignored local-mode option. `dir` is the *credential* state
+/// dir (`cli_material_until` reads the registered workspace login); a
+/// caller-chosen `--state-dir` never becomes a hosted path.
+#[allow(clippy::too_many_arguments)]
+fn remote_restore(
+    target: RemoteTarget,
+    portable: bool,
+    preflight: bool,
+    replace: bool,
+    source: Option<PathBuf>,
+    repos: Vec<PathBuf>,
+    force: bool,
+    controller_state: Option<PathBuf>,
+    expected_package_digest: Option<String>,
+    expected_destination_digest: Option<String>,
+    expected_generation: Option<String>,
+    activate: bool,
+    reconciliation: Option<PathBuf>,
+    request_id: Option<String>,
+    status: Option<String>,
+    rollback: Option<String>,
+    state_dir: Option<PathBuf>,
+) -> Result<i32> {
+    if state_dir.is_some() {
+        return Err(unsupported(
+            "restore --portable",
+            "--state-dir",
+            "it names a local destination — the hosted migration never opens one",
+        ));
+    }
+    if !portable {
+        return Err(Error::rejected(
+            "remote `restore` is `restore --portable` only — a hosted workspace \
+             holds no local backup or export-bundle path",
+        ));
+    }
+    for (flag, present) in [
+        ("--repo", !repos.is_empty()),
+        ("--force", force),
+        ("--controller-state", controller_state.is_some()),
+        ("--activate", activate),
+        ("--reconciliation", reconciliation.is_some()),
+    ] {
+        if present {
+            return Err(unsupported(
+                "restore --portable",
+                flag,
+                "it names a local destination or controller — the hosted \
+                 migration never opens one",
+            ));
+        }
+    }
+    let note = |line: &str| eprintln!("{line}");
+    let digests = expected_package_digest.is_some()
+        || expected_destination_digest.is_some()
+        || expected_generation.is_some();
+    if let Some(id) = status.as_deref() {
+        if source.is_some() || rollback.is_some() || preflight || replace || digests {
+            return Err(Error::usage(
+                "--status takes an operation id or request:<id>, without a source — choose one remote \
+                 restore action: --preflight, --status, --rollback or an \
+                 import/--replace run",
+            ));
+        }
+        let receipt = cadence_agent::remote_migration::run(
+            &target,
+            MigrationCommand::Status {
+                operation_id: id.to_string(),
+                // A caller-supplied request id binds the receipt check.
+                request_id,
+            },
+            note,
+        )?;
+        print_json(&receipt);
+        return Ok(0);
+    }
+    if let Some(id) = rollback {
+        if source.is_some() || preflight || replace || expected_package_digest.is_some() {
+            return Err(Error::usage(
+                "choose one remote restore action: --rollback does not combine \
+                 with --preflight, --replace or --expected-package-digest",
+            ));
+        }
+        if request_id.is_none() {
+            return Err(Error::usage(
+                "--rollback needs --request-id — the same stable id the \
+                 replacement run minted, never a fresh one",
+            ));
+        }
+        if expected_destination_digest.is_none() || expected_generation.is_none() {
+            return Err(Error::usage(
+                "--rollback needs --expected-destination-digest and \
+                 --expected-generation — the CURRENT values from \
+                 `restore --portable --status`, never a preflight pair",
+            ));
+        }
+        let receipt = cadence_agent::remote_migration::run(
+            &target,
+            MigrationCommand::Rollback {
+                operation_id: id,
+                request_id: request_id.unwrap_or_default(),
+                expected_destination_digest: expected_destination_digest.unwrap_or_default(),
+                expected_generation: expected_generation.unwrap_or_default(),
+            },
+            note,
+        )?;
+        print_json(&receipt);
+        return Ok(migration_outcome_exit_code(&receipt));
+    }
+    let source = source.ok_or_else(|| {
+        Error::usage(
+            "remote `restore --portable` needs the package directory — \
+             only `--status`/`--rollback` omit the source",
+        )
+    })?;
+    if preflight {
+        if digests || request_id.is_some() || replace {
+            return Err(Error::usage(
+                "--preflight is read-only: no --request-id, --replace or \
+                 --expected-* — it prints the values those flags need",
+            ));
+        }
+        let receipt = cadence_agent::remote_migration::run(
+            &target,
+            MigrationCommand::Preflight { source },
+            note,
+        )?;
+        print_json(&receipt);
+        return Ok(0);
+    }
+    let request_id = request_id.ok_or_else(|| {
+        Error::usage(
+            "remote `restore --portable` needs --request-id — a stable id you \
+             mint once and reuse verbatim on replay",
+        )
+    })?;
+    if replace {
+        if expected_package_digest.is_none()
+            || expected_destination_digest.is_none()
+            || expected_generation.is_none()
+        {
+            return Err(Error::usage(
+                "remote `restore --portable --replace` needs \
+                 --expected-package-digest, --expected-destination-digest \
+                 and --expected-generation — the exact values from \
+                 `restore --portable --preflight`",
+            ));
+        }
+        let receipt = cadence_agent::remote_migration::run(
+            &target,
+            MigrationCommand::Replace {
+                source,
+                request_id,
+                expected_package_digest: expected_package_digest.unwrap_or_default(),
+                expected_destination_digest: expected_destination_digest.unwrap_or_default(),
+                expected_generation: expected_generation.unwrap_or_default(),
+            },
+            note,
+        )?;
+        print_json(&receipt);
+        return Ok(migration_outcome_exit_code(&receipt));
+    }
+    if digests {
+        return Err(Error::usage(
+            "--expected-* digests belong to --replace; a plain remote \
+             `restore --portable` imports inactive with just --request-id",
+        ));
+    }
+    // A plain remote `restore --portable --request-id …` imports INACTIVE —
+    // it never replaces or activates a running workspace.
+    let receipt = cadence_agent::remote_migration::run(
+        &target,
+        MigrationCommand::Import { source, request_id },
+        note,
+    )?;
+    print_json(&receipt);
+    Ok(migration_outcome_exit_code(&receipt))
+}
+
+/// Mutation success means a verified terminal result, not HTTP acceptance.
+/// Status queries remain successful reads even when the recorded job failed.
+fn migration_outcome_exit_code(receipt: &Value) -> i32 {
+    match receipt.get("phase").and_then(Value::as_str) {
+        Some("committed_inactive" | "replaced_inactive" | "rolled_back") => 0,
+        Some("failed") => cadence_agent::error::exit_code_for_kind("rejected"),
+        Some("unknown") => cadence_agent::error::exit_code_for_kind("unknown"),
+        _ => cadence_agent::error::exit_code_for_kind("busy"),
     }
 }
 
