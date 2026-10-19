@@ -1140,7 +1140,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           />
         )}
         {route.screen === "apps" && !route.project && (
-          <Apps project={project} viewer={viewer} />
+          <Apps viewer={viewer} />
         )}
         {route.screen === "appsExplore" && (
           <Explorer viewer={viewer} />

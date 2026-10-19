@@ -110,7 +110,7 @@ async function check(name: string, body: () => Promise<void>) {
   }
 }
 async function main() {
-  await React.act(() => root.render(React.createElement(Apps, { project: "all", viewer: operator })));
+  await React.act(() => root.render(React.createElement(Apps, { viewer: operator })));
   await flush();
   // 1. A favourite the daemon saved is shown in Favorites.
   await check("favourites render", async () => {
@@ -131,7 +131,7 @@ async function main() {
     await React.act(() => checkbox.click());
     await flush();
     await React.act(() => root.render(React.createElement("div")));
-    await React.act(() => root.render(React.createElement(Apps, { project: "all", viewer: operator })));
+    await React.act(() => root.render(React.createElement(Apps, { viewer: operator })));
     await flush();
     const saved = host.querySelector("section[aria-label='Favorites']");
     assert(saved?.querySelector("a[aria-label='Open CRM']") && saved.querySelector("a[aria-label='Open Social Content']"),

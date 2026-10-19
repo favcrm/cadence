@@ -76,7 +76,7 @@ equal(matchRoute("/my-work/extra").screen, "notFound", "My work has no nested ro
 equal(projectScope({ screen: "projects", slug: "cadence", section: "issues" }), "slug", "projects are the slug");
 equal(projectScope({ screen: "agents", alias: null }), "chips", "agents");
 equal(projectScope({ screen: "overview" }), "chips", "overview");
-equal(projectScope({ screen: "apps", project: null, name: null }), "chips", "apps list");
+equal(projectScope({ screen: "apps", project: null, name: null }), "none", "apps list is a workspace home");
 equal(projectScope({ screen: "apps", project: "cadence", name: "studio" }), "none", "app detail is not a filter");
 equal(projectScope({ screen: "settings", section: "memory" }), "picker", "memory");
 equal(projectScope({ screen: "settings", section: "models" }), "none", "models");
@@ -113,7 +113,7 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
   const detail = readLocation("/apps/cadence/studio", "?project=other");
   equal(detail.project, "all", "app detail ignores query project");
   equal(detail.route, { screen: "apps", project: "cadence", name: "studio" }, "app detail route");
-  equal(readLocation("/apps", "?project=cadence").project, "cadence", "apps query scope");
+  equal(readLocation("/apps", "?project=cadence").project, "all", "apps ignores query project");
 }
 
 // An app detail href does not repeat its path's project in the query.
@@ -121,7 +121,7 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
   const loc = readLocation("/apps/cadence/studio", "");
   equal(locationHref(loc), "/apps/cadence/studio", "app detail href");
   const list = readLocation("/apps", "?project=cadence");
-  equal(locationHref(list), "/apps?project=cadence", "apps href keeps scope");
+  equal(locationHref(list), "/apps", "apps href drops the query project");
 }
 
 // CAD-1026: an app page's native-controls choice never follows to another installation.
@@ -268,7 +268,7 @@ equal(scopeRedirect("/settings", "?project=cadence"), "/settings", "settings dro
 equal(scopeRedirect("/settings/update", "?project=cadence"), "/settings/update", "update drops ?project=");
 equal(scopeRedirect("/apps/cadence/studio", "?project=other"), "/apps/cadence/studio", "app detail drops query project");
 equal(scopeRedirect("/agents", "?project=cadence"), null, "agents keeps the filter");
-equal(scopeRedirect("/apps", "?project=cadence"), null, "apps keeps the filter");
+equal(scopeRedirect("/apps", "?project=cadence"), "/apps", "apps drops the query project");
 equal(scopeRedirect("/overview", "?project=cadence"), null, "overview keeps the filter");
 equal(scopeRedirect("/settings/memory", "?project=cadence"), null, "memory keeps the filter");
 equal(legacyRedirect("/projects/cadence", "?view=list"), null, "a routed URL is not legacy");

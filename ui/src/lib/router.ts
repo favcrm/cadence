@@ -31,12 +31,12 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /login                     a `cadence ui login` link lands here
  *
  * Query parameters carry the rest: `project` (the in-page filter on
- * screens that have one — Agents, Team overview, the Apps list, and
- * Settings → Memory), `issue` (the open issue drawer, on any screen),
- * `view` and the filter keys (Projects only). Home, Wiki, Outbox and the
- * rest of Settings carry no project scope. Parameters the app does not
- * own are kept. Pure functions — the React side is lib/useLocation.ts —
- * so routing is unit-tested in plain node (tests/router.test.ts).
+ * screens that have one — Agents, Team overview and Settings → Memory),
+ * `issue` (the open issue drawer, on any screen), `view` and the filter
+ * keys (Projects only). Home, Wiki, Outbox, the Apps home and the rest
+ * of Settings carry no project scope. Parameters the app does not own
+ * are kept. Pure functions — the React side is lib/useLocation.ts — so
+ * routing is unit-tested in plain node (tests/router.test.ts).
  */
 
 export type ProjectSection = "overview" | "issues" | "epics" | "milestones" | "context" | "workflows";
@@ -98,7 +98,7 @@ export const NAV: { screen: Screen; label: string; route: Route }[] = [
  *
  * - `slug` — the project page (`/projects/:slug`). A sidebar project opens it.
  * - `chips` — an in-page chip row, stored as `?project=` (Agents, Team
- *   overview, the Apps list).
+ *   overview).
  * - `picker` — an in-page project picker, stored as `?project=`
  *   (Settings → Memory).
  * - `none` — no project scope in the URL or in state.
@@ -112,11 +112,11 @@ export function projectScope(route: Route): ProjectScope {
     case "agents":
     case "overview":
       return "chips";
-    case "apps":
-      return route.project ? "none" : "chips";
     case "settings":
       return route.section === "memory" ? "picker" : "none";
     default:
+      // `/apps` is a workspace home (CAD-1607): it has no project scope,
+      // so it neither shows a chip row nor keeps `?project=` in its URL.
       return "none";
   }
 }
