@@ -625,3 +625,202 @@ fn cad225_unattended_chain_goal_to_merged() {
         "settle merges nothing itself"
     );
 }
+
+/// Release the parked `upload-pack` on drop — a test panic must never
+/// strand the daemon thread inside the fixture's git wait. `hold()`
+/// returns the armed guard so the release reads as one deliberate step
+/// at the call site.
+struct RemoteRelease {
+    state: PathBuf,
+}
+
+impl RemoteRelease {
+    fn hold(state: &Path) -> Self {
+        Self {
+            state: state.to_path_buf(),
+        }
+    }
+    fn release(&self) {
+        let _ = std::fs::write(self.state.join("up-go"), "1\n");
+    }
+}
+
+impl Drop for RemoteRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// CAD-225: automatic dispatch must carry live authority to the send,
+/// not only past `master_dispatch`'s preflight. `dispatch::run` does its
+/// blocking base resolution BEFORE the kickoff send; here the fixture
+/// checkout's `remote.origin.uploadpack` parks that remote read long
+/// enough for the granted TTL to lapse, then lets git proceed. On the
+/// flawed path the operator-classified self-RPC send still enqueues.
+/// The `up-call` marker proves the ordering — nothing before
+/// `unattended_dispatch_repo`'s bound-repo selection touches `origin`,
+/// so the parked call can only be `resolve_base` running AFTER the
+/// live-grant preflight, inside `issue::dispatch::run`.
+#[test]
+fn cad225_expired_authority_must_not_dispatch_after_blocking_setup() {
+    let world = World::open();
+    let state = world.root.path();
+    world.register("master", "pm");
+    seed_checkout_history(&world);
+    let _daemon = Served::start(state);
+    // Same fixture context the chain test stands AFTER `Served::start`:
+    // a running home turn so `master_policy` scopes this as a home-thread
+    // master call rather than fencing it unresolved.
+    let (dup, _state) = world
+        .shared
+        .store
+        .enqueue_steered(
+            "master",
+            "home thread turn",
+            None,
+            "cad225-home-turn",
+            "chat",
+            None,
+            None,
+            None,
+            &Sender::Unattributed,
+            &crate::store::Steer::NONE,
+            None,
+            None,
+            None,
+        )
+        .expect("the master's home turn enqueues");
+    assert!(!dup, "home turn id must not collide");
+    world
+        .shared
+        .store
+        .mark_running("cad225-home-turn", "cad225-home")
+        .expect("the home turn runs");
+
+    // Grant (short TTL) and admit the exact bound render, both over the
+    // real socket — the same automatic authority the chain test proves.
+    let granted = rpc(
+        state,
+        Asserted::Operator,
+        "workflow_approve",
+        world.unattended(&[PATH], bound_inputs(), Some(10), None),
+    )
+    .expect("operator unattended grant");
+    let grant_id = world.require_native_grant(&granted);
+    let proposed = rpc(
+        state,
+        Asserted::Operator,
+        "plan_propose",
+        json!({
+            "project": PROJECT,
+            "workflow": WORKFLOW,
+            "inputs": bound_inputs(),
+        }),
+    )
+    .expect("exact render admits");
+    let epic = proposed["epic"].as_str().unwrap().to_string();
+    let plan = world.issue(&epic).front.plan.expect("epic plan");
+    assert_eq!(plan.state, "approved");
+    assert_eq!(plan.tickets.len(), 1);
+    let ticket = plan.tickets[0].clone();
+    let run = world
+        .shared
+        .unattended_authorization_for_issue(&ticket)
+        .expect("bound run reads")
+        .expect("admitted ticket is bound");
+    assert_eq!(run.grant_id, grant_id);
+    assert!(
+        run.expires_at > now_secs(),
+        "fixture grant must still be live when the dispatch starts"
+    );
+
+    // Park the checkout's remote transport: `ls-remote`/`fetch` against
+    // the seeded `file://` rewrite still forks `git-upload-pack`, and
+    // `remote.origin.uploadpack` names the program git runs for it.
+    // The wrapper signals the daemon thread arrived at remote base
+    // resolution, parks until `up-go`, then execs the real
+    // `git-upload-pack` — a repo-local config hook on fixture state,
+    // never a production seam. Its own deadline fails the remote read
+    // rather than parking forever if the test never releases it.
+    let wrapper = state.join("up-pack");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\n\
+         : > \"$(dirname \"$0\")/up-call\"\n\
+         wait=0\n\
+         while [ ! -f \"$(dirname \"$0\")/up-go\" ]; do\n\
+         \tsleep 0.2\n\
+         \twait=$((wait + 1))\n\
+         \tif [ $wait -gt 300 ]; then exit 1; fi\n\
+         done\n\
+         exec git-upload-pack \"$@\"\n",
+    )
+    .expect("upload-pack wrapper writes");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("wrapper is executable");
+    }
+    let git = std::process::Command::new("git")
+        .arg("-C")
+        .arg(world.checkout())
+        .args(["config", "remote.origin.uploadpack"])
+        .arg(&wrapper)
+        .status()
+        .expect("fixture git");
+    assert!(git.success(), "remote.origin.uploadpack configures");
+
+    let release = RemoteRelease::hold(state);
+    let state_dir = state.to_path_buf();
+    let dispatched_ticket = ticket.clone();
+    let dispatch = std::thread::spawn(move || {
+        rpc(
+            &state_dir,
+            Asserted::Agent("master".into()),
+            "master_dispatch",
+            json!({"issue": dispatched_ticket, "to": "worker"}),
+        )
+    });
+    assert!(
+        world.wait_for("up-call", 30),
+        "the automatic dispatch never reached its blocking remote setup \
+         — preflight must have refused early or remote resolution never ran"
+    );
+    // The grant was proved live before this point; let its TTL fully
+    // lapse while `resolve_base` is still parked.
+    let wait = (run.expires_at - now_secs() + 1.0).clamp(0.0, 30.0);
+    std::thread::sleep(Duration::from_secs_f64(wait));
+    world.assert_invalid_run(&ticket);
+    release.release();
+    let outcome = dispatch
+        .join()
+        .expect("the dispatch thread answered, never deadlocked");
+    // Only a standing server-side refusal counts: `rejected`/`gate` are
+    // typed wire kinds the daemon answers for invalid authority, while a
+    // transport/timeout/local failure arrives as `internal`/`unknown`/
+    // `busy` and must not masquerade as the guard.
+    assert!(
+        match &outcome {
+            Err(e) => matches!(e.kind(), "rejected" | "gate"),
+            Ok(body) =>
+                body["dispatched"].as_bool() == Some(false)
+                    || body["unattended_refusal"]
+                        .as_str()
+                        .is_some_and(|w| !w.is_empty()),
+        },
+        "automatic dispatch whose authority expired inside its blocking \
+         setup must be refused by the daemon, not enqueued: {outcome:?}"
+    );
+    let rows = world
+        .shared
+        .store
+        .messages("worker")
+        .expect("worker lane reads")
+        .iter()
+        .filter(|m| m.issue.as_deref() == Some(ticket.as_str()))
+        .count();
+    assert_eq!(
+        rows, 0,
+        "a refused automatic dispatch wrote a kickoff turn for {ticket}"
+    );
+}

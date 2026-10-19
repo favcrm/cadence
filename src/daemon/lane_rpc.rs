@@ -723,6 +723,7 @@ impl Shared {
                 "operator",
                 &self.state_dir,
                 Some(&lane.group),
+                issue::dispatch::DispatchOrigin::Explicit,
             )
         });
         let mut out = match dispatched {

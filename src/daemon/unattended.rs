@@ -763,6 +763,15 @@ impl Shared {
         Ok(Some((payload.clone(), grant)))
     }
 
+    /// Native run presence without tracker/Git reads. The caller's grant
+    /// read guard keeps marks stable; malformed history must still refuse.
+    pub(super) fn unattended_issue_bound(&self, issue: &str) -> Result<bool> {
+        Ok(self
+            .unattended_marks()?
+            .iter()
+            .any(|mark| mark.binds(issue)))
+    }
+
     /// `unattended_authorization_for_issue` — the contract interface.
     ///
     /// `Ok(None)` only when no native unattended run ever bound this

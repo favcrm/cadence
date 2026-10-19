@@ -537,7 +537,15 @@ impl Shared {
         // proves in production, rather than leaning on the daemon's own
         // ambient ancestry (which a test pane marks as an agent's).
         let out = crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
-            issue::dispatch::run(&pm, id, &args, ALIAS, &self.state_dir, Some(ALIAS))
+            issue::dispatch::run(
+                &pm,
+                id,
+                &args,
+                ALIAS,
+                &self.state_dir,
+                Some(ALIAS),
+                issue::dispatch::DispatchOrigin::Automatic,
+            )
         })?;
         // Only a real send is the master's dispatch: a duplicate answers
         // with the live kickoff someone else sent (`dispatched: false`),

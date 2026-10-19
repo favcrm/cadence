@@ -44,8 +44,15 @@ pub(super) fn run(
         force,
         take_over,
     };
-    let out =
-        cadence_agent::issue::dispatch::run(&pm, issue.as_str(), &args, "", &state_dir, None)?;
+    let out = cadence_agent::issue::dispatch::run(
+        &pm,
+        issue.as_str(),
+        &args,
+        "",
+        &state_dir,
+        None,
+        cadence_agent::issue::dispatch::DispatchOrigin::Explicit,
+    )?;
     // CAD-383: a backlog/ready issue someone else owns warns only.
     if let Some(warning) = out["claim"]["warning"].as_str() {
         eprintln!("warning: {warning}");

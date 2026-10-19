@@ -25,6 +25,13 @@ use crate::store;
 /// dispatch must not queue a duplicate while one is live.
 const LIVE_MESSAGE_STATES: &[&str] = &["queued", "submitting", "running"];
 
+/// Automatic provenance is authenticated at the daemon's final send.
+/// Explicit dispatch and repair retain the connection-bound caller's authority.
+pub enum DispatchOrigin {
+    Automatic,
+    Explicit,
+}
+
 pub struct DispatchArgs {
     pub to: String,
     /// The kickoff note; `None` points the worker at the ticket's own
@@ -456,6 +463,9 @@ fn lane_head(worktree: &Path) -> Option<String> {
 /// (master_dispatch) — it writes the dispatch record directly, pm =
 /// its own alias; `None` for the CLI, whose `dispatch_record` RPC
 /// derives the pm from the caller's connection.
+///
+/// Native automatic callers preserve their origin through the self-RPC so
+/// live authority is checked after blocking setup, at the final enqueue gate.
 pub fn run(
     pm: &Pm,
     id: &str,
@@ -463,6 +473,7 @@ pub fn run(
     actor: &str,
     state_dir: &Path,
     dispatch_pm: Option<&str>,
+    origin: DispatchOrigin,
 ) -> Result<Value> {
     let (project, dir) = write::issue_dir(pm, id)?;
     let (front, body) = write::load_front(&dir)?;
@@ -984,13 +995,13 @@ pub fn run(
     // later re-dispatch can prove this kickoff's report belongs to
     // THIS issue and lane (CAD-467).
     let (message, sent_state) = if let Some(body) = send_body {
-        let sent = client::rpc(
-            state_dir,
-            "dispatch_send",
-            json!({"alias": args.to, "text": body, "reply_to": reply_to, "message": mid,
-                   "issue": front.id, "worktree": started["worktree"]}),
-        )
-        .map_err(send_failed)?;
+        let mut send = json!({"alias": args.to, "text": body, "reply_to": reply_to,
+                              "message": mid,
+                              "issue": front.id, "worktree": started["worktree"]});
+        if matches!(origin, DispatchOrigin::Automatic) {
+            send["unattended"] = json!(true);
+        }
+        let sent = client::rpc(state_dir, "dispatch_send", send).map_err(send_failed)?;
         (
             sent["message"].as_str().unwrap_or_default().to_string(),
             ("message_state", sent["state"].clone()),

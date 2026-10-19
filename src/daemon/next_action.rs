@@ -614,6 +614,7 @@ impl Shared {
                 DAEMON_ALIAS,
                 &self.state_dir,
                 Some(upstream),
+                issue::dispatch::DispatchOrigin::Automatic,
             )?,
         };
         // A duplicate answers with the live kickoff somebody else sent.

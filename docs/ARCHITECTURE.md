@@ -121,8 +121,12 @@ including a deliberately shortened lifetime. This relies on intact native
 history; it is not confinement against arbitrary same-UID database rewrites.
 
 Canonical issue dispatch and its native revision/CI-fix turns recheck current
-authority and use the recorded issue's repository and worker lane. A done
-report alone cannot start review: the owned queue turn must have completed
+authority and use the recorded issue's repository and worker lane. Automatic
+dispatch preserves daemon-authenticated origin through its self-RPC and
+revalidates at the final enqueue gate, after blocking worktree/Git setup.
+The tracker snapshot stays locked through enqueue; explicit operator
+hand-dispatch and repair retain their existing authority. A done report alone
+cannot start review: the owned queue turn must have completed
 with that exact SHA. Unknown outcomes remain held for reconciliation; a known
 failed provider turn stays failed and requires deliberate recovery, not a
 fabricated successful result or a blind replay. A grant does not authorize
