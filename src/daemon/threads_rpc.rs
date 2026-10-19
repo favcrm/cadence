@@ -243,9 +243,12 @@ impl Shared {
         // race). It is a typed argument like `human`: stripped from the
         // forwarded params, so `expected_recipient_uid` is never a send
         // request field on any verb.
+        // The uid is borrowed from the request, never copied: the
+        // forwarded params below carry their own copy, and this typed
+        // argument only has to outlive the enqueue call.
         let expected_uid = match params.get("expected_recipient_uid") {
             None | Some(Value::Null) => None,
-            Some(Value::String(uid)) if !uid.is_empty() => Some(uid.clone()),
+            Some(Value::String(uid)) if !uid.is_empty() => Some(uid.as_str()),
             Some(_) => {
                 return Err(Error::rejected(
                     "expected_recipient_uid must be a nonempty recipient uid string",
@@ -274,7 +277,7 @@ impl Shared {
                 )))
             },
             human.as_ref(),
-            expected_uid.as_deref(),
+            expected_uid,
             None,
         )?;
         // The thread the message landed in: its conversation, which is
