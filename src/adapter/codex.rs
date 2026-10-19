@@ -179,7 +179,12 @@ fn verified_steering_runtime(reply: &Value) -> bool {
     reply
         .get("userAgent")
         .and_then(Value::as_str)
-        .is_some_and(|agent| agent.split_whitespace().next() == Some("cadence-agent/0.160.0"))
+        .is_some_and(|agent| {
+            matches!(
+                agent.split_whitespace().next(),
+                Some("cadence-agent/0.160.0" | "cadence-agent/0.161.0")
+            )
+        })
 }
 
 const ENV_SCRUB: &[&str] = &[
@@ -1386,7 +1391,7 @@ impl ProviderAdapter for CodexAdapter {
         client_message_id: &str,
     ) -> Result<SteerOutcome> {
         if !self.native_turn_steering() {
-            return Err(Error::rejected("Codex runtime has no verified exact-turn input capability (validated server: 0.160.0)"));
+            return Err(Error::rejected("Codex runtime has no verified exact-turn input capability (validated servers: 0.160.0, 0.161.0)"));
         }
         steer_shared(
             &self.shared,
@@ -1426,13 +1431,18 @@ mod tests {
 
     #[test]
     fn steering_requires_the_verified_initialize_version() {
-        assert!(verified_steering_runtime(
-            &json!({"userAgent": "cadence-agent/0.160.0 (Linux; x86_64)"})
-        ));
+        for version in ["0.160.0", "0.161.0"] {
+            assert!(verified_steering_runtime(
+                &json!({"userAgent": format!("cadence-agent/{version} (Linux; x86_64)")})
+            ));
+        }
         for reply in [
             json!({}),
             json!({"userAgent": "cadence-agent/0.159.0"}),
             json!({"userAgent": "cadence-agent/0.160.0-dev"}),
+            json!({"userAgent": "cadence-agent/0.161.0-dev"}),
+            json!({"userAgent": "cadence-agent/0.161.1"}),
+            json!({"userAgent": "cadence-agent/0.162.0"}),
             json!({"serverInfo": {"version": "0.160.0"}}),
         ] {
             assert!(!verified_steering_runtime(&reply), "{reply}");

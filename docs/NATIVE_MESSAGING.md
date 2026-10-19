@@ -5,7 +5,7 @@ recovery. Native adapters translate delivery; they are not a second broker.
 
 ## Delivery matrix
 
-Observed runtimes: Codex 0.160.0, Pi 1.0.0, Claude Code 2.1.287.
+Observed runtimes: Codex 0.160.0 and 0.161.0, Pi 1.0.0, Claude Code 2.1.287.
 
 | Intent | Managed Codex | Managed Pi | Managed Claude | PTY |
 | --- | --- | --- | --- | --- |
@@ -91,6 +91,12 @@ old-run guidance from later model requests. After settlement the adapter confirm
 kickoff instead of risking replay. Both filtering and cleanup matter when input
 was accepted just before cancellation.
 
+Codex steering admits only the verified initialize `userAgent` first tokens
+`cadence-agent/0.160.0` and `cadence-agent/0.161.0`. CLI installation, a static
+registry capability or a compatible-looking schema alone does not enable it.
+Other versions, including development suffixes, retain ordinary queued delivery
+but refuse strict nudges until their exact-turn behavior is revalidated.
+
 Codex validates `expectedTurnId` inside the app-server. Wrong or missing turn ids
 in a successful reply are unknown, not accepted. The adapter releases
 reader-shared locks before waiting, so a quota notification cannot block receipt
@@ -115,8 +121,24 @@ remains a typed-amendment policy gap, not something inferred from an ack.
 
 ## Validation
 
-See `tests/manual/native_inbox/README.md` and `EVIDENCE.md`. Opt-in probes use
-newly owned sessions and temporary state, never production sessions. Direct
-runtime probes are not Cadence end-to-end evidence. The lane-native smoke mode
-is `CAD1015_NATIVE_STEERING=1`; use an absolute lane binary and preserve build,
-revision/artifact, runtime versions, failure cases and cleanup evidence.
+The independently authored Codex 0.161.0 refusal check uses a newly owned
+ephemeral thread and the installed CLI's normal authentication:
+
+```sh
+python3 tests/codex_native_steering_acceptance.py --run \
+  --scratch "$(mktemp -d /tmp/codex-steer.XXXXXX)"
+```
+
+It requires stale-target refusal while another turn is active, with a valid
+current-turn positive control and no stale guidance in the successor's events.
+Without `--run`, it performs only initialization, not model inference.
+Direct runtime probes are not Cadence end-to-end evidence.
+
+CAD-1583 separately exercised the lane binary in temporary Cadence state:
+the old admission refused 0.161.0; the updated adapter accepted guidance while
+the original kickoff remained running; its matching result contained both
+the original objective and guidance markers. An ordinary follow-up completed
+separately. The tested model was `gpt-6.1-sol`; no existing sessions or
+production daemon were used. Ticket artifacts retain source/binary hashes,
+protocol and adapter evidence, and cleanup. Future runtimes require fresh
+validation; this is not certification of every Codex version.
