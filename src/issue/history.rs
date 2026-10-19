@@ -879,10 +879,7 @@ fn owner_walk(
         } else if let (Some(index), false) = (current, line.is_empty()) {
             if let Some(rel) = line.strip_suffix("/issue.md") {
                 if wanted.contains_key(rel) {
-                    walk.by_rel
-                        .entry(rel.to_string())
-                        .or_insert_with(Vec::new)
-                        .push(index);
+                    walk.by_rel.entry(rel.to_string()).or_default().push(index);
                 }
             }
         }
