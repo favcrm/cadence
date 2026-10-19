@@ -60,12 +60,13 @@ pub const WAKE_TIMEOUT_DEFAULT: u64 = 120;
 /// Upper bound on one wake wait, whatever the remote advertises.
 const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 
-/// The allowlisted remote verbs this build can send. A command not listed
-/// here is refused locally and its bytes never leave the process.
-/// `message_send` stays excluded (an agent-to-agent channel this client
-/// does not expose). Platform team verbs are in this allowlist and are not
-/// native container verbs: the hosted call path carries them, and the
-/// platform answers them without a daemon.
+/// The allowlisted remote verbs this build can send — the CAD-1019 contract
+/// ∩ AOS-128's `HOSTED_CADENCE_CLI_VERBS`: a command not listed here is
+/// refused *locally* and its bytes never leave the process.
+///
+/// Platform team verbs are in this allowlist and are not native container
+/// verbs: the hosted call path carries them, and the platform answers them
+/// without a daemon.
 ///
 /// Writes ride the same single-use envelope. The caller's authority never
 /// travels as a request field, only inside the envelope [`call_once`] mints
