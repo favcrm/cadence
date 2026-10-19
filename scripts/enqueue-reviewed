@@ -46,6 +46,7 @@ import tempfile
 import time
 import tomllib
 import unicodedata
+from urllib.parse import quote
 
 ME = "enqueue-reviewed"
 DEFAULT_NOTES_DIR = "/var/www/agent-notes"
@@ -241,7 +242,8 @@ def is_human_path(path, risk=()):
 def required_contexts(repo, base):
     """(set of required check names, [reasons]). Fail closed."""
     names, reasons = set(), []
-    rc, out, err = run(["gh", "api", f"repos/{repo}/rules/branches/{base}"])
+    branch = quote(base, safe="")
+    rc, out, err = run(["gh", "api", f"repos/{repo}/rules/branches/{branch}"])
     if rc != 0:
         reasons.append(f"cannot read the rulesets of {base}: {err.strip() or out.strip()}")
     else:
@@ -252,7 +254,7 @@ def required_contexts(repo, base):
                         names.add(c["context"])
         except (ValueError, TypeError, KeyError) as e:
             reasons.append(f"cannot parse the rulesets of {base}: {e}")
-    rc, out, err = run(["gh", "api", f"repos/{repo}/branches/{base}/protection"])
+    rc, out, err = run(["gh", "api", f"repos/{repo}/branches/{branch}/protection"])
     if rc != 0:
         if "not protected" not in (out + err).lower():
             reasons.append(f"cannot read branch protection of {base}: {err.strip() or out.strip()}")
@@ -378,14 +380,16 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue):
     return reasons, counted
 
 
-def check_comment(comments, head, counted, required=()):
+def check_comment(comments, head, counted, base_ref, required=()):
     names = sorted({n["name"] for n in counted})
     for c in comments or []:
         body = c.get("body") or ""
-        if head in body and all(n in body for n in names) and all(v in body for v in required):
+        if (head in body and all(n in body for n in names)
+                and f"Base branch: {base_ref}" in body.splitlines()
+                and all(v in body for v in required)):
             return []
     suffix = (f" and required delivery evidence ({', '.join(required)})" if required else "")
-    return [f"no ticket comment names head {head} and lists the verdict notes{suffix}"
+    return [f"no ticket comment names head {head}, exact base branch {base_ref} and lists the verdict notes{suffix}"
             + (f" ({', '.join(names)})" if names else "")]
 
 
@@ -401,6 +405,8 @@ def requirements_inspection(issue, repo, pr, head):
             raise ValueError("unexpected response shape")
         if (result.get("issue") != issue or result.get("repo") != repo.lower()
                 or result.get("pr") != pr or result.get("head") != head
+                or not isinstance(result.get("base_ref"), str) or not result["base_ref"]
+                or any(unicodedata.category(char) == "Cc" for char in result["base_ref"])
                 or not FULL_SHA.fullmatch(result.get("base", ""))
                 or not FULL_SHA.fullmatch(result.get("merge_base", ""))
                 or not re.fullmatch(r"sha256:[0-9a-f]{64}", result.get("policy_digest", ""))
@@ -437,7 +443,7 @@ def requirements_inspection(issue, repo, pr, head):
         if req["class"] == "routine" and req["browser_qa"]:
             raise ValueError("routine classification cannot require Browser QA")
         binding = {key: result[key] for key in
-                   ("issue", "project", "repo", "pr", "head", "base", "merge_base", "policy_digest")}
+                   ("issue", "project", "repo", "pr", "head", "base", "base_ref", "merge_base", "policy_digest")}
         if not isinstance(binding["project"], str) or not binding["project"]:
             raise ValueError("requirements response has no project binding")
         readiness = result.get("readiness")
@@ -446,6 +452,7 @@ def requirements_inspection(issue, repo, pr, head):
                 raise ValueError("routine readiness is malformed")
             if (readiness.get("repo") != repo.lower() or readiness.get("pr") != pr
                     or readiness.get("head") != head or readiness.get("base") != result["base"]
+                    or readiness.get("base_ref") != result["base_ref"]
                     or readiness.get("policy_digest") != result["policy_digest"]
                     or type(readiness.get("ci_run_id")) is not int or readiness["ci_run_id"] <= 0
                     or readiness.get("ci_run_url") != f"https://github.com/{repo.lower()}/actions/runs/{readiness.get('ci_run_id')}"
@@ -715,17 +722,14 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     base_oid = view.get("baseRefOid") or ""
     if not FULL_SHA.fullmatch(base_oid):
         reasons.append("cannot bind evidence to a full base commit SHA")
-    try:
-        default = gh_json(["repo", "view", repo, "--json", "defaultBranchRef"])["defaultBranchRef"]["name"]
-    except (RuntimeError, KeyError, TypeError) as e:
-        default = None
-        reasons.append(f"cannot read the default branch of {repo}: {e}")
-    if default and base != default:
-        reasons.append(f"PR #{pr} targets {base!r}, not the default branch {default!r}")
 
-    # Required checks of the base.
-    names, rs = required_contexts(repo, base or "main")
-    reasons += rs
+    # Read only the actual PR target's checks; absent target data must not use main.
+    if not isinstance(base, str) or not base:
+        names = set()
+        reasons.append("PR has no valid base branch to bind delivery evidence")
+    else:
+        names, rs = required_contexts(repo, base)
+        reasons += rs
     if names:
         reasons += check_required(names, view.get("statusCheckRollup"), head)
         report.append(f"required checks: {', '.join(sorted(names))}")
@@ -779,6 +783,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         try:
             authority = requirements_inspection(issue, repo, pr, head)
             if (authority["binding"]["base"] != base_oid
+                    or authority["binding"]["base_ref"] != base
                     or authority["binding"]["repo"] != repo.lower()
                     or authority["binding"]["project"] != ticket.get("project")):
                 raise RuntimeError("authoritative requirements binding differs from the ticket project, PR base or repository")
@@ -878,9 +883,9 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     if require_comment:
         if approval_evidence.get("approval"):
             required_comment_evidence.append("Operator approval id: " + approval_evidence["approval"])
-        reasons += check_comment(ticket.get("comments"), head, counted, required_comment_evidence)
+        reasons += check_comment(ticket.get("comments"), head, counted, base, required_comment_evidence)
     if evidence is not None and not reasons:
-        evidence.update(issue=issue, repo=repo, pr=pr, head=head, base=base_oid,
+        evidence.update(issue=issue, repo=repo, pr=pr, head=head, base=base_oid, base_ref=base,
                         notes=sorted({n["name"] for n in counted}),
                         checks=sorted(names), comments=ticket.get("comments") or [],
                         binding=authority["binding"] if authority else None,
@@ -915,6 +920,7 @@ def green_ci_run(repo, head):
 def evidence_body(evidence):
     lines = [f"Delivery evidence: {evidence['repo']}#{evidence['pr']}",
              f"Head: {evidence['head']}", f"Base: {evidence['base']}",
+             f"Base branch: {evidence['base_ref']}",
              f"Green CI run: {evidence['ci_run']}",
              "Required checks: " + ", ".join(evidence["checks"]),
              "Verdict notes: " + (", ".join(evidence["notes"]) or "none required")]
@@ -933,9 +939,10 @@ def evidence_body(evidence):
 
 def check_evidence_head(args, repo, evidence):
     view = gh_json(["pr", "view", str(args.pr), "-R", repo, "--json",
-                    "state,headRefOid,baseRefOid,autoMergeRequest"])
+                    "state,headRefOid,baseRefOid,baseRefName,autoMergeRequest"])
     if (view.get("state") != "OPEN" or view.get("headRefOid") != evidence["head"]
-            or view.get("baseRefOid") != evidence["base"] or view.get("autoMergeRequest")):
+            or view.get("baseRefOid") != evidence["base"]
+            or view.get("baseRefName") != evidence["base_ref"] or view.get("autoMergeRequest")):
         return ["PR head/base/state changed during evidence collection; revalidate before enqueue"]
     return []
 

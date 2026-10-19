@@ -51,6 +51,7 @@ class Case:
         self.paths = ["scripts/enqueue-reviewed", ".github/workflows/ci.yml"]
         self.title = f"{ISSUE}: approve once per ticket"
         self.branch = BRANCH
+        self.base_ref = "main"
         self.ticket_body = BODY
         self.refs = [{"kind": "branch", "path": BRANCH}]
         self.status = "doing"
@@ -81,7 +82,7 @@ class Case:
         if argv[:3] == ["gh", "pr", "view"]:
             return 0, json.dumps({
                 "number": 5, "state": "OPEN", "title": self.title, "headRefName": self.branch,
-                "headRefOid": HEAD, "baseRefName": "main", "baseRefOid": BASE,
+                "headRefOid": HEAD, "baseRefName": self.base_ref, "baseRefOid": BASE,
                 "mergeStateStatus": "CLEAN", "autoMergeRequest": None,
                 "author": {"login": "cc"},
                 "statusCheckRollup": [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}]}), ""
@@ -102,7 +103,7 @@ class Case:
             matching = [r for r in self.store if r["issue"].lower() == issue.lower()]
             approval_id = "merge-pr5-aaaa" if self.per_head else (
                 matching[-1]["approval_id"] if matching else "missing")
-            comment = f"{HEAD} {NOTE}\nOperator approval id: {approval_id}"
+            comment = f"{HEAD} {NOTE}\nBase branch: {self.base_ref}\nOperator approval id: {approval_id}"
             return 0, json.dumps({"id": issue, "project": self.project, "owner": None, "claim": None,
                                   "body": self.ticket_body, "status": self.status, "refs": self.refs,
                                   "comments": [{"body": comment}]}), ""
@@ -133,7 +134,7 @@ class Case:
                    "full_checks": True, "reasons": ["fixture: legacy project has no approved solo profile"],
                    "policy_digest": policy_digest, "activation": "no_profile"}
             response = {"issue": issue, "project": self.project, "repo": "o/r", "pr": pr,
-                        "head": head, "base": BASE, "merge_base": "c" * 40,
+                        "head": head, "base": BASE, "base_ref": self.base_ref, "merge_base": "c" * 40,
                         "policy_digest": policy_digest, "requirements": req, "readiness": None}
             self.requirements_calls += 1
             if self.requirements_override is not None:

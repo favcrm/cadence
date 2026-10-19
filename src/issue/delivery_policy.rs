@@ -58,6 +58,13 @@ pub struct DeliveryPolicy {
     /// requirements always use [`Resolved`], never the raw file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub solo_operator: Option<SoloOperatorProfile>,
+    /// CAD-1561: one extra PR target beyond the repository default
+    /// branch. `None` is omitted from the canonical JSON so existing
+    /// digests and approvals are unchanged. A non-default target is
+    /// admitted only while the exact current approved policy names it —
+    /// last-approved fallbacks (`delivery_unapproved` notes) do not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_branch: Option<String>,
 }
 
 /// The legacy solo-operator delivery profile (CAD-1298), still readable
@@ -181,6 +188,8 @@ struct RawDelivery {
     oversized: Option<RawSize>,
     #[serde(default)]
     solo_operator: Option<SoloOperatorProfile>,
+    #[serde(default)]
+    integration_branch: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -325,11 +334,18 @@ impl RawDelivery {
         for (name, raw) in self.reviews {
             reviews.insert(name.clone(), raw.into_review(&name)?);
         }
-        if let Some(ref s) = self.solo_operator {
+        if let Some(s) = &self.solo_operator {
             if s.version != 1 {
                 return Err(err(format!(
                     "solo_operator.version {}: the only supported version is 1",
                     s.version
+                )));
+            }
+        }
+        if let Some(b) = &self.integration_branch {
+            if !valid_branch_name(b) {
+                return Err(err(format!(
+                    "integration_branch {b:?}: not a canonical GitHub branch name"
                 )));
             }
         }
@@ -344,6 +360,7 @@ impl RawDelivery {
             heavy,
             oversized,
             solo_operator: self.solo_operator,
+            integration_branch: self.integration_branch,
         })
     }
 }
@@ -377,6 +394,7 @@ pub fn default_policy() -> DeliveryPolicy {
             files_over: crate::delivery::OVERSIZED_FILES,
         },
         solo_operator: None,
+        integration_branch: None,
     }
 }
 
@@ -601,6 +619,33 @@ fn valid_app(app: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// A canonical GitHub branch name — plain `heads/` content only, no
+/// `refs/` prefix, revision operator, whitespace or control/format
+/// mark, and not `HEAD`/`@`. Mirrors `git check-ref-format --branch`'s
+/// documented rules so an approved target can never smuggle a symbolic
+/// ref, a remote path, or a revision expression.
+fn valid_branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name != "HEAD"
+        && name != "@"
+        && !name.starts_with("refs/")
+        && !name.starts_with('-')
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.contains("..")
+        && !name.contains("//")
+        && !name.contains("@{")
+        && name.bytes().all(|b| {
+            !(b <= 0x20 || b == 0x7f)
+                && !matches!(b, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
+        && name
+            .split('/')
+            .all(|seg| !seg.starts_with('.') && !seg.ends_with('.') && !seg.ends_with(".lock"))
+        && crate::issue::areas::scrub(name) == name
+}
+
 /// A `when.paths` entry: the same repo-relative, file-level glob
 /// grammar `areas:` and `paths=` use — slice 3 matches with
 /// `areas::matches`, so the two must accept exactly the same strings.
@@ -643,12 +688,23 @@ impl DeliveryPolicy {
             // partially honored.
             let mut rest = self.clone();
             rest.solo_operator = None;
+            rest.integration_branch = None;
             if rest != default_policy() {
                 return Err(err(
                     "solo_operator is supported only on the default delivery policy — \
                      a custom merge/reviews/risk/limits configuration beside a \
                      profile is refused",
                 ));
+            }
+        }
+        if let Some(b) = &self.integration_branch {
+            // Checked here too: `approved_from` deserializes a recorded
+            // `delivery` directly — a malformed approved target must
+            // invalidate the whole approval, not survive it.
+            if !valid_branch_name(b) {
+                return Err(err(format!(
+                    "integration_branch {b:?}: not a canonical GitHub branch name"
+                )));
             }
         }
         if self.reviews.is_empty() {

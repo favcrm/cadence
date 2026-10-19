@@ -190,6 +190,12 @@ pub struct ReadyEvidence {
     pub pr: u64,
     pub head: String,
     pub base: String,
+    /// The PR's actual target branch name (CAD-1561) — binds the
+    /// evidence to `staging` vs `main`, not just the base OID.
+    /// `default` keeps pre-1561 serialized records readable; an empty
+    /// bind never matches a named target, which fails closed.
+    #[serde(default)]
+    pub base_ref: String,
     pub policy_digest: String,
     pub ci_run_id: u64,
     pub ci_run_url: String,
@@ -204,6 +210,8 @@ pub struct ReadyBinding {
     pub pr: u64,
     pub head: String,
     pub base: String,
+    #[serde(default)]
+    pub base_ref: String,
     pub policy_digest: String,
     pub ci_run_id: u64,
     pub ci_run_url: String,
@@ -364,12 +372,13 @@ impl Record {
         }
         let binding = self.ready_binding.as_ref()?;
         Some(format!(
-            "{}/{}:{}:{}:{}:{}:{}:{}@{}",
+            "{}/{}:{}:{}:{}:{}:{}:{}:{}@{}",
             self.issue,
             binding.repo,
             binding.pr,
             binding.head,
             binding.base,
+            binding.base_ref,
             binding.policy_digest,
             binding.ci_run_id,
             binding.outcome_report,
@@ -418,6 +427,12 @@ impl Record {
                         && e.pr == b.pr
                         && e.head == b.head
                         && e.base == b.base
+                        // CAD-1561: evidence must name its actual target
+                        // branch — a pre-1561 record deserializes base_ref
+                        // empty and can never merge-ready without a fresh
+                        // binding.
+                        && e.base_ref == b.base_ref
+                        && !b.base_ref.is_empty()
                         && e.policy_digest == b.policy_digest
                         && e.ci_run_id == b.ci_run_id
                         && e.ci_run_url == b.ci_run_url

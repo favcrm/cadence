@@ -13,6 +13,10 @@ use crate::issue::{self, delivery_policy, delivery_requirements as requirements}
 #[path = "cad1298_requirements_acceptance.rs"]
 mod acceptance;
 
+#[cfg(test)]
+#[path = "cad1561_integration_branch_acceptance.rs"]
+mod cad1561_integration_branch_acceptance;
+
 fn reject(why: impl std::fmt::Display) -> Error {
     Error::rejected(format!("delivery requirements: {why}"))
 }
@@ -60,6 +64,25 @@ fn default_branch(shared: &Shared, repo: &str) -> Result<String> {
         .filter(|name| !name.is_empty())
         .map(str::to_string)
         .ok_or_else(|| reject("repository has no default branch"))
+}
+
+/// Percent-encode a branch name for a single URL path segment —
+/// `repos/{repo}/rules/branches/{x}` takes the name inline, so `/`
+/// (and every other non-unreserved byte) must be `%`-escaped or a
+/// slashed target like `release/staging` reads as a different branch.
+/// Policy already restricts these to canonical git names; this encodes
+/// rather than revalidates so callers never depend on that.
+pub(super) fn branch_segment(branch: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(branch.len());
+    for b in branch.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 fn valid_sha(s: &str) -> bool {
@@ -169,6 +192,26 @@ fn content_at_base(shared: &Shared, repo: &str, path: &str, base: &str) -> Optio
     .ok()
 }
 
+/// CAD-1561: a non-default PR target is admitted only when the EXACT
+/// current approved policy names it. `source == "approved"` plus
+/// `note == None` means the file's section IS the recorded approval
+/// verbatim — a last-approved fallback after an edit carries a
+/// `delivery_unapproved` note and does not qualify. The approval's own
+/// digest/policy equality keeps provenance honest even if `effective`
+/// semantics change.
+fn approved_integration_target(
+    base_ref: &str,
+    resolved: &delivery_policy::Resolved,
+    approved: Option<&delivery_policy::Approved>,
+) -> bool {
+    resolved.source == "approved"
+        && resolved.note.is_none()
+        && resolved.policy.integration_branch.as_deref() == Some(base_ref)
+        && approved.is_some_and(|a| {
+            a.digest == resolved.digest && a.policy.as_ref() == Some(&resolved.policy)
+        })
+}
+
 pub(super) fn classify(shared: &Shared, params: &Value) -> Result<Value> {
     let (issue_id, pr_url, requested_head) = request_fields(params)?;
 
@@ -203,8 +246,23 @@ pub(super) fn classify(shared: &Shared, params: &Value) -> Result<Value> {
     let base_ref = view["baseRefName"]
         .as_str()
         .ok_or_else(|| reject("PR has no base branch"))?;
-    if base_ref != default {
-        return Err(reject("PR base is not the repository default branch"));
+    // Resolve the effective policy once — the target gate and the
+    // requirements evaluator below share it. The reread at the end
+    // still re-resolves for drift detection.
+    let approvals = shared.store.work_approvals()?;
+    let approved = approvals
+        .get(&project.key)
+        .and_then(delivery_policy::approved_from);
+    let resolved = delivery_policy::effective(
+        &project.key,
+        delivery_policy::load(&pm.dir, &project.key),
+        approved.as_ref(),
+    );
+    if base_ref != default && !approved_integration_target(base_ref, &resolved, approved.as_ref()) {
+        return Err(reject(format!(
+            "PR base {base_ref:?} is neither the repository default {default:?} \
+             nor an approved delivery integration_branch"
+        )));
     }
     let base = view["baseRefOid"]
         .as_str()
@@ -274,15 +332,6 @@ pub(super) fn classify(shared: &Shared, params: &Value) -> Result<Value> {
         changes.push(requirements::change(status, &old_mode, &new_mode, path));
     }
 
-    let approvals = shared.store.work_approvals()?;
-    let approved = approvals
-        .get(&project.key)
-        .and_then(delivery_policy::approved_from);
-    let resolved = delivery_policy::effective(
-        &project.key,
-        delivery_policy::load(&pm.dir, &project.key),
-        approved.as_ref(),
-    );
     let risk_paths = content_at_base(shared, &repo, "docs/roles/risk-paths.toml", &base);
     let one_review = content_at_base(shared, &repo, "docs/roles/one-review-paths.toml", &base);
     let lists = requirements::TrustedLists {
@@ -312,7 +361,11 @@ pub(super) fn classify(shared: &Shared, params: &Value) -> Result<Value> {
         || after["baseRefOid"].as_str() != Some(base.as_str())
         || after["changedFiles"].as_u64() != Some(changed_files)
         || default_branch(shared, &repo)? != default
-        || after_resolved.digest != resolved.digest
+        // Whole-Resolved equality: an unapproved/malformed PROJECT.md
+        // mid-collection can keep the approved policy in force with the
+        // SAME digest but source/note changed — a digest-only check
+        // would grant the extra target under stale provenance.
+        || after_resolved != resolved
     {
         return Err(reject(
             "PR head/base or approved policy changed during collection",
@@ -320,20 +373,23 @@ pub(super) fn classify(shared: &Shared, params: &Value) -> Result<Value> {
     }
     Ok(
         json!({"issue": issue_id, "project": project.key, "repo": repo, "pr": number,
-        "head": head, "base": base, "merge_base": merge_base,
+        "head": head, "base": base, "base_ref": base_ref, "merge_base": merge_base,
         "policy_digest": result.policy_digest, "requirements": result}),
     )
 }
 
 /// Recheck the current full PR check floor for profile-backed approvals.
-/// This uses GitHub's required branch checks plus a successful canonical
-/// pull_request ci.yml run, never the daemon's previously observed boolean.
+/// This uses the ACTUAL target branch's required checks plus a
+/// successful canonical pull_request ci.yml run, never the daemon's
+/// previously observed boolean and never the repository default's
+/// protection when the PR targets a different approved branch.
 pub(super) fn full_ci_green(
     shared: &Shared,
     repo: &str,
     number: u64,
     head: &str,
     base: &str,
+    base_ref: &str,
 ) -> Result<bool> {
     let current: Value = serde_json::from_str(&gh(
         shared,
@@ -344,15 +400,17 @@ pub(super) fn full_ci_green(
             "-R",
             repo,
             "--json",
-            "headRefOid,baseRefOid,statusCheckRollup",
+            "headRefOid,baseRefOid,baseRefName,statusCheckRollup",
         ],
     )?)
     .map_err(|e| reject(format!("unreadable current PR checks: {e}")))?;
-    if current["headRefOid"].as_str() != Some(head) || current["baseRefOid"].as_str() != Some(base)
+    if current["headRefOid"].as_str() != Some(head)
+        || current["baseRefOid"].as_str() != Some(base)
+        || current["baseRefName"].as_str() != Some(base_ref)
     {
         return Ok(false);
     }
-    let branch = default_branch(shared, repo)?;
+    let branch = branch_segment(base_ref);
     let rules = api(shared, &format!("repos/{repo}/rules/branches/{branch}"))?;
     let protection = api(
         shared,
@@ -539,10 +597,13 @@ fn routine_readiness_inner(
     let base = answer["base"]
         .as_str()
         .ok_or_else(|| reject("missing base SHA"))?;
+    let base_ref = answer["base_ref"]
+        .as_str()
+        .ok_or_else(|| reject("missing base branch name"))?;
     let number = answer["pr"]
         .as_u64()
         .ok_or_else(|| reject("missing PR number"))?;
-    let branch = default_branch(shared, repo)?;
+    let branch = branch_segment(base_ref);
     let rules = api(shared, &format!("repos/{repo}/rules/branches/{branch}"))?;
     let protection = api(
         shared,
@@ -613,7 +674,10 @@ fn routine_readiness_inner(
         return Ok(RoutineReadiness::NotRoutine);
     }
     let view = pr_view(shared, repo, number)?;
-    if view["headRefOid"].as_str() != Some(head) || view["baseRefOid"].as_str() != Some(base) {
+    if view["headRefOid"].as_str() != Some(head)
+        || view["baseRefOid"].as_str() != Some(base)
+        || view["baseRefName"].as_str() != Some(base_ref)
+    {
         return Ok(RoutineReadiness::NotRoutine);
     }
     let mut states: HashMap<String, Vec<String>> = HashMap::new();
@@ -682,6 +746,7 @@ fn routine_readiness_inner(
     let final_answer = classify(shared, &json!({"issue":issue_id,"pr":pr_url,"head":head}))?;
     if final_answer["head"] != answer["head"]
         || final_answer["base"] != answer["base"]
+        || final_answer["base_ref"] != answer["base_ref"]
         || final_answer["policy_digest"] != answer["policy_digest"]
         || final_answer["requirements"]["class"] != "routine"
     {
@@ -692,6 +757,7 @@ fn routine_readiness_inner(
         pr: number,
         head: head.to_string(),
         base: base.to_string(),
+        base_ref: base_ref.to_string(),
         policy_digest: answer["policy_digest"]
             .as_str()
             .unwrap_or_default()

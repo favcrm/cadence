@@ -67,6 +67,21 @@ publish to a live account to prove a release.
   operationally verified separate in the ticket. Never publish to a live
   account to prove a release.
 
+### Approved project integration target (CAD-1561)
+
+Install the reviewed daemon and matching `enqueue-reviewed` script before
+adopting `delivery.integration_branch`. The operator then edits the project's
+policy and re-approves it through an operator connection using
+`cadence issue project approve-work <key>`. This is separate from source merge
+approval and is never performed by the source change itself.
+
+Verify read-only requirements report the intended `base_ref`, and run the
+guarded enqueue dry-run against the exact head; all remaining review, CI and
+approval requirements still apply. Do not change the repository default or
+retarget the PR to work around a refusal. Before rolling back to a daemon
+without this option, remove it and re-approve the policy; integration-target
+delivery then refuses and the repository-default route remains available.
+
 ## App bundle
 
 - **Runner:** operator, using the bundle kit's `run.sh`.
