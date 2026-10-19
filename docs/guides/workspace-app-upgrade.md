@@ -85,6 +85,13 @@ locator or `catalogue_resolution: "manual"`. Apply also requires
 and actor fields are never accepted from the caller. A repeat of the exact
 request returns the committed result; a changed proposed bundle, stale digest, stale generation, or
 reused request ID with different material is refused.
+
+For files-mode HTTP requests, send the complete `files` map instead of `source`.
+The canonical root files `app.md`, optional `app-chat.json` and
+`app-assistant.json` travel unchanged and participate in the bundle digest.
+Native validation still checks the assistant descriptor; unknown root members
+and aliased or nested assistant paths are refused before staging.
+
 Every check receipt carries a `readiness` object. `install-check` reports
 `{"ready": true, "reason": null}` once the bundle validates — a fresh install
 has no active work. `upgrade-check` re-reads the installation's live state:

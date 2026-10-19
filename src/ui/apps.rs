@@ -364,7 +364,7 @@ fn leaf_ok(seg: &str, need_md_tag: bool) -> bool {
 /// alias the same staged file and defeat duplicate detection; this grammar
 /// refuses them instead. Admitted shapes (the only flat entries the bundle
 /// allows):
-///   `app.md`, `app-chat.json`         (exactly; CAD-1110)
+///   `app.md`, `app-chat.json`, `app-assistant.json` (canonical root files)
 ///   `workflows/<tag>.md`              (valid_tag stem — the installer's rule)
 ///   `rubrics/<leaf>` `templates/<leaf>` (any visible flat leaf)
 ///   `views/app-views-v1.json`         (exact descriptor filename)
@@ -381,7 +381,7 @@ fn upload_path_ok(path: &str) -> bool {
         return false;
     }
     match segs.as_slice() {
-        ["app.md"] | ["app-chat.json"] => true,
+        ["app.md"] | ["app-chat.json"] | [crate::issue::app_assistant::FILE] => true,
         ["workflows", leaf] => leaf_ok(leaf, true),
         ["views", leaf] => *leaf == crate::issue::app_view::FILE,
         ["rubrics", leaf] | ["templates", leaf] => leaf_ok(leaf, false),
