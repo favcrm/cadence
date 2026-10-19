@@ -194,6 +194,19 @@ export default function AppShell({
   const [generalSetup, setGeneralSetup] = useState<{ key: string; error: string | null } | null>(null);
   const [generalSetupAttempt, setGeneralSetupAttempt] = useState(0);
   const [contextId, setContextId] = useState("");
+  // CAD-1615 — the board-wide drawer for an app screen. The app asks for
+  // it with its own verb; the shell owns the geometry and the scrim, and
+  // Escape or the scrim puts the screen back in the outlet.
+  const [screenDrawer, setScreenDrawer] = useState<string | null>(null);
+  const onScreenDrawer = useCallback((mode: "outlet" | "drawer", surface?: string) => {
+    setScreenDrawer(mode === "drawer" ? (surface ?? "") : null);
+  }, []);
+  useEffect(() => {
+    if (screenDrawer === null) return;
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setScreenDrawer(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [screenDrawer]);
   const [linkNotice, setLinkNotice] = useState<string | null>(null);
   // CAD-1560: one shell-owned scope for every active app view. The
   // in-workspace selection (Social's picker, a screen's saved-context
@@ -840,7 +853,8 @@ export default function AppShell({
   }, [launcherRun, launcherIsCurrent]);
 
   return (
-    <div className="app-shell" data-app-shell-outlet={installId}>
+    <div className="app-shell" data-app-shell-outlet={installId} data-screen-drawer={screenDrawer !== null ? "true" : undefined}>
+      {screenDrawer !== null && <div className="app-shell-screen-scrim" aria-hidden="true" onClick={() => setScreenDrawer(null)} />}
       <div className="app-shell-crumb">
         <Link href="/apps" className="lnk text-label">
           ← {t("All apps")}
@@ -971,7 +985,7 @@ export default function AppShell({
             onOpenView={openView}
           />
         </div>
-        <section id="app-shell-workspace" className="app-shell-outlet" aria-label={`${title} ${t("workspace")}`}>
+        <section id="app-shell-workspace" className="app-shell-outlet" data-screen-drawer={screenDrawer !== null ? "true" : undefined} aria-label={`${title} ${t("workspace")}`}>
           {cachedPreviewSnapshot?.installation.install_id === installId &&
             isSocialContent(cachedPreviewSnapshot.installation) && loading ? (
               <WorkspaceAppCachedPreview
@@ -1140,6 +1154,7 @@ export default function AppShell({
                 children(attachMediaReference, scope.contextId)
               ) : (
                 <InstalledScreenOutlet installation={installation} contexts={contexts} contextId={scope.contextId}
+                  onScreenDrawer={onScreenDrawer} presentation={screenDrawer !== null ? "drawer" : "outlet"}
                   admitted={receiptReady && contextAdoptionReady && (viewer.operator === true && !viewer.readOnly || viewer.screenReader === true)}
                   onRoute={screenRoute} onCommand={screenCommand} onNavigation={setScreenNavigation} onMediaAttach={attachMediaReference}
                   fallback={contextAdoptionReady

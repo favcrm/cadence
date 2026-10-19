@@ -55,11 +55,19 @@ export type ChildToHost =
   | SlotRequest
   | ToolRequest;
 
+/** CAD-1615 — the host tells the child which surface its frame is in.
+ *  `drawer` means the shell presents the frame in the board-wide drawer
+ *  (the whole window height, the board under a scrim); the child draws
+ *  its surface full-bleed there. `outlet` is the normal app pane. The
+ *  host owns the geometry; the surface is the app's. */
+export type ScreenPresentationMode = "outlet" | "drawer";
+export type ScreenPresentation = { v: 1; op: "presentation"; mode: ScreenPresentationMode };
+
 /** CAD-1123 HP3 — the closed verb sets. A verb outside its set closes the
  *  port. `call` verbs never spend or publish; every spend or publish verb is a
  *  `slot` verb and waits for a tap on a host-drawn button. The `publish.*` slot
  *  verbs arrive with HP4: add them here and in the host's dispatch table. */
-export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "media.read", "media.publish", "media.chat.attach"] as const;
+export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "media.read", "media.publish", "media.chat.attach"] as const;
 export const SLOT_VERBS = ["run.start", "publish.destination.use", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "publish.settings.save", "media.original.download"] as const;
 /** CAD-1365 — the protected original download slot. Qualified per mount
  *  (screen-media.v1 + media.read + live token); never a generic action verb. */
@@ -165,6 +173,10 @@ export const SCREEN_V2 = "screen.v2";
  *  `host_contract: "screen-actions.v1"`. A child opts in by listing it in
  *  `accepts` alongside `screen.v2`; only then may it send `{v:2,op:"tool"}`. */
 export const SCREEN_ACTIONS_V1 = "screen-actions.v1";
+/** CAD-1615 — the child opts in to being told which surface its frame is
+ *  in. A frame that does not advertise it never receives a presentation
+ *  message, so an older package is never shown an op it cannot parse. */
+export const SCREEN_PRESENTATION_V1 = "screen-presentation.v1";
 /** CAD-1365 — the media catalog/curation channel a media-contract
  *  screen's child opts into alongside `screen.v2`. Opting in grants
  *  nothing: dispatch still needs the minted receipt's declared
