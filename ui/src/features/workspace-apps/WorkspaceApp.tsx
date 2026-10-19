@@ -206,6 +206,9 @@ export default function WorkspaceApp({
   appKey,
   contextId,
   onMediaAttach,
+  onScreenDrawer,
+  presentation,
+  onScreenClosed,
 }: {
   installId: string;
   viewer: Viewer;
@@ -216,6 +219,12 @@ export default function WorkspaceApp({
    *  `rememberContext`, and the owner hands the verified value back here. */
   contextId: string;
   onMediaAttach?: MediaChatAttach;
+  /** CAD-1615 — the board-wide drawer the screen may ask for, and the
+   *  surface the shell is presenting it in. */
+  onScreenDrawer?: (mode: "outlet" | "drawer", surface?: string) => void;
+  presentation?: "outlet" | "drawer";
+  /** The screen went away (a refused push, a retired mount): close with it. */
+  onScreenClosed?: () => void;
 }) {
   const t = useTranslate();
   // CAD-1137: a revisit mounts with the last session's snapshot already
@@ -1000,7 +1009,7 @@ export default function WorkspaceApp({
     />
   );
   const screen = (fallback: React.ReactNode) => projection
-    ? <><ScreenHost projection={projection} fallback={fallback} loadAsset={screenExtras.loadAsset} actions={screenActions} onMediaAttach={onMediaAttach} /><Toast msg={connectToastMsg} /></> : <>{fallback}<Toast msg={connectToastMsg} /></>;
+    ? <><ScreenHost projection={projection} fallback={fallback} loadAsset={screenExtras.loadAsset} actions={screenActions} onMediaAttach={onMediaAttach} onScreenDrawer={onScreenDrawer} presentation={presentation} onNavigation={(navigation) => { if (navigation === null) onScreenClosed?.(); }} /><Toast msg={connectToastMsg} /></> : <>{fallback}<Toast msg={connectToastMsg} /></>;
   if (data && !supportsSocialContentWorkspace(data.installation)) {
     return screen(<main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>

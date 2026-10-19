@@ -147,7 +147,13 @@ export default function AppShell({
   viewer: Viewer;
   /** Installed screen receives only the trusted native chat handoff and
    *  the shell's one verified app scope (CAD-1560). */
-  children?: (onMediaAttach: MediaChatAttach, contextId: string) => React.ReactNode;
+  children?: (onMediaAttach: MediaChatAttach, contextId: string, screen: {
+    /** CAD-1615 — the board-wide drawer the app screen may ask for. */
+    onScreenDrawer: (mode: "outlet" | "drawer", surface?: string) => void;
+    presentation: "outlet" | "drawer";
+    /** The screen went away: the drawer closes with it. */
+    onScreenClosed: () => void;
+  }) => React.ReactNode;
   /** Board menu wiring: receives the verified installation (or null
    *  while loading, failed, or switched away). The parent matches
    *  installId to its route and compares values before storing. */
@@ -201,6 +207,10 @@ export default function AppShell({
   const onScreenDrawer = useCallback((mode: "outlet" | "drawer", surface?: string) => {
     setScreenDrawer(mode === "drawer" ? (surface ?? "") : null);
   }, []);
+  const closeScreenDrawer = useCallback(() => setScreenDrawer(null), []);
+  // A different installation or scope is a different screen: the drawer never
+  // outlives the frame that opened it.
+  useEffect(() => { setScreenDrawer(null); }, [installId, contextId]);
   useEffect(() => {
     if (screenDrawer === null) return;
     const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setScreenDrawer(null); };
@@ -1151,12 +1161,12 @@ export default function AppShell({
                 // the social-only workspace, which then rendered its
                 // "no supported board workspace" guide instead of the
                 // screen the package declared.
-                children(attachMediaReference, scope.contextId)
+                children(attachMediaReference, scope.contextId, { onScreenDrawer, presentation: screenDrawer !== null ? "drawer" : "outlet", onScreenClosed: closeScreenDrawer })
               ) : (
                 <InstalledScreenOutlet installation={installation} contexts={contexts} contextId={scope.contextId}
                   onScreenDrawer={onScreenDrawer} presentation={screenDrawer !== null ? "drawer" : "outlet"}
                   admitted={receiptReady && contextAdoptionReady && (viewer.operator === true && !viewer.readOnly || viewer.screenReader === true)}
-                  onRoute={screenRoute} onCommand={screenCommand} onNavigation={setScreenNavigation} onMediaAttach={attachMediaReference}
+                  onRoute={screenRoute} onCommand={screenCommand} onNavigation={(navigation) => { setScreenNavigation(navigation); if (navigation === null) closeScreenDrawer(); }} onMediaAttach={attachMediaReference}
                   fallback={contextAdoptionReady
                     ? <ScreenUnavailable installation={installation} contexts={contexts} contextId={scope.contextId}
                         admitted={viewer.operator === true && !viewer.readOnly} operator={viewer.operator === true} />

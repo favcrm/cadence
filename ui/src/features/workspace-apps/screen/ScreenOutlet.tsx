@@ -177,7 +177,9 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
             planner: (verb, args) => services ? (RECORD_SLOT_VERBS as readonly string[]).includes(verb) ? services.planner(verb as RecordSlotVerb, args) : Promise.resolve({ code: "forbidden", text: "This operation is unavailable." }) : acting.current!.planner(verb, args, actionToken ? { actionToken } : undefined),
             onSlot: view => { if (isCurrent()) setSlot(view); },
             onLink: url => { if (isCurrent()) setLink(url); },
-            onScreenDrawer: (mode, surface) => { if (isCurrent()) navigationCallbacks.current.onScreenDrawer?.(mode, surface); },
+            onScreenDrawer: onScreenDrawer
+              ? (mode, surface) => { if (isCurrent()) navigationCallbacks.current.onScreenDrawer?.(mode, surface); }
+              : undefined,
             ...(actionToken ? { invoke: (alias: string, input: Record<string, unknown>, requestId: string, scope?:import("./screenProtocol").GenerationScope) =>
               invokeTool(actionToken!, alias, input, requestId, scope) } : {}),
           } : undefined, undefined, unsaved => {

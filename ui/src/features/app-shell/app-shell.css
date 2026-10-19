@@ -146,6 +146,8 @@
    window height on the right, the rest of the board under a scrim. The host
    owns the geometry; the app draws its surface inside the frame. */
 .app-shell[data-screen-drawer="true"] .app-shell-outlet {
+  display: flex;
+  flex-direction: column;
   position: fixed;
   top: 0;
   right: 0;
