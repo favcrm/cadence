@@ -956,6 +956,8 @@ pub struct PortableExportOptions {
     pub scope: Scope,
     /// The ordinary Git tracker checkout to pin into the package.
     pub tracker: PathBuf,
+    /// Redact credential-shaped spans in private-copy message bodies.
+    pub redact_history_secrets: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -989,6 +991,9 @@ pub struct PortableManifest {
     pub nulled_columns: Vec<String>,
     pub disabled_columns: Vec<String>,
     pub exclusions: Vec<String>,
+    /// None means strict history export; Some(0) still records explicit opt-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_message_bodies: Option<u64>,
     pub members: Vec<Member>,
 }
 
@@ -1024,7 +1029,14 @@ pub fn export_portable(
     let allow = Allowlist::load(state_dir)?;
     let head = admit_tracker(&opts.tracker)?;
     let staging = private_staging(out)?;
-    match build_package(&live, &staging, &opts.tracker, &head, &allow) {
+    match build_package(
+        &live,
+        &staging,
+        &opts.tracker,
+        &head,
+        &allow,
+        opts.redact_history_secrets,
+    ) {
         Ok(manifest) => publish(&staging, out, &manifest),
         Err(error) => {
             let _ = fs::remove_dir_all(&staging);
@@ -1077,7 +1089,14 @@ pub fn export_portable_snapshot_selected(
     let head = admit_tracker(captured.path())?;
     let staging = private_staging(out)?;
     let result = (|| {
-        let manifest = build_package(&live, &staging, captured.path(), &head, &allow)?;
+        let manifest = build_package(
+            &live,
+            &staging,
+            captured.path(),
+            &head,
+            &allow,
+            opts.redact_history_secrets,
+        )?;
         let mut report = inspect_portable(&staging)?;
         captured.verify_package(&staging, &manifest.members)?;
         captured.verify_unchanged()?;
@@ -1185,6 +1204,7 @@ pub fn inspect_portable(source: &Path) -> Result<Value> {
         "nulled_columns": manifest.nulled_columns,
         "disabled_columns": manifest.disabled_columns,
         "exclusions": manifest.exclusions,
+        "redacted_message_bodies": manifest.redacted_message_bodies,
         "verification": {
             "member_paths_hashes_sizes": true,
             "exact_member_set": true,
@@ -1235,6 +1255,7 @@ fn build_package(
     tracker: &Path,
     head: &str,
     allow: &Allowlist,
+    redact_history_secrets: bool,
 ) -> Result<PortableManifest> {
     let db = staging.join(PKG_DB);
     // Private online snapshot; the live store is only read.
@@ -1244,7 +1265,7 @@ fn build_package(
     let omitted_rows = project(&db)?;
     // Existing redaction on the private copy, then a read-only secret scan
     // and integrity check of the projected copy.
-    scrub(&db)?;
+    let scrub = scrub(&db, redact_history_secrets)?;
     scan_db(&db, allow)?;
     let (integrity, schema) = inspect(&db)?;
     require_ok(&db, &integrity)?;
@@ -1253,6 +1274,13 @@ fn build_package(
     let pm_root = pm_root_of(&tracker_dir)?;
     let mut members = vec![member_for(&db, PKG_DB)?];
     members.extend(tracker_members(staging, &tracker_dir)?);
+    let mut package_exclusions = exclusions();
+    if redact_history_secrets {
+        package_exclusions.push(
+            "credential-shaped spans in UTF-8 text messages.body (opt-in; includes warn-only findings)"
+                .into(),
+        );
+    }
     let manifest = PortableManifest {
         pm_root,
         format: PORTABLE_FORMAT.into(),
@@ -1268,7 +1296,8 @@ fn build_package(
         omitted_rows,
         nulled_columns: NULLED.iter().map(|(t, c)| format!("{t}.{c}")).collect(),
         disabled_columns: DISABLED.iter().map(|(t, c)| format!("{t}.{c}")).collect(),
-        exclusions: exclusions(),
+        exclusions: package_exclusions,
+        redacted_message_bodies: scrub.redacted_message_bodies,
         members,
     };
     let text = serde_json::to_string_pretty(&manifest)?;
@@ -2039,6 +2068,7 @@ fn publish(staging: &Path, out: &Path, manifest: &PortableManifest) -> Result<Va
         "omitted_tables": manifest.omitted_tables,
         "omitted_rows": manifest.omitted_rows,
         "exclusions": manifest.exclusions,
+        "redacted_message_bodies": manifest.redacted_message_bodies,
     }))
 }
 

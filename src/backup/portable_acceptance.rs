@@ -30,6 +30,8 @@ use crate::backup::portable::{
 use crate::rollout::db_file;
 use crate::store::Store;
 
+mod history_sanitization_acceptance;
+
 const ROOT: &str = "/tmp/cad1163-export-acceptance";
 const TICKET_REL: &str = "tickets/CAD-1163.md";
 const TICKET_BODY: &str = "# CAD-1163 synthetic ticket fixture\n\nPortable export acceptance.\n";
@@ -187,6 +189,7 @@ fn opts(tracker: &Path) -> PortableExportOptions {
     PortableExportOptions {
         scope: Scope::Coordination,
         tracker: tracker.to_path_buf(),
+        redact_history_secrets: false,
     }
 }
 

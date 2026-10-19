@@ -78,6 +78,7 @@ fn opts(tracker: &Path) -> PortableExportOptions {
     PortableExportOptions {
         scope: Scope::Coordination,
         tracker: tracker.to_path_buf(),
+        redact_history_secrets: false,
     }
 }
 

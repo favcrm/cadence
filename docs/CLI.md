@@ -325,6 +325,30 @@ not an authentication argument. Sensitive argument names and `AUTHOR=...`
 assignments retain their credential checks. Recognizable provider tokens
 still refuse, including when supplied as `--author` values.
 
+History remains strict by default: credential-bearing message bodies refuse
+export. With explicit operator consent, add `--redact-history-secrets` to a
+`--portable` export (with or without `--snapshot-working-tree`) to sanitize
+UTF-8 text in `messages.body` on the private copy only. The existing redactor
+replaces credential-shaped spans, including warn-only findings and private-key
+blocks, so this deliberately trades exported-history fidelity for sanitization.
+Source history, message IDs, structured fields and tracker files are unchanged.
+Non-text and invalid-UTF-8 bodies are not handled by this extra pass; all cells
+still face the normal final scan. Credentials elsewhere still refuse export.
+
+```sh
+cadence export --state-dir /path/to/source-state \
+  --portable --tracker /path/to/source-tracker \
+  --snapshot-working-tree --redact-history-secrets --out /private/new-package
+```
+
+Redaction runs before the private-copy `VACUUM` so old bytes are not retained
+in freed pages. The manifest and both export/inspection receipts report
+`redacted_message_bodies`: a number (including zero) records opt-in and counts
+changed bodies, not credential occurrences; a missing manifest field or null
+receipt field means no opt-in. Exclusions disclose the transformation. This
+metadata is exporter-declared provenance, not proof of source fidelity, and
+does not bypass inspection, import admission, or any other credential check.
+
 Portable `pm.yaml` validation accepts tracker metadata plus the native closed
 `pi`, `host`, and `hosted` configuration sections. Files are copied byte for
 byte, including comments; settings are not stripped or reserialized. Unknown
