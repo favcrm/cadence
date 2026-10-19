@@ -42,6 +42,7 @@ fn restored(name: &str) -> (PathBuf, PathBuf, PathBuf) {
         &PortableExportOptions {
             scope: Scope::Coordination,
             tracker: pm_dir,
+            redact_store_secrets: false,
         },
     )
     .expect("export");

@@ -451,7 +451,16 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             tracker,
             apps,
             snapshot_working_tree,
-        } => export::run(state_dir, out, portable, tracker, apps, snapshot_working_tree),
+            redact_store_secrets,
+        } => export::run(
+            state_dir,
+            out,
+            portable,
+            tracker,
+            apps,
+            snapshot_working_tree,
+            redact_store_secrets,
+        ),
         Commands::Restore {
             source,
             repos,

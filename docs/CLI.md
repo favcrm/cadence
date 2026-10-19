@@ -282,6 +282,20 @@ cadence export --state-dir /path/to/source-state \
 cadence --org local inspect-portable /private/new-package
 ```
 
+Historical store prose that still contains blocking credential-shaped values
+normally refuses export. For an explicitly lossy handoff, add
+`--redact-store-secrets` to a plain, portable, or working-tree export. It
+masks detected blocking spans only in the private SQLite copy, after native
+turn-token scrubbing; it never rewrites live history. Unrelated text and
+TEXT/BLOB storage classes are preserved. Warn-only values are unchanged.
+Cells whose bytes cannot safely be decoded remain untouched, and the final
+secret scan still refuses any surviving blocker before publication.
+
+This flag does not redact tracker files or relax tracker filename/config
+checks, source-drift checks, package inspection, or inactive restore.
+It is not a general tracker-content sanitizer: ordinary tracker documents
+can contain sensitive prose and must be reviewed separately before sharing.
+
 `--snapshot-working-tree` includes tracked modifications and deletions plus
 non-ignored untracked regular files. Ignored tracked files remain included.
 File/directory replacements are captured as deleted tracked files plus new
@@ -343,6 +357,12 @@ tracker revision, member count/bytes, exclusions, and `source_capture`
 policy). Keep this receipt privately alongside, not inside, the package. The database and
 tracker are **not a transactionally atomic snapshot**; the receipt explicitly
 sets `atomic_database_and_tracker=false`.
+
+Export receipts also record `store_secret_redaction.enabled` and
+`store_secret_redaction.cells`; the latter counts only cells rewritten by
+this explicit pass, not normal native-token scrubbing. These fields belong
+to the private export receipt, not the package manifest or a later
+`inspect-portable` receipt.
 
 `inspect-portable` independently checks an existing package's exact file set,
 paths, hashes and sizes, then SQLite integrity, catalog/schema and the

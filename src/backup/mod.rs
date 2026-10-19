@@ -1108,8 +1108,12 @@ fn newer_schema_refusal(schema: i64) -> Result<()> {
 
 /// Write a portable bundle (`cadence.sqlite3` + `manifest.json`) into the
 /// new directory `out`. Fails closed: a blocking secret-scan finding, or
-/// any other error, removes `out` again.
-pub fn export(state_dir: &Path, out: &Path) -> Result<Value> {
+/// any other error, removes `out` again. `redact_store_secrets` is the
+/// operator's explicit `--redact-store-secrets` opt-in (CAD-1580): with
+/// it, blocking credential-shaped spans are redacted from the private
+/// copy's text cells after native token scrubbing; the live store is
+/// never touched either way.
+pub fn export(state_dir: &Path, out: &Path, redact_store_secrets: bool) -> Result<Value> {
     let live = db_file(state_dir);
     if !live.is_file() {
         return Err(Error::rejected(format!(
@@ -1129,17 +1133,22 @@ pub fn export(state_dir: &Path, out: &Path) -> Result<Value> {
         fs::create_dir_all(parent)?;
     }
     fs::DirBuilder::new().mode(0o700).create(out)?;
-    let result = export_into(&live, out, &allow);
+    let result = export_into(&live, out, &allow, redact_store_secrets);
     if result.is_err() {
         let _ = fs::remove_dir_all(out);
     }
     result
 }
 
-fn export_into(live: &Path, out: &Path, allow: &Allowlist) -> Result<Value> {
+fn export_into(
+    live: &Path,
+    out: &Path,
+    allow: &Allowlist,
+    redact_store_secrets: bool,
+) -> Result<Value> {
     let partial = out.join(format!(".{BUNDLE_DB}.partial"));
     snapshot(live, &partial)?;
-    let scrub = scrub(&partial)?;
+    let scrub = scrub(&partial, redact_store_secrets)?;
     let scrubbed = scrub.columns.clone();
     let scan = scan_db(&partial, allow)?;
     let (integrity, schema) = inspect(&partial)?;
@@ -1190,6 +1199,10 @@ fn export_into(live: &Path, out: &Path, allow: &Allowlist) -> Result<Value> {
         "repos": manifest.repos,
         "scrubbed": scrubbed,
         "redacted": {"tokens": scrub.redacted_values, "cells": scrub.redacted_cells},
+        "store_secret_redaction": {
+            "enabled": redact_store_secrets,
+            "cells": scrub.store_secret_cells,
+        },
         "scan": {
             "cells": scan.cells,
             "warnings": scan.warnings.len(),
@@ -1200,8 +1213,11 @@ fn export_into(live: &Path, out: &Path, allow: &Allowlist) -> Result<Value> {
 }
 
 /// Null the token-bearing columns, then rebuild the file so freed pages
-/// (deleted rows, old values) are not carried along.
-fn scrub(db: &Path) -> Result<Scrub> {
+/// (deleted rows, old values) are not carried along. With
+/// `redact_store_secrets` — the operator's explicit opt-in — blocking
+/// credential-shaped spans in the copy's text cells are redacted in the
+/// same transaction before the VACUUM, so freed pages carry neither.
+fn scrub(db: &Path, redact_store_secrets: bool) -> Result<Scrub> {
     // CAD-1011: a durable-sealed or latch-carrying source must not be
     // copy-transformed into a production-usable db — refuse at the source.
     crate::store::preflight_writer_guard(db)?;
@@ -1220,6 +1236,14 @@ fn scrub(db: &Path) -> Result<Scrub> {
             scrubbed.push(format!("{table}.{column}"));
         }
     }
+    // CAD-1580: only on the operator's explicit opt-in, and only on this
+    // private copy: rewrite blocking credential-shaped spans inside the
+    // same transaction, before VACUUM frees their pages.
+    let store_secret_cells = if redact_store_secrets {
+        redact_store_secret_cells(&tx)?
+    } else {
+        0
+    };
     tx.commit()?;
     // The only caller supplies its own private export-partial copy, never
     // the live store. VACUUM cannot run inside the write transaction.
@@ -1230,6 +1254,7 @@ fn scrub(db: &Path) -> Result<Scrub> {
         columns: scrubbed,
         redacted_values: redaction.values,
         redacted_cells: redaction.cells,
+        store_secret_cells,
     })
 }
 
@@ -1237,6 +1262,10 @@ struct Scrub {
     columns: Vec<String>,
     redacted_values: usize,
     redacted_cells: u64,
+    /// Text cells the opt-in `--redact-store-secrets` pass rewrote
+    /// (CAD-1580); 0 when the flag is off. Separate from
+    /// `redacted_cells`, which counts the native token/generation pass.
+    store_secret_cells: u64,
 }
 
 struct Redaction {
@@ -1284,6 +1313,64 @@ fn each_text_cell(
         }
     }
     Ok(())
+}
+
+/// The `--redact-store-secrets` pass (CAD-1580), run inside `scrub`'s
+/// write transaction after the native token/generation scrub. Every TEXT
+/// cell and every BLOB that holds UTF-8 bytes is checked with
+/// [`crate::secret::redact_blocking`]; a hit rewrites just that cell with
+/// the union of its blocking spans replaced and keeps the cell's SQLite
+/// storage class — TEXT stays TEXT, a UTF-8 BLOB stays a BLOB. Cells
+/// whose bytes are not UTF-8 are left byte-identical: nothing is
+/// lossy-converted, and the unchanged strict final scan still refuses
+/// the export when a blocker survives in them. Returns the number of
+/// cells rewritten.
+fn redact_store_secret_cells(conn: &Connection) -> Result<u64> {
+    use rusqlite::types::Value;
+    let mut updates: Vec<(String, String, i64, Value)> = Vec::new();
+    for table in user_tables(conn)? {
+        let mut stmt = conn.prepare(&format!("SELECT rowid, * FROM {}", quote_ident(&table)))?;
+        let columns: Vec<String> = stmt
+            .column_names()
+            .iter()
+            .skip(1)
+            .map(|s| s.to_string())
+            .collect();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let rowid: i64 = row.get(0)?;
+            for (i, column) in columns.iter().enumerate() {
+                let (bytes, is_blob) = match row.get_ref(i + 1)? {
+                    ValueRef::Text(bytes) => (bytes, false),
+                    ValueRef::Blob(bytes) => (bytes, true),
+                    _ => continue,
+                };
+                let Ok(text) = std::str::from_utf8(bytes) else {
+                    continue;
+                };
+                let Some(redacted) = secret::redact_blocking(text)? else {
+                    continue;
+                };
+                let value = if is_blob {
+                    Value::Blob(redacted.into_bytes())
+                } else {
+                    Value::Text(redacted)
+                };
+                updates.push((table.clone(), column.clone(), rowid, value));
+            }
+        }
+    }
+    for (table, column, rowid, value) in &updates {
+        conn.execute(
+            &format!(
+                "UPDATE {} SET {}=?1 WHERE rowid=?2",
+                quote_ident(table),
+                quote_ident(column)
+            ),
+            params![value, rowid],
+        )?;
+    }
+    Ok(updates.len() as u64)
 }
 
 /// The registry's turn-token shape (CAD-407); group 1 is the generation.

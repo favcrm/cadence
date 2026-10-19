@@ -190,6 +190,15 @@ pub(crate) enum Commands {
         /// the store or tracker is read or the output is created.
         #[arg(long = "app", value_name = "APP", requires = "portable")]
         apps: Vec<String>,
+        /// Opt-in, off by default (CAD-1580): after the usual native token
+        /// scrubbing, redact blocking credential-shaped spans inside the
+        /// private export copy only — the live store is never rewritten.
+        /// Warn-only values and unrelated text pass through; anything the
+        /// pass cannot redact still fails the unchanged final scan and
+        /// nothing is published. Applies to the plain bundle, `--portable`
+        /// and `--snapshot-working-tree` exports alike.
+        #[arg(long)]
+        redact_store_secrets: bool,
     },
     /// Independently inspect a portable coordination package, read-only.
     /// Prints JSON integrity, schema and exclusion evidence; does not restore,

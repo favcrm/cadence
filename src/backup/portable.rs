@@ -956,6 +956,11 @@ pub struct PortableExportOptions {
     pub scope: Scope,
     /// The ordinary Git tracker checkout to pin into the package.
     pub tracker: PathBuf,
+    /// The operator's explicit `--redact-store-secrets` opt-in (CAD-1580):
+    /// redact blocking credential-shaped spans in the private store copy
+    /// after native token scrubbing. False by default; the strict scan
+    /// then refuses a store that carries them.
+    pub redact_store_secrets: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -1024,8 +1029,21 @@ pub fn export_portable(
     let allow = Allowlist::load(state_dir)?;
     let head = admit_tracker(&opts.tracker)?;
     let staging = private_staging(out)?;
-    match build_package(&live, &staging, &opts.tracker, &head, &allow) {
-        Ok(manifest) => publish(&staging, out, &manifest),
+    match build_package(
+        &live,
+        &staging,
+        &opts.tracker,
+        &head,
+        &allow,
+        opts.redact_store_secrets,
+    ) {
+        Ok((manifest, store_secret_cells)) => publish(
+            &staging,
+            out,
+            &manifest,
+            opts.redact_store_secrets,
+            store_secret_cells,
+        ),
         Err(error) => {
             let _ = fs::remove_dir_all(&staging);
             Err(error)
@@ -1077,10 +1095,21 @@ pub fn export_portable_snapshot_selected(
     let head = admit_tracker(captured.path())?;
     let staging = private_staging(out)?;
     let result = (|| {
-        let manifest = build_package(&live, &staging, captured.path(), &head, &allow)?;
+        let (manifest, store_secret_cells) = build_package(
+            &live,
+            &staging,
+            captured.path(),
+            &head,
+            &allow,
+            opts.redact_store_secrets,
+        )?;
         let mut report = inspect_portable(&staging)?;
         captured.verify_package(&staging, &manifest.members)?;
         captured.verify_unchanged()?;
+        report["store_secret_redaction"] = json!({
+            "enabled": opts.redact_store_secrets,
+            "cells": store_secret_cells,
+        });
         report["source_capture"] = captured.evidence();
         report["exporter_revision"] = json!(crate::overview::BUILD_COMMIT);
         report["source_fidelity"] = json!("captured_tracker_matches_package_and_rechecked");
@@ -1229,22 +1258,27 @@ fn private_staging(out: &Path) -> Result<PathBuf> {
     Ok(staging)
 }
 
+/// Returns the manifest and the number of text cells the opt-in
+/// `--redact-store-secrets` pass rewrote in the private store copy
+/// (0 unless `redact_store_secrets`).
 fn build_package(
     live: &Path,
     staging: &Path,
     tracker: &Path,
     head: &str,
     allow: &Allowlist,
-) -> Result<PortableManifest> {
+    redact_store_secrets: bool,
+) -> Result<(PortableManifest, u64)> {
     let db = staging.join(PKG_DB);
     // Private online snapshot; the live store is only read.
     snapshot(live, &db)?;
     let source_uuid = read_source_uuid(&db)?;
     check_catalog(&db)?;
     let omitted_rows = project(&db)?;
-    // Existing redaction on the private copy, then a read-only secret scan
-    // and integrity check of the projected copy.
-    scrub(&db)?;
+    // Existing redaction on the private copy — plus the opt-in store
+    // secret pass — then a read-only secret scan and integrity check of
+    // the projected copy.
+    let scrubbed = scrub(&db, redact_store_secrets)?;
     scan_db(&db, allow)?;
     let (integrity, schema) = inspect(&db)?;
     require_ok(&db, &integrity)?;
@@ -1273,7 +1307,7 @@ fn build_package(
     };
     let text = serde_json::to_string_pretty(&manifest)?;
     write_private(&staging.join(PKG_MANIFEST), text.as_bytes())?;
-    Ok(manifest)
+    Ok((manifest, scrubbed.store_secret_cells))
 }
 
 /// Every known table outside the coordination profile, in catalog order:
@@ -2021,7 +2055,13 @@ fn write_private_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 
 /// Publish the staged package as `out` with a no-replace rename. A
 /// concurrently created `out` makes the rename fail rather than replace it.
-fn publish(staging: &Path, out: &Path, manifest: &PortableManifest) -> Result<Value> {
+fn publish(
+    staging: &Path,
+    out: &Path,
+    manifest: &PortableManifest,
+    redact_store_secrets: bool,
+    store_secret_cells: u64,
+) -> Result<Value> {
     if let Err(e) = rename_noreplace(staging, out) {
         let _ = fs::remove_dir_all(staging);
         return Err(e);
@@ -2035,6 +2075,10 @@ fn publish(staging: &Path, out: &Path, manifest: &PortableManifest) -> Result<Va
         "tracker_revision": manifest.tracker_revision,
         "schema_version": manifest.schema_version,
         "members": manifest.members.len(),
+        "store_secret_redaction": {
+            "enabled": redact_store_secrets,
+            "cells": store_secret_cells,
+        },
         "tables": manifest.tables,
         "omitted_tables": manifest.omitted_tables,
         "omitted_rows": manifest.omitted_rows,

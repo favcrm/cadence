@@ -1741,6 +1741,7 @@ mod acceptance {
         let opts = PortableExportOptions {
             scope: Scope::Coordination,
             tracker,
+            redact_store_secrets: false,
         };
         let package = root.path().join("package");
         export_portable(&state, &package, &opts)

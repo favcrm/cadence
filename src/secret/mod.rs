@@ -682,9 +682,39 @@ pub fn redact_text(text: &str) -> Result<String> {
             .into_iter()
             .map(|(start, end)| (start, end, PEM_RULE.to_string(), true)),
     );
+    Ok(apply_hits(text, hits))
+}
+
+/// The blocking-only counterpart of [`redact_text`] for the operator's
+/// opt-in `--redact-store-secrets` export pass (CAD-1580): the same raw
+/// rule matches, the same span union and merge, the same
+/// `[redacted:<rule>]` marker — restricted to `Severity::Block` findings
+/// (private-key blocks included). Warn-only matches and all unrelated
+/// text pass through untouched. `None` when nothing blocking matches, so
+/// the caller can leave a cell's bytes — and its SQLite storage class —
+/// exactly as stored.
+pub(crate) fn redact_blocking(text: &str) -> Result<Option<String>> {
+    let mut hits: Vec<(usize, usize, String, bool)> = raw_hits(text, None)?
+        .into_iter()
+        .filter(|(_, _, f)| f.severity == Severity::Block)
+        .map(|(start, end, f)| (start, end, f.rule, true))
+        .collect();
+    hits.extend(
+        pem_blocks(text)?
+            .into_iter()
+            .map(|(start, end)| (start, end, PEM_RULE.to_string(), true)),
+    );
     if hits.is_empty() {
-        return Ok(text.to_string());
+        return Ok(None);
     }
+    Ok(Some(apply_hits(text, hits)))
+}
+
+/// Merge `hits` — `(start, end, rule, is blocking)`, unsorted — into the
+/// union of covered spans and splice `[redacted:<rule>]` in place of
+/// each. Shared by [`redact_text`] and [`redact_blocking`]; an empty hit
+/// list returns the text unchanged.
+fn apply_hits(text: &str, mut hits: Vec<(usize, usize, String, bool)>) -> String {
     hits.sort_by_key(|(start, end, _, _)| (*start, std::cmp::Reverse(*end)));
     // Merge into (start, end, label rule, label is blocking).
     let mut merged: Vec<(usize, usize, String, bool)> = Vec::new();
@@ -715,7 +745,7 @@ pub fn redact_text(text: &str) -> Result<String> {
         at = end;
     }
     out.push_str(&text[at..]);
-    Ok(out)
+    out
 }
 
 /// The gitleaks rule a private-key block is redacted under.

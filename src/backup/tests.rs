@@ -253,7 +253,7 @@ fn cad314_export_bundle_holds_only_the_scrubbed_db_and_manifest() {
     std::fs::write(state.join("private/token"), &marker).unwrap();
     let out_dir = root.path().join("bundle");
 
-    let out = export(&state, &out_dir).unwrap();
+    let out = export(&state, &out_dir, false).unwrap();
 
     let mut names: Vec<String> = std::fs::read_dir(&out_dir)
         .unwrap()
@@ -301,7 +301,7 @@ fn cad314_export_fails_closed_on_a_secret_and_writes_nothing() {
     }
     let out_dir = root.path().join("bundle");
 
-    let err = export(&state, &out_dir).unwrap_err().to_string();
+    let err = export(&state, &out_dir, false).unwrap_err().to_string();
 
     assert!(err.contains("github-pat"), "{err}");
     assert!(err.contains("messages.body"), "names the location: {err}");
@@ -335,7 +335,7 @@ fn cad314_export_drops_deleted_rows_left_in_free_pages() {
     assert!(contains(&std::fs::read(live(&state)).unwrap(), &token));
     let out_dir = root.path().join("bundle");
 
-    export(&state, &out_dir).unwrap();
+    export(&state, &out_dir, false).unwrap();
 
     let bytes = std::fs::read(out_dir.join("cadence.sqlite3")).unwrap();
     assert!(
@@ -804,7 +804,7 @@ fn cad396_export_nulls_turn_tokens() {
     )
     .unwrap();
     drop(conn);
-    let out = export(&state, &root.path().join("bundle")).unwrap();
+    let out = export(&state, &root.path().join("bundle"), false).unwrap();
     let db = root.path().join("bundle").join(BUNDLE_DB);
     assert_eq!(
         count(
@@ -918,7 +918,7 @@ fn cad396_export_redacts_turn_tokens_written_by_mark_running() {
         "mark_running must have written the token into an event"
     );
 
-    let out = export(&state, &root.path().join("bundle")).unwrap();
+    let out = export(&state, &root.path().join("bundle"), false).unwrap();
 
     let bytes = std::fs::read(root.path().join("bundle").join(BUNDLE_DB)).unwrap();
     for secret in [&token, &orphan, &generation] {
@@ -980,7 +980,7 @@ fn cad407_prose_under_a_turn_id_key_is_not_redacted() {
     raw_event(&conn, r#"{"turn_id":"not-a-token-at-all"}"#);
     drop(conn);
 
-    let out = export(&state, &root.path().join("bundle")).unwrap();
+    let out = export(&state, &root.path().join("bundle"), false).unwrap();
 
     let db = root.path().join("bundle").join(BUNDLE_DB);
     assert_eq!(
@@ -1030,7 +1030,7 @@ fn cad407_orphan_tokens_are_redacted_whatever_the_key_or_escaping() {
     raw_event(&conn, &format!(r#"{{"generation":"{g_claude}"}}"#));
     drop(conn);
 
-    let out = export(&state, &root.path().join("bundle")).unwrap();
+    let out = export(&state, &root.path().join("bundle"), false).unwrap();
 
     let db = root.path().join("bundle").join(BUNDLE_DB);
     let bytes = std::fs::read(&db).unwrap();
@@ -1109,7 +1109,7 @@ fn cad407_an_escaped_token_refuses_the_export() {
     );
     drop(conn);
     let out = root.path().join("bundle");
-    let err = export(&state, &out).unwrap_err().to_string();
+    let err = export(&state, &out, false).unwrap_err().to_string();
     assert!(err.contains("events.payload rowid"), "{err}");
     assert!(!out.exists());
 }
@@ -1153,7 +1153,7 @@ fn cad424_a_generation_logged_alone_is_redacted() {
     raw_event(&conn, &kept);
     drop(conn);
 
-    let out = export(&state, &root.path().join("bundle")).unwrap();
+    let out = export(&state, &root.path().join("bundle"), false).unwrap();
 
     let db = root.path().join("bundle").join(BUNDLE_DB);
     let bytes = std::fs::read(&db).unwrap();
@@ -1191,7 +1191,7 @@ fn cad424_an_escaped_logged_generation_refuses_the_export() {
     raw_event(&conn, &format!(r#"{{"generation":"{a}{}"}}"#, hex(11)));
     drop(conn);
     let out = root.path().join("bundle");
-    let err = export(&state, &out).unwrap_err().to_string();
+    let err = export(&state, &out, false).unwrap_err().to_string();
     assert!(err.contains("events.payload rowid"), "{err}");
     assert!(!out.exists());
 }
@@ -1284,7 +1284,7 @@ fn cad319_export_scans_and_redacts_thread_entries() {
         "the store redacts before writing"
     );
 
-    let out = export(&state, &root.path().join("bundle")).unwrap();
+    let out = export(&state, &root.path().join("bundle"), false).unwrap();
 
     let db = root.path().join("bundle").join(BUNDLE_DB);
     let bytes = std::fs::read(&db).unwrap();
@@ -1309,7 +1309,7 @@ fn cad319_export_scans_and_redacts_thread_entries() {
     .unwrap();
     drop(conn);
     let out_dir = root.path().join("bundle2");
-    let err = export(&state, &out_dir).unwrap_err().to_string();
+    let err = export(&state, &out_dir, false).unwrap_err().to_string();
     assert!(err.contains("thread_entries.payload"), "{err}");
     assert!(!err.contains(&pat), "{err}");
     assert!(!out_dir.exists());
@@ -1354,7 +1354,7 @@ fn cad410_export_carries_no_body_of_a_truncated_private_key() {
             .unwrap();
     }
 
-    export(&state, &root.path().join("bundle")).unwrap();
+    export(&state, &root.path().join("bundle"), false).unwrap();
 
     let bytes = std::fs::read(root.path().join("bundle").join(BUNDLE_DB)).unwrap();
     for line in &body {
