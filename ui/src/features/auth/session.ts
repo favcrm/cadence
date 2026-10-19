@@ -1,4 +1,5 @@
 import { ApiError } from "../../lib/api";
+import { errorMessage } from "../../lib/apiError";
 import { sessionHeaders, sessionKey, setSessionKey } from "../../lib/sessionKey";
 import { privateSessionGeneration } from "../../lib/privateSession";
 import { parseLoginNonce } from "./gate";
@@ -36,7 +37,7 @@ async function sessionPost(path: string, body: object, signal?: AbortSignal): Pr
   const parsed = await resp.json().catch(() => null);
   if (signal?.aborted) throw new Error("Session changed during sign-in");
   if (!resp.ok) {
-    throw new ApiError(parsed?.error ?? `${resp.status} ${resp.statusText}`, resp.status, parsed ?? undefined);
+    throw new ApiError(errorMessage(parsed, `${resp.status} ${resp.statusText}`), resp.status, parsed ?? undefined);
   }
   return parsed;
 }

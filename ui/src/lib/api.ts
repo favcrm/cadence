@@ -1,6 +1,6 @@
 import type { LanePayload } from "../features/issues/lane";
 import { ConditionalGet } from "./conditionalGet";
-import { ApiError } from "./apiError";
+import { ApiError, errorMessage } from "./apiError";
 import { sessionKey, sessionHeaders } from "./sessionKey";
 import {
   bindPrivateAbort,
@@ -194,7 +194,7 @@ async function readConditional<T>(path: string, signal: AbortSignal | undefined,
         window.dispatchEvent(new Event("cadence:session-required"));
       }
       throw new ApiError(
-        typeof body?.error === "string" ? body.error : body?.error?.message ?? `${resp.status} ${resp.statusText}`,
+        errorMessage(body, `${resp.status} ${resp.statusText}`),
         resp.status,
         body ? { ...body, code } : undefined,
       );
@@ -255,7 +255,7 @@ async function write<T extends object | undefined>(
     op.assertCurrent();
     if (!resp.ok) {
       throw new ApiError(
-        parsed?.error ?? `${resp.status} ${resp.statusText}`,
+        errorMessage(parsed, `${resp.status} ${resp.statusText}`),
         resp.status,
         parsed ?? undefined,
       );
@@ -280,7 +280,7 @@ async function post<T>(path: string, body: object, operation?: PrivateOperation)
     op.assertCurrent();
     if (!resp.ok) {
       throw new ApiError(
-        parsed?.error ?? `${resp.status} ${resp.statusText}`,
+        errorMessage(parsed, `${resp.status} ${resp.statusText}`),
         resp.status,
         parsed ?? undefined,
       );
@@ -499,7 +499,7 @@ export const api = {
       op.assertCurrent();
       if (!resp.ok) {
         throw new ApiError(
-          parsed?.error ?? `${resp.status} ${resp.statusText}`,
+          errorMessage(parsed, `${resp.status} ${resp.statusText}`),
           resp.status,
           parsed ?? undefined,
         );
