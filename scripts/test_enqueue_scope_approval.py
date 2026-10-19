@@ -36,7 +36,7 @@ CI_SUITE = 106304880676
 CI_URL = "https://github.com/o/r/actions/runs/12345"
 CI_RUN = {"id": 12345, "head_sha": HEAD, "event": "pull_request", "status": "completed",
           "conclusion": "success", "html_url": CI_URL, "workflow_id": 362543015,
-          "path": ".github/workflows/ci.yml", "check_suite_id": CI_SUITE, "run_attempt": 1,
+          "path": ".github/workflows/ci.yml", "check_suite_id": CI_SUITE, "run_attempt": 1, "run_number": 1,
           "created_at": "2026-10-19T09:35:50Z", "run_started_at": "2026-10-19T09:35:50Z",
           "updated_at": "2026-10-19T09:43:23Z"}
 
@@ -107,7 +107,7 @@ class Case:
                     "conclusion": "success", "started_at": "2026-10-19T09:43:14Z",
                     "completed_at": "2026-10-19T09:43:22Z", "details_url": "https://github.com/o/r/actions/runs/12345",
                     "app": {"id": 15368, "slug": "github-actions"}, "check_suite": {"id": 106304880676}}]}), ""
-            if "actions/workflows/ci.yml/runs" in url:
+            if "actions/workflows/ci.yml/runs" in url or "/actions/runs?head_sha=" in url:
                 return 0, json.dumps({"total_count": len(self.ci_runs), "workflow_runs": self.ci_runs}), ""
             if url.endswith("/protection"):
                 return 1, "", "Branch not protected"

@@ -68,7 +68,7 @@ CI_SUITE = 106304880676
 CI_RUN = {"id": RUN_ID, "head_sha": HEAD, "event": "pull_request",
           "status": "completed", "conclusion": "success", "html_url": CI_URL,
           "workflow_id": 362543015, "path": ".github/workflows/ci.yml",
-          "check_suite_id": CI_SUITE, "run_attempt": 1,
+          "check_suite_id": CI_SUITE, "run_attempt": 1, "run_number": 1,
           "created_at": "2026-10-19T09:35:50Z", "run_started_at": "2026-10-19T09:35:50Z",
           "updated_at": "2026-10-19T09:43:23Z"}
 GATE = "ci"
@@ -207,7 +207,7 @@ class Case(scope.Case):
                 "required_status_checks": [binding]}}]), ""
         if argv[:2] == ["gh", "api"] and "/check-runs" in argv[-1]:
             return self.check_runs()
-        if argv[:2] == ["gh", "api"] and "actions/workflows/ci.yml/runs" in argv[-1]:
+        if argv[:2] == ["gh", "api"] and ("actions/workflows/ci.yml/runs" in argv[-1] or "/actions/runs?head_sha=" in argv[-1]):
             if self.ci_rc != 0:
                 return self.ci_rc, "", "actions api down"
             return 0, json.dumps({"total_count": len(self.ci_runs), "workflow_runs": self.ci_runs}), ""
