@@ -64,8 +64,15 @@ ISSUE = "CAD-1298"
 NOTE = "20261003-100000-cad1298-pr5-review-verdict.md"
 RUN_ID = 12345
 CI_URL = f"https://github.com/{REPO}/actions/runs/{RUN_ID}"
+CI_SUITE = 106304880676
 CI_RUN = {"id": RUN_ID, "head_sha": HEAD, "event": "pull_request",
-          "status": "completed", "conclusion": "success", "html_url": CI_URL}
+          "status": "completed", "conclusion": "success", "html_url": CI_URL,
+          "workflow_id": 362543015, "path": ".github/workflows/ci.yml",
+          "check_suite_id": CI_SUITE, "run_attempt": 1,
+          "created_at": "2026-10-19T09:35:50Z", "run_started_at": "2026-10-19T09:35:50Z",
+          "updated_at": "2026-10-19T09:43:23Z"}
+GATE = "ci"
+TRUSTED_APP = {"id": 15368, "slug": "github-actions"}
 OPERATOR = "operator-connection"
 APPROVAL_ID = "merge-pr5-aaaa"
 
@@ -104,7 +111,7 @@ class Case(scope.Case):
         self.merge_rc = 0
         self.ci_rc = 0
         self.ci_runs = [CI_RUN]
-        self.rollup = [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        self.rollup = [{"name": GATE, "status": "COMPLETED", "conclusion": "SUCCESS"}]
         self.view_calls = 0
         self.stale_at = None                 # apply stale_fields once views reach this
         self.stale_fields = {"headRefOid": "c" * 40}
@@ -159,6 +166,17 @@ class Case(scope.Case):
         if self.stale_at is not None and self.view_calls >= self.stale_at:
             view.update(self.stale_fields)
         return 0, json.dumps(view), ""
+    def check_runs(self):
+        """The required gate, read from the same rollup knob the PR view uses.
+        Shaped like `gh api commits/SHA/check-runs?check_name=...` output."""
+        runs = []
+        if self.rollup and self.rollup[0]["conclusion"] is not None:
+            state = self.rollup[0]
+            runs.append({"id": 117992467504, "name": state["name"], "head_sha": HEAD,
+                         "status": state["status"].lower(), "conclusion": state["conclusion"].lower(),
+                         "started_at": "2026-10-19T09:43:14Z", "completed_at": "2026-10-19T09:43:22Z",
+                         "details_url": CI_URL, "app": TRUSTED_APP, "check_suite": {"id": CI_SUITE}})
+        return 0, json.dumps({"total_count": len(runs), "check_runs": runs}), ""
 
     def run(self, argv, input_text=None):
         if argv[:3] == ["gh", "pr", "view"]:
@@ -176,10 +194,16 @@ class Case(scope.Case):
         if argv[:3] == ["gh", "api", "graphql"]:
             return 0, json.dumps({"data": {"repository": {"pullRequest": {
                 "isInMergeQueue": True, "state": "OPEN"}}}}), ""
+        if argv[:2] == ["gh", "api"] and "/rules/branches/" in argv[-1]:
+            binding = {"context": GATE, "integration_id": TRUSTED_APP["id"]}
+            return 0, json.dumps([{"type": "required_status_checks", "parameters": {
+                "required_status_checks": [binding]}}]), ""
+        if argv[:2] == ["gh", "api"] and "/check-runs" in argv[-1]:
+            return self.check_runs()
         if argv[:2] == ["gh", "api"] and "actions/workflows/ci.yml/runs" in argv[-1]:
             if self.ci_rc != 0:
                 return self.ci_rc, "", "actions api down"
-            return 0, json.dumps({"workflow_runs": self.ci_runs}), ""
+            return 0, json.dumps({"total_count": len(self.ci_runs), "workflow_runs": self.ci_runs}), ""
         if argv[:3] == ["cadence", "issue", "comment"]:
             if self.comment_rc != 0:
                 return self.comment_rc, "", "tracker write failed"

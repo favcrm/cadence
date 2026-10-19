@@ -240,8 +240,18 @@ def is_human_path(path, risk=()):
 # ---- required checks --------------------------------------------------------
 
 def required_contexts(repo, base):
-    """(set of required check names, [reasons]). Fail closed."""
-    names, reasons = set(), []
+    """({required check name: bound GitHub app id, or None for any app}, [reasons]). Fail closed."""
+    req, reasons = {}, []
+
+    def add(name, app):
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"bad required check name {name!r}")
+        if app is not None and (type(app) is not int or app <= 0):
+            raise ValueError(f"bad app id {app!r} for '{name}'")
+        if app is not None and req.get(name) not in (None, app):
+            raise ValueError(f"'{name}' is bound to two apps ({req[name]}, {app})")
+        req[name] = app if app is not None else req.get(name)
+
     branch = quote(base, safe="")
     rc, out, err = run(["gh", "api", f"repos/{repo}/rules/branches/{branch}"])
     if rc != 0:
@@ -251,7 +261,7 @@ def required_contexts(repo, base):
             for rule in json.loads(out):
                 if rule.get("type") == "required_status_checks":
                     for c in rule.get("parameters", {}).get("required_status_checks", []):
-                        names.add(c["context"])
+                        add(c["context"], c.get("integration_id"))
         except (ValueError, TypeError, KeyError) as e:
             reasons.append(f"cannot parse the rulesets of {base}: {e}")
     rc, out, err = run(["gh", "api", f"repos/{repo}/branches/{branch}/protection"])
@@ -261,42 +271,87 @@ def required_contexts(repo, base):
     else:
         try:
             rsc = json.loads(out).get("required_status_checks") or {}
-            names.update(rsc.get("contexts", []))
-            names.update(c["context"] for c in rsc.get("checks", []))
+            for name in rsc.get("contexts", []):
+                add(name, None)
+            for c in rsc.get("checks", []):
+                add(c["context"], c.get("app_id"))
         except (ValueError, TypeError, KeyError) as e:
             reasons.append(f"cannot parse branch protection of {base}: {e}")
-    if not reasons and not names:
+    if not reasons and not req:
         reasons.append(f"no required checks found for {base}; refusing to read an empty list as 'nothing required'")
-    return names, reasons
+    return req, reasons
 
 
-def check_states(rollup):
-    """{check name: [state, ...]} from statusCheckRollup, state upper-case."""
-    states = {}
+CHECK_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+
+
+def check_runs_at(repo, head, name):
+    """Every check run named `name` at the exact head, shape-checked; fails closed."""
+    doc = gh_json(["api", f"repos/{repo}/commits/{head}/check-runs?check_name={quote(name, safe='')}"
+                   "&filter=all&per_page=100"])
+    runs = doc.get("check_runs") if isinstance(doc, dict) else None
+    total = doc.get("total_count") if isinstance(doc, dict) else None
+    if not isinstance(runs, list) or type(total) is not int or total > len(runs):
+        raise RuntimeError(f"cannot read every check run named '{name}' at head {head[:12]}")
+    for r in runs:
+        app = r.get("app") if isinstance(r, dict) else None
+        suite = r.get("check_suite") if isinstance(r, dict) else None
+        if not (isinstance(r, dict) and type(r.get("id")) is int and r["id"] > 0
+                and r.get("name") == name and r.get("head_sha") == head
+                and isinstance(r.get("status"), str)
+                and (r.get("conclusion") is None or isinstance(r.get("conclusion"), str))
+                and isinstance(r.get("started_at"), str) and CHECK_STAMP.fullmatch(r["started_at"])
+                and isinstance(app, dict) and type(app.get("id")) is int and app["id"] > 0
+                and isinstance(app.get("slug"), str)
+                and isinstance(suite, dict) and type(suite.get("id")) is int and suite["id"] > 0):
+            raise RuntimeError(f"malformed check run named '{name}' at head {head[:12]}")
+    return runs
+
+
+def required_check_reasons(repo, head, required, rollup):
+    """(reasons, check suite ids of the successful required checks from GitHub Actions).
+
+    Per required name only the newest check run from the bound app decides: an older
+    failure is superseded by a newer success, and an older success never hides a newer
+    failed, pending or ambiguous run. Same-named commit statuses must all succeed."""
+    reasons, suites = [], set()
+    statuses = {}
     for e in rollup or []:
-        if "context" in e:  # StatusContext
-            name, state = e["context"], (e.get("state") or "").upper()
-        else:  # CheckRun
-            name = e.get("name")
-            status = (e.get("status") or "").upper()
-            state = (e.get("conclusion") or "").upper() if status == "COMPLETED" else (status or "PENDING")
-        if name:
-            states.setdefault(name, []).append(state or "PENDING")
-    return states
-
-
-def check_required(names, rollup, head):
-    reasons = []
-    states = check_states(rollup)
-    for name in sorted(names):
-        got = states.get(name)
-        if not got:
+        if isinstance(e, dict) and "context" in e:
+            statuses.setdefault(e["context"], []).append((e.get("state") or "").upper())
+    for name in sorted(required):
+        app = required[name]
+        try:
+            runs = check_runs_at(repo, head, name)
+        except RuntimeError as e:
+            reasons.append(str(e))
+            continue
+        if app is not None:
+            runs = [r for r in runs if r["app"]["id"] == app]
+        bad = sorted({s for s in statuses.get(name, []) if s != "SUCCESS"})
+        if bad:
+            reasons.append(f"required status '{name}' is not successful ({', '.join(bad)}) at head {head[:12]}")
+        elif not runs:
+            if app is None and statuses.get(name):
+                continue  # a successful commit status of an unbound name
             reasons.append(f"required check '{name}' is missing at head {head[:12]}")
-        elif any(s != "SUCCESS" for s in got):
-            bad = sorted({s for s in got if s != "SUCCESS"})
-            kind = "pending" if all(s in ("PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "EXPECTED", "REQUESTED") for s in bad) else "not successful"
-            reasons.append(f"required check '{name}' is {kind} ({', '.join(bad)}) at head {head[:12]}")
-    return reasons
+        else:
+            # Per app, its newest run decides: a success from one app never supersedes a
+            # failed, pending or ambiguous run of another app with the same name.
+            newest = {}
+            for r in runs:
+                newest.setdefault(r["app"]["id"], []).append(r)
+            for group in newest.values():
+                top = max(group, key=lambda r: (r["started_at"], r["id"]))
+                if sum(r["started_at"] == top["started_at"] for r in group) > 1:
+                    reasons.append(f"required check '{name}' has ambiguous newest runs at head {head[:12]}")
+                elif top["status"] != "completed":
+                    reasons.append(f"required check '{name}' is pending ({top['status']}) at head {head[:12]}")
+                elif top.get("conclusion") != "success":
+                    reasons.append(f"required check '{name}' is not successful ({top.get('conclusion')}) at head {head[:12]}")
+                elif top["app"]["slug"] == "github-actions":
+                    suites.add(top["check_suite"]["id"])
+    return reasons, suites
 
 
 # ---- verdict notes (parsed by `cadence audit verdicts`) --------------------
@@ -724,15 +779,24 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         reasons.append("cannot bind evidence to a full base commit SHA")
 
     # Read only the actual PR target's checks; absent target data must not use main.
+    gate_suites = frozenset()
     if not isinstance(base, str) or not base:
-        names = set()
+        required = {}
         reasons.append("PR has no valid base branch to bind delivery evidence")
     else:
-        names, rs = required_contexts(repo, base)
+        required, rs = required_contexts(repo, base)
         reasons += rs
+    names = set(required)
+    ci_url = None
     if names:
-        reasons += check_required(names, view.get("statusCheckRollup"), head)
+        rs, suites = required_check_reasons(repo, head, required, view.get("statusCheckRollup"))
+        reasons += rs
+        gate_suites = frozenset(suites)
         report.append(f"required checks: {', '.join(sorted(names))}")
+        try:
+            ci_url = green_ci_run(repo, head, gate_suites, names)
+        except RuntimeError as e:
+            reasons.append(str(e))
 
     # Changed paths (modes included) and size, straight from git.
     try:
@@ -794,7 +858,6 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             if req["activation"] == "active":
                 required_comment_evidence.extend((f"Delivery class: {req['class']}",
                                                   f"Policy digest: {authority['binding']['policy_digest']}"))
-                ci_url = green_ci_run(repo, head)
                 required_comment_evidence.append(f"Green CI run: {ci_url}")
             if authority["readiness"]:
                 ready = authority["readiness"]
@@ -828,12 +891,8 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                 reasons.append("active routine delivery has no fresh native readiness proof for this exact binding")
             else:
                 ready = authority["readiness"]
-                try:
-                    ci_url = green_ci_run(repo, head)
-                    if ci_url != ready["ci_run_url"]:
-                        reasons.append("native routine readiness CI run is not the actual successful ci.yml run at this head")
-                except RuntimeError as e:
-                    reasons.append(str(e))
+                if ci_url is not None and ci_url != ready["ci_run_url"]:
+                    reasons.append("native routine readiness CI run is not the actual successful ci.yml run at this head")
             if need_qa:
                 reasons += check_reviews(verdicts, True, True, authors, issue)[0]
         elif klass == "consequential":
@@ -891,30 +950,43 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
                         binding=authority["binding"] if authority else None,
                         requirements=authority["requirements"] if authority else None,
                         readiness=authority["readiness"] if authority else None)
-        try:
-            evidence["ci_run"] = green_ci_run(repo, head)
-        except RuntimeError as e:
-            reasons.append(str(e))
+        evidence["ci_run"] = ci_url
     return reasons, report
 
 
-def green_ci_run(repo, head):
-    """An actual successful ci.yml PR run at this head, not a guessed URL."""
+def green_ci_run(repo, head, gate_suites, names):
+    """The URL of the latest ci.yml PR run attempt at this head. That attempt is chosen first,
+    by run_started_at, whatever its gate: it must be a completed success whose check suite is
+    the sole suite holding the required checks `names`. An older successful run never stands in
+    for a newer attempt, and a rerun is judged by its current attempt. Fails closed."""
     doc = gh_json(["api", f"repos/{repo}/actions/workflows/ci.yml/runs"
-                   f"?head_sha={head}&event=pull_request&status=success&per_page=100"])
+                   f"?head_sha={head}&event=pull_request&per_page=100"])
     runs = doc.get("workflow_runs") if isinstance(doc, dict) else None
-    if not isinstance(runs, list):
-        raise RuntimeError("cannot read a green CI run for the evidence comment")
-    for run_ in runs:
-        if not isinstance(run_, dict):
-            continue
-        run_id = run_.get("id")
-        if (type(run_id) is int and run_id > 0
-                and run_.get("head_sha") == head and run_.get("event") == "pull_request"
-                and run_.get("status") == "completed" and run_.get("conclusion") == "success"
-                and run_.get("html_url") == f"https://github.com/{repo}/actions/runs/{run_id}"):
-            return run_["html_url"]
-    raise RuntimeError(f"no successful ci.yml PR run is available for exact head {head}")
+    total = doc.get("total_count") if isinstance(doc, dict) else None
+    if not isinstance(runs, list) or type(total) is not int or total > len(runs):
+        raise RuntimeError("cannot read the latest ci.yml run for the evidence comment")
+    for r in runs:
+        if not (isinstance(r, dict) and type(r.get("id")) is int and r["id"] > 0
+                and type(r.get("check_suite_id")) is int and r["check_suite_id"] > 0
+                and isinstance(r.get("run_started_at"), str) and CHECK_STAMP.fullmatch(r["run_started_at"])
+                and isinstance(r.get("head_sha"), str) and isinstance(r.get("event"), str)
+                and isinstance(r.get("status"), str)
+                and (r.get("conclusion") is None or isinstance(r.get("conclusion"), str))
+                and isinstance(r.get("html_url"), str)):
+            raise RuntimeError("cannot read the latest ci.yml run for the evidence comment")
+    current = [r for r in runs if r["head_sha"] == head and r["event"] == "pull_request"]
+    if not current:
+        raise RuntimeError(f"no ci.yml PR run exists at exact head {head}")
+    latest = max(current, key=lambda r: r["run_started_at"])
+    if sum(r["run_started_at"] == latest["run_started_at"] for r in current) > 1:
+        raise RuntimeError(f"the latest ci.yml PR runs at exact head {head} are ambiguous")
+    if (latest["status"] != "completed" or latest.get("conclusion") != "success"
+            or latest["html_url"] != f"https://github.com/{repo}/actions/runs/{latest['id']}"):
+        raise RuntimeError(f"the latest ci.yml PR run {latest['id']} at exact head {head} is not a completed success")
+    if gate_suites != {latest["check_suite_id"]}:
+        raise RuntimeError(f"required check(s) {', '.join(sorted(names)) or 'none'} are not held by "
+                           f"the latest ci.yml PR run {latest['id']} at exact head {head}")
+    return latest["html_url"]
 
 
 def evidence_body(evidence):
