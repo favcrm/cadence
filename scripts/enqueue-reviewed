@@ -865,11 +865,15 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     ci_runs = []
     proofs = {}
     if names:
+        listed = True
         try:
             ci_runs = workflow_runs_at(repo, head)
         except RuntimeError as e:
             reasons.append(str(e))
-        if ci_runs:
+            listed = False
+        if listed:
+            # An empty listing is a read, not a proof: the checks and the canonical
+            # run are judged against it and refuse when it holds nothing.
             rs, proofs = required_check_reasons(repo, head, required, view.get("statusCheckRollup"), ci_runs)
             reasons += rs
             report.append(f"required checks: {', '.join(sorted(names))}")
