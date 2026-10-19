@@ -165,8 +165,9 @@ audience and live bearer before any runtime is resolved or woken; the
 container independently re-verifies the envelope before dispatching the
 verb. `verb` is one of a fixed allowlist — `status`, `agent_list`,
 `agent_show`, `issue_ls`, `issue_show`, `issue_history`, `message_read`,
-`message_inbox`, `issue_new`, `issue_comment`, `issue_set`,
-`project_policy`, `message_send` — and
+`message_inbox`, `team_list`, `team_invites`, `issue_new`, `issue_comment`,
+`issue_set`, `team_invite`, `team_revoke_invite`, `team_set_role`,
+`team_remove`, `project_policy`, `message_send` — and
 `arguments` is a strict per-verb payload. Any
 other command is refused locally and never sent.
 
