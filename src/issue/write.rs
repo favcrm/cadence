@@ -2017,13 +2017,12 @@ pub(crate) fn mark_done_on_merge_waiting_with(
     wait: Duration,
     clock: &dyn WaitClock,
 ) -> std::result::Result<Option<String>, DoneWriteFailure> {
-    let mut from = None;
-    let result = (|| -> Result<Option<String>> {
+    let lock = (|| -> Result<PmLock> {
         let deadline = clock.now() + wait;
         let mut backoff = Duration::from_millis(50);
-        let _lock = loop {
+        loop {
             if let Some(lock) = pm.try_lock()? {
-                break lock;
+                return Ok(lock);
             }
             let left = deadline.saturating_duration_since(clock.now());
             if left.is_zero() {
@@ -2033,7 +2032,24 @@ pub(crate) fn mark_done_on_merge_waiting_with(
             }
             clock.sleep(backoff.min(left));
             backoff = (backoff * 2).min(Duration::from_millis(500));
-        };
+        }
+    })()
+    .map_err(|error| DoneWriteFailure { error, from: None })?;
+    mark_done_on_merge_locked(pm, &lock, id, why, actor, expect)
+}
+
+/// The same status CAS, plan gate and rollback under an already held tracker
+/// lock. Daemon callers validate final native authority in this critical section.
+pub(crate) fn mark_done_on_merge_locked(
+    pm: &Pm,
+    _lock: &PmLock,
+    id: &str,
+    why: &str,
+    actor: &str,
+    expect: Option<&str>,
+) -> std::result::Result<Option<String>, DoneWriteFailure> {
+    let mut from = None;
+    let result = (|| -> Result<Option<String>> {
         let (_project, dir) = issue_dir(pm, id)?;
         let (mut front, body) = load_front(&dir)?;
         from = Some(front.status.clone());

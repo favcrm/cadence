@@ -624,7 +624,20 @@ impl Store {
     /// a payload field the daemon's own admission writes — no RPC can
     /// mint it.
     pub fn record_unattended_run(&self, payload: Value) -> Result<()> {
-        self.write_tx(|conn| Self::event(&conn, APPROVAL_STREAM, UNATTENDED_RUN_EVENT, payload))
+        self.write_tx(|conn| {
+            // The native intent already carries the server-derived deadline.
+            // Recheck after acquiring the SQLite writer, before minting work.
+            if payload["status"] == "intent"
+                && payload["expires_at"].as_f64().is_none_or(|until| {
+                    !until.is_finite() || crate::issue::time::now_epoch() as f64 >= until
+                })
+            {
+                return Err(Error::rejected(
+                    "the bound grant expired before the admission intent — nothing was admitted",
+                ));
+            }
+            Self::event(&conn, APPROVAL_STREAM, UNATTENDED_RUN_EVENT, payload)
+        })
     }
 
     /// CAD-225: every `unattended_run` mark in write order. A payload

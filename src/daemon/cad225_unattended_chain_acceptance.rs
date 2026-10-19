@@ -2062,6 +2062,227 @@ fn canonical_ordinary_integration_control() {
     );
 }
 
+// The policy edit uses the same PM writer lock and scoped Git transaction
+// as supported tracker writes; it never bypasses an action-owned snapshot.
+const CANONICAL_OPERATOR_POLICY: &str = "---\ndelivery:\n  reviews:\n    review:\n      kind: agent\n      focus: general\n    human:\n      kind: operator\n  risk:\n    - require: [review, human]\n---\n# Widgets\n";
+
+fn try_operator_policy_edit(world: &World) -> bool {
+    let pm = crate::issue::Pm::at(&world.pm()).expect("open tracker");
+    let file = world.pm().join(PROJECT).join("PROJECT.md");
+    let Some(lock) = pm
+        .try_lock_for_paths(std::slice::from_ref(&file))
+        .expect("supported policy writer lock")
+    else {
+        return false;
+    };
+    let parsed = crate::issue::delivery_policy::parse(CANONICAL_OPERATOR_POLICY)
+        .expect("the injected policy is valid")
+        .expect("delivery section");
+    parsed.validate().expect("valid required operator review");
+    std::fs::write(&file, CANONICAL_OPERATOR_POLICY).expect("save policy under PM lock");
+    crate::issue::write::commit_scoped(
+        &pm,
+        &lock,
+        std::slice::from_ref(&file),
+        "Require operator review during the landing observation",
+        &[],
+        "operator",
+    )
+    .expect("scoped policy commit");
+    drop(lock);
+    assert_eq!(
+        std::fs::read_to_string(file).expect("committed policy reads"),
+        CANONICAL_OPERATOR_POLICY
+    );
+    true
+}
+
+// This guard is inside the scoped-thread body: on panic it releases the
+// remote read BEFORE thread::scope joins an approval waiting on the action.
+struct PolicyObservationRelease(PathBuf);
+
+impl Drop for PolicyObservationRelease {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.0.join("qr-go"), "1\n");
+    }
+}
+
+#[test]
+fn cad225_landing_revalidates_policy_after_final_observation() {
+    canonical_default_landing_control();
+    let expected_policy = crate::issue::delivery_policy::parse(CANONICAL_OPERATOR_POLICY)
+        .expect("valid policy")
+        .expect("delivery section");
+    let expected_digest = crate::issue::delivery_policy::digest(&expected_policy);
+    let world = World::open();
+    let admitted = world.grant_and_admit(Some(120));
+    world.save_pass(&admitted.ticket, "reviewer");
+    let mut read = CanonicalQueueRead::start(&world, admitted.ticket.clone());
+    assert!(
+        world.wait_for("qr-call", 30),
+        "valid default classification must reach the final queue read"
+    );
+    assert!(world.gh_calls("workflows/ci.yml/runs") > 0);
+    assert!(world.gh_calls(&format!("compare/{BASE}...{HEAD}")) >= 2);
+    assert_eq!(world.gh_calls("pr merge"), 0);
+
+    let edited_first = try_operator_policy_edit(&world);
+    if edited_first {
+        let (entered_tx, entered) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        let shared = world.shared.clone();
+        let outcome = std::thread::scope(|scope| {
+            let _release = PolicyObservationRelease(world.root.path().to_path_buf());
+            let approve = scope.spawn(move || {
+                let _ = entered_tx.send(());
+                let result = scoped(Asserted::Operator, || {
+                    shared
+                        .rpc_project_work_approve(&json!({"project": PROJECT}), std::process::id())
+                });
+                let _ = done_tx.send(());
+                result
+            });
+            entered
+                .recv_timeout(Duration::from_secs(5))
+                .expect("native approval attempt starts during the observation");
+            // Give a nonserialized approval an opportunity to complete.
+            // Timeout is NOT an assertion or authority signal: a correct
+            // writer may serialize approval behind the still-running action.
+            let _ = done.recv_timeout(Duration::from_millis(250));
+            let outcome = read.finish();
+            let approval = approve
+                .join()
+                .expect("approval thread joins")
+                .expect("the native operator approves the valid policy");
+            assert_eq!(approval["by"].as_str(), Some("operator"));
+            assert_eq!(
+                approval["delivery_digest"].as_str(),
+                Some(expected_digest.as_str())
+            );
+            outcome
+        });
+        assert_canonical_landing_refused(&world, &admitted.ticket, &outcome);
+    } else {
+        // The action already owns the policy snapshot. It may authorize
+        // first; only after it returns may the supported edit commit.
+        let outcome = read.finish();
+        assert_canonical_landing_requested(&world, &admitted.ticket, &outcome);
+        assert!(try_operator_policy_edit(&world));
+        world
+            .call(Asserted::Operator, |shared| {
+                shared.rpc_project_work_approve(&json!({"project": PROJECT}), std::process::id())
+            })
+            .expect("native policy approval after the authorized action");
+    }
+
+    let approvals = world
+        .shared
+        .store
+        .work_approvals()
+        .expect("native approvals read");
+    let approval = approvals.get(PROJECT).expect("native project approval");
+    assert_eq!(approval["by"].as_str(), Some("operator"));
+    assert_eq!(
+        approval["delivery_digest"].as_str(),
+        Some(expected_digest.as_str())
+    );
+    let classified = super::super::delivery_requirements_rpc::classify(
+        &world.shared,
+        &json!({
+            "issue": admitted.ticket,
+            "pr": format!("https://github.com/{REPO}/pull/{PR}"),
+            "head": HEAD,
+        }),
+    )
+    .expect("same valid head/base/branch with the new policy classifies");
+    assert_eq!(classified["head"].as_str(), Some(HEAD));
+    assert_eq!(classified["base"].as_str(), Some(BASE));
+    assert_eq!(classified["base_ref"].as_str(), Some("main"));
+    assert_ne!(
+        classified["requirements"]["activation"].as_str(),
+        Some("active")
+    );
+    assert!(world
+        .shared
+        .unattended_authorization_for_issue(&admitted.ticket)
+        .expect("the workflow and issue semantics were unchanged")
+        .is_some());
+    assert_eq!(world.recorded_merge_approvals(), 0);
+}
+
+#[test]
+fn cad225_fresh_admission_expiry_binds_the_intent_writer() {
+    // A real live admission is the control, not just a parsable grant.
+    {
+        let control = World::open();
+        let admitted = control.grant_and_admit(Some(120));
+        assert_eq!(control.issue(&admitted.ticket).front.status, "ready");
+    }
+    let world = World::open();
+    let granted = world
+        .approve(
+            Asserted::Operator,
+            world.unattended(&[PATH], bound_inputs(), Some(8), None),
+        )
+        .expect("native short-lived grant");
+    world.require_native_grant(&granted);
+    let expiry = world.workflow_approval()["unattended"]["expires_at"]
+        .as_f64()
+        .expect("native server expiry");
+    let issues_before = world.issues();
+    let commits_before = world.commits();
+    let until_arm = expiry - now_secs() - 2.0;
+    if until_arm > 0.0 {
+        std::thread::sleep(Duration::from_secs_f64(until_arm));
+    }
+    let mut race = CanonicalSqlRace::start(&world, move |shared| {
+        scoped(Asserted::Operator, || {
+            shared.rpc_plan_propose(
+                &json!({
+                    "project": PROJECT,
+                    "workflow": WORKFLOW,
+                    "inputs": bound_inputs(),
+                }),
+                std::process::id(),
+            )
+        })
+    });
+    race.at_writer();
+    assert!(
+        now_secs() < expiry,
+        "intent reached its real writer while live"
+    );
+    let until_expired = expiry - now_secs() + 0.15;
+    if until_expired > 0.0 {
+        std::thread::sleep(Duration::from_secs_f64(until_expired));
+    }
+    assert!(now_secs() >= expiry);
+    assert!(!race.wait.release.load(Ordering::SeqCst));
+    assert!(!race.producer.as_ref().expect("producer").is_finished());
+    let outcome = race.finish();
+    let error = outcome.expect_err("a fresh intent must not admit after its grant expires");
+    assert!(
+        matches!(error.kind(), "rejected" | "gate" | "conflict"),
+        "SQLite busy/transport/setup errors do not prove refusal: {error:?}"
+    );
+    assert_eq!(
+        world.issues(),
+        issues_before,
+        "no logical epic or ticket files"
+    );
+    assert_eq!(
+        world.commits(),
+        commits_before,
+        "no admission tracker commit"
+    );
+    assert!(
+        world.audit_events().iter().all(|(kind, payload)| {
+            kind != crate::store::UNATTENDED_RUN_EVENT || payload["status"] != "admitted"
+        }),
+        "no admitted run receipt may be recorded after the expired intent wait"
+    );
+}
+
 #[test]
 fn cad225_final_queue_observation_binds_target_and_base() {
     canonical_default_landing_control();
@@ -2114,4 +2335,389 @@ fn cad225_final_queue_observation_binds_target_and_base() {
             "this must be a target-evidence refusal, not lost workflow authority"
         );
     }
+}
+
+// ---- Independent postmerge settlement acceptance -------------------------
+
+/// Produce the authority through native grant/admission, owned completion,
+/// router intake, assigned-reviewer verdict and observer queue reconciliation.
+/// No settlement record, grant fingerprint or intent is planted here.
+fn settlement_ready(world: &World) -> Admitted {
+    let admitted = world.grant_and_admit(Some(120));
+    world.dispatch_turn(&admitted.ticket, 1, true, Some(Some(HEAD)));
+    world
+        .shared
+        .delivery_start(&admitted.ticket, PROJECT, "worker")
+        .expect("native delivery starts");
+    world.done_report(&admitted.ticket, now_secs() as i64 + 60, HEAD);
+    world
+        .shared
+        .route_delivery()
+        .expect("owned done report routes");
+    assert_eq!(record(world, &admitted.ticket).state, State::Reviewing);
+    let shared = world.shared.clone();
+    scoped(Asserted::Agent("reviewer".into()), || {
+        shared.rpc_report_verdict(
+            &json!({
+                "issue": admitted.ticket,
+                "text": verdict_text(&admitted.ticket, "pass", HEAD, Some("auto")),
+            }),
+            std::process::id(),
+        )
+    })
+    .expect("assigned reviewer records the native exact-head PASS");
+    assert!(world
+        .shared
+        .store
+        .unattended_review_recorded(&record(world, &admitted.ticket))
+        .expect("native review receipt reads"));
+    world
+        .observe(Asserted::Operator, &admitted.ticket, HEAD)
+        .expect("native observer requests the protected queue");
+    world.queue_admitted();
+    world
+        .observe_auto(Asserted::Operator, &admitted.ticket, HEAD, "OPEN")
+        .expect("native observer records actual queue admission");
+    assert_eq!(record(world, &admitted.ticket).state, State::Enqueued);
+    assert!(world
+        .shared
+        .store
+        .unattended_merge_intent(&admitted.ticket, HEAD)
+        .unwrap()
+        .is_some());
+    assert!(world
+        .shared
+        .store
+        .unattended_merge_enqueued(&admitted.ticket, HEAD)
+        .unwrap()
+        .is_some());
+    assert_eq!(world.gh_calls("pr merge"), 1);
+    assert_eq!(world.recorded_merge_approvals(), 0);
+    admitted
+}
+
+/// A real Git commit failure after the writer has captured status creates
+/// Pending. Restore the hook even if the observation or assertion panics.
+struct SettlementCommitFailure(PathBuf);
+
+impl SettlementCommitFailure {
+    fn install(world: &World) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let hook = world.pm().join(".git/hooks/pre-commit");
+        assert!(!hook.exists(), "only own a new fixture hook");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("write failing hook");
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+            .expect("make hook executable");
+        Self(hook)
+    }
+}
+
+impl Drop for SettlementCommitFailure {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn settlement_pending(world: &World, ticket: &str) {
+    let before = world.issue(ticket).front.status;
+    let failure = SettlementCommitFailure::install(world);
+    world
+        .observe_state(Asserted::Operator, ticket, HEAD, "MERGED")
+        .expect("merge observation answers despite failed tracker commit");
+    drop(failure);
+    let rec = record(world, ticket);
+    assert_eq!(rec.state, State::Merged);
+    assert!(
+        matches!(
+            &rec.ticket_done,
+            Some(delivery::TicketDone::Pending {
+                from: Some(from),
+                attempts: 1,
+                ..
+            }) if from == &before
+        ),
+        "a real failed commit must create the first pending write: {:?}",
+        rec.ticket_done
+    );
+    assert_eq!(world.issue(ticket).front.status, before);
+}
+
+/// Existing scripted PR view rendezvous: in settlement the next view is
+/// after the early canonical check. A missing marker is an early-path failure,
+/// never an accepted refusal. Release and join on every exit, including panic.
+struct SettlementRead {
+    root: PathBuf,
+    finished: mpsc::Receiver<()>,
+    producer: Option<std::thread::JoinHandle<Result<()>>>,
+}
+
+impl SettlementRead {
+    fn start(world: &World, ticket: String, retry: bool) -> Self {
+        world.arm_rendezvous();
+        let root = world.root.path().to_path_buf();
+        let shared = world.shared.clone();
+        let (finished_tx, finished) = mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            let result = if retry {
+                shared.settle_ticket_done().map(|_| ())
+            } else {
+                scoped(Asserted::Operator, || {
+                    shared.rpc_delivery_observe(
+                        &json!({
+                            "issue": ticket, "head": HEAD, "pr_state": "MERGED",
+                            "ci_green": true, "auto_merge": true,
+                            "additions": 1, "deletions": 0, "files": 1,
+                        }),
+                        std::process::id(),
+                    )
+                })
+                .map(|_| ())
+            };
+            let _ = finished_tx.send(());
+            result
+        });
+        Self {
+            root,
+            finished,
+            producer: Some(producer),
+        }
+    }
+
+    fn at_read(&self, world: &World) {
+        assert!(
+            world.wait_for("rv-call", 30),
+            "otherwise-valid settlement must reach its blocking remote read"
+        );
+        assert!(
+            !self.producer.as_ref().expect("producer").is_finished(),
+            "an unrelated early refusal cannot satisfy the race"
+        );
+        assert!(!world.root.path().join("rv-go").exists());
+    }
+
+    fn finish(&mut self) {
+        self.finish_releasing(|| {});
+    }
+
+    fn finish_releasing(&mut self, release: impl FnOnce()) {
+        std::fs::write(self.root.join("rv-go"), "1\n").expect("release remote read");
+        let finished = self.finished.recv_timeout(Duration::from_secs(5));
+        // Release a test-owned tracker writer before any timeout panic
+        // joins the producer, so a broken blocking implementation cleans up.
+        release();
+        finished.expect("settlement must finish without waiting for a tracker writer");
+        self.producer
+            .take()
+            .expect("producer")
+            .join()
+            .expect("settlement thread")
+            .expect("settlement path answers; refusal is its recorded outcome");
+    }
+}
+
+impl Drop for SettlementRead {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.root.join("rv-go"), "1\n");
+        if let Some(producer) = self.producer.take() {
+            let _ = producer.join();
+        }
+    }
+}
+
+fn assert_settlement_marked(world: &World, ticket: &str) {
+    let rec = record(world, ticket);
+    assert_eq!(rec.state, State::Merged);
+    assert!(
+        matches!(rec.ticket_done, Some(delivery::TicketDone::Marked { .. })),
+        "valid settlement must actually mark done: {:?}",
+        rec.ticket_done
+    );
+    assert_eq!(world.issue(ticket).front.status, "done");
+    assert_eq!(world.gh_calls("pr merge"), 1, "no merge replay");
+    assert_eq!(world.recorded_merge_approvals(), 0);
+}
+
+fn assert_settlement_refused(world: &World, ticket: &str, status: &str) {
+    let rec = record(world, ticket);
+    assert_eq!(
+        rec.state,
+        State::Merged,
+        "remote merge remains an observation"
+    );
+    assert!(
+        matches!(
+            &rec.ticket_done,
+            Some(delivery::TicketDone::Refused { why }) if !why.is_empty()
+        ),
+        "changed/expired authority must refuse, not claim success or busy: {:?}",
+        rec.ticket_done
+    );
+    assert_eq!(world.issue(ticket).front.status, status);
+    assert_ne!(status, "done");
+    assert!(world
+        .shared
+        .store
+        .events_tail(crate::store::Store::DAEMON_STREAM, 100)
+        .expect("settlement notices read")
+        .iter()
+        .all(|event| { event.kind != "ticket_done_on_merge" || event.payload["issue"] != ticket }));
+    assert_eq!(
+        world.gh_calls("pr merge"),
+        1,
+        "settlement cannot replay merge"
+    );
+    assert_eq!(world.recorded_merge_approvals(), 0);
+}
+
+#[test]
+fn cad225_settlement_remote_read_valid_initial_and_retry_controls() {
+    for retry in [false, true] {
+        let world = World::open();
+        let admitted = settlement_ready(&world);
+        if retry {
+            settlement_pending(&world, &admitted.ticket);
+        }
+        let mut read = SettlementRead::start(&world, admitted.ticket.clone(), retry);
+        read.at_read(&world);
+        read.finish();
+        assert_settlement_marked(&world, &admitted.ticket);
+    }
+}
+
+fn settlement_semantic_race(retry: bool) {
+    let world = World::open();
+    let admitted = settlement_ready(&world);
+    if retry {
+        settlement_pending(&world, &admitted.ticket);
+    }
+    let before = world.issue(&admitted.ticket).front.status;
+    let expiry = world
+        .shared
+        .unattended_authorization_for_issue(&admitted.ticket)
+        .unwrap()
+        .expect("live bound authority before collection")
+        .expires_at;
+    let mut read = SettlementRead::start(&world, admitted.ticket.clone(), retry);
+    read.at_read(&world);
+    assert!(expiry > now_secs() + 30.0, "this is not an expiry case");
+    let title = "Changed canonical work during postmerge remote collection";
+    let edited_first = try_canonical_title_edit(&world, &admitted.ticket, title);
+    assert!(
+        expiry > now_secs() + 20.0,
+        "grant stays live through the edit"
+    );
+    read.finish();
+    if edited_first {
+        assert_settlement_refused(&world, &admitted.ticket, &before);
+    } else {
+        // A snapshot lock may serialize the action before the edit.
+        // Never bypass it or demand refusal of unchanged work.
+        assert_settlement_marked(&world, &admitted.ticket);
+        edit_title_after_action(&world, &admitted.ticket, title);
+    }
+    assert_eq!(world.issue(&admitted.ticket).front.title, title);
+    world.assert_invalid_run(&admitted.ticket);
+}
+
+#[test]
+fn cad225_settlement_remote_read_semantic_edit_initial() {
+    settlement_semantic_race(false);
+}
+
+#[test]
+fn cad225_settlement_remote_read_semantic_edit_retry() {
+    settlement_semantic_race(true);
+}
+
+fn settlement_expiry_race(retry: bool) {
+    let world = World::open();
+    let admitted = settlement_ready(&world);
+    if retry {
+        settlement_pending(&world, &admitted.ticket);
+    }
+    world
+        .approve(
+            Asserted::Operator,
+            json!({
+                "project": PROJECT, "name": WORKFLOW,
+                "renew": admitted.grant_id, "ttl_secs": 8,
+            }),
+        )
+        .expect("native renewal sets a short real deadline");
+    let expiry = world
+        .shared
+        .unattended_authorization_for_issue(&admitted.ticket)
+        .unwrap()
+        .expect("renewed authority is live before remote collection")
+        .expires_at;
+    let before = world.issue(&admitted.ticket).front.status;
+    let mut read = SettlementRead::start(&world, admitted.ticket.clone(), retry);
+    read.at_read(&world);
+    assert!(expiry > now_secs(), "remote collection began before expiry");
+    let remaining = expiry - now_secs() + 1.0;
+    assert!((0.0..=10.0).contains(&remaining));
+    std::thread::sleep(Duration::from_secs_f64(remaining));
+    assert!(now_secs() > expiry, "the real server deadline elapsed");
+    read.finish();
+    assert_settlement_refused(&world, &admitted.ticket, &before);
+    world.assert_invalid_run(&admitted.ticket);
+}
+
+#[test]
+fn cad225_settlement_remote_read_expiry_initial() {
+    settlement_expiry_race(false);
+}
+
+#[test]
+fn cad225_settlement_remote_read_expiry_retry() {
+    settlement_expiry_race(true);
+}
+
+#[test]
+fn cad225_settlement_retry_busy_is_nonwaiting_and_preserves_status_override() {
+    let world = World::open();
+    let admitted = settlement_ready(&world);
+    settlement_pending(&world, &admitted.ticket);
+    let pm = crate::issue::Pm::at(&world.pm()).expect("open tracker");
+    let writer = pm
+        .try_lock_for_paths(&[world.pm().join(PROJECT).join(&admitted.ticket)])
+        .expect("probe supported tracker writer")
+        .expect("own the tracker before retry begins");
+    let mut read = SettlementRead::start(&world, admitted.ticket.clone(), true);
+    // This control permits an early busy outcome: only the attack cases
+    // require the remote barrier. A guarded implementation may refuse busy
+    // before collecting evidence, while another validates after collection.
+    // finish must return while this genuine writer remains held. A wait or
+    // successful done write cannot pass as the legitimate pending retry.
+    read.finish_releasing(|| drop(writer));
+    let rec = record(&world, &admitted.ticket);
+    assert!(
+        matches!(rec.ticket_done, Some(delivery::TicketDone::Pending { .. })),
+        "busy retry must retain its captured status: {:?}",
+        rec.ticket_done
+    );
+    assert_ne!(world.issue(&admitted.ticket).front.status, "done");
+    crate::issue::write::set_fields_if_rev(
+        &pm,
+        std::slice::from_ref(&admitted.ticket),
+        &["status=backlog".to_string()],
+        "operator",
+        None,
+        None,
+    )
+    .expect("supported operator status override");
+    world
+        .shared
+        .settle_ticket_done()
+        .expect("retry respects its original status CAS");
+    assert!(
+        matches!(
+            &record(&world, &admitted.ticket).ticket_done,
+            Some(delivery::TicketDone::Kept { status }) if status == "backlog"
+        ),
+        "an operator status override must be kept"
+    );
+    assert_eq!(world.issue(&admitted.ticket).front.status, "backlog");
+    assert_eq!(world.gh_calls("pr merge"), 1);
+    assert_eq!(world.recorded_merge_approvals(), 0);
 }

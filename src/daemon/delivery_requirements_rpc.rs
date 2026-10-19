@@ -212,7 +212,33 @@ fn approved_integration_target(
         })
 }
 
+/// Local policy and approval provenance, without remote collection. A caller
+/// committing authority holds the tracker lock through its mutation.
+pub(super) fn policy_snapshot(
+    shared: &Shared,
+    pm_dir: &std::path::Path,
+    project: &str,
+) -> Result<(delivery_policy::Resolved, Option<delivery_policy::Approved>)> {
+    let approvals = shared.store.work_approvals()?;
+    let approved = approvals
+        .get(project)
+        .and_then(delivery_policy::approved_from);
+    let resolved = delivery_policy::effective(
+        project,
+        delivery_policy::load(pm_dir, project),
+        approved.as_ref(),
+    );
+    Ok((resolved, approved))
+}
+
 pub(super) fn classify(shared: &Shared, params: &Value) -> Result<Value> {
+    classify_with_policy(shared, params).map(|(answer, _)| answer)
+}
+
+pub(super) fn classify_with_policy(
+    shared: &Shared,
+    params: &Value,
+) -> Result<(Value, delivery_policy::Resolved)> {
     let (issue_id, pr_url, requested_head) = request_fields(params)?;
 
     let pm = shared.pm()?;
@@ -249,15 +275,7 @@ pub(super) fn classify(shared: &Shared, params: &Value) -> Result<Value> {
     // Resolve the effective policy once — the target gate and the
     // requirements evaluator below share it. The reread at the end
     // still re-resolves for drift detection.
-    let approvals = shared.store.work_approvals()?;
-    let approved = approvals
-        .get(&project.key)
-        .and_then(delivery_policy::approved_from);
-    let resolved = delivery_policy::effective(
-        &project.key,
-        delivery_policy::load(&pm.dir, &project.key),
-        approved.as_ref(),
-    );
+    let (resolved, approved) = policy_snapshot(shared, &pm.dir, &project.key)?;
     if base_ref != default && !approved_integration_target(base_ref, &resolved, approved.as_ref()) {
         return Err(reject(format!(
             "PR base {base_ref:?} is neither the repository default {default:?} \
@@ -343,15 +361,7 @@ pub(super) fn classify(shared: &Shared, params: &Value) -> Result<Value> {
     // Refuse a mixed-head answer: re-read all external and operator-owned
     // inputs that determine the result before returning it.
     let after = pr_view(shared, &repo, number)?;
-    let after_approvals = shared.store.work_approvals()?;
-    let after_approved = after_approvals
-        .get(&project.key)
-        .and_then(delivery_policy::approved_from);
-    let after_resolved = delivery_policy::effective(
-        &project.key,
-        delivery_policy::load(&pm.dir, &project.key),
-        after_approved.as_ref(),
-    );
+    let (after_resolved, _) = policy_snapshot(shared, &pm.dir, &project.key)?;
     if after["state"].as_str() != Some("OPEN")
         || after["title"]
             .as_str()
@@ -371,11 +381,12 @@ pub(super) fn classify(shared: &Shared, params: &Value) -> Result<Value> {
             "PR head/base or approved policy changed during collection",
         ));
     }
-    Ok(
+    Ok((
         json!({"issue": issue_id, "project": project.key, "repo": repo, "pr": number,
         "head": head, "base": base, "base_ref": base_ref, "merge_base": merge_base,
         "policy_digest": result.policy_digest, "requirements": result, "changes": changes}),
-    )
+        resolved,
+    ))
 }
 
 /// Recheck the actual target's required checks and latest canonical PR CI.

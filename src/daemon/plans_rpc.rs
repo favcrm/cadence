@@ -476,6 +476,10 @@ impl Shared {
         let project = required_str(params, "project")?;
         crate::issue::model::check_key(project)?;
         let pm_dir = self.pm_dir()?;
+        // Policy files and their native approval share the tracker snapshot
+        // held by automatic landing through its final check and mutation.
+        let pm = crate::issue::Pm::at(&pm_dir)?;
+        let _tracker = pm.lock_for_paths(&[pm_dir.join(project).join("PROJECT.md")])?;
         if !crate::issue::project::list(&pm_dir)?
             .iter()
             .any(|p| p.key == project)

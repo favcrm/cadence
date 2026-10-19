@@ -131,6 +131,8 @@ dispatch preserves daemon-authenticated origin through its self-RPC and
 revalidates at the final enqueue gate, after blocking worktree/Git setup.
 Bound kickoff and follow-up writes carry the server-derived grant deadline
 into the queue transaction; connection/SQLite writer waits cannot extend it.
+The initial admission intent also checks its server-derived deadline after
+acquiring the SQL writer, before creating any logical issue or tracker commit.
 The tracker snapshot stays locked from each final canonical check through
 kickoff/follow-up enqueue and landing intent/remote attempt; ordinary edits
 serialize against that snapshot. Explicit operator hand-dispatch and repair
@@ -175,13 +177,19 @@ check after the intent writer wait and before the remote attempt. Intent/queue
 receipts retain the destination for repair and postmerge; missing or changed
 target evidence holds.
 
+The final tracker snapshot also binds the whole resolved delivery policy,
+including approval source and drift note. Native project-policy approval uses
+that same tracker lock, so it cannot cross intent or remote mutation.
+
 Native admission and enqueue intents precede logical tracker writes and remote
 mutation. ID directories reserve resources across interrupted admission; they
 are not approval evidence. Identical files are not commit proof. An uncertain
 enqueue is reconciled against the exact remote queue state, never blindly
 repeated. Same-grant renewal does not rewrite the original intent's historical
 expiry. Postmerge completion, including retries, must still have applicable
-native authority, recorded queue admission and enforceable integration checks;
+native authority, recorded queue admission and enforceable integration checks.
+After remote collection, final canonical and deadline validation shares the
+actual non-waiting tracker writer with the status CAS and ordinary plan gate;
 observed `MERGED` alone is insufficient. Revocation stops future daemon actions;
 it does not itself guarantee cancellation of an already-issued remote queue request.
 

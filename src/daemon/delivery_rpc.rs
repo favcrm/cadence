@@ -1465,7 +1465,39 @@ impl Shared {
         let pr_ref = rec_pr_ref(rec);
         let actor = format!("operator (delivery {pr_ref})");
         let why = format!("{pr_ref} merged at {head}");
-        match issue::write::mark_done_on_merge(pm, id, &why, &actor, expect) {
+        let lock = pm.try_lock().and_then(|lock| {
+            lock.ok_or_else(|| {
+                Error::rejected("the tracker is locked by another writer (write lock)")
+            })
+        });
+        let result = match lock {
+            Ok(tracker) => {
+                // Remote collection has finished. Grant→delivery→tracker:
+                // revalidate locally inside the actual status-write snapshot.
+                let authority = self.unattended_authorization_for_issue(id).and_then(|run| {
+                    if run.is_some_and(|run| now() as f64 >= run.expires_at) {
+                        Err(Error::rejected("the bound grant expired before settlement"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(error) = authority {
+                    let why = format!(
+                        "unattended postmerge verification held: {error}; operator verification is required"
+                    );
+                    notices.push(Notice {
+                        issue: id.clone(),
+                        comment: None,
+                        kind: "ticket_done_refused",
+                        payload: json!({"issue": id, "why": why}),
+                    });
+                    return TicketDone::Refused { why };
+                }
+                issue::write::mark_done_on_merge_locked(pm, &tracker, id, &why, &actor, expect)
+            }
+            Err(error) => Err(issue::write::DoneWriteFailure { error, from: None }),
+        };
+        match result {
             Ok(None) => {
                 notices.push(Notice {
                     issue: id.clone(),

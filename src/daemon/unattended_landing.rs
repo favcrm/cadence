@@ -167,7 +167,8 @@ impl Shared {
             ));
         }
         let request = json!({"issue": rec.issue, "pr": pr_url, "head": head});
-        let classification = delivery_requirements_rpc::classify(self, &request)?;
+        let (classification, policy) =
+            delivery_requirements_rpc::classify_with_policy(self, &request)?;
         check_scope(&classification, &run)?;
         let base = classification["base"]
             .as_str()
@@ -187,8 +188,9 @@ impl Shared {
             }
             return Ok(false);
         }
-        let confirmed = delivery_requirements_rpc::classify(self, &request)?;
-        if confirmed != classification {
+        let (confirmed, confirmed_policy) =
+            delivery_requirements_rpc::classify_with_policy(self, &request)?;
+        if confirmed != classification || confirmed_policy != policy {
             return Err(reject(
                 "the head, base, file scope or trusted policy changed during authorization",
             ));
@@ -221,6 +223,11 @@ impl Shared {
         if !same_authorization(&run, &current) {
             return Err(reject(
                 "the workflow authorization changed during collection",
+            ));
+        }
+        if delivery_requirements_rpc::policy_snapshot(self, &pm.dir, &run.project)?.0 != policy {
+            return Err(reject(
+                "the effective delivery policy or approval provenance changed before enqueue",
             ));
         }
         let intent = json!({
