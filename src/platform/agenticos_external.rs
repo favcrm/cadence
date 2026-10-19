@@ -706,7 +706,7 @@ impl AgenticosExternalAdapter {
             Some(TEXT_MANIFEST_PIN | RECORDING_MANIFEST_PIN)
         ) {
             return Err(AppCapabilityError::Refused(
-                "AgenticOS text generation requires a reviewed text-capable deployment".into(),
+                "AgenticOS text generation is unavailable without the reviewed manifest v4 (or newer) deployment".into(),
             ));
         }
         validate_text_authority(authority).map_err(AppCapabilityError::Refused)?;
@@ -2869,7 +2869,7 @@ mod tests {
             .err()
             .expect("@3 refuses text");
         assert!(
-            matches!(&refused, AppCapabilityError::Refused(_)),
+            matches!(&refused, AppCapabilityError::Refused(reason) if reason.contains("manifest v4")),
             "{refused:?}"
         );
         // @4: advertised, and a call goes through the same guards to the door
