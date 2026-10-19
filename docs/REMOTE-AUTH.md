@@ -456,6 +456,15 @@ The scenario requires an external coordinator and refuses a real parent
 `CADENCE_ALIAS` before constructing isolated synthetic-persona environments;
 never unset a managed identity to run it.
 
+The acceptance takes its evidence from the runtime's own store and from the
+fixture peer's record of the requests that reached the hosted boundary
+(method, path and status only). A refusal is therefore attributed to the
+hop that produced it — the local credential pin, the board's own scope,
+live-membership and authorization checks (which name themselves with
+`error.hop = "board"` and a reason), or the container's own guards (which
+answer with their own typed codes) — and a no-enqueue claim is backed by
+the durable rows the runtime holds, not by another principal's read error.
+
 This is not an installed release CLI or a deployed workspace. The controller
 primes CLI and wiki JWKS caches over verified disposable TLS; fresh
 handler-thread JWKS fetching and real master commissioning/model policy are
