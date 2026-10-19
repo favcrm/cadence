@@ -191,6 +191,9 @@ class Case(scope.Case):
         if argv[:3] == ["gh", "pr", "merge"]:
             self.merges.append(list(argv))
             return self.merge_rc, "", "merge refused"
+        if argv[:2] == ["gh", "api"] and "/contents/.github/workflows/ci.yml?ref=" in argv[-1]:
+            # The trusted base's ci.yml declares the gate job the required context names.
+            return 0, "name: CI\njobs:\n  ci:\n    name: ci\n    runs-on: ubuntu-latest\n", ""
         if (argv[:2] == ["gh", "api"] and "/contents/" in argv[-1]
                 and any(f in argv[-1] for f in (enq.ONE_REVIEW_FILE, enq.RISK_PATHS_FILE))):
             # The trusted-base lists are served at whatever ref the caller

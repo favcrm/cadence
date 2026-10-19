@@ -107,6 +107,34 @@ PROMO_OLD_URL = f"https://github.com/{REPO}/actions/runs/{PROMO_OLD_RUN}"
 PUSH_RUN, PUSH_SUITE, PUSH_NUMBER, PUSH_JOB = 39207701467, 106241800480, 3237, 117993000013
 CI_NEWER_RUN, CI_NEWER_SUITE, CI_NEWER_NUMBER, CI_NEWER_JOB = 39208290000, 106243399999, 3239, 117993000014  # invented
 CI_NEWER_URL = f"https://github.com/{REPO}/actions/runs/{CI_NEWER_RUN}"
+OLD_FIRST_JOB, OLD_RETRY_JOB = 117993400001, 117993400002  # invented
+OLD_RUN_NUMBER = 44437  # run_rec's run_number for OLD_RUN created 09:33:57
+OTHER_RUN, OTHER_SUITE, OTHER_JOB, OTHER_NUMBER = 39231400000, 106306000000, 117994000000, 3240  # invented
+
+# Trusted base copies of the producer workflows, served by the contents endpoint.
+CI_WORKFLOW_TEXT = """name: CI
+on:
+  pull_request:
+
+jobs:
+  gate:
+    name: Required result gate
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gate
+"""
+PROMO_WORKFLOW_TEXT = """name: Promotion policy
+on:
+  pull_request:
+
+jobs:
+  promotion:
+    name: Main promotion policy
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo promotion
+"""
+WORKFLOW_TEXT = {CI_PATH: CI_WORKFLOW_TEXT, PROMO_PATH: PROMO_WORKFLOW_TEXT}
 
 
 def ts(hms):
@@ -250,6 +278,27 @@ def promo_orphan_gate():
                            started="2026-10-19T06:20:00Z", completed="2026-10-19T06:20:30Z"))
 
 
+def first_attempt_gate():
+    """OLD_RUN's gate from its first attempt, in the suite the re-run keeps (started before the retry)."""
+    return gate_rec(OLD_FIRST_JOB, OLD_SUITE, started=ts("09:34:05"), completed=ts("09:34:30"))
+
+
+def retried_older_run(*, conclusion="failure"):
+    """OLD_RUN re-run as attempt 2, started after NEW_RUN; GitHub keeps run_number and suite."""
+    run, gate = attempt(OLD_RUN, OLD_SUITE, OLD_RUN_NUMBER, ts("09:40:00"), OLD_RETRY_JOB,
+                        conclusion=conclusion, started=ts("09:40:10"),
+                        completed=None if conclusion is None else ts("09:40:40"))
+    run["run_attempt"] = 2
+    return run, gate
+
+
+def other_workflow_gate():
+    """The only producer of the required context: a green run of other.yml, which the base does not carry."""
+    return attempt(OTHER_RUN, OTHER_SUITE, OTHER_NUMBER, ts("09:50:00"), OTHER_JOB,
+                   workflow_id=OTHER_WORKFLOW_ID, path=OTHER_PATH, conclusion="success",
+                   started=ts("09:50:05"), completed=ts("09:50:30"))
+
+
 class Case:
     """One PR 747 scenario over the guard's external transport."""
 
@@ -320,6 +369,13 @@ class Case:
         for f in (enq.ONE_REVIEW_FILE, enq.RISK_PATHS_FILE):
             if path == f"repos/{REPO}/contents/{f}" and query.get("ref") == BASE:
                 return 0, (ROOT / f).read_text(), ""
+        if path.startswith(f"repos/{REPO}/contents/.github/workflows/"):
+            if query.get("ref") != BASE:
+                raise AssertionError(f"workflow read at an unserved ref: {url}")
+            text = WORKFLOW_TEXT.get(path[len(f"repos/{REPO}/contents/"):])
+            if text is None:
+                return 1, "", "Not Found"
+            return 0, text, ""
         prefix = f"repos/{REPO}/commits/"
         if path.startswith(prefix) and path.endswith("/check-runs"):
             return self.check_runs(path[len(prefix):-len("/check-runs")], query.get("check_name"))
@@ -617,6 +673,45 @@ class CurrentAuthoritativeCi(unittest.TestCase):
         self.assertEqual(len(c.posted), 1, c.posted)
         self.assertIn(f"Green CI run: {CI_URL}", c.posted[0])
         self.assertEqual(c.merges, [], "a merge command ran after the evaluated CI run changed")
+
+    # ---- (3) later attempts of an older run, undeclared producers, separate producers ----
+
+    def test_later_failed_attempt_of_older_run_refuses_despite_newer_success(self):
+        def retried(c):
+            c.add(None, first_attempt_gate())
+            c.add(*observed_ready())
+            c.add(*retried_older_run())
+        self.refuse_in_both_modes(retried)
+
+    def test_later_pending_attempt_of_older_run_refuses_despite_newer_success(self):
+        def retried(c):
+            c.add(None, first_attempt_gate())
+            c.add(*observed_ready())
+            c.add(*retried_older_run(conclusion=None))
+        self.refuse_in_both_modes(retried)
+
+    def test_same_named_check_from_undeclared_workflow_refuses_despite_gateless_green_ci(self):
+        def undeclared(c):
+            c.add(*newest_without_gate())
+            c.add(*other_workflow_gate())
+        self.refuse_in_both_modes(undeclared)
+
+    def test_separate_declared_producers_each_prove_their_context_and_both_runs_are_named(self):
+        for order, reversed_rollup in ORDERS:
+            with self.subTest(order=order, dry_run=True):
+                c = multi_case(self._tmp.name)
+                c.rollup_reversed = reversed_rollup
+                rc, out, err = self.run_main(c, "--dry-run")
+                self.assertEqual(rc, 0, (out, err))
+                self.assertEqual(c.merges, [])
+            with self.subTest(order=order, dry_run=False):
+                c = multi_case(self._tmp.name, seeded=False)
+                c.rollup_reversed = reversed_rollup
+                self.admit(c, expect_posted_has=(f"Green CI run: {CI_URL}",
+                                                 f"Required check run: {PROMO_GATE} = {PROMO_URL}"))
+
+    def test_required_context_with_no_producer_at_all_refuses(self):
+        self.refuse_in_both_modes(lambda c: None, make=lambda tmp: multi_case(tmp, promo=None))
 
 
 if __name__ == "__main__":

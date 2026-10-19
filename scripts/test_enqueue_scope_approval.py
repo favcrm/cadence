@@ -109,6 +109,9 @@ class Case:
                     "app": {"id": 15368, "slug": "github-actions"}, "check_suite": {"id": 106304880676}}]}), ""
             if "actions/workflows/ci.yml/runs" in url or "/actions/runs?head_sha=" in url:
                 return 0, json.dumps({"total_count": len(self.ci_runs), "workflow_runs": self.ci_runs}), ""
+            if "/contents/.github/workflows/ci.yml?ref=" in url:
+                # The trusted base's ci.yml declares the gate job the required context names.
+                return 0, "name: CI\njobs:\n  ci:\n    name: ci\n    runs-on: ubuntu-latest\n", ""
             if url.endswith("/protection"):
                 return 1, "", "Branch not protected"
             for f in (enq.ONE_REVIEW_FILE, enq.RISK_PATHS_FILE):  # the REAL lists
