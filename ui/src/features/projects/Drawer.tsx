@@ -180,10 +180,7 @@ export default function Drawer({ id, detail, readState, onRetry, href, onClose, 
     setDraft({ comment: next.comment, status: next.status });
   };
 
-  /** Keep post-save focus through later SSE reads, until the user moves away. */
-  const refocus = (kind: "comment" | "status") => {
-    pendingFocus.current = { kind, key: ctxRef.current.key, generation: privateSessionGeneration() };
-  };
+  /** Submission owns focus through revalidation only until the user moves away. */
   useEffect(() => {
     const request = pendingFocus.current;
     if (!request) return;
@@ -251,6 +248,7 @@ export default function Drawer({ id, detail, readState, onRetry, href, onClose, 
     const sameScope = () => privateSessionGeneration() === ctx.generation &&
       ctxRef.current.id === ctx.id && ctxRef.current.key === ctx.identityKey;
     personal.drafts.set(personal.draftKey, { ...draft, pending: { token: ctx.token, kind } });
+    if (mounted.current) pendingFocus.current = { kind, key: ctx.identityKey, generation: ctx.generation };
     personal.onDraftChange();
     setOutcome(null);
     try {
@@ -281,7 +279,6 @@ export default function Drawer({ id, detail, readState, onRetry, href, onClose, 
       // instance ignores its state update; the shared map still settles.
       setDraft({ comment: kept.comment, status: kept.status });
       setOutcome({ tone: "ok", text: kind === "comment" ? t("Comment added.") : t("Status saved") });
-      if (mounted.current) refocus(kind);
     } catch (error) {
       if (!sameScope()) return;
       if (privateReadsAllowed()) {
@@ -305,7 +302,6 @@ export default function Drawer({ id, detail, readState, onRetry, href, onClose, 
           ? t("Not saved — details changed since this snapshot loaded. Retry once fresh details are in; your draft is kept.")
           : t("Could not confirm the save — draft kept. Try again when ready."),
       });
-      if (mounted.current) refocus(kind);
     } finally {
       if (privateSessionGeneration() === ctx.generation) {
         const current = personal.drafts.get(personal.draftKey);
