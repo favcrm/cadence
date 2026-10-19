@@ -119,7 +119,7 @@ class Case:
             matching = [r for r in self.store if r["issue"].lower() == issue.lower()]
             approval_id = "merge-pr5-aaaa" if self.per_head else (
                 matching[-1]["approval_id"] if matching else "missing")
-            comment = f"{HEAD} {NOTE}\nBase branch: {self.base_ref}\nOperator approval id: {approval_id}"
+            comment = f"{HEAD} {NOTE}\nBase branch: {self.base_ref}\nGreen CI run: {CI_URL}\nOperator approval id: {approval_id}"
             return 0, json.dumps({"id": issue, "project": self.project, "owner": None, "claim": None,
                                   "body": self.ticket_body, "status": self.status, "refs": self.refs,
                                   "comments": [{"body": comment}]}), ""

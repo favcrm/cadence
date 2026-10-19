@@ -272,7 +272,7 @@ class EvidencePosting(unittest.TestCase):
     # ---- dry run -----------------------------------------------------------
 
     def test_dry_run_checks_everything_and_writes_nothing(self):
-        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}\nOperator approval id: {APPROVAL_ID}"}]
+        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}\nGreen CI run: {CI_URL}\nOperator approval id: {APPROVAL_ID}"}]
         rc, out, err = self.run_main("--dry-run")
         self.assertEqual(rc, 0, (out, err))
         self.assertIn("dry run", out)
@@ -281,7 +281,7 @@ class EvidencePosting(unittest.TestCase):
 
     def test_dry_run_accepts_native_authorized_integration_target_without_writes(self):
         self.c.base_ref = "staging"
-        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: staging\nOperator approval id: {APPROVAL_ID}"}]
+        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: staging\nGreen CI run: {CI_URL}\nOperator approval id: {APPROVAL_ID}"}]
         rc, out, err = self.run_main("--dry-run")
         self.assertEqual(rc, 0, (out, err))
         self.assertEqual(self.c.posted, [])
@@ -296,7 +296,7 @@ class EvidencePosting(unittest.TestCase):
         for approval_id in (None, "replaced-approval"):
             with self.subTest(approval_id=approval_id):
                 self.fresh()
-                body = f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}"
+                body = f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}\nGreen CI run: {CI_URL}"
                 if approval_id is not None:
                     body += f"\nOperator approval id: {approval_id}"
                 self.c.comments = [{"body": body}]
@@ -304,7 +304,7 @@ class EvidencePosting(unittest.TestCase):
                 self.assertEqual(rc, 1, (out, err))
                 self.assert_refused_clean(rc, err)
         self.fresh()
-        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}\nOperator approval id: {APPROVAL_ID}"}]
+        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}\nGreen CI run: {CI_URL}\nOperator approval id: {APPROVAL_ID}"}]
         rc, out, err = self.run_main("--dry-run")
         self.assertEqual(rc, 0, (out, err))
         self.assertEqual(self.c.posted, [])

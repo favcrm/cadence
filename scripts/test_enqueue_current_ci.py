@@ -581,7 +581,7 @@ class CurrentAuthoritativeCi(unittest.TestCase):
                 c.rollup_reversed = reversed_rollup
                 c.comments = [ticket_comment(OLD_URL)]
                 rc, out, err = self.run_main(c, "--dry-run")
-                self.assertEqual(rc, 0, (out, err))
+                self.assertEqual(rc, 1, (out, err))
                 self.assertEqual(c.posted, [])
                 self.assertEqual(c.merges, [])
 
