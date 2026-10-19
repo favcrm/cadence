@@ -11,14 +11,14 @@ use std::time::{Duration, Instant};
 use super::write::{new_issue, project_add};
 use super::*;
 
-fn tracker() -> (tempfile::TempDir, Pm) {
+pub(super) fn tracker() -> (tempfile::TempDir, Pm) {
     let dir = tempfile::tempdir().unwrap();
     let pm = Pm::init(&dir.path().join("pm")).unwrap();
     project_add(&pm, "cadence", "CAD", &[], &[], &[], None).unwrap();
     (dir, pm)
 }
 
-fn mk(pm: &Pm, cwd: &Path, title: &str) -> String {
+pub(super) fn mk(pm: &Pm, cwd: &Path, title: &str) -> String {
     new_issue(
         pm,
         cwd,
@@ -83,6 +83,17 @@ fn lock_helper() {
         .unwrap();
         git(&pm.dir, &["mv", "renamed/victim.txt", "renamed/moved.txt"]).unwrap();
     }
+    if role == "hold_staged_unstaged" {
+        // CAD-1601: the crashed writer staged one version of a tracked
+        // file and then left a DIFFERENT version in the working tree.
+        // The index holds the staged version; the worktree holds the
+        // other one. A recovery that keeps the staged content must
+        // commit the staged blob, never the worktree's.
+        let file = pm.dir.join("tracked.txt");
+        std::fs::write(&file, b"staged\n").unwrap();
+        git(&pm.dir, &["add", "--", "tracked.txt"]).unwrap();
+        std::fs::write(&file, b"working\n").unwrap();
+    }
     if role == "hold_comment" {
         // CAD-1600: the live incident. The writer had written and
         // staged ticket CAD-2's comment, then died before committing.
@@ -117,7 +128,7 @@ fn lock_helper() {
     std::thread::sleep(Duration::from_secs(600));
 }
 
-fn spawn_writer(pm: &Pm, role: &str, setsid: bool) -> (Child, PathBuf) {
+pub(super) fn spawn_writer(pm: &Pm, role: &str, setsid: bool) -> (Child, PathBuf) {
     let ready = pm.dir.parent().unwrap().join(format!("ready-{role}"));
     let _ = std::fs::remove_file(&ready);
     let mut cmd = Command::new(std::env::current_exe().unwrap());
@@ -147,7 +158,7 @@ fn spawn_writer(pm: &Pm, role: &str, setsid: bool) -> (Child, PathBuf) {
     (child, ready)
 }
 
-fn sigkill(mut child: Child) {
+pub(super) fn sigkill(mut child: Child) {
     unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
     child.wait().unwrap();
 }

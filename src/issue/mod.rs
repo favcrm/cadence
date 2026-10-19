@@ -47,6 +47,7 @@ pub mod project;
 pub mod project_new;
 pub mod reclaim;
 pub mod reconcile;
+pub mod recovery;
 pub mod relay;
 pub mod report;
 pub mod retro;
@@ -60,7 +61,7 @@ pub mod work;
 pub mod workflow;
 pub mod write;
 
-pub use pmlock::{LockState, PmLock};
+pub use pmlock::{InterruptionReport, LockState, PmLock};
 
 /// The legacy lock path, kept as the new protocol's fence file.
 const MARKER_LOCK_FILE: &str = ".write.lock";
@@ -374,7 +375,7 @@ impl Pm {
     /// under its own lock, CAD-449) and retries later instead.
     #[track_caller]
     pub fn try_lock(&self) -> Result<Option<PmLock>> {
-        self.acquire(None, None)
+        self.acquire(None, None, false)
     }
 
     /// [`Self::lock`] scoped to `paths`: when a crashed writer left
@@ -394,7 +395,7 @@ impl Pm {
     /// writer holds it.
     #[track_caller]
     pub fn try_lock_for_paths(&self, paths: &[PathBuf]) -> Result<Option<PmLock>> {
-        self.acquire(None, Some(paths))
+        self.acquire(None, Some(paths), false)
     }
 
     /// True when the worktree differs from HEAD.

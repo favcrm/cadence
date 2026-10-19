@@ -192,6 +192,18 @@ impl Error {
             revision: Some(revision),
         })
     }
+    /// A conflict with a stable code and no stored revision: the thing
+    /// that moved is not an issue's revision but another state the caller
+    /// inspected (CAD-1601's recovery reviews a tracker's own state).
+    /// The wire kind stays `conflict` (5).
+    pub fn conflict_coded(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Structured(Structured {
+            kind: "conflict",
+            code: code.to_string(),
+            message: message.into(),
+            revision: None,
+        })
+    }
     pub fn code(&self) -> Option<&str> {
         match self {
             Self::Structured(structured) => Some(structured.code.as_str()),

@@ -399,7 +399,33 @@ pub struct PmLock {
     site: &'static Location<'static>,
     /// Key of the process-wide holder record this guard set.
     site_key: PathBuf,
+    /// A recovery guard (CAD-1601): it was taken over an interrupted
+    /// tracker to settle the crash. It is never a general writer's
+    /// lock, so the ordinary commit path refuses it — a recovery
+    /// commits only through its own exact-index path.
+    recovery: bool,
     _flock: Unlock,
+}
+
+/// What a crashed writer left behind, in the detail the operator
+/// recovery flow needs (CAD-1601).
+///
+/// `paths` are the paths the crash is blamed for — the only ones a
+/// recovery may select. `foreign` are protected: they pre-date the
+/// crash or cannot be attributed to it, and selecting one is refused
+/// however explicit the operator's confirmation is.
+#[derive(Debug, Clone, Default)]
+pub struct InterruptionReport {
+    pub paths: Vec<String>,
+    pub foreign: Vec<String>,
+    /// The protected paths themselves, without the `kind` prefix that
+    /// `foreign` carries for display. A recovery compares a selected
+    /// path against these, so they must be bare paths.
+    pub foreign_paths: Vec<String>,
+    pub named: Vec<String>,
+    /// Git-global hazards (`index.lock`, a merge/rebase/cherry-pick
+    /// state). A path-local recovery cannot settle them.
+    pub hazards: Vec<String>,
 }
 
 /// CAD-1234: the acquiring call site of every lock this process holds,
@@ -460,6 +486,16 @@ impl PmLock {
     /// by [`Pm::commit_scoped`](super::Pm::commit_scoped); the plain
     /// commit path never takes a scoped lock.
     pub(super) fn check_commit(&self, rel: &[String]) -> Result<()> {
+        if self.recovery {
+            // A recovery lock is not a writer's lock. The recovery
+            // commits only its confirmed set, through its own
+            // exact-index path; the ordinary commit path must never
+            // carry it.
+            return Err(Error::rejected(
+                "a recovery lock may not be used for an ordinary tracker commit — the \
+                 recovery commits only its confirmed set, through its own path",
+            ));
+        }
         let Scope::Paths { admitted, blocked } = &self.scope else {
             return Ok(());
         };
@@ -675,8 +711,17 @@ struct Tree {
 struct Interruption {
     named: Vec<String>,
     foreign: Vec<String>,
+    /// The protected paths themselves, without the `kind` prefix that
+    /// `foreign` carries for display (CAD-1601: a recovery compares a
+    /// selected path against these).
+    foreign_paths: Vec<String>,
     paths: Vec<String>,
     global: bool,
+    /// The Git-global hazards that make the interruption unresolvable by
+    /// a path-local recovery: `index.lock`, a merge/rebase/cherry-pick
+    /// state. Kept apart from `named` so a caller can name them
+    /// exactly (CAD-1601).
+    hazards: Vec<String>,
 }
 
 fn open_coordination(path: &Path, create: bool) -> std::io::Result<Option<File>> {
@@ -834,6 +879,7 @@ fn classify(
 ) -> Option<Interruption> {
     let mut named: Vec<String> = Vec::new();
     let mut foreign: Vec<String> = Vec::new();
+    let mut foreign_paths: Vec<String> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
     for s in &tree.git_state {
         named.push(format!("git state {s}"));
@@ -849,8 +895,10 @@ fn classify(
             // leftovers, so none is blamed. Git state, staged entries
             // and modified tracked files still refuse.
             foreign.push(format!("{kind} {p}"));
+            foreign_paths.push(p.clone());
         } else if snapshot.is_some_and(|s| s.contains(p)) {
             foreign.push(format!("{kind} {p}"));
+            foreign_paths.push(p.clone());
         } else if p.ends_with('/') && inside.iter().any(|f| f.starts_with(p.as_str())) {
             // Named by the files found inside it, below.
         } else {
@@ -874,7 +922,9 @@ fn classify(
             global: !tree.git_state.is_empty(),
             named,
             foreign,
+            foreign_paths,
             paths,
+            hazards: tree.git_state.clone(),
         })
     }
 }
@@ -1119,7 +1169,12 @@ impl Pm {
     /// [`Waiter`]): it is used as the lock taken, in place of a fresh
     /// non-blocking `flock`.
     #[track_caller]
-    fn attempt(&self, declared: Option<&[PathBuf]>, queued: Option<Unlock>) -> Result<Attempt> {
+    fn attempt(
+        &self,
+        declared: Option<&[PathBuf]>,
+        queued: Option<Unlock>,
+        recovery: bool,
+    ) -> Result<Attempt> {
         let git_dir = self.lock_git_dir().map_err(|e| self.git_dir_error(e))?;
         let flock_path = git_dir.join(FLOCK_FILE);
         // From here every exit releases the lock explicitly.
@@ -1145,29 +1200,48 @@ impl Pm {
         // content carries a diagnostic trailer (holder pid, host,
         // version, start time, binary); liveness still comes from the
         // flock alone.
-        let tmp = git_dir.join(format!("{TMP_PREFIX}{}", std::process::id()));
-        let tmp_file = create_exclusive(&tmp, &marker_content())
-            .map_err(|e| io_unknown(&tmp, "the lock marker", e))?;
-        let tmp_ident = tmp_file
-            .metadata()
-            .map(|m| (m.dev(), m.ino()))
-            .map_err(|e| io_unknown(&tmp, "the lock marker", e))?;
-        let linked = std::fs::hard_link(&tmp, &legacy);
-        let _ = std::fs::remove_file(&tmp);
-        let (ident, reused, stale_meta) = match linked {
-            Ok(()) => (tmp_ident, false, None),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                match self.legacy_file() {
-                    // Our own marker under a flock we now hold: the writer
-                    // that left it is gone. Reuse it once the git state is
-                    // shown free of its leftovers. Its trailer, where
-                    // present, names the dead writer in a refusal.
-                    Ok(Some((MarkerClass::Ours(meta), id))) => (id, true, meta),
-                    Ok(_) => return Ok(Attempt::Legacy),
-                    Err(e) => return Err(io_unknown(&legacy, ".write.lock", e)),
+        let (ident, reused, stale_meta) = if recovery {
+            // A recovery never publishes a marker: the crash's own
+            // marker is the evidence being acted on, and replacing it
+            // would lose the exact marker the operator inspected.
+            match self.legacy_file() {
+                Ok(Some((MarkerClass::Ours(meta), id))) => (id, true, meta),
+                Ok(Some((MarkerClass::Foreign, _))) => return Err(self.busy_error(true)),
+                Ok(None) => {
+                    return Err(Error::rejected(
+                        "there is no interrupted write to recover — the tracker has no \
+                         crash marker. Recovery needs the marker a crashed writer left; \
+                         if the leftovers are real, inspect them with `git status` and \
+                         decide by hand. A retry will not help.",
+                    ))
                 }
+                Err(e) => return Err(io_unknown(&legacy, ".write.lock", e)),
             }
-            Err(e) => return Err(io_unknown(&legacy, ".write.lock", e)),
+        } else {
+            let tmp = git_dir.join(format!("{TMP_PREFIX}{}", std::process::id()));
+            let tmp_file = create_exclusive(&tmp, &marker_content())
+                .map_err(|e| io_unknown(&tmp, "the lock marker", e))?;
+            let tmp_ident = tmp_file
+                .metadata()
+                .map(|m| (m.dev(), m.ino()))
+                .map_err(|e| io_unknown(&tmp, "the lock marker", e))?;
+            let linked = std::fs::hard_link(&tmp, &legacy);
+            let _ = std::fs::remove_file(&tmp);
+            match linked {
+                Ok(()) => (tmp_ident, false, None),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    match self.legacy_file() {
+                        // Our own marker under a flock we now hold: the writer
+                        // that left it is gone. Reuse it once the git state
+                        // is shown free of its leftovers. Its trailer, where
+                        // present, names the dead writer in a refusal.
+                        Ok(Some((MarkerClass::Ours(meta), id))) => (id, true, meta),
+                        Ok(_) => return Ok(Attempt::Legacy),
+                        Err(e) => return Err(io_unknown(&legacy, ".write.lock", e)),
+                    }
+                }
+                Err(e) => return Err(io_unknown(&legacy, ".write.lock", e)),
+            }
         };
         // Declared paths as repo-relative strings, up front: a path
         // outside the tracker is a caller bug, refused like commit's.
@@ -1185,9 +1259,40 @@ impl Pm {
             since: Instant::now(),
             site,
             site_key: flock_path,
+            recovery,
             _flock: file,
         };
         let tree = self.tree_state(&git_dir)?;
+        if recovery {
+            // The recovery is the one operation that may run over an
+            // interrupted tracker. It is deliberately narrow: the
+            // crash's leftovers must exist, they must be path-local,
+            // and the crash's marker and snapshot are left exactly as
+            // the dead writer left them — the marker is the evidence
+            // and the tripwire, and the snapshot is the attribution
+            // baseline. A global Git hazard is not a path-local
+            // interruption and cannot be settled here.
+            let Some(i) = self.interruption(&git_dir, &tree)? else {
+                return Err(Error::rejected(
+                    "there is no interrupted write to recover — the crashed writer's \
+                     leftovers are gone. Recovery needs the marker and the staged \
+                     work they named; if the tracker really still holds work, inspect \
+                     it with `git status` and decide by hand. A retry will not help.",
+                ));
+            };
+            if i.global {
+                return Err(Error::rejected(format!(
+                    "the tracker has a Git-global state that a path-local recovery cannot \
+                     settle: {}. Resolve the Git operation itself first (finish or abort \
+                     the merge/rebase, or clear the stale index.lock), then review \
+                     again. A retry of this recovery will not help.",
+                    i.hazards.join(", ")
+                )));
+            }
+            // The marker stays unarmed: it survives this guard, and only
+            // a later writer reuses it once the leftovers are gone.
+            return Ok(Attempt::Got(lock));
+        }
         if reused {
             if let Some(i) = self.interruption(&git_dir, &tree)? {
                 match &declared_rel {
@@ -1247,6 +1352,7 @@ impl Pm {
         &self,
         wait: Option<Duration>,
         declared: Option<&[PathBuf]>,
+        recovery: bool,
     ) -> Result<Option<PmLock>> {
         self.fence_check()?;
         let deadline = wait.map(|w| Instant::now() + w);
@@ -1254,7 +1360,7 @@ impl Pm {
         let mut waiter: Option<Waiter> = None;
         loop {
             let queued = waiter.as_mut().and_then(Waiter::take);
-            let busy = match self.attempt(declared, queued)? {
+            let busy = match self.attempt(declared, queued, recovery)? {
                 Attempt::Got(lock) => {
                     self.fence_check()?;
                     return Ok(Some(lock));
@@ -1342,14 +1448,35 @@ impl Pm {
     #[track_caller]
     pub(super) fn acquire_scoped_default(&self, declared: &[PathBuf]) -> Result<PmLock> {
         Ok(self
-            .acquire(Some(WAIT), Some(declared))?
+            .acquire(Some(WAIT), Some(declared), false)?
             .expect("a waiting acquire answers"))
     }
 
     #[track_caller]
     pub(super) fn acquire_for(&self, wait: Duration) -> Result<PmLock> {
         Ok(self
-            .acquire(Some(wait), None)?
+            .acquire(Some(wait), None, false)?
+            .expect("a waiting acquire answers"))
+    }
+
+    /// CAD-1601: the recovery lock — the kernel flock every other
+    /// writer takes, taken over an interrupted tracker for the one
+    /// operation that settles it.
+    ///
+    /// It differs from an ordinary write in three deliberate ways: it
+    /// publishes no marker (the crash's own marker is the evidence
+    /// being acted on), it rewrites no dirty snapshot (the snapshot is
+    /// the attribution baseline), and the marker survives the guard
+    /// (only a verified, complete recovery settles the transaction, and
+    /// until then the tripwire must stay).
+    ///
+    /// A global Git hazard refuses it: a path-local recovery cannot
+    /// settle Git-global state. A legacy or foreign marker refuses it:
+    /// that is not this build's crash to settle.
+    #[track_caller]
+    pub fn lock_for_recovery(&self) -> Result<PmLock> {
+        Ok(self
+            .acquire(Some(WAIT), None, true)?
             .expect("a waiting acquire answers"))
     }
 
@@ -1508,6 +1635,50 @@ impl Pm {
                 self.dir.join(MARKER_LOCK_FILE).display()
             )),
         }
+    }
+
+    /// CAD-1601: the interruption details, read under the coordination
+    /// lock so the answer is exactly what the write path would decide.
+    /// Read-only: it creates, rewrites and removes nothing.
+    pub fn interruption_report(&self) -> Result<InterruptionReport> {
+        let git_dir = match self.lock_git_dir() {
+            Ok(d) => d,
+            Err(GitDirError::NotRepo) => {
+                return Err(Error::internal(format!(
+                    "{} is not a git repository",
+                    self.dir.display()
+                )))
+            }
+            Err(GitDirError::Io(e)) => {
+                return Err(Error::internal(format!(
+                    "{}: {e}",
+                    self.dir.join(".git").display()
+                )))
+            }
+        };
+        let flock_path = git_dir.join(FLOCK_FILE);
+        let _probe = match open_coordination(&flock_path, false) {
+            Ok(Some(f)) => match flock(&f, libc::LOCK_EX) {
+                Ok(true) => Some(Unlock(f)),
+                Ok(false) => {
+                    return Err(self.busy_error(false));
+                }
+                Err(e) => return Err(Error::internal(format!("{}: {e}", flock_path.display()))),
+            },
+            Ok(None) => None,
+            Err(e) => return Err(Error::internal(format!("{}: {e}", flock_path.display()))),
+        };
+        let tree = self.tree_state(&git_dir)?;
+        Ok(match self.interruption(&git_dir, &tree)? {
+            Some(i) => InterruptionReport {
+                paths: i.paths,
+                foreign: i.foreign,
+                foreign_paths: i.foreign_paths,
+                named: i.named,
+                hazards: i.hazards,
+            },
+            None => InterruptionReport::default(),
+        })
     }
 
     /// A crashed writer leaves the git index and worktree mid-write.
