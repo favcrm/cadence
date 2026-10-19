@@ -128,6 +128,19 @@ pub fn declares_smtp_custody(files: &BTreeMap<String, String>, app: &str) -> boo
     })
 }
 
+/// CAD-1562: an install is eligible for the hosted WhatsApp door only
+/// when one of its integrity-checked screen packages, declared for `app`,
+/// lists a `whatsapp.*` operation. Any scan or parse failure reads as not
+/// declared.
+pub fn declares_whatsapp_door(files: &BTreeMap<String, String>, app: &str) -> bool {
+    tags_in(files).is_ok_and(|tags| {
+        tags.iter().any(|tag| {
+            extract(files, tag)
+                .is_ok_and(|pkg| pkg.app == app && pkg.operations.iter().any(|op| op.is_whatsapp()))
+        })
+    })
+}
+
 /// Re-prove one screen package against the live bundle snapshot.
 ///
 /// Collects the `screens/<tag>/` members from `files`, refuses when the

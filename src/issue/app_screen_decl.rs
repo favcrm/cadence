@@ -203,6 +203,23 @@ pub enum ScreenOperation {
     ScreenPreviewClear,
     #[serde(rename = "screen.route.patch")]
     ScreenRoutePatch,
+    // CAD-1562: the hosted WhatsApp door (`agenticos.whatsapp-door.v1`).
+    #[serde(rename = "whatsapp.status")]
+    WhatsappStatus,
+    #[serde(rename = "whatsapp.connect_session")]
+    WhatsappConnectSession,
+    #[serde(rename = "whatsapp.conversations.list")]
+    WhatsappConversationsList,
+    #[serde(rename = "whatsapp.conversations.show")]
+    WhatsappConversationsShow,
+    #[serde(rename = "whatsapp.messages")]
+    WhatsappMessages,
+    #[serde(rename = "whatsapp.reply.prepare")]
+    WhatsappReplyPrepare,
+    #[serde(rename = "whatsapp.reply.send")]
+    WhatsappReplySend,
+    #[serde(rename = "whatsapp.reply.status")]
+    WhatsappReplyStatus,
 }
 
 impl ScreenOperation {
@@ -222,6 +239,21 @@ impl ScreenOperation {
                 | Self::OriginManage
                 | Self::ChatCampaignOpen
                 | Self::ChatCampaignBrief
+                | Self::WhatsappReplySend
+        )
+    }
+    /// CAD-1562: an operation of the hosted WhatsApp door.
+    pub fn is_whatsapp(self) -> bool {
+        matches!(
+            self,
+            Self::WhatsappStatus
+                | Self::WhatsappConnectSession
+                | Self::WhatsappConversationsList
+                | Self::WhatsappConversationsShow
+                | Self::WhatsappMessages
+                | Self::WhatsappReplyPrepare
+                | Self::WhatsappReplySend
+                | Self::WhatsappReplyStatus
         )
     }
     /// CAD-1537: the closed allowlist a read-only screen (a member or a
@@ -253,6 +285,13 @@ impl ScreenOperation {
                 | Self::ScreenRoutePatch
                 | Self::ScreenPreviewShow
                 | Self::ScreenPreviewClear
+                // CAD-1562: WhatsApp reads. The connect link and every
+                // reply step stay operator-only.
+                | Self::WhatsappStatus
+                | Self::WhatsappConversationsList
+                | Self::WhatsappConversationsShow
+                | Self::WhatsappMessages
+                | Self::WhatsappReplyStatus
         )
     }
     pub fn args_limit(self) -> usize {
@@ -261,7 +300,9 @@ impl ScreenOperation {
             Self::RecordsCreate
             | Self::RecordsUpdate
             | Self::ContentSave
-            | Self::ScreenPreviewShow => 49_152,
+            | Self::ScreenPreviewShow
+            | Self::WhatsappReplyPrepare
+            | Self::WhatsappReplySend => 49_152,
             _ => 16_384,
         }
     }

@@ -17,7 +17,7 @@ use super::{
     app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_media, app_records,
     app_release, app_runs, app_screens, app_social_drafts, approvals, apps, business_templates,
     connections, crm_send, crm_smtp, home, lane, operator, read_model, social_publish, stages,
-    threads, updates, wiki, workflows,
+    threads, updates, whatsapp, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -1372,6 +1372,17 @@ pub(crate) fn write_route(
             return;
         }
         let response = crm_smtp::handle(&mut request, state_dir, route);
+        send(request, response);
+        return;
+    }
+    // CAD-1562: every WhatsApp route is operator-proof POST-only, reads
+    // included, exactly like the daemon RPCs it relays.
+    if let Some(route) = whatsapp::route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = whatsapp::handle(&mut request, state_dir, route);
         send(request, response);
         return;
     }

@@ -78,6 +78,7 @@ mod team_assistants_http_refusal;
 mod threads;
 mod topics;
 mod updates;
+mod whatsapp;
 mod wiki;
 mod wiki_envelope;
 #[cfg(all(test, feature = "test-seam"))]
