@@ -1,4 +1,6 @@
 import { useContext, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { HugeiconsIcon } from "@hugeicons/react";
+import { InformationCircleIcon } from "@hugeicons/core-free-icons";
 import { READ_ONLY_REASON } from "../auth/gate";
 import { WriteGate } from "../auth/WriteGate";
 import { api, ApiError } from "../../lib/api";
@@ -177,6 +179,10 @@ function activate(event: KeyboardEvent, run: () => void) {
   }
 }
 
+function HelpHint({ text }: { text: string }) {
+  return <span className="agent-help" role="img" tabIndex={0} title={text} aria-label={text}><HugeiconsIcon icon={InformationCircleIcon} size={14} strokeWidth={1.7} aria-hidden="true" /></span>;
+}
+
 function ModelIdCombo({
   value,
   disabled,
@@ -220,7 +226,7 @@ function ModelIdCombo({
 
   return (
     <div className="fld">
-      <span className="slabel" id="agent-model-id-label">id</span>
+      <span className="slabel" id="agent-model-id-label">id <HelpHint text={hint} /></span>
       <div className="combo">
         <input
           className="field"
@@ -297,7 +303,6 @@ function ModelIdCombo({
           </ul>
         </div>}
       </div>
-      <p className="hint">{hint}</p>
     </div>
   );
 }
@@ -629,16 +634,15 @@ export default function ModelDefaults() {
     closeDrawer();
   }
 
-  const sub = {
-    harnesses: "The launchers and what they can run.",
-    profiles: "Versioned jobs: a description and the model it runs on.",
-    models: "Providers, their models, and what is allowed.",
+  const help = {
+    harnesses: "Harnesses start agents through registered adapters. Installation and versions are read from the host; declaring a harness does not install it.",
+    profiles: "Profiles define jobs and models. Save before syncing files or previewing a launch. Managed launches read the registry; generated files are for launches started by hand.",
+    models: "Manage providers and their models here. Pi models need allow-list permission; native CLIs do not. Catalog entries are observations, not permission to launch. Package pins do not install packages.",
   }[tab];
 
   function renderHarnesses() {
     return (
       <div>
-        <p className="lead">{t("Launchers. A harness starts an agent; a provider supplies the models. Pi launches on the Pi-extension providers — the native CLIs supply their own.")}</p>
         <div className="card">
           {draft.harnesses.map((harness) => {
             const observed = observations.harnesses[harness.id];
@@ -657,7 +661,6 @@ export default function ModelDefaults() {
             <div className="emptyrow"><span>{t("No harnesses yet.")}</span><Button size="sm" disabled={frozen} onClick={() => openNew("harnesses")}>{t("Add harness")}</Button></div>
           )}
         </div>
-        <p className="hint">{t("Recording is a declaration: the version is read from the host, the endpoint kinds come from Cadence's adapter registry.")}</p>
       </div>
     );
   }
@@ -665,7 +668,6 @@ export default function ModelDefaults() {
   function renderProfiles() {
     return (
       <div>
-        <p className="lead">{t("A profile is a job description and the model it runs on, versioned with the project. Sync writes it into the harness files for launches started by hand.")}</p>
         <div className="card">
           {draft.profiles.map((profile) => {
             const observed = observations.profiles[profile.id];
@@ -689,7 +691,6 @@ export default function ModelDefaults() {
             <div className="emptyrow"><span>{t("No profiles yet.")}</span><Button size="sm" disabled={frozen} onClick={() => openNew("profiles")}>{t("Add profile")}</Button></div>
           )}
         </div>
-        <p className="hint">{t("Files exist for hands-on launches only: Cadence-managed launches read the registry, so nothing has to be kept in step. File sync and preview use the last saved revision.")}</p>
       </div>
     );
   }
@@ -697,7 +698,6 @@ export default function ModelDefaults() {
   function renderModels() {
     return (
       <div>
-        <p className="lead">{t("Providers first, then the models under each. Toggle a model into the allow list; profiles pick from what is enabled. Native CLIs have no allow list.")}</p>
         {draft.providers.map((provider) => {
           const models = draft.models.filter((model) => model.provider === provider.id);
           const on = models.filter((model) => !provider.gate || (draft.scope[model.id] ?? "off") !== "off").length;
@@ -769,7 +769,7 @@ export default function ModelDefaults() {
               <Button size="sm" variant="danger" disabled={frozen} onClick={() => edit((config) => ({ ...config, pins: config.pins.filter((_, itemIndex) => itemIndex !== index) }))}>Remove</Button>
             </div>
           ))}
-          {draft.pins.length === 0 && <p className="hint">No package pins in this revision. A pin records a version; it does not install a package.</p>}
+          {draft.pins.length === 0 && <p className="hint">No package pins.</p>}
           <div className="addrow"><Button size="sm" disabled={frozen} onClick={() => edit((config) => ({ ...config, pins: [...config.pins, { pkg: "", pinned: "" }] }))}>Add pin</Button></div>
         </details>
       </div>
@@ -777,7 +777,7 @@ export default function ModelDefaults() {
   }
 
   function field(label: string, node: ReactNode, hint?: string) {
-    return <label className="fld"><span className="slabel">{label}</span>{node}{hint ? <p className="hint">{hint}</p> : null}</label>;
+    return <label className="fld"><span className="slabel">{label}{hint && <HelpHint text={hint} />}</span>{node}</label>;
   }
 
   function renderDrawer() {
@@ -804,12 +804,10 @@ export default function ModelDefaults() {
             </div>
             {!existing && field("id", <input disabled={frozen} value={harness.id} placeholder="pi" onChange={(event) => set({ id: event.target.value })} />, "Registered adapter ID, independent of the display label.")}
             <div className="vrow"><span>on this host</span><span className={`badge ${observed?.installed ? "b-ok" : "plain"}`}>{observed?.installed === true ? `installed · ${observed.live} live` : observed?.installed === false ? "not installed" : "unknown"}{observed?.version ? ` · ${observed.version}` : ""}</span></div>
-            <p className="hint">Read from the host, not set here — a declared harness that is not installed fences on launch.</p>
           </div></section>
           <section className="dsec"><div className="dinn">
             {field("note", <textarea disabled={frozen} value={harness.note} onChange={(event) => set({ note: event.target.value })} />)}
           </div></section>
-          <p className="hint">The endpoint kinds and launch parameters come from Cadence's adapter registry — a provider that is not there needs its adapter before this harness can use it.</p>
           <div className="dact">
             <Button size="sm" variant="primary" disabled={frozen} onClick={() => {
               if (existing) { closeDrawer(); return; }
@@ -849,7 +847,6 @@ export default function ModelDefaults() {
             </div>
             {field("note", <textarea disabled={frozen} value={provider.note} onChange={(event) => set({ note: event.target.value })} />)}
           </div></section>
-          <p className="hint">A Pi extension provider is what the pi launcher loads with -e; a native CLI provider is served by the harness itself.</p>
           <div className="dact">
             <Button size="sm" variant="primary" disabled={frozen} onClick={() => {
               if (existing) { closeDrawer(); return; }
@@ -918,14 +915,13 @@ export default function ModelDefaults() {
               {field("max out", <input data-field="out" disabled={frozen} value={model.out} placeholder="128K" onChange={(event) => set({ out: event.target.value })} />)}
             </div>
             <div className="vrow"><span>live agents on it</span><b>{observations.models[model.id]?.live ?? 0}</b></div>
-            <p className="hint">Observed from the fleet, not set here. Unknown catalog metadata stays unknown until you pick a catalog row.</p>
             <div className="grid2">
               {field("thinking", <div>{fact(model.thinking)}</div>)}
               {field("images", <div>{fact(model.images)}</div>)}
             </div>
-            {provider?.gate ? <div className="grid2">{field("allow list", <select disabled={frozen} value={draft.scope[model.id] ?? "off"} onChange={(event) => edit((config) => ({ ...config, scope: { ...config.scope, [model.id]: event.target.value as AgentScope } }))}>{SCOPES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>)}</div> : <p className="hint">{provider?.label || "This provider"} has no allow list — its models are always available.</p>}
+            {provider?.gate && <div className="grid2">{field("allow list", <select disabled={frozen} value={draft.scope[model.id] ?? "off"} onChange={(event) => edit((config) => ({ ...config, scope: { ...config.scope, [model.id]: event.target.value as AgentScope } }))}>{SCOPES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>)}</div>}
           </div></section>
-          <p className="hint">{users.length ? `Used by ${users.join(", ")}.` : "No profile uses this model yet."}</p>
+          {!!users.length && <p className="hint">Used by {users.join(", ")}.</p>}
           {drawer.idDraft !== undefined && <p className="notice bad" role="alert">{drawer.idDraft.trim() ? `Model '${drawer.idDraft}' already exists.` : "Model needs an id."}</p>}
           <div className="dact">
             <Button size="sm" variant="primary" disabled={frozen || drawer.idDraft !== undefined} onClick={() => {
@@ -995,7 +991,7 @@ export default function ModelDefaults() {
               {(observed?.files ?? []).map((file) => (
                 <div className="target" key={file.path}><span className="tpath">{file.path}</span><span className={`badge ${file.status === "in sync" ? "b-ok" : file.status === "needs sync" || file.status === "unmanaged" ? "b-warn" : "plain"}`}>{file.status}</span></div>
               ))}
-              {!observed?.files?.length && <p className="hint">No generated-file status for this profile yet. Save, then sync, to write managed files.</p>}
+              {!observed?.files?.length && <p className="hint">No generated files.</p>}
             </div></section>
             <section className="dsec"><div className="dtitle">History{observed?.version ? ` · v${observed.version}` : ""}</div><div className="dinn">
               <div className="hist">
@@ -1039,7 +1035,6 @@ export default function ModelDefaults() {
               </div>
             </>
           )}
-          <p className="hint">Cadence-managed launches need no files: the registry is read at launch. Preview does not start an agent; it resolves the saved profile, harness, model and permission.</p>
         </>
       );
     }
@@ -1061,9 +1056,9 @@ export default function ModelDefaults() {
   return (
     <section className="agents-settings" aria-busy={loading || saving}>
       <div className="page-head">
-        <div>
+        <div className="title-line">
           <h1>{t("Agents")}</h1>
-          <p className="sub">{t(sub)}</p>
+          <HelpHint text={t(help)} />
         </div>
         <div className="head-actions">
           <Button disabled={frozen} onClick={() => openNew(tab)}>{tab === "harnesses" ? t("Add harness") : tab === "profiles" ? t("Add profile") : t("Add provider")}</Button>
@@ -1071,7 +1066,6 @@ export default function ModelDefaults() {
           <Button disabled={!saved?.config.profiles.length || dirty} title={dirty ? "Save before preview" : undefined} onClick={() => { if (!saved?.config.profiles.length) return; setDrawer({ kind: "preview", profileId: saved.config.profiles[0]?.id || "", harnessId: saved.config.harnesses[0]?.id || "" }); }}>Preview a launch…</Button>
         </div>
       </div>
-      <p className="notice quiet">{t("One registry, versioned with the project. Everything here is created and managed on this page: harnesses, model providers, their models, and the profiles that use them. Catalog rows are observations, not permission to launch.")}</p>
       {readOnly && <p className="notice" role="status">{saved?.read_only || gate === READ_ONLY_REASON ? t("This board is read-only. You can inspect agent settings here.") : t("Sign in using the top bar to edit agent settings.")}</p>}
       {loading && !saved && <p role="status">{t("Loading agent settings…")}</p>}
       {loadError && (
@@ -1106,9 +1100,11 @@ export default function ModelDefaults() {
           <div className="savebar">
             <span className={`badge ${issues.length ? "b-fail" : dirty ? "b-warn" : "plain"}`}>{issues.length ? `${issues.length} problem${issues.length > 1 ? "s" : ""}` : changeCount ? `${changeCount} change${changeCount > 1 ? "s" : ""}` : "no changes"}</span>
             <span className="ref">{readOnly ? "read-only: saving needs an operator session" : `revision ${saved.revision}`}</span>
-            <span className="ref" style={{ marginLeft: "auto" }}>{note}</span>
-            <Button size="sm" disabled={!dirty || saving} onClick={() => { if (saved) { setDraft(normalize(saved.config)); setSaveError(null); setConflict(false); setNote("Draft reset to the last saved revision."); closeDrawer(); } }}>Discard</Button>
-            <Button size="sm" variant="primary" disabled={!dirty || !!issues.length || frozen || conflict} loading={saving} onClick={() => void save()}>Save</Button>
+            <span className="ref save-note">{note}</span>
+            <div className="save-actions">
+              <Button size="sm" disabled={!dirty || saving} onClick={() => { if (saved) { setDraft(normalize(saved.config)); setSaveError(null); setConflict(false); setNote("Draft reset to the last saved revision."); closeDrawer(); } }}>Discard</Button>
+              <Button size="sm" variant="primary" disabled={!dirty || !!issues.length || frozen || conflict} loading={saving} onClick={() => void save()}>Save</Button>
+            </div>
           </div>
         </>
       )}

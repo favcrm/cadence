@@ -2087,6 +2087,11 @@ An empty registry shows empty states, not the mockup's demo rows. Providers &
 models follows the approved mockup without a Role defaults editor; stored
 defaults are preserved and inherited profiles still resolve them. Launch
 eligibility comes from saved-state Preview, not an optimistic unsaved badge.
+The operator-approved clean presentation omits the registry banner, subtitles
+and explanatory paragraphs. Muted information icons expose page and field help
+through native tooltips and accessible labels. Validation, failures, live
+status and concise empty states stay visible; Save and Discard remain grouped
+on narrow screens.
 
 Save commits harness/provider/model declarations, role defaults, Pi policy,
 pins and profile definitions in one revision-bound SQLite transaction.
