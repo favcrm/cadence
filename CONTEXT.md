@@ -10,6 +10,8 @@ Cadence coordinates people and agents doing work through apps and projects.
 
 **App installation**: A workspace's configured instance of an app, with its own identity, team defaults and approved capabilities. Updating the app does not change who owns its work.
 
+**Catalogue release**: An optional locator of catalogue id, version and digest recorded on an installation after that exact package matched directory metadata. The locator is not trust or permission, and publishing or disabling a release does not change an installation that was already recorded.
+
 **App context**: An optional named context within an app installation that keeps a client's or brand's settings, records and connection bindings separate. A context does not grant access by itself.
 
 **Project**: An optional grouping of related work, potentially spanning multiple apps and repositories. Linking work to a project does not transfer ownership or grant access.

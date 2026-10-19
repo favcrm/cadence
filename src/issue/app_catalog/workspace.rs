@@ -1,4 +1,6 @@
 //! Operator-owned workspace installation transport. Execution is deliberately absent.
+use super::catalogue::{authorize, resolve_provenance, Provenance};
+pub(crate) use super::catalogue::{CatalogueClaim, CatalogueDirectory};
 use super::*;
 use crate::issue::{app, app_view, workflow, write};
 use crate::store::Store;
@@ -33,6 +35,13 @@ pub(crate) struct UpgradeJournal {
     /// this field existed still decodes — it carries nothing.
     #[serde(default)]
     pub(crate) bindings: BTreeMap<String, Value>,
+    /// Catalogue locator written into the new record. Absence with
+    /// `catalogue_manual` false is a non-catalogue upgrade. Absence with
+    /// `catalogue_manual` true is an explicit clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    catalogue: Option<app::CatalogueOrigin>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    catalogue_manual: bool,
     diff: Value,
     compatibility: Value,
 }
@@ -44,6 +53,45 @@ impl UpgradeJournal {
     pub(crate) fn new_digest(&self) -> &str {
         &self.expected_new_digest
     }
+}
+
+fn journal_catalogue_matches(journal: &UpgradeJournal, claim: &CatalogueClaim) -> bool {
+    match claim {
+        CatalogueClaim::Absent => journal.catalogue.is_none() && !journal.catalogue_manual,
+        CatalogueClaim::Manual => journal.catalogue.is_none() && journal.catalogue_manual,
+        CatalogueClaim::Locator(locator) => {
+            journal.catalogue.as_ref() == Some(locator) && !journal.catalogue_manual
+        }
+    }
+}
+
+fn catalogue_decision(
+    existing: Option<&app::CatalogueOrigin>,
+    claim: &CatalogueClaim,
+    updating: bool,
+    old_version: Option<&str>,
+    new_manifest: &app::Manifest,
+    new_digest: &str,
+    directory: CatalogueDirectory<'_>,
+) -> Result<Provenance> {
+    let decision = resolve_provenance(
+        existing,
+        claim,
+        updating,
+        old_version,
+        &new_manifest.version,
+        new_digest,
+    )?;
+    if let Some(origin) = &decision.origin {
+        authorize(
+            directory,
+            origin,
+            &new_manifest.app,
+            &new_manifest.version,
+            new_digest,
+        )?;
+    }
+    Ok(decision)
 }
 
 fn upgrade_journal_path(id: &InstallationId, request: &str) -> PathBuf {
@@ -89,6 +137,47 @@ fn structural_diff(old: &BTreeMap<String, String>, new: &BTreeMap<String, String
     json!({"added":added,"removed":removed,"changed":changed})
 }
 
+/// Compare declarations, never configured connections or credentials.
+fn declared_access_changes(old: Option<&app::Manifest>, new: &app::Manifest) -> Value {
+    let old_connections = old.map_or(&[][..], |manifest| manifest.connections.as_slice());
+    let mut capabilities = serde_json::Map::new();
+    for (slot, declaration) in &new.capabilities {
+        let before = old.and_then(|manifest| manifest.capabilities.get(slot));
+        if before != Some(declaration) {
+            capabilities.insert(
+                slot.clone(),
+                json!({"before": before, "after": declaration}),
+            );
+        }
+    }
+    if let Some(old) = old {
+        for (slot, declaration) in &old.capabilities {
+            if !new.capabilities.contains_key(slot) {
+                capabilities.insert(slot.clone(), json!({"before": declaration, "after": null}));
+            }
+        }
+    }
+    let added = new
+        .connections
+        .iter()
+        .filter(|slot| !old_connections.contains(slot))
+        .map(|slot| Value::String(slot.clone()))
+        .collect();
+    let removed = old_connections
+        .iter()
+        .filter(|slot| !new.connections.contains(slot))
+        .map(|slot| Value::String(slot.clone()))
+        .collect();
+    let connections = serde_json::Map::from_iter([
+        ("added".into(), Value::Array(added)),
+        ("removed".into(), Value::Array(removed)),
+    ]);
+    Value::Object(serde_json::Map::from_iter([
+        ("connections".into(), Value::Object(connections)),
+        ("capabilities".into(), Value::Object(capabilities)),
+    ]))
+}
+
 pub(crate) struct UpgradeRequest<'a> {
     pub(crate) id: &'a str,
     pub(crate) source: &'a str,
@@ -96,6 +185,8 @@ pub(crate) struct UpgradeRequest<'a> {
     pub(crate) expected_generation: &'a str,
     pub(crate) expected_new_digest: &'a str,
     pub(crate) request_id: &'a str,
+    pub(crate) catalogue: &'a CatalogueClaim,
+    pub(crate) directory: CatalogueDirectory<'a>,
 }
 
 fn committed_upgrade_repeat(
@@ -119,6 +210,7 @@ fn committed_upgrade_repeat(
         || journal.expected_new_digest != request.expected_new_digest
         || bundle_digest(&journal.files) != request.expected_new_digest
         || new_digest.is_some_and(|digest| bundle_digest(&journal.files) != digest)
+        || !journal_catalogue_matches(&journal, request.catalogue)
     {
         return Err(Error::rejected(
             "upgrade request ID was reused for different material",
@@ -570,7 +662,16 @@ fn check_expected_digest(expected: &str, actual: &str) -> Result<()> {
 ///
 /// CAD-1422: `builtin:<catalog_id>` was the host built-in source form; the
 /// catalog is retired, so a `builtin:` source is refused here.
-pub(crate) fn install_check(pm: &Pm, source: &str) -> Result<Value> {
+pub(crate) fn install_check(pm: &Pm, source: &str, catalogue: &CatalogueClaim) -> Result<Value> {
+    install_check_from(pm, source, catalogue, CatalogueDirectory::Configured)
+}
+
+pub(super) fn install_check_from(
+    pm: &Pm,
+    source: &str,
+    catalogue: &CatalogueClaim,
+    directory: CatalogueDirectory<'_>,
+) -> Result<Value> {
     let (files, validated, provenance) = match source.strip_prefix(BUILTIN_SOURCE_PREFIX) {
         Some(catalog_id) => builtin_bundle(pm, catalog_id)?,
         None => resolved_bundle(pm, source)?,
@@ -580,10 +681,21 @@ pub(crate) fn install_check(pm: &Pm, source: &str) -> Result<Value> {
         let (catalog, _) = current(&root)?;
         same_name_workspace(&catalog, &validated.manifest.app)
     })?;
+    let digest = bundle_digest(&files);
+    let decision = catalogue_decision(
+        None,
+        catalogue,
+        false,
+        None,
+        &validated.manifest,
+        &digest,
+        directory,
+    )?;
     Ok(json!({"schema":1,"name":validated.manifest.app,
         "version":validated.manifest.version,"source":provenance,
-        "digest":bundle_digest(&files),
+        "catalogue":decision.origin,"digest":digest,
         "files":files.keys().collect::<Vec<_>>(),
+        "access_diff":declared_access_changes(None, &validated.manifest),
         "committed":false,"compatibility":validated.compatibility,"notes":validated.notes,
         "secret_warnings":crate::secret::warnings_json(&validated.secret_warnings)}))
 }
@@ -784,15 +896,52 @@ pub(crate) fn install(
     state: &Path,
     source: &str,
     expected_digest: Option<&str>,
+    catalogue: &CatalogueClaim,
+) -> Result<Value> {
+    install_from(
+        pm,
+        state,
+        source,
+        expected_digest,
+        catalogue,
+        CatalogueDirectory::Configured,
+    )
+}
+
+pub(super) fn install_from(
+    pm: &Pm,
+    state: &Path,
+    source: &str,
+    expected_digest: Option<&str>,
+    catalogue: &CatalogueClaim,
+    directory: CatalogueDirectory<'_>,
 ) -> Result<Value> {
     let _ = state; // Caller must pass the daemon's connection-bound operator gate.
     let (files, validated, provenance) = resolved_bundle(pm, source)?;
+    let digest = bundle_digest(&files);
+    if let (Some(expected), CatalogueClaim::Locator(locator)) = (expected_digest, catalogue) {
+        if expected != locator.digest {
+            return Err(Error::rejected(
+                "catalogue digest does not match the expected digest",
+            ));
+        }
+    }
+    let decision = catalogue_decision(
+        None,
+        catalogue,
+        false,
+        None,
+        &validated.manifest,
+        &digest,
+        directory,
+    )?;
     install_resolved(
         pm,
         files,
         validated,
         provenance,
         expected_digest,
+        decision.origin,
         &|| Ok(()),
     )
 }
@@ -807,6 +956,7 @@ fn install_resolved(
     validated: app::Validated,
     provenance: app::Source,
     expected_digest: Option<&str>,
+    catalogue: Option<app::CatalogueOrigin>,
     guard: &dyn Fn() -> Result<()>,
 ) -> Result<Value> {
     // Refuse a changed bundle before the lock, the catalog read or any write.
@@ -831,6 +981,7 @@ fn install_resolved(
         removed: None,
         restore_after: None,
         purge_after: None,
+        catalogue,
     };
     catalog.installations.insert(
         id.clone(),
@@ -881,10 +1032,31 @@ pub(crate) fn upgrade_check(
     source: &str,
     expected_digest: &str,
     expected_generation: &str,
+    catalogue: &CatalogueClaim,
+) -> Result<Value> {
+    upgrade_check_from(
+        pm,
+        id,
+        source,
+        expected_digest,
+        expected_generation,
+        catalogue,
+        CatalogueDirectory::Configured,
+    )
+}
+
+pub(super) fn upgrade_check_from(
+    pm: &Pm,
+    id: &str,
+    source: &str,
+    expected_digest: &str,
+    expected_generation: &str,
+    catalogue: &CatalogueClaim,
+    directory: CatalogueDirectory<'_>,
 ) -> Result<Value> {
     let id = InstallationId::parse(id)?;
     let (files, validated, provenance) = upgrade_bundle(pm, source)?;
-    let (entry_name, old_files) = optimistic(pm, || {
+    let (entry_name, old_files, existing, old_manifest) = optimistic(pm, || {
         let root = Root::open(&pm.dir)?;
         let (catalog, _) = current(&root)?;
         let entry = catalog
@@ -902,24 +1074,41 @@ pub(crate) fn upgrade_check(
         if hash(&yaml(&catalog)?) != expected_generation {
             return Err(Error::rejected("workspace catalog generation is stale"));
         }
-        let (old_bundle, _) = entry.paths(&id);
+        let (old_bundle, record_path) = entry.paths(&id);
         let old_files = snapshot(&root, &old_bundle, false)?;
         if bundle_digest(&old_files) != expected_digest {
             return Err(Error::rejected("workspace installation digest is stale"));
         }
+        let installed = record(&required(&root, &record_path, RECORD_CAP)?, &entry.app)?;
+        let old_manifest = app::parse_manifest(
+            old_files
+                .get("app.md")
+                .ok_or_else(|| Error::rejected("installed bundle has no manifest"))?,
+        )?;
         // Published state must still be what was read.
         catalog.require_current(&root)?;
         let name = entry.app.clone();
-        Ok((name, old_files))
+        Ok((name, old_files, installed.catalogue, old_manifest))
     })?;
     let new_digest = bundle_digest(&files);
     if new_digest == expected_digest {
         return Err(Error::rejected("upgrade bundle is unchanged"));
     }
+    let decision = catalogue_decision(
+        existing.as_ref(),
+        catalogue,
+        true,
+        Some(&old_manifest.version),
+        &validated.manifest,
+        &new_digest,
+        directory,
+    )?;
     Ok(json!({"schema":1,"install_id":&*id,"name":entry_name,
         "version":validated.manifest.version,"source":provenance,
+        "catalogue":decision.origin,
         "expected_digest":expected_digest,"expected_generation":expected_generation,
         "digest":new_digest,"structural_diff":structural_diff(&old_files,&files),
+        "access_diff":declared_access_changes(Some(&old_manifest), &validated.manifest),
         "committed":false,"approved":false,"compatibility":validated.compatibility,"notes":validated.notes,
         "secret_warnings":crate::secret::warnings_json(&validated.secret_warnings)}))
 }
@@ -971,6 +1160,39 @@ pub(crate) fn upgrade(
     }
     let (files, validated, provenance) = upgrade_bundle(pm, source)?;
     let new_digest = bundle_digest(&files);
+    if let CatalogueClaim::Locator(locator) = request.catalogue {
+        if locator.digest != request.expected_new_digest {
+            return Err(Error::rejected(
+                "catalogue digest does not match the expected new digest",
+            ));
+        }
+    }
+    let (seen_catalogue, seen_version) = optimistic(pm, || {
+        let root = Root::open(&pm.dir)?;
+        let (catalog, _) = current(&root)?;
+        let entry = catalog
+            .installations
+            .get(&id)
+            .ok_or_else(|| Error::rejected("unknown installation ID"))?;
+        let (bundle, record_path) = entry.paths(&id);
+        let old_files = snapshot(&root, &bundle, false)?;
+        let installed = record(&required(&root, &record_path, RECORD_CAP)?, &entry.app)?;
+        let old_manifest = app::parse_manifest(
+            old_files
+                .get("app.md")
+                .ok_or_else(|| Error::rejected("installed bundle has no manifest"))?,
+        )?;
+        Ok((installed.catalogue, old_manifest.version))
+    })?;
+    let decision = catalogue_decision(
+        seen_catalogue.as_ref(),
+        request.catalogue,
+        true,
+        Some(&seen_version),
+        &validated.manifest,
+        &new_digest,
+        request.directory,
+    )?;
     let _lock = pm.lock()?;
     let root = Root::open(&pm.dir)?;
     let (mut catalog, before_catalog) = current(&root)?;
@@ -1020,7 +1242,23 @@ pub(crate) fn upgrade(
             "upgrade record has a different installation ID",
         ));
     }
+    if next_record.catalogue != seen_catalogue {
+        return Err(Error::rejected(
+            "catalogue origin changed since the upgrade was checked",
+        ));
+    }
+    let old_manifest = app::parse_manifest(
+        old_files
+            .get("app.md")
+            .ok_or_else(|| Error::rejected("installed bundle has no manifest"))?,
+    )?;
+    if old_manifest.version != seen_version {
+        return Err(Error::rejected(
+            "installed version changed since the upgrade was checked",
+        ));
+    }
     next_record.source = provenance;
+    next_record.catalogue = decision.origin.clone();
     next_record.updated_at = Some(crate::issue::time::iso(crate::issue::time::now_epoch()));
     let entry = catalog.installations.get_mut(&id).unwrap();
     entry.bundle_revision = Some(new_digest.trim_start_matches("sha256:").to_string());
@@ -1038,6 +1276,8 @@ pub(crate) fn upgrade(
         before_record,
         after_record: yaml(&next_record)?,
         bindings: carried.into_iter().collect(),
+        catalogue: decision.origin,
+        catalogue_manual: decision.manual,
         diff: structural_diff(&old_files, &files),
         compatibility,
         files,
@@ -1134,6 +1374,19 @@ fn apply_upgrade<F: FnOnce(&UpgradeJournal) -> Result<Vec<String>>>(
             "upgrade journal changes installation authority or identity",
         ));
     }
+    if next.catalogue != journal.catalogue
+        || (journal.catalogue_manual && next.catalogue.is_some())
+        || (!journal.catalogue_manual && old.catalogue.is_some() && journal.catalogue.is_none())
+    {
+        return Err(Error::rejected(
+            "upgrade journal changes catalogue provenance",
+        ));
+    }
+    if let (Some(previous), Some(origin)) = (&old.catalogue, &next.catalogue) {
+        if previous.id != origin.id {
+            return Err(Error::rejected("upgrade journal changes the catalogue id"));
+        }
+    }
     // CAD-1140: the carry set the journal stages is the one apply
     // delivers — every receipt still pinned to the replaced digest, each
     // `install_id`/`context.install_id` naming this installation. A
@@ -1168,6 +1421,15 @@ fn apply_upgrade<F: FnOnce(&UpgradeJournal) -> Result<Vec<String>>>(
     )?;
     if validated.manifest.app != old_entry.app {
         return Err(Error::rejected("upgrade manifest changes app identity"));
+    }
+    if let Some(origin) = &next.catalogue {
+        if origin.version != validated.manifest.version
+            || origin.digest != journal.expected_new_digest
+        {
+            return Err(Error::rejected(
+                "upgrade journal catalogue locator does not match the package",
+            ));
+        }
     }
     for (name, text) in &journal.files {
         if !member_path_ok(name) || text.len() as u64 > app::file_cap(name) {
@@ -1567,7 +1829,7 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
         })
         .collect::<Vec<_>>();
     Ok(
-        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"view_descriptor":view_descriptor,"view_descriptor_digest":view_descriptor_digest,"compatibility":compatibility,"source":record.source,"installed_at":record.installed_at,"removed":record.removed,"restore_after":record.restore_after,"purge_after":record.purge_after,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"smtp_custody":crate::issue::app_screen_pkg::declares_smtp_custody(&files, &manifest.app),"whatsapp_door":crate::issue::app_screen_pkg::declares_whatsapp_door(&files, &manifest.app),"listing":manifest.listing.as_ref().map(|l| l.value.clone()),"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
+        json!({"schema":1,"workspace":"default","catalog_generation":hash(&yaml(catalog)?),"install_id":&**id,"name":manifest.app,"title":manifest.title,"version":manifest.version,"summary":manifest.summary,"project":entry.project,"project_link":entry.project,"storage_kind":if entry.storage==Storage::Workspace {"workspace"} else {"legacy"},"digest":bundle_digest(&files),"view_descriptor":view_descriptor,"view_descriptor_digest":view_descriptor_digest,"compatibility":compatibility,"source":record.source,"catalogue":record.catalogue,"installed_at":record.installed_at,"removed":record.removed,"restore_after":record.restore_after,"purge_after":record.purge_after,"approval":{"state":if entry.storage==Storage::Workspace {"unapproved"} else {"unknown"}},"approved":if entry.storage==Storage::Workspace {json!(false)} else {Value::Null},"executable":false,"execution_note":"catalog execution is unavailable; existing legacy execution paths are unchanged","guide":manifest.guide,"capabilities":serde_json::to_value(&manifest.capabilities).map_err(|e| Error::internal(format!("installed slot contract is not serializable: {e}")))?,"connection_slots":manifest.connections,"smtp_custody":crate::issue::app_screen_pkg::declares_smtp_custody(&files, &manifest.app),"whatsapp_door":crate::issue::app_screen_pkg::declares_whatsapp_door(&files, &manifest.app),"listing":manifest.listing.as_ref().map(|l| l.value.clone()),"record":record,"files":files.keys().collect::<Vec<_>>(),"workflows":workflows }),
     )
 }
 /// CAD-1189: catalog reads take no lock. Every writer journals first
@@ -2070,6 +2332,7 @@ pub(crate) fn install_builtin_guarded(
         validated,
         provenance,
         Some(expected_digest),
+        None,
         guard,
     )
 }
@@ -2097,6 +2360,26 @@ pub(crate) fn update_check(pm: &Pm, install_id: &str) -> Result<Value> {
     let current_digest = desc["digest"].as_str().unwrap_or_default().to_string();
     let record: Record = serde_json::from_value(desc["record"].clone())
         .map_err(|e| Error::internal(format!("installation record is not readable: {e}")))?;
+    if let Some(locator) = record.catalogue.as_ref() {
+        let installed_version = desc["version"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("installed version is not readable"))?;
+        // Directory I/O must not hold the workspace's mutation lock.
+        drop(_lock);
+        let origin = crate::ui::public_directory::catalog_origin()
+            .ok_or_else(|| Error::rejected("catalogue metadata is unavailable"))?;
+        let document = crate::ui::public_directory::fetch_versions_at(&origin, &locator.id)?;
+        let mut result = super::catalogue::update_check(
+            &document,
+            locator,
+            &entry.app,
+            installed_version,
+            &current_digest,
+        )?;
+        result["install_id"] = json!(&*id);
+        result["host_checked"] = json!(false);
+        return Ok(result);
+    }
     let source = record.source;
     match source {
         app::Source::Builtin { id: cat_id, digest } => {
@@ -2303,6 +2586,8 @@ mod cad1189_acceptance;
 mod cad1254_acceptance;
 #[cfg(test)]
 mod cad1270_parity;
+#[cfg(test)]
+mod catalogue_acceptance;
 
 #[cfg(test)]
 mod tests {
@@ -2334,7 +2619,14 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         let pm = Pm::init(pm_dir.path()).unwrap();
         let source = sources.path().join("bundle-a");
         bundle(&source, MANIFEST_A);
-        let out = install(&pm, state_dir.path(), source.to_str().unwrap(), None).unwrap();
+        let out = install(
+            &pm,
+            state_dir.path(),
+            source.to_str().unwrap(),
+            None,
+            &CatalogueClaim::Absent,
+        )
+        .unwrap();
         let id = out["install_id"].as_str().unwrap().to_string();
         (pm_dir, state_dir, sources, id)
     }
@@ -2405,8 +2697,15 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         bundle(&source_b, MANIFEST_B);
         let digest = before["digest"].as_str().unwrap();
         let generation = before["catalog_generation"].as_str().unwrap();
-        let check =
-            upgrade_check(&pm, &id, source_b.to_str().unwrap(), digest, generation).unwrap();
+        let check = upgrade_check(
+            &pm,
+            &id,
+            source_b.to_str().unwrap(),
+            digest,
+            generation,
+            &CatalogueClaim::Absent,
+        )
+        .unwrap();
         let new_digest = check["digest"].as_str().unwrap().to_string();
         upgrade(
             &pm,
@@ -2417,6 +2716,8 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
                 expected_generation: generation,
                 expected_new_digest: &new_digest,
                 request_id: "fixture-upgrade",
+                catalogue: &CatalogueClaim::Absent,
+                directory: CatalogueDirectory::Configured,
             },
             |_, _| Ok((json!({}), BTreeMap::new())),
             |_| Ok(Vec::new()),

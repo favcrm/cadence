@@ -102,7 +102,13 @@ fn cad1254_screen_asset_cap_refuses_oversize_and_keeps_256k_elsewhere() {
     for (app_name, rel, len, refused_at) in cases {
         let src = sources.path().join(app_name);
         bundle(&src, app_name, rel, len);
-        let ws = install(&pm, state.path(), src.to_str().unwrap(), None);
+        let ws = install(
+            &pm,
+            state.path(),
+            src.to_str().unwrap(),
+            None,
+            &CatalogueClaim::Absent,
+        );
         let legacy = app::install(&pm, "legacy", src.to_str().unwrap(), state.path(), "accept");
         match refused_at {
             Some(cap) => {

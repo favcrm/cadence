@@ -496,8 +496,13 @@ impl Shared {
     ) -> Result<Value> {
         self.operator_connection("workspace app catalog", params, peer_pid)?;
         let allowed: &[&str] = match method {
-            "app_workspace_install" => &["source", "expected_digest"],
-            "app_workspace_install_check" => &["source"],
+            "app_workspace_install" => &[
+                "source",
+                "expected_digest",
+                "catalogue",
+                "catalogue_resolution",
+            ],
+            "app_workspace_install_check" => &["source", "catalogue", "catalogue_resolution"],
             "app_workspace_upgrade" => &[
                 "install_id",
                 "source",
@@ -505,12 +510,16 @@ impl Shared {
                 "expected_generation",
                 "expected_new_digest",
                 "request_id",
+                "catalogue",
+                "catalogue_resolution",
             ],
             "app_workspace_upgrade_check" => &[
                 "install_id",
                 "source",
                 "expected_digest",
                 "expected_generation",
+                "catalogue",
+                "catalogue_resolution",
             ],
             "app_workspace_upgrade_recover" => &["install_id", "request_id"],
             "app_workspace_migration_recover" => &["journal_id", "rollback"],
@@ -523,6 +532,17 @@ impl Shared {
         if object.keys().any(|key| !allowed.contains(&key.as_str())) {
             return Err(Error::rejected("unknown workspace catalog parameter"));
         }
+        let catalogue = if matches!(
+            method,
+            "app_workspace_install"
+                | "app_workspace_install_check"
+                | "app_workspace_upgrade"
+                | "app_workspace_upgrade_check"
+        ) {
+            crate::issue::app_catalog::catalogue::claim_from_object(object)?
+        } else {
+            crate::issue::app_catalog::catalogue::CatalogueClaim::Absent
+        };
         // A Git source is vetted exactly as the Explorer's check vets it,
         // before the daemon opens the network.
         if matches!(
@@ -552,10 +572,11 @@ impl Shared {
                     &self.state_dir,
                     required_str(params, "source")?,
                     expected,
+                    &catalogue,
                 )
             }
             "app_workspace_install_check" => {
-                workspace::install_check(&pm, required_str(params, "source")?)
+                workspace::install_check(&pm, required_str(params, "source")?, &catalogue)
             }
             "app_workspace_upgrade_check" => workspace::upgrade_check(
                 &pm,
@@ -563,6 +584,7 @@ impl Shared {
                 required_str(params, "source")?,
                 required_str(params, "expected_digest")?,
                 required_str(params, "expected_generation")?,
+                &catalogue,
             ),
             "app_workspace_upgrade" => {
                 let id = required_str(params, "install_id")?;
@@ -576,6 +598,9 @@ impl Shared {
                         expected_generation: required_str(params, "expected_generation")?,
                         expected_new_digest: required_str(params, "expected_new_digest")?,
                         request_id: required_str(params, "request_id")?,
+                        catalogue: &catalogue,
+                        directory:
+                            crate::issue::app_catalog::catalogue::CatalogueDirectory::Configured,
                     },
                     |files, manifest| {
                         self.store.app_install_upgrade_ready(id)?;
@@ -681,6 +706,32 @@ impl Shared {
             }
             _ => Err(Error::rejected("unknown catalog operation")),
         }?;
+        // Check receipts carry the runtime readiness an apply would face.
+        // A fresh install admits its own admission only, so it is ready when
+        // it validates. An upgrade re-reads the installation's active work,
+        // unresolved effects and derived grants: a refusal there is policy,
+        // not a check failure, and stays read-only information for the
+        // caller. Any other store error propagates as the check's own
+        // outcome — an unreadable store is not "busy".
+        match method {
+            "app_workspace_install_check" => {
+                result["readiness"] = json!({"ready": true, "reason": null});
+            }
+            "app_workspace_upgrade_check" => {
+                let readiness = match self
+                    .store
+                    .app_install_upgrade_ready(required_str(params, "install_id")?)
+                {
+                    Ok(()) => json!({"ready": true, "reason": null}),
+                    Err(error) if error.kind() == "rejected" => {
+                        json!({"ready": false, "reason": "active_work_or_grants"})
+                    }
+                    Err(error) => return Err(error),
+                };
+                result["readiness"] = readiness;
+            }
+            _ => {}
+        }
         // CAD-1119: install = consent. This RPC is operator-only (the
         // connection-bound proof above), so only the operator's install or
         // update of a version records its approval, with the digest and

@@ -273,9 +273,9 @@ impl Shared {
         Ok(result)
     }
 
-    /// `app_home` — one row per live install: identity, attention
-    /// state/message/action/count, icon. Members get the same rows
-    /// with `update` folded to `ok` and member wording.
+    /// `app_home` — identity, installed version/listing, catalogue locator
+    /// and attention for each install. The locator is navigation, not trust.
+    /// Members get `update` folded to `ok` and member wording.
     fn rpc_app_home(&self, member: bool) -> Result<Value> {
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
@@ -323,6 +323,9 @@ impl Shared {
                     "title": desc["title"],
                     "tagline": listing["tagline"],
                     "icon": listing["icon"],
+                    "version": desc["version"],
+                    "listing": listing,
+                    "catalogue": desc["catalogue"],
                     "attention": attention,
                 }));
                 continue;
@@ -376,6 +379,9 @@ impl Shared {
                 "project": desc["project"],
                 "tagline": listing["tagline"],
                 "icon": listing["icon"],
+                "version": desc["version"],
+                "listing": listing,
+                "catalogue": desc["catalogue"],
                 "attention": attention,
             }));
         }

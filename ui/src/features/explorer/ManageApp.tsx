@@ -171,6 +171,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
     setChecking(true); setNotice(null); setUpgradeProposal(null);
     void workspaceApps.upgradeCheck(requestedInstallId, {
       source, expected_digest: expectedDigest, expected_generation: expectedGeneration,
+      catalogue_resolution: "manual",
     })
       .then((receipt) => {
         if (isCurrentRequest()) setUpgradeProposal({ installId: requestedInstallId, source, expectedDigest, expectedGeneration, receipt });
@@ -200,6 +201,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       expected_generation: expectedGeneration,
       expected_new_digest: receipt.digest,
       request_id: `upgrade-${crypto.randomUUID()}`,
+      catalogue_resolution: "manual",
     })
       .then(async () => {
         await appExplorer.updateCheck(requestedInstallId).catch(() => undefined);

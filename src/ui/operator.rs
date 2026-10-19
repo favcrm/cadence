@@ -325,6 +325,11 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-installations/upload",
         RouteClass::OperatorOnly,
     ),
+    route(
+        "POST",
+        "/api/app-installations/upload/check",
+        RouteClass::OperatorOnly,
+    ),
     // CAD-1006: the screen mint. Authority is the proven session
     // credential relayed to the daemon, never a caller field; the minted
     // nonce is the frame GET's one-use cap. CAD-1537: a member or a

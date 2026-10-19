@@ -1275,6 +1275,7 @@ export default function WorkspaceApp({
                         const receipt = await workspaceApps.upgradeCheck(installId, {
                           source, expected_digest: data.installation.digest,
                           expected_generation: data.installation.catalog_generation,
+                          catalogue_resolution: "manual",
                         });
                         setUpgradeProposal({ source, receipt });
                       })}>{t("Check update")}</Button>
@@ -1296,6 +1297,7 @@ export default function WorkspaceApp({
                           expected_generation: receipt.expected_generation,
                           expected_new_digest: receipt.digest,
                           request_id: retainedRequest(requestKey),
+                          catalogue_resolution: "manual",
                         });
                         completeRequest(requestKey);
                         setUpgradeProposal(null);

@@ -49,7 +49,7 @@ pub(super) fn catalog_origin_from(catalog: Option<&str>, issuer: Option<&str>) -
     Some(raw.to_string())
 }
 
-pub(super) fn catalog_origin() -> Option<String> {
+pub(crate) fn catalog_origin() -> Option<String> {
     catalog_origin_from(
         std::env::var("AGENTICOS_BOARD_CATALOG_ORIGIN")
             .ok()
@@ -66,6 +66,11 @@ pub(super) fn is_public_catalog_route(path: &str) -> bool {
     path == "/api/public-apps" || path.starts_with("/api/public-apps/")
 }
 
+/// The fixed hosted package broker the platform answers inside the
+/// container. It serves only the pinned release document — never metadata,
+/// never another path — so `api.internal` stays a metadata door.
+const HOSTED_PACKAGE_ORIGIN: &str = "http://catalogue-packages.internal";
+
 pub(super) fn proxy_public_catalog(path: &str, raw_query: &str) -> super::write_path::HttpResp {
     let Some(upstream) = catalog_upstream(path, raw_query) else {
         return super::serve::err_response(404, "No such app.");
@@ -73,7 +78,14 @@ pub(super) fn proxy_public_catalog(path: &str, raw_query: &str) -> super::write_
     let Some(origin) = catalog_origin() else {
         return super::serve::err_response(503, "public directory is not configured");
     };
-    fetch_public_catalog(&format!("{origin}{upstream}"))
+    // Only the exact, already-validated package read uses the closed broker.
+    // Metadata stays on api.internal; self-hosted origins serve their own bytes.
+    let fetch_origin = if origin == "http://api.internal" && upstream.contains("/release?") {
+        HOSTED_PACKAGE_ORIGIN
+    } else {
+        &origin
+    };
+    fetch_public_catalog(&format!("{fetch_origin}{upstream}"))
 }
 
 fn catalog_id(id: &str) -> bool {
@@ -86,42 +98,135 @@ fn catalog_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-fn digest_param(raw_query: &str) -> Option<String> {
-    if raw_query.is_empty() || raw_query.contains('&') {
-        return None;
-    }
-    let (key, value) = raw_query.split_once('=')?;
-    if key != "digest" {
-        return None;
-    }
-    let value = super::serve::pct_decode(value)?;
-    let hex = value.strip_prefix("sha256:")?;
-    if hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        Some(value)
-    } else {
-        None
-    }
-}
-
-/// The upstream path, or `None` when the request is not one of the three
-/// public catalog reads.
+/// The upstream path, or `None` when the request is not one of the closed
+/// public catalog reads: the list, one app, its versions metadata, or one
+/// exact release document. Versions carry no query and no bundle bytes.
+/// The release document still requires both the exact version and digest.
 fn catalog_upstream(path: &str, raw_query: &str) -> Option<String> {
     let rest = path.strip_prefix("/api/public-apps")?;
     if rest.is_empty() {
         return raw_query.is_empty().then(|| "/public/apps".to_string());
     }
     let rest = rest.strip_prefix('/')?;
-    if let Some(id) = rest.strip_suffix("/release") {
-        if !catalog_id(id) {
+    if let Some(id) = rest.strip_suffix("/versions") {
+        if !catalog_id(id) || id.contains('/') || !raw_query.is_empty() {
             return None;
         }
-        let digest = digest_param(raw_query)?;
-        return Some(format!("/public/apps/{id}/release?digest={digest}"));
+        return Some(format!("/public/apps/{id}/versions"));
+    }
+    if let Some(id) = rest.strip_suffix("/release") {
+        if !catalog_id(id) || id.contains('/') {
+            return None;
+        }
+        let (version, digest) = release_query(raw_query)?;
+        return Some(format!(
+            "/public/apps/{id}/release?version={}&digest={}",
+            query_component(&version),
+            query_component(&digest)
+        ));
     }
     if !catalog_id(rest) || rest.contains('/') || !raw_query.is_empty() {
         return None;
     }
     Some(format!("/public/apps/{rest}"))
+}
+
+fn version_token(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 40
+        && version.bytes().all(
+            |b| matches!(b, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'.' | b'_' | b'+' | b'-'),
+        )
+}
+
+/// Exactly `version` and `digest`, once each, in either order. A digest-only
+/// query is not a version pin and is refused.
+fn release_query(raw_query: &str) -> Option<(String, String)> {
+    if raw_query.is_empty() || raw_query.contains(['?', '#']) {
+        return None;
+    }
+    let mut version = None;
+    let mut digest = None;
+    for pair in raw_query.split('&') {
+        if pair.is_empty() {
+            return None;
+        }
+        let (key, value) = pair.split_once('=')?;
+        let decoded = super::serve::pct_decode(value)?;
+        match key {
+            "version" if version.is_none() => {
+                if !version_token(&decoded) {
+                    return None;
+                }
+                version = Some(decoded);
+            }
+            "digest" if digest.is_none() => {
+                let hex = decoded.strip_prefix("sha256:")?;
+                if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                    return None;
+                }
+                digest = Some(decoded);
+            }
+            _ => return None,
+        }
+    }
+    Some((version?, digest?))
+}
+
+fn query_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Versions metadata for one catalogue id. Transport failure, a non-200
+/// status and a non-JSON body are the same refusal: metadata was not read,
+/// so it cannot authorize a catalogue claim. This is not a general client.
+pub(crate) fn fetch_versions_at(origin: &str, id: &str) -> crate::error::Result<serde_json::Value> {
+    use crate::error::Error;
+    if !catalog_id(id) || !catalogue_id_for_versions(id) {
+        return Err(Error::rejected("catalogue metadata is unavailable"));
+    }
+    let origin = origin.trim().trim_end_matches('/');
+    if origin.is_empty() || origin.contains(['?', '#', ' ', '@']) {
+        return Err(Error::rejected("catalogue metadata is unavailable"));
+    }
+    let url = format!("{origin}/public/apps/{id}/versions");
+    fetch_json(&url).ok_or_else(|| Error::rejected("catalogue metadata is unavailable"))
+}
+
+fn catalogue_id_for_versions(id: &str) -> bool {
+    crate::issue::app_catalog::catalogue::catalogue_id_ok(id)
+}
+
+const VERSIONS_BODY_CAP: u64 = 1024 * 1024;
+
+fn fetch_json(url: &str) -> Option<serde_json::Value> {
+    use std::time::Duration;
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(8)))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    let mut response = agent.get(url).call().ok()?;
+    if response.status().as_u16() != 200 {
+        return None;
+    }
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(VERSIONS_BODY_CAP)
+        .read_to_vec()
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn fetch_public_catalog(url: &str) -> super::write_path::HttpResp {
@@ -216,31 +321,31 @@ mod tests {
     }
 
     #[test]
-    fn catalog_proxy_only_forwards_the_three_public_reads() {
-        assert_eq!(
-            catalog_upstream("/api/public-apps", "").as_deref(),
-            Some("/public/apps")
-        );
-        assert_eq!(
-            catalog_upstream("/api/public-apps/social-content", "").as_deref(),
-            Some("/public/apps/social-content")
-        );
-        assert_eq!(
+    fn catalogue_proxy_refuses_unpinned_or_private_reads() {
+        assert!(catalog_upstream("/api/public-apps", "x=1").is_none());
+        assert!(catalog_upstream("/api/public-apps/../admin", "").is_none());
+        assert!(catalog_upstream("/api/public-apps/a/b", "").is_none());
+        assert!(catalog_upstream("/api/public-apps/social-content/versions", "x=1").is_none());
+        assert!(catalog_upstream("/api/public-apps/social-content/versions/extra", "").is_none());
+        assert!(
             catalog_upstream(
                 "/api/public-apps/social-content/release",
                 "digest=sha256%3Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             )
-            .as_deref(),
-            Some(
-                "/public/apps/social-content/release?digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            )
+            .is_none(),
+            "a digest without a version is not a pinned release"
         );
-        assert!(catalog_upstream("/api/public-apps", "x=1").is_none());
-        assert!(catalog_upstream("/api/public-apps/../admin", "").is_none());
-        assert!(catalog_upstream("/api/public-apps/a/b", "").is_none());
-        assert!(
-            catalog_upstream("/api/public-apps/social-content/release", "digest=nope").is_none()
-        );
+        assert!(catalog_upstream(
+            "/api/public-apps/social-content/release",
+            "version=0.9.7&version=0.9.8&digest=sha256%3Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+        .is_none());
+        assert!(catalog_upstream(
+            "/api/public-apps/social-content/release",
+            "version=0.9.7&digest=sha256%3Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&extra=1"
+        )
+        .is_none());
+        assert!(catalog_upstream("/api/public-apps/social-content/blob", "").is_none());
         assert!(catalog_upstream("/api/other", "").is_none());
     }
 }
