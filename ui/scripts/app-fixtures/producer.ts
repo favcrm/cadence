@@ -12,7 +12,7 @@ declare const process: {
 
 const MAX_INPUT = 1024 * 1024;
 const MAX_OUTPUT = 8 * 1024 * 1024;
-const CONTRACT = "app-screen-projection-fixtures/2";
+const CONTRACT = "app-screen-projection-fixtures/3";
 const NOW = 1_799_999_000;
 const SCENARIOS = ["empty", "loading", "unavailable", "ready", "draft", "review"] as const;
 type Scenario = typeof SCENARIOS[number];

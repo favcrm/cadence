@@ -89,6 +89,8 @@ var CALL_VERBS = [
 	"read.run",
 	"context.defaults.save",
 	"open-link",
+	"screen.drawer.open",
+	"screen.drawer.close",
 	"social.drafts.list",
 	"social.drafts.show",
 	"social.drafts.create",
@@ -717,7 +719,7 @@ function screenProjection(installation, tag, contextId, contexts, runs, effects,
 //#region scripts/app-fixtures/producer.ts
 var MAX_INPUT = 1048576;
 var MAX_OUTPUT = 8388608;
-var CONTRACT = "app-screen-projection-fixtures/2";
+var CONTRACT = "app-screen-projection-fixtures/3";
 var NOW = 1799999e3;
 var SCENARIOS = [
 	"empty",
