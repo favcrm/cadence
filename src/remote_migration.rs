@@ -1666,3 +1666,103 @@ mod tests {
         assert!(part_data(&not_ok, &t, "op-1", &part_pack(), &descriptor, 2, 5, 1024).is_err());
     }
 }
+
+#[cfg(test)]
+mod pack_stream_tests {
+    use super::*;
+
+    const MEMBER: usize = 3 * 1024;
+
+    fn sha_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// One member file of `content` in a fresh temp dir, plus the inventory
+    /// and pack that describe it. `declared` is the pack's planned byte count.
+    fn fixture(
+        content: &[u8],
+        declared_sha: &str,
+        declared: u64,
+    ) -> (PathBuf, Vec<InventoryMember<'static>>, Pack) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cad1593-pack-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.bin"), content).unwrap();
+        let inventory = vec![InventoryMember {
+            path: "a.bin",
+            sha256: Box::leak(declared_sha.to_string().into_boxed_str()),
+            bytes: content.len() as u64,
+        }];
+        let pack = Pack {
+            index: 0,
+            bytes: declared,
+            members: 0..1,
+        };
+        (dir, inventory, pack)
+    }
+
+    fn content() -> Vec<u8> {
+        (0..MEMBER).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn part_reads_yield_exact_ranges_and_hash_survives_the_boundary() {
+        let body = content();
+        let sha = sha_hex(&body);
+        let (dir, inventory, pack) = fixture(&body, &sha, body.len() as u64);
+        let mut reader = PackReader::open(&dir, &pack, &inventory).unwrap();
+        let mut out = Vec::new();
+        // Three parts of 1024 bytes: the member straddles every boundary.
+        for _ in 0..3 {
+            let mut part = PackPartReader::new(&mut reader, 1024);
+            let mut chunk = Vec::new();
+            part.read_to_end(&mut chunk).unwrap();
+            assert_eq!(chunk.len(), 1024, "part must yield exactly its range");
+            part.finish_part().unwrap();
+            out.extend_from_slice(&chunk);
+        }
+        assert_eq!(out, body);
+        expect_pack_end(&mut reader).expect("forced read must hit end of file");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn forced_read_refuses_a_pack_longer_than_the_plan() {
+        let body = content();
+        let sha = sha_hex(&body);
+        // Plan declares fewer bytes than the member actually holds.
+        let (dir, inventory, pack) = fixture(&body, &sha, 1000);
+        let mut reader = PackReader::open(&dir, &pack, &inventory).unwrap();
+        let mut part = PackPartReader::new(&mut reader, 1000);
+        let mut chunk = Vec::new();
+        part.read_to_end(&mut chunk).unwrap();
+        assert_eq!(chunk.len(), 1000);
+        assert!(expect_pack_end(&mut reader).is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn member_digest_mismatch_fails_across_the_part_boundary() {
+        let body = content();
+        let wrong = sha_hex(b"not the member");
+        let (dir, inventory, pack) = fixture(&body, &wrong, body.len() as u64);
+        let mut reader = PackReader::open(&dir, &pack, &inventory).unwrap();
+        let mut first = PackPartReader::new(&mut reader, 2048);
+        let mut chunk = Vec::new();
+        first.read_to_end(&mut chunk).unwrap();
+        let mut second = PackPartReader::new(&mut reader, 1024);
+        let mut tail = Vec::new();
+        second.read_to_end(&mut tail).unwrap();
+        second.finish_part().unwrap();
+        assert!(
+            expect_pack_end(&mut reader).is_err(),
+            "trailing member digest must be checked after the last part"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
