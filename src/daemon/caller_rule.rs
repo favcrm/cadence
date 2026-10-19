@@ -109,8 +109,40 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "model_defaults_set",
         Rule::Handler("operator_connection (CAD-337)"),
     ),
+    (
+        "agent_settings_get",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
+    (
+        "agent_settings_set",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
+    (
+        "agent_settings_catalog",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
+    (
+        "agent_settings_sync",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
+    (
+        "agent_settings_preview",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
+    (
+        "agent_settings_command",
+        Rule::Handler(
+            "settings_caller: operator, or a settings grant bound to the exact op+payload+revision+agent identity (CAD-1586)",
+        ),
+    ),
+    (
+        "cli_settings_command",
+        Rule::Handler(
+            "cli_caller: re-verified cli_envelope on a proven board relay; human owner or grant-bound agents/<h> principal (CAD-1586)",
+        ),
+    ),
     ("agent_list", Rule::Read),
-    ("agent_show", Rule::Read),
+    ("agent_show", Rule::Handler("read; optional profile instructions require authorize_agent_mutation(SelfService)")),
     // CAD-886: `agent_wait` answers a strict subset of what `agent_show`
     // discloses (state/reason/message/turn/waited_secs) — same visibility.
     ("agent_wait", Rule::Read),
@@ -323,6 +355,23 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "platform_assistant_provision",
         Rule::Handler("proven_operator + re-verified member envelope (CAD-1420)"),
+    ),
+    // CAD-1568: the remote CLI's principal-bound plane. Every cli_message_*
+    // verb re-binds `cli_envelope` on a proven operator/board relay only and
+    // cryptographically re-verifies it (cli_rpc::cli_caller); the handler's
+    // recipient classes and principal-scoped readback are daemon-enforced —
+    // a request field never widens them.
+    (
+        "cli_message_send",
+        Rule::Handler("cli_caller: re-verified human cli_envelope on a proven board relay; hosted master coordination is human-owner only (CAD-1568)"),
+    ),
+    (
+        "cli_message_read",
+        Rule::Handler("cli_caller + principal-owned messages only (CAD-1568)"),
+    ),
+    (
+        "cli_message_inbox",
+        Rule::Handler("cli_caller: re-verified human-owner cli_envelope for passive inbox inspection (CAD-1568)"),
     ),
     ("member_assist_state", Rule::Handler("member_caller: member_as on a proven board relay only")),
     ("member_assist_history", Rule::Handler("member_caller: member_as on a proven board relay only")),
@@ -1168,6 +1217,16 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("crm_smtp_revoke", Rule::Handler("rpc_crm_smtp")),
     ("crm_smtp_show", Rule::Handler("rpc_crm_smtp")),
     ("crm_smtp_test_send", Rule::Handler("rpc_crm_smtp")),
+    // CAD-1562: every WhatsApp door verb enters `rpc_whatsapp`, whose
+    // first act is `operator_connection`.
+    ("whatsapp_status", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_connect_session", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_conversations_list", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_conversations_show", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_messages", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_reply_prepare", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_reply_send", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_reply_status", Rule::Handler("rpc_whatsapp")),
     // CAD-786: the send verbs all enter `rpc_crm_send`, whose first
     // act is `operator_connection`.
     ("crm_send_prepare", Rule::Handler("rpc_crm_send")),
@@ -1267,6 +1326,36 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "wiki_history",
         Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
+    ),
+    (
+        "wiki_collection_get",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-1470)"),
+    ),
+    (
+        "wiki_collection_put",
+        Rule::Handler(
+            "wiki_caller: owner connection only; metadata labels are not authority (CAD-1470)",
+        ),
+    ),
+    (
+        "wiki_read_revision",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as; historical selector never falls back to live (CAD-1470)"),
+    ),
+    (
+        "wiki_corrections_list",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-1470)"),
+    ),
+    (
+        "wiki_corrections_submit",
+        Rule::Handler(
+            "wiki_caller plus verified human subject; not issue_created and not an operator alias (CAD-1470)",
+        ),
+    ),
+    (
+        "wiki_corrections_review",
+        Rule::Handler(
+            "wiki_caller owner plus a different verified human subject; session id is not identity (CAD-1470)",
+        ),
     ),
     // CAD-719: index health is operator-only — a read-only status and
     // an explicit rebuild. These do not bind `wiki_caller`: they gate

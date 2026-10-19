@@ -310,6 +310,10 @@ impl Shared {
             .transpose()?;
         let by = required_str(params, "by")?;
         let task_id = required_str(params, "task")?;
+        let _grant = self
+            .unattended_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         self.plan_gate_task(task_id)?;
         let pending = self.store.task(task_id)?;
         // CAD-1380 deferred commit: an assist-bound job's dispatch

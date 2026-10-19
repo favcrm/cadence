@@ -17,7 +17,7 @@ use super::{
     app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_media, app_records,
     app_release, app_runs, app_screens, app_social_drafts, approvals, apps, business_templates,
     connections, crm_send, crm_smtp, home, lane, operator, read_model, social_publish, stages,
-    threads, updates, wiki, workflows,
+    threads, updates, whatsapp, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -789,6 +789,124 @@ pub(crate) fn read_settings_body(request: &mut Request) -> std::result::Result<V
     Ok(buf)
 }
 
+pub(crate) fn agent_settings_get(state_dir: &Path, read_only: bool) -> HttpResp {
+    match client::rpc(state_dir, "agent_settings_get", json!({})) {
+        Ok(mut snapshot) => {
+            if let Some(obj) = snapshot.as_object_mut() {
+                obj.insert("read_only".to_string(), json!(read_only));
+            }
+            json_response(snapshot)
+        }
+        Err(err) => settings_rpc_error(err),
+    }
+}
+
+fn agent_settings_body(request: &mut Request) -> std::result::Result<Value, HttpResp> {
+    const CAP: u64 = 256 * 1024;
+    let mut buf = Vec::new();
+    let mut limited = request.as_reader().take(CAP + 1);
+    if let Err(e) = limited.read_to_end(&mut buf) {
+        return Err(coded_response(
+            400,
+            "invalid_request",
+            &format!("body read failed: {e}"),
+            None,
+        ));
+    }
+    if buf.len() as u64 > CAP {
+        return Err(coded_response(
+            400,
+            "invalid_request",
+            "settings body exceeds 256 KiB",
+            None,
+        ));
+    }
+    let text = std::str::from_utf8(&buf).map_err(|_| {
+        coded_response(
+            400,
+            "invalid_request",
+            "settings body must be UTF-8 JSON",
+            None,
+        )
+    })?;
+    serde_json::from_str(text).map_err(|_| {
+        coded_response(
+            400,
+            "invalid_request",
+            "settings body must be a JSON object",
+            None,
+        )
+    })
+}
+
+fn agent_settings_error(err: Error) -> HttpResp {
+    if err.kind() == "conflict" {
+        let message = err.to_string();
+        let revision = message
+            .split_once("settings revision is ")
+            .map(|(_, token)| token.trim().to_string());
+        let body = serde_json::to_vec_pretty(&json!({
+            "error": message,
+            "code": "revision_conflict",
+            "revision": revision,
+        }))
+        .unwrap_or_default();
+        let mut resp = Response::from_data(body).with_status_code(StatusCode(409));
+        resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+        return resp;
+    }
+    settings_rpc_error(err)
+}
+
+pub(crate) fn agent_settings_post(request: &mut Request, state_dir: &Path, path: &str) -> HttpResp {
+    let body = match agent_settings_body(request) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let (method, params) = if path.ends_with("/catalog") {
+        (
+            "agent_settings_catalog",
+            json!({"provider": body.get("provider").cloned().unwrap_or(Value::Null)}),
+        )
+    } else if path.ends_with("/sync") {
+        (
+            "agent_settings_sync",
+            json!({
+                "expected_revision": body.get("expected_revision").cloned().unwrap_or(Value::Null),
+                "profile": body.get("profile").cloned().unwrap_or(Value::Null),
+            }),
+        )
+    } else if path.ends_with("/preview") {
+        (
+            "agent_settings_preview",
+            json!({
+                "expected_revision": body.get("expected_revision").cloned().unwrap_or(Value::Null),
+                "profile": body.get("profile").cloned().unwrap_or(Value::Null),
+                "harness": body.get("harness").cloned().unwrap_or(Value::Null),
+            }),
+        )
+    } else {
+        (
+            "agent_settings_set",
+            json!({
+                "expected_revision": body.get("expected_revision").cloned().unwrap_or(Value::Null),
+                "config": body.get("config").cloned().unwrap_or(Value::Null),
+            }),
+        )
+    };
+    match client::rpc(state_dir, method, params) {
+        Ok(mut snapshot) => {
+            if method == "agent_settings_set" {
+                if let Some(obj) = snapshot.as_object_mut() {
+                    obj.insert("read_only".to_string(), json!(false));
+                }
+            }
+            json_response(snapshot)
+        }
+        Err(err) => agent_settings_error(err),
+    }
+}
+
 /// `POST /api/settings/model-defaults` — operator-only, admitted by
 /// `operator::admit` (session plus process proof) before this runs.
 pub(crate) fn model_defaults_post(request: &mut Request, state_dir: &Path) -> HttpResp {
@@ -949,6 +1067,19 @@ pub(crate) fn write_route(
         } else {
             updates::check_now(state_dir)
         };
+        send(request, resp);
+        return;
+    }
+    if path == "/api/settings/agents"
+        || path == "/api/settings/agents/catalog"
+        || path == "/api/settings/agents/sync"
+        || path == "/api/settings/agents/preview"
+    {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = agent_settings_post(&mut request, state_dir, path);
         send(request, resp);
         return;
     }
@@ -1244,6 +1375,17 @@ pub(crate) fn write_route(
         send(request, response);
         return;
     }
+    // CAD-1562: every WhatsApp route is operator-proof POST-only, reads
+    // included, exactly like the daemon RPCs it relays.
+    if let Some(route) = whatsapp::route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = whatsapp::handle(&mut request, state_dir, route);
+        send(request, response);
+        return;
+    }
     // CAD-786: the send verbs — operator-proof POST-only writes,
     // exactly like the daemon RPCs they relay.
     if let Some(route) = crm_send::route(path) {
@@ -1502,12 +1644,16 @@ pub(crate) fn write_route(
     // staged to a server-derived external temp dir (NOT under pm.dir, which
     // the installer refuses as a source), then installed via the unchanged
     // source-path installer. OperatorOnly in WRITE_ROUTES.
-    if path == "/api/app-installations/upload" {
+    if path == "/api/app-installations/upload" || path == "/api/app-installations/upload/check" {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let response = apps::workspace_upload(&mut request, state_dir);
+        let response = if path.ends_with("/check") {
+            apps::workspace_upload_check(&mut request, state_dir)
+        } else {
+            apps::workspace_upload(&mut request, state_dir)
+        };
         send(request, response);
         return;
     }
@@ -1765,6 +1911,9 @@ pub(crate) fn write_route(
         return;
     };
     let actor = caller.actor().to_string();
+    // AOS-274: the policy key, built from the variant — `actor()` above is
+    // display text for attribution.
+    let spelling = operator::caller_spelling(&caller);
     let pm = match Pm::at(pm_dir) {
         Ok(pm) => pm,
         Err(e) => {
@@ -1805,6 +1954,12 @@ pub(crate) fn write_route(
             send(request, err_response(400, "bad project key"));
             return;
         };
+        // AOS-274: a caller may only file work into a project it can use;
+        // a restricted project answers exactly like an absent one.
+        if super::project_policy::refused(&pm, &project, &spelling) {
+            send(request, err_response(404, "unknown project"));
+            return;
+        }
         let pm = match activity_pm(
             pm,
             &request,
@@ -1848,6 +2003,15 @@ pub(crate) fn write_route(
         send(request, err_response(400, "bad issue id"));
         return;
     };
+    // AOS-274: every write against an existing issue must pass the same
+    // project decision, and a restricted project answers like an absent
+    // issue. An unknown id keeps each verb's own not-found answer.
+    if let Ok(issue) = crate::issue::board::find_issue(&pm.dir, &id) {
+        if super::project_policy::refused(&pm, &issue.project, &spelling) {
+            send(request, err_response(404, "unknown issue"));
+            return;
+        }
+    }
     if sub == Some("artifacts") {
         // POST /api/issues/:id/artifacts?name=<basename> — raw bytes.
         let name = query("name").unwrap_or_default();

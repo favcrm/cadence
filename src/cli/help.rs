@@ -16,6 +16,10 @@ const CORE: &[(&str, &[(&str, &str)])] = &[
         "Me",
         &[
             ("self", "Your alias, running message and report token"),
+            (
+                "my-work",
+                "Issues assigned to your signed-in hosted identity",
+            ),
             ("done", "Report your running turn's result"),
             ("inbox", "Read an inbox agent's durable queue"),
         ],
@@ -83,6 +87,7 @@ const OPERATOR: &[&str] = &[
     "backup",
     "restore",
     "export",
+    "inspect-portable",
     "ui",
     "master",
     "connection",
@@ -94,6 +99,7 @@ const OPERATOR: &[&str] = &[
     "staging",
     "org",
     "team",
+    "settings",
 ];
 
 /// Visible verbs that are neither core nor operator.
@@ -632,7 +638,9 @@ mod tests {
     #[test]
     fn deliberately_hidden_commands_appear_in_no_help_view() {
         let hidden = originally_hidden();
-        assert_eq!(hidden.len(), 8, "{hidden:?}");
+        // `skill sync` is the hidden implementation `cadence update` calls.
+        // `cadence skill install` stays the visible manual repair.
+        assert_eq!(hidden.len(), 9, "{hidden:?}");
         for view in [
             render_root(false),
             render_root(true),

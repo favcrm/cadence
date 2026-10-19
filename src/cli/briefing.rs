@@ -73,7 +73,14 @@ pub(crate) fn brief_agent(
     enqueue: bool,
     instructions: Option<&str>,
 ) -> Result<PathBuf> {
-    let agent = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?["agent"].clone();
+    let agent = client::rpc(
+        state_dir,
+        "agent_show",
+        json!({
+            "alias": alias, "limit": 0, "include_profile_instructions": true,
+        }),
+    )?["agent"]
+        .clone();
     // A mailbox consumes no briefing — nothing runs in it.
     if !registry::has_actor(
         agent["provider"].as_str().unwrap_or_default(),
@@ -92,9 +99,14 @@ pub(crate) fn brief_agent(
     let file = client::briefing_path(state_dir, &agent["params"], alias);
     let instructions = match instructions {
         Some(text) => Some(text.to_string()),
-        None => std::fs::read_to_string(&file)
-            .ok()
-            .and_then(|old| role_instructions(&old).map(str::to_string)),
+        None => agent["instructions"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| {
+                std::fs::read_to_string(&file)
+                    .ok()
+                    .and_then(|old| role_instructions(&old).map(str::to_string))
+            }),
     }
     .filter(|text| !text.trim().is_empty());
     let body = briefing_body(state_dir, &agent, root_alias, instructions.as_deref());
@@ -434,17 +446,9 @@ pub(crate) fn briefing_body(
     )
 }
 
-/// Ensure `<repo>/AGENTS.md` carries the cadence block between the
-/// marker pair. Idempotent: markers present → untouched; no markers →
-/// the block appends at the end; no file → created. Content outside the
-/// markers is never modified.
-pub(crate) fn ensure_agents_block(repo: &Path) -> Result<()> {
-    let path = repo.join("AGENTS.md");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    if existing.contains(AGENTS_BEGIN) {
-        return Ok(());
-    }
-    let block = format!(
+/// The cadence block as this build writes it.
+pub(crate) fn agents_block() -> String {
+    format!(
         "{AGENTS_BEGIN}\n\
          ## Cadence-managed agents\n\n\
          This repo may be worked on by cadence-managed agents. If\n\
@@ -454,7 +458,67 @@ pub(crate) fn ensure_agents_block(repo: &Path) -> Result<()> {
          `cadence message result <msg-id> --token <turn_id> --text ...`,\n\
          and discover peers with `cadence agent list`.\n\
          {AGENTS_END}\n"
-    );
+    )
+}
+
+/// Blocks an earlier build wrote, which this build may therefore
+/// replace: a repository carrying one of these verbatim has not edited
+/// it. Append the outgoing text here whenever [`agents_block`] changes
+/// (CAD-1530).
+pub(crate) const SUPERSEDED_AGENTS_BLOCKS: &[&str] = &[
+    // The first shipped block. It sent a managed agent to the lane copy
+    // of its briefing, which exists only in a sandboxed (agent-UID) pty
+    // pane; every other agent's briefing is the state-dir copy, whose
+    // path `agent show` prints.
+    "<!-- cadence:begin -->\n\
+     ## Cadence-managed agents\n\n\
+     This repo may be worked on by cadence-managed agents. If\n\
+     `CADENCE_ALIAS` is set in your environment: run `cadence self` for\n\
+     your identity and running turn token, read your briefing at\n\
+     `.cadence/<group>/BRIEFING-<alias>.md`, report with\n\
+     `cadence message result <msg-id> --token <turn_id> --text ...`,\n\
+     and discover peers with `cadence agent list`.\n\
+     <!-- cadence:end -->\n",
+];
+
+/// The marker region of an existing file, end marker and the newline
+/// after it included.
+fn agents_region(text: &str) -> Option<&str> {
+    let start = text.find(AGENTS_BEGIN)?;
+    let end = start + text[start..].find(AGENTS_END)? + AGENTS_END.len();
+    let end = if text[end..].starts_with('\n') {
+        end + 1
+    } else {
+        end
+    };
+    Some(&text[start..end])
+}
+
+/// Ensure `<repo>/AGENTS.md` carries the cadence block between the
+/// marker pair. No begin marker → the block appends at the end; no file
+/// → created. A block this build wrote is left alone, and one an
+/// earlier build wrote — matched verbatim — is replaced, so a
+/// repository that installed an old copy is repaired (CAD-1530).
+/// Anything else is left exactly as found, as is every byte outside the
+/// markers: another repository's file, and a begin marker with no end
+/// marker, are both left alone rather than appended to.
+pub(crate) fn ensure_agents_block(repo: &Path) -> Result<()> {
+    let path = repo.join("AGENTS.md");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let block = agents_block();
+    // The begin marker decides. An unclosed pair is left alone, exactly
+    // as this function refused every marked file before CAD-1530:
+    // appending beside a stray begin marker would add a second block to
+    // someone else's repository.
+    if existing.contains(AGENTS_BEGIN) {
+        if let Some(region) = agents_region(&existing) {
+            // Only a block we can prove is ours, unedited, is refreshed.
+            if region != block.as_str() && SUPERSEDED_AGENTS_BLOCKS.contains(&region) {
+                std::fs::write(&path, existing.replacen(region, &block, 1))?;
+            }
+        }
+        return Ok(());
+    }
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .create(true)

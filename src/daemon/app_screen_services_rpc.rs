@@ -259,6 +259,16 @@ enum PreviewMode {
     Draft,
     Saved,
 }
+// CAD-1562: WhatsApp door arguments. No key, digest, company or
+// connection field exists: the host derives each of them.
+args!(WaPage { cursor: Option<String>, limit: Option<u64> });
+args!(WaConversation {
+    conversation_id: String
+});
+args!(WaMessages { conversation_id: String, cursor: Option<String>, limit: Option<u64> });
+args!(WaReply { conversation_id: String, text: String, reply_to_message_id: Option<String> });
+args!(WaReplySend { conversation_id: String, text: String, effect_id: String, reply_to_message_id: Option<String> });
+args!(WaEffect { effect_id: String });
 args!(RoutePatch { section: Option<String>, view: Option<String>, record_id: Option<String>, segment_id: Option<String>, replace: Option<bool> });
 
 fn typed<T: for<'de> Deserialize<'de> + Serialize>(value: &Value) -> Result<Value> {
@@ -307,6 +317,12 @@ fn call_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
         SendsShow => typed::<SendId>(value),
         SendsList => typed::<ProposalList>(value),
         SmtpShow | OriginShow => typed::<Empty>(value),
+        WhatsappStatus | WhatsappConnectSession => typed::<Empty>(value),
+        WhatsappConversationsList => typed::<WaPage>(value),
+        WhatsappConversationsShow => typed::<WaConversation>(value),
+        WhatsappMessages => typed::<WaMessages>(value),
+        WhatsappReplyPrepare => typed::<WaReply>(value),
+        WhatsappReplyStatus => typed::<WaEffect>(value),
         ScreenPreviewShow => typed::<PreviewShow>(value),
         ScreenPreviewClear => typed::<PreviewClear>(value),
         ScreenRoutePatch => {
@@ -341,6 +357,7 @@ fn slot_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
             typed::<CampaignId>(value)
         }
         ScreenOperation::ChatCampaignBrief => typed::<CampaignBrief>(value),
+        ScreenOperation::WhatsappReplySend => typed::<WaReplySend>(value),
         _ => Err(Error::rejected("screen SLOT operation is not implemented")),
     }
 }
@@ -394,6 +411,14 @@ fn native_method(operation: ScreenOperation) -> Result<&'static str> {
         SmtpTestSend => "crm_smtp_test_send",
         OriginShow => "crm_send_origin_show",
         OriginManage => "crm_send_origin_set",
+        WhatsappStatus => "whatsapp_status",
+        WhatsappConnectSession => "whatsapp_connect_session",
+        WhatsappConversationsList => "whatsapp_conversations_list",
+        WhatsappConversationsShow => "whatsapp_conversations_show",
+        WhatsappMessages => "whatsapp_messages",
+        WhatsappReplyPrepare => "whatsapp_reply_prepare",
+        WhatsappReplySend => "whatsapp_reply_send",
+        WhatsappReplyStatus => "whatsapp_reply_status",
         _ => {
             return Err(Error::rejected(
                 "screen operation has no implemented executor",
@@ -480,21 +505,29 @@ impl Shared {
         let (session, view) = self
             .tool_session(token, key, origin)
             .ok_or_else(|| screen_access_denied("screen service requires live operator session"))?;
-        if origin == Origin::Public
+        let member = origin == Origin::Public
             && !view
                 .user
                 .as_ref()
-                .is_some_and(crate::operator_auth::BoardUser::is_operator)
-        {
-            return Err(screen_access_denied(
-                "screen service requires operator-role public session",
-            ));
-        }
+                .is_some_and(crate::operator_auth::BoardUser::is_operator);
         let context = self
             .tool_context_proven(action_token, &session)
             .map_err(|error| {
                 screen_authority_error(error, "screen mount or session unavailable")
             })?;
+        // CAD-1537: a member uses only a read-only mount, and a read-only
+        // mount admits only the read allowlist — every write, SLOT
+        // (prepare and confirm) and host command is refused here.
+        if member && !context.read_only {
+            return Err(screen_access_denied(
+                "screen service requires operator-role public session",
+            ));
+        }
+        if context.read_only && !operation.is_screen_read() {
+            return Err(screen_access_denied(
+                "a read-only screen admits only read operations",
+            ));
+        }
         if context.context_id.is_none() {
             return Err(screen_access_denied(
                 "screen service requires active context",
@@ -767,6 +800,9 @@ impl Shared {
                 let value = self.rpc_crm_smtp_with_proof(method, &params, peer_pid, Some(proof))?;
                 Ok(sanitized_smtp(value))
             }
+            op if op.is_whatsapp() => {
+                self.rpc_whatsapp_with_proof(method, &params, peer_pid, Some(proof))
+            }
             _ => self.rpc_app_content_with_proof(method, &params, peer_pid, Some(proof)),
         }
     }
@@ -905,6 +941,7 @@ impl Shared {
                     Ok(json!({"content": shown}))
                 }
             }
+            ScreenOperation::WhatsappReplySend => self.whatsapp_reply_facts(install, context, args),
             ScreenOperation::OriginManage => Ok(json!({"scope": "daemon-global",
                 "unsubscribe_origin": self.store.crm_setting("unsubscribe_origin")?.or_else(|| self.unsubscribe_origin.clone())})),
             _ => Err(Error::rejected(
@@ -939,6 +976,16 @@ impl Shared {
                 | ChatCampaignOpen,
                 Confirmation::Tap(tap),
             ) if tap.confirmed => {}
+            // CAD-1562: the tap approves the host-computed digest of the
+            // prepared reply the card drew; the frame never supplies it.
+            (WhatsappReplySend, Confirmation::Tap(tap)) if tap.confirmed => {
+                let facts = &proof
+                    .confirmed
+                    .as_ref()
+                    .ok_or_else(|| Error::rejected("confirmation missing"))?
+                    .1;
+                *args = json!({"effect_id": facts["effect_id"], "digest": facts["digest"]});
+            }
             (ChatCampaignBrief, Confirmation::Brief(input))
                 if input.confirmed && args["brief"].as_str() == Some(input.brief.as_str()) => {}
             (RecordsCsvImport, Confirmation::Csv(input)) if input.confirmed => {

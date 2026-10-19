@@ -68,7 +68,8 @@ export type Route =
   | { screen: "workspaceAppKey"; appKey: string }
   | { screen: "agents"; alias: string | null }
   | { screen: "threads" }
-  | { screen: "wiki"; mode: WikiMode; path: string | null; query: string | null }
+  | { screen: "myWork" }
+  | { screen: "wiki"; mode: WikiMode; path: string | null; query: string | null; at?: string; section?: string; page?: number }
   | { screen: "outbox" }
   | { screen: "setup" }
   | { screen: "settings"; section: SettingsSection; page?: ConnectionPage }
@@ -80,6 +81,7 @@ export type Screen = Route["screen"];
 /** The main navigation — MVP screens only (Setup is reached from Home). */
 export const NAV: { screen: Screen; label: string; route: Route }[] = [
   { screen: "home", label: "Home", route: { screen: "home" } },
+  { screen: "myWork", label: "My work", route: { screen: "myWork" } },
   { screen: "threads", label: "Threads", route: { screen: "threads" } },
   { screen: "projects", label: "Projects", route: { screen: "projects", slug: null, section: "overview" } },
   { screen: "wiki", label: "Wiki", route: { screen: "wiki", mode: "browse", path: null, query: null } },
@@ -246,6 +248,7 @@ export function matchRoute(pathname: string): Route {
     if (head === "overview" && !a) return { screen: "overview" };
     // `?item=<effect_id>` deep-links one published item (CAD-546).
     if (head === "outbox" && !a) return { screen: "outbox" };
+    if (head === "my-work" && !a) return { screen: "myWork" };
     // `!b` keeps the original one-segment shape; the connections
     // section alone may carry its /new, /new/<provider> and
     // /account/<id> sub-pages (bounded to one extra segment above).
@@ -338,6 +341,8 @@ export function routePath(route: Route): string {
       return "/overview";
     case "outbox":
       return "/outbox";
+    case "myWork":
+      return "/my-work";
     case "settings":
       if (route.section === "account") return "/settings/account";
       if (route.section === "memory") return "/settings/memory";
@@ -369,6 +374,20 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
   const matched = matchRoute(pathname);
   const q = new URLSearchParams(search);
   let route = matched.screen === "issue" ? { ...matched, tab: parseIssueTab(q.get("tab")) } : matched;
+  if (route.screen === "wiki") {
+    const at = q.get("at");
+    const section = q.get("section");
+    const page = q.get("page");
+    const parsedPage = page !== null && /^[1-9][0-9]{0,5}$/.test(page) ? Number(page) : undefined;
+    if (at !== null || section || parsedPage !== undefined) {
+      route = {
+        ...route,
+        ...(at !== null ? { at } : {}),
+        ...(section ? { section } : {}),
+        ...(parsedPage !== undefined ? { page: parsedPage } : {}),
+      };
+    }
+  }
   if (route.screen === "projects" && route.section === "overview" && q.has("view")) {
     route = { ...route, section: "issues" };
   }
@@ -418,7 +437,7 @@ export function locationHref(loc: AppLocation, search = ""): string {
   // an app page's too (CAD-1040: the operator's back door to native
   // controls instead of the mounted app screen); it never carries over to
   // another installation.
-  for (const key of ["tab", "view", "project", "issue", "run", "new", "screen"]) q.delete(key);
+  for (const key of ["tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page"]) q.delete(key);
   writeFilters(q, NO_FILTERS);
   const route = scopedRoute(loc.route, loc.project);
   // CAD-1068: the mounted app routes (`workspaceAppKey`, and the retired
@@ -439,6 +458,11 @@ export function locationHref(loc: AppLocation, search = ""): string {
     q.set("project", loc.project);
   }
   if (loc.openId) q.set("issue", loc.openId);
+  if (route.screen === "wiki") {
+    if (route.at !== undefined) q.set("at", route.at);
+    if (route.section) q.set("section", route.section);
+    if (route.page !== undefined) q.set("page", String(route.page));
+  }
   const s = q.toString();
   return routePath(route) + (s ? `?${s}` : "");
 }

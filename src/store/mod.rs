@@ -16,6 +16,8 @@ use serde_json::json;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod settings_authority;
+pub use settings_authority::{ProfileBody, SettingsDoc, SettingsSnapshot};
 mod platform;
 pub(crate) use platform::{scope_list, scope_name};
 pub use platform::{
@@ -29,18 +31,20 @@ pub use effects::{
     EFFECT_EXECUTED_EVENT, EFFECT_FAILED_EVENT, EFFECT_NEEDS_YOU_EVENT, EFFECT_REQUESTED_EVENT,
 };
 mod threads;
-pub use threads::MemberAuthority;
 pub use threads::{
     tool_result_summary, tool_summary, ConversationKind, NewEntry, Sender, Thread, ThreadEntry,
     CONVERSATION_LIMIT, KIND_ASSISTANT_TEXT, KIND_MESSAGE, KIND_TOOL_CALL, KIND_TOOL_RESULT,
     KIND_TURN_RESULT, PAGE_MAX as THREAD_PAGE_MAX, ROLE_AGENT, ROLE_OPERATOR, ROLE_SYSTEM,
     SUBJECT_CAMPAIGN,
 };
+pub use threads::{CliAuthority, MemberAuthority};
 pub use threads::{COMPACTED_EVENT as THREAD_COMPACTED_EVENT, PACK_EVENT as THREAD_PACK_EVENT};
 
 mod agents;
 mod cloud_dispatch_outbox;
 pub use agents::{Agent, ModelDefaultsSnapshot, NewAgent, AGENT_STATES};
+
+pub const MAX_INSTRUCTIONS_BYTES: usize = 32_000;
 pub mod activity;
 mod delivery;
 mod events;
@@ -49,7 +53,8 @@ pub use events::{
     APPROVAL_RECORDED_EVENT, APPROVAL_RECORDED_VIA, APPROVAL_REVOKED_EVENT, APPROVAL_STREAM,
     APP_APPROVED_EVENT, AUTO_RESUME_EVENT, AUTO_RESUME_FAILED_EVENT, AUTO_STOP_EVENT,
     AUTO_STOP_MARKER_KINDS, DELIVERY_ROLLUP_EVENT, DESIGNATION_EVENT, EVENT_ROLLUP_AGE_SECS,
-    EVENT_ROLLUP_BATCH, ROLLABLE_EVENT_KINDS, VERDICT_RECORDED_EVENT, VERDICT_STREAM,
+    EVENT_ROLLUP_BATCH, ROLLABLE_EVENT_KINDS, UNATTENDED_MERGE_ENQUEUED_EVENT,
+    UNATTENDED_MERGE_INTENT_EVENT, UNATTENDED_RUN_EVENT, VERDICT_RECORDED_EVENT, VERDICT_STREAM,
     WORKFLOW_APPROVED_EVENT, WORK_APPROVED_EVENT,
 };
 // CAD-316: the rollup's read-only counts for `doctor --host`.

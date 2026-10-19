@@ -336,3 +336,167 @@ mod cad1209_excused_report {
         assert_eq!(uses.excused, vec![910]);
     }
 }
+
+/// CAD-1558 reviewer-written refusal acceptance check for the fd re-read
+/// bound in `inspect_pid`, driven through `process_use_under_from_proc_root`
+/// (the real guard). A fd link that stays unreadable while its entry is
+/// present, or any other unexplained read error, keeps the scan incomplete;
+/// a holder beside it is still named. The transient case (a link that
+/// vanishes once and then resolves) needs a race between two syscalls and
+/// cannot be produced deterministically from a synthetic tree.
+#[cfg(all(test, target_os = "linux"))]
+mod cad1558_acceptance {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::time::{Duration, Instant};
+
+    fn fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let (proc_root, lane) = (root.join("proc"), root.join("lane"));
+        std::fs::create_dir_all(&lane).unwrap();
+        std::fs::create_dir_all(proc_root.join("self/ns")).unwrap();
+        std::fs::create_dir_all(proc_root.join("2/ns")).unwrap();
+        let canon = proc_root.canonicalize().unwrap();
+        std::fs::write(
+            proc_root.join("self/mountinfo"),
+            format!(
+                "1 23 0:55 / {} rw,nosuid,nodev,noexec,relatime - proc proc rw\n",
+                canon.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(proc_root.join("self/kernel-release"), "7.0.0\n").unwrap();
+        std::fs::write(
+            proc_root.join("2/stat"),
+            "2 (kthreadd) S 0 0 0 0 -1 2097152 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+        symlink("pid:[42]", proc_root.join("self/ns/pid")).unwrap();
+        symlink("pid:[42]", proc_root.join("2/ns/pid")).unwrap();
+        std::fs::write(
+            proc_root.join("self/status"),
+            "Name:\tt\nState:\tR (running)\nNSpid:\t7\nCapPrm:\t0000000000000000\n",
+        )
+        .unwrap();
+        process(&proc_root, 2);
+        (proc_root, lane)
+    }
+
+    /// An own-uid, live (`S`) process with an empty fd directory.
+    fn process(proc_root: &Path, pid: u32) -> PathBuf {
+        let dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(dir.join("fd")).unwrap();
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        std::fs::write(
+            dir.join("status"),
+            format!(
+                "Name:\tfixture\nState:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nGroups:\t{gid}\nCapEff:\t0000000000000000\nCapPrm:\t0000000000000000\n"
+            ),
+        )
+        .unwrap();
+        symlink("/", dir.join("cwd")).unwrap();
+        dir
+    }
+
+    fn root() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("c1558u-")
+            .tempdir_in("/tmp")
+            .unwrap()
+    }
+
+    #[test]
+    fn unreadable_fd_link_refuses_and_a_holder_is_still_named() {
+        let root = root();
+        let (proc_root, lane) = fixture(root.path());
+        let holder = process(&proc_root, 921);
+        symlink(lane.canonicalize().unwrap(), holder.join("fd/3")).unwrap();
+        // A regular file where the fd link should be: readlink fails with
+        // EINVAL, an error no policy explains.
+        let bad = process(&proc_root, 920);
+        std::fs::write(bad.join("fd/3"), "").unwrap();
+        let uses = process_use_under_from_proc_root(&lane, &proc_root).unwrap();
+        let err = uses.enumeration_error.expect("scan must be incomplete");
+        assert!(
+            err.contains("inspect file descriptor for process 920"),
+            "{err}"
+        );
+        assert_eq!(uses.fd, vec![921]);
+
+        std::fs::remove_dir_all(&bad).unwrap();
+        let uses = process_use_under_from_proc_root(&lane, &proc_root).unwrap();
+        assert!(
+            uses.enumeration_error.is_none(),
+            "{:?}",
+            uses.enumeration_error
+        );
+        assert_eq!(uses.fd, vec![921]);
+    }
+
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// The kernel's own "readlink ENOENT, lstat Ok" pair, persistently:
+    /// after `unshare(CLONE_NEWPID)` and before any child is forked,
+    /// `/proc/<pid>/ns/pid_for_children` has no reaper to name. A fake
+    /// pid's `fd` directory points at that real `ns` directory, so every
+    /// bounded re-read sees exactly what a vanishing fd link gives.
+    #[test]
+    fn persistently_vanishing_fd_link_refuses_after_bounded_rereads() {
+        let restricted =
+            std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+                .map(|value| value.trim() == "1")
+                .unwrap_or(false);
+        if restricted {
+            // Unprivileged CLONE_NEWPID is refused on this kernel (Ubuntu
+            // 24.04 default); the case runs wherever the kernel allows it.
+            eprintln!("cad1558: unprivileged pid namespaces restricted; case not run");
+            return;
+        }
+        let child = Child(
+            std::process::Command::new("/usr/bin/unshare")
+                .args(["-U", "-r", "-p", "/bin/sleep", "60"])
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn unshare for a reaperless pid namespace"),
+        );
+        let ns = PathBuf::from(format!("/proc/{}/ns", child.0.id()));
+        let link = ns.join("pid_for_children");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let vanished = matches!(
+                std::fs::read_link(&link),
+                Err(ref e) if e.kind() == io::ErrorKind::NotFound
+            ) && std::fs::symlink_metadata(&link).is_ok();
+            if vanished {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pid_for_children never became a vanishing link"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let root = root();
+        let (proc_root, lane) = fixture(root.path());
+        let holder = process(&proc_root, 921);
+        symlink(lane.canonicalize().unwrap(), holder.join("fd/3")).unwrap();
+        let vanishing = process(&proc_root, 922);
+        std::fs::remove_dir(vanishing.join("fd")).unwrap();
+        symlink(&ns, vanishing.join("fd")).unwrap();
+        let uses = process_use_under_from_proc_root(&lane, &proc_root).unwrap();
+        let err = uses.enumeration_error.expect("scan must be incomplete");
+        assert!(
+            err.contains("inspect file descriptor for process 922")
+                && err.contains("No such file or directory"),
+            "{err}"
+        );
+        assert_eq!(uses.fd, vec![921]);
+        drop(child);
+    }
+}

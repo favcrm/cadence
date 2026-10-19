@@ -36,6 +36,71 @@ Activation needs an operator-reviewed image/configuration backup and restore
 runbook; a failed guard must not automatically fall back to the sessionless
 local surface.
 
+## My work
+
+My work (`/my-work`) lists PM issues assigned to the signed-in human. It reuses
+the current issue read model and links to the existing Issue page for requirements,
+comments, references and progress. Refresh rereads the tracker; reassignment removes
+the issue from the previous owner's personal result. Loading, empty and unavailable
+states do not invent work. No local agent, model provider or Git repository is needed.
+Refresh retains keyboard focus while its read is pending and announces the busy
+state on the page. Refreshing again cancels the previous read; a late response
+cannot replace the newer result.
+
+Each compact card has an Inspect button and a separate Details link. Inspect
+opens a native modal snapshot; full details, history, evidence and execution
+remain on the existing Issue page. Returning from Details restores the queue's
+scroll and focused item. On narrow screens the drawer fills the viewport, with
+Close and full-details navigation pinned around its scrolling body.
+
+The personal drawer permits two existing revision-bound writes: a comment and
+an explicit status Save. Selecting a status alone never writes, and an unchanged
+status cannot be saved. Derived/container status locks only the status control;
+it does not prohibit an otherwise authorized comment. Current membership,
+write permission and fresh issue reads are required for either action. Failed
+or conflicting writes retain the draft and never replay automatically. Drafts
+and pending submission tokens survive close/reopen in memory, scoped to the
+issue and verified session; changing identity clears them.
+
+A denied issue read (401/403/404) retires its personal card and draft even if
+the drawer has already closed. A write refusal instead triggers fresh reads
+and permission verification: it does not itself prove the issue is unreadable.
+Older projection responses cannot restore a retired row.
+
+Assignment context is optional. A bounded, shared first-parent Git history
+walk proves the current ownership transition against a pinned history head;
+unresolved history, actors, corrupt objects or changed snapshots return
+unavailable context. Git authors and later no-op edits are not assigners.
+Self-assignment requires the exact verified human receipt, never the shared
+`operator` spelling. Provenance work finishes before the final caller/policy
+check and is limited by a shared deadline and object-read budget.
+
+My work remains an assigned-task queue, not a personal read-receipt or follow-up
+list. Status represents shared task progress; opening Inspect changes neither
+status nor attention state. Comment counts are totals, not unread indicators.
+Owned terminal-status issues remain included; no Active/Completed filter or
+personal tracking fields are introduced.
+
+The board derives the owner from its live session and rechecks the caller after
+the read. Query selectors are refused. Local board sessions use the existing
+`operator` attribution; named hosted Owners and Members retain their own user handles.
+Existing project access is applied before deriving cards, relationships and epic
+roll-ups; being assigned an issue never grants access to its project. Owner
+administrative visibility does not replace the Owner's individual attribution.
+Only readable issue targets contribute parent, blocker, related and duplicate
+links. This scoped PM projection is not an execution-eligibility decision.
+The read is discarded if its project-access set or effective caller authority
+changes while it is being prepared. This personal filter introduces no new grant
+and does not activate Private projects or qualify assistant/filesystem isolation.
+
+`cadence --org <org> my-work` provides the same PM read for a signed-in hosted org
+through the existing `cli.read` actor-envelope protocol. The native server derives
+the owner from the verified user actor and accepts no arguments. A local-org CLI
+invocation explains that a hosted org is required. Existing project, issue, setup,
+membership and local-agent commands remain their current interfaces; this feature
+adds no setup/access screens, work-proof format or agent-execution dashboard.
+
+
 ## Issue folder
 
 ```
@@ -447,9 +512,27 @@ digest is canonical across reordered keys and defaults written out or
 left implicit — but `risk` rule order is significant, so reordering
 rules changes it and needs re-approval.
 
+`integration_branch` optionally permits one additional PR target beside the
+repository default branch (CAD-1561). It must be a canonical branch name, not
+a `refs/` path or revision expression, and match the current, exactly approved
+policy. An unapproved, removed or malformed section cannot enable it through
+the last-approved fallback. Re-approve through the operator connection after
+changing the target; this option does not replace any CI, review or approval
+requirements and is compatible with the supported `solo_operator` profile.
+Requirements and readiness bind the actual target as `base_ref`, alongside
+the head/base OIDs and policy digest. Protection and required checks come from
+that target, including slashed branch names. Retargeting invalidates the
+evidence even when both branches share an OID; old readiness records without
+`base_ref` need fresh binding. Enqueue comments include an exact
+`Base branch: <name>` line. Omitting the option preserves existing policy digests.
+Native merge approval and legacy merge check/enqueued phases enforce the same
+target admission for every policy activation, including custom and fallback
+policies. Operator merge approval does not approve a project integration target.
+
 ```yaml
 delivery:
   merge: {method: squash, queue: true}    # optional; method: squash|merge|rebase
+  integration_branch: staging              # optional; operator-approved extra target
   max_revise: 2                           # optional; 1..=10
   reviews:                                # required, non-empty: the names
     standards: {kind: agent, focus: standards}      # focus: general|standards|
@@ -605,10 +688,17 @@ the `Issue: <ID>` trailer — as JSON.
   else it refuses naming the candidates. An explicit `--repo` must be
   one of the declared repos (code-commit discovery only walks those);
   an undeclared path is refused with the declared list and a pointer
-  to `repos` in `project.yaml`. **Base** resolves `--base`, else fetches
-  the branch named by `origin/HEAD` and pins its exact commit SHA; a
-  repository without a remote default falls back to its current branch.
-  A fetch failure refuses setup with a retry/explicit `--base` remedy.
+  to `repos` in `project.yaml`. **Base** resolves `--base`, else the
+  repo's configured integration branch (`repos[].base`, for example
+  `staging`), else fetches the branch named by `origin/HEAD`, else the
+  remote's symbolic HEAD (`git ls-remote --symref origin HEAD`), and
+  pins that commit. A repository with no `origin` remote uses its
+  current branch. When `origin` exists but its integration branch
+  cannot be resolved, start refuses — it does not adopt the main
+  checkout's current branch. When that checkout's tip is not contained
+  in the integration commit, the lane is still cut from the integration
+  commit and the output's `base.warning` names the mismatch. A fetch
+  failure refuses setup with a retry/explicit `--base` remedy.
 - The worktree is minted through the same helper as
   `cadence devin --worktree` (shared `src/worktree.rs`), including the
   `.gitignore` `.cadence/` rule — added only when missing.
@@ -656,8 +746,8 @@ the `Issue: <ID>` trailer — as JSON.
   else — an operator's own link — is refused, not silently
   half-shared.
 - The worktree gets a `.env` with `CARGO_BUILD_JOBS` and
-  `CADENCE_BUILD_SLOT` for the slot service (docs/PROTOCOL.md). To
-  keep `issue finish`'s clean-tree guard green, `issue start` appends
+  `CADENCE_BUILD_SLOT` for the slot service. To keep `issue finish`'s
+  clean-tree guard green, `issue start` appends
   the root-anchored patterns `/.env` and `/.env.tmp` to the repo's
   `info/exclude` — under flock, idempotent — which for a linked
   worktree is the COMMON git dir: the entries are permanent and cover
@@ -1488,7 +1578,7 @@ exactly one git commit whose subject carries the actor:
 | `POST /api/delivery/:id/decline` | `{reason}` — same path and refusals; relays the daemon's operator-only `delivery_decline`; a blank reason is `400 reason_required` | `200` with the loop record |
 | `POST /api/epics/:epic/stage` | `{stage, note?}` — CAD-432: move an epic's stage over the daemon's `epic_stage` (CAD-405); the board never writes the tracker for it. The relay runs on the board's own connection, which the daemon attributes to the operator, so **every** board move needs the operator, not only moves into an `operator_stages` stage: read-only, the write guards, `403 operator_only` for an agent-attributed caller and `403 operator_proof` for a peer without the positive proof — the plan routes' path — before anything is written; no identity field is read (`deny_unknown_fields`). The relay sets `operator_decision: true`, and the daemon then requires the operator on the board's connection for any target, so a board an agent started is refused too (`403 operator_proof`) instead of landing the move as that agent's. Agents move stages with `cadence issue epic stage` over their own connection. The daemon's rules still apply: one step forward, any step back to the floor | `200` `{epic, from, to, forward, needs_operator, by, at, …}`; `400` a skip or unknown stage; `409` already there; `404` unknown epic |
 | `POST /api/issues/:id/answers` | `{question, text}` — the operator's answer (CAD-328) to the open question report `question` on `:id`: an `answer` task report (CAD-341) authored `operator`, never from the request or the board's environment; `403 operator_only` for an agent caller and `403 operator_proof` for a peer that is not provably the operator (same proof as the plan routes); `400` when `question` is not a question report on the ticket or `text` is blank. Then the daemon's `answer_route` (CAD-447) queues one message to the question's author with the answer and the report path — the reply's `route` says whether it was sent (`undeliverable` when the asker is gone; the answer stands either way) — and a best-effort `reports_changed` so the master's report router (CAD-339) picks it up at once | `201` `{issue, card, warnings, route}` |
-| `POST /api/threads/:alias/messages` | `{text, message?}` — the operator's chat message (CAD-319): starts the thread on first use and queues `text` to the agent like `cadence send`. Refused `403 caller_agent` when the caller is attributed to an agent (pane or managed endpoint tool process); the daemon refuses agent connections again. Tied to no agent is the operator by default, not positive proof (CAD-313) | `200` with the send receipt and `thread` |
+| `POST /api/threads/:alias/messages` | `{text, message?, expected_recipient_uid?}` — the operator's chat message (CAD-319): starts the thread on first use and queues `text` to the agent like `cadence send`. `expected_recipient_uid` (CAD-1591) is an optional identity constraint, never authority: a nonempty uid the daemon's enqueue transaction compares to the recipient's current uid — a mismatch refuses before any message or thread side effect, and an omitted field keeps the ordinary path. Refused `403 caller_agent` when the caller is attributed to an agent (pane or managed endpoint tool process); the daemon refuses agent connections again. Tied to no agent is the operator by default, not positive proof (CAD-313) | `200` with the send receipt and `thread` |
 
 Success bodies are `{issue, card, warnings}` — the fresh payloads, so
 the UI needs no second fetch. `warnings` notes a `ready`/`doing`/`review`
@@ -1721,7 +1811,7 @@ payload at read time — nothing is stored; `cadence overview [--json]
 
 **Needs me** — one row per subject, ranked by urgency then age, each with
 `{kind, title, age, project, link, command, audience, audience_reason}`.
-Plan, question, merge-decision and master-permission rows may also carry
+Plan, question, merge-decision, unattended-hold and master-permission rows may also carry
 display-only `short_title` (about 50 characters) and `why` (one sentence),
 sanitized server-side and omitted when the source is empty or reads as a
 command (the word `cadence` anywhere, a backtick, `${` or `$(`); nothing reads them back
@@ -1736,6 +1826,7 @@ agent text as a title on its own, and shows a permission's whole reason
 | Rank | Kind | Class | Owner | Command |
 |---|---|---|---|---|
 | 10 | `merge` — open PR with `qa-verdict=success` and green checks | team | the issue owner (`cadence/<id>-…` head branch) | `gh pr merge <n> --repo <slug> --squash --admin --match-head-commit <sha>` |
+| 17 | `unattended_held` — bounded workflow work cannot safely continue | operator | operator; Details contain the reason and next inspection step | `cadence delivery ls` |
 | 20 | `approval` — a brokered permission request is open | operator | — | `cadence agent respond <a> --request <h> --decision accept` (provider input requests: `--answers-file <f>`) |
 | 20 | `idea_plan` — an idea in `review` tagged `plan-ready` (CAD-139). A `parked` or `idea-stale` review does not raise `review_no_pr` | operator | — | `cadence idea decide <id> approve` |
 | 20 | `idea_duplicate` — a backlog idea linked `duplicate_of` another open issue | operator | — | `cadence issue show <id>` |
@@ -1802,6 +1893,14 @@ minutes):
 A row whose `since` is null escalates only when its owner cannot act,
 and its reason never says `unhandled`. `age` is unchanged — it still
 orders rows inside a rank.
+
+An unattended hold and a worker fence coalesce only when the native queue proves
+the same owned unknown or failed turn. The held turn determines the project;
+the worker's registered cwd may belong to another project. The fenced recovery
+row stays primary and retains both causes; unrelated fences remain visible.
+A failed provider turn is not an unknown outcome that can be reconciled as
+completed. Acknowledging either observation does not resolve its underlying
+condition.
 
 Both CI rows share one subject, `ci:<slug>@<branch>`, so a red and
 unverified main is one row with two causes. They come from the
@@ -1918,6 +2017,14 @@ CADENCE_DEV_BOARD_PORT=3117 npx --yes pnpm@12.2.1 dev  # Vite HMR; /api → isol
 npx --yes pnpm@12.2.1 typecheck  # tsc --noEmit
 npx --yes pnpm@12.2.1 build      # → local ui/dist (--features ui embeds it)
 ```
+
+The UI build also emits precompressed Brotli (`.br`) and gzip (`.gz`)
+siblings. The embedded board negotiates these for its HTML, JavaScript and
+CSS; `--dist` mode uses available sibling files. Compression runs at build
+time, not per request. Static file responses keep `Cache-Control: no-store`
+and vary on `Accept-Encoding`, including raw responses. A client that
+refuses identity and every available coding receives `406`; otherwise a
+missing acceptable compressed sibling falls back to the original bytes.
 
 Start an isolated sandbox board and use the Rust restart loop in
 [CONTRIBUTING.md](../CONTRIBUTING.md#isolated-board-development) before running
@@ -2045,20 +2152,79 @@ A successful revoke remains distinct from a failed follow-up read; stale data
 cannot revoke another rule. Existing RPC/HTTP operator proofs, API shapes and
 rule policy remain unchanged. Live permission decisions stay in Home.
 
-Settings → Models is a full-width provider workspace. A compact provider
-selector opens one editor at a time and keeps drafts for every provider.
-The default model applies to newly registered agents across projects; existing
-agents keep their saved selection. A role can inherit that configured default,
-use the provider-native default, or select a specific model. Pi is the exception:
-its default option is labelled Operator policy default and uses the configured
-Pi policy fallback; explicit model IDs still require that policy's allowlist.
-Suggestions remain previously observed IDs, not a provider catalog. Unavailable providers retain
-their limitation text. Save applies all provider drafts with the current
-expected revision; reset omits that provider and discard restores all saved
-values. Read-only/sign-in gates, validation, failed-save drafts and revision
-conflicts remain visible. Initial read failure offers Retry; loading and an
-empty provider list are distinct. Labels and responsive role rows use shared
-controls, theme tokens and keyboard focus.
+Settings → Agents has Harnesses, Profiles, and Providers & models tabs.
+Declarations do not install programs, create adapters, change credentials or
+alter running sessions. Installation, versions and fleet usage are observed
+separately from editable declarations. Native CLI models do not use Pi
+allowlists; Pi scopes distinguish master and worker runtime permissions.
+A profile's team role selects model preferences, never runtime authority.
+Drawers scroll vertically on short or narrow screens so job descriptions,
+model details, file targets and actions remain reachable without clipping.
+New harness and provider drawers keep the registry ID separate from the display
+label (for example, `claude` versus “Claude Code”). Closing a drawer keeps edits
+to existing rows in the page draft; Discard resets that draft and its status.
+An existing model's blank or duplicate ID stays visible as a validation error;
+Save model stays disabled until the ID is corrected.
+An empty registry shows empty states, not the mockup's demo rows. Providers &
+models follows the approved mockup without a Role defaults editor; stored
+defaults are preserved and inherited profiles still resolve them. Launch
+eligibility comes from saved-state Preview, not an optimistic unsaved badge.
+The operator-approved clean presentation omits the registry banner, subtitles
+and explanatory paragraphs. Information buttons expose page and field help on
+hover, keyboard focus or tap in styled, viewport-bounded top-layer tooltips.
+Escape dismisses help before closing its drawer; outside taps and scrolling
+dismiss help too. Touch pointers get 44px targets. Validation, failures, live
+status and concise empty states stay visible; Save and Discard remain grouped
+on narrow screens.
+
+Save commits harness/provider/model declarations, role defaults, Pi policy,
+pins and profile definitions in one revision-bound SQLite transaction.
+Conflicts and validation failures retain the draft; Discard restores the saved
+revision. Sync and Preview require saved state. Full settings reads include
+profile job bodies, so RPC and HTTP both require operator proof. Read-only
+operator sessions can inspect but cannot mutate settings. Catalog Refresh reads the supported
+`omp models <provider> --json --no-extensions` listing and shows its actual
+source and fetch time; discovered models are not launch permission. Import
+adds missing rows to the draft with Pi permission off. Picking a combobox row
+fills metadata; opening an existing row preserves its saved values.
+Provider pins accept `name@version` or `name version`; Save stores the canonical
+`name@version` form. The legacy model-defaults writer preserves the Agents
+overlay and refuses edits to it; use Agents Save for those fields.
+
+At daemon startup, legacy `pm.yaml [pi]` and non-master
+`agents/<profile>/AGENT.md` definitions are imported once. The SQLite settings
+authority is then used by CLI, daemon and adapter launch paths; subsequent
+file edits do not replace it. Retired-source drift is informational. The
+master's own instructions and integrity protections remain separate.
+Regular files directly under `agents/` are not profile definitions and are
+left untouched. Symlinks, special files and invalid actual profiles still
+refuse import rather than being followed or silently discarded.
+
+Portable coordination exports omit settings authority alongside model defaults.
+An execution-disabled portable restore does not import legacy settings or
+recreate those authority rows. Its existing read-only and no-launch fences
+remain in force.
+
+`cadence join <pm> <provider> --profile <id>` snapshots the saved job, team role,
+model selection, settings revision and profile digest for the new session.
+An explicit model or native provider-default selection can override the
+profile preference, but cannot bypass known model/harness compatibility or
+Pi policy. Existing sessions retain their stored instructions. New or changed
+jobs must fit both the AGENT.md character cap and the 32,000 UTF-8 byte launch
+instruction limit. Larger imported jobs remain preserved; Preview and launch
+explain the refusal until they are shortened.
+Profile usage lists active sessions. Stopped/offline sessions retain their
+snapshots and audit history but do not prevent profile deletion.
+
+Sync writes supported derived `.pi/agents/<id>.md` and
+`.claude/agents/<id>.md` exports under the PM root. It preserves unmanaged files,
+refuses symlinked ancestors and never replaces a concurrently created target.
+Managed updates write the validated, single-link file descriptor rather than
+replacing its path; their ownership header survives partial writes, allowing
+a later Sync to repair an interrupted derived export. These files are not the
+canonical launch source. Preview reports the saved selection, compatibility,
+installation and permission refusals, including host Pi-confinement defaults,
+without starting an agent session.
 
 The SPA has real routes (CAD-326, `ui/src/lib/router.ts`): `/` Home,
 `/overview` (the team overview: needs, drift, monitors, projects),
@@ -2073,6 +2239,27 @@ either cursor advances. Mark all read dismisses notifications without marking
 unviewed transcript messages read.
 All includes every eligible conversation, not a truncated first page. The bell's
 unread total covers that complete authorized history.
+
+Agent-pair Threads stay read-only (CAD-1591): a message whose recorded
+sender is a still-registered agent carries a "Reply as you" action that
+opens the operator's existing DM to that participant — an operator reply,
+never a reply impersonating either agent. The composer shows a context
+strip with the original message id, a bounded quoted excerpt and a
+backlink to the pair conversation it came from, and the sent body appends
+a `Replying to your message <id>` quote block; the quote is context, never
+a routing field, so origin and reply_to are untouched and the send is an
+ordinary operator DM. The recorded sender's uid rides every attempt as
+`expected_recipient_uid`: a removed or replaced participant is refused by
+the daemon's enqueue transaction before any side effect, never silently
+re-addressed, and a removed, legacy or unproven sender is never offered
+the action at all. The reply draft is scoped to the recorded sender uid
+and original message id (`threads-reply:<uid>:<messageId>`), so it can
+never merge into or displace the ordinary DM draft and clears with a
+private-session reset; it lives in page state, not the URL, so a copied
+link cannot fabricate a reply context. Drafting never sends. After an
+accepted send the context stays until an explicit Cancel — only the exact
+submitted intent is marked sent, nothing is unconditionally cleared — so
+post-submit edits remain visible with their reply context.
 
 Browser alerts require explicit device opt-in through the browser's native
 permission and subscription flow. Alerts are generic by default; opening one

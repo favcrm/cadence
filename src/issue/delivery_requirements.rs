@@ -414,6 +414,10 @@ pub(crate) fn activation_of(resolved: &Resolved) -> Activation {
 
     let mut policy = resolved.policy.clone();
     policy.solo_operator = None;
+    // CAD-1561: the integration target widens which PR base the policy
+    // admits — it does not change the requirements level. An approved
+    // default-equivalent-plus-target policy stays Active.
+    policy.integration_branch = None;
     if matches!(resolved.source, "default" | "file" | "approved") && policy == default_policy() {
         Activation::Active
     } else {

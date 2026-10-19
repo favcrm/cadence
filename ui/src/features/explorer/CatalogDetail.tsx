@@ -7,7 +7,6 @@ import { installationAppHref, installedAppHref } from "../apps/appViewModel";
 import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip } from "./shared";
 import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
-import { Loading, Notice } from "../app-shell/shared/States";
 import { useTranslate } from "../../lib/locale";
 import "./explorer.css";
 import { PublicAppDetail } from "./publicDirectory";
@@ -63,11 +62,8 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
 
   if (viewer.operator === null) {
     return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9" aria-label={t("app catalog detail")}>
-      {viewer.access === "unavailable" ? (
-        <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
-          {t("Access could not be confirmed. Retry the access check before acting.")}
-        </Notice>
-      ) : <Loading>{t("Checking whether this session can act…")}</Loading>}
+      <h1 className="text-section font-semibold">{t("No such app.")}</h1>
+      <Link href="/apps/explore">{t("Back to Explore")}</Link>
     </main>;
   }
   if (error) {

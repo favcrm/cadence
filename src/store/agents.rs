@@ -275,10 +275,11 @@ impl Store {
             return Err(Error::rejected("Working directory must be a directory"));
         }
         if let Some(text) = new.instructions {
-            if text.len() > 32_000 {
-                return Err(Error::rejected(
-                    "Instructions must be at most 32000 characters",
-                ));
+            if text.len() > super::MAX_INSTRUCTIONS_BYTES {
+                return Err(Error::rejected(format!(
+                    "Instructions must be at most {} UTF-8 bytes",
+                    super::MAX_INSTRUCTIONS_BYTES,
+                )));
             }
         }
         if let Some(p) = new.params {
@@ -322,10 +323,21 @@ impl Store {
                     }
                 };
             let selection = resolved.model_selection.as_ref().map(Value::to_string);
-            let merged_params = match resolved.params.as_deref() {
+            let merged_params: Value = match resolved.params.as_deref() {
                 Some(raw) => serde_json::from_str(raw)?,
                 None => json!({}),
             };
+            if merged_params.get("profile").and_then(Value::as_str).is_some() {
+                if let Some(model) = merged_params.get("model").and_then(Value::as_str) {
+                    let metadata = &defaults.config.agent_settings;
+                    crate::agent_settings::validate_model_harness(
+                        model,
+                        new.provider,
+                        metadata.get("models").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]),
+                        metadata.get("providers").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]),
+                    )?;
+                }
+            }
             if let Err(err) =
                 registry::validate_launch_params(new.provider, new.endpoint_kind, &merged_params)
             {
@@ -725,6 +737,13 @@ impl Store {
             let patch = patch
                 .as_object()
                 .ok_or_else(|| Error::rejected("params patch must be a JSON object"))?;
+            for key in ["profile", "profile_revision", "profile_digest"] {
+                if patch.contains_key(key) {
+                    return Err(Error::rejected(
+                        "profile identity is fixed at registration and cannot be patched",
+                    ));
+                }
+            }
             let model_selection = if patch.contains_key("model") {
                 if !registry::supports_model(&agent.provider, &agent.endpoint_kind) {
                     return Err(Error::invalid(
@@ -837,9 +856,8 @@ impl Store {
         document: &str,
         attribution: Option<&str>,
     ) -> Result<ModelDefaultsSnapshot> {
-        let write = crate::model_defaults::parse_settings_document(document)?;
+        let mut write = crate::model_defaults::parse_settings_document(document)?;
         let attribution = crate::model_defaults::normalize_attribution(attribution)?;
-        let stored = serde_json::to_string(&write.config)?;
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let current = Self::read_model_defaults_tx(&tx)?;
@@ -852,6 +870,24 @@ impl Store {
                     ),
                 ));
             }
+            // `model_defaults_set` does not edit the agents overlay. A body
+            // that omits it (serde default null) must not wipe the object.
+            if write.config.agent_settings.is_null() {
+                write.config.agent_settings = current.config.agent_settings.clone();
+            } else if write.config.agent_settings != current.config.agent_settings {
+                return Err(Error::invalid(
+                    "invalid_config",
+                    "model_defaults_set cannot edit agent_settings; use Agents settings",
+                ));
+            }
+            super::settings_authority::reject_nested_authority(&write.config)?;
+            let (_, _, authority) = super::settings_authority::load_model_defaults_row(&tx)?;
+            super::settings_authority::guard_launch_ids(&super::SettingsDoc {
+                model_defaults: write.config.clone(),
+                pi: authority.pi.clone(),
+                profiles: authority.profiles.clone(),
+            })?;
+            let stored = super::settings_authority::join_document(&write.config, &authority)?;
             let next = current.revision.checked_add(1).ok_or_else(|| {
                 Error::invalid("invalid_request", "model defaults revision overflowed")
             })?;
@@ -880,22 +916,79 @@ impl Store {
         })
     }
 
-    fn read_model_defaults_tx(tx: &impl super::StoreConn) -> Result<ModelDefaultsSnapshot> {
-        let (revision, document): (i64, String) = tx
-            .query_row(
-                "SELECT revision, document FROM model_defaults WHERE id=1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|err| match err {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    Error::internal("model defaults row is missing")
-                }
-                other => Error::from(other),
-            })?;
-        let mut config: crate::model_defaults::ModelDefaults = serde_json::from_str(&document)
-            .map_err(|err| Error::internal(format!("stored model defaults are invalid: {err}")))?;
+    /// Same revision gate as [`Self::replace_model_defaults`] for a config
+    /// the agents settings writer already validated. The 16 KiB model-defaults
+    /// HTTP envelope does not apply; the serialized document is capped here.
+    pub fn replace_model_defaults_config(
+        &self,
+        expected_revision: i64,
+        mut config: crate::model_defaults::ModelDefaults,
+        attribution: Option<&str>,
+    ) -> Result<ModelDefaultsSnapshot> {
         crate::model_defaults::validate_config(&mut config)?;
+        let attribution = crate::model_defaults::normalize_attribution(attribution)?;
+        let stored_len = serde_json::to_string(&config)?.len();
+        if stored_len > 256 * 1024 {
+            return Err(Error::invalid(
+                "invalid_config",
+                "agents settings document exceeds 256 KiB",
+            ));
+        }
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let current = Self::read_model_defaults_tx(&tx)?;
+            if current.revision != expected_revision {
+                return Err(Error::conflict(
+                    current.revision,
+                    format!(
+                        "model defaults revision is {}, not {expected_revision}",
+                        current.revision
+                    ),
+                ));
+            }
+            if config.agent_settings.is_null() {
+                config.agent_settings = current.config.agent_settings.clone();
+            }
+            super::settings_authority::reject_nested_authority(&config)?;
+            let (_, _, authority) = super::settings_authority::load_model_defaults_row(&tx)?;
+            super::settings_authority::guard_launch_ids(&super::SettingsDoc {
+                model_defaults: config.clone(),
+                pi: authority.pi.clone(),
+                profiles: authority.profiles.clone(),
+            })?;
+            let stored = super::settings_authority::join_document(&config, &authority)?;
+            let next = current.revision.checked_add(1).ok_or_else(|| {
+                Error::invalid("invalid_request", "model defaults revision overflowed")
+            })?;
+            let at = now();
+            tx.execute(
+                "UPDATE model_defaults SET revision=?, document=? WHERE id=1",
+                params![next, stored],
+            )?;
+            Self::event(
+                &tx,
+                Self::DAEMON_STREAM,
+                "model_defaults_updated",
+                json!({
+                    "revision": next,
+                    "before": current.config,
+                    "after": config,
+                    "attribution": attribution.actor,
+                    "transport": attribution.transport,
+                    "at": at,
+                }),
+            )?;
+            Ok(ModelDefaultsSnapshot {
+                revision: next,
+                config,
+            })
+        })
+    }
+
+    pub(super) fn read_model_defaults_tx(
+        tx: &impl super::StoreConn,
+    ) -> Result<ModelDefaultsSnapshot> {
+        let (revision, config, _) = super::settings_authority::load_model_defaults_row(tx)?;
         Ok(ModelDefaultsSnapshot { revision, config })
     }
 

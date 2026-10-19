@@ -109,6 +109,79 @@ function rotr(x: number, n: number): number {
   return ((x >>> n) | (x << (32 - n))) >>> 0;
 }
 
+/** Incremental SHA-256 over bounded chunks. `hex()` is lowercase and does not retain the input. */
+export function createSha256(): { update(chunk: Uint8Array): void; hex(): string } {
+  let h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a;
+  let h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+  const pending = new Uint8Array(64);
+  const w = new Uint32Array(64);
+  let filled = 0;
+  let total = 0;
+
+  const compress = (view: DataView, offset: number) => {
+    for (let t = 0; t < 16; t++) w[t] = view.getUint32(offset + t * 4, false);
+    for (let t = 16; t < 64; t++) {
+      const s0 = (rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3)) >>> 0;
+      const s1 = (rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10)) >>> 0;
+      w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
+    }
+    let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+    for (let t = 0; t < 64; t++) {
+      const s1 = (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) >>> 0;
+      const ch = ((e & f) ^ (~e & g)) >>> 0;
+      const t1 = (h + s1 + ch + K[t] + w[t]) >>> 0;
+      const s0 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) >>> 0;
+      const maj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+      const t2 = (s0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0;
+      d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
+    h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + h) >>> 0;
+  };
+
+  return {
+    update(chunk: Uint8Array) {
+      total += chunk.length;
+      let offset = 0;
+      if (filled !== 0) {
+        const take = Math.min(64 - filled, chunk.length);
+        pending.set(chunk.subarray(0, take), filled);
+        filled += take;
+        offset = take;
+        if (filled === 64) {
+          compress(new DataView(pending.buffer, pending.byteOffset, 64), 0);
+          filled = 0;
+        }
+      }
+      while (offset + 64 <= chunk.length) {
+        compress(new DataView(chunk.buffer, chunk.byteOffset + offset, 64), 0);
+        offset += 64;
+      }
+      if (offset < chunk.length) {
+        pending.set(chunk.subarray(offset), 0);
+        filled = chunk.length - offset;
+      }
+    },
+    hex() {
+      const tail = new Uint8Array(128);
+      tail.set(pending.subarray(0, filled), 0);
+      tail[filled] = 0x80;
+      const view = new DataView(tail.buffer);
+      if (filled >= 56) compress(view, 0);
+      const bits = BigInt(total) * 8n;
+      const lengthAt = filled >= 56 ? 64 : 0;
+      view.setUint32(lengthAt + 56, Number(bits >> 32n), false);
+      view.setUint32(lengthAt + 60, Number(bits & 0xffffffffn), false);
+      compress(view, lengthAt);
+      const out = new Uint8Array(32);
+      const written = new DataView(out.buffer);
+      [h0, h1, h2, h3, h4, h5, h6, h7].forEach((word, i) => written.setUint32(i * 4, word >>> 0, false));
+      return Array.from(out).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    },
+  };
+}
+
 /** `sha256:` hex of the UTF-8 bytes of `text`. */
 export function sha256Text(text: string): string {
   const bytes = new TextEncoder().encode(text);

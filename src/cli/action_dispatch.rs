@@ -103,6 +103,11 @@ pub(crate) fn run() -> Result<i32> {
 fn command_line_ids(m: &clap::ArgMatches) -> Vec<String> {
     let typed = m
         .ids()
+        // `ids()` reports propagated global args (e.g. `settings agents`
+        // `--grant`) on nested subcommand matches too, but `value_source`
+        // panics on an id the subcommand never declared. `try_contains_id`
+        // verifies the declaration first; only then is `value_source` safe.
+        .filter(|id| matches!(m.try_contains_id(id.as_str()), Ok(true)))
         .filter(|id| m.value_source(id.as_str()) == Some(clap::parser::ValueSource::CommandLine))
         .map(|id| id.as_str().to_string());
     let nested = m
@@ -110,6 +115,38 @@ fn command_line_ids(m: &clap::ArgMatches) -> Vec<String> {
         .map(|(_, sub)| command_line_ids(sub))
         .unwrap_or_default();
     typed.chain(nested).collect()
+}
+
+/// The `cadence self` payload for a mailbox with no actor: the inbound
+/// backlog a consumer owes it (CAD-480). Extracted so a test can compare
+/// its shape with the example in `skills/cadence/SKILL.md` (CAD-1514).
+pub(super) fn self_inbox_payload(show: &Value, kind: &str) -> Value {
+    json!({
+        "alias": show["agent"]["alias"],
+        "endpoint_kind": kind,
+        "queued": show["queued"],
+        "unread": show["inbox"]["queued"],
+        "oldest_unread_age_secs": show["inbox"]["oldest_age_secs"],
+    })
+}
+
+/// The `cadence self` payload for an actor: only the running turns
+/// (CAD-879), never history. Extracted for the same reason as
+/// [`self_inbox_payload`].
+pub(super) fn self_actor_payload(alias: &str, show: &Value) -> Value {
+    let running = show["messages"]
+        .as_array()
+        .map(|ms| {
+            ms.iter()
+                .filter(|m| m["state"].as_str() == Some("running"))
+                .map(|m| {
+                    json!({"id": m["id"], "turn_id": m["turn_id"],
+                           "task": m["task_id"]})
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({"alias": alias, "running": running})
 }
 
 pub(super) fn run_cli(cli: Cli) -> Result<i32> {
@@ -168,6 +205,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             no_open,
             auth_dir,
             web,
+            settings,
         } => {
             // `--token-stdin` is the legacy AgenticOS token path, not org login.
             let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
@@ -183,13 +221,14 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             let issuer = issuer
                 .as_deref()
                 .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
-            let grant = if *web {
+            let grant = if *web || *settings {
                 cadence_agent::remote_enrollment::login_portal_scoped(
                     issuer,
                     hint.as_deref().or(slug.as_deref()),
                     &dir,
                     |url, code| show_login_code(url, code, *no_open),
-                    true,
+                    *web,
+                    *settings,
                 )?
             } else if let Some(org) = org.as_deref() {
                 let slug = slug.as_deref().ok_or_else(|| {
@@ -359,12 +398,16 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     let tracker = std::env::var_os("CADENCE_PM_DIR")
         .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
         .transpose()?;
-    // CAD-1355: `update` is local install maintenance, so it resolves
-    // through the updater-only selector — a saved remote default never
-    // routes it, an explicit remote `--org`/`CADENCE_ORG` refuses with
-    // local-only guidance before any transport, credentials or wake.
+    // CAD-1355 / CAD-1545: `update` and `dev` are local maintenance, so
+    // they resolve through the shared local-maintenance selector — a saved
+    // remote default never routes them, and an explicit remote
+    // `--org`/`CADENCE_ORG` refuses with local-only guidance before any
+    // transport, credentials or wake. `dev` also refuses a remote
+    // `CADENCE_ORG` when a local pin is set.
     let resolved = if matches!(cli.command, Commands::Update { .. }) {
         org::resolve_update(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
+    } else if matches!(cli.command, Commands::Dev { .. }) {
+        org::resolve_dev(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
     } else {
         org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
     };
@@ -377,9 +420,9 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             return remote::run(target, cli.command, cli.wake_timeout, cli.state_dir.clone());
         }
     };
-    // CAD-310: a sandbox's state dir decides its profile and tracker,
-    // not the caller's env. `sandbox` verbs resolve their own roots.
-    if !matches!(cli.command, Commands::Sandbox { .. }) {
+    // CAD-310: a dev Cadence's state dir decides its profile and tracker,
+    // not the caller's env. `dev` verbs (alias `sandbox`) resolve their own roots.
+    if !matches!(cli.command, Commands::Dev { .. }) {
         cadence_agent::sandbox::adopt(&state_dir)?;
     }
     // CAD-615: the master retrying an approved command. The daemon
@@ -398,6 +441,10 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         | Commands::Auth { .. }
         | Commands::Web { .. } => {
             unreachable!("auth or web dispatched before state-dir")
+        }
+        Commands::InspectPortable { source } => {
+            print_json(&cadence_agent::backup::portable::inspect_portable(&source)?);
+            Ok(0)
         }
         Commands::Doctor {
             host,
@@ -421,7 +468,11 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             portable,
             tracker,
             apps,
-        } => export::run(state_dir, out, portable, tracker, apps),
+            snapshot_working_tree,
+            redact_history_secrets,
+        } => export::run(
+            state_dir, out, portable, tracker, apps, snapshot_working_tree, redact_history_secrets,
+        ),
         Commands::Restore {
             source,
             repos,
@@ -693,6 +744,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             cloud_params,
             confine,
             no_confine,
+            profile,
         } => join::run(
             state_dir,
             group,
@@ -725,6 +777,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             cloud_params,
             confine,
             no_confine,
+            profile,
         ),
         Commands::Attach { name, print } => attach::run(state_dir, name, print),
         Commands::Resume { group, all, detach } => resume::run(state_dir, group, all, detach),
@@ -743,41 +796,27 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
                 show["agent"]["endpoint_kind"].as_str().unwrap_or_default(),
             );
             if !registry::has_actor(provider, kind) {
-                print_json(&json!({
-                    "alias": show["agent"]["alias"],
-                    "endpoint_kind": kind,
-                    "queued": show["queued"],
-                    // CAD-480: the unread backlog and its age — what a
-                    // consumer owes this mailbox.
-                    "unread": show["inbox"]["queued"],
-                    "oldest_unread_age_secs": show["inbox"]["oldest_age_secs"],
-                }));
+                // CAD-1514: the shape lives in `self_inbox_payload`, which
+                // a test compares against the SKILL.md example.
+                print_json(&self_inbox_payload(&show, kind));
                 return Ok(0);
             }
-            let running = show["messages"]
-                .as_array()
-                .map(|ms| {
-                    ms.iter()
-                        .filter(|m| m["state"].as_str() == Some("running"))
-                        .map(|m| {
-                            json!({"id": m["id"], "turn_id": m["turn_id"],
-                                   "task": m["task_id"]})
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let payload = self_actor_payload(&alias, &show);
             // CAD-375: the daemon shows a running turn's token only to
             // the agent's own pane or endpoint. A `null` here means this
             // process is not in it — say so rather than print a report
             // instruction that cannot work.
-            if running.iter().any(|m| m["turn_id"].is_null()) {
+            if payload["running"]
+                .as_array()
+                .is_some_and(|ms| ms.iter().any(|m| m["turn_id"].is_null()))
+            {
                 return Err(Error::rejected(format!(
                     "turn tokens for '{alias}' are shown only to that agent's own pane \
                      or managed endpoint, and this process does not descend from it — \
                      run `cadence self` inside the agent's pane (CAD-375)"
                 )));
             }
-            print_json(&json!({"alias": alias, "running": running}));
+            print_json(&payload);
             Ok(0)
         }
         Commands::Done {
@@ -861,6 +900,10 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         Commands::Template { action } => business_templates::run_template(state_dir, action),
         Commands::Document { action } => business_templates::run_document(state_dir, action),
         Commands::Ui { action } => ui::run(state_dir, action),
+        Commands::Settings { action } => settings::run(&state_dir, action),
+        Commands::MyWork => Err(Error::usage(
+            "my-work requires a hosted org; run cadence login, then cadence --org <org> my-work",
+        )),
         Commands::Status {
             group,
             all,
@@ -965,7 +1008,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             state_dir, action, check, rollback, drain, now, keep, backup_dir, json, progress, to,
             target,
         ),
-        Commands::Sandbox { action } => sandbox::run(state_dir, action),
+        Commands::Dev { action } => sandbox::run(state_dir, action),
         Commands::Confine {
             read,
             write,

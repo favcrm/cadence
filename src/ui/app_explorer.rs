@@ -368,6 +368,7 @@ mod principal_acceptance {
         Caller::Named(Named {
             actor: "A <a@x> (board)".into(),
             author: "alice".into(),
+            sub: "sub_alice".into(),
             operator,
         })
     }

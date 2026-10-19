@@ -1,6 +1,7 @@
-import { api } from "./api";
+import { api, ApiError, type MyWorkPayload } from "./api";
 import { QueryCache, type Resource } from "./cache";
 import { loadThread, type PageReader, type ThreadState } from "../features/home/thread";
+import { onPrivateReadsPaused, onPrivateSessionReset } from "./privateSession";
 
 /** Page reads of one agent's thread. */
 export function threadReader(alias: string): PageReader {
@@ -31,6 +32,50 @@ import type {
 /** The app's one query cache — every screen reads its stores from here. */
 export const cache = new QueryCache();
 
+const unavailablePrivateRecord = (error: unknown) => error instanceof ApiError &&
+  (error.status === 401 || error.status === 403 || error.status === 404);
+
+let myWorkController: AbortController | null = null;
+const unavailableIssueListeners = new Set<(id: string) => void>();
+
+function abortMyWorkRead(): void {
+  myWorkController?.abort();
+}
+
+onPrivateReadsPaused(abortMyWorkRead);
+onPrivateSessionReset(abortMyWorkRead);
+
+async function readMyWork(): Promise<MyWorkPayload> {
+  abortMyWorkRead();
+  const controller = new AbortController();
+  myWorkController = controller;
+  try {
+    return await api.myWork(controller.signal);
+  } finally {
+    if (myWorkController === controller) myWorkController = null;
+  }
+}
+
+/** Explicit refresh replaces the pending read without dropping same-session rows. */
+export function refreshMyWork(): Promise<void> {
+  abortMyWorkRead();
+  resources.myWork.pause();
+  return resources.myWork.refresh();
+}
+
+export function onIssueUnavailable(listener: (id: string) => void): () => void {
+  unavailableIssueListeners.add(listener);
+  return () => { unavailableIssueListeners.delete(listener); };
+}
+
+function retirePersonalIssue(id: string): void {
+  abortMyWorkRead();
+  resources.myWork.pause();
+  resources.myWork.mutate((body) => ({ ...body, issues: body.issues.filter((row) => row.id !== id) }));
+  for (const listener of unavailableIssueListeners) listener(id);
+  if (resources.myWork.observed()) void resources.myWork.refresh();
+}
+
 /**
  * `GET /api/threads/master` — the master's thread (CAD-328). A fetch
  * loads only what the store does not hold yet and keeps its pending
@@ -50,6 +95,11 @@ export const resources = {
   /** `GET /api/issues` — cards, derived status, job-bound agents. */
   issues: cache.resource<IssueCard[]>("issues", () => api.issues().then((r) => r.issues), {
     isEmpty: (rows) => rows.length === 0,
+  }),
+  /** Caller-scoped personal projection; private-cache reset retires it with the session. */
+  myWork: cache.resource<MyWorkPayload>("myWork", readMyWork, {
+    isEmpty: (body) => body.issues.length === 0,
+    discardOnError: unavailablePrivateRecord,
   }),
   /** `GET /api/projects` — project config (key, prefix, repos). */
   projects: cache.resource<Project[]>("projects", () => api.projects().then((r) => r.projects), {
@@ -74,7 +124,10 @@ export const resources = {
    */
   masterState: cache.resource<MasterState>("masterState", () => api.masterState()),
   /** `GET /api/issues/<id>` — one drawer's detail (and a plan card's epic). */
-  issue: cache.family<string, IssueDetail>("issue", (id) => api.issue(id)),
+  issue: cache.family<string, IssueDetail>("issue", (id) => api.issue(id), (id) => ({
+    discardOnError: unavailablePrivateRecord,
+    onDiscard: () => retirePersonalIssue(id),
+  })),
   /**
    * `GET /api/issues/<id>/lane` — live lane state. Not in `issue.md`, so
    * the focus poll and an agents stream frame invalidate it with the issue.

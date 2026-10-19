@@ -15,6 +15,7 @@ pub mod connections;
 pub mod custody;
 pub mod deployments;
 pub mod hosted_email;
+pub mod hosted_whatsapp;
 pub mod local;
 pub mod smtp;
 pub mod smtp_internal;

@@ -74,6 +74,12 @@ pub enum RouteClass {
     /// browser/session guard; its handler narrows the verified identity
     /// and action (for example, self-only vs organization operator).
     CallerScoped,
+    /// CAD-1537: an installed app's own screen — the mount and its read
+    /// service calls. The guards run as for a write, and also on a
+    /// `--read-only` board; an operator session (with peer proof) or a
+    /// named member is admitted, never an agent. The daemon decides per
+    /// operation: a member's or read-only board's mount is read-only.
+    ScreenRead,
 }
 
 /// One write route: method, path pattern (`*` is one non-empty
@@ -319,18 +325,25 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-installations/upload",
         RouteClass::OperatorOnly,
     ),
-    // CAD-1006: the screen mint — operator-only like the install routes.
-    // Authority is the proven session credential relayed to the daemon,
-    // never a caller field; the minted nonce is the frame GET's one-use cap.
+    route(
+        "POST",
+        "/api/app-installations/upload/check",
+        RouteClass::OperatorOnly,
+    ),
+    // CAD-1006: the screen mint. Authority is the proven session
+    // credential relayed to the daemon, never a caller field; the minted
+    // nonce is the frame GET's one-use cap. CAD-1537: a member or a
+    // `--read-only` board mounts read-only (`ScreenRead`); the SLOT and
+    // tool routes below stay the operator's.
     route(
         "POST",
         "/api/app-installations/*/screens/*/mount",
-        RouteClass::OperatorOnly,
+        RouteClass::ScreenRead,
     ),
     route(
         "POST",
         "/api/app-screen-services/call",
-        RouteClass::OperatorOnly,
+        RouteClass::ScreenRead,
     ),
     route(
         "POST",
@@ -442,6 +455,22 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route(
         "POST",
         "/api/settings/model-defaults",
+        RouteClass::OperatorOnly,
+    ),
+    route("POST", "/api/settings/agents", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/settings/agents/catalog",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/settings/agents/sync",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/settings/agents/preview",
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/threads/*/messages", RouteClass::OperatorOnly),
@@ -557,6 +586,13 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // attributed agent) writes, and the daemon's per-prefix allowlist
     // decides where. The board relays; it never widens a caller.
     route("PUT", "/api/wiki/file", RouteClass::AgentAllowed),
+    route("PUT", "/api/wiki/collection", RouteClass::AgentAllowed),
+    route("POST", "/api/wiki/corrections", RouteClass::AgentAllowed),
+    route(
+        "POST",
+        "/api/wiki/corrections/review",
+        RouteClass::AgentAllowed,
+    ),
     route("PUT", "/api/wiki/transfer", RouteClass::AgentAllowed),
     route("POST", "/api/wiki/upload", RouteClass::AgentAllowed),
     route("POST", "/api/wiki/mkdir", RouteClass::AgentAllowed),
@@ -648,7 +684,7 @@ pub(super) fn admit(
     ) {
         return Ok(None);
     }
-    if opts.read_only {
+    if opts.read_only && class != RouteClass::ScreenRead {
         return Err(guard_fail(
             "read_only",
             "board is read-only — writes are disabled",
@@ -666,6 +702,10 @@ pub(super) fn admit(
     };
     write_guard(request, ct, opts)?;
     let caller = board_caller(request, state_dir, opts, true, None)?;
+    if class == RouteClass::ScreenRead {
+        let what = format!("{method} {path}");
+        return admit_screen_caller(request, state_dir, opts, caller, &what).map(Some);
+    }
     if class == RouteClass::OperatorOnly {
         match &caller {
             Caller::Agent(alias) => {
@@ -756,6 +796,48 @@ pub(super) fn admit_operator_read_caller(
     }
 }
 
+/// CAD-1537: a read of an installed app's own screen — its installation
+/// receipt and contexts. Admits the operator (with peer proof, as
+/// [`admit_operator_read`]) or a named member; never an agent.
+pub(super) fn admit_screen_read(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<Caller, HttpResp> {
+    let caller = board_caller(request, state_dir, opts, false, None)?;
+    let what = format!(
+        "GET {}",
+        request.url().split('?').next().unwrap_or_default()
+    );
+    admit_screen_caller(request, state_dir, opts, caller, &what)
+}
+
+/// The [`RouteClass::ScreenRead`] caller rule: an agent is refused, a
+/// named user of either role is admitted (the daemon re-proves the role),
+/// and the operator still needs positive process proof on the peer.
+fn admit_screen_caller(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    caller: Caller,
+    what: &str,
+) -> Result<Caller, HttpResp> {
+    match &caller {
+        Caller::Agent(alias) => Err(guard_fail(
+            "operator_only",
+            &format!(
+                "{what} is a board viewer's read — this request comes from agent \
+                 '{alias}'; open it from a browser"
+            ),
+        )),
+        Caller::Named(_) => Ok(caller),
+        Caller::Operator(_) => {
+            super::home::prove_operator_peer(request, state_dir, opts, what, None)?;
+            Ok(caller)
+        }
+    }
+}
+
 /// A public session's user as a board caller (CAD-526): what a verified
 /// assertion proved, kept to the attribution fields a write needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -764,6 +846,9 @@ pub(super) struct Named {
     pub actor: String,
     /// The `[A-Za-z0-9_-]` comment-author / ack handle.
     pub author: String,
+    /// The assertion's `sub` — the platform's stable person id, the
+    /// only spelling `Activity-Receipt` self-assignment proofs compare.
+    pub sub: String,
     /// `owner`-mapped sessions pass operator-only routes.
     pub operator: bool,
 }
@@ -1141,6 +1226,44 @@ pub(super) fn public_session(
 pub(super) struct ReadAdmission {
     proof: Option<(String, String, Origin)>,
     checked_at: std::time::Instant,
+}
+
+impl ReadAdmission {
+    /// True when `admit_read` admitted the request without a session — the
+    /// local bootstrap case, where the caller is the operator.
+    pub(super) fn is_anonymous(&self) -> bool {
+        self.proof.is_none()
+    }
+}
+
+/// The caller spelling for a read `admit_read` already admitted.
+///
+/// `operator` for an anonymous local read; otherwise the public session's
+/// `users/<handle>` via [`board_caller`]. A failure to resolve refuses —
+/// a project-scoped read is never served unfiltered.
+pub(super) fn read_actor(
+    admission: &ReadAdmission,
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<String, HttpResp> {
+    if admission.is_anonymous() {
+        return Ok("operator".to_string());
+    }
+    // `Caller::actor()` is display text (it can read "<name> via board"),
+    // so the policy spelling is built from the variant: the public
+    // session's attribution handle is the platform subject, which is what
+    // `users/<handle>` keys on everywhere else.
+    board_caller(request, state_dir, opts, false, None).map(|caller| caller_spelling(&caller))
+}
+
+/// The project-policy spelling for a resolved board caller.
+pub(super) fn caller_spelling(caller: &Caller) -> String {
+    match caller {
+        Caller::Operator(_) => "operator".to_string(),
+        Caller::Named(named) => format!("users/{}", named.author),
+        Caller::Agent(alias) => format!("agents/{alias}"),
+    }
 }
 
 impl ReadAdmission {
@@ -1553,6 +1676,7 @@ fn held_of(origin: Origin, session: &Value) -> Option<Held> {
                     Held::Named(Named {
                         actor: user.actor(),
                         author: user.handle.clone(),
+                        sub: user.sub.clone(),
                         operator: user.is_operator(),
                     })
                 })
@@ -2446,7 +2570,19 @@ pub(super) fn platform_session(
     ) {
         Ok(opened) => {
             let token = opened["token"].as_str().unwrap_or_default();
-            let body = serde_json::to_vec(&json!({"ok": true})).unwrap_or_default();
+            // The server's own session expiry rides the success body so
+            // the AgenticOS edge binds its custody digest to the ACTUAL
+            // session lifetime — never an approximation. The value comes
+            // only from the daemon's opened row; a missing or malformed
+            // expiry is an internal fault, not a sign-in with a guessed
+            // or extended lifetime.
+            let expires_at = opened["session"]["expires_at"].as_i64();
+            let body = match expires_at {
+                Some(at) if at > 0 => {
+                    serde_json::to_vec(&json!({"ok": true, "expires_at": at})).unwrap_or_default()
+                }
+                _ => return platform_fail(500, "internal", "session expiry unavailable"),
+            };
             let mut resp = Response::from_data(body).with_status_code(StatusCode(200));
             resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
             set_cookie(
@@ -2477,6 +2613,27 @@ pub(super) fn platform_session(
 
 #[cfg(test)]
 mod tests {
+    /// A board session's display actor is not the policy key: the named
+    /// handle is. Using `Caller::actor()` here made every project
+    /// unreadable for a real board session (cad1452).
+    #[test]
+    fn a_board_session_maps_to_the_user_spelling_not_the_display_actor() {
+        let named = Caller::Named(Named {
+            actor: "Fable Chen <fable@example.com> (board)".into(),
+            author: "usr_fable".into(),
+            sub: "sub_fable".into(),
+            operator: false,
+        });
+        assert_eq!(caller_spelling(&named), "users/usr_fable");
+        assert_eq!(
+            caller_spelling(&Caller::Operator("operator (ui)".into())),
+            "operator"
+        );
+        assert_eq!(
+            caller_spelling(&Caller::Agent("pane-3".into())),
+            "agents/pane-3"
+        );
+    }
     use super::*;
 
     #[test]
@@ -2744,6 +2901,7 @@ mod tests {
             Some(Held::Named(Named {
                 actor: "Fable <f@e.co> (board)".into(),
                 author: "fable".into(),
+                sub: "sub_fable".into(),
                 operator: false,
             }))
         };
@@ -2781,6 +2939,7 @@ mod tests {
             Verdict::Named(Named {
                 actor: "Fable <f@e.co> (board)".into(),
                 author: "fable".into(),
+                sub: "sub_fable".into(),
                 operator: false,
             })
         );

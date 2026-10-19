@@ -482,7 +482,13 @@ impl Shared {
         }
         // CI: the base branch's required checks, from check runs only.
         let base = view["baseRefName"].as_str().unwrap_or_default();
-        let branch = gh(&["api", &format!("repos/{repo}/branches/{base}")])?;
+        let branch = gh(&[
+            "api",
+            &format!(
+                "repos/{repo}/branches/{}",
+                delivery_requirements_rpc::branch_segment(base)
+            ),
+        ])?;
         let runs = gh(&[
             "api",
             &format!("repos/{repo}/commits/{head}/check-runs?filter=all&per_page=100"),

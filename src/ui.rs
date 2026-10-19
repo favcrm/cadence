@@ -47,6 +47,8 @@ mod business_templates;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1337_acceptance;
 mod cli_route;
+#[cfg(all(test, feature = "cli-runtime-test"))]
+pub(crate) use cli_route::prime_jwks_for_test as prime_cli_jwks_for_test;
 mod connections;
 mod crm_send;
 mod crm_smtp;
@@ -57,10 +59,13 @@ mod lane;
 mod lifecycle;
 mod locale;
 mod login;
+mod member_assist;
+mod my_work;
 mod notify_service;
 mod operator;
 mod platform_account;
-mod public_directory;
+mod project_policy;
+pub(crate) mod public_directory;
 mod read_model;
 mod serve;
 mod setup;
@@ -74,6 +79,7 @@ mod team_assistants_http_refusal;
 mod threads;
 mod topics;
 mod updates;
+mod whatsapp;
 mod wiki;
 mod wiki_envelope;
 #[cfg(all(test, feature = "test-seam"))]
@@ -1484,7 +1490,7 @@ mod tests {
         std::fs::write(dist.path().join("favicon.svg"), "<svg/>").unwrap();
         std::fs::create_dir(dist.path().join("assets")).unwrap();
         std::fs::write(dist.path().join("assets/index.js"), "js").unwrap();
-        let answer = |path: &str| static_answer_for(Some(dist.path()), path, None);
+        let answer = |path: &str| static_answer_for(Some(dist.path()), path, None, None);
         for route in [
             "/",
             "/projects",
@@ -1500,7 +1506,7 @@ mod tests {
             "/agents/cc.worker-1",
         ] {
             match answer(route) {
-                StaticAnswer::File(name, bytes) => {
+                StaticAnswer::File(name, bytes, None) => {
                     assert_eq!(name, "/index.html", "{route}");
                     assert_eq!(content_type(&name), "text/html; charset=utf-8", "{route}");
                     assert_eq!(bytes, b"<!doctype html>shell", "{route}");
@@ -1509,14 +1515,14 @@ mod tests {
             }
         }
         match answer("/assets/index.js") {
-            StaticAnswer::File(name, bytes) => {
+            StaticAnswer::File(name, bytes, None) => {
                 assert_eq!(name, "/assets/index.js");
                 assert_eq!(bytes, b"js");
             }
             _ => panic!("asset not served"),
         }
         match answer("/favicon.svg") {
-            StaticAnswer::File(_, bytes) => assert_eq!(bytes, b"<svg/>"),
+            StaticAnswer::File(_, bytes, None) => assert_eq!(bytes, b"<svg/>"),
             _ => panic!("favicon not served"),
         }
         for missing in [
@@ -1539,7 +1545,7 @@ mod tests {
         // No build: routes say so instead of serving nothing.
         let empty = tempfile::TempDir::new().unwrap();
         assert!(matches!(
-            static_answer_for(Some(empty.path()), "/projects", None),
+            static_answer_for(Some(empty.path()), "/projects", None, None),
             StaticAnswer::NoBuild
         ));
     }
@@ -1556,8 +1562,9 @@ mod tests {
             Some(dist.path()),
             path,
             accept,
+            None,
         ) {
-            StaticAnswer::File(name, bytes) => {
+            StaticAnswer::File(name, bytes, _) => {
                 let resp = Response::from_data(bytes.clone());
                 assert_eq!(resp.status_code().0, 200, "{path}");
                 assert_eq!(name, "/index.html", "{path}");
@@ -1586,6 +1593,7 @@ mod tests {
                     Some(dist.path()),
                     "/wiki/global/x.md",
                     Some("application/json"),
+                    None,
                 ),
                 StaticAnswer::Missing
             ),
@@ -1593,15 +1601,150 @@ mod tests {
         );
         assert!(
             matches!(
-                static_answer_for(Some(dist.path()), "/api/wiki/file", None),
+                static_answer_for(Some(dist.path()), "/api/wiki/file", None, None),
                 StaticAnswer::Missing
             ),
             "file bytes stay on the API route"
         );
         assert!(matches!(
-            static_answer_for(Some(dist.path()), "/projects/x/logo.png", None),
+            static_answer_for(Some(dist.path()), "/projects/x/logo.png", None, None),
             StaticAnswer::Missing
         ));
+    }
+
+    /// Accept-Encoding picks the build's precompressed sibling when the
+    /// client names its coding, falls back to the raw bytes otherwise,
+    /// and honors refusals: an explicit `q=0` (or a malformed q) beats a
+    /// `*` offer, and `identity;q=0` with no acceptable coded answer is a
+    /// 406 rather than raw bytes the client ruled out.
+    #[test]
+    fn static_files_negotiate_precompressed_siblings() {
+        let dist = tempfile::TempDir::new().unwrap();
+        std::fs::write(dist.path().join("index.html"), "raw-html").unwrap();
+        std::fs::write(dist.path().join("index.html.br"), "coded-html").unwrap();
+        std::fs::write(dist.path().join("index.html.gz"), "gzip-html").unwrap();
+        std::fs::create_dir(dist.path().join("assets")).unwrap();
+        std::fs::write(dist.path().join("assets/index.js"), "raw-js").unwrap();
+        std::fs::write(dist.path().join("assets/index.js.br"), "coded-js").unwrap();
+
+        let file = |path: &str, ae: Option<&str>| -> (String, Vec<u8>, Option<&'static str>) {
+            match static_answer_for(Some(dist.path()), path, None, ae) {
+                StaticAnswer::File(name, bytes, encoding) => (name, bytes, encoding),
+                other => panic!("{path} {ae:?}: expected a file, got {other:?}"),
+            }
+        };
+        // An offered coding answers the sibling bytes under the plain name.
+        assert_eq!(
+            file("/assets/index.js", Some("gzip, deflate, br")),
+            (
+                "/assets/index.js".to_string(),
+                b"coded-js".to_vec(),
+                Some("br")
+            )
+        );
+        assert_eq!(
+            file("/assets/index.js", Some("gzip")),
+            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
+        );
+        assert_eq!(
+            file("/assets/index.js", None),
+            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
+        );
+        // q=0 refuses: explicit beats `*`, malformed q fails closed.
+        assert_eq!(
+            file("/assets/index.js", Some("br;q=0, *;q=0.5")),
+            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
+        );
+        assert_eq!(
+            file("/assets/index.js", Some("br ; q = 0 , gzip")),
+            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
+        );
+        assert_eq!(
+            file("/assets/index.js", Some("br;q=oops, gzip")),
+            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
+        );
+        // Refused identity with an acceptable coded answer serves the code.
+        assert_eq!(
+            file("/", Some("identity;q=0, br")),
+            (
+                "/index.html".to_string(),
+                b"coded-html".to_vec(),
+                Some("br")
+            )
+        );
+        assert!(matches!(
+            static_answer_for(
+                Some(dist.path()),
+                "/assets/index.js",
+                None,
+                Some("identity;q=0"),
+            ),
+            StaticAnswer::NotAcceptable
+        ));
+        // RFC 9110 §12.5.3: `*;q=0` without a more-specific identity
+        // entry excludes the raw file too — and a malformed `*` q
+        // fails closed the same way.
+        for ae in ["*;q=0", "*;q=oops"] {
+            assert!(
+                matches!(
+                    static_answer_for(Some(dist.path()), "/assets/index.js", None, Some(ae),),
+                    StaticAnswer::NotAcceptable
+                ),
+                "{ae} excludes identity"
+            );
+        }
+        // An explicit identity entry overrides `*`, both ways.
+        assert_eq!(
+            file("/assets/index.js", Some("*;q=0, identity;q=0.5")),
+            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
+        );
+        assert_eq!(
+            file("/assets/index.js", Some("*;q=1, identity;q=0")),
+            (
+                "/assets/index.js".to_string(),
+                b"coded-js".to_vec(),
+                Some("br")
+            )
+        );
+        // And with every coding refused, the explicit identity q=0
+        // leaves nothing acceptable.
+        assert!(matches!(
+            static_answer_for(
+                Some(dist.path()),
+                "/assets/index.js",
+                None,
+                Some("*;q=0.5, identity;q=0, br;q=0"),
+            ),
+            StaticAnswer::NotAcceptable
+        ));
+        // A trailing dot is grammatical: `1.` is full weight, `0.` is zero.
+        assert_eq!(
+            file("/assets/index.js", Some("br;q=1.")),
+            (
+                "/assets/index.js".to_string(),
+                b"coded-js".to_vec(),
+                Some("br")
+            )
+        );
+        assert_eq!(
+            file("/assets/index.js", Some("br;q=0.")),
+            ("/assets/index.js".to_string(), b"raw-js".to_vec(), None)
+        );
+        // Out-of-range, non-finite and over-precise qvalues fail closed
+        // to refusal, never to a positive weight.
+        for ae in [
+            "br;q=nan, gzip",
+            "br;q=inf, gzip",
+            "br;q=-1, gzip",
+            "br;q=2, gzip",
+            "br;q=0.9999, gzip",
+        ] {
+            assert_eq!(
+                file("/assets/index.js", Some(ae)),
+                ("/assets/index.js".to_string(), b"raw-js".to_vec(), None),
+                "{ae} admits nothing"
+            );
+        }
     }
 
     #[test]

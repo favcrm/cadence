@@ -59,7 +59,10 @@ fn gx_with(social_context: bool) -> Gx {
     let dir = tempfile::Builder::new().prefix("c98a").tempdir().unwrap();
     let pm = dir.path().join("pm");
     crate::issue::Pm::init(&pm).unwrap();
-    let opts = ServeOptions::default();
+    let opts = ServeOptions {
+        provider_env: crate::adapter::ProviderEnv::refusing_providers(),
+        ..Default::default()
+    };
     opts.provider_env
         .set("CADENCE_PM_DIR", pm.to_str().unwrap());
     opts.provider_env
@@ -77,12 +80,13 @@ fn gx_with(social_context: bool) -> Gx {
                 cwd: &cwd,
                 sandbox: "read-only",
                 instructions: None,
-                params: None,
+                params: (alias == "master").then_some(r#"{"model":"fixture/model"}"#),
                 team_role: None,
                 model_policy: None,
             })
             .unwrap();
     }
+    crate::test_seam::seed_pi_fixture_policy(&shared.store, "fixture/model").unwrap();
     // The master's live endpoint generation, so a minted turn token is
     // current under the endpoint's own scheme.
     shared

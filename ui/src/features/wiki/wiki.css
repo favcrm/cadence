@@ -1166,3 +1166,24 @@
 .wk-pane > .page-state {
   min-height: min(28rem, 100%);
 }
+
+.wk-collection, .wk-review, .wk-report { min-width: 0; }
+.wk-collection-meta, .wk-collection-row, .wk-collection-edit {
+  display: grid;
+  gap: 8px 16px;
+  min-width: 0;
+}
+.wk-collection-row, .wk-collection-edit { grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr) auto; padding: 12px 0; border-top: 1px solid var(--color-ink-700); }
+.wk-collection-edit { grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); }
+.wk-collection-table { overflow-x: auto; }
+.wk-proc { display: inline-flex; align-items: center; min-height: 1.5rem; padding: 0 8px; border: 1px solid var(--color-ink-600); }
+.wk-proc-covered { color: var(--color-ok); }
+.wk-proc-failed, .wk-proc-unsupported { color: var(--color-fail); }
+.wk-proc-pending, .wk-proc-unknown, .wk-proc-empty { color: var(--color-warn); }
+.wk-report-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 8px; }
+.wk-report { margin-top: 8px; }
+@media (max-width: 720px) {
+  .wk-collection-row { grid-template-columns: minmax(0, 1fr); }
+  .wk-collection .field, .wk-review .field, .wk-report .field { width: 100%; max-width: 100%; }
+  .wk-collection .btn, .wk-review .btn, .wk-report .btn { min-height: 44px; }
+}

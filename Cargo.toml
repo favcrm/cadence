@@ -49,6 +49,10 @@ e2e = []
 # and review tests can inject proc roots. The compile_error! in
 # src/test_seam.rs keeps these seams out of every release build.
 test-seam = []
+# CAD-1568: manual cross-repository CLI/runtime acceptance. The ignored
+# packaged-CLI scenario drives a `cargo build --features test-seam` binary
+# against real AOS test handlers; never part of ordinary `cargo test`.
+cli-runtime-test = ["test-seam"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

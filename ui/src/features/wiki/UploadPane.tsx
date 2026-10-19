@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { Route } from "../../lib/router";
 import { fmtBytes } from "../../lib/fmt";
 import { IconCheck, IconUpload, IconWarning } from "../../ui/icons";
-import { uploadFile } from "./api";
+import { clearTransferResume, importFile, readResume, forgetResume, type ImportResult, type ResumeEntry } from "./transfer";
 import {
   capLabel,
   counts,
@@ -44,6 +44,9 @@ export default function UploadPane({
   const [items, setItems] = useState<UploadItem[]>([]);
   const [drag, setDrag] = useState(0);
   const [held, setHeld] = useState(false);
+  const [updateExisting, setUpdateExisting] = useState(false);
+  const [resumes, setResumes] = useState<ResumeEntry[]>([]);
+  const updateRef = useRef(false);
   const itemsRef = useRef<UploadItem[]>([]);
   const files = useRef(new Map<string, File>());
   const nextId = useRef(0);
@@ -52,6 +55,7 @@ export default function UploadPane({
   const attempt = useRef(0);
   const operationRef = useRef<PrivateOperation | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  updateRef.current = updateExisting;
 
   const abandon = () => {
     attempt.current += 1;
@@ -91,6 +95,15 @@ export default function UploadPane({
     setItems(next);
   };
 
+  // An import in flight records itself as soon as `begin` answers, so reading
+  // here would present the running transfer as an interrupted one. Refresh
+  // only while nothing is running: every completion path sets `items` after
+  // it clears the flag, which re-runs this effect.
+  useEffect(() => {
+    if (running.current) return;
+    setResumes(readResume(dir));
+  }, [dir, items]);
+
   useEffect(() => {
     const stopPause = onPrivateReadsPaused(abandon);
     const stopReset = onPrivateSessionReset(() => {
@@ -102,6 +115,8 @@ export default function UploadPane({
       operation?.dispose();
       files.current.clear();
       itemsRef.current = [];
+      clearTransferResume();
+      setResumes([]);
       setHeld(false);
       setItems([]);
     });
@@ -151,7 +166,7 @@ export default function UploadPane({
       if (operationRef.current === operation) operationRef.current = null;
       running.current = false;
     };
-    uploadFile(dir, file, (percent) => {
+    importFile(dir, file, updateRef.current, (percent) => {
       if (!currentAttempt()) return;
       setItems((current) => {
         const next = uploadProgress(current, id, percent);
@@ -159,19 +174,19 @@ export default function UploadPane({
         return next;
       });
     }, operation)
-      .then((result) => {
+      .then((result: ImportResult) => {
         if (!currentAttempt()) return;
         const abandonedTransfer = operation.signal.aborted || heldRef.current;
         releaseTransport();
+        const detail = `${result.outcome} · extraction ${result.extraction} · index ${result.index}`;
         setItems((current) => {
-          const next = uploadDone(current, id);
+          const next = uploadDone(current, id).map((item) => item.id === id ? { ...item, detail } : item);
           itemsRef.current = next;
           return next;
         });
         if (abandonedTransfer) return;
-        if (result?.extraction && result.extraction.status !== "indexed") {
-          onToast("warn", `${file.name} was saved; text extraction ${result.extraction.status}: ${result.extraction.reason ?? "review the source"}`);
-        }
+        const blocked = result.index !== "covered" || result.extraction === "failed" || result.extraction === "empty" || result.extraction === "unsupported" || result.extraction === "conflict";
+        if (blocked) onToast("warn", `${file.name} was saved; extraction ${result.extraction}; index ${result.index}${result.error ? `: ${result.error}` : ""}`);
         onUploaded();
       })
       .catch((error: unknown) => {
@@ -229,6 +244,9 @@ export default function UploadPane({
           <div className="kicker">
             {t("Up to")} {capLabel()} {t("per file")}
           </div>
+          <label className="kicker">
+            <input type="checkbox" checked={updateExisting} disabled={readOnly} onChange={(event) => setUpdateExisting(event.target.checked)} /> {t("Update changed files")}
+          </label>
           <Button disabled={readOnly} onClick={() => fileInput.current?.click()}>{t("Choose files")}</Button>
           <input
             ref={fileInput}
@@ -252,6 +270,14 @@ export default function UploadPane({
           </div>
         )}
       </div>
+
+      {resumes.length > 0 && (
+        <Note>
+          {t("An import was interrupted. Reselect the same file to continue that job.")}
+          <ul>{resumes.map((entry) => <li key={entry.job_id}>{entry.path} · {entry.job_id}</li>)}</ul>
+          <Button onClick={() => { forgetResume(dir); setResumes([]); }}>{t("Forget this interrupted import on this browser")}</Button>
+        </Note>
+      )}
 
       {items.length > 0 && (
         <div className="wk-uplist">
@@ -285,6 +311,7 @@ export default function UploadPane({
                 ) : (
                   <span className="kicker">queued</span>
                 )}
+                {item.detail && <span className="kicker">{item.detail}</span>}
               </span>
             </div>
           ))}

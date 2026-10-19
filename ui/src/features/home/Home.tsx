@@ -29,6 +29,8 @@ import NeedsRail from "./NeedsRail";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
 import PlanCard from "./PlanCard";
 import Conversation from "../app-shell/chat/Conversation";
+import MemberChat from "./MemberChat";
+import { memberScope } from "./memberThread";
 import { time } from "./ThreadView";
 import {
   initialFollow,
@@ -39,6 +41,7 @@ import {
   onSend,
   onTailChange,
   onViewportScroll,
+  reducedMotion,
   type Follow,
 } from "./scrollFollow";
 import { sendToMaster } from "./send";
@@ -72,9 +75,6 @@ function fmtElapsed(secs: number): string {
   if (m < 60) return `${m}m ${secs % 60}s`;
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
-
-const reducedMotion = () =>
-  typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 /**
  * The in-flight turn line (CAD-551): the pulse and elapsed clock while a
@@ -468,24 +468,16 @@ const ThreadList = memo(function ThreadList({
           ? null
           : anchorItem.entry;
   // A daemon that cannot name its running turn's message still owes an
-  // honest Working signal: bounded fallback on the tail item only while
-  // the tail is not an answer — once the reply lands, `turn.state`
-  // clears too. An answer tail keeps its own header slot instead.
+  // honest Working signal, and so does a named turn whose first stored
+  // entry has not landed yet: the bounded fallback rides the tail item —
+  // including an answer tail that belongs to an EARLIER turn (a stale or
+  // failed reply). That answer keeps its own header slot, and the
+  // running turn gets a standalone row after it, so a turn is never
+  // invisible in the transcript while the dock counts it working
+  // (CAD-1533).
   const fallbackItem =
-    working && anchorItem === null && shown.length > 0 && shown[shown.length - 1].type !== "answer"
-      ? shown[shown.length - 1]
-      : null;
+    working && anchorItem === null && shown.length > 0 ? shown[shown.length - 1] : null;
   const activityItem = anchorItem ?? fallbackItem;
-  const activityEntry =
-    anchorItem !== null
-      ? anchorEntry
-      : fallbackItem === null
-        ? null
-        : fallbackItem.type === "tools"
-          ? fallbackItem.entries[fallbackItem.entries.length - 1] ?? null
-          : fallbackItem.type === "pending"
-            ? null
-            : fallbackItem.entry;
   if (items.length === 0) return null;
   return (
     <>
@@ -507,12 +499,32 @@ const ThreadList = memo(function ThreadList({
         activity={(item) => {
           if (!working || activityItem === null || item.key !== activityItem.key) return null;
           const live = <AssistantActivity since={working.since} />;
+          // The anchored row shows this turn's own newest entry time. A
+          // fallback row rides the tail item, which may belong to an
+          // EARLIER turn (a stale or failed reply), so it is stamped with
+          // the running turn's start — never with that foreign time
+          // (CAD-1533 review, finding 1).
+          const at =
+            anchorItem !== null
+              ? anchorEntry
+                ? time(anchorEntry.created)
+                : undefined
+              : working.since !== null
+                ? time(new Date(working.since * 1000).toISOString())
+                : undefined;
           // The answer bubble carries the indicator on its own name row;
           // a standalone row covers in-flight steps/commentary that have
-          // none of their own.
-          if (item.type === "answer") return { kind: "header", node: live };
-          if (item.type === "operator") return { kind: "row", node: <AssistantNameRow at={activityEntry ? time(activityEntry.created) : undefined} live={live} />, position: "after" };
-          return { kind: "row", node: <AssistantNameRow at={activityEntry ? time(activityEntry.created) : undefined} live={live} />, position: "before" };
+          // none of their own, and the running turn when the row it would
+          // anchor to is another turn's reply (CAD-1533). A row that IS
+          // this turn's own — the operator's just-sent message, or the
+          // reply itself — keeps the indicator below it.
+          if (item.type === "answer" && anchorItem !== null) return { kind: "header", node: live };
+          const below = item.type === "operator" || item.type === "pending" || item.type === "answer";
+          return {
+            kind: "row",
+            node: <AssistantNameRow at={at} live={live} />,
+            position: below ? "after" : "before",
+          };
         }}
         after={(item) =>
           anchors.has(item.key) ? (
@@ -538,7 +550,89 @@ const ThreadList = memo(function ThreadList({
  * floating dock at its bottom, and the empty/not-started states sit
  * centred in it with the dock disabled.
  */
+/**
+ * CAD-1485: the outer Home owns the mode decision only. A signed-in
+ * member (or an explicit `?chat=assistant` on a hosted board) gets the
+ * private-assistant surface; everyone else gets the Master workspace.
+ * The two are siblings — MemberChat never mounts MasterHome's hooks,
+ * so a member never subscribes, reads or sends on any Master resource.
+ */
 export default function Home({
+  readOnly,
+  hosted = null,
+  viewerSub = null,
+  viewerIsMember = false,
+  sessionId = null,
+  overview,
+  onOpenIssue,
+  overviewHref,
+  permissionsHref,
+  resolveAppPath,
+  setupNotice = null,
+}: {
+  readOnly: boolean;
+  hosted?: boolean | null;
+  /** CAD-1485: the verified public session's subject — member or
+   *  operator/owner — when the session names one. `?chat=assistant`
+   *  keys the owner's private chat on it; a member's default view is
+   *  already private. */
+  viewerSub?: string | null;
+  /** The verified session's `role === "member"`. Members always land on
+   *  their own private assistant; owners/operators keep Master unless
+   *  they explicitly ask for their own assistant. */
+  viewerIsMember?: boolean;
+  /** The verified session's id — scopes the member-chat store so a
+   *  re-login as another member never reads the previous chat. */
+  sessionId?: string | null;
+  overview: ResourceState<Overview>;
+  onOpenIssue: (id: string) => void;
+  overviewHref: string;
+  /** Settings → Master permissions (the standing "Always" rules). */
+  permissionsHref: string;
+  /** CAD-1438: resolves an install id to its unique canonical `/apps/<key>` path, or null. */
+  resolveAppPath: (installId: string) => string | null;
+  /** The first-run setup strip (CAD-1312): rendered inside the chat
+   *  panel below the Assistant heading so the Needs-you rail beside it
+   *  keeps the workspace's top edge. */
+  setupNotice?: ReactNode;
+}) {
+  // `?chat=assistant` is a UI-mode selector only — it names the signed-in
+  // user's OWN private assistant, never another actor. It changes no actor
+  // and no authority. The private surface is a HOSTED-board feature: a
+  // local or tailnet board's named session (device grant, unsigned local
+  // sign-in) never enters it — those keep the Master workspace, exactly
+  // like a standalone board. On a hosted board a member lands on their own
+  // assistant by default; an owner reaches theirs only through the query.
+  const chatParam = new URLSearchParams(window.location.search).get("chat") === "assistant";
+  const memberChat = hosted === true && viewerSub !== null && (viewerIsMember || chatParam);
+  if (memberChat && viewerSub !== null) {
+    const scope = memberScope(sessionId, viewerSub);
+    return (
+      <MemberChat
+        key={scope}
+        scope={scope}
+        readOnly={readOnly}
+        onOpenIssue={onOpenIssue}
+      />
+    );
+  }
+  return (
+    <MasterHome
+      readOnly={readOnly}
+      hosted={hosted}
+      overview={overview}
+      onOpenIssue={onOpenIssue}
+      overviewHref={overviewHref}
+      permissionsHref={permissionsHref}
+      resolveAppPath={resolveAppPath}
+      setupNotice={setupNotice}
+    />
+  );
+}
+
+/** The Master workspace — unchanged, mounted only when the outer Home
+ *  did NOT route to the member's private assistant. */
+function MasterHome({
   readOnly,
   hosted = null,
   overview,
@@ -553,13 +647,8 @@ export default function Home({
   overview: ResourceState<Overview>;
   onOpenIssue: (id: string) => void;
   overviewHref: string;
-  /** Settings → Master permissions (the standing "Always" rules). */
   permissionsHref: string;
-  /** CAD-1438: resolves an install id to its unique canonical `/apps/<key>` path, or null. */
   resolveAppPath: (installId: string) => string | null;
-  /** The first-run setup strip (CAD-1312): rendered inside the chat
-   *  panel below the Assistant heading so the Needs-you rail beside it
-   *  keeps the workspace's top edge. */
   setupNotice?: ReactNode;
 }) {
   const t = useTranslate();
@@ -642,13 +731,12 @@ export default function Home({
     turn.kind === "working"
       ? { message: turn.message, since: typeof turn.since === "number" ? turn.since : null }
       : null;
-  // Same-row growth the ResizeObserver follows re-subscribes when the
-  // name-row indicator appears or clears (its content lives inside the
-  // observed list).
-  const nameRowShown =
-    workingActivity !== null &&
-    (activityAnchor(items, workingActivity.message) !== null ||
-      (items.length > 0 && items[items.length - 1].type !== "answer"));
+  // The ResizeObserver re-subscribes when the name-row indicator appears
+  // or clears (its content lives inside the observed list): a running
+  // turn with any row to ride, whether it anchors to its own entry or
+  // falls back to any tail item — answers included (CAD-1533 review,
+  // finding 2).
+  const nameRowShown = workingActivity !== null && items.length > 0;
 
   // Live entries: the store opened on the newest page, so the stream
   // resumes after its last seq — never a replay of the history. On a
@@ -1082,7 +1170,7 @@ export default function Home({
 
           {(unseen > 0 || activity) && (
             <button type="button" className="newpill num" onClick={jumpToLatest} data-jump-to-latest>
-              ↓ {jumpLabel(unseen)}
+              ↓ {jumpLabel(unseen, t)}
             </button>
           )}
 

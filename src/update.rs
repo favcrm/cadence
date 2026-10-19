@@ -189,6 +189,7 @@ pub fn open_private(path: &Path, append: bool, truncate: bool) -> Result<std::fs
 /// The run's exclusive hold on `<state>/update.lock` — released when it
 /// drops, or by the kernel when the process exits. Non-blocking: a
 /// second update refuses at once instead of queueing behind the first.
+#[derive(Debug)]
 pub struct RunLock {
     _file: std::fs::File,
 }
@@ -209,6 +210,23 @@ impl RunLock {
             )));
         }
         Ok(RunLock { _file: file })
+    }
+}
+
+/// `run` and `rollback` keep this alive until the caller drops it.
+/// Guidance sync has to happen before the lock drops, or a later update
+/// can switch builds and then be overwritten by the earlier post-step.
+#[derive(Debug)]
+pub struct LockedReport {
+    pub report: RunReport,
+    _lock: RunLock,
+}
+
+impl std::ops::Deref for LockedReport {
+    type Target = RunReport;
+
+    fn deref(&self) -> &Self::Target {
+        &self.report
     }
 }
 
@@ -831,11 +849,7 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
         }
     }
     let schema_current = rollout::store_schema(state_dir)?;
-    let schema_target = if up_to_date {
-        schema_current
-    } else {
-        src.schema_version(&target).unwrap_or(None)
-    };
+    let schema_target = src.schema_version(&target).unwrap_or(None);
     // CAD-1235: `update` only moves forward. With target as base and
     // current as head, "behind" means the target is newer; "ahead" means
     // it is older. Unproven ancestry fails closed when current is known.
@@ -870,7 +884,7 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
             )),
         }
     }
-    if let (Some(from), Some(to), false) = (schema_current, schema_target, up_to_date) {
+    if let (Some(from), Some(to)) = (schema_current, schema_target) {
         if to < from {
             older = true;
             refusals.push(format!(
@@ -1226,8 +1240,8 @@ fn restore_board(
 /// for a progress log, opens it and records the run's start and end —
 /// so the board's detached helper leaves a record that outlives the
 /// board reading it.
-pub fn run(host: &dyn UpdateHost, opts: &Options) -> Result<RunReport> {
-    let _lock = RunLock::acquire(host.state_dir())?;
+pub fn run(host: &dyn UpdateHost, opts: &Options) -> Result<LockedReport> {
+    let lock = RunLock::acquire(host.state_dir())?;
     let log = host.progress_log();
     if let Some(path) = &log {
         run_log_start(path, std::process::id(), host.identity(), host.now())?;
@@ -1239,7 +1253,10 @@ pub fn run(host: &dyn UpdateHost, opts: &Options) -> Result<RunReport> {
             Err(error) => run_log_fail(path, &error.to_string(), host.now()),
         }
     }
-    outcome
+    outcome.map(|report| LockedReport {
+        report,
+        _lock: lock,
+    })
 }
 
 /// [`run`]'s body, under the re-entry lock and with the log started.
@@ -1313,10 +1330,9 @@ fn run_locked(host: &dyn UpdateHost, opts: &Options) -> Result<RunReport> {
     Ok(report)
 }
 
-/// `install`: false when the release is already linked (a previous run
-/// installed it and the restart did not happen) — the backup and the
-/// install are skipped and the run goes straight to the drain and the
-/// switch, with the previous release as the rollback target.
+/// `install`: false when the release is already linked but activation
+/// did not finish. A fresh backup receipt is still required for the
+/// new lease before switching; only installation is skipped.
 fn run_inner(
     host: &dyn UpdateHost,
     opts: &Options,
@@ -1344,17 +1360,16 @@ fn run_inner(
     //    lease receipt, then the install: `upgrade::run` stages the
     //    attested build side by side and moves the link. The daemon
     //    keeps running the old build until the switch below.
-    let mut backup = Value::Null;
+    let backup = take_backup(host, opts)?;
+    progress(
+        host,
+        format!(
+            "backup: {} (recorded as the lease receipt)",
+            backup["backup"]["db"].as_str().unwrap_or("?")
+        ),
+    );
     let mut install_report = Value::Null;
     if install {
-        backup = take_backup(host, opts)?;
-        progress(
-            host,
-            format!(
-                "backup: {} (recorded as the lease receipt)",
-                backup["backup"]["db"].as_str().unwrap_or("?")
-            ),
-        );
         install_report = upgrade::run(
             host.source(),
             host.layout(),
@@ -1608,11 +1623,13 @@ pub fn previous_release(host: &dyn UpdateHost) -> Result<Option<String>> {
 
 /// `cadence update --rollback`: return to the previous release, restart,
 /// health check — and offer the backup restore when the schema changed.
-pub fn rollback(host: &dyn UpdateHost) -> Result<RunReport> {
+pub fn rollback(host: &dyn UpdateHost) -> Result<LockedReport> {
     // One mutation per state dir: the lock serialises a rollback against
     // a running update, and the lease it takes is what lets the daemon
-    // trust the marker this rollback writes (CAD-561 r2).
-    let _lock = RunLock::acquire(host.state_dir())?;
+    // trust the marker this rollback writes (CAD-561 r2). The same lock
+    // stays held until the caller drops the report, which is after
+    // guidance sync.
+    let lock = RunLock::acquire(host.state_dir())?;
     let layout = host.layout();
     let current = match upgrade::current(layout)? {
         Current::Link { sha, .. } => sha,
@@ -1637,7 +1654,10 @@ pub fn rollback(host: &dyn UpdateHost) -> Result<RunReport> {
     let lease = take_lease(host, &previous)?;
     let outcome = rollback_body(host, current, &previous);
     let _ = release_lease(host, &lease);
-    outcome
+    outcome.map(|report| LockedReport {
+        report,
+        _lock: lock,
+    })
 }
 
 /// [`rollback`]'s body, under the lock and the lease.
@@ -2013,14 +2033,38 @@ mod tests {
     }
 
     #[test]
+    fn already_linked_target_still_reports_its_schema_crossing() {
+        let host = Host::new(src(CUR, "unknown", 52), 51);
+        let report = check(&host).unwrap();
+        assert!(report.up_to_date);
+        assert_eq!(report.schema_current, Some(51));
+        assert_eq!(report.schema_target, Some(52));
+        assert!(report.migration);
+    }
+
+    #[test]
     fn current_target_is_a_noop_without_ancestry() {
-        let host = Host::new(src(CUR, "unknown", 32), 33);
+        let host = Host::new(src(CUR, "unknown", 33), 33);
         let report = run(&host, &Options::default()).unwrap();
         assert!(report.check.up_to_date);
         assert!(report.check.refusals.is_empty());
         assert!(report.install.is_none());
         assert!(report.lease.is_none());
         assert!(report.backup.is_none());
+    }
+
+    #[test]
+    fn the_update_lock_is_held_until_the_report_is_dropped() {
+        let host = Host::new(src(CUR, "unknown", 33), 33);
+        let report = run(&host, &Options::default()).unwrap();
+        assert!(report.report.check.up_to_date);
+        let held = RunLock::acquire(host.state_dir()).unwrap_err().to_string();
+        assert!(
+            held.contains("already running"),
+            "guidance sync has to run before this lock drops: {held}"
+        );
+        drop(report);
+        RunLock::acquire(host.state_dir()).unwrap();
     }
 
     #[test]

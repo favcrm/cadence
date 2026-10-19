@@ -90,6 +90,9 @@ pub(crate) struct ToolContext {
     /// Declared alias → capability slot, copied from the integrity-
     /// checked package at mint. The closed invocable set.
     pub tools: std::collections::BTreeMap<String, String>,
+    /// CAD-1537: minted for a member or a `--read-only` board — only
+    /// read operations (`ScreenOperation::is_screen_read`), no tools.
+    pub read_only: bool,
     pub issued: Instant,
 }
 
@@ -178,11 +181,13 @@ impl Shared {
 
     /// Is the stored context's minting session still live in `Auth`?
     /// Fail-closed on any lookup error — a revoked session ends the mount.
-    fn tool_session_live(&self, session_hash: &str) -> bool {
+    /// CAD-1537: `read_only` — a read-only context's public member session
+    /// counts as live; every other context still needs a current owner.
+    fn tool_session_live(&self, session_hash: &str, read_only: bool) -> bool {
         if !session_hash_ok(session_hash) {
             return false;
         }
-        match self.public_row_hash(session_hash) {
+        match self.public_row_hash(session_hash, read_only) {
             Some(public) => public,
             None => {
                 let now = self.operator_now();
@@ -223,7 +228,7 @@ impl Shared {
             ));
         }
         // The minting session must still be live (revocation kills it).
-        if !self.tool_session_live(&ctx.session) {
+        if !self.tool_session_live(&ctx.session, ctx.read_only) {
             let mut map = self.tool_contexts.lock().unwrap_or_else(|e| e.into_inner());
             map.remove(token);
             return Err(Error::rejected("the mounting session is no longer live"));
@@ -376,6 +381,11 @@ impl Shared {
             }
         }
         let ctx = self.tool_context_proven(action_token, &session)?;
+        // CAD-1537: a read-only mount (member or `--read-only` board) never
+        // invokes a tool.
+        if ctx.read_only {
+            return Err(Error::rejected("a read-only screen mount invokes no tools"));
+        }
 
         // The alias must be one the mount's own approved package declared,
         // resolving to its declared capability slot — before any broker work.

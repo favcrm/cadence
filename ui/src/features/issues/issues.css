@@ -82,6 +82,15 @@
 .issue-link-form > :first-child {
   grid-column: 1 / -1;
 }
+.issue-check-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+.issue-output-links {
+  list-style: none;
+}
 @media (max-width: 640px) {
   .issue-workspace .btn,
   .issue-workspace .field,

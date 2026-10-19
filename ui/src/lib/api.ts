@@ -33,8 +33,11 @@ import type {
   MemoryDetail,
   Meta,
   MilestoneRow,
-  ModelDefaultsConfig,
-  ModelDefaultsSnapshot,
+  AgentCatalog,
+  AgentPreviewResult,
+  AgentSettingsConfig,
+  AgentSettingsSnapshot,
+  AgentSyncResult,
   OutboxDetail,
   UpdateBanner,
   UpdateCheck,
@@ -114,6 +117,47 @@ export interface ThreadPage {
   cursor?: number;
   /** Backward reads (`tail`/`before`): older entries remain. */
   more_before?: boolean;
+}
+
+/** CAD-1485: `POST /api/member-assistant/state` — the member's assistant
+ *  binding (daemon-owned `to_json`) plus the bound conversation id. */
+export interface MemberAssistState {
+  assistant: {
+    org: string;
+    sub: string;
+    assistant_id: string;
+    alias: string;
+    conversation_id: string | null;
+    state: string;
+    bootstrap_state?: string | null;
+    authority_rev?: number;
+    created?: number;
+    updated?: number;
+  };
+  conversation_id: string | null;
+}
+
+/** `POST /api/member-assistant/history` — the member's bound conversation
+ *  page. `entries` carry the stored `role`/`kind`/`seq`; `cursor` is the
+ *  forward resume watermark. A member names no thread — the binding's
+ *  own conversation is always the read. */
+export interface MemberAssistHistory {
+  conversation: { id: string; alias: string; created?: string; updated?: string } | null;
+  entries: unknown[];
+  cursor?: number;
+  more_before?: boolean;
+}
+
+/** `POST /api/member-assistant/send` receipt: the accepted message id and
+ *  queue state. `queued`/`attention` tell the truth when the assistant's
+ *  endpoint could not start — the row stays queued, never a fabricated
+ *  reply. */
+export interface MemberAssistSend {
+  message: string;
+  state: string;
+  duplicate?: boolean;
+  queued?: boolean;
+  attention?: string;
 }
 
 export { ApiError } from "./apiError";
@@ -303,6 +347,24 @@ function refusedUpload(body: unknown, status: number, statusText: string): { mes
   return { message: fallback, code: topCode };
 }
 
+/** Recorded owner handoff for the current personal assignment, never a Git-author guess. */
+export interface AssignmentContext {
+  kind: "assigned" | "initial_owner";
+  actor: string;
+  at: string;
+  self_assigned: boolean;
+}
+
+export interface MyWorkIssue extends IssueCard {
+  assignment: AssignmentContext | null;
+}
+
+export interface MyWorkPayload {
+  owner: string;
+  issues: MyWorkIssue[];
+}
+
+
 export const api = {
   health: () => get<Health>("/api/health"),
   /** `withOperator` asks the server to run the operator proof (CAD-432) — once per page load.
@@ -311,6 +373,7 @@ export const api = {
   meta: (withOperator = false, signal?: AbortSignal) =>
     get<Meta>(withOperator ? "/api/meta?operator=1" : "/api/meta", signal),
   overview: () => get<Overview>("/api/overview"),
+  myWork: (signal?: AbortSignal) => get<MyWorkPayload>("/api/my-work", signal),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
   projectContext: (project: string, role: ContextRole = "pm", expectedRevision?: string) => {
     const query = new URLSearchParams({ role });
@@ -466,7 +529,11 @@ export const api = {
    *  master"): they land on the entry's payload, never in the text.
    *  `app` is the shell chat's current installation/context (CAD-802):
    *  never authority — the daemon proves both against its store and
-   *  stamps the verified binding on the entry, refusing anything else. */
+   *  stamps the verified binding on the entry, refusing anything else.
+   *  `expectedRecipientUid` (CAD-1591) is an identity constraint, not
+   *  authority: the contextual Threads reply pins the recorded sender it
+   *  is answering, and the daemon refuses before any side effect when
+   *  the alias now names a different uid. Ordinary sends omit it. */
   threadSend: (
     alias: string,
     text: string,
@@ -477,6 +544,7 @@ export const api = {
     attachments?: { id: string }[],
     operation?: PrivateOperation,
     mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
+    expectedRecipientUid?: string,
   ) =>
     post<Record<string, unknown>>(
       `/api/threads/${encodeURIComponent(alias)}/messages`,
@@ -491,6 +559,7 @@ export const api = {
         // grammar and existence, never the client's metadata.
         ...(attachments && attachments.length > 0 ? { attachments } : {}),
         ...(mediaRefs && mediaRefs.length > 0 ? { media_refs: mediaRefs } : {}),
+        ...(expectedRecipientUid ? { expected_recipient_uid: expectedRecipientUid } : {}),
       },
       operation,
     ),
@@ -576,6 +645,26 @@ export const api = {
       xhr.send(form);
     }), signal);
   },
+  /** CAD-1485: `POST /api/member-assistant/state` — the signed-in member's
+   *  own assistant surface state (binding + bound conversation id). The
+   *  public session cookie is the only credential; the board mints the
+   *  assistant envelope server-side. Body is `{}`. */
+  memberAssistState: () =>
+    post<MemberAssistState>(`/api/member-assistant/state`, {}),
+  /** `POST /api/member-assistant/history` — a page of the member's bound
+   *  conversation. `after`/`before`/`tail`/`limit` match the daemon's own
+   *  fields; a member never names a thread (the binding owns it). */
+  memberAssistHistory: (page: {
+    after?: number;
+    before?: number;
+    tail?: boolean;
+    limit?: number;
+  }) => post<MemberAssistHistory>(`/api/member-assistant/history`, { ...page }),
+  /** `POST /api/member-assistant/send` — send `text` to the member's own
+   *  assistant. `message` is the client-chosen idempotent id a retry
+   *  reuses (one message, not two). */
+  memberAssistSend: (text: string, message: string) =>
+    post<MemberAssistSend>(`/api/member-assistant/send`, { text, message }),
   /** `GET /api/app-installations/<id>/chat-descriptor` (CAD-1110): the installed
    *  package's `app-chat.json`, pinned to the digest its install consented to. A
    *  404 means no descriptor (plain shared chat). */
@@ -945,7 +1034,16 @@ export const api = {
    *  operator-gated; the chip shows the refusal until it lands). */
   masterModels: () => get<MasterModels>("/api/master/models"),
 
-  modelDefaults: () => get<ModelDefaultsSnapshot>("/api/settings/model-defaults"),
+  /** CAD-1548 — harnesses, profiles, providers and models. */
+  agentSettings: () => get<AgentSettingsSnapshot>("/api/settings/agents"),
+  saveAgentSettings: (body: { expected_revision: string; config: AgentSettingsConfig }) =>
+    post<AgentSettingsSnapshot>("/api/settings/agents", body),
+  refreshAgentCatalog: (provider: string) =>
+    post<AgentCatalog>("/api/settings/agents/catalog", { provider }),
+  syncAgentProfiles: (body: { expected_revision: string; profile: string | null }) =>
+    post<AgentSyncResult>("/api/settings/agents/sync", body),
+  previewAgentLaunch: (body: { expected_revision: string; profile: string; harness: string }) =>
+    post<AgentPreviewResult>("/api/settings/agents/preview", body),
   /** CAD-561: the Settings Update card — current version, the last
    *  check, the running update's progress and the drain state. */
   updateStatus: () => get<UpdateStatus>("/api/update"),
@@ -955,9 +1053,6 @@ export const api = {
   updateCheck: () => post<UpdateCheck>("/api/update/check", {}),
   /** Start the update: the same pipeline as `cadence update`. */
   startUpdate: () => post<{ started: boolean }>("/api/update", {}),
-  saveModelDefaults: (body: { expected_revision: number; config: ModelDefaultsConfig }) =>
-    writeSettings(body),
-
   /** `GET /api/issues/<id>/lane` — the card's live agent, or `lane: null`. */
   lane: (id: string) => get<LanePayload>(`/api/issues/${encodeURIComponent(id)}/lane`),
   /** Ask for status. Optional extra is appended to the `status?` template server-side. */
@@ -978,10 +1073,3 @@ export const api = {
   laneReassign: (id: string, body: { provider: string; model?: string; effort?: string; note?: string }) =>
     post<Record<string, unknown>>(`/api/issues/${encodeURIComponent(id)}/lane/reassign`, body),
 };
-
-async function writeSettings(body: {
-  expected_revision: number;
-  config: ModelDefaultsConfig;
-}): Promise<ModelDefaultsSnapshot> {
-  return post<ModelDefaultsSnapshot>("/api/settings/model-defaults", body);
-}

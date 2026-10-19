@@ -401,7 +401,7 @@ impl Shared {
         request_id: &str,
         proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
-        self.crm_smtp_scope_with_proof(install, context, proof, || {
+        self.crm_smtp_scope_with_proof(install, context, true, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
             let facts = self.crm_send_facts(install, context, &records, campaign, freeze, proof.is_some())?;
             if (facts.frozen_member_ids.len() as i64) > facts.max_recipients {
@@ -507,7 +507,7 @@ impl Shared {
         given_digest: &str,
         proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
-        self.crm_smtp_scope_with_proof(install, context, proof, || {
+        self.crm_smtp_scope_with_proof(install, context, true, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
             let send = records
                 .app_campaign_send(context, send_id)?
@@ -629,7 +629,7 @@ impl Shared {
         send_id: &str,
         proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
-        self.crm_smtp_scope_with_proof(install, context, proof, || {
+        self.crm_smtp_scope_with_proof(install, context, false, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
             let send = records
                 .app_campaign_send(context, send_id)?
@@ -651,7 +651,7 @@ impl Shared {
         campaign: Option<&str>,
         proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
-        self.crm_smtp_scope_with_proof(install, context, proof, || {
+        self.crm_smtp_scope_with_proof(install, context, false, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
             let sends = records.app_campaign_sends(context, campaign)?;
             let mut out = Vec::with_capacity(sends.len());
@@ -681,7 +681,7 @@ impl Shared {
         resolution: &str,
         proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
-        self.crm_smtp_scope_with_proof(install, context, proof, || {
+        self.crm_smtp_scope_with_proof(install, context, false, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
             if records.app_campaign_send(context, send_id)?.is_none() {
                 return Err(Error::rejected(
@@ -868,7 +868,7 @@ impl Shared {
             // authority, content still approved at the pinned
             // revision, customer still sendable — all inside the
             // custody lock the submission itself holds.
-            let step = match self.crm_smtp_scope(install, context, || {
+            let step = match self.crm_smtp_scope(install, context, false, || {
                 self.crm_send_row_step(
                     &records,
                     install,

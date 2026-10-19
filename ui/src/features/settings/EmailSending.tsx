@@ -41,9 +41,9 @@ interface Target {
   label: string;
 }
 
-/** Every active CRM context, flattened. One entry means no selector. */
+/** Every active context of an install that declares SMTP sending, flattened. One entry means no selector. */
 async function loadTargets(signal: AbortSignal): Promise<Target[]> {
-  const installs = (await workspaceApps.installations(signal)).filter((i) => i.name === "crm");
+  const installs = (await workspaceApps.installations(signal)).filter((i) => i.smtp_custody === true);
   const out: Target[] = [];
   for (const install of installs) {
     const contexts = await workspaceApps.contexts(install.install_id, signal);
@@ -120,7 +120,7 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
       ) : targets === null ? (
         <p className="text-label text-ink-400" role="status">{t("Loading…")}</p>
       ) : target === null ? (
-        <p className="text-label text-ink-400" data-state="no-crm">{t("No CRM is installed in this workspace, so there is nothing to send from yet.")}</p>
+        <p className="text-label text-ink-400" data-state="no-crm">{t("No installed app sends email, so there is nothing to set up yet.")}</p>
       ) : (
         <div className="grid gap-3 min-w-0">
           {targets.length > 1 && (

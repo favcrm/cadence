@@ -77,6 +77,10 @@ pub mod registry;
 pub mod stdio;
 pub mod ws;
 
+// CAD-1526: the message-window acceptance for the pi turn guard.
+#[cfg(test)]
+mod pi_turn_guard_acceptance;
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
@@ -116,6 +120,8 @@ pub const REFUSED_COMMAND: &str = "false";
 pub struct ProviderEnv(
     Arc<RwLock<BTreeMap<String, String>>>,
     Option<std::path::PathBuf>,
+    Option<crate::platform::deployments::HostedCompanyMaster>,
+    Option<Arc<crate::store::Store>>,
 );
 
 impl ProviderEnv {
@@ -203,11 +209,44 @@ impl ProviderEnv {
     /// The authority is outside the mutable environment map and is inherited
     /// by clones without being exposed through `set`, `remove` or `vars`.
     pub(crate) fn with_workspace(&self, workspace: std::path::PathBuf) -> Self {
-        Self(Arc::clone(&self.0), Some(workspace))
+        Self(
+            Arc::clone(&self.0),
+            Some(workspace),
+            self.2.clone(),
+            self.3.clone(),
+        )
     }
 
     pub(crate) fn workspace(&self) -> Option<&std::path::Path> {
         self.1.as_deref()
+    }
+
+    /// Immutable image-owned authority; mutable environment values cannot grant it.
+    pub(crate) fn with_company_master(
+        mut self,
+        admission: Option<crate::platform::deployments::HostedCompanyMaster>,
+    ) -> Self {
+        self.2 = admission;
+        self
+    }
+
+    pub(crate) fn company_master(&self) -> bool {
+        self.2.is_some()
+    }
+
+    /// Bind launch policy to the caller's actual workspace store, never an
+    /// environment variable a provider or worker can replace.
+    pub fn with_settings_store(&self, store: Arc<crate::store::Store>) -> Self {
+        Self(
+            Arc::clone(&self.0),
+            self.1.clone(),
+            self.2.clone(),
+            Some(store),
+        )
+    }
+
+    pub(crate) fn settings_store(&self) -> Option<&crate::store::Store> {
+        self.3.as_deref()
     }
 
     pub fn set(&self, name: &str, value: impl Into<String>) {
@@ -1047,8 +1086,18 @@ mod tests {
     #[test]
     fn turn_slot_fills_every_token_position_or_drops_the_block() {
         let slot = "<<cadence-turn-slot:abc>>";
-        let block =
-            crate::master::scoped_verb_reference("i", "c", "m1", slot, std::path::Path::new("/t"));
+        let block = crate::master::scoped_verb_reference(
+            "i",
+            "c",
+            "m1",
+            slot,
+            std::path::Path::new("/t"),
+            &crate::app_assistant::Declared {
+                actions: ["segments.save".to_string()].into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let prompt = format!("[App context]\n{block}\n\nhello");
         assert!(prompt.matches(slot).count() >= 2);
         let filled = with_turn_token(&prompt, Some(slot), "pi-1-ff");

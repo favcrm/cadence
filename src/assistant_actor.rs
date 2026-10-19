@@ -278,19 +278,11 @@ fn public_scheme(host: &str) -> &'static str {
     }
 }
 
-/// The `[A-Za-z0-9_-]` ≤64 attribution handle.
+/// The attribution handle for a verified actor: its subject in the shared
+/// identifier grammar ([`crate::ident::sanitized`]).
 fn handle_of(actor: &str, sub: &str) -> String {
     let tail = actor.split_once('/').map(|(_, t)| t).unwrap_or(sub);
-    tail.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(64)
-        .collect()
+    crate::ident::sanitized(tail)
 }
 
 /// Verify an assistant envelope end to end: structure, `kid` → key, the

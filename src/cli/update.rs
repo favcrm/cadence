@@ -97,29 +97,11 @@ fn refuse_managed_runtime() -> Result<()> {
         }
         _ => cadence_agent::issue::default_dir()?,
     };
-    let path = pm_dir.join("pm.yaml");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => {
-            return Err(Error::rejected(format!(
-                "cadence update cannot read the lifecycle config {} ({e}) — \
-                 refusing rather than guessing whether this runtime is \
-                 image-managed",
-                path.display()
-            )))
-        }
-    };
-    // The `hosted:` table deserializes into the daemon's own
-    // `lease::Hosted` — a present table that is not valid YAML or
-    // carries a wrong-typed key refuses rather than reading as off.
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&text)
-        .map_err(|e| Error::rejected(format!("pm.yaml is not valid YAML: {e}")))?;
-    let Some(hosted) = yaml.get("hosted") else {
+    // Same loader as daemon startup: missing file/table is off; every
+    // other read or parse failure refuses. No lease is taken.
+    let Some(hosted) = cadence_agent::lease::read_hosted(&pm_dir)? else {
         return Ok(());
     };
-    let hosted: cadence_agent::lease::Hosted = serde_yaml::from_value(hosted.clone())
-        .map_err(|e| Error::rejected(format!("pm.yaml [hosted]: {e}")))?;
     if matches!(
         hosted.lease.as_deref().map(str::trim),
         Some(lease) if !lease.is_empty() && lease != "none" && lease != "off"
@@ -183,7 +165,19 @@ pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
         let status = client::rpc(state_dir, "update_status", json!({})).unwrap_or_else(
             |_| json!({"pending_update": Value::Null, "waiting": [], "waiting_count": 0}),
         );
+        let guidance = home_dir()
+            .map(|home| guidance::readonly(&home))
+            .unwrap_or_else(|error| {
+                json!({
+                    "guidance": "not-checked",
+                    "wrote": false,
+                    "error": error.to_string(),
+                    "live_session": "not-checked",
+                })
+            });
         if args.json {
+            let mut status = status;
+            status["guidance"] = guidance;
             print_json(&status);
         } else {
             match status["pending_update"].as_object() {
@@ -221,6 +215,9 @@ pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
                     .join(", ");
                 println!("waiting for {} turns: {rendered}", waiters.len());
             }
+            for line in guidance::lines(&guidance) {
+                println!("{line}");
+            }
         }
         return Ok(0);
     }
@@ -231,8 +228,21 @@ pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
             // the sha is on main: a refusal names the failed check.
             update::verify_pinned(&host, &report.target)?;
         }
+        let guidance = home_dir()
+            .map(|home| guidance::readonly(&home))
+            .unwrap_or_else(|error| {
+                json!({
+                    "guidance": "not-checked",
+                    "wrote": false,
+                    "error": error.to_string(),
+                    "target_guidance": "not-verified",
+                    "live_session": "not-checked",
+                })
+            });
         if args.json {
-            print_json(&report.to_json());
+            let mut body = report.to_json();
+            body["guidance"] = guidance;
+            print_json(&body);
         } else {
             for line in report.lines() {
                 println!("{line}");
@@ -246,13 +256,23 @@ pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
                         .unwrap_or_else(|| report.target.clone())
                 );
             }
+            for line in guidance::lines(&guidance) {
+                println!("{line}");
+            }
         }
         return Ok(0);
     }
     if args.rollback {
         let report = update::rollback(&host)?;
+        let guidance = guidance_after(state_dir, &host.layout, &report);
         if args.json {
-            print_json(&report.to_json());
+            let mut body = report.to_json();
+            body["guidance"] = guidance;
+            print_json(&body);
+        } else {
+            for line in guidance::lines(&guidance) {
+                println!("{line}");
+            }
         }
         return Ok(0);
     }
@@ -264,13 +284,37 @@ pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
         backup_dir: args.backup_dir.clone(),
     };
     let report = update::run(&host, &opts)?;
+    let guidance = guidance_after(state_dir, &host.layout, &report);
     if args.json {
-        print_json(&report.to_json());
+        let mut body = report.to_json();
+        body["guidance"] = guidance;
+        print_json(&body);
+    } else {
+        for line in guidance::lines(&guidance) {
+            println!("{line}");
+        }
     }
     if report.rolled_back {
         return Ok(1);
     }
     Ok(0)
+}
+
+fn guidance_after(
+    state_dir: &Path,
+    layout: &cadence_agent::upgrade::Layout,
+    report: &cadence_agent::update::RunReport,
+) -> Value {
+    match home_dir() {
+        Ok(home) => guidance::after_update(state_dir, layout, report, &home),
+        Err(error) => json!({
+            "guidance": "not-checked",
+            "wrote": false,
+            "error": error.to_string(),
+            "live_session": "not-checked",
+            "daemon_restarted_for_skills": false,
+        }),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

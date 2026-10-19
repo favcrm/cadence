@@ -30,6 +30,9 @@ pub struct EditSpec {
     pub unlink: Vec<String>,
     /// `kind:target`, or a bare http(s) URL (kind `url`).
     pub refs: Vec<String>,
+    /// Refs to remove, each named exactly as `--ref` names it. Every
+    /// one must already exist (CAD-1522).
+    pub unrefs: Vec<String>,
     pub attach: Vec<PathBuf>,
     /// The acceptance checklist text, as `issue acceptance --from`.
     pub acceptance: Option<String>,
@@ -119,6 +122,25 @@ pub fn edit(
             })
         })
         .collect::<Result<_>>()?;
+    // CAD-1522: the inverse of `--ref`, parsed and validated exactly
+    // like it so a malformed `--unref` refuses before anything is
+    // written. Whether each target exists is checked under the lock.
+    let unrefs: Vec<(String, String)> = spec
+        .unrefs
+        .iter()
+        .map(|raw| {
+            part("--unref", || {
+                let (kind, target) = if is_http(raw) {
+                    ("url", raw.as_str())
+                } else {
+                    split_kind("--unref", raw)?
+                };
+                model::check_ref_kind(kind)?;
+                model::check_ref_value(target)?;
+                Ok((kind.to_string(), target.to_string()))
+            })
+        })
+        .collect::<Result<_>>()?;
     let mut attachments: Vec<(String, Vec<u8>)> = Vec::new();
     for file in &spec.attach {
         part("--attach", || {
@@ -142,6 +164,11 @@ pub fn edit(
             if !model::valid_artifact_name(&name) {
                 return Err(Error::rejected(format!(
                     "bad artifact name '{name}' — [A-Za-z0-9._-]{{1,120}}, no leading dot"
+                )));
+            }
+            if model::reserved_artifact_name(&name) {
+                return Err(Error::rejected(format!(
+                    "{name} is a tracker-owned record and cannot be attached: only its own workflow writes it"
                 )));
             }
             attachments.push((name, std::fs::read(file)?));
@@ -180,6 +207,26 @@ pub fn edit(
             .refs
             .push(write::new_ref(kind, target, None, None, None));
         changed.push(format!("ref:{kind}"));
+    }
+    // CAD-1522: remove refs by exact kind+target. A target that is not
+    // there refuses the whole edit: the caller asked for a correction
+    // that cannot be made, and silently doing nothing would hide it.
+    for (kind, target) in &unrefs {
+        part("--unref", || {
+            let before = front.refs.len();
+            front.refs.retain(|r| {
+                !(r.kind == *kind
+                    && (r.url.as_deref() == Some(target.as_str())
+                        || r.path.as_deref() == Some(target.as_str())))
+            });
+            if front.refs.len() == before {
+                return Err(Error::rejected(format!(
+                    "{id} has no {kind} ref '{target}' to remove"
+                )));
+            }
+            Ok(())
+        })?;
+        changed.push(format!("unref:{kind}"));
     }
     for (unlink, kind, target) in &links {
         let flag = if *unlink { "--unlink" } else { "--link" };

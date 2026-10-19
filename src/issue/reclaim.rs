@@ -936,6 +936,7 @@ mod tests {
             repos: vec![crate::issue::project::Repo {
                 path: Some(repo.display().to_string()),
                 remote: None,
+                base: None,
             }],
             components: Vec::new(),
             tags: Vec::new(),
@@ -943,6 +944,8 @@ mod tests {
             build: None,
             memory: None,
             intake: None,
+            id: None,
+            policy: None,
         };
         std::fs::write(
             project_dir.join("project.yaml"),

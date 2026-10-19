@@ -26,6 +26,46 @@ def job(text, name):
 
 
 class CleanupTests(unittest.TestCase):
+    def test_release_store_secrets_are_read_only_from_a_scoped_environment(self):
+        # CAD-1506: the release-store write credentials are environment-scoped.
+        # A repository-scoped secret is readable by any run from a branch of
+        # this repo, including a PR run of the PR's own code, so every job
+        # that reads one must declare a scoped environment whose branch policy
+        # keeps the key off PR refs. The refused case is exactly that: a
+        # referencing job with no environment.
+        #
+        # `release-store` carries the publishing jobs (branch policy: main and
+        # v* tags, no reviewers, so no approval click is added). The
+        # visibility flip in release-visibility.yml keeps the `production`
+        # environment because its operator approval is the gate on the
+        # outward action; the key therefore lives in both environments.
+        allowed = ("release-store", "production")
+        expected = {
+            ("ci.yml", "release-publish-r2", "release-store"),
+            ("promotion-completion.yml", "publish-release", "release-store"),
+            ("release-mirror.yml", "mirror", "release-store"),
+            ("release-visibility.yml", "make-public", "production"),
+        }
+        seen = set()
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            jobs_text = path.read_text().partition("\njobs:\n")[2]
+            for match in re.finditer(r"(?m)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)",
+                                     jobs_text, re.S):
+                name, body = match.group(1), match.group(2)
+                if "secrets.RELEASES_R2_" not in body:
+                    continue
+                environment = re.search(r"(?m)^    environment: (\S+)$", body)
+                self.assertIsNotNone(
+                    environment,
+                    f"{path.name} job {name} reads the release-store secrets "
+                    "without a scoped environment")
+                self.assertIn(
+                    environment.group(1), allowed,
+                    f"{path.name} job {name} uses environment "
+                    f"{environment.group(1)!r}, not one that holds the release-store key")
+                seen.add((path.name, name, environment.group(1)))
+        self.assertEqual(seen, expected, "release-store consumers changed")
+
     def test_pr_rehearsal_cache_is_read_only_and_never_replaces_real_checks(self):
         # CAD-1135: inspect the actual consumer configuration. This proves
         # wiring, not a remote cache hit or GitHub's runtime save refusal.
@@ -270,6 +310,42 @@ class CleanupTests(unittest.TestCase):
                     result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
                                             env=env, capture_output=True, text=True)
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+
+    def test_public_artifacts_and_store_bindings_stay_pinned(self):
+        # CAD-1511: on a public repository every Actions artifact is
+        # downloadable by any GitHub account, and artifact bytes are never
+        # redacted. A staging upload must therefore not carry a shared temp dir
+        # whose writer it does not control, and a publisher that spends the
+        # release-store key must write the dedicated literals, never a
+        # repository variable.
+        staging = workflow("staging.yml")
+        uploads = [step for step in re.split(r"(?=^      - )", staging, flags=re.M)
+                   if "actions/upload-artifact@" in step]
+        self.assertGreaterEqual(len(uploads), 3, "staging.yml artifact uploads")
+        path_lines = 0
+        for step in uploads:
+            for line in step.splitlines():
+                if "runner.temp" not in line:
+                    continue
+                path_lines += 1
+                self.assertNotIn(
+                    "staging-e2e", line,
+                    "a staging artifact declares the retired journey's shared temp dir")
+        self.assertGreaterEqual(path_lines, len(uploads),
+                                "each artifact upload carries a path entry")
+
+        mirror = workflow("release-mirror.yml")
+        self.assertIn(
+            'RELEASES_ENDPOINT="https://87b59a40e130c425e35474687ad98a4f.r2.cloudflarestorage.com"',
+            mirror)
+        self.assertIn('--endpoint "$RELEASES_ENDPOINT"', mirror)
+        self.assertIn('--bucket "$RELEASES_BUCKET"', mirror)
+        self.assertNotIn("RELEASES_R2_PUBLIC_VISIBILITY", mirror)
+        # Asserted so that changing it is deliberate: the retry keeps the
+        # private record, and the production-gated release-visibility workflow
+        # owns the public flip.
+        self.assertIn("--visibility private", mirror)
 
 
 # The provider-refusal case uses a stub cargo only to keep metadata lookup

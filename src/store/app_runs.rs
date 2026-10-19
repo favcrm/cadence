@@ -374,6 +374,10 @@ CREATE TABLE IF NOT EXISTS app_run_reviews(
  artifact_digest TEXT NOT NULL, reviewer TEXT NOT NULL, message_id TEXT UNIQUE NOT NULL,
  decision TEXT NOT NULL CHECK(decision IN ('approve','revise')), rationale TEXT NOT NULL,
  PRIMARY KEY(run_id,step_id), FOREIGN KEY(run_id,step_id) REFERENCES app_run_steps(run_id,step_id));
+CREATE TABLE IF NOT EXISTS app_run_artifact_fetches(
+ artifact_id TEXT NOT NULL REFERENCES app_run_artifacts(id),
+ message_id TEXT NOT NULL, turn_hash TEXT NOT NULL, created REAL NOT NULL,
+ PRIMARY KEY(artifact_id,message_id,turn_hash));
 ";
 
 pub struct LocalRunProvenance<'a> {
@@ -1589,7 +1593,7 @@ impl Store {
                             "source":run["snapshot"]["source"],
                             "capability_slots":run["snapshot"]["workflow"]["capability_slots"],
                             "required_asset_slot":run["snapshot"]["workflow"]["required_asset_slot"],
-                            "result_contract":"Return exactly one complete JSON envelope as your final text, with no prose, heading, or Markdown fence. It must have schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If required_asset_slot is set, approval must include asset_receipt_id and asset_sha256 from that exact slot's fetched receipt; otherwise these fields are optional for a reviewed binary asset. Fetch dependencies with cadence app run artifact using the active message/turn token. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
+                            "result_contract":"Return exactly one complete JSON envelope as your final text, with no prose, heading, or Markdown fence. It must have schema=1, kind, run_id, step_id, revision. Producer: outcome=succeeded, artifacts=[{media_type:text/markdown,text:...}]. Reviewer: producer_step_id, producer_revision=1, artifact_sha256, decision=approve|revise, rationale. If required_asset_slot is set, approval must include asset_receipt_id and asset_sha256 from that exact slot's fetched receipt; otherwise these fields are optional for a reviewed binary asset. Fetch dependencies with the active message and turn token. An approve is refused unless this turn successfully fetched that dependency; revise does not require the fetch. Managed Codex: call MCP self, then MCP app_run_artifact with the dependency artifact_id and that response's exact id as message and turn_id as token. Other providers: cadence app run artifact ID --message MSG --token TOKEN. No outward effects authorized.","max_artifact_bytes":ARTIFACT_BYTES});
                         let body = envelope.to_string();
                         if body.len() > super::ENQUEUE_BYTES {
                             return Err(Error::rejected(
@@ -1693,22 +1697,35 @@ impl Store {
         turn: Option<(&str, &str)>,
         current_bundle: &str,
     ) -> Result<Value> {
-        let turn =
+        let (message, token) =
             turn.ok_or_else(|| Error::rejected("worker artifact fetch requires an assigned turn"))?;
-        self.app_artifact_read(id, Some(turn), Some(current_bundle))
+        // The existing worker guards and the byte, digest, and bounds checks
+        // run in this sealed write. The receipt commits only after they pass;
+        // a refusal rolls it back with them.
+        self.write_tx(|tx| {
+            let value =
+                self.app_artifact_read_in(tx, id, Some((message, token)), Some(current_bundle))?;
+            tx.execute(
+                "INSERT INTO app_run_artifact_fetches(artifact_id,message_id,turn_hash,created) VALUES(?,?,?,?) ON CONFLICT(artifact_id,message_id,turn_hash) DO NOTHING",
+                params![id, message, artifact_digest(token.as_bytes()), now()],
+            )?;
+            Ok(value)
+        })
     }
     /// Caller proof is supplied by the daemon's operator-only route. Audit
-    /// access is distinct from current execution or installation authority.
+    /// access is distinct from current execution or installation authority
+    /// and does not record a worker fetch receipt.
     pub fn app_artifact_for_operator(&self, id: &str) -> Result<Value> {
-        self.app_artifact_read(id, None, None)
+        let conn = self.conn();
+        self.app_artifact_read_in(&conn, id, None, None)
     }
-    fn app_artifact_read(
+    fn app_artifact_read_in(
         &self,
+        conn: &impl super::StoreConn,
         id: &str,
         turn: Option<(&str, &str)>,
         current_bundle: Option<&str>,
     ) -> Result<Value> {
-        let conn = self.conn();
         let (run_id, producer_step, digest, media_type, bytes): (
             String,
             String,
@@ -1723,10 +1740,10 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| Error::rejected("artifact unavailable"))?;
-        let run = Self::app_run_show_in(&conn, &run_id)?;
+        let run = Self::app_run_show_in(conn, &run_id)?;
         if let Some((message, token)) = turn {
             Self::app_current_in(
-                &conn,
+                conn,
                 &run,
                 current_bundle.ok_or_else(|| {
                     Error::rejected("worker fetch requires current installation proof")
@@ -1738,17 +1755,17 @@ impl Store {
                 ));
             }
             let msg = self
-                .message_in(&conn, message)?
+                .message_in(conn, message)?
                 .filter(|m| m.state == "running" && m.turn_id.as_deref() == Some(token))
                 .ok_or_else(|| Error::rejected("artifact needs an active assigned turn"))?;
             let spec:String=conn.query_row("SELECT spec FROM app_run_steps WHERE run_id=? AND message_id=? AND state='dispatched'",params![run_id,message],|r|r.get(0)).optional()?.ok_or_else(||Error::rejected("artifact is not a dependency of this turn"))?;
             let step: LocalStep =
                 serde_json::from_str(&spec).map_err(|e| Error::internal(e.to_string()))?;
-            let generation = self.agent_in(&conn, &msg.alias)?.generation;
+            let generation = self.agent_in(conn, &msg.alias)?.generation;
             let assigned = &run["snapshot"]["assignments"][&step.id];
             if step.assignee != msg.alias
                 || material_digest(&Self::app_binding_identity(
-                    &self.agent_in(&conn, &msg.alias)?,
+                    &self.agent_in(conn, &msg.alias)?,
                 )) != assigned["identity_digest"].as_str().unwrap()
                 || !step.dependencies.contains(&producer_step)
                 || !local_token_current(
@@ -2210,7 +2227,15 @@ impl Store {
                             },
                             _ => false,
                         };
-                        if digest==artifact_sha256 && producer!=message.alias && asset_valid {
+                        // Approve names this artifact, this reviewer message,
+                        // and the hash of the turn token completing now.
+                        // Revise stays a recorded decision without that read.
+                        let fetched = decision != "approve" || tx.query_row(
+                            "SELECT 1 FROM app_run_artifact_fetches WHERE artifact_id=?1 AND message_id=?2 AND turn_hash=?3",
+                            params![id, message.id, artifact_digest(token.as_bytes())],
+                            |_| Ok(()),
+                        ).optional()?.is_some();
+                        if digest==artifact_sha256 && producer!=message.alias && asset_valid && fetched {
                             tx.execute("INSERT INTO app_run_reviews(run_id,step_id,artifact_id,artifact_digest,reviewer,message_id,decision,rationale,asset_receipt_id,asset_digest) VALUES(?,?,?,?,?,?,?,?,?,?)",params![run_id,step_id,id,digest,message.alias,message.id,decision,rationale,asset_receipt_id,asset_sha256])?;
                             Self::event(tx,Self::DAEMON_STREAM,"app_run_step_reviewed",json!({"run_id":run_id,"step_id":step_id,"artifact_digest":digest,"reviewer":message.alias,"decision":decision}))?;
                             valid=decision=="approve";

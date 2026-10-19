@@ -191,13 +191,57 @@
   min-height: 0;
   overscroll-behavior: contain;
 }
-/* Desktop: the header, transcript and composer share a 1.5rem inset. */
+/* Desktop: the header, recipient strip and transcript share a 1.5rem inset. */
 @media (min-width: 768px) {
   .threads-head,
+  .threads-recipient,
   .threads-messages {
     padding-left: 1.5rem;
     padding-right: 1.5rem;
   }
+}
+/* DM recipient strip: the live roster's avatar, badge and work context,
+ * honest about a recipient missing from the roster. */
+.threads-recipient {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.6rem;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--color-ink-800);
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+  min-width: 0;
+}
+.threads-recipient .agent-avatar {
+  width: 26px;
+  height: 26px;
+}
+.threads-recipient-line {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  min-width: 0;
+}
+.threads-recipient-line strong {
+  color: var(--color-ink-200);
+  font-weight: 500;
+}
+.threads-recipient-work {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.6rem;
+  min-width: 0;
+  margin-left: auto;
+}
+.threads-msg-error {
+  font-size: var(--text-micro);
+  color: var(--color-fail);
+  padding-left: 0.25rem;
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 /* Flat transcript: a label line, then the body; spacing separates messages. */
 .threads-msg {
@@ -278,6 +322,46 @@
   gap: 0.5rem;
   font-size: var(--text-label);
   color: var(--color-ink-400);
+}
+.threads-msg-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  padding-left: 0.25rem;
+}
+/* CAD-1591 contextual reply banner above the DM composer: the bounded
+   quote and original reference the sent body carries. */
+.threads-replyctx {
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.4rem;
+  padding: 0.5rem 0.75rem;
+  display: grid;
+  gap: 0.4rem;
+}
+.threads-replyctx-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  font-size: var(--text-label);
+}
+.threads-replyctx-quote {
+  margin: 0;
+  padding-left: 0.6rem;
+  border-left: 2px solid var(--color-ink-700);
+  color: var(--color-ink-300);
+  font-size: var(--text-label);
+  white-space: pre-wrap;
+  max-height: 6rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  overflow-wrap: anywhere;
+}
+.threads-replyctx-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.6rem;
 }
 .threads-mode {
   display: flex;

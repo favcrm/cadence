@@ -13,6 +13,10 @@ use crate::issue::{self, delivery_policy, delivery_requirements as requirements}
 #[path = "cad1298_requirements_acceptance.rs"]
 mod acceptance;
 
+#[cfg(test)]
+#[path = "cad1561_integration_branch_acceptance.rs"]
+mod cad1561_integration_branch_acceptance;
+
 fn reject(why: impl std::fmt::Display) -> Error {
     Error::rejected(format!("delivery requirements: {why}"))
 }
@@ -60,6 +64,25 @@ fn default_branch(shared: &Shared, repo: &str) -> Result<String> {
         .filter(|name| !name.is_empty())
         .map(str::to_string)
         .ok_or_else(|| reject("repository has no default branch"))
+}
+
+/// Percent-encode a branch name for a single URL path segment —
+/// `repos/{repo}/rules/branches/{x}` takes the name inline, so `/`
+/// (and every other non-unreserved byte) must be `%`-escaped or a
+/// slashed target like `release/staging` reads as a different branch.
+/// Policy already restricts these to canonical git names; this encodes
+/// rather than revalidates so callers never depend on that.
+pub(super) fn branch_segment(branch: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(branch.len());
+    for b in branch.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 fn valid_sha(s: &str) -> bool {
@@ -169,7 +192,53 @@ fn content_at_base(shared: &Shared, repo: &str, path: &str, base: &str) -> Optio
     .ok()
 }
 
+/// CAD-1561: a non-default PR target is admitted only when the EXACT
+/// current approved policy names it. `source == "approved"` plus
+/// `note == None` means the file's section IS the recorded approval
+/// verbatim — a last-approved fallback after an edit carries a
+/// `delivery_unapproved` note and does not qualify. The approval's own
+/// digest/policy equality keeps provenance honest even if `effective`
+/// semantics change.
+fn approved_integration_target(
+    base_ref: &str,
+    resolved: &delivery_policy::Resolved,
+    approved: Option<&delivery_policy::Approved>,
+) -> bool {
+    resolved.source == "approved"
+        && resolved.note.is_none()
+        && resolved.policy.integration_branch.as_deref() == Some(base_ref)
+        && approved.is_some_and(|a| {
+            a.digest == resolved.digest && a.policy.as_ref() == Some(&resolved.policy)
+        })
+}
+
+/// Local policy and approval provenance, without remote collection. A caller
+/// committing authority holds the tracker lock through its mutation.
+pub(super) fn policy_snapshot(
+    shared: &Shared,
+    pm_dir: &std::path::Path,
+    project: &str,
+) -> Result<(delivery_policy::Resolved, Option<delivery_policy::Approved>)> {
+    let approvals = shared.store.work_approvals()?;
+    let approved = approvals
+        .get(project)
+        .and_then(delivery_policy::approved_from);
+    let resolved = delivery_policy::effective(
+        project,
+        delivery_policy::load(pm_dir, project),
+        approved.as_ref(),
+    );
+    Ok((resolved, approved))
+}
+
 pub(super) fn classify(shared: &Shared, params: &Value) -> Result<Value> {
+    classify_with_policy(shared, params).map(|(answer, _)| answer)
+}
+
+pub(super) fn classify_with_policy(
+    shared: &Shared,
+    params: &Value,
+) -> Result<(Value, delivery_policy::Resolved)> {
     let (issue_id, pr_url, requested_head) = request_fields(params)?;
 
     let pm = shared.pm()?;
@@ -203,8 +272,15 @@ pub(super) fn classify(shared: &Shared, params: &Value) -> Result<Value> {
     let base_ref = view["baseRefName"]
         .as_str()
         .ok_or_else(|| reject("PR has no base branch"))?;
-    if base_ref != default {
-        return Err(reject("PR base is not the repository default branch"));
+    // Resolve the effective policy once — the target gate and the
+    // requirements evaluator below share it. The reread at the end
+    // still re-resolves for drift detection.
+    let (resolved, approved) = policy_snapshot(shared, &pm.dir, &project.key)?;
+    if base_ref != default && !approved_integration_target(base_ref, &resolved, approved.as_ref()) {
+        return Err(reject(format!(
+            "PR base {base_ref:?} is neither the repository default {default:?} \
+             nor an approved delivery integration_branch"
+        )));
     }
     let base = view["baseRefOid"]
         .as_str()
@@ -274,15 +350,6 @@ pub(super) fn classify(shared: &Shared, params: &Value) -> Result<Value> {
         changes.push(requirements::change(status, &old_mode, &new_mode, path));
     }
 
-    let approvals = shared.store.work_approvals()?;
-    let approved = approvals
-        .get(&project.key)
-        .and_then(delivery_policy::approved_from);
-    let resolved = delivery_policy::effective(
-        &project.key,
-        delivery_policy::load(&pm.dir, &project.key),
-        approved.as_ref(),
-    );
     let risk_paths = content_at_base(shared, &repo, "docs/roles/risk-paths.toml", &base);
     let one_review = content_at_base(shared, &repo, "docs/roles/one-review-paths.toml", &base);
     let lists = requirements::TrustedLists {
@@ -294,15 +361,7 @@ pub(super) fn classify(shared: &Shared, params: &Value) -> Result<Value> {
     // Refuse a mixed-head answer: re-read all external and operator-owned
     // inputs that determine the result before returning it.
     let after = pr_view(shared, &repo, number)?;
-    let after_approvals = shared.store.work_approvals()?;
-    let after_approved = after_approvals
-        .get(&project.key)
-        .and_then(delivery_policy::approved_from);
-    let after_resolved = delivery_policy::effective(
-        &project.key,
-        delivery_policy::load(&pm.dir, &project.key),
-        after_approved.as_ref(),
-    );
+    let (after_resolved, _) = policy_snapshot(shared, &pm.dir, &project.key)?;
     if after["state"].as_str() != Some("OPEN")
         || after["title"]
             .as_str()
@@ -312,28 +371,35 @@ pub(super) fn classify(shared: &Shared, params: &Value) -> Result<Value> {
         || after["baseRefOid"].as_str() != Some(base.as_str())
         || after["changedFiles"].as_u64() != Some(changed_files)
         || default_branch(shared, &repo)? != default
-        || after_resolved.digest != resolved.digest
+        // Whole-Resolved equality: an unapproved/malformed PROJECT.md
+        // mid-collection can keep the approved policy in force with the
+        // SAME digest but source/note changed — a digest-only check
+        // would grant the extra target under stale provenance.
+        || after_resolved != resolved
     {
         return Err(reject(
             "PR head/base or approved policy changed during collection",
         ));
     }
-    Ok(
+    Ok((
         json!({"issue": issue_id, "project": project.key, "repo": repo, "pr": number,
-        "head": head, "base": base, "merge_base": merge_base,
-        "policy_digest": result.policy_digest, "requirements": result}),
-    )
+        "head": head, "base": base, "base_ref": base_ref, "merge_base": merge_base,
+        "policy_digest": result.policy_digest, "requirements": result, "changes": changes}),
+        resolved,
+    ))
 }
 
-/// Recheck the current full PR check floor for profile-backed approvals.
-/// This uses GitHub's required branch checks plus a successful canonical
-/// pull_request ci.yml run, never the daemon's previously observed boolean.
+/// Recheck the actual target's required checks and latest canonical PR CI.
+/// Automatic landing additionally requires the default branch's enforced
+/// native merge queue; prequeue feedback is not current-base integration.
 pub(super) fn full_ci_green(
     shared: &Shared,
     repo: &str,
     number: u64,
     head: &str,
     base: &str,
+    base_ref: &str,
+    require_queue: bool,
 ) -> Result<bool> {
     let current: Value = serde_json::from_str(&gh(
         shared,
@@ -344,15 +410,22 @@ pub(super) fn full_ci_green(
             "-R",
             repo,
             "--json",
-            "headRefOid,baseRefOid,statusCheckRollup",
+            "headRefOid,baseRefOid,baseRefName,statusCheckRollup",
         ],
     )?)
     .map_err(|e| reject(format!("unreadable current PR checks: {e}")))?;
-    if current["headRefOid"].as_str() != Some(head) || current["baseRefOid"].as_str() != Some(base)
+    if current["headRefOid"].as_str() != Some(head)
+        || current["baseRefOid"].as_str() != Some(base)
+        || current["baseRefName"].as_str() != Some(base_ref)
     {
         return Ok(false);
     }
-    let branch = default_branch(shared, repo)?;
+    if require_queue && default_branch(shared, repo)? != base_ref {
+        return Err(reject(
+            "automatic landing requires the repository default branch",
+        ));
+    }
+    let branch = branch_segment(base_ref);
     let rules = api(shared, &format!("repos/{repo}/rules/branches/{branch}"))?;
     let protection = api(
         shared,
@@ -378,7 +451,7 @@ pub(super) fn full_ci_green(
             }
         }
     }
-    match protection {
+    match &protection {
         Ok(doc) => {
             let checks = &doc["required_status_checks"];
             if !checks.is_null() && !checks.is_object() {
@@ -450,24 +523,272 @@ pub(super) fn full_ci_green(
     }) {
         return Ok(false);
     }
-    let runs = api(shared, &format!("repos/{repo}/actions/workflows/ci.yml/runs?head_sha={head}&event=pull_request&status=success&per_page=100"))?;
-    let Some(runs) = runs["workflow_runs"].as_array() else {
+    let runs = api(shared, &format!("repos/{repo}/actions/workflows/ci.yml/runs?head_sha={head}&event=pull_request&per_page=100"))?;
+    let entries = runs["workflow_runs"]
+        .as_array()
+        .ok_or_else(|| reject("canonical CI runs are unreadable"))?;
+    if runs["total_count"].as_u64() != Some(entries.len() as u64) {
+        return Err(reject(
+            "canonical CI history is incomplete; newest attempt cannot be proven",
+        ));
+    }
+    let mut latest: Option<(&Value, (u64, u64))> = None;
+    for run in entries {
+        if run["head_sha"].as_str() != Some(head) || run["event"].as_str() != Some("pull_request") {
+            return Err(reject(
+                "canonical CI response contradicts its head/event filter",
+            ));
+        }
+        let order = (
+            run["run_number"].as_u64().filter(|n| *n > 0),
+            run["run_attempt"].as_u64().filter(|n| *n > 0),
+        );
+        let (Some(number), Some(attempt)) = order else {
+            return Err(reject(
+                "canonical CI run has no server-owned ordering evidence",
+            ));
+        };
+        let order = (number, attempt);
+        if let Some((previous, key)) = latest {
+            if order == key && previous["id"] != run["id"] {
+                return Err(reject("canonical CI attempts have ambiguous ordering"));
+            }
+        }
+        if latest.is_none_or(|(_, key)| order > key) {
+            latest = Some((run, order));
+        }
+    }
+    let Some((run, _)) = latest else {
         return Ok(false);
     };
-    Ok(runs.iter().any(|run| {
-        run["head_sha"].as_str() == Some(head)
-            && run["event"].as_str() == Some("pull_request")
-            && run["status"].as_str() == Some("completed")
-            && run["conclusion"].as_str() == Some("success")
-            && run["id"].as_u64().is_some_and(|id| id > 0)
-            && run["id"].as_u64().is_some_and(|id| {
-                run["html_url"]
+    // Select before checking status: an older success cannot hide a new
+    // pending/failed attempt. Those are work-in-progress, not human approvals.
+    if run["status"].as_str() != Some("completed") || run["conclusion"].as_str() != Some("success")
+    {
+        return Ok(false);
+    }
+    let id = run["id"]
+        .as_u64()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| reject("canonical CI run has no id"))?;
+    if !run["html_url"]
+        .as_str()
+        .and_then(|url| url.strip_prefix("https://github.com/"))
+        .and_then(|path| path.strip_suffix(&format!("/actions/runs/{id}")))
+        .is_some_and(|run_repo| run_repo.eq_ignore_ascii_case(repo))
+    {
+        return Err(reject("canonical CI run belongs to another repository"));
+    }
+    if require_queue {
+        require_queue_authority(shared, repo, base, &rules, protection.as_ref().ok())?;
+    }
+    Ok(true)
+}
+
+/// Recheck the external enforcement boundary before postmerge settlement.
+pub(super) fn unattended_queue_authority(
+    shared: &Shared,
+    repo: &str,
+    base: &str,
+    base_ref: &str,
+) -> Result<()> {
+    if default_branch(shared, repo)? != base_ref {
+        return Err(reject(
+            "the authorized target is no longer the repository default",
+        ));
+    }
+    let branch = branch_segment(base_ref);
+    let rules = api(shared, &format!("repos/{repo}/rules/branches/{branch}"))?;
+    let protection = api(
+        shared,
+        &format!("repos/{repo}/branches/{branch}/protection"),
+    )?;
+    require_queue_authority(shared, repo, base, &rules, Some(&protection))
+}
+
+fn require_queue_authority(
+    shared: &Shared,
+    repo: &str,
+    base: &str,
+    rules: &Value,
+    protection: Option<&Value>,
+) -> Result<()> {
+    let mut queues = rules
+        .as_array()
+        .ok_or_else(|| reject("applicable branch rules are unreadable"))?
+        .iter()
+        .filter(|rule| rule["type"] == "merge_queue")
+        .peekable();
+    if queues.peek().is_none() {
+        return Err(reject("automatic landing requires an enforced native merge queue on the default branch; operator setup is required"));
+    }
+    for rule in queues {
+        let id = rule["ruleset_id"]
+            .as_u64()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| reject("merge queue has no authenticated ruleset identity"))?;
+        let detail = api(shared, &format!("repos/{repo}/rulesets/{id}"))?;
+        if detail["id"].as_u64() != Some(id)
+            || detail["enforcement"] != "active"
+            || detail["target"] != "branch"
+            || detail["current_user_can_bypass"] != "never"
+            || !detail["bypass_actors"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+            || !detail["rules"]
+                .as_array()
+                .is_some_and(|rules| rules.iter().any(|rule| rule["type"] == "merge_queue"))
+        {
+            return Err(reject("merge queue enforcement or mutation-identity bypass protection is unproven; operator inspection is required"));
+        }
+    }
+    let protection = protection
+        .filter(|doc| doc["enforce_admins"]["enabled"] == true)
+        .ok_or_else(|| {
+            reject(
+                "automatic landing requires required-check protection enforced for administrators",
+            )
+        })?;
+    let checks = protection["required_status_checks"]["checks"]
+        .as_array()
+        .filter(|checks| !checks.is_empty())
+        .ok_or_else(|| {
+            reject("required integration checks have no authenticated source bindings")
+        })?;
+    let mut bound = std::collections::BTreeSet::new();
+    for check in checks {
+        let context = check["context"]
+            .as_str()
+            .filter(|context| !context.is_empty())
+            .ok_or_else(|| reject("a required integration check has no context"))?;
+        // github.com GitHub Actions app, not an arbitrary status publisher.
+        if check["app_id"].as_u64() != Some(15368) {
+            return Err(reject("required integration checks must be bound to GitHub Actions, not an unspecified status publisher"));
+        }
+        bound.insert(context);
+    }
+    if !protection["required_status_checks"]["contexts"]
+        .as_array()
+        .is_some_and(|contexts| {
+            contexts.iter().all(|context| {
+                context
                     .as_str()
-                    .and_then(|url| url.strip_prefix("https://github.com/"))
-                    .and_then(|path| path.strip_suffix(&format!("/actions/runs/{id}")))
-                    .is_some_and(|run_repo| run_repo.eq_ignore_ascii_case(repo))
+                    .is_some_and(|context| bound.contains(context))
             })
-    }))
+        })
+    {
+        return Err(reject(
+            "required integration contexts contain an unbound check",
+        ));
+    }
+    for rule in rules.as_array().into_iter().flatten() {
+        if rule["type"] == "required_status_checks" {
+            let checks = rule["parameters"]["required_status_checks"]
+                .as_array()
+                .ok_or_else(|| reject("required-check rules are unreadable"))?;
+            if checks.iter().any(|check| {
+                check["integration_id"].as_u64() != Some(15368)
+                    || check["context"]
+                        .as_str()
+                        .is_none_or(|name| !bound.contains(name))
+            }) {
+                return Err(reject(
+                    "ruleset integration checks lack matching trusted protection bindings",
+                ));
+            }
+        }
+    }
+    let raw = content_at_base(shared, repo, ".github/workflows/ci.yml", base)
+        .ok_or_else(|| reject("trusted integration workflow is unavailable"))?;
+    let workflow: serde_yaml::Value = serde_yaml::from_str(&raw)
+        .map_err(|_| reject("trusted integration workflow is malformed"))?;
+    let merge_group = match &workflow["on"] {
+        serde_yaml::Value::Mapping(events) => events.contains_key("merge_group"),
+        serde_yaml::Value::Sequence(events) => events
+            .iter()
+            .any(|event| event.as_str() == Some("merge_group")),
+        event => event.as_str() == Some("merge_group"),
+    };
+    if !merge_group {
+        return Err(reject(
+            "trusted CI does not handle merge_group; automatic landing is unsupported",
+        ));
+    }
+    // These are the canonical workflow's existing full integration floor,
+    // not whatever subset happens to remain in mutable repository settings.
+    for gate in ["fmt", "clippy", "test", "build", "ui"] {
+        let job = workflow["jobs"].get(gate).ok_or_else(|| {
+            reject(format!(
+                "trusted CI lacks the supported {gate} integration gate"
+            ))
+        })?;
+        let name = match job.get("name") {
+            None => gate,
+            Some(name) => name
+                .as_str()
+                .ok_or_else(|| reject("trusted integration gate name is unreadable"))?,
+        };
+        if !bound.contains(name) {
+            return Err(reject(format!("operator must protect the existing {name} integration gate before automatic landing")));
+        }
+    }
+    if let Some(job) = workflow["jobs"].get("cross-build-required") {
+        let name = job["name"].as_str().unwrap_or("cross-build-required");
+        if !bound.contains(name) {
+            return Err(reject(format!("operator must protect the existing {name} integration aggregate before automatic landing")));
+        }
+    }
+    Ok(())
+}
+
+/// An enabled auto-merge request is not proof of admission to the queue.
+pub(super) fn unattended_queue_entry(
+    shared: &Shared,
+    repo: &str,
+    number: u64,
+    head: &str,
+    base: &str,
+    base_ref: &str,
+) -> Result<Option<String>> {
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| reject("invalid queue repository"))?;
+    let query = format!(
+        "query {{ repository(owner:{},name:{}) {{ pullRequest(number:{number}) {{ headRefOid baseRefOid baseRefName state mergeQueueEntry {{ id }} }} }} }}",
+        json!(owner), json!(name),
+    );
+    let response: Value = serde_json::from_str(&gh(
+        shared,
+        &["api", "graphql", "-f", &format!("query={query}")],
+    )?)
+    .map_err(|_| reject("native merge queue response is unreadable"))?;
+    if response
+        .get("errors")
+        .is_some_and(|errors| !errors.as_array().is_some_and(Vec::is_empty))
+    {
+        return Err(reject("native merge queue query failed"));
+    }
+    let pr = &response["data"]["repository"]["pullRequest"];
+    if pr["headRefOid"] != head
+        || pr["state"] != "OPEN"
+        || pr["baseRefOid"] != base
+        || pr["baseRefName"] != base_ref
+    {
+        return Err(reject(
+            "queue observation no longer names the open authorized head",
+        ));
+    }
+    if pr.get("mergeQueueEntry").is_none() {
+        return Err(reject("native merge queue entry evidence is missing"));
+    }
+    if pr["mergeQueueEntry"].is_null() {
+        return Ok(None);
+    }
+    pr["mergeQueueEntry"]["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(|id| Some(id.to_owned()))
+        .ok_or_else(|| reject("native merge queue entry has no identity"))
 }
 
 pub(super) enum RoutineReadiness {
@@ -539,10 +860,13 @@ fn routine_readiness_inner(
     let base = answer["base"]
         .as_str()
         .ok_or_else(|| reject("missing base SHA"))?;
+    let base_ref = answer["base_ref"]
+        .as_str()
+        .ok_or_else(|| reject("missing base branch name"))?;
     let number = answer["pr"]
         .as_u64()
         .ok_or_else(|| reject("missing PR number"))?;
-    let branch = default_branch(shared, repo)?;
+    let branch = branch_segment(base_ref);
     let rules = api(shared, &format!("repos/{repo}/rules/branches/{branch}"))?;
     let protection = api(
         shared,
@@ -613,7 +937,10 @@ fn routine_readiness_inner(
         return Ok(RoutineReadiness::NotRoutine);
     }
     let view = pr_view(shared, repo, number)?;
-    if view["headRefOid"].as_str() != Some(head) || view["baseRefOid"].as_str() != Some(base) {
+    if view["headRefOid"].as_str() != Some(head)
+        || view["baseRefOid"].as_str() != Some(base)
+        || view["baseRefName"].as_str() != Some(base_ref)
+    {
         return Ok(RoutineReadiness::NotRoutine);
     }
     let mut states: HashMap<String, Vec<String>> = HashMap::new();
@@ -682,6 +1009,7 @@ fn routine_readiness_inner(
     let final_answer = classify(shared, &json!({"issue":issue_id,"pr":pr_url,"head":head}))?;
     if final_answer["head"] != answer["head"]
         || final_answer["base"] != answer["base"]
+        || final_answer["base_ref"] != answer["base_ref"]
         || final_answer["policy_digest"] != answer["policy_digest"]
         || final_answer["requirements"]["class"] != "routine"
     {
@@ -692,6 +1020,7 @@ fn routine_readiness_inner(
         pr: number,
         head: head.to_string(),
         base: base.to_string(),
+        base_ref: base_ref.to_string(),
         policy_digest: answer["policy_digest"]
             .as_str()
             .unwrap_or_default()

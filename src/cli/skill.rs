@@ -11,7 +11,14 @@ pub(crate) enum SkillAction {
         name: Option<String>,
     },
     /// Inspect every bundled guidance file and each provider's discovery link.
+    /// This does not write, and it does not claim a live session reloaded.
     Status,
+    /// Non-force refresh used by native `cadence update` so the activated
+    /// binary writes its own embedded bytes. Not a second installer:
+    /// `cadence skill install` remains the manual repair. Matching files
+    /// and foreign provider entries are left unchanged.
+    #[command(hide = true)]
+    Sync,
 }
 
 pub(super) fn run(_state_dir: PathBuf, action: SkillAction) -> Result<i32> {
@@ -22,6 +29,49 @@ pub(super) fn run(_state_dir: PathBuf, action: SkillAction) -> Result<i32> {
             print_json(&report);
         }
         SkillAction::Status => print_json(&cadence_agent::skill::status(&home)),
+        SkillAction::Sync => {
+            if cadence_agent::sandbox::profile().is_some() {
+                print_json(&json!({
+                    "skipped": true,
+                    "wrote": false,
+                    "reason": "sandbox profile never writes the shared home",
+                    "guidance": "not-checked",
+                    "repair": "cadence skill install",
+                    "live_session": "not-checked",
+                    "status": cadence_agent::skill::status(&home),
+                }));
+                return Ok(0);
+            }
+            match cadence_agent::skill::sync(&home, false, None) {
+                Ok(sync) => {
+                    let status = cadence_agent::skill::status(&home);
+                    print_json(&json!({
+                        "skipped": false,
+                        "wrote": sync["wrote"],
+                        "sync": sync,
+                        "guidance": status["guidance"],
+                        "repair": status["repair"],
+                        "attention": status["attention"],
+                        "live_session": "not-checked",
+                        "live_session_note": status["live_session_note"],
+                        "status": status,
+                    }));
+                }
+                Err(error) => {
+                    let status = cadence_agent::skill::status(&home);
+                    print_json(&json!({
+                        "skipped": false,
+                        "wrote": false,
+                        "error": error.to_string(),
+                        "guidance": "needs-attention",
+                        "repair": "cadence skill install",
+                        "live_session": "not-checked",
+                        "live_session_note": status["live_session_note"],
+                        "status": status,
+                    }));
+                }
+            }
+        }
     }
     Ok(0)
 }

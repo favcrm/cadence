@@ -73,12 +73,38 @@ pub(crate) enum MasterAction {
         #[arg(long)]
         post: bool,
     },
+    /// The master's full launch diagnosis (CAD-1586): registered state
+    /// and stored fields, the configured/effective model and where it
+    /// came from, a fresh policy launch check with the refusal code
+    /// and reason, the applicable allowlist, pending queue and last
+    /// turn. Liveness/authentication that cannot be proven is reported
+    /// as unknown — a launchable verdict is not a launch guarantee.
+    Status {
+        /// A settings grant id issued for `master.status` — how a
+        /// designated management agent runs the diagnosis under its
+        /// scoped grant (the operator needs none).
+        #[arg(long)]
+        grant: Option<String>,
+    },
     /// Print the filesystem confinement `master start` launches the
     /// master's provider under (CAD-439), computed from this env exactly
     /// as the daemon does: `{confine, read, write}`. Reads nothing,
     /// starts nothing — for `scripts/master-read-probe.sh`.
     #[command(hide = true)]
     Confinement,
+    /// Resume the registered master after its configuration is repaired
+    /// in Settings > Agents (CAD-1586): the same `agent resume` the
+    /// operator runs — a live master is refused, an unreconciled
+    /// unknown-outcome fence still refuses (reconcile first), and a
+    /// failed start reports `attention`, never a false success. A
+    /// designated management agent passes `--grant <id>` — the settings
+    /// grant the operator approved for exactly this resume.
+    Resume {
+        /// A settings grant id issued for `master.resume` (the operator
+        /// needs none).
+        #[arg(long)]
+        grant: Option<String>,
+    },
     /// Ask the operator to approve one plain command (master only).
     /// The command is the exact argv after `--`.
     AskPermission {
@@ -204,6 +230,30 @@ pub(super) fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> 
             "master_summary",
             json!({"since": since, "post": post}),
         )?,
+        MasterAction::Status { grant } => {
+            let mut payload = json!({});
+            if let Some(grant) = grant {
+                payload["grant_id"] = json!(grant);
+            }
+            client::rpc(
+                state_dir,
+                "agent_settings_command",
+                json!({"operation": "master.status", "expected_revision": Value::Null,
+                       "payload": payload}),
+            )?
+        }
+        MasterAction::Resume { grant } => {
+            let mut payload = json!({});
+            if let Some(grant) = grant {
+                payload["grant_id"] = json!(grant);
+            }
+            client::rpc(
+                state_dir,
+                "agent_settings_command",
+                json!({"operation": "master.resume", "expected_revision": Value::Null,
+                       "payload": payload}),
+            )?
+        }
         MasterAction::AskPermission { reason, argv } => {
             let cwd = std::env::current_dir().map_err(|e| {
                 cadence_agent::error::Error::rejected(format!("cwd is unreadable: {e}"))

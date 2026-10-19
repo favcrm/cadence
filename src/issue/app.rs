@@ -272,6 +272,21 @@ pub struct Record {
     /// then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purge_after: Option<i64>,
+    /// Catalogue release this installation was checked against. Absence
+    /// is a path, Git or other non-catalogue install — never a guessed
+    /// label. The locator is provenance, not a grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalogue: Option<CatalogueOrigin>,
+}
+
+/// A published catalogue release named by id, version and digest.
+/// Matching bytes do not make the caller trusted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogueOrigin {
+    pub id: String,
+    pub version: String,
+    pub digest: String,
 }
 
 /// Where an installed bundle came from. `git` records the exact commit
@@ -1770,6 +1785,7 @@ pub fn install(
         removed: None,
         restore_after: None,
         purge_after: None,
+        catalogue: None,
     };
     if let Err(e) = write_record(&record_path, &record) {
         rollback(false);

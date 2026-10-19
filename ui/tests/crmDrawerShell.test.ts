@@ -162,8 +162,8 @@ async function main() {
   assert(document.activeElement === heading, "deep-linked drawer returns focus to the outlet heading, not body");
 
   // Reduced motion and layout fixes are in the sheet.
-  const nativeCss = fs.readFileSync(require("path").join(process.cwd(), "src/features/app-shell/crm-drawer.css"), "utf8");
-  assert(nativeCss.includes('@import "../../../screen-ui/src/drawer.css";'), "native drawer imports the shared drawer styles");
+  const nativeCss = fs.readFileSync(require("path").join(process.cwd(), "src/features/app-shell/shared/drawer.css"), "utf8");
+  assert(nativeCss.includes('@import "../../../../screen-ui/src/drawer.css";'), "native drawer imports the shared drawer styles");
   const css = fs.readFileSync(require("path").join(process.cwd(), "screen-ui/src/drawer.css"), "utf8") + nativeCss;
   assert(/prefers-reduced-motion: reduce\)[^]*crm-drawer-scrim[^]*animation: none/.test(css), "scrim honours reduced motion");
   assert(/\.crm-drawer\s*\{[^}]*\banimation:\s*none;\s*transition:\s*none;/.test(css), "drawer honours reduced motion");

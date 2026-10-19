@@ -135,6 +135,9 @@ async function main() {
     }
     if (url.pathname.startsWith("/api/connections")) return json({ connections: [] });
     if (url.pathname.startsWith("/api/app-runs")) return json({ runs: [] });
+    // The screen's shared extras reader also reads this installation's retained
+    // tool receipts (CAD-1177); a generic screen mount now shares that reader.
+    if (url.pathname.startsWith("/api/app-screen-tools/results")) return json({ results: [] });
     if (path === "/api/app-favorites") return json({ favorites: [] });
     if (url.pathname.endsWith("/records")) return json({ records: [], truncated: false, next_cursor: null });
     if (url.pathname.endsWith("/segments/list")) return json({ segments: [] });

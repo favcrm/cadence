@@ -273,6 +273,12 @@ jobs:
       vars.RELEASES_R2_BUCKET != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # CAD-1506: the release-store write credentials are environment-scoped
+    # (branch policy: main and v* tags). A workflow_run job's ref is the
+    # default branch, so the policy admits this job; no approval click is
+    # added. The production approval on the upstream promotion is
+    # unchanged.
+    environment: release-store
     permissions:
       contents: read
       actions: read

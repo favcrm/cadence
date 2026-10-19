@@ -64,5 +64,6 @@ pub(super) fn run(
         &CodexOpts::default(),
         team_role.as_deref(),
         provider_default_model,
+        None,
     )
 }

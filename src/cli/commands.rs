@@ -4,6 +4,8 @@ use super::*;
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
+    /// List PM issues assigned to your signed-in hosted identity.
+    MyWork,
     /// Retain, inspect or explicitly send a local result to hosted queued custody.
     Remote {
         #[command(subcommand)]
@@ -54,6 +56,13 @@ pub(crate) enum Commands {
         /// and grants no web authority.
         #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
         web: bool,
+        /// CAD-1586: also request the Settings scopes (`settings.read`,
+        /// `settings.write`) for this consent — required before remote
+        /// `settings agents`, `master status` or `master resume` can run.
+        /// Combines with `--web`; without it the login is unchanged and
+        /// grants no settings authority.
+        #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
+        settings: bool,
     },
     /// Inspect or remove local AgenticOS credentials.
     Auth {
@@ -180,11 +189,28 @@ pub(crate) enum Commands {
         /// `--portable`.
         #[arg(long, requires = "portable")]
         tracker: Option<PathBuf>,
+        /// Privately capture tracked changes/deletions and non-ignored
+        /// untracked files without changing the source tracker. Verify the
+        /// package and recheck the source before publication.
+        #[arg(long, requires = "portable")]
+        snapshot_working_tree: bool,
+        /// Redact credential-shaped spans (including warnings) in message
+        /// bodies on the private export copy only. Source history is unchanged;
+        /// all other fields and the sanitized copy still face normal scanning.
+        #[arg(long, requires = "portable")]
+        redact_history_secrets: bool,
         /// Repeatable, with `--portable`: an app whose data to include. No
         /// app schema is supported yet, so any selection is refused before
         /// the store or tracker is read or the output is created.
         #[arg(long = "app", value_name = "APP", requires = "portable")]
         apps: Vec<String>,
+    },
+    /// Independently inspect a portable coordination package, read-only.
+    /// Prints JSON integrity, schema and exclusion evidence; does not restore,
+    /// start a daemon, or establish import readiness. Local-only.
+    InspectPortable {
+        /// Existing portable package directory.
+        source: PathBuf,
     },
     /// Restore a backup (its `.manifest.json`) or an export bundle (its
     /// directory) into the state dir. Refuses while a daemon holds the
@@ -618,6 +644,14 @@ pub(crate) enum Commands {
     /// the body is `--text`, `-m` or `--file`. There are no email-style
     /// `--subject`, `--body` or `--cc` flags.
     ///
+    /// On a remote org (`--org <slug>`) the supported form is the durable
+    /// enqueue only: `--message <id>` is required (the stable id a lost
+    /// reply reconciles by), and `--ready`/`--force`, `--nudge`,
+    /// `--priority`/`--supersedes`, `--reply-to` and `--task` refuse —
+    /// they are local-endpoint surfaces. The recipient is the hosted master
+    /// for a verified human workspace owner; read the outcome with
+    /// `cadence message read <id> --org <slug>`.
+    ///
     /// Multi-topic reports: open the body with a `SUBJECT: <topic>`
     /// line (a single-line pty body leads with `SUBJECT: <topic> —`)
     /// so the recipient can scan topics; there is no subject field.
@@ -694,7 +728,9 @@ pub(crate) enum Commands {
         /// Worktree slug — default: the slugified issue title.
         #[arg(long)]
         name: Option<String>,
-        /// Base ref — else the repo's origin/HEAD, else current branch.
+        /// Integration ref to cut the lane from. Default: the repo's
+        /// configured base, else the remote HEAD. Never the main
+        /// checkout's current branch when that remote ref resolves.
         #[arg(long)]
         base: Option<String>,
         /// Repo path — same resolution as `issue start`.
@@ -783,6 +819,10 @@ pub(crate) enum Commands {
         /// their only delivery channel there.
         #[arg(long)]
         instructions_file: Option<PathBuf>,
+        /// Saved Agents settings profile. Its instructions and defaults are
+        /// resolved by the daemon and snapshotted for this new session.
+        #[arg(long, conflicts_with_all = ["instructions_file", "no_bootstrap"])]
+        profile: Option<String>,
         /// Run the worker in an isolated checkout of the PM's repo:
         /// `git worktree add <repo>/.cadence/wt/<name> -b cadence/<name>`.
         #[arg(long)]
@@ -1272,6 +1312,16 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: SecretAction,
     },
+    /// Settings surfaces. `settings agents` manages the Settings >
+    /// Agents document — harnesses, providers, models, catalogs, role
+    /// defaults, profiles and extension pins — through the daemon's
+    /// revision-checked transaction shared with the board. Every
+    /// mutation takes `--expected-revision` from `settings agents
+    /// show`; a stale token is a conflict, never a silent retry.
+    Settings {
+        #[command(subcommand)]
+        action: settings::SettingsAction,
+    },
     /// The read-only board UI + JSON API on loopback.
     Ui {
         #[command(subcommand)]
@@ -1495,7 +1545,16 @@ pub(crate) enum Commands {
     /// as the lease receipt, so no manual copy step. `--check` shows
     /// what would happen and changes nothing; `--rollback` returns to
     /// the previous release; `status` shows a pending update and what
-    /// it waits on. Operator-only: the same process proof as
+    /// it waits on. A native update also synchronizes bundled guidance
+    /// from the build that is active afterwards, including when the
+    /// binary is already current and after rollback. `--check` and
+    /// `status` do not write guidance, and they do not treat the
+    /// target build's guidance as verified. A guidance failure does
+    /// not roll back a healthy binary and does not restart the daemon
+    /// just to refresh skills. `cadence skill install` is the manual
+    /// repair. An existing agent session is not reloaded. Client-only
+    /// update does not install guidance or start a daemon.
+    /// Operator-only: the same process proof as
     /// `rollout claim` runs either way, never from inside a pane;
     /// `--as` is an optional audit label (a bare run labels itself
     /// from the proven native OS identity). An image-managed runtime
@@ -1565,10 +1624,13 @@ pub(crate) enum Commands {
     /// `CADENCE_PROFILE=sandbox:<name>` — which skips the skill sync
     /// into `$HOME`, refuses `ui tailscale`, and keeps the provider WAL
     /// watcher observe-only. Refuses production's dirs and port 3010.
+    /// Always local: a saved remote default org is ignored, and an
+    /// explicitly remote `--org`/`CADENCE_ORG` refuses before any remote
+    /// transport. `sandbox` remains a supported command alias.
     #[command(name = "dev", visible_alias = "sandbox")]
-    Sandbox {
+    Dev {
         #[command(subcommand)]
-        action: cadence_agent::sandbox::SandboxAction,
+        action: cadence_agent::sandbox::DevAction,
     },
     /// Run a command under a filesystem sandbox (CAD-439): `--read`
     /// paths are readable and executable, `--write` paths fully usable,

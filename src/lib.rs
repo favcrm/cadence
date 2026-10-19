@@ -9,6 +9,7 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod adapter;
+pub mod agent_settings;
 pub mod agent_uid;
 pub mod app_assistant;
 pub mod app_preview_export;
@@ -40,6 +41,7 @@ pub mod doctor;
 pub mod error;
 pub mod filter;
 pub mod home;
+mod ident;
 pub mod inbox;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod installer_bundle;

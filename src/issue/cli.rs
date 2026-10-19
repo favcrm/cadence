@@ -137,7 +137,7 @@ pub enum IssueAction {
     /// List issues — a compact table on a TTY, JSON when piped (or `--json`).
     /// Value flags repeat and comma-join and match ANY of their values;
     /// different flags AND; `--tag` is the exception — all must be
-    /// present. See PROTOCOL.md "List grammar".
+    /// present. The grammar prints from `crate::filter::GRAMMAR`.
     #[command(after_long_help = crate::filter::GRAMMAR)]
     #[command(visible_alias = "list")]
     Ls {
@@ -285,8 +285,11 @@ pub enum IssueAction {
         /// Worktree slug — default: the slugified title (≤32 chars).
         #[arg(long)]
         name: Option<String>,
-        /// Base ref — else refresh and use the repo's origin/HEAD;
-        /// repositories without a remote default use the current branch.
+        /// Integration ref to cut the lane from. Default: the repo's
+        /// configured `base`, else the remote HEAD (`origin/HEAD`, else
+        /// the remote's symbolic HEAD). A checkout with no `origin`
+        /// uses its current branch. A resolved remote ref is never
+        /// replaced by the main checkout's current branch.
         #[arg(long)]
         base: Option<String>,
         /// Owner to record when the issue has none — default: the
@@ -561,6 +564,10 @@ pub enum IssueAction {
         /// `kind:target` (`pr:https://…`) or a bare http(s) URL. Repeatable.
         #[arg(long = "ref", value_name = "KIND:TARGET")]
         refs: Vec<String>,
+        /// A ref to remove, named as `--ref` names it. Repeatable.
+        /// Every one must already exist, or the whole edit refuses.
+        #[arg(long = "unref", value_name = "KIND:TARGET")]
+        unrefs: Vec<String>,
         /// Attach a file, as `issue attach`. Repeatable.
         #[arg(long = "attach", value_name = "FILE")]
         attach: Vec<PathBuf>,
@@ -783,6 +790,39 @@ pub enum ProjectAction {
         /// Project key.
         key: String,
     },
+    /// Record a project's access policy: visibility and the callers it
+    /// admits. `--grant` is the full member list and replaces whatever
+    /// was recorded; omitting it clears grants. It does not merge.
+    /// Private is unavailable until the isolation gate passes;
+    /// workspace-visible is the only visibility this build can write.
+    Policy {
+        /// Project key.
+        key: String,
+        /// Visibility to record.
+        #[arg(long, value_enum, default_value = "workspace-visible")]
+        visibility: PolicyVisibility,
+        /// Grant a caller access (`users/<handle>` or `operator`);
+        /// repeatable.
+        #[arg(long = "grant")]
+        grants: Vec<String>,
+    },
+}
+
+/// `--visibility` for `project policy`: the recorded vocabulary, before it
+/// is mapped to the project policy type.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum PolicyVisibility {
+    WorkspaceVisible,
+    Private,
+}
+
+impl PolicyVisibility {
+    fn recorded(self) -> crate::issue::project::Visibility {
+        match self {
+            Self::WorkspaceVisible => crate::issue::project::Visibility::WorkspaceVisible,
+            Self::Private => crate::issue::project::Visibility::Private,
+        }
+    }
 }
 
 pub(crate) fn print_json(value: &Value) {
@@ -838,6 +878,16 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     tags,
                     owner.as_deref(),
                 )?;
+                print_json(&out);
+                Ok(0)
+            }
+            ProjectAction::Policy {
+                key,
+                visibility,
+                grants,
+            } => {
+                let pm = open_pm()?;
+                let out = write::set_project_policy(&pm, key, visibility.recorded(), grants, "")?;
                 print_json(&out);
                 Ok(0)
             }
@@ -1681,6 +1731,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             link,
             unlink,
             refs,
+            unrefs,
             attach,
             acceptance,
             comment_file,
@@ -1716,6 +1767,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 link: link.clone(),
                 unlink: unlink.clone(),
                 refs: refs.clone(),
+                unrefs: unrefs.clone(),
                 attach: attach.clone(),
                 acceptance: read("--acceptance", acceptance)?,
                 comment: read("--comment-file", comment_file)?,

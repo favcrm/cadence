@@ -69,6 +69,7 @@ fn cad1163_selftest_native_pm_with_hooks_exports_restores_and_reads_back() {
     let opts = PortableExportOptions {
         scope: Scope::Coordination,
         tracker: pm_dir.clone(),
+        redact_history_secrets: false,
     };
     export_portable(&state, &out, &opts).expect("native PM with hooks exports");
     let dest = root.join("restored");
@@ -104,6 +105,7 @@ fn cad1163_selftest_modified_native_hook_refuses_before_git() {
     let opts = PortableExportOptions {
         scope: Scope::Coordination,
         tracker: pm_dir,
+        redact_history_secrets: false,
     };
     let err =
         export_portable(&state, &root.join("package"), &opts).expect_err("modified hook refuses");
@@ -262,6 +264,7 @@ fn cad1441_known_catalog_accepts_historical_order_and_refuses_unknown_or_missing
     let opts = PortableExportOptions {
         scope: Scope::Coordination,
         tracker: tracker.clone(),
+        redact_history_secrets: false,
     };
 
     // Accept: exactly the known names in historical physical order.

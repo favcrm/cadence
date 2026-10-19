@@ -145,11 +145,6 @@ impl Shared {
                         .get("app.md")
                         .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
                 )?;
-                if manifest.app != crate::app_assistant::SOCIAL_APP {
-                    return Err(Error::rejected(
-                        "social actions run only for the Social Content app",
-                    ));
-                }
                 let mut tools: BTreeMap<String, String> = BTreeMap::new();
                 for tag in crate::issue::app_screen_pkg::tags_in(files)? {
                     tools.extend(crate::issue::app_screen_pkg::extract(files, &tag)?.tools);
@@ -564,6 +559,7 @@ impl Shared {
             mount: None,
             session: String::new(),
             tools: BTreeMap::new(),
+            read_only: false,
             issued: Instant::now(),
         }
     }

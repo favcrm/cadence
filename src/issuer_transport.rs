@@ -3,26 +3,44 @@
 //! built before: the caller's config, WebPki roots and the default resolver.
 //! There is no environment, config or public selector for anything else.
 //!
-//! The only difference exists under `cfg(test)`: a fixture may trust one
-//! ephemeral test CA and resolve the synthetic board hostnames to loopback
-//! through the same `ureq` TLS/resolver path. Certificate verification stays
-//! on. This module never disables verification, never trusts a host globally
-//! and never changes DNS for anything but the fixture's named hosts.
+//! The only differences exist outside production builds: under `cfg(test)` a
+//! fixture may trust one ephemeral test CA and resolve the synthetic board
+//! hostnames to loopback through the same `ureq` TLS/resolver path; and in a
+//! non-test binary built with `test-seam` (debug-only — `compile_error!`
+//! keeps the feature out of every release) the explicit env pair
+//! `CADENCE_TEST_TLS_CA` + `CADENCE_TEST_TLS_CONNECT` arms the same shape for
+//! the CAD-1568 packaged-CLI acceptance. Certificate verification stays on
+//! in both. Neither disables verification, trusts a host globally nor
+//! changes DNS for anything but the fixture's named hosts.
 
 use std::time::Duration;
+
+/// The canonical production board alias the native chain uses unchanged.
+/// Fixtures map it to loopback only; the production endpoint rule and
+/// parser are never touched.
+#[cfg(any(test, feature = "test-seam"))]
+pub(crate) const CANONICAL_BOARD_HOST: &str = "lc.cadencecloud.app";
 
 /// Build the agent from the caller's finished `ureq` config builder.
 pub(crate) fn agent(
     builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
 ) -> ureq::Agent {
-    #[cfg(not(test))]
-    {
-        ureq::Agent::new_with_config(builder.build())
-    }
-    #[cfg(test)]
-    {
-        test_fixture::agent(builder)
-    }
+    build(builder)
+}
+
+#[cfg(test)]
+fn build(builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>) -> ureq::Agent {
+    test_fixture::agent(builder)
+}
+
+#[cfg(all(not(test), not(feature = "test-seam")))]
+fn build(builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>) -> ureq::Agent {
+    ureq::Agent::new_with_config(builder.build())
+}
+
+#[cfg(all(not(test), feature = "test-seam"))]
+fn build(builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>) -> ureq::Agent {
+    env_fixture::agent(builder)
 }
 
 /// The JWKS fetch agent, production shape unchanged.
@@ -32,6 +50,116 @@ pub(crate) fn jwks_agent(timeout: Duration) -> ureq::Agent {
             .timeout_global(Some(timeout))
             .http_status_as_error(false),
     )
+}
+
+/// CAD-1568: the packaged-CLI acceptance runs the real `cadence` executable
+/// as a child process, so the thread-local `cfg(test)` fixture cannot reach
+/// it. In a non-test `test-seam` debug binary only, the explicit env pair
+/// arms an equivalent fixture transport: `CADENCE_TEST_TLS_CA` names a
+/// private 0600 PEM file holding the single fixture CA certificate and
+/// `CADENCE_TEST_TLS_CONNECT` is the `127.0.0.1:P` bridge socket. The pair
+/// is all-or-nothing: exactly one of the two is a loud failure, never a
+/// silent fall back to production DNS or trust. While armed, only the
+/// fixture's own two hosts (`lc.cadencecloud.app` and the exact
+/// `issuer.board.localhost` authority the controlled TLS bridge serves)
+/// resolve — every other host fails closed — and full certificate-chain
+/// and hostname verification still run against that private CA.
+#[cfg(all(not(test), feature = "test-seam"))]
+mod env_fixture {
+    use std::net::SocketAddr;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+    use ureq::config::ConfigBuilder;
+    use ureq::tls::{Certificate, RootCerts, TlsConfig};
+    use ureq::typestate::AgentScope;
+    use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
+    use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
+
+    /// The env pair a seam-built binary's fixture transport is armed with.
+    const CA_ENV: &str = "CADENCE_TEST_TLS_CA";
+    const CONNECT_ENV: &str = "CADENCE_TEST_TLS_CONNECT";
+    /// The exact issuer host the controlled fixture bridge serves.
+    const ISSUER_HOST: &str = "issuer.board.localhost";
+
+    /// Resolves only the fixture's own two hosts to the armed loopback;
+    /// every other host is refused outright, so an armed agent can never
+    /// reach a real network destination.
+    #[derive(Debug)]
+    struct EnvResolver {
+        loopback: SocketAddr,
+    }
+
+    impl Resolver for EnvResolver {
+        fn resolve(
+            &self,
+            uri: &ureq::http::Uri,
+            _config: &ureq::config::Config,
+            _timeout: NextTimeout,
+        ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+            let host = uri.host().unwrap_or_default();
+            if host != super::CANONICAL_BOARD_HOST && host != ISSUER_HOST {
+                return Err(ureq::Error::HostNotFound);
+            }
+            let mut addrs = ResolvedSocketAddrs::from_fn(|_| self.loopback);
+            addrs.push(self.loopback);
+            Ok(addrs)
+        }
+    }
+
+    /// The private fixture CA file → DER. Mirrors the TLS fixture's own
+    /// guards: an absolute path, a regular owned 0600 file, one bounded PEM
+    /// certificate block. Every deviation is a loud panic in the seam
+    /// binary, not a fallback.
+    fn fixture_ca_der(path: &Path) -> Vec<u8> {
+        assert!(path.is_absolute(), "{CA_ENV} must be an absolute path");
+        let meta = std::fs::symlink_metadata(path)
+            .unwrap_or_else(|_| panic!("{CA_ENV} file cannot be inspected"));
+        assert!(
+            meta.is_file()
+                && meta.uid() == unsafe { libc::geteuid() }
+                && (meta.mode() & 0o777) == 0o600
+                && meta.len() <= 16384,
+            "{CA_ENV} must be a private owned regular PEM file"
+        );
+        let text = String::from_utf8(
+            std::fs::read(path).unwrap_or_else(|_| panic!("{CA_ENV} file cannot be read")),
+        )
+        .unwrap_or_else(|_| panic!("{CA_ENV} must be PEM text"));
+        let text = text.trim();
+        let body = text
+            .strip_prefix("-----BEGIN CERTIFICATE-----")
+            .and_then(|rest| rest.strip_suffix("-----END CERTIFICATE-----"))
+            .unwrap_or_else(|| panic!("{CA_ENV} must contain exactly one PEM certificate"));
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(body.split_ascii_whitespace().collect::<String>())
+            .unwrap_or_else(|_| panic!("{CA_ENV} certificate is not base64 DER"))
+    }
+
+    pub(crate) fn agent(builder: ConfigBuilder<AgentScope>) -> ureq::Agent {
+        let ca = std::env::var_os(CA_ENV);
+        let connect = std::env::var_os(CONNECT_ENV);
+        let (ca, connect) = match (ca, connect) {
+            (None, None) => return ureq::Agent::new_with_config(builder.build()),
+            (Some(ca), Some(connect)) => (ca, connect),
+            _ => panic!(
+                "{CA_ENV} and {CONNECT_ENV} arm the fixture transport together or not at all"
+            ),
+        };
+        let connect: SocketAddr = connect
+            .to_str()
+            .and_then(|value| value.parse().ok())
+            .filter(|addr: &SocketAddr| addr.ip().is_loopback())
+            .unwrap_or_else(|| panic!("{CONNECT_ENV} must be a 127.0.0.1 socket address"));
+        let der = fixture_ca_der(Path::new(&ca));
+        let roots = RootCerts::new_with_certs(&[Certificate::from_der(&der).to_owned()]);
+        let tls = TlsConfig::builder().root_certs(roots).build();
+        ureq::Agent::with_parts(
+            builder.tls_config(tls).proxy(None).max_redirects(0).build(),
+            DefaultConnector::default(),
+            EnvResolver { loopback: connect },
+        )
+    }
 }
 
 #[cfg(test)]
@@ -138,16 +266,11 @@ pub(crate) mod test_fixture {
         }
     }
 
-    /// The canonical production board alias the native chain uses unchanged.
-    /// It maps to loopback only inside this fixture; the production endpoint
-    /// rule and parser are not touched.
-    pub(crate) const CANONICAL_BOARD_HOST: &str = "lc.cadencecloud.app";
-
     /// A logical host the fixture resolves to loopback: the canonical board
     /// alias, or a synthetic `*.board.localhost` name used by the TLS slice.
     /// Certificate names are still verified against the presented SAN.
     fn fixture_maps(host: &str) -> bool {
-        host == CANONICAL_BOARD_HOST || host.ends_with(".board.localhost")
+        host == super::CANONICAL_BOARD_HOST || host.ends_with(".board.localhost")
     }
 
     #[derive(Debug)]

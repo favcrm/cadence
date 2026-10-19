@@ -32,6 +32,12 @@ use crate::error::{Error, Result};
 use crate::rollout::db_file;
 use crate::secret::Allowlist;
 
+mod capture;
+#[cfg(test)]
+mod capture_acceptance;
+#[cfg(test)]
+mod hook_capture_acceptance;
+
 pub const PORTABLE_FORMAT: &str = "cadence.portable/1";
 pub const INACTIVE_MARKER: &str = "portable-restore.json";
 const PKG_DB: &str = "cadence.sqlite3";
@@ -256,6 +262,10 @@ const CATALOG: &[(&str, &[&str])] = &[
     (
         "app_install_requests",
         &["id", "catalog_id", "requested_by", "at", "state"],
+    ),
+    (
+        "app_run_artifact_fetches",
+        &["artifact_id", "message_id", "turn_hash", "created"],
     ),
     (
         "app_run_artifacts",
@@ -708,6 +718,10 @@ const CATALOG: &[(&str, &[&str])] = &[
     ),
     ("schema_version", &["version"]),
     (
+        "settings_authority",
+        &["id", "pi", "profiles", "legacy_imported"],
+    ),
+    (
         "social_publish_intents",
         &[
             "intent_id",
@@ -942,6 +956,8 @@ pub struct PortableExportOptions {
     pub scope: Scope,
     /// The ordinary Git tracker checkout to pin into the package.
     pub tracker: PathBuf,
+    /// Redact credential-shaped spans in private-copy message bodies.
+    pub redact_history_secrets: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -975,6 +991,9 @@ pub struct PortableManifest {
     pub nulled_columns: Vec<String>,
     pub disabled_columns: Vec<String>,
     pub exclusions: Vec<String>,
+    /// None means strict history export; Some(0) still records explicit opt-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_message_bodies: Option<u64>,
     pub members: Vec<Member>,
 }
 
@@ -1010,7 +1029,14 @@ pub fn export_portable(
     let allow = Allowlist::load(state_dir)?;
     let head = admit_tracker(&opts.tracker)?;
     let staging = private_staging(out)?;
-    match build_package(&live, &staging, &opts.tracker, &head, &allow) {
+    match build_package(
+        &live,
+        &staging,
+        &opts.tracker,
+        &head,
+        &allow,
+        opts.redact_history_secrets,
+    ) {
         Ok(manifest) => publish(&staging, out, &manifest),
         Err(error) => {
             let _ = fs::remove_dir_all(&staging);
@@ -1036,6 +1062,157 @@ pub fn export_portable_selected(
         )));
     }
     export_portable(state_dir, out, opts)
+}
+
+/// Capture a dirty working tree privately, then use the same native package
+/// builder. Publication follows independent package validation and a final
+/// source check; the source database and tracker are not one atomic snapshot.
+pub fn export_portable_snapshot_selected(
+    state_dir: &Path,
+    out: &Path,
+    opts: &PortableExportOptions,
+    apps: &[String],
+) -> Result<Value> {
+    if !apps.is_empty() {
+        return export_portable_selected(state_dir, out, opts, apps);
+    }
+    refuse_existing(out)?;
+    refuse_output_in_tracker(out, &opts.tracker)?;
+    let live = db_file(state_dir);
+    if !live.is_file() {
+        return Err(Error::rejected(
+            "portable export source database is missing",
+        ));
+    }
+    let allow = Allowlist::load(state_dir)?;
+    let captured = capture::TrackerCapture::new(&opts.tracker)?;
+    let head = admit_tracker(captured.path())?;
+    let staging = private_staging(out)?;
+    let result = (|| {
+        let manifest = build_package(
+            &live,
+            &staging,
+            captured.path(),
+            &head,
+            &allow,
+            opts.redact_history_secrets,
+        )?;
+        let mut report = inspect_portable(&staging)?;
+        captured.verify_package(&staging, &manifest.members)?;
+        captured.verify_unchanged()?;
+        report["source_capture"] = captured.evidence();
+        report["exporter_revision"] = json!(crate::overview::BUILD_COMMIT);
+        report["source_fidelity"] = json!("captured_tracker_matches_package_and_rechecked");
+        report["atomic_database_and_tracker"] = json!(false);
+        report["bundle"] = json!(out);
+        rename_noreplace(&staging, out)?;
+        Ok(report)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+fn refuse_output_in_tracker(out: &Path, tracker: &Path) -> Result<()> {
+    let absolute = std::env::current_dir()?.join(out);
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    while ancestor.symlink_metadata().is_err() {
+        suffix.push(
+            ancestor
+                .file_name()
+                .ok_or_else(|| Error::rejected("output path has no resolvable parent"))?,
+        );
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| Error::rejected("output path has no resolvable parent"))?;
+    }
+    let mut resolved = ancestor.canonicalize()?;
+    for part in suffix.into_iter().rev() {
+        resolved.push(part);
+    }
+    if resolved.starts_with(tracker.canonicalize()?) {
+        return Err(Error::rejected(
+            "snapshot export output must be outside the source tracker",
+        ));
+    }
+    Ok(())
+}
+
+/// Read-only inspection through the same integrity, catalog and authority
+/// checks as inactive restore. A valid manifest is not source authenticity,
+/// present-day source fidelity, or destination/import admission.
+pub fn inspect_portable(source: &Path) -> Result<Value> {
+    if !source.symlink_metadata()?.is_dir() {
+        return Err(Error::rejected("package is not a plain directory"));
+    }
+    require_regular(&source.join(PKG_MANIFEST))?;
+    // Reject linked directories before reading any listed member through them.
+    let mut paths = Vec::new();
+    collect_package_members(source, source, &mut paths)?;
+    let (manifest_sha256, _) = hash_file(&source.join(PKG_MANIFEST))?;
+    let manifest = verify_package(source)?;
+    // Ordinary read-only SQLite opens can still create WAL/SHM files.
+    // Native exports are rollback-journal single-file databases; admit that
+    // header before any SQLite connection touches the supplied package.
+    let mut header = [0u8; 20];
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(source.join(PKG_DB))?
+        .read_exact(&mut header)?;
+    if &header[..16] != b"SQLite format 3\0" || header[18] != 1 || header[19] != 1 {
+        return Err(Error::rejected(
+            "portable inspection requires a single-file rollback-journal SQLite database",
+        ));
+    }
+    validate_staged_store(&source.join(PKG_DB), &manifest)?;
+    let tracker = source.join(PKG_TRACKER);
+    if pm_root_of(&tracker)? != manifest.pm_root {
+        return Err(Error::rejected(
+            "package tracker PM root differs from manifest",
+        ));
+    }
+    if hash_file(&source.join(PKG_MANIFEST))?.0 != manifest_sha256 {
+        return Err(Error::rejected(
+            "package manifest changed during inspection",
+        ));
+    }
+    let bytes = manifest.members.iter().try_fold(0u64, |total, member| {
+        total
+            .checked_add(member.bytes)
+            .ok_or_else(|| Error::rejected("package byte total overflows"))
+    })?;
+    Ok(json!({
+        "status": "verified_coordination_package",
+        "portable": true,
+        "bundle": source,
+        "manifest_sha256": manifest_sha256,
+        "format": manifest.format,
+        "scope": manifest.scope,
+        "full_workspace": manifest.full_workspace,
+        "cadence": manifest.cadence,
+        "inspector_revision": crate::overview::BUILD_COMMIT,
+        "schema_version": manifest.schema_version,
+        "tracker_revision": manifest.tracker_revision,
+        "members": manifest.members.len(),
+        "bytes": bytes,
+        "tables": manifest.tables,
+        "omitted_tables": manifest.omitted_tables,
+        "omitted_rows": manifest.omitted_rows,
+        "nulled_columns": manifest.nulled_columns,
+        "disabled_columns": manifest.disabled_columns,
+        "exclusions": manifest.exclusions,
+        "redacted_message_bodies": manifest.redacted_message_bodies,
+        "verification": {
+            "member_paths_hashes_sizes": true,
+            "exact_member_set": true,
+            "database_integrity_catalog_authority": true
+        },
+        "source_fidelity": "not_independently_established",
+        "import_ready": false
+    }))
 }
 
 fn refuse_existing(out: &Path) -> Result<()> {
@@ -1078,6 +1255,7 @@ fn build_package(
     tracker: &Path,
     head: &str,
     allow: &Allowlist,
+    redact_history_secrets: bool,
 ) -> Result<PortableManifest> {
     let db = staging.join(PKG_DB);
     // Private online snapshot; the live store is only read.
@@ -1087,7 +1265,7 @@ fn build_package(
     let omitted_rows = project(&db)?;
     // Existing redaction on the private copy, then a read-only secret scan
     // and integrity check of the projected copy.
-    scrub(&db)?;
+    let scrub = scrub(&db, redact_history_secrets)?;
     scan_db(&db, allow)?;
     let (integrity, schema) = inspect(&db)?;
     require_ok(&db, &integrity)?;
@@ -1096,6 +1274,13 @@ fn build_package(
     let pm_root = pm_root_of(&tracker_dir)?;
     let mut members = vec![member_for(&db, PKG_DB)?];
     members.extend(tracker_members(staging, &tracker_dir)?);
+    let mut package_exclusions = exclusions();
+    if redact_history_secrets {
+        package_exclusions.push(
+            "credential-shaped spans in UTF-8 text messages.body (opt-in; includes warn-only findings)"
+                .into(),
+        );
+    }
     let manifest = PortableManifest {
         pm_root,
         format: PORTABLE_FORMAT.into(),
@@ -1111,7 +1296,8 @@ fn build_package(
         omitted_rows,
         nulled_columns: NULLED.iter().map(|(t, c)| format!("{t}.{c}")).collect(),
         disabled_columns: DISABLED.iter().map(|(t, c)| format!("{t}.{c}")).collect(),
-        exclusions: exclusions(),
+        exclusions: package_exclusions,
+        redacted_message_bodies: scrub.redacted_message_bodies,
         members,
     };
     let text = serde_json::to_string_pretty(&manifest)?;
@@ -1250,6 +1436,8 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
     let conn = Connection::open(db)?;
     let mut omitted = Vec::new();
     let tx = conn.unchecked_transaction()?;
+    // Related private rows are removed together; enforce their foreign keys at commit.
+    tx.pragma_update(None, "defer_foreign_keys", true)?;
     let mut guard_sql = Vec::new();
     for name in PRIVATE_DELETE_GUARDS {
         guard_sql.push(tx.query_row(
@@ -1324,6 +1512,30 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
 /// no config `include`, no `hooks` entries beyond `.sample`, no symlink or
 /// hardlink inside `.git`. The tracker must be clean. Returns HEAD.
 pub fn admit_tracker(tracker: &Path) -> Result<String> {
+    admit_tracker_metadata(tracker, Admission::Export)?;
+    let status = git_plain(
+        tracker,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    if !status.trim().is_empty() {
+        return Err(Error::rejected(format!(
+            "tracker {} refused: not clean; commit or stash before export",
+            tracker.display()
+        )));
+    }
+    git_plain(tracker, &["rev-parse", "--verify", "HEAD"])
+}
+
+/// Export refuses active hooks and `core.hooksPath`. Capture admits regular
+/// installed hooks and one plain `core.hooksPath` key. The configured
+/// directory is not read. Source git still forces `core.hooksPath=/dev/null`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Export,
+    Capture,
+}
+
+fn admit_tracker_metadata(tracker: &Path, admission: Admission) -> Result<()> {
     let refuse =
         |why: &str| Error::rejected(format!("tracker {} refused: {why}", tracker.display()));
     let dotgit = tracker.join(".git");
@@ -1347,26 +1559,27 @@ pub fn admit_tracker(tracker: &Path) -> Result<String> {
             return Err(refuse(&format!("{banned} is present; unsupported layout")));
         }
     }
-    let hooks = dotgit.join("hooks");
-    if hooks.is_dir() && has_active_hooks(&hooks)? {
-        return Err(refuse("active git hooks"));
+    // Export only. `is_dir` follows links, and the byte compare reads hook
+    // files. Capture must not do either; the metadata walk still refuses a
+    // symlink, hardlink, or special file, including inside `hooks/`.
+    if admission == Admission::Export {
+        let hooks = dotgit.join("hooks");
+        if hooks.is_dir() && has_active_hooks(&hooks)? {
+            return Err(refuse("active git hooks"));
+        }
     }
     check_metadata_tree(&dotgit, tracker)?;
-    check_config_keys(&dotgit.join("config"), tracker)?;
-    let status = git_plain(
-        tracker,
-        &["status", "--porcelain=v1", "--untracked-files=all"],
-    )?;
-    if !status.trim().is_empty() {
-        return Err(refuse("not clean; commit or stash before export"));
-    }
-    git_plain(tracker, &["rev-parse", "--verify", "HEAD"])
+    check_config_keys(&dotgit.join("config"), tracker, admission)?;
+    Ok(())
 }
 
 /// Read `.git/config` as keys only, before git loads it. Includes and
 /// conditional includes refuse, as do keys that name a path or command git
 /// would run or read elsewhere. No values enter any evidence.
-fn check_config_keys(config: &Path, tracker: &Path) -> Result<()> {
+///
+/// Capture ignores a plain `[core]` `hooksPath` key and does not parse its
+/// value. A subsection, or any other path or command key, still refuses.
+fn check_config_keys(config: &Path, tracker: &Path, admission: Admission) -> Result<()> {
     let refuse =
         |why: String| Error::rejected(format!("tracker {} refused: {why}", tracker.display()));
     let text = match fs::read(config) {
@@ -1375,21 +1588,20 @@ fn check_config_keys(config: &Path, tracker: &Path) -> Result<()> {
     };
     let text = String::from_utf8(text).map_err(|_| refuse("non-UTF-8 .git/config".into()))?;
     let mut section = String::new();
+    let mut plain_section = false;
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
         if let Some(head) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            let name = head
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
+            let mut parts = head.split_whitespace();
+            let name = parts.next().unwrap_or_default().to_ascii_lowercase();
             if name == "include" || name == "includeif" {
                 return Err(refuse(format!("config {name} section is not supported")));
             }
             section = name;
+            plain_section = parts.next().is_none();
             continue;
         }
         let key = line
@@ -1399,6 +1611,9 @@ fn check_config_keys(config: &Path, tracker: &Path) -> Result<()> {
             .trim()
             .to_ascii_lowercase();
         let full = format!("{section}.{key}");
+        if admission == Admission::Capture && plain_section && full == "core.hookspath" {
+            continue;
+        }
         const PATH_OR_COMMAND: &[&str] = &[
             "core.worktree",
             "core.hookspath",
@@ -1524,6 +1739,11 @@ fn git_plain(dir: &Path, args: &[&str]) -> Result<String> {
 /// Run git and return raw stdout. No UTF-8 conversion and no trimming, so
 /// a blob's bytes (including trailing newlines and non-UTF-8 content) are
 /// exported exactly as committed.
+///
+/// `-c core.hooksPath=/dev/null` is installed before `args`, with a cleared
+/// environment and a private index. Capture admits a source `core.hooksPath`
+/// key only because every source git command comes through here. A later
+/// `-c core.hooksPath` in `args` would replace the override.
 fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let scratch = std::env::temp_dir().join(format!("cad1163-git-{}", nonce()));
     fs::create_dir_all(&scratch)?;
@@ -1590,15 +1810,13 @@ fn check_tracker_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Closed decoder for a portable `pm.yaml`. It mirrors the native `PmConfig`
-/// tree in `src/issue/mod.rs` (and `ReviewRules` in `src/delivery`): the same
-/// field names and value types at every level, with `deny_unknown_fields` so an
-/// extra key at any depth refuses. Native serde ignores unknown keys, so this
-/// mirror is the only place they are rejected. Values are never copied into an
+/// Closed decoder for a portable `pm.yaml`. Tracker metadata mirrors the
+/// native `PmConfig` tree; runtime sections reuse their closed native types.
+/// Unknown fields refuse at every level. Values are never copied into an
 /// error: a mismatch reports only the generic reason.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)] // validation-only: the fields close the schema, they are not read
+#[allow(dead_code)] // metadata fields close the schema; runtime strings are scanned
 struct PortablePmConfig {
     schema: u32,
     #[serde(default)]
@@ -1615,6 +1833,12 @@ struct PortablePmConfig {
     review: PortableReview,
     #[serde(default)]
     approvals: PortableApprovals,
+    #[serde(default)]
+    pi: crate::pi_policy::PiPolicy,
+    #[serde(default)]
+    host: crate::doctor::host::HostOverrides,
+    #[serde(default)]
+    hosted: crate::lease::Hosted,
 }
 
 #[derive(Deserialize, Default)]
@@ -1654,6 +1878,9 @@ const PM_CONFIG_KEYS: &[&str] = &[
     "wiki",
     "review",
     "approvals",
+    "pi",
+    "host",
+    "hosted",
 ];
 
 fn check_tracker_content(path: &str, bytes: &[u8]) -> Result<()> {
@@ -1661,20 +1888,57 @@ fn check_tracker_content(path: &str, bytes: &[u8]) -> Result<()> {
         return Ok(());
     }
     let refuse = |why: &str| Error::rejected(format!("tracker file {path} refused: {why}"));
+    let text = std::str::from_utf8(bytes).map_err(|_| refuse("not valid YAML"))?;
     let value: serde_yaml::Value =
-        serde_yaml::from_slice(bytes).map_err(|_| refuse("not valid YAML"))?;
+        serde_yaml::from_str(text).map_err(|_| refuse("not valid YAML"))?;
     let map = value.as_mapping().ok_or_else(|| refuse("not a mapping"))?;
-    for key in map.keys() {
+    for (key, section) in map {
         let name = key.as_str().ok_or_else(|| refuse("non-string key"))?;
         if !PM_CONFIG_KEYS.contains(&name) {
             return Err(refuse(&format!(
                 "unknown top-level key {name}; credential-bearing config is not portable"
             )));
         }
+        if matches!(name, "pi" | "host" | "hosted") && !section.is_mapping() {
+            return Err(refuse(&format!("runtime section {name} must be a mapping")));
+        }
     }
-    serde_yaml::from_value::<PortablePmConfig>(value).map_err(|_| {
+    let config = serde_yaml::from_value::<PortablePmConfig>(value).map_err(|_| {
         refuse("does not match the pm.yaml schema (unknown or mistyped key at some level)")
     })?;
+    let check_text = |text: &str| -> Result<()> {
+        if crate::secret::scan(text, Some(path))?
+            .iter()
+            .any(|finding| finding.severity == crate::secret::Severity::Block)
+        {
+            return Err(refuse("credential-shaped config content is not portable"));
+        }
+        Ok(())
+    };
+    // Raw text covers comments; decoded runtime strings cover YAML escapes.
+    check_text(text)?;
+    for value in config
+        .pi
+        .providers
+        .iter()
+        .chain(&config.pi.agentic_providers)
+        .chain(&config.pi.models.allow)
+        .chain(config.pi.models.master_allow.iter().flatten())
+        .chain(config.pi.models.worker_allow.iter().flatten())
+        .chain(config.pi.models.default.master.iter())
+        .chain(config.pi.models.default.worker.iter())
+        .chain(config.host.priority_lanes.iter().flatten())
+        .chain(
+            config
+                .host
+                .auto_stop_idle_secs_by_provider
+                .iter()
+                .flat_map(|providers| providers.keys()),
+        )
+        .chain(config.hosted.lease.iter())
+    {
+        check_text(value)?;
+    }
     Ok(())
 }
 
@@ -1804,6 +2068,7 @@ fn publish(staging: &Path, out: &Path, manifest: &PortableManifest) -> Result<Va
         "omitted_tables": manifest.omitted_tables,
         "omitted_rows": manifest.omitted_rows,
         "exclusions": manifest.exclusions,
+        "redacted_message_bodies": manifest.redacted_message_bodies,
     }))
 }
 
@@ -1852,7 +2117,7 @@ fn exclusions() -> Vec<String> {
         "authority: platform_credentials, platform_grants, platform_defaults, platform_drafts, platform_effects, app_grants, rollout_grants, rollout_leases, staging_grants, staging_instances, daemon_build, assistants, assist_requests, assist_stall_checks, assist_job_shares, job_subscribers (rows deleted from the private copy)",
         "live execution authority nulled: agents.generation, pid, pid_start, endpoint, thread_id, session_id, params; messages.turn_id; token-shaped values redacted by the existing scrub",
         "imported actors disabled: agents.enabled=0; monitors dispatch flags=0",
-        "provenance purged: connection_metadata (source UUID recorded in the manifest only), model_defaults",
+        "provenance purged: connection_metadata (source UUID recorded in the manifest only), model_defaults, settings_authority",
         "business app data outside the coordination profile: app_*, crm_*, social_publish_intents, cloud_dispatch_outbox, chat_files (rows deleted from the private copy; declared omitted, not a full workspace)",
         "local checkouts, process identity, sockets and runtime files: not included",
     ]

@@ -114,14 +114,14 @@ class Case(scope.Case):
         digest = "sha256:" + "e" * 64
         run_id = 12345
         result = {"issue": ISSUE, "project": self.project, "repo": REPO, "pr": 5,
-                  "head": HEAD, "base": BASE, "merge_base": "c" * 40,
+                  "head": HEAD, "base": BASE, "base_ref": self.base_ref, "merge_base": "c" * 40,
                   "policy_digest": digest,
                   "requirements": {"class": "routine", "reviews": 0, "review_kind": "none",
                                    "security_capable": False, "browser_qa": False,
                                    "operator_approval": False, "full_checks": False,
                                    "reasons": ["fixture: synthetic approved routine profile"],
                                    "policy_digest": digest, "activation": "active"},
-                  "readiness": ({"repo": REPO, "pr": 5, "head": HEAD, "base": BASE,
+                  "readiness": ({"repo": REPO, "pr": 5, "head": HEAD, "base": BASE, "base_ref": self.base_ref,
                                  "policy_digest": digest, "ci_run_id": run_id,
                                  "ci_run_url": CI_URL,
                                  "outcome_report": f"{ISSUE}/reports/worker-done.md"}
@@ -153,7 +153,7 @@ class Case(scope.Case):
         if self.rollup_flip_at is not None and self.view_calls >= self.rollup_flip_at:
             rollup = [{"name": "ci", "status": "COMPLETED", "conclusion": "FAILURE"}]
         view = {"number": 5, "state": "OPEN", "title": self.title, "headRefName": self.branch,
-                "headRefOid": HEAD, "baseRefName": "main", "baseRefOid": BASE,
+                "headRefOid": HEAD, "baseRefName": self.base_ref, "baseRefOid": BASE,
                 "mergeStateStatus": "CLEAN", "autoMergeRequest": None,
                 "author": {"login": "cc"}, "statusCheckRollup": rollup}
         if self.stale_at is not None and self.view_calls >= self.stale_at:
@@ -241,18 +241,31 @@ class EvidencePosting(unittest.TestCase):
     # ---- dry run -----------------------------------------------------------
 
     def test_dry_run_checks_everything_and_writes_nothing(self):
-        self.c.comments = [{"body": f"{HEAD} {NOTE}\nOperator approval id: {APPROVAL_ID}"}]
+        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}\nOperator approval id: {APPROVAL_ID}"}]
         rc, out, err = self.run_main("--dry-run")
         self.assertEqual(rc, 0, (out, err))
         self.assertIn("dry run", out)
         self.assertEqual(self.c.posted, [], "a tracker comment was written")
         self.assertEqual(self.c.merges, [], "a merge command ran")
 
+    def test_dry_run_accepts_native_authorized_integration_target_without_writes(self):
+        self.c.base_ref = "staging"
+        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: staging\nOperator approval id: {APPROVAL_ID}"}]
+        rc, out, err = self.run_main("--dry-run")
+        self.assertEqual(rc, 0, (out, err))
+        self.assertEqual(self.c.posted, [])
+        self.assertEqual(self.c.merges, [])
+
+    def test_dry_run_refuses_prefix_target_comment_at_the_same_base_oid(self):
+        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: main-staging\nOperator approval id: {APPROVAL_ID}"}]
+        rc, out, err = self.run_main("--dry-run")
+        self.assert_refused_clean(rc, err)
+
     def test_dry_run_requires_the_current_approval_id_in_the_comment(self):
         for approval_id in (None, "replaced-approval"):
             with self.subTest(approval_id=approval_id):
                 self.fresh()
-                body = f"{HEAD} {NOTE}"
+                body = f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}"
                 if approval_id is not None:
                     body += f"\nOperator approval id: {approval_id}"
                 self.c.comments = [{"body": body}]
@@ -260,7 +273,7 @@ class EvidencePosting(unittest.TestCase):
                 self.assertEqual(rc, 1, (out, err))
                 self.assert_refused_clean(rc, err)
         self.fresh()
-        self.c.comments = [{"body": f"{HEAD} {NOTE}\nOperator approval id: {APPROVAL_ID}"}]
+        self.c.comments = [{"body": f"{HEAD} {NOTE}\nBase branch: {self.c.base_ref}\nOperator approval id: {APPROVAL_ID}"}]
         rc, out, err = self.run_main("--dry-run")
         self.assertEqual(rc, 0, (out, err))
         self.assertEqual(self.c.posted, [])
@@ -380,7 +393,7 @@ class EvidencePosting(unittest.TestCase):
     # ---- staleness ---------------------------------------------------------
 
     def test_stale_head_or_base_before_the_post_writes_nothing(self):
-        for fields in ({"headRefOid": "c" * 40}, {"baseRefOid": "d" * 40},
+        for fields in ({"headRefOid": "c" * 40}, {"baseRefOid": "d" * 40}, {"baseRefName": "staging"},
                        {"state": "CLOSED"}, {"autoMergeRequest": {"enabledAt": "x"}}):
             with self.subTest(fields=fields):
                 self.fresh()
@@ -391,7 +404,7 @@ class EvidencePosting(unittest.TestCase):
 
     def test_stale_head_or_base_after_the_post_refuses_the_enqueue(self):
         # View 3+ is the full re-evaluation after the comment was written.
-        for fields in ({"headRefOid": "c" * 40}, {"baseRefOid": "d" * 40},
+        for fields in ({"headRefOid": "c" * 40}, {"baseRefOid": "d" * 40}, {"baseRefName": "staging"},
                        {"autoMergeRequest": {"enabledAt": "x"}}):
             with self.subTest(fields=fields):
                 self.fresh()
@@ -443,7 +456,7 @@ class EvidencePosting(unittest.TestCase):
 
     def test_evidence_body_with_no_counted_notes_fabricates_none(self):
         body = enq.evidence_body({"issue": ISSUE, "repo": REPO, "pr": 5, "head": HEAD,
-                                  "base": BASE, "ci_run": CI_URL, "checks": ["ci"],
+                                  "base": BASE, "base_ref": "main", "ci_run": CI_URL, "checks": ["ci"],
                                   "notes": [], "comments": []})
         self.assertIn(HEAD, body)
         self.assertIn(CI_URL, body)

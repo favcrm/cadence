@@ -966,14 +966,14 @@ pub fn card_json(ctx: &Ctx, view: &View) -> Value {
 /// `work` block.
 pub fn epics_json(
     pm_dir: &Path,
-    views: &[View],
+    views: &[&View],
     project_key: Option<&str>,
     now: i64,
     approvals: &Approvals,
 ) -> Vec<Value> {
     let by_id: HashMap<String, &View> = views
         .iter()
-        .map(|v| (v.issue.front.id.clone(), v))
+        .map(|v| (v.issue.front.id.clone(), *v))
         .collect();
     let ctx = Ctx::new(pm_dir, &by_id, now, approvals);
     views

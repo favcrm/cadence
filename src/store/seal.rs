@@ -68,9 +68,11 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// preferences, push devices and private intents. v48 (CAD-1420) adds only
 /// the three `assistants` bootstrap lifecycle columns on the binding row.
 /// v49 (CAD-914) adds wiki transfer job tables. v50 (CAD-1482) adds image
-/// lineage. None touch a sealed/witnessed surface, so the bound extends to 50.
+/// lineage. v51 (CAD-792) adds `app_run_artifact_fetches`, the worker
+/// dependency-fetch receipt. v52 (CAD-1548) adds `settings_authority`.
+/// None are latch or witness rows, so the bound extends to 52.
 #[allow(dead_code)]
-const PROTECTED_SCHEMA_MAX: i64 = 50;
+const PROTECTED_SCHEMA_MAX: i64 = 52;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -1473,6 +1475,26 @@ impl Store {
                     [], |row| row.get(0),
                 )?;
                 if lineage_tables != 1 {
+                    return Err(Error::rejected("owner witness database schema is unsupported"));
+                }
+            }
+            if *db_schema >= 51 {
+                let fetch_tables: i64 = wtx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='app_run_artifact_fetches'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if fetch_tables != 1 {
+                    return Err(Error::rejected("owner witness database schema is unsupported"));
+                }
+            }
+            if *db_schema >= 52 {
+                let settings_tables: i64 = wtx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='settings_authority'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if settings_tables != 1 {
                     return Err(Error::rejected("owner witness database schema is unsupported"));
                 }
             }

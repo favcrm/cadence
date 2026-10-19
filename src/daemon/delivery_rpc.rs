@@ -62,6 +62,7 @@ fn apply_routine_ready_observation(
         pr: evidence.pr,
         head: evidence.head.clone(),
         base: evidence.base.clone(),
+        base_ref: evidence.base_ref.clone(),
         policy_digest: evidence.policy_digest.clone(),
         ci_run_id: evidence.ci_run_id,
         ci_run_url: evidence.ci_run_url.clone(),
@@ -121,7 +122,64 @@ impl Shared {
     /// Open the loop's record for a ticket `master_dispatch` just sent
     /// to `worker`. A finished record is replaced; a live one is kept.
     pub(super) fn delivery_start(&self, id: &str, project: &str, worker: &str) -> Result<()> {
-        self.delivery_adopt(id, project, worker, now())
+        let dispatched_at = self
+            .store
+            .worker_issue_turn(id, worker)?
+            .map_or_else(now, |turn| turn.created.floor() as i64);
+        self.delivery_adopt(id, project, worker, dispatched_at)
+    }
+
+    pub(super) fn unattended_worker_complete(
+        &self,
+        issue: &str,
+        worker: &str,
+        marker: &mut Option<String>,
+        head: &str,
+    ) -> Result<bool> {
+        let turn = self.store.worker_issue_turn(issue, worker)?;
+        let turn = turn.ok_or_else(|| {
+            Error::invalid(
+            "unattended_completion_missing",
+            "the done report has no native owned worker turn; operator must inspect the dispatch",
+        )
+        })?;
+        match turn.state.as_str() {
+            "queued" | "running" => Ok(false),
+            "completed" if turn.sha.as_deref() == Some(head) => Ok(true),
+            "completed" => {
+                let error = Error::invalid(
+                    "unattended_completion_revision",
+                    format!(
+                        "worker turn {} completed without the done report's exact revision {head}; operator must inspect its durable result",
+                        turn.id
+                    ),
+                );
+                *marker = Some(turn.id);
+                Err(error)
+            }
+            "failed" => {
+                let error = Error::invalid(
+                    "unattended_completion_failed",
+                    format!(
+                        "worker turn {} definitively failed; inspect its durable failure, restore provider availability, resume the lane with `cadence agent resume {}` and explicitly start a new owned turn — do not relabel the failed result as completed",
+                        turn.id, worker
+                    ),
+                );
+                *marker = Some(turn.id);
+                Err(error)
+            }
+            _ => {
+                let error = Error::invalid(
+                    "unattended_completion_unresolved",
+                    format!(
+                        "worker turn {} is {}; reconcile its owned outcome before continuing, never replay it",
+                        turn.id, turn.state
+                    ),
+                );
+                *marker = Some(turn.id);
+                Err(error)
+            }
+        }
     }
 
     /// CAD-484: open the record for a lane the checkup adopted — the
@@ -153,6 +211,10 @@ impl Shared {
         if let Err(e) = self.settle_ticket_done() {
             tracing::warn!("delivery router, merged tickets: {e}");
         }
+        let _grant = self
+            .unattended_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         if all.values().all(|r| r.state.terminal()) {
@@ -195,8 +257,76 @@ impl Shared {
         held: &[(String, String)],
         hist: &[&Record],
     ) -> Result<bool> {
-        if rec.state.terminal() || rec.state == State::Escalated {
+        if rec.state.terminal() {
             return Ok(false);
+        }
+        if rec.state == State::Escalated
+            && (!rec.unattended_hold
+                || !matches!(
+                    self.unattended_authorization_for_issue(&rec.issue),
+                    Ok(Some(_))
+                ))
+        {
+            return Ok(false);
+        }
+        if rec.state == State::Escalated && rec.unattended_turn.is_some() {
+            // A recorded REVISE is not permission to replay its failed or
+            // unknown turn. Reconciliation may resume the existing report;
+            // a new revision needs its own fresh done report below.
+            if self
+                .store
+                .worker_issue_turn(&rec.issue, &rec.worker)?
+                .is_some_and(|turn| {
+                    turn.state == "completed"
+                        && turn.sha.is_some()
+                        && turn.sha.as_deref() == rec.head.as_deref()
+                })
+            {
+                self.start_review(pm, rec, hist)?;
+                return Ok(true);
+            }
+        }
+        if rec.state == State::Escalated && rec.unattended_turn.is_none() {
+            if let Some(verdict) = rec.verdict.as_ref().filter(|v| {
+                rec.head.as_deref() == Some(v.sha.as_str())
+                    && rec.reviewer.as_deref() == Some(v.reviewer.as_str())
+                    && v.reviewer != rec.worker
+            }) {
+                if verdict.verdict == "pass" && self.store.review_export_recorded(rec)? {
+                    rec.enter(State::Passed, now());
+                    rec.unattended_hold = false;
+                    rec.note = None;
+                    return Ok(true);
+                }
+                if verdict.verdict == "revise"
+                    && self.store.verdict_recorded(
+                        &rec.issue,
+                        "revise",
+                        &verdict.sha,
+                        &verdict.reviewer,
+                        &verdict.report,
+                    )?
+                {
+                    if rec.revisions >= delivery::MAX_REVISE {
+                        rec.note = Some(format!(
+                            "{} REVISE verdicts — the review did not converge; the operator decides",
+                            rec.revisions
+                        ));
+                    } else {
+                        self.queue_revision(rec, now())?;
+                        rec.note = None;
+                    }
+                    rec.unattended_hold = false;
+                    return Ok(true);
+                }
+            }
+            let note = rec.note.take();
+            if let Err(error) = self.start_review(pm, rec, hist) {
+                rec.unattended_hold = true;
+                rec.note = note;
+                return Err(error);
+            }
+            return Ok(rec.state != State::Escalated || !rec.unattended_hold || rec.note != note);
         }
         let dir = pm.dir.join(&rec.project).join(&rec.issue);
         let mut fresh: Vec<Value> = task_report::list(&dir, &rec.issue)
@@ -372,7 +502,7 @@ impl Shared {
     /// bounded `gh pr view`. `None` means the diff could not be sized
     /// (offline, the head moved mid-read): the review proceeds without
     /// a tier rather than blocking on a stat fetch.
-    fn review_stats(rec: &Record) -> Option<(u64, u64, u64)> {
+    fn review_stats(&self, rec: &Record) -> Option<(u64, u64, u64)> {
         let head = rec.head.as_deref()?;
         if let Some(o) = &rec.observed {
             if o.head == head {
@@ -381,7 +511,7 @@ impl Shared {
         }
         let pr = rec.pr.as_deref()?;
         let text = delivery::gh(
-            delivery::GH,
+            &self.delivery_gh.to_string_lossy(),
             &[
                 "pr",
                 "view",
@@ -412,9 +542,43 @@ impl Shared {
         let (Some(sha), Some(pr)) = (rec.head.clone(), rec.pr.clone()) else {
             return Ok(());
         };
-        // Activated routine work waits on verified CI without dispatching
-        // an unnecessary reviewer. Every retry recollects the authority.
-        if let Some(report) = rec.outcome_report.as_deref() {
+        rec.unattended_turn = None;
+        let unattended = match self.unattended_authorization_for_issue(&rec.issue) {
+            Ok(run) => run.is_some(),
+            Err(error) => {
+                rec.enter(State::Escalated, now());
+                rec.unattended_hold = true;
+                rec.note = Some(format!("Automatic review held: {error}"));
+                return Ok(());
+            }
+        };
+        if rec.unattended_hold {
+            rec.unattended_hold = false;
+            rec.note = None;
+        }
+        if unattended {
+            match self.unattended_worker_complete(
+                &rec.issue,
+                &rec.worker,
+                &mut rec.unattended_turn,
+                &sha,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    rec.enter(State::Working, now());
+                    return Ok(());
+                }
+                Err(error) => {
+                    rec.enter(State::Escalated, now());
+                    rec.unattended_hold = true;
+                    rec.note = Some(format!("Correlated completion held: {error}"));
+                    return Ok(());
+                }
+            }
+        }
+        // Ordinary routine work retains its lean readiness path. A workflow
+        // grant requires independent QA even when the diff is routine.
+        if let Some(report) = rec.outcome_report.as_deref().filter(|_| !unattended) {
             match delivery_requirements_rpc::routine_readiness(self, &rec.issue, &pr, &sha, report)
                 .unwrap_or(RoutineReadiness::NotRoutine)
             {
@@ -424,6 +588,7 @@ impl Shared {
                         pr: evidence.pr,
                         head: evidence.head.clone(),
                         base: evidence.base.clone(),
+                        base_ref: evidence.base_ref.clone(),
                         policy_digest: evidence.policy_digest.clone(),
                         ci_run_id: evidence.ci_run_id,
                         ci_run_url: evidence.ci_run_url.clone(),
@@ -451,7 +616,8 @@ impl Shared {
         // Risk is measured once per head — `on_done`/`review_moved_head`
         // clear it when the head moves.
         if rec.risk.is_none() {
-            rec.risk = Self::review_stats(rec)
+            rec.risk = self
+                .review_stats(rec)
                 .map(|(files, adds, dels)| delivery::risk_class(adds, dels, files).as_str())
                 .map(str::to_string);
         }
@@ -542,6 +708,11 @@ impl Shared {
         let items = issue::parse::acceptance_items(&ticket.body);
         let listing = issue::dispatch::acceptance_listing(&items);
         let round = rec.rounds + 1;
+        let risk_note = if unattended {
+            "\n\nUnattended grant: include `risk: auto` in the verdict frontmatter only if this exact head needs no sensitive/operator-only treatment. The path list is a floor: declare human/unknown risk for auth, identity, secrets or other consequential uncertainty; never label those auto."
+        } else {
+            ""
+        };
         let mut text = delivery::review_kickoff(
             &rec.issue,
             round,
@@ -551,11 +722,13 @@ impl Shared {
             rec.risk.as_deref(),
             listing.as_deref(),
             &ticket.dir.join("issue.md"),
-            store::kickoff_ceiling(&agent.provider, &agent.endpoint_kind),
+            store::kickoff_ceiling(&agent.provider, &agent.endpoint_kind)
+                .saturating_sub(risk_note.len()),
         );
         if profile_review {
             text.push_str("\n\nRequired coverage: one combined Standards + Spec/security review of this exact PR head. Address both axes explicitly in the review.");
         }
+        text.push_str(risk_note);
         let mid = format!("review-{}", hash(&format!("{}/{sha}/{round}", rec.issue)));
         self.send_as(
             &json!({"alias": reviewer, "text": text, "message": mid, "source": "review"}),
@@ -595,6 +768,27 @@ impl Shared {
         Ok(())
     }
 
+    /// Queue the recorded revision with its stable correlation id. A router
+    /// retry after renewal/restart can never create a second revision turn.
+    fn queue_revision(self: &Arc<Self>, rec: &mut Record, at: i64) -> Result<()> {
+        let verdict = rec
+            .verdict
+            .as_ref()
+            .ok_or_else(|| Error::rejected("a revision needs its recorded independent verdict"))?;
+        let text = delivery::revise_message(
+            &rec.issue,
+            &verdict.reviewer,
+            &verdict.sha,
+            rec.revisions,
+            &verdict.report,
+            &verdict.summary,
+            rec.pr.as_deref().unwrap_or_default(),
+        );
+        self.send_issue_followup(rec, &format!("revise-{}", hash(&verdict.report)), &text)?;
+        rec.enter(State::Working, at);
+        Ok(())
+    }
+
     /// `report_verdict` — the reviewer's PASS/REVISE on the head under
     /// review. The caller is derived from the connection (never a field
     /// or `CADENCE_ALIAS`) and must be the assigned reviewer: not the
@@ -629,6 +823,10 @@ impl Shared {
             .front
             .verdict
             .ok_or_else(|| Error::rejected("a verdict names pass or revise"))?;
+        let _grant = self
+            .unattended_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
@@ -656,6 +854,15 @@ impl Shared {
                  review {head} and file the verdict for it"
             )));
         }
+        let authorization = self.unattended_authorization_for_issue(id);
+        if matches!(&authorization, Ok(Some(_)))
+            && verdict == task_report::Verdict::Pass
+            && prepared.front.risk.is_none()
+        {
+            return Err(Error::rejected(
+                "an unattended PASS needs an explicit verdict-frontmatter risk declaration",
+            ));
+        }
         let filed = task_report::store(&pm, &prepared, &who)?;
         let at = now();
         let summary = task_report::summary_line(prepared.body(), delivery::SUMMARY_MAX);
@@ -668,12 +875,24 @@ impl Shared {
             report: report.clone(),
             at,
         });
-        let comment = match verdict {
-            task_report::Verdict::Pass => {
+        let comment = match (authorization, verdict) {
+            (Err(error), _) => {
+                if matches!(verdict, task_report::Verdict::Revise) {
+                    rec.revisions += 1;
+                }
+                rec.enter(State::Escalated, at);
+                rec.unattended_hold = true;
+                rec.note = Some(format!("Automatic continuation held: {error}"));
+                format!(
+                    "{} by {who} at {sha}: {summary} — held for workflow authorization",
+                    verdict.as_str()
+                )
+            }
+            (Ok(_), task_report::Verdict::Pass) => {
                 rec.enter(State::Passed, at);
                 format!("PASS by {who} at {sha}: {summary}")
             }
-            task_report::Verdict::Revise => {
+            (Ok(_), task_report::Verdict::Revise) => {
                 rec.revisions += 1;
                 if rec.revisions >= delivery::MAX_REVISE {
                     rec.enter(State::Escalated, at);
@@ -688,22 +907,7 @@ impl Shared {
                         delivery::MAX_REVISE
                     )
                 } else {
-                    let msg = delivery::revise_message(
-                        id,
-                        &who,
-                        &sha,
-                        rec.revisions,
-                        &report,
-                        &summary,
-                        rec.pr.as_deref().unwrap_or_default(),
-                    );
-                    self.send_as(
-                        &json!({"alias": rec.worker, "text": msg,
-                                "message": format!("revise-{}", hash(&report)),
-                                "source": "review"}),
-                        &|_| Ok(store::Sender::Unattributed),
-                    )?;
-                    rec.enter(State::Working, at);
+                    self.queue_revision(rec, at)?;
                     format!(
                         "REVISE {} of {} by {who} at {sha}: {summary} — back to {}",
                         rec.revisions,
@@ -716,6 +920,7 @@ impl Shared {
         let review_receipt = json!({
             "issue": id, "verdict": verdict.as_str(), "sha": sha, "reviewer": who,
             "report": report, "pr": rec.pr, "project": rec.project, "worker": rec.worker,
+            "risk": prepared.front.risk,
         });
         let out = rec.to_json();
         delivery::save(&self.state_dir, &all)?;
@@ -837,6 +1042,10 @@ impl Shared {
             read_at: params["read_at"].as_i64().unwrap_or_else(now),
         };
         let pm = self.pm()?;
+        let grant_guard = self
+            .unattended_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let guard = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         // CAD-362: pair-precision history for any re-route below.
@@ -914,7 +1123,24 @@ impl Shared {
                 }
             }
         }
-        // Auto-merge remains on only for the freshly bound enqueued head.
+        let (unattended_authorized, unattended_refusal) =
+            match self.try_unattended_enqueue(&pm, rec) {
+                Ok(authorized) => (authorized, None),
+                Err(error) => {
+                    let reason = error.to_string();
+                    if !rec.unattended_hold || rec.note.as_deref() != Some(reason.as_str()) {
+                        self.store.event_public(
+                            store::APPROVAL_STREAM,
+                            "unattended_landing_held",
+                            json!({"issue": id, "head": rec.head, "reason": reason}),
+                        )?;
+                    }
+                    rec.unattended_hold = true;
+                    rec.note = Some(reason.clone());
+                    (false, Some(reason))
+                }
+            };
+        // Preserve an authorized pending request without calling it Enqueued.
         let routine_approved = rec.state == State::Enqueued
             && rec
                 .ready_evidence
@@ -931,8 +1157,9 @@ impl Shared {
                         && e.outcome_report == b.outcome_report
                         && e.head == head
                 });
-        let approved = rec.state == State::Enqueued
-            && (rec.passed_sha() == Some(head.as_str()) || routine_approved);
+        let approved = (rec.state == State::Enqueued
+            && (rec.passed_sha() == Some(head.as_str()) || routine_approved))
+            || (unattended_authorized && rec.passed_sha() == Some(head.as_str()));
         rec.disable_auto = rec.observed.as_ref().is_some_and(|o| o.auto_merge)
             && !approved
             && rec.state != State::Merged;
@@ -945,6 +1172,9 @@ impl Shared {
             "issue": id, "state": rec.state.as_str(), "was": before.as_str(),
             "disable_auto": rec.disable_auto, "merge_ready": rec.merge_ready(),
         });
+        if let Some(reason) = unattended_refusal {
+            out["unattended_refusal"] = json!(reason);
+        }
         // CAD-449: only the transition into `merged` settles the ticket's
         // status. The record's `merged` is the once-guard: a replay, a
         // second sync or a ticket reopened after its merge finds it
@@ -967,6 +1197,7 @@ impl Shared {
         let ended = (before != rec.state).then(|| rec.clone());
         delivery::save(&self.state_dir, &all)?;
         drop(guard);
+        drop(grant_guard);
         // The wake first: it releases `wake_lock`, which a comment waiting
         // on the tracker lock must not hold.
         if let Some(rec) = ended {
@@ -979,7 +1210,10 @@ impl Shared {
         // just ended is terminal, never merge-ready, so the two wakes
         // cannot fire together. The key comes from the saved record
         // alone, so concurrent observers converge on it.
-        if let Some(ready) = all.get(id).filter(|r| r.merge_ready()) {
+        if let Some(ready) = all
+            .get(id)
+            .filter(|r| r.merge_ready() && r.state != State::Enqueued && !r.unattended_hold)
+        {
             self.wake_on_merge_ready(ready);
         }
         self.post_notices(&pm, notices);
@@ -998,6 +1232,10 @@ impl Shared {
     /// becomes `kept` once the
     /// operator set the status by hand. Answers how many records moved.
     pub(super) fn settle_ticket_done(&self) -> Result<usize> {
+        let _grant = self
+            .unattended_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let (moved, notices, pm) = {
             let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
             let mut all = delivery::load(&self.state_dir)?;
@@ -1056,6 +1294,25 @@ impl Shared {
                             continue;
                         }
                         let head = rec.observed.as_ref().map(|o| o.head.clone());
+                        let refusal = match self
+                            .unattended_merge_done_refusal(rec, head.as_deref().unwrap_or_default())
+                        {
+                            Ok(refusal) => refusal,
+                            Err(error) => Some(format!(
+                                "the unattended merge could not be checked: {error}"
+                            )),
+                        };
+                        if let Some(why) = refusal {
+                            notices.push(Notice {
+                                issue: id.clone(),
+                                comment: None,
+                                kind: "ticket_done_refused",
+                                payload: json!({"issue": id, "why": why}),
+                            });
+                            rec.ticket_done = Some(TicketDone::Refused { why });
+                            moved += 1;
+                            continue;
+                        }
                         let mut mine = Vec::new();
                         let mut next = self.mark_ticket_done(
                             &pm,
@@ -1208,7 +1465,39 @@ impl Shared {
         let pr_ref = rec_pr_ref(rec);
         let actor = format!("operator (delivery {pr_ref})");
         let why = format!("{pr_ref} merged at {head}");
-        match issue::write::mark_done_on_merge(pm, id, &why, &actor, expect) {
+        let lock = pm.try_lock().and_then(|lock| {
+            lock.ok_or_else(|| {
+                Error::rejected("the tracker is locked by another writer (write lock)")
+            })
+        });
+        let result = match lock {
+            Ok(tracker) => {
+                // Remote collection has finished. Grant→delivery→tracker:
+                // revalidate locally inside the actual status-write snapshot.
+                let authority = self.unattended_authorization_for_issue(id).and_then(|run| {
+                    if run.is_some_and(|run| now() as f64 >= run.expires_at) {
+                        Err(Error::rejected("the bound grant expired before settlement"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(error) = authority {
+                    let why = format!(
+                        "unattended postmerge verification held: {error}; operator verification is required"
+                    );
+                    notices.push(Notice {
+                        issue: id.clone(),
+                        comment: None,
+                        kind: "ticket_done_refused",
+                        payload: json!({"issue": id, "why": why}),
+                    });
+                    return TicketDone::Refused { why };
+                }
+                issue::write::mark_done_on_merge_locked(pm, &tracker, id, &why, &actor, expect)
+            }
+            Err(error) => Err(issue::write::DoneWriteFailure { error, from: None }),
+        };
+        match result {
             Ok(None) => {
                 notices.push(Notice {
                     issue: id.clone(),
@@ -1334,6 +1623,9 @@ impl Shared {
                 v.reviewer, v.report
             )));
         }
+        if let Some(why) = self.unattended_merge_done_refusal(rec, head)? {
+            return Ok(Some(why));
+        }
         Ok(None)
     }
 
@@ -1390,6 +1682,21 @@ impl Shared {
                         "{id} is not ready to merge: {why}"
                     )));
                 }
+                // CAD-1561: the retained check/enqueued phases share the
+                // requirements classifier's authoritative current-target
+                // admission — a standing PASS on a base that is neither
+                // the repository default nor the approved
+                // `integration_branch` refuses here exactly as
+                // `delivery_approve` refuses it.
+                delivery_requirements_rpc::classify(
+                    self,
+                    &json!({"issue": id, "pr": pr, "head": sha}),
+                )
+                .map_err(|_| {
+                    Error::rejected(
+                        "current profile requirements could not be verified; the merge was not enqueued",
+                    )
+                })?;
                 if phase == "check" {
                     return Ok(json!({"issue": id, "sha": sha, "pr": pr}));
                 }
@@ -1399,6 +1706,7 @@ impl Shared {
                     )));
                 }
                 rec.enter(State::Enqueued, now());
+                rec.unattended_hold = false;
                 let out = rec.to_json();
                 delivery::save(&self.state_dir, &all)?;
                 if let Ok(pm) = self.pm() {
@@ -1527,6 +1835,7 @@ impl Shared {
                         pr: evidence.pr,
                         head: evidence.head.clone(),
                         base: evidence.base.clone(),
+                        base_ref: evidence.base_ref.clone(),
                         policy_digest: evidence.policy_digest.clone(),
                         ci_run_id: evidence.ci_run_id,
                         ci_run_url: evidence.ci_run_url.clone(),
@@ -1560,27 +1869,25 @@ impl Shared {
             }
         }
         if !routine {
-            let pm = self.pm()?;
-            let approved = self.store.work_approvals()?;
-            let effective = crate::issue::delivery_policy::effective(
-                &rec.project,
-                crate::issue::delivery_policy::load(&pm.dir, &rec.project),
-                approved
-                    .get(&rec.project)
-                    .and_then(crate::issue::delivery_policy::approved_from)
-                    .as_ref(),
-            );
-            if crate::issue::delivery_requirements::activation_of(&effective)
-                == crate::issue::delivery_requirements::Activation::Active
-            {
-                let request = json!({"issue": id, "pr": pr_url, "head": live});
-                let current = delivery_requirements_rpc::classify(self, &request)
-                    .map_err(|_| Error::rejected("current profile requirements could not be verified; no merge was approved"))?;
-                let requirements = &current["requirements"];
-                if requirements["activation"] != "active"
-                    || requirements["reviews"]
-                        .as_u64()
-                        .is_none_or(|count| count > 1)
+            // CAD-1561: the requirements classifier is the authoritative
+            // admission of the CURRENT target under the CURRENT approved
+            // policy. It runs for EVERY activation here — an
+            // unapproved/removed/malformed policy or a base that is
+            // neither the repository default nor the approved
+            // `integration_branch` refuses even when no profile floor
+            // applies — before the approval is recorded and before `gh`
+            // enqueues.
+            let request = json!({"issue": id, "pr": pr_url, "head": live});
+            let current = delivery_requirements_rpc::classify(self, &request).map_err(|_| {
+                Error::rejected(
+                    "current profile requirements could not be verified; no merge was approved",
+                )
+            })?;
+            let requirements = &current["requirements"];
+            if requirements["activation"] == "active" {
+                if requirements["reviews"]
+                    .as_u64()
+                    .is_none_or(|count| count > 1)
                     || requirements["browser_qa"] == true
                 {
                     return Err(Error::rejected(
@@ -1591,27 +1898,35 @@ impl Shared {
                     let base = current["base"].as_str().ok_or_else(|| {
                         Error::rejected("current profile requirements have no base SHA")
                     })?;
-                    if !delivery_requirements_rpc::full_ci_green(self, &slug, number, &live, base)
-                        .map_err(|_| Error::rejected("current full CI requirements could not be verified; no merge was approved"))?
+                    let base_ref = current["base_ref"].as_str().ok_or_else(|| {
+                        Error::rejected("current profile requirements have no base branch name")
+                    })?;
+                    if !delivery_requirements_rpc::full_ci_green(self, &slug, number, &live, base, base_ref, false)
+                        .map_err(|_| Error::rejected("current required checks or canonical ci.yml run could not be verified; no merge was approved"))?
                     {
                         return Err(Error::rejected("current required checks or canonical ci.yml run are not green; no merge was approved"));
                     }
                 }
-                let confirmed =
-                    delivery_requirements_rpc::classify(self, &request).map_err(|_| {
-                        Error::rejected(
-                            "profile requirements changed during approval; no merge was approved",
-                        )
-                    })?;
-                if confirmed["head"] != current["head"]
-                    || confirmed["base"] != current["base"]
-                    || confirmed["policy_digest"] != current["policy_digest"]
-                    || confirmed["requirements"] != current["requirements"]
-                {
-                    return Err(Error::rejected(
-                        "profile requirements changed during approval; no merge was approved",
-                    ));
-                }
+            }
+            // Freshness through the side effects below: the same
+            // classification is re-collected and every admission input —
+            // head, base commit, base branch, policy digest,
+            // requirements — must be identical, so a target or policy
+            // that changed while the floors ran still refuses.
+            let confirmed = delivery_requirements_rpc::classify(self, &request).map_err(|_| {
+                Error::rejected(
+                    "profile requirements changed during approval; no merge was approved",
+                )
+            })?;
+            if confirmed["head"] != current["head"]
+                || confirmed["base"] != current["base"]
+                || confirmed["base_ref"] != current["base_ref"]
+                || confirmed["policy_digest"] != current["policy_digest"]
+                || confirmed["requirements"] != current["requirements"]
+            {
+                return Err(Error::rejected(
+                    "profile requirements changed during approval; no merge was approved",
+                ));
             }
         }
         if !rec.merge_ready() {
@@ -1668,6 +1983,7 @@ impl Shared {
             )));
         }
         rec.enter(State::Enqueued, now());
+        rec.unattended_hold = false;
         let mut out = rec.to_json();
         out["approval_id"] = serde_json::json!(approval_id);
         out["approved_by"] = serde_json::json!(actor);
@@ -1729,6 +2045,7 @@ impl Shared {
         rec.note = Some(reason.to_string());
         rec.declined_by = Some(actor.clone());
         rec.enter(State::Declined, now());
+        rec.unattended_hold = false;
         let out = rec.to_json();
         let ended = rec.clone();
         delivery::save(&self.state_dir, &all)?;

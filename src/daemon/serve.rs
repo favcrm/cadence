@@ -602,9 +602,7 @@ pub(super) fn hosted_config(opts: &ServeOptions) -> Result<crate::lease::Hosted>
         Some(dir) if !dir.is_empty() => crate::home::guard_tracker(PathBuf::from(dir))?,
         _ => crate::issue::default_dir()?,
     };
-    crate::doctor::host::read_hosted_overrides(&pm_dir)
-        .map(|o| o.unwrap_or_default())
-        .map_err(Error::internal)
+    crate::lease::read_hosted(&pm_dir).map(|o| o.unwrap_or_default())
 }
 
 /// The SIGTERM flush bound — the held lease's `flush_timeout`, else

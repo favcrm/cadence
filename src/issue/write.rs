@@ -464,6 +464,27 @@ pub fn set_acceptance(pm: &Pm, id: &str, source: &Path, actor: &str) -> Result<V
     Ok(out)
 }
 
+/// `<key>/` inside the PM dir, refusing a symlinked project directory: a
+/// tracker edit must never land outside it.
+fn project_dir(pm: &Pm, key: &str) -> Result<PathBuf> {
+    let dir = pm.dir.join(key);
+    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{key}/ is a symlink — refusing to write outside the PM dir"
+        )));
+    }
+    Ok(dir)
+}
+
+/// Serialize `project` to `path` — the one place a project record is
+/// written, so `project add` and a policy write produce the same file.
+fn write_project_yaml(path: &Path, project: &project::Project) -> Result<()> {
+    let yaml = serde_yaml::to_string(project)
+        .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
+    std::fs::write(path, yaml)?;
+    Ok(())
+}
+
 /// `project add` — create `<pm>/<key>/project.yaml`.
 #[allow(clippy::too_many_arguments)]
 pub fn project_add(
@@ -514,6 +535,7 @@ pub fn project_add(
         repo_entries.push(project::Repo {
             path: Some(repo.clone()),
             remote,
+            base: None,
         });
     }
     let project = project::Project {
@@ -526,18 +548,17 @@ pub fn project_add(
         build: None,
         memory: None,
         intake: None,
+        // AOS-274: identity is minted once, and every project records an
+        // explicit policy. Only workspace-visible is written until the
+        // isolation gate passes.
+        id: Some(project::new_id()),
+        policy: Some(project::ProjectPolicy::workspace_visible()),
     };
-    let dir = pm.dir.join(key);
-    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-        return Err(Error::rejected(format!(
-            "{key}/ is a symlink — refusing to write outside the PM dir"
-        )));
-    }
+    let dir = project_dir(pm, key)?;
     std::fs::create_dir_all(&dir)?;
-    let yaml = serde_yaml::to_string(&project)
-        .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
     let yaml_path = dir.join("project.yaml");
-    std::fs::write(&yaml_path, yaml)?;
+    let prev = file_preimage(&yaml_path);
+    write_project_yaml(&yaml_path, &project)?;
     let foreign = match commit_scoped(
         pm,
         &lock,
@@ -548,12 +569,84 @@ pub fn project_add(
     ) {
         Ok(f) => f,
         Err(e) => {
-            let _ = std::fs::remove_file(&yaml_path);
+            restore_preimage(&yaml_path, prev);
             return Err(e);
         }
     };
     let mut out = json!({"project": key, "prefix": project.prefix,
               "path": dir, "committed": true});
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
+}
+
+/// Replace a project's recorded access policy (AOS-274).
+///
+/// Takes the tracker lock, re-reads the project, keeps its identity, bumps
+/// the policy version and commits `project.yaml` only. `Private` is refused
+/// until the isolation gate passes — `workspace-visible` is the only
+/// visibility this build may record.
+pub fn set_project_policy(
+    pm: &Pm,
+    key: &str,
+    visibility: project::Visibility,
+    members: &[String],
+    actor: &str,
+) -> Result<Value> {
+    // Validate before any join. A remote key is caller input; `../…` or a
+    // slash must never become a path outside the tracker.
+    let key = crate::issue::model::check_key(key)?;
+    if visibility == project::Visibility::Private {
+        return Err(Error::rejected(
+            "private projects are not available yet — the isolation gate has not passed; \
+             only workspace-visible can be recorded",
+        ));
+    }
+    let dir = project_dir(pm, &key)?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
+    let yaml_path = dir.join("project.yaml");
+    if !crate::issue::board::is_real_file(&yaml_path) {
+        return Err(Error::rejected(format!(
+            "no project '{key}' — register it with `cadence issue project add`"
+        )));
+    }
+    let mut project = project::load(&yaml_path)?;
+    let grants = members
+        .iter()
+        .map(|member| project::Grant::parse(member))
+        .collect::<Result<Vec<_>>>()?;
+    let mut policy = project.policy.clone().unwrap_or_default();
+    policy.version = policy.version.saturating_add(1);
+    policy.visibility = visibility;
+    policy.members = grants;
+    project.policy = Some(policy.clone());
+    if project.id.is_none() {
+        project.id = Some(project::new_id());
+    }
+    let prev = file_preimage(&yaml_path);
+    write_project_yaml(&yaml_path, &project)?;
+    let foreign = match commit_scoped(
+        pm,
+        &lock,
+        std::slice::from_ref(&yaml_path),
+        &format!("project {key} policy version {}", policy.version),
+        &[],
+        actor,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            // A refused commit leaves the record exactly as it was — the
+            // rule every other write in this module follows, and the one
+            // this verb was missing.
+            restore_preimage(&yaml_path, prev);
+            return Err(e);
+        }
+    };
+    let mut out = json!({
+        "project": key,
+        "policy": serde_json::to_value(&policy)
+            .map_err(|e| Error::internal(format!("policy: {e}")))?,
+        "committed": true,
+    });
     attach_foreign(&mut out, &foreign);
     Ok(out)
 }
@@ -720,6 +813,10 @@ pub fn create_plan(
     doc: &crate::issue::plan::PlanDoc,
     workflow: Option<&str>,
     actor: &str,
+    // CAD-225: ids a durable unattended intent reserved but never wrote
+    // (a crashed admission). Read under the lock so ordinary creation
+    // can never land on a reserved id — the intent stays reconcilable.
+    avoid: &dyn Fn() -> Result<HashSet<String>>,
 ) -> Result<Value> {
     use crate::issue::plan::Dep;
     let project = project::list(&pm.dir)?
@@ -733,10 +830,24 @@ pub fn create_plan(
     let proposer = actor_who(actor, None);
     let root = pm.dir.join(&project.key);
     let lock = pm.lock_for_paths(std::slice::from_ref(&root))?;
+    let avoid = avoid()?;
     let first = next_id(&root, &project.prefix)?;
-    let id_at = |n: u64| format!("{}-{}", project.prefix, first + n);
-    let epic = id_at(0);
-    let ids: Vec<String> = (0..=doc.tickets.len() as u64).map(id_at).collect();
+    let mut ids: Vec<String> = (0..=doc.tickets.len() as u64)
+        .map(|n| format!("{}-{}", project.prefix, first + n))
+        .collect();
+    // A reserved id skips the whole contiguous block, never packs it.
+    for offset in 1..=(avoid.len() + ids.len() + 2) as u64 {
+        if !ids.iter().any(|id| avoid.contains(id)) {
+            break;
+        }
+        ids = (0..=doc.tickets.len() as u64)
+            .map(|n| format!("{}-{}", project.prefix, first + offset + n))
+            .collect();
+    }
+    if ids.iter().any(|id| avoid.contains(id)) {
+        return Err(Error::internal("could not allocate unreserved ticket ids"));
+    }
+    let epic = ids[0].clone();
     let now = time::iso(time::now_epoch());
 
     let mut epic_front = Front::new(&epic, &doc.title, &now);
@@ -836,6 +947,377 @@ pub fn create_plan(
         "proposed_by": proposer,
         "tickets": ids[1..],
         "committed": true,
+    });
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
+}
+
+/// CAD-225: the canonical original semantics an unattended grant binds
+/// — everything the authorized work IS, nothing about how it is going.
+/// Runtime state (`status`, `claim`, `stage`, timestamps, `created`,
+/// `refs`, tags, advisory `paths`) is deliberately absent: a ticket
+/// moving `ready` → `doing` is still the same work; a changed title,
+/// body, owner, size, dependency or plan membership is not.
+pub(crate) fn granted_semantics(front: &Front, body: &str) -> String {
+    #[derive(serde::Serialize)]
+    struct CanonicalPlan<'a> {
+        state: &'a str,
+        proposed_by: &'a str,
+        decided_by: Option<&'a str>,
+        workflow: Option<&'a str>,
+        tickets: &'a [String],
+        reason: Option<&'a str>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct CanonicalIssue<'a> {
+        id: &'a str,
+        title: &'a str,
+        priority: &'a str,
+        owner: Option<&'a str>,
+        size: Option<&'a str>,
+        parent: Option<&'a str>,
+        plan_epic: Option<&'a str>,
+        item_type: Option<&'a str>,
+        blocked_by: Vec<&'a str>,
+        plan: Option<CanonicalPlan<'a>>,
+        body: &'a str,
+    }
+
+    let mut blocked_by: Vec<&str> = front.blocked_by.iter().map(String::as_str).collect();
+    blocked_by.sort_unstable();
+    let canonical = CanonicalIssue {
+        id: &front.id,
+        title: &front.title,
+        priority: &front.priority,
+        owner: front.owner.as_deref(),
+        size: front.size.as_deref(),
+        parent: front.parent.as_deref(),
+        plan_epic: front.plan_epic.as_deref(),
+        item_type: front.item_type.as_deref(),
+        blocked_by,
+        plan: front.plan.as_ref().map(|plan| CanonicalPlan {
+            state: &plan.state,
+            proposed_by: &plan.proposed_by,
+            decided_by: plan.decided_by.as_deref(),
+            workflow: plan.workflow.as_deref(),
+            tickets: &plan.tickets,
+            reason: plan.reason.as_deref(),
+        }),
+        body,
+    };
+    serde_json::to_string(&canonical)
+        .expect("canonical semantic strings, slices and options serialize without failure")
+}
+
+/// The reserved ids and canonical semantics of a grant admission,
+/// computed under the PM lock before any tracker file exists — the
+/// daemon records them as the durable intent inside the same lock.
+pub(crate) struct GrantedPreview {
+    pub epic: String,
+    pub tickets: Vec<String>,
+    /// Canonical semantics per issue id — [`granted_semantics`].
+    pub semantics: std::collections::BTreeMap<String, String>,
+}
+
+/// CAD-225 unattended admission: the grant-bound plan materializes
+/// `approved` with `ready` tickets in ONE tracker commit, decided by the
+/// workflow grant (`decided_by`), never a fabricated operator decision.
+///
+/// `fixed` re-creates the exact `Some((epic, tickets))` ids a recorded
+/// intent reserved — the recovery path. `expected_semantics` is the
+/// intent's canonical map; a rebuild that no longer matches refuses
+/// before anything is written.
+///
+/// `on_intent` runs under the PM lock, after the reserved ids and
+/// canonical semantics are computed and the disk is proven free of the
+/// binding, but before any folder is created — the durable intent is
+/// on record before any tracker mutation. It is skipped on the pure
+/// readback path (existing files already identical).
+///
+/// Disk classification with `fixed` ids: all absent → write (or, with
+/// `allow_write` false, `unattended_missing`); all present and
+/// semantically identical → return the existing run (`reused`), a
+/// second plan is never allocated; anything else → `unattended_diverged`,
+/// the caller marks the intent held.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_granted_plan(
+    pm: &Pm,
+    project_key: &str,
+    doc: &crate::issue::plan::PlanDoc,
+    workflow: Option<&str>,
+    actor: &str,
+    decided_by: &str,
+    fixed: Option<(&str, &[String])>,
+    expected_semantics: Option<&std::collections::BTreeMap<String, String>>,
+    allow_write: bool,
+    avoid: &dyn Fn() -> Result<HashSet<String>>,
+    on_intent: &mut dyn FnMut(&GrantedPreview) -> Result<()>,
+) -> Result<Value> {
+    use crate::issue::plan::Dep;
+    let project = project::list(&pm.dir)?
+        .into_iter()
+        .find(|p| p.key == project_key)
+        .ok_or_else(|| {
+            Error::rejected(format!(
+                "Unknown project '{project_key}' — `cadence issue project ls` lists them"
+            ))
+        })?;
+    let proposer = actor_who(actor, None);
+    let root = pm.dir.join(&project.key);
+    let lock = pm.lock_for_paths(std::slice::from_ref(&root))?;
+    let ids: Vec<String> = match fixed {
+        Some((epic, tickets)) => {
+            if tickets.len() != doc.tickets.len() {
+                return Err(Error::invalid(
+                    "unattended_diverged",
+                    format!(
+                        "the recorded intent binds {} tickets but the render has {}",
+                        tickets.len(),
+                        doc.tickets.len()
+                    ),
+                ));
+            }
+            let mut seen = HashSet::new();
+            for id in std::iter::once(epic).chain(tickets.iter().map(String::as_str)) {
+                model::check_id(id)?;
+                if !id.starts_with(&format!("{}-", project.prefix)) {
+                    return Err(Error::invalid(
+                        "unattended_diverged",
+                        format!("reserved id '{id}' does not belong to {project_key}"),
+                    ));
+                }
+                if !seen.insert(id.to_string()) {
+                    return Err(Error::invalid(
+                        "unattended_diverged",
+                        format!("reserved id '{id}' is bound twice"),
+                    ));
+                }
+            }
+            std::iter::once(epic.to_string())
+                .chain(tickets.iter().cloned())
+                .collect()
+        }
+        None => {
+            let avoid = avoid()?;
+            let first = next_id(&root, &project.prefix)?;
+            let mut ids: Vec<String> = (0..=doc.tickets.len() as u64)
+                .map(|n| format!("{}-{}", project.prefix, first + n))
+                .collect();
+            for offset in 1..=(avoid.len() + ids.len() + 2) as u64 {
+                if !ids.iter().any(|id| avoid.contains(id)) {
+                    break;
+                }
+                ids = (0..=doc.tickets.len() as u64)
+                    .map(|n| format!("{}-{}", project.prefix, first + offset + n))
+                    .collect();
+            }
+            if ids.iter().any(|id| avoid.contains(id)) {
+                return Err(Error::internal("could not allocate unreserved ticket ids"));
+            }
+            ids
+        }
+    };
+    let epic = ids[0].clone();
+    let now = time::iso(time::now_epoch());
+
+    let mut epic_front = Front::new(&epic, &doc.title, &now);
+    epic_front.plan = Some(model::Plan {
+        state: "approved".to_string(),
+        proposed_by: proposer.clone(),
+        proposed_at: now.clone(),
+        decided_by: Some(decided_by.to_string()),
+        decided_at: Some(now.clone()),
+        reason: None,
+        workflow: workflow.map(str::to_string),
+        tickets: ids[1..].to_vec(),
+    });
+    epic_front.item_type = Some("epic".to_string());
+    let mut epic_body = format!("{}\n\n## Goal\n\n{}\n", doc.title, doc.goal);
+    if !doc.non_goals.is_empty() {
+        epic_body.push_str("\n## Non-goals\n\n");
+        for g in &doc.non_goals {
+            epic_body.push_str(&format!("- {g}\n"));
+        }
+    }
+    if !doc.intro.is_empty() {
+        epic_body.push_str(&format!("\n## Plan\n\n{}\n", doc.intro));
+    }
+    let mut files: Vec<(PathBuf, Front, String)> = vec![(root.join(&epic), epic_front, epic_body)];
+    for (n, ticket) in doc.tickets.iter().enumerate() {
+        let id = &ids[n + 1];
+        let mut front = Front::new(id, &ticket.title, &now);
+        // Grant-admitted tickets are `ready` at create — the plan is
+        // already approved, so `check_status_write` admits it.
+        front.status = "ready".to_string();
+        front.parent = Some(epic.clone());
+        front.plan_epic = Some(epic.clone());
+        front.size = ticket.size.clone();
+        front.owner = ticket.agent.clone();
+        front.blocked_by = ticket
+            .depends_on
+            .iter()
+            .map(|d| match d {
+                Dep::Ticket(k) => ids[k + 1].clone(),
+                Dep::Issue(i) => i.clone(),
+            })
+            .collect();
+        let mut body = format!("{}\n", ticket.title);
+        if !ticket.description.is_empty() {
+            body.push_str(&format!("\n{}\n", ticket.description));
+        }
+        let body = parse::replace_acceptance(&body, &ticket.acceptance)?;
+        files.push((root.join(id), front, body));
+    }
+    let semantics: std::collections::BTreeMap<String, String> = files
+        .iter()
+        .map(|(_, front, body)| (front.id.clone(), granted_semantics(front, body)))
+        .collect();
+    if let Some(expected) = expected_semantics {
+        if *expected != semantics {
+            return Err(Error::invalid(
+                "unattended_diverged",
+                "the recorded intent's semantics no longer match what the bound \
+                 render produces — the admission is held for reconciliation",
+            ));
+        }
+    }
+    // Disk classification under the same lock the write will use.
+    let mut present = 0usize;
+    let mut identical = true;
+    for (dir, front, _) in &files {
+        if !dir.join("issue.md").is_file() {
+            continue;
+        }
+        present += 1;
+        let loaded = board::load_issue(&pm.dir, &project.key, &front.id).map_err(|e| {
+            Error::invalid(
+                "unattended_diverged",
+                format!("existing {} is unreadable ({e})", front.id),
+            )
+        })?;
+        let loaded_semantics = granted_semantics(&loaded.front, &loaded.body);
+        if semantics.get(&front.id) != Some(&loaded_semantics) {
+            identical = false;
+        }
+    }
+    // Identical files on disk are NOT commit proof: a torn admission can
+    // leave the exact intended content uncommitted (hook refused,
+    // process died) or structurally invalid. The reused path therefore
+    // still revalidates structure and runs the scoped commit — a clean
+    // tree makes it a no-op, an uncommitted or unhooked state commits
+    // or fails honestly (recovery then marks the intent held).
+    let reused = present == files.len() && identical;
+    if present > 0 && !reused {
+        return Err(Error::invalid(
+            "unattended_diverged",
+            format!(
+                "{present} of {} reserved ids exist with different content — the \
+                 partial admission is held, never overwritten or re-allocated",
+                files.len()
+            ),
+        ));
+    }
+    if !allow_write && !reused {
+        return Err(Error::invalid(
+            "unattended_missing",
+            "the admitted run's files are gone — held for reconciliation",
+        ));
+    }
+    // Reserve the allocated ids' directories FIRST: `next_id` treats an
+    // existing `<prefix>-N` dir as allocated and `new_issue` refuses an
+    // existing dir, so a torn admission can never have its ids silently
+    // consumed by an unrelated issue or plan — every allocator honors
+    // directory existence under this same lock. Directories are resource
+    // reservations only; the durable intent stays the authority. Once
+    // any dir exists it is NEVER deleted here: a reservation error is
+    // still an uncertain outcome (on recovery, a native intent already
+    // binds these ids), and only explicit reconciliation may free them.
+    for (dir, _, _) in &files {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Then the pre-intent callback — daemon-side: revalidate live grant
+    // bounds under this same lock and record the durable intent BEFORE
+    // the first issue.md exists. On an error the reservations STAY: the
+    // callback may already have persisted the intent (or, on recovery,
+    // a native mark already binds these ids), and `new_issue` does not
+    // read store reservations — only the directories stop it stealing
+    // these ids. An un-bindable dir is a numbering hole, never a stolen
+    // id; no logical tracker content is written.
+    on_intent(&GrantedPreview {
+        epic: epic.clone(),
+        tickets: ids[1..].to_vec(),
+        semantics,
+    })?;
+    let build = || -> Result<Vec<String>> {
+        // Reused files are byte-identical — leave them untouched (the
+        // commit below still proves admission or fails); only a real
+        // write creates the folders' contents.
+        if !reused {
+            for (dir, front, body) in &files {
+                std::fs::create_dir_all(dir.join("comments"))?;
+                std::fs::create_dir_all(dir.join("artifacts"))?;
+                save_front(dir, front, body)?;
+            }
+        }
+        let issues = board::load_all(&pm.dir, None)?;
+        for id in &ids {
+            check_structure(&issues, id)?;
+        }
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let paths: Vec<PathBuf> = files
+            .iter()
+            .map(|(dir, _, _)| dir.join("issue.md"))
+            .collect();
+        commit_who_scoped(
+            pm,
+            &lock,
+            &paths,
+            &format!(
+                "{epic}: plan admitted by {decided_by} ({} tickets ready)",
+                doc.tickets.len()
+            ),
+            &refs,
+            actor,
+            Some(decided_by),
+        )
+    };
+    let foreign = match build() {
+        Ok(foreign) => foreign,
+        Err(e) => {
+            // The durable intent may already bind these ids — the
+            // reservation directories (and any partial issue.md
+            // evidence) stay: removing them would let `new_issue` steal
+            // the ids, which reads only directory existence. Recovery
+            // classifies what is on disk — absent, identical, diverged —
+            // and holds on anything unknown.
+            return Err(e);
+        }
+    };
+    // `reused`: report the epic's recorded fields — the plan on disk
+    // admitted this run, not this call's scratch values.
+    let (proposed_by, decided_at) = if reused {
+        let epic_issue = board::load_issue(&pm.dir, &project.key, &epic)?;
+        let plan = epic_issue.front.plan.clone();
+        (
+            plan.as_ref().map(|p| p.proposed_by.clone()),
+            plan.and_then(|p| p.decided_at),
+        )
+    } else {
+        (Some(proposer.clone()), Some(now.clone()))
+    };
+    let mut out = json!({
+        "epic": epic,
+        "project": project.key,
+        "title": doc.title,
+        "state": "approved",
+        "proposed_by": proposed_by,
+        "decided_by": decided_by,
+        "decided_at": decided_at,
+        "tickets": ids[1..],
+        "ready": ids[1..],
+        "committed": true,
+        "reused": reused,
     });
     attach_foreign(&mut out, &foreign);
     Ok(out)
@@ -1535,13 +2017,12 @@ pub(crate) fn mark_done_on_merge_waiting_with(
     wait: Duration,
     clock: &dyn WaitClock,
 ) -> std::result::Result<Option<String>, DoneWriteFailure> {
-    let mut from = None;
-    let result = (|| -> Result<Option<String>> {
+    let lock = (|| -> Result<PmLock> {
         let deadline = clock.now() + wait;
         let mut backoff = Duration::from_millis(50);
-        let _lock = loop {
+        loop {
             if let Some(lock) = pm.try_lock()? {
-                break lock;
+                return Ok(lock);
             }
             let left = deadline.saturating_duration_since(clock.now());
             if left.is_zero() {
@@ -1551,7 +2032,24 @@ pub(crate) fn mark_done_on_merge_waiting_with(
             }
             clock.sleep(backoff.min(left));
             backoff = (backoff * 2).min(Duration::from_millis(500));
-        };
+        }
+    })()
+    .map_err(|error| DoneWriteFailure { error, from: None })?;
+    mark_done_on_merge_locked(pm, &lock, id, why, actor, expect)
+}
+
+/// The same status CAS, plan gate and rollback under an already held tracker
+/// lock. Daemon callers validate final native authority in this critical section.
+pub(crate) fn mark_done_on_merge_locked(
+    pm: &Pm,
+    _lock: &PmLock,
+    id: &str,
+    why: &str,
+    actor: &str,
+    expect: Option<&str>,
+) -> std::result::Result<Option<String>, DoneWriteFailure> {
+    let mut from = None;
+    let result = (|| -> Result<Option<String>> {
         let (_project, dir) = issue_dir(pm, id)?;
         let (mut front, body) = load_front(&dir)?;
         from = Some(front.status.clone());
@@ -2412,6 +2910,11 @@ pub fn attach_bytes(
             "Bad artifact name '{name}' — [A-Za-z0-9._-]{{1,120}}, no leading dot"
         )));
     }
+    if model::reserved_artifact_name(name) {
+        return Err(Error::rejected(format!(
+            "{name} is a tracker-owned record and cannot be attached: only its own workflow writes it"
+        )));
+    }
     if bytes.len() as u64 > pm.config.artifact_max_bytes {
         return Err(Error::rejected(format!(
             "{name} is {} bytes — over the {} cap; link it instead",
@@ -2462,6 +2965,107 @@ pub fn attach_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AOS-274: the recorded policy advances by one version per write,
+    /// keeps the minted identity, refuses private until the isolation
+    /// gate passes, and refuses both an unsupported grant and an unknown
+    /// project.
+    #[test]
+    fn setting_a_policy_bumps_the_version_and_refuses_private() {
+        let (_dir, pm) = tracker();
+        let key = "cadence";
+        let before = project::load(&pm.dir.join(key).join("project.yaml")).unwrap();
+        let start = before.policy.as_ref().map(|p| p.version).unwrap_or(0);
+        let id = before.id.clone().expect("creation mints an identity");
+
+        let out =
+            set_project_policy(&pm, key, project::Visibility::WorkspaceVisible, &[], "").unwrap();
+        assert_eq!(out["policy"]["version"], start + 1);
+        assert_eq!(out["policy"]["visibility"], "workspace_visible");
+        let loaded = project::load(&pm.dir.join(key).join("project.yaml")).unwrap();
+        assert_eq!(loaded.id, Some(id), "the identity must not change");
+        assert_eq!(loaded.policy.as_ref().unwrap().version, start + 1);
+
+        // A grant is recorded and the version advances again.
+        let out = set_project_policy(
+            &pm,
+            key,
+            project::Visibility::WorkspaceVisible,
+            &["users/mia".to_string()],
+            "",
+        )
+        .unwrap();
+        assert_eq!(out["policy"]["version"], start + 2);
+        assert_eq!(out["policy"]["members"][0], "users/mia");
+        let before = std::fs::read(pm.dir.join(key).join("project.yaml")).unwrap();
+
+        // Private is refused until the isolation gate passes.
+        set_project_policy(&pm, key, project::Visibility::Private, &[], "").unwrap_err();
+
+        // Reserved grantee kinds and unknown projects are refused.
+        set_project_policy(
+            &pm,
+            key,
+            project::Visibility::WorkspaceVisible,
+            &["agents/dev".to_string()],
+            "",
+        )
+        .unwrap_err();
+        set_project_policy(&pm, "ghost", project::Visibility::WorkspaceVisible, &[], "")
+            .unwrap_err();
+        assert!(!pm.dir.join("ghost").exists());
+
+        // A key that is not the tracker grammar never joins the filesystem,
+        // so it cannot create or edit a project outside this pm dir.
+        for bad in [
+            "../aos274-escape",
+            "cadence/../../aos274-escape",
+            "",
+            "..",
+            "/tmp",
+        ] {
+            set_project_policy(
+                &pm,
+                bad,
+                project::Visibility::WorkspaceVisible,
+                &["users/mia".to_string()],
+                "",
+            )
+            .unwrap_err();
+        }
+        let escape = pm.dir.join("..").join("aos274-escape").join("project.yaml");
+        assert!(!escape.exists(), "traversal key wrote outside the tracker");
+        assert_eq!(
+            std::fs::read(pm.dir.join(key).join("project.yaml")).unwrap(),
+            before,
+            "a refused policy mutation changed the real project"
+        );
+    }
+
+    /// A commit the tracker refuses leaves the record exactly as it was —
+    /// the rule every other writer here follows, which this verb was
+    /// missing: the version had already been bumped on disk when the
+    /// commit failed, so a refused write looked applied.
+    #[test]
+    fn a_policy_write_whose_commit_is_refused_leaves_the_record_alone() {
+        let (_dir, pm) = tracker();
+        let key = "cadence";
+        let path = pm.dir.join(key).join("project.yaml");
+        let before = std::fs::read(&path).unwrap();
+        let hook = failing_hook(&pm);
+
+        assert!(
+            set_project_policy(&pm, key, project::Visibility::WorkspaceVisible, &[], "").is_err(),
+            "the refused commit was reported as a success"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a refused commit left the changed record behind"
+        );
+        assert!(clean(&pm), "a refused policy write left something behind");
+        std::fs::remove_file(hook).unwrap();
+    }
 
     /// CAD-908: a created file is whole, a collision renames, and no
     /// temp file survives either outcome.
@@ -2589,6 +3193,25 @@ mod tests {
             && crate::issue::git(&pm.dir, &["status", "--porcelain"]).is_ok_and(|s| s.is_empty())
     }
 
+    /// The tracker's own records are not caller attachments: a copy of a
+    /// correction record onto another ticket must not be writable, or a
+    /// listing would read it as that ticket's reviewed correction.
+    #[test]
+    fn attach_refuses_the_tracker_owned_records() {
+        let (_dir, pm) = tracker();
+        for name in model::RESERVED_ARTIFACT_NAMES {
+            assert!(
+                attach_bytes(&pm, "CAD-1", name, b"{}", true, "t").is_err(),
+                "{name} was accepted as a caller attachment"
+            );
+            let (_project, dir) = issue_dir(&pm, "CAD-1").unwrap();
+            assert!(
+                !dir.join("artifacts").join(name).exists(),
+                "{name} was written to artifacts/"
+            );
+        }
+    }
+
     /// A forced done over several ids keeps its reason in the commit
     /// subject even when a later id was already done (CAD-887 review).
     #[test]
@@ -2660,6 +3283,73 @@ mod tests {
         assert!(clean(&pm));
         std::fs::remove_file(hook).unwrap();
         crate::issue::edit::edit(&pm, "CAD-1", &spec, "t", None).unwrap();
+    }
+
+    /// CAD-1522: `--unref` removes exactly the named ref, and an
+    /// `--unref` whose target is not there refuses the whole edit — the
+    /// caller asked for a correction that cannot be made, and the other
+    /// parts of the same call must not land either. Before this, a ref
+    /// added by mistake could not be removed at all, and a stale `pr:`
+    /// ref pointing at another open PR makes `issue reconcile` return
+    /// `held(open-pr)` forever (observed on ticket CAD-1514).
+    #[test]
+    fn edit_unref_removes_one_ref_and_refuses_an_absent_target() {
+        let (_tmp, pm) = tracker();
+        let url = |n: u32| format!("https://github.com/favcrm/cadence/pull/{n}");
+        let edit = |spec: crate::issue::edit::EditSpec| {
+            crate::issue::edit::edit(&pm, "CAD-1", &spec, "t", None)
+        };
+        let refs = || -> Vec<String> {
+            let (front, _) = load_front(&pm.dir.join("cadence/CAD-1")).unwrap();
+            front.refs.iter().filter_map(|r| r.url.clone()).collect()
+        };
+        let commits = || -> u32 {
+            crate::issue::git(&pm.dir, &["rev-list", "--count", "HEAD"])
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+
+        edit(crate::issue::edit::EditSpec {
+            refs: vec![format!("pr:{}", url(1)), format!("pr:{}", url(2))],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(refs(), vec![url(1), url(2)]);
+
+        let before = std::fs::read(pm.dir.join("cadence/CAD-1/issue.md")).unwrap();
+        let err = edit(crate::issue::edit::EditSpec {
+            unrefs: vec![format!("pr:{}", url(9))],
+            set: vec!["priority=P0".to_string()],
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("has no pr ref"), "{err}");
+        assert_eq!(
+            refs(),
+            vec![url(1), url(2)],
+            "a refused --unref removed a ref"
+        );
+        assert_eq!(
+            std::fs::read(pm.dir.join("cadence/CAD-1/issue.md")).unwrap(),
+            before,
+            "a refused --unref still wrote the rest of the edit"
+        );
+
+        let commits_before = commits();
+        edit(crate::issue::edit::EditSpec {
+            unrefs: vec![format!("pr:{}", url(1))],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(refs(), vec![url(2)], "the wrong ref was removed");
+        assert_eq!(
+            commits(),
+            commits_before + 1,
+            "removal lands as exactly one tracker commit"
+        );
     }
 
     #[test]

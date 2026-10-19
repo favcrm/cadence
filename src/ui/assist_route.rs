@@ -118,23 +118,24 @@ fn peek_kid(envelope: &str) -> Result<String, HttpResp> {
     })
 }
 
-/// Verify the bearer into a [`AssistActor`] or answer the refusal.
-fn assist_caller(
-    request: &Request,
+/// Verify an assistant envelope into an [`AssistActor`] or answer the
+/// refusal. This is the single verification the `/api/assist` bearer and
+/// the CAD-1485 member-chat surface both run: signature against the
+/// platform JWKS, `iss`/`aud`/org/time pins — identical pins either way.
+/// The caller supplies the raw signed envelope; how it was obtained
+/// (Authorization bearer vs a server-minted board-authorize answer) is
+/// the caller's concern.
+pub(super) fn verify_envelope(
+    envelope: &str,
     public: &crate::ui::PublicBoard,
 ) -> Result<AssistActor, HttpResp> {
-    let bearer = header_value(request, "Authorization");
-    let envelope = match assistant_actor::envelope_from_bearer(bearer.as_deref()) {
-        Ok(e) => e,
-        Err(r) => return Err(assist_fail(status_of(r.code), r.code, &r.message)),
-    };
     let config = board_identity::Config {
         host: public.host.clone(),
         issuer: public.issuer.clone(),
         company: public.company.clone(),
     };
     let now = crate::issue::time::now_epoch();
-    let kid = peek_kid(&envelope)?;
+    let kid = peek_kid(envelope)?;
     let key = {
         let mut cache = ASSIST_JWKS.lock().unwrap_or_else(|e| e.into_inner());
         match cache.key(&config.issuer, &kid, now) {
@@ -148,8 +149,21 @@ fn assist_caller(
             }
         }
     };
-    assistant_actor::verify(&envelope, &config, &key, now)
+    assistant_actor::verify(envelope, &config, &key, now)
         .map_err(|r| assist_fail(status_of(r.code), r.code, &r.message))
+}
+
+/// Verify the bearer into a [`AssistActor`] or answer the refusal.
+fn assist_caller(
+    request: &Request,
+    public: &crate::ui::PublicBoard,
+) -> Result<AssistActor, HttpResp> {
+    let bearer = header_value(request, "Authorization");
+    let envelope = match assistant_actor::envelope_from_bearer(bearer.as_deref()) {
+        Ok(e) => e,
+        Err(r) => return Err(assist_fail(status_of(r.code), r.code, &r.message)),
+    };
+    verify_envelope(&envelope, public)
 }
 
 /// `POST /api/assist/<tail>` — diverted on the public host ahead of the
@@ -194,10 +208,33 @@ pub(super) fn post(
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    // Single-use at the HTTP boundary — the ONE defined consumption
-    // point (kickoff §3). The raw signed envelope is forwarded to the
-    // daemon for cryptographic re-verification; the daemon does NOT
-    // re-consume the jti (it is not a second consumption point).
+    // Recover the raw signed envelope to forward — the daemon re-verifies
+    // it, so member proof travels signed, never as a bare relayed field.
+    let bearer = header_value(request, "Authorization");
+    let envelope = match assistant_actor::envelope_from_bearer(bearer.as_deref()) {
+        Ok(e) => e,
+        Err(r) => return assist_fail(status_of(r.code), r.code, &r.message),
+    };
+    run_member_verb(verb, &args, &caller, &envelope, state_dir, pm_dir, opts)
+}
+
+/// Consume the envelope's single-use jti and run the verified member
+/// verb. This is the ONE defined consumption point (kickoff §3) — the
+/// `/api/assist` bearer path and the CAD-1485 member-chat path both go
+/// through here, so either way the jti is spent exactly once and the raw
+/// signed envelope is forwarded to the daemon for cryptographic
+/// re-verification (the daemon does NOT re-consume the jti). Callers
+/// must have already run [`verify_envelope`] and, on the bearer path,
+/// [`assistant_actor::scope_covers`].
+pub(super) fn run_member_verb(
+    verb: AssistVerb,
+    args: &Value,
+    caller: &AssistActor,
+    envelope: &str,
+    state_dir: &Path,
+    pm_dir: &Path,
+    opts: &ServeOpts,
+) -> HttpResp {
     let spent = {
         let _guard = ASSIST_SPENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut set = assistant_actor::Spent::load(state_dir);
@@ -214,14 +251,7 @@ pub(super) fn post(
             "the envelope's jti was already consumed",
         );
     }
-    // Recover the raw signed envelope to forward — the daemon re-verifies
-    // it, so member proof travels signed, never as a bare relayed field.
-    let bearer = header_value(request, "Authorization");
-    let envelope = match assistant_actor::envelope_from_bearer(bearer.as_deref()) {
-        Ok(e) => e,
-        Err(r) => return assist_fail(status_of(r.code), r.code, &r.message),
-    };
-    dispatch(verb, &args, &caller, &envelope, state_dir, pm_dir, opts)
+    dispatch(verb, args, caller, envelope, state_dir, pm_dir, opts)
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, HttpResp> {
@@ -374,20 +404,41 @@ fn dispatch(
             member_rpc(state_dir, "member_assist_history", actor, envelope, args)
         }
         AssistVerb::AssistSend => {
-            // The daemon accepts `text` only — any other argument key
-            // refuses before the projection can create a binding.
-            if let Some(field) = args
-                .as_object()
-                .and_then(|o| o.keys().find(|k| k.as_str() != "text"))
-            {
+            // The daemon accepts `text` and the optional idempotent `message`
+            // id — any other argument key refuses before the projection can
+            // create a binding. `message` is validated here (identifier
+            // grammar, never a `sys-` daemon id). The shared verb path
+            // (`run_member_verb`) spends the envelope's jti BEFORE calling
+            // `dispatch`, so a malformed send is refused before any binding
+            // write or effect but costs that jti — the same as every other
+            // field check on this path.
+            if let Some(field) = args.as_object().and_then(|o| {
+                o.keys()
+                    .find(|k| !["text", "message"].contains(&k.as_str()))
+            }) {
                 return assist_fail(
                     400,
                     "invalid_request",
-                    &format!("assist_send takes text only; field '{field}' is not accepted"),
+                    &format!("assist_send takes text and optional message; field '{field}' is not accepted"),
                 );
             }
             match arg_str(args, "text") {
                 Ok(Some(text)) if !text.trim().is_empty() => {
+                    match arg_str(args, "message") {
+                        Err(resp) => return resp,
+                        Ok(Some(mid)) => {
+                            if crate::proto::identifier(mid, "Message ID").is_err()
+                                || mid.starts_with(crate::proto::DAEMON_MESSAGE_PREFIX)
+                            {
+                                return assist_fail(
+                                    400,
+                                    "invalid_request",
+                                    "assist argument 'message' is not a usable message id",
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                    }
                     if let Err(resp) = provision(state_dir, "assist_send", envelope) {
                         return resp;
                     }

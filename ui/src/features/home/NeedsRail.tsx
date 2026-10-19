@@ -56,6 +56,33 @@ export default function NeedsRail({
   const local = useTodoLocal();
   // A new visit to Home: earlier decided and sent marks stop applying.
   useLayoutEffect(() => beginTodoVisit(), []);
+  // The floating button that owns the slide-over's focus on the way out.
+  const needBtn = useRef<HTMLButtonElement | null>(null);
+  const drawerEl = useRef<HTMLElement | null>(null);
+  const wasOpen = useRef(false);
+  // The <1100px drawer is a dialog: it lands focus on itself, Escape
+  // closes it, and closing hands focus back to the button that opened
+  // it. An Ask hand-off is unaffected — the composer's own focus lands
+  // after this one (child effects run before this parent's).
+  useEffect(() => {
+    if (!drawer) return;
+    drawerEl.current?.focus();
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") setDrawer(false);
+    };
+    addEventListener("keydown", onKey);
+    return () => removeEventListener("keydown", onKey);
+  }, [drawer]);
+  useEffect(() => {
+    if (!drawer && wasOpen.current) needBtn.current?.focus();
+    wasOpen.current = drawer;
+  }, [drawer]);
+  // An issue opened from the slide-over leaves Home — drop the drawer so
+  // a stale overlay never hangs over the navigation.
+  const openIssue = (id: string) => {
+    setDrawer(false);
+    onOpenIssue(id);
+  };
   const [review, setReview] = useState<string | null>(null);
   // The reading items, as they stood when the drawer opened: "n of m" does
   // not recount when the overview refreshes mid-run.
@@ -96,7 +123,6 @@ export default function NeedsRail({
     hits.current.get(refocus)?.focus();
     setRefocus(null);
   }, [refocus, review]);
-
   const todoBody = (
     <>
       {block && <p className="todo-note">{t(READ_ONLY_COPY)}</p>}
@@ -118,7 +144,7 @@ export default function NeedsRail({
             defaultOpen={i === firstPermission}
             doneText={marksFor(local, n).doneText}
             onReview={openReview}
-            onOpenIssue={onOpenIssue}
+            onOpenIssue={openIssue}
             onAsk={(need) => ask(need)}
             onHide={hideTodo}
             onDone={doneTodo}
@@ -174,7 +200,17 @@ export default function NeedsRail({
           {updates.map((n) => (
             <li key={n.key}>
               <span>{updateTitle(n)}</span>
-              <span className="text-ink-500">{metaLine(n)}</span>
+              <span className="text-ink-500">
+                {/* An Updates row stays information; the subject id is a
+                    plain link to the issue it names, never an action. */}
+                {n.issue !== null && (
+                  <button type="button" className="lnk num" onClick={() => openIssue(n.issue!)}>
+                    {n.issue}
+                  </button>
+                )}
+                {n.issue !== null && " · "}
+                {metaLine(n)}
+              </span>
             </li>
           ))}
         </ul>
@@ -184,7 +220,7 @@ export default function NeedsRail({
           setDrawer(false);
           onAskAgent(agent, update);
         }}
-        onOpenIssue={onOpenIssue}
+        onOpenIssue={openIssue}
       />
     </>
   );
@@ -253,6 +289,7 @@ export default function NeedsRail({
       <button
         type="button"
         className="needbtn rail:hidden"
+        ref={needBtn}
         onClick={() => setDrawer(true)}
         aria-label={t("to do — {count} waiting; open the list").replace("{count}", String(count))}
       >
@@ -264,7 +301,14 @@ export default function NeedsRail({
       {drawer && (
         <>
           <div className="needsscrim rail:hidden" onClick={() => setDrawer(false)} />
-          <section className="needsdrawer rail:hidden" role="dialog" aria-label={t("to do")} aria-modal="true">
+          <section
+            className="needsdrawer rail:hidden"
+            role="dialog"
+            aria-label={t("to do")}
+            aria-modal="true"
+            tabIndex={-1}
+            ref={drawerEl}
+          >
             {tabs(true)}
             <div className="rail-scroll min-h-0 flex-1">{panelBody}</div>
           </section>

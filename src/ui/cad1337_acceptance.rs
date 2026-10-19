@@ -92,11 +92,12 @@ impl Fx {
                 cwd,
                 sandbox: "read-only",
                 instructions: None,
-                params: None,
+                params: Some(r#"{"model":"fixture/model"}"#),
                 team_role: None,
                 model_policy: None,
             })
             .unwrap();
+        crate::test_seam::seed_pi_fixture_policy(&fixture_store, "fixture/model").unwrap();
         drop(fixture_store);
         crate::board_identity::write_config(
             &state,

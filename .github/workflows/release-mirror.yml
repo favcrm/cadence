@@ -22,6 +22,10 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # CAD-1506: the release-store write credentials are environment-scoped
+    # (branch policy: main and v* tags). This job only ever runs from
+    # refs/heads/main, so the policy admits it; no approval click is added.
+    environment: release-store
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -91,11 +95,24 @@ jobs:
           TAG: ${{ inputs.tag }}
           SOURCE_SHA: ${{ steps.release.outputs.sha }}
           PUBLISHED_AT: ${{ steps.release.outputs.published_at }}
+          CONFIGURED_ENDPOINT: ${{ vars.RELEASES_R2_ENDPOINT }}
+          CONFIGURED_BUCKET: ${{ vars.RELEASES_R2_BUCKET }}
           AWS_ACCESS_KEY_ID: ${{ secrets.RELEASES_R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.RELEASES_R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
           test -n "$AWS_ACCESS_KEY_ID" && test -n "$AWS_SECRET_ACCESS_KEY"
+          # CAD-1511: the store is pinned to the dedicated literals, exactly as
+          # the automatic publisher gates on them (ci.yml `release-publish-r2`)
+          # and release-visibility validates them. A mis-set repository
+          # variable refuses here and can never steer this write to another
+          # store; the publisher reads the literals, not the variables.
+          RELEASES_ENDPOINT="https://87b59a40e130c425e35474687ad98a4f.r2.cloudflarestorage.com"
+          RELEASES_BUCKET="agenticos-v2-release-artifacts"
+          test "$CONFIGURED_ENDPOINT" = "$RELEASES_ENDPOINT" || {
+            echo "RELEASES_R2_ENDPOINT is not the dedicated release store" >&2; exit 1; }
+          test "$CONFIGURED_BUCKET" = "$RELEASES_BUCKET" || {
+            echo "RELEASES_R2_BUCKET is not the dedicated release store" >&2; exit 1; }
           if [ -f dist/bundles/bundles/build-attestation-x86_64-linux.jsonl ]; then
             mv dist/bundles/bundles/*.jsonl dist/bundles/
           fi
@@ -112,11 +129,18 @@ jobs:
           test -f dist/bundles/publication-attestation.jsonl
           args+=(--artifact "publication-receipt.json=dist/bundles/publication-receipt.json:publication:application/json")
           args+=(--artifact "publication-attestation.jsonl=dist/bundles/publication-attestation.jsonl:publication:application/json")
+          # The retry writes the same profile as the automatic publisher and
+          # keeps today's effective visibility: the variable was unset in this
+          # repository, so `private` is what this path has always written. The
+          # private->public flip stays with the `production`-gated
+          # release-visibility workflow. Whether a retry should instead
+          # reproduce a `public` record directly is an operator decision about
+          # an outward action — a one-word change, not a default to widen here.
           python3 scripts/publish-release.py \
-            --endpoint "${{ vars.RELEASES_R2_ENDPOINT }}" \
-            --bucket "${{ vars.RELEASES_R2_BUCKET }}" \
+            --endpoint "$RELEASES_ENDPOINT" \
+            --bucket "$RELEASES_BUCKET" \
             --product cadence --profile public-client \
             --version "$TAG" --source-sha "$SOURCE_SHA" \
-            --visibility "${{ vars.RELEASES_R2_PUBLIC_VISIBILITY || 'private' }}" \
+            --visibility private \
             --published-at "$PUBLISHED_AT" \
             "${args[@]}"

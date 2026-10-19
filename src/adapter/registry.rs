@@ -47,6 +47,9 @@ const DEVIN_CLOUD_PARAMS: &[&str] = &[
     "upstream",
     "agents_md",
     "stall_secs",
+    "profile",
+    "profile_revision",
+    "profile_digest",
 ];
 
 /// The modes `cursor --permission-mode` accepts — each maps to one

@@ -60,6 +60,7 @@ const BEARER_CAP: usize = 8192;
 pub enum Verb {
     // cli.read
     Status,
+    MyWork,
     AgentList,
     AgentShow,
     IssueLs,
@@ -73,14 +74,30 @@ pub enum Verb {
     IssueComment,
     IssueSet,
     MessageSend,
+    ProjectPolicy,
+    // settings.read / settings.write — per-op inside the daemon
+    // (CAD-1586): reads and mutations share one verb; the daemon
+    // refuses an op whose required scope the envelope lacks.
+    SettingsAgents,
+    // settings.read — master launch diagnosis for the authorized
+    // management agent (CAD-1586); writes nothing.
+    MasterStatus,
 }
 
-/// The `cli.*` scope a verb needs — `cli.write` never implies
-/// `cli.read` (the contract's `hostedCadenceCliVerbAllowed`).
+/// The scope a verb needs — `cli.write` never implies `cli.read`, and
+/// neither implies a `settings.*` scope (the contract's
+/// `hostedCadenceCliVerbAllowed`, extended for CAD-1586).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     Read,
     Write,
+    SettingsRead,
+    SettingsWrite,
+    /// The route-level gate for verbs whose op decides between
+    /// `settings.read` and `settings.write`: an envelope needs at
+    /// least one settings scope to pass; the daemon enforces the
+    /// per-op requirement.
+    SettingsAny,
 }
 
 impl Verb {
@@ -90,6 +107,7 @@ impl Verb {
     pub fn of(segment: &str) -> Option<Verb> {
         Some(match segment {
             "status" => Verb::Status,
+            "my_work" => Verb::MyWork,
             "agent_list" => Verb::AgentList,
             "agent_show" => Verb::AgentShow,
             "issue_ls" => Verb::IssueLs,
@@ -102,6 +120,9 @@ impl Verb {
             "issue_comment" => Verb::IssueComment,
             "issue_set" => Verb::IssueSet,
             "message_send" => Verb::MessageSend,
+            "project_policy" => Verb::ProjectPolicy,
+            "settings_agents" => Verb::SettingsAgents,
+            "master_status" => Verb::MasterStatus,
             _ => return None,
         })
     }
@@ -109,6 +130,7 @@ impl Verb {
     pub fn scope(self) -> Scope {
         match self {
             Verb::Status
+            | Verb::MyWork
             | Verb::AgentList
             | Verb::AgentShow
             | Verb::IssueLs
@@ -117,9 +139,15 @@ impl Verb {
             | Verb::MessageRead
             | Verb::MessageInbox
             | Verb::TeamList => Scope::Read,
-            Verb::IssueNew | Verb::IssueComment | Verb::IssueSet | Verb::MessageSend => {
-                Scope::Write
-            }
+            Verb::IssueNew
+            | Verb::IssueComment
+            | Verb::IssueSet
+            | Verb::MessageSend
+            | Verb::ProjectPolicy => Scope::Write,
+            Verb::SettingsAgents => Scope::SettingsAny,
+            // CAD-1586: master diagnosis is a settings-scoped read —
+            // the management agent needs it, and cli.* never covers it.
+            Verb::MasterStatus => Scope::SettingsRead,
         }
     }
 }
@@ -177,7 +205,6 @@ struct Claims {
     /// The exact issuing credential — required in the claim set (a
     /// missing or extra field fails the closed shape); the container
     /// binds nothing further to it, so it is parsed, not read.
-    #[allow(dead_code)]
     credential_id: String,
     iat: i64,
     exp: i64,
@@ -193,6 +220,15 @@ pub struct CliActor {
     /// `claims.actor` verbatim — `operator`, `users/<sub>`,
     /// `service/<sub>` or `agents/<id>` (the schema bounds each).
     pub actor: String,
+    /// `claims.role_at_issue` — the issuer-side membership role at mint
+    /// (`owner` | `member`). The route reads it for the verbs the
+    /// contract reserves to the Owner, so those verbs refuse without
+    /// re-reading any platform state. Never a request field.
+    pub role_at_issue: String,
+    /// `claims.principal_kind` — `user`, `agent`, or `service`. An agent
+    /// can be minted with `role_at_issue=owner`; verbs reserved to a
+    /// human Owner read this alongside the role. Never a request field.
+    pub principal_kind: String,
     /// The granted cli scopes, each already narrowed to the
     /// `{cli.read, cli.write}` vocabulary.
     pub scopes: Vec<String>,
@@ -205,6 +241,34 @@ pub struct CliActor {
     /// own subject, so a remote send/comment is never written as the
     /// board's operator handle.
     pub handle: String,
+    /// The verified claims' `credential_id` — the envelope's recorded
+    /// authority provenance a deferred commit may re-prove. No route
+    /// binds authority to it beyond what the closed claim set already
+    /// pins.
+    pub credential_id: String,
+}
+
+impl CliActor {
+    /// The project-policy spelling this actor is keyed by: the actor's
+    /// kind with its subject in the sanitized handle form the board
+    /// stores (`board_identity::handle_of`), which is also the only form
+    /// the store accepts — `Grant::parse` refuses a handle outside
+    /// `[A-Za-z0-9_-]{1,200}`.
+    ///
+    /// Deriving it here is what makes a grant recorded on either surface
+    /// match the caller arriving through the other. Keying on `actor`
+    /// verbatim would refuse a member whose subject needs sanitizing a
+    /// project the board admits it to: the envelope's
+    /// `users/auth0|usr:9/x` can never equal the store's
+    /// `users/auth0_usr_9_x`.
+    pub fn policy_spelling(&self) -> String {
+        match self.actor.split_once('/') {
+            Some((kind, _)) => format!("{kind}/{}", self.handle),
+            // `operator` is not a `<kind>/<subject>` spelling; the
+            // verified schema bounds the actor to these four forms.
+            None => self.actor.clone(),
+        }
+    }
 }
 
 /// Extract the compact envelope from `Authorization`: exactly
@@ -281,18 +345,9 @@ fn public_scheme(host: &str) -> &'static str {
 /// `users/<sub>`/`service/<sub>`/`agents/<id>` map to their namespaced
 /// tail so the daemon-visible author can never read as `operator` or
 /// collide with a pane alias it does not own.
-fn handle_of(actor: &str, sub: &str) -> String {
+pub(crate) fn handle_of(actor: &str, sub: &str) -> String {
     let tail = actor.split_once('/').map(|(_, t)| t).unwrap_or(sub);
-    tail.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(64)
-        .collect()
+    crate::ident::sanitized(tail)
 }
 
 /// Verify an envelope end to end (the container half of AOS-128's
@@ -363,16 +418,17 @@ pub fn verify(
         ));
     }
     // The claim schema's invariants, re-checked against our parse:
-    // every scope is the cli vocabulary; `operator` actor only ever
+    // every scope is the cli/settings vocabulary; `operator` actor only ever
     // rides a verified owner USER; `owner` role never maps a service.
-    if claims
-        .scope
-        .iter()
-        .any(|s| s != "cli.read" && s != "cli.write")
-    {
+    if claims.scope.iter().any(|s| {
+        !matches!(
+            s.as_str(),
+            "cli.read" | "cli.write" | "settings.read" | "settings.write"
+        )
+    }) {
         return Err(Rejection::new(
             "bad_claims",
-            "the envelope carries a scope outside the cli vocabulary",
+            "the envelope carries a scope outside the cli/settings vocabulary",
         ));
     }
     if claims.actor == "operator"
@@ -412,8 +468,11 @@ pub fn verify(
     }
     Ok(CliActor {
         handle: handle_of(&claims.actor, &claims.sub),
+        credential_id: claims.credential_id,
         sub: claims.sub,
         actor: claims.actor,
+        role_at_issue: claims.role_at_issue,
+        principal_kind: claims.principal_kind,
         scopes: claims.scope,
         jti: claims.jti,
         exp: claims.exp,
@@ -424,11 +483,16 @@ pub fn verify(
 /// envelope's `scope` is the server's intersected ceiling — this route
 /// never widens it.
 pub fn scope_covers(actor: &CliActor, need: Scope) -> bool {
-    let want = match need {
-        Scope::Read => "cli.read",
-        Scope::Write => "cli.write",
-    };
-    actor.scopes.iter().any(|s| s == want)
+    match need {
+        Scope::Read => actor.scopes.iter().any(|s| s == "cli.read"),
+        Scope::Write => actor.scopes.iter().any(|s| s == "cli.write"),
+        Scope::SettingsRead => actor.scopes.iter().any(|s| s == "settings.read"),
+        Scope::SettingsWrite => actor.scopes.iter().any(|s| s == "settings.write"),
+        Scope::SettingsAny => actor
+            .scopes
+            .iter()
+            .any(|s| s == "settings.read" || s == "settings.write"),
+    }
 }
 
 // ---------- single-use `jti` ----------
@@ -542,5 +606,47 @@ impl Spent {
         file.sync_all()?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod policy_spelling_tests {
+    use super::*;
+
+    fn actor(spelling: &str, sub: &str) -> CliActor {
+        CliActor {
+            handle: handle_of(spelling, sub),
+            sub: sub.to_string(),
+            actor: spelling.to_string(),
+            role_at_issue: "member".to_string(),
+            principal_kind: "user".to_string(),
+            scopes: vec!["cli.read".to_string(), "cli.write".to_string()],
+            credential_id: "cred".to_string(),
+            jti: "jti".to_string(),
+            exp: i64::MAX,
+        }
+    }
+
+    /// The spelling a policy decision keys on is the sanitized subject the
+    /// board stores — not the raw claim, which the store would refuse.
+    #[test]
+    fn the_policy_spelling_is_the_sanitized_subject() {
+        assert_eq!(
+            actor("users/usr_9", "usr_9").policy_spelling(),
+            "users/usr_9"
+        );
+        assert_eq!(
+            actor("users/auth0|usr:9/x", "auth0|usr:9/x").policy_spelling(),
+            "users/auth0_usr_9_x"
+        );
+        // The reserved kinds keep their kind, so a restricted project
+        // still refuses them deliberately.
+        assert_eq!(actor("agents/dev", "dev").policy_spelling(), "agents/dev");
+        assert_eq!(actor("service/svc", "svc").policy_spelling(), "service/svc");
+        // `operator` is not a `<kind>/<subject>` spelling.
+        assert_eq!(actor("operator", "usr_9").policy_spelling(), "operator");
+        // The subject is cut where the attribution handle is cut.
+        let long = actor(&format!("users/{}", "s".repeat(100)), &"s".repeat(100));
+        assert_eq!(long.policy_spelling(), format!("users/{}", "s".repeat(64)));
     }
 }

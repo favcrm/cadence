@@ -270,6 +270,20 @@ impl Fx {
                 checked(store.message(&taken.id), "turn reread failed"),
                 "claimed turn missing",
             );
+            if step == 1 {
+                let artifact = required(
+                    run["artifacts"][0]["id"].as_str(),
+                    "artifact handle missing",
+                );
+                checked(
+                    store.app_artifact_with_digest(
+                        artifact,
+                        Some((&taken.id, taken.turn_id.as_deref().unwrap())),
+                        bundle,
+                    ),
+                    "guarded dependency fetch failed",
+                );
+            }
             checked(
                 store.finish(
                     &taken,

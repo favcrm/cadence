@@ -25,8 +25,10 @@
 //!
 //! HOW THE NEGATIVE OBSERVES (no fabricated evidence): a forward-only
 //! `tar` observer sits first on PATH for the test process — it logs its
-//! argv to `$TAR_OBSERVE_LOG` and EXECS the real tar. A `-x … -C` line
-//! is a REAL filesystem-extraction attempt the product asked for. After
+//! argv to `$TAR_OBSERVE_LOG` and EXECS the real tar. A filesystem
+//! extraction is an argument that extracts (`-x`) together with a
+//! directory argument (`-C` or a short cluster containing `C`). The
+//! letters `-C` inside a path are not that flag. After
 //! the run the private flat dir is statted: an over-bound member file
 //! on disk proves the pre-guard write the fix must remove. The observer
 //! never fabricates output and never calls tar itself on the test's
@@ -446,8 +448,50 @@ fn tar_calls(env: &Env) -> Vec<String> {
 fn fs_extracts(calls: &[String]) -> usize {
     calls
         .iter()
-        .filter(|c| c.contains("-x") && c.contains("-C"))
+        .filter(|call| tar_extracts_to_directory(call))
         .count()
+}
+
+/// A filesystem extraction is `tar` asked to extract (`-x`) and to
+/// change directory (`-C`), as arguments. A path such as
+/// `cadence-release-C…` contains the letters `-C` but is not a flag;
+/// counting it rejected the bounded `-xOzf` reads.
+fn tar_extracts_to_directory(call: &str) -> bool {
+    let mut extract = false;
+    let mut directory = false;
+    for arg in call.split_whitespace() {
+        let Some(flags) = arg.strip_prefix('-') else {
+            continue;
+        };
+        if flags.is_empty() || flags.starts_with('-') {
+            continue;
+        }
+        if flags.contains('x') {
+            extract = true;
+        }
+        if flags.contains('C') {
+            directory = true;
+        }
+    }
+    extract && directory
+}
+
+#[test]
+fn fs_extract_count_ignores_a_path_that_merely_contains_dash_c() {
+    let bounded = [
+        "-tvzf /tmp/cadence-release-CCUu4W/cadence-release.tar.gz".to_string(),
+        "-xOzf /tmp/cadence-release-CCUu4W/cadence-release.tar.gz cadence".to_string(),
+        "-xOzf /tmp/cadence-release-CCUu4W/cadence-release.tar.gz cadence.sha256".to_string(),
+    ];
+    assert_eq!(fs_extracts(&bounded), 0);
+    assert_eq!(
+        fs_extracts(&["-xzf /tmp/archive.tar.gz -C /tmp/out".to_string()]),
+        1
+    );
+    assert_eq!(
+        fs_extracts(&["-xCf /tmp/out /tmp/archive.tar.gz".to_string()]),
+        1
+    );
 }
 
 /// Build tools dir (observer tar + policy gh), run `f` with it on PATH.

@@ -17,8 +17,16 @@ session can check and apply updates for any installed app at
 `/apps/manage/<id>`: enter a source, select **Check update**, inspect the
 proposed version, digest, changed files and compatibility/notes, then select
 **Apply checked update**. The page pins the installed digest, catalog
-generation, and checked new digest, and refuses stale proposals. Git installs
-are prefilled with their recorded URL, and other installs start empty for an
+generation, and checked new digest, and refuses stale proposals. The package
+path or Git URL on that page and on **Settings → App package** is a
+non-catalogue source: the check and apply send `catalogue_resolution: "manual"`
+so an installation that recorded a catalogue locator can still be replaced
+from those controls, and the locator is cleared on purpose rather than left
+pointing at different bytes. Omitting both the locator and that resolution
+refuses the update when a locator is already stored. A catalogue locator on
+the upgrade itself must match the new package and an installable directory
+release, and it cannot move the installation to an older ordered version.
+Git installs are prefilled with their recorded URL, and other installs start empty for an
 absolute path or Git URL. A historical built-in install (CAD-1422 retired
 the embedded catalog) updates from the app's detached repository — name its
 trusted path or Git URL.
@@ -71,11 +79,21 @@ The operator must call this from an operator connection. The same operation is
 available to an authenticated operator through `POST
 /api/app-installations/<install-id>/upgrade`. The read-only preview is `POST
 /api/app-installations/<install-id>/upgrade/check`; it accepts `source`,
-`expected_digest`, and `expected_generation`. Apply also requires
+`expected_digest`, and `expected_generation`, plus either a `catalogue`
+locator or `catalogue_resolution: "manual"`. Apply also requires
 `expected_new_digest` and `request_id`. Identity, approval,
 and actor fields are never accepted from the caller. A repeat of the exact
 request returns the committed result; a changed proposed bundle, stale digest, stale generation, or
 reused request ID with different material is refused.
+Every check receipt carries a `readiness` object. `install-check` reports
+`{"ready": true, "reason": null}` once the bundle validates — a fresh install
+has no active work. `upgrade-check` re-reads the installation's live state:
+`{"ready": true, "reason": null}` when apply would be admitted, or
+`{"ready": false, "reason": "active_work_or_grants"}` when a nonterminal run,
+an unresolved effect or derived grants block it. A false readiness is a
+check answer, not an error: apply re-verifies the same gate under the lock
+and refuses then. Store failures are never reported as busy — the check
+fails instead.
 
 An installation with a run in `awaiting_approval`, `approved`, or `running`
 state, or an unresolved Local effect in `waiting`, `decided`, `executing` or `reconcile`,

@@ -24,6 +24,16 @@ pub(crate) fn take_decoded_messages() -> usize {
     DECODED_MESSAGES.with(|n| n.replace(0))
 }
 
+/// The correlated worker result needed by the delivery router, without
+/// decoding a kickoff body on every pending-turn check.
+#[derive(Debug)]
+pub(crate) struct WorkerTurn {
+    pub id: String,
+    pub state: String,
+    pub created: f64,
+    pub sha: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub seq: i64,
@@ -678,6 +688,7 @@ impl Store {
             None,
             human,
             None,
+            None,
         )
     }
 
@@ -717,9 +728,12 @@ impl Store {
             conversation,
             None,
             None,
+            None,
         )
     }
 
+    /// `authorized_until` is daemon-derived and checked after acquiring
+    /// the queue writer. Ordinary sends pass `None`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_steered_for_with_conversation(
         &self,
@@ -740,6 +754,7 @@ impl Store {
         conversation: Option<&str>,
         human: Option<&Value>,
         media_refs: Option<&Value>,
+        authorized_until: Option<f64>,
     ) -> Result<(bool, String)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
@@ -776,6 +791,16 @@ impl Store {
                     .map(|m| self.supersedable_in(&tx, alias, m))
                     .collect::<Result<Vec<_>>>()?
             };
+            // Existing-envelope retries mint no work; new turns must still
+            // be authorized after the connection and SQLite writer waits.
+            if !retry
+                && authorized_until
+                    .is_some_and(|until| crate::issue::time::now_epoch() as f64 >= until)
+            {
+                return Err(Error::rejected(
+                    "the bound grant expired before the queue write — nothing was queued",
+                ));
+            }
             let out = self.enqueue_tx_with_conversation(
                 &tx,
                 alias,
@@ -1492,7 +1517,19 @@ impl Store {
             }
             self.task_in(tx, task)?;
         }
+        // CAD-1568: a CLI retry must retain its canonical principal, not
+        // merely its lossy display source. Keep the existing local retry
+        // contract: starting a chat may add operator attribution later.
         if let Some(old) = self.message_in(tx, id)? {
+            let same_sender = match sender {
+                Sender::Cli(authority) => {
+                    old.sender.as_deref() == Some(authority.sender_label().as_str())
+                }
+                _ => !old
+                    .sender
+                    .as_deref()
+                    .is_some_and(|label| label.starts_with("cli:")),
+            };
             // `refs` lives on the enqueue's thread-entry payload, not
             // the message row — the stored side is read back so a
             // retry naming different refs conflicts like any field.
@@ -1504,6 +1541,7 @@ impl Store {
                 && old.issue.as_deref() == issue
                 && old.worktree.as_deref() == worktree
                 && old.priority == priority
+                && same_sender
                 && Self::entry_refs_in(tx, id)? == refs.cloned()
                 && Self::entry_app_in(tx, id)? == app.cloned()
                 && Self::entry_attachments_in(tx, id)? == attachments.cloned()
@@ -1517,13 +1555,10 @@ impl Store {
             }
             return Ok((true, old.state));
         }
-        // CAD-819: the participant identity is derived by the daemon from
-        // the connection (`sender`) and the recipient row, never a request
-        // field. An unattributed sender keeps NULL: an unknown sender.
+        let (sender_uid, sender_label) = self.sender_identity_in(tx, sender)?;
         let recipient = self.agent_in(tx, alias)?;
         let recipient_uid = recipient.uid.clone();
         let recipient_label = recipient.alias.clone();
-        let (sender_uid, sender_label) = self.sender_identity_in(tx, sender)?;
         tx.execute(
             "INSERT INTO messages(id,alias,body,reply_to,source,task_id,issue,worktree,priority,created,
                                   sender_uid,recipient_uid,sender,recipient)
@@ -1609,6 +1644,12 @@ impl Store {
             // CAD-1380: a member is attributed by label only, never as the
             // operator and never with an agent uid.
             Sender::Member(_) | Sender::VerifiedMember(_) => (None, Some("member".into())),
+            // CAD-1568: a remote CLI principal is attributed by its
+            // verified canonical `(org, sub)` key, never as the operator
+            // and never with an agent uid — `cli:<canonical>` is the
+            // durable per-principal identity the enqueue dedupe and a
+            // cli-scoped readback own.
+            Sender::Cli(auth) => (None, Some(auth.sender_label())),
             Sender::Unattributed => (None, None),
         })
     }
@@ -2444,6 +2485,21 @@ impl Store {
         self.message_in(&conn, id)
     }
 
+    /// Whether a message row with this id exists. A bare existence probe
+    /// for send paths that must not decode the full row.
+    pub fn message_exists(&self, id: &str) -> Result<bool> {
+        let conn = self.conn();
+        match conn.query_row(
+            "SELECT 1 FROM messages WHERE id=? LIMIT 1",
+            [id],
+            |_| Ok(()),
+        ) {
+            Ok(()) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Whether an agent caller may read this message body. The row must
     /// name the alias, and a known recipient UID must be the alias's
     /// CURRENT UID; a legacy NULL UID counts only from the current
@@ -2525,6 +2581,88 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// The lane's latest owned turn on this issue: the original
+    /// dispatch kickoff or a daemon-issued native review follow-up
+    /// (a `source='review'` row with no caller-derived sender — only
+    /// `send_issue_followup` writes one, tagged server-side). Only rows
+    /// carrying the lane's `issue`/`worktree` tags count: an untagged
+    /// `review` row is ordinary mail, never this worker's turn.
+    pub(crate) fn worker_issue_turn(
+        &self,
+        issue: &str,
+        worker: &str,
+    ) -> Result<Option<WorkerTurn>> {
+        self.read_worker_turn(
+            "SELECT id,state,created,CASE WHEN state='completed' THEN result END \
+             FROM messages WHERE alias=?1 AND issue=?2 AND worktree IS NOT NULL \
+             AND (source='dispatch' OR (source='review' AND sender_uid IS NULL)) \
+             ORDER BY seq DESC LIMIT 1",
+            params![worker, issue],
+        )
+    }
+
+    /// The worktree the lane's latest dispatch kickoff was tagged
+    /// with — the current authorized lane after a manual retry or
+    /// worktree repair re-sent it. Follow-ups re-derive the lane tag
+    /// from that native queue record; they never take a caller's or a
+    /// follow-up's own claim, so `source='dispatch'` rows only — never
+    /// a `source='review'` row a follow-up itself wrote.
+    pub(crate) fn worker_issue_lane(&self, issue: &str, worker: &str) -> Result<Option<String>> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT worktree FROM messages WHERE alias=?1 AND issue=?2 \
+             AND source='dispatch' AND worktree IS NOT NULL \
+             ORDER BY seq DESC LIMIT 1",
+            params![worker, issue],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn read_worker_turn(
+        &self,
+        query: &str,
+        parameters: impl rusqlite::Params,
+    ) -> Result<Option<WorkerTurn>> {
+        let row: Option<(String, String, f64, Option<String>)> = {
+            let conn = self.conn();
+            conn.query_row(query, parameters, |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .optional()?
+        };
+        let Some((id, state, created, raw)) = row else {
+            return Ok(None);
+        };
+        let sha = if let Some(raw) = raw {
+            let result: Value = serde_json::from_str(&raw)
+                .map_err(|_| Error::rejected("the worker's durable result is malformed"))?;
+            match result.get("sha") {
+                Some(Value::String(sha)) => Some(super::check_commit_sha(sha)?),
+                Some(Value::Null) | None => ["text", "note"].iter().find_map(|field| {
+                    result
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .and_then(super::last_sha_line)
+                }),
+                Some(_) => {
+                    return Err(Error::rejected(
+                        "the worker's durable result revision is not a string",
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Some(WorkerTurn {
+            id,
+            state,
+            created,
+            sha,
+        }))
     }
 
     /// CAD-250: the agent's delivered, unreported pty turns, oldest

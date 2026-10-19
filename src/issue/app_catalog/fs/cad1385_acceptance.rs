@@ -97,6 +97,7 @@ fn cad1385_catalog_replacement_retries_whole_show_and_hard_links_still_refuse() 
         state.path(),
         v1.to_str().unwrap(),
         None,
+        &crate::issue::app_catalog::catalogue::CatalogueClaim::Absent,
     )
     .unwrap();
     let id = installed["install_id"].as_str().unwrap().to_owned();
@@ -110,6 +111,7 @@ fn cad1385_catalog_replacement_retries_whole_show_and_hard_links_still_refuse() 
         v2.to_str().unwrap(),
         &old_digest,
         &generation,
+        &crate::issue::app_catalog::catalogue::CatalogueClaim::Absent,
     )
     .unwrap();
     let new_digest = checked["digest"].as_str().unwrap().to_owned();
@@ -129,6 +131,8 @@ fn cad1385_catalog_replacement_retries_whole_show_and_hard_links_still_refuse() 
             expected_generation: &generation_for_upgrade,
             expected_new_digest: &new_digest_for_upgrade,
             request_id: "cad1385-retry",
+            catalogue: &crate::issue::app_catalog::catalogue::CatalogueClaim::Absent,
+            directory: crate::issue::app_catalog::catalogue::CatalogueDirectory::Configured,
         };
         crate::issue::app_catalog::workspace::upgrade(
             &upgrade_pm,

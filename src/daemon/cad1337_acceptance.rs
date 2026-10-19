@@ -147,12 +147,13 @@ impl Fx {
                     cwd: &cwd,
                     sandbox: "read-only",
                     instructions: None,
-                    params: None,
+                    params: (alias == "master").then_some(r#"{"model":"fixture/model"}"#),
                     team_role: None,
                     model_policy: None,
                 })
                 .unwrap();
         }
+        crate::test_seam::seed_pi_fixture_policy(&shared.store, "fixture/model").unwrap();
         shared
             .store
             .set_identity_with_quota(
@@ -1090,4 +1091,142 @@ fn cad1337_upload_refuses_writable_workspace_and_parent() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn cad1553_image_company_authority_is_strict_and_bound_at_shared_boot() {
+    use crate::platform::deployments::DeploymentMetadata;
+
+    const EXACT: &str = r#"{"schema":1,"master_trust_boundary":"company-container@1","providers":[{"provider":"agenticos","origin":"http://api.internal","manifest_pin":"agenticos-manifest@1/publish_post@2"}]}"#;
+    const ORDINARY: &str = r#"{"schema":1,"providers":[{"provider":"agenticos","origin":"http://api.internal","manifest_pin":"agenticos-manifest@1/publish_post@2"}]}"#;
+    let valid: Value = serde_json::from_str(EXACT).unwrap();
+    let trusted = DeploymentMetadata::parse(EXACT.as_bytes())
+        .expect("exact versioned image assertion must be accepted");
+    let ordinary = DeploymentMetadata::parse(ORDINARY.as_bytes()).unwrap();
+    assert!(trusted.hosted_company_master().is_some());
+    assert!(
+        ordinary.hosted_company_master().is_none(),
+        "an ordinary provider pin is not company-wide file authority"
+    );
+
+    let mut bad = Vec::new();
+    for value in [
+        json!(null),
+        json!(true),
+        json!(1),
+        json!(""),
+        json!("company-container@2"),
+        json!("COMPANY-CONTAINER@1"),
+        json!("company-container@1 "),
+        json!(["company-container@1"]),
+        json!({"mode":"company-container@1"}),
+    ] {
+        let mut candidate = valid.clone();
+        candidate["master_trust_boundary"] = value;
+        bad.push(candidate.to_string());
+    }
+    for (field, value) in [
+        ("provider", "other"),
+        ("origin", "https://api.internal"),
+        ("origin", "http://api.internal:80"),
+        ("origin", "http://api.internal/"),
+        ("origin", "http://other.internal"),
+        ("manifest_pin", "agenticos-manifest@1/publish_post@1"),
+        ("manifest_pin", "agenticos-manifest@1/publish_post@3"),
+    ] {
+        let mut candidate = valid.clone();
+        candidate["providers"][0][field] = json!(value);
+        bad.push(candidate.to_string());
+    }
+    let mut no_provider = valid.clone();
+    no_provider["providers"] = json!([]);
+    bad.push(no_provider.to_string());
+    let mut unknown_field = valid.clone();
+    unknown_field["company_master"] = json!(true);
+    bad.push(unknown_field.to_string());
+    let mut unknown_schema = valid.clone();
+    unknown_schema["schema"] = json!(2);
+    bad.push(unknown_schema.to_string());
+    bad.push(EXACT.replacen("\"schema\":1", "\"schema\":1,\"schema\":1", 1));
+    bad.push(EXACT.replacen(
+        r#""master_trust_boundary":"company-container@1""#,
+        r#""master_trust_boundary":"company-container@1","master_trust_boundary":"company-container@1""#,
+        1,
+    ));
+    bad.push("{".to_string());
+    for candidate in bad {
+        let error = DeploymentMetadata::parse(candidate.as_bytes())
+            .expect_err("malformed, unknown or mismatched image authority was accepted");
+        assert!(
+            error
+                .to_string()
+                .contains("trusted provider deployment metadata refused"),
+            "wrong metadata refusal: {error}; candidate={candidate}"
+        );
+    }
+
+    // Exercise actual Shared composition, not only the proof accessor.
+    // The pre-bound stale proof is deliberately supplied in the mutable opts
+    // for negative cases: only the current metadata may authorize this boot.
+    for case in ["absent", "ordinary-provider", "exact"] {
+        let root = tempfile::Builder::new()
+            .prefix("c1553-boot-")
+            .tempdir()
+            .unwrap();
+        let state = root.path().join("s");
+        let tracker = root.path().join("t");
+        let home = root.path().join("h");
+        let private = root.path().join("p");
+        for path in [&state, &home, &private] {
+            std::fs::create_dir(path).unwrap();
+        }
+        crate::issue::Pm::init(&tracker).unwrap();
+        let mut opts = ServeOptions {
+            provider_env: crate::adapter::ProviderEnv::refusing_providers()
+                .with_company_master(trusted.hosted_company_master()),
+            ..ServeOptions::default()
+        };
+        opts.provider_env.set("HOME", home.to_str().unwrap());
+        opts.provider_env
+            .set("CADENCE_HOME", private.to_str().unwrap());
+        opts.provider_env
+            .set("CADENCE_PM_DIR", tracker.to_str().unwrap());
+        opts.provider_env
+            .set(crate::master::CONFINE_EXTRA_READ_ENV, "");
+        opts.provider_env
+            .set(crate::master::CONFINE_EXTRA_WRITE_ENV, "");
+        opts.provider_env
+            .set("master_trust_boundary", "company-container@1");
+        opts.provider_env
+            .set("CADENCE_MASTER_TRUST_BOUNDARY", "company-container@1");
+        opts.provider_env.set("CADENCE_COMPANY_MASTER", "true");
+        opts.provider_env.set("CADENCE_PROVIDER_DEPLOYMENTS", EXACT);
+        opts.provider_deployments = match case {
+            "absent" => None,
+            "ordinary-provider" => Some(ordinary.clone()),
+            "exact" => Some(trusted.clone()),
+            _ => unreachable!(),
+        };
+        let shared = Shared::new(&state, &opts)
+            .unwrap_or_else(|error| panic!("{case} disposable Shared boot failed: {error}"));
+        assert_eq!(shared.upload_workspace_dir, private.join("workspace"));
+        assert_eq!(
+            shared.provider_env.company_master(),
+            case == "exact",
+            "{case}: mutable env or a stale proof replaced current image authority"
+        );
+        // Mutation through the original shared map and a clone must neither
+        // manufacture authority on negative boots nor erase the positive one.
+        let mutable = opts.provider_env.clone();
+        mutable.set("master_trust_boundary", "company-container@2");
+        mutable.remove("CADENCE_PROVIDER_DEPLOYMENTS");
+        assert_eq!(
+            shared.provider_env.clone().company_master(),
+            case == "exact"
+        );
+        assert_eq!(
+            shared.provider_env.workspace(),
+            Some(shared.upload_workspace_dir.as_path())
+        );
+    }
+}
 include!("cad1337_repair_acceptance.rs");

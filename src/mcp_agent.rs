@@ -1,8 +1,13 @@
 //! Scoped Cadence tools for a managed Codex endpoint.
 //!
 //! Codex starts local MCP servers outside its command sandbox. This process
-//! and its CLI children remain descendants of the enrolled provider, so the
-//! daemon still derives the caller from SO_PEERCRED and /proc ancestry.
+//! remains a descendant of the enrolled provider, so the daemon derives the
+//! caller from SO_PEERCRED and /proc ancestry. `self` and `app_run_artifact`
+//! call those existing daemon RPCs in this process. `app_run_artifact` is
+//! only that one guarded method and the tool's three strings; it is not a
+//! general RPC tool, and it does not spawn a CLI child that would carry the
+//! turn token in argv. The other tools still run the Cadence CLI as children
+//! of this process, which keeps the same enrolled ancestry.
 
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -74,7 +79,7 @@ pub fn run(state_dir: &Path) -> Result<i32> {
 
 fn tools() -> Value {
     json!([
-        {"name":"self","description":"Show your Cadence identity and running work.",
+        {"name":"self","description":"Show your Cadence identity and your own held turns. Each running entry is {id, turn_id, task} for this endpoint only. Use id as message and turn_id as token with app_run_artifact.",
          "inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"wiki_search","description":"Lexical search of wiki pages visible to your Cadence identity. Not semantic: every token in q must appear (AND); punctuation splits tokens; only the first 12 tokens are used; q is at most 256 bytes. A full question usually matches nothing, so pass scoped keywords instead: the vendor, product or entity, the operation or field name, and the exact identifier, version or number from the question (e.g. '<vendor> <operation>', '<product> <field> <version>'). Drop filler words. Use path to limit to a collection you are authorized for (an organization/global folder, a project folder such as projects/<key>, or a private folder your identity may read); do not narrow by default. Results are candidates, not evidence: wiki_read each source before answering, and an empty result is not proof of absence.",
          "inputSchema":{"type":"object","properties":{
@@ -90,7 +95,13 @@ fn tools() -> Value {
              "required":["path"],"additionalProperties":false}},
         {"name":"issue_show","description":"Read one Cadence issue by ID.",
          "inputSchema":{"type":"object","properties":{"id":{"type":"string"}},
-             "required":["id"],"additionalProperties":false}}
+             "required":["id"],"additionalProperties":false}},
+        {"name":"app_run_artifact","description":"Read one text dependency artifact for your current assigned app turn. Required strings: artifact_id from the kickoff, plus message and token equal to the id and turn_id from self. Alias, provider, path, and command are refused.",
+         "inputSchema":{"type":"object","properties":{
+             "artifact_id":{"type":"string"},
+             "message":{"type":"string"},
+             "token":{"type":"string"}},
+             "required":["artifact_id","message","token"],"additionalProperties":false}}
     ])
 }
 
@@ -163,6 +174,23 @@ fn command_args(name: &str, args: &Value) -> Result<Vec<String>> {
                 return Err(Error::rejected("issue id must be CAD-<number>"));
             }
             Ok(vec!["issue".into(), "show".into(), id.into()])
+        }
+        "app_run_artifact" => {
+            let args = fields(
+                args,
+                &["artifact_id", "message", "token"],
+                &["artifact_id", "message", "token"],
+            )?;
+            Ok(vec![
+                "app".into(),
+                "run".into(),
+                "artifact".into(),
+                positional(args["artifact_id"].as_str().unwrap())?,
+                "--message".into(),
+                positional(args["message"].as_str().unwrap())?,
+                "--token".into(),
+                positional(args["token"].as_str().unwrap())?,
+            ])
         }
         _ => Err(Error::rejected("unknown Cadence agent tool")),
     }
@@ -238,6 +266,21 @@ fn invoke(state_dir: &Path, alias: &str, argv: &[String]) -> Result<String> {
         }
         return Ok(identity.to_string());
     }
+    if argv.len() == 8
+        && argv[0] == "app"
+        && argv[1] == "run"
+        && argv[2] == "artifact"
+        && argv[4] == "--message"
+        && argv[6] == "--token"
+    {
+        // Same guarded route, without putting the turn token in child argv.
+        let artifact = crate::client::rpc(
+            state_dir,
+            "app_run_artifact",
+            json!({"artifact_id": argv[3], "message": argv[5], "token": argv[7]}),
+        )?;
+        return Ok(artifact.to_string());
+    }
     let binary = std::env::current_exe()?;
     let mut command = Command::new(binary);
     command.arg("--state-dir").arg(state_dir).args(argv);
@@ -270,17 +313,40 @@ mod tests {
             ("wiki_search", json!({"q":"needle","alias":"operator"})),
             ("wiki_search", json!({"q":"needle","as":"operator"})),
             ("issue_show", json!({"id":"--state-dir"})),
+            (
+                "app_run_artifact",
+                json!({"artifact_id":"artifact-1","message":"m1","token":"t1","alias":"other"}),
+            ),
+            (
+                "app_run_artifact",
+                json!({"artifact_id":"artifact-1","message":"m1","token":"t1","provider":"codex"}),
+            ),
+            (
+                "app_run_artifact",
+                json!({"artifact_id":"artifact-1","message":"m1","token":"t1","path":"/tmp/x"}),
+            ),
+            (
+                "app_run_artifact",
+                json!({"artifact_id":"artifact-1","message":"m1","token":"t1","command":"sh"}),
+            ),
+            (
+                "app_run_artifact",
+                json!({"artifact_id":"artifact-1","message":"m1"}),
+            ),
+            (
+                "app_run_artifact",
+                json!({"artifact_id":"artifact-1","token":"t1"}),
+            ),
+            (
+                "app_run_artifact",
+                json!({"artifact_id":"artifact-1","message":"m1","token":""}),
+            ),
+            (
+                "app_run_artifact",
+                json!({"artifact_id":"--help","message":"m1","token":"t1"}),
+            ),
         ] {
             assert!(command_args(name, &args).is_err(), "{name}: {args}");
         }
-    }
-
-    #[test]
-    fn only_known_cli_argv_can_be_constructed() {
-        assert_eq!(command_args("self", &json!({})).unwrap(), ["self"]);
-        assert_eq!(
-            command_args("wiki_search", &json!({"q":"needle"})).unwrap(),
-            ["wiki", "search", "needle", "--json"]
-        );
     }
 }

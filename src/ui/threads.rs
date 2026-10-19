@@ -22,11 +22,14 @@
 //! - `?conversation=<id>` on the thread read and stream selects that
 //!   conversation's entries (an unknown id is 404; home when absent).
 //! - `POST /api/threads/<alias>/messages` `{"text", "message"?, "app"?,
-//!   "conversation"?}` —
+//!   "conversation"?, "expected_recipient_uid"?}` —
 //!   the operator's message, queued to the agent like `cadence send`.
 //!   `app` (`{install_id, context_id}`, CAD-802) is never authority:
 //!   the daemon proves both against its store and stamps the verified
-//!   binding on the entry.
+//!   binding on the entry. `expected_recipient_uid` (CAD-1591) is a
+//!   recipient-identity constraint, never authority either: the relay
+//!   carries it through and the daemon's enqueue transaction refuses
+//!   before any write when the alias's current uid differs.
 //!
 //! The POST instructs an agent. It passes the board's write guards, and
 //! a caller the board attributes to an agent (a pane, or a managed
@@ -116,6 +119,11 @@ struct ThreadMessageReq {
     attachments: Option<Vec<ThreadAttachment>>,
     /// One retained library image. The daemon re-proves id, revision and digest.
     media_refs: Option<Vec<ThreadMediaRef>>,
+    /// CAD-1591: the contextual-reply recipient constraint — the uid the
+    /// operator's composer recorded. Relayed verbatim; the daemon
+    /// validates the shape and fences it inside the enqueue
+    /// transaction, never here.
+    expected_recipient_uid: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -428,6 +436,9 @@ pub(super) fn post_message(
             .iter()
             .map(|a| json!({"id": a.id}))
             .collect::<Vec<_>>());
+    }
+    if let Some(expected_uid) = req.expected_recipient_uid {
+        params["expected_recipient_uid"] = Value::String(expected_uid);
     }
     match client::rpc(state_dir, "thread_send", params) {
         Ok(receipt) => json_response(receipt),

@@ -157,10 +157,17 @@ function AgentCard({ agent, reports, onAsk, onOpenIssue }: {
     </div>
     {context && <p className="agent-context">{context}</p>}
     {recent.length > 0 && <ul className="agent-update-notes">
-      {recent.map((update) => <li key={update.key}>
-        <div className="flex gap-2 items-baseline text-micro text-ink-500"><span className="text-ink-300">{update.label}</span><UpdatedAt at={update.at} /></div>
+      {recent.map((update) => {
+        const issue = update.issue;
+        return <li key={update.key}>
+        <div className="flex gap-2 items-baseline text-micro text-ink-500"><span className="text-ink-300">{update.label}</span>
+          {/* A report's stored issue id opens its real page; absent, the
+              label stays the only read — never an invented link. */}
+          {issue !== undefined && <button type="button" className="lnk num" onClick={() => onOpenIssue(issue)}>{issue}</button>}
+          <UpdatedAt at={update.at} /></div>
         {update.text && <details className="agent-update-detail"><summary>{update.text.replace(/[#*`]/g, "").split("\n").filter(Boolean).slice(0, 2).join(" ").slice(0, 220)}</summary><p>{update.text}</p></details>}
-      </li>)}
+      </li>;
+      })}
     </ul>}
     {line && <p className={`${line.warn ? "text-micro text-warn" : "text-label text-ink-500"} ${recent.length > 0 ? "mt-2" : "mt-3"}`}>
       {t(line.text)}

@@ -165,7 +165,8 @@ audience and live bearer before any runtime is resolved or woken; the
 container independently re-verifies the envelope before dispatching the
 verb. `verb` is one of a fixed allowlist — `status`, `agent_list`,
 `agent_show`, `issue_ls`, `issue_show`, `issue_history`, `message_read`,
-`message_inbox`, `issue_new`, `issue_comment`, `issue_set` — and
+`message_inbox`, `issue_new`, `issue_comment`, `issue_set`,
+`project_policy`, `message_send` — and
 `arguments` is a strict per-verb payload. Any
 other command is refused locally and never sent.
 
@@ -317,7 +318,7 @@ Refusals happen locally, before a byte is sent: `issue new` without
 `--id`/`--status`; `issue comment` with `--author` or `--kind`; `issue
 set` without `--if-rev`, with an empty revision, with `--force`, or
 naming more than one ticket. `--file` bodies are read client-side (`-` = stdin) and
-bounded by the 32 KB cap — never remote paths. `message send`, `issue
+bounded by the 32 KB cap — never remote paths. `issue
 edit/attach`, provider verbs and operator verbs are not on the wire.
 
 `issue set` is compare-and-swap: send the `rev` from `issue show`
@@ -338,6 +339,134 @@ operational concern outside this client feature.
 Each collaborating writer enrolls independently: a separate
 `XDG_CONFIG_HOME` (or separate account/machine) per identity, its own
 `cadence login` grant — credentials are never copied between homes.
+
+### Remote message send (CAD-1568)
+
+`cadence send` (and its `message send` form) enqueue a durable coordination
+message to the hosted **master**, for a verified human workspace owner.
+This is not generic container execution. The recipient fence is the
+canonical `master` agent only: any other recipient spelling is a typed
+refusal, and the daemon resolves the exact `master` agent row — another
+worker's session or thread id that happens to spell `master` is never
+substituted, and no refusal silently reroutes or enqueues elsewhere.
+The selected row's UID is checked inside the enqueue transaction; removing
+or replacing that recipient before enqueue refuses the send rather than
+allowing a later generic lookup to redirect it.
+Personal assistants require separate assistant authority and local workers
+use the `local-agent`/local-assignment plane; both are unsupported
+remote-send recipient classes. Member-to-member remote coordination and
+the local-worker follow-up journey are explicitly deferred on the ticket —
+refused, not silently fulfilled. Agent/service envelopes cannot inherit
+their parent human's messaging or private readback authority.
+Roll out the matching native-server authorization guard before exposing
+the upgraded CLI to a hosted workspace. A CLI upgrade alone does not
+establish these sender-ownership and private-readback guarantees.
+This feature does not authorize a production rollout.
+
+```sh
+cadence login acme                                            # owner-approved hosted grant
+cadence --org acme wiki put global/docs/kit.md --file kit.md  # stage inputs in the wiki
+cadence --org acme send master --message ask-42 --text \
+  "Please coordinate review of the staged kit — see global/docs/kit.md."
+cadence --org acme message read ask-42     # your message: body + state + result
+```
+
+The wiki staging step requires an existing `wiki.write` grant; `cli.write`
+alone permits sending a message, not writing wiki pages. Use already-staged
+inputs when the login has only CLI scopes.
+
+`--message <id>` is **required** on a remote send: it is the caller-chosen
+stable id (identifier grammar, never `sys-*`) the send is deduplicated
+and reconciled under. The send binds the recipient's Home
+`message_conversation` at enqueue: a first-ever send creates the master's
+Home thread transactionally with the durable message, and every later
+send to it reports the same `conversation`. The successful reply is the
+complete enqueue receipt — the echoed stable `message` id, the canonical
+`alias` (`master`), the lifecycle `state`, the `duplicate` bool, the
+immutable `workspace_id` (the workspace ID verified at login, not the
+slug), the authenticated human's canonical `sender_subject`, the `cli-*`
+display `sender`, and the stored `conversation`. That receipt proves
+durable enqueue only — it is never the delivery, execution or result of
+the message, which remain `message read`'s report.
+
+A `2xx` answer without that complete correlated receipt — missing,
+malformed, or bound to another message, alias, workspace or subject — is
+`unknown`, exactly like a lost reply: reconcile by the stable `--message`
+id. It is never reported as a success and never replayed. `message read
+<id>` returns your own sent message's body plus `state`, sanitized
+`result`, `error` and `awaiting_report`, with the same `workspace_id`,
+`sender_subject`, `sender`, `alias` and `conversation` binding the send
+receipt carried. Absent and foreign message IDs return the same
+`not_found` refusal. Browser member-chat messages are not CLI-owned.
+
+`--ready`/`--force`, `--nudge`, `--priority`/`--supersedes`, `--reply-to`
+and `--task` are local-endpoint and routing surfaces: they refuse before
+a request, they are not dropped. `--file` bodies are read client-side
+(`-` = stdin) under the message enqueue cap; an oversized body is
+refused whole, never truncated.
+
+Remote refusals carry bounded codes, never raw server text:
+`recipient_class_unsupported` (any target other than `master`),
+`not_permitted` (not a human owner for master chat/passive inbox inspection,
+or not a human principal for CLI message readback),
+`message_id_conflict` (a `--message` id already used with different
+content or owned by another principal — reconcile or choose a fresh id),
+`rejected` (for example a reserved `sys-` id),
+`insufficient_scope` (login lacks the operation's `cli.*` scope),
+`invalid_request` (missing/empty body or id at the request boundary),
+`not_found` (no CLI message visible to this human under that id).
+
+If a send's outcome is lost (timeout, dropped connection, 5xx after the
+call, or a 2xx whose receipt is not the complete correlated one above),
+do not guess: run `cadence message read <id> --org <org>` using the
+original human login and workspace. `not_found` does not prove that no
+other principal owns the ID. After reconciling the destination and identity,
+retry with the **same** `--message` id: the same principal/id/content does
+not enqueue another message. This is enqueue dedupe, not exactly-once
+downstream effects. Never blindly resubmit under a different ID.
+
+Developer acceptance uses an isolated native daemon, the real AgenticOS
+hosted handlers and durable stores, and the synthetic provider. Point at
+an API checkout containing the native-forwarder and TLS-bridge test helpers
+with its dependencies installed:
+
+The `cli-runtime-test` feature is an explicit manual-harness opt-in.
+Ordinary `test-seam` CI retains the CLI tests in their original binary
+target and still runs the new daemon ownership/refusal acceptance checks.
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 \
+  cadence --state-dir "$HOME/.local/state/cadence" build-slot run build -- \
+  cargo build --locked --features test-seam --bin cadence
+
+CAD1568_AOS_API_DIR=/absolute/path/to/agenticos-v2/apps/api \
+  CAD1568_CLI="$PWD/target/debug/cadence" \
+  CARGO_BUILD_JOBS=2 CARGO_PROFILE_TEST_DEBUG=0 \
+  cadence --state-dir "$HOME/.local/state/cadence" build-slot run test -- \
+  cargo test --locked --features cli-runtime-test --lib \
+    cad1568_real_hosted_message_roundtrip_and_refusals \
+    -- --ignored --test-threads 1 --nocapture
+```
+
+Use the local admission broker's actual state directory above. Unlike
+`--org local`, this does not export a local instance binding into the
+tested CLI process; no caller identity variables are cleared.
+
+The fixture launches that debug executable through its real entry point,
+parser and dispatch for login, wiki staging/reference, send and exact-result
+readback. The library no longer borrows the binary's CLI modules. The
+`test-seam` build adds only an explicitly armed private-CA/loopback transport
+for these subprocesses; certificate-chain, hostname, signed-envelope and
+authority checks remain enabled. Release builds reject `test-seam`.
+The scenario requires an external coordinator and refuses a real parent
+`CADENCE_ALIAS` before constructing isolated synthetic-persona environments;
+never unset a managed identity to run it.
+
+This is not an installed release CLI or a deployed workspace. The controller
+primes CLI and wiki JWKS caches over verified disposable TLS; fresh
+handler-thread JWKS fetching and real master commissioning/model policy are
+not proved. Production messaging runtimes, credentials and providers are not
+exercised.
 
 ## Issuer-bound service enrollment (CAD-717)
 

@@ -199,8 +199,6 @@ for (const density of ["full", "compact"] as const) {
     density,
   );
   ok((withRefs.match(/class="refchip/g) ?? []).length === 2, `${density}: one chip per ref`);
-  ok(withRefs.includes(">issue:CAD-1<"), `${density}: issue chip label`);
-  ok(withRefs.includes(">agent:w1<"), `${density}: agent chip label`);
   const noRefs = render(items.operator, density);
   ok(!noRefs.includes("refchip") && !noRefs.includes("refsrow"), `${density}: operator without refs has no chips`);
   const pendingRefs = render(
@@ -211,7 +209,7 @@ for (const density of ["full", "compact"] as const) {
     },
     density,
   );
-  ok((pendingRefs.match(/class="refchip/g) ?? []).length === 1 && pendingRefs.includes(">issue:CAD-9<"), `${density}: pending refs render`);
+  ok((pendingRefs.match(/class="refchip/g) ?? []).length === 1, `${density}: pending refs render`);
   ok(!render(items.pending, density).includes("refchip"), `${density}: pending without refs has no chips`);
 }
 

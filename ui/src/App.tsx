@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, type WriteResp } from "./lib/api";
+import { api, ApiError, type MyWorkPayload, type WriteResp } from "./lib/api";
 import { useLocale } from "./lib/locale";
 import Agents from "./features/agents/Agents";
 import Apps from "./features/apps/Apps";
@@ -17,7 +17,7 @@ import { APPS_CHANGED_EVENT } from "./features/workspace-apps/workspaceApps";
 import { appLoadErrorCopy } from "./features/explorer/appErrors";
 import WorkspaceApp from "./features/workspace-apps/WorkspaceApp";
 import Board from "./features/projects/Board";
-import Drawer from "./features/projects/Drawer";
+import Drawer, { type MyWorkDraft } from "./features/projects/Drawer";
 import ProjectsOverview from "./features/projects/ProjectsOverview";
 import IssuePage from "./features/issues/IssuePage";
 import { issuePath, laneFollowsStream, refreshIssueIds } from "./features/issues/model";
@@ -35,6 +35,7 @@ import Outbox from "./features/outbox/Outbox";
 import ThreadsPage from "./features/threads/ThreadsPage";
 import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
+import MyWork from "./features/home/MyWork";
 import { useHomeCount } from "./features/home/todoLocal";
 import Context from "./features/projects/Context";
 import { contextNavigationSearch } from "./features/projects/contextRoute";
@@ -61,7 +62,7 @@ import SignIn from "./features/auth/SignIn";
 import { kickoffBlock as operatorKickoffBlock, writeBlock } from "./features/auth/gate";
 import { WriteGate } from "./features/auth/WriteGate";
 import { sessionHeaders } from "./lib/sessionKey";
-import { privateReadsAllowed, privateSessionGeneration, withPrivateOperation } from "./lib/privateSession";
+import { onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration, withPrivateOperation } from "./lib/privateSession";
 import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
 import { runningRelease } from "./lib/fmt";
 import { applyDraft, composerField, sessionStore, stashDraft, takeDraft } from "./lib/draft";
@@ -73,7 +74,7 @@ import { RESOURCE_NAMES } from "./lib/cache";
 import { noteThreadsChanged } from "./features/threads/threadsClient";
 import { LiveUpdates, patchRows } from "./lib/liveUpdates";
 import type { Agent, AgentsPayload } from "./lib/types";
-import { cache, resources } from "./lib/resources";
+import { cache, onIssueUnavailable, resources } from "./lib/resources";
 import { useMaybeResource, useResource } from "./lib/useResource";
 import {
   goTo,
@@ -122,6 +123,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
   workspaceAppKey: "app",
   agents: "agents",
   threads: "threads",
+  myWork: "my work",
   wiki: "wiki",
   outbox: "outbox",
   setup: "setup",
@@ -133,6 +135,22 @@ const SCREEN_LABEL: Record<Screen, string> = {
 
 /** Screens that read the overview: Home's Needs-you rail and the full overview. */
 const overviewOn = (s: Screen) => s === "home" || s === "overview";
+
+/** Preserve personal order and provenance only while the same assignment still holds. */
+function mergePersonalCard(previous: MyWorkPayload, card: IssueCard, keepProvenance = true): MyWorkPayload {
+  const index = previous.issues.findIndex((row) => row.id === card.id);
+  // New/reassigned rows need a fresh scoped projection, never an unrelated
+  // board patch or an old write response that could resurrect a removed row.
+  if (index < 0) return previous;
+  if (card.owner !== previous.owner) {
+    return { ...previous, issues: previous.issues.filter((row) => row.id !== card.id) };
+  }
+  const old = previous.issues[index];
+  const row = { ...card, assignment: keepProvenance ? old?.assignment ?? null : null };
+  const issues = previous.issues.slice();
+  issues[index] = row;
+  return { ...previous, issues };
+}
 
 export default function App() {
   // Private room alerts share the admitted workspace's concealment and reset lifecycle.
@@ -183,6 +201,23 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // The open drawer's detail, cached per id: reopening a drawer paints
   // the last payload while it revalidates.
   const detailState = useMaybeResource(openId ? resources.issue(openId) : null);
+  const personalState = useMaybeResource(screen === "myWork" ? resources.myWork : null);
+  const personalWanted = useRef(screen === "myWork");
+  personalWanted.current = screen === "myWork";
+  const [personalDrafts] = useState(() => new Map<string, MyWorkDraft>());
+  const [, notifyPersonalDrafts] = useState(0);
+  useEffect(() => onPrivateSessionReset(() => personalDrafts.clear()), [personalDrafts]);
+  useEffect(() => onIssueUnavailable((id) => {
+    const suffix = `:${id}`;
+    let changed = false;
+    for (const key of personalDrafts.keys()) {
+      if (key.endsWith(suffix)) changed = personalDrafts.delete(key) || changed;
+    }
+    if (changed) notifyPersonalDrafts((version) => version + 1);
+  }), [personalDrafts]);
+  const personalReturn = useRef<{ id: string; scroll: number } | null>(null);
+  const previousScreen = useRef(screen);
+  const restorePersonal = useRef(false);
   const [toast, setToast] = useState<ToastMsg | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
@@ -201,6 +236,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // CAD-1423: change signal for the notification inbox. The verified identity is
   // still read from the daemon by the inbox itself; this only says when to re-check.
   const authEpoch = JSON.stringify([meta?.signed_in ?? null, meta?.session?.id ?? null, meta?.session?.user?.sub ?? null, meta?.read_only ?? null]);
+  const personalGeneration = privateSessionGeneration();
+  const personalIdentity = JSON.stringify([personalGeneration, meta.session?.id, meta.session?.user?.sub, meta.actor]);
 
   // CAD-1312: the header's organisation label is the hosted board's
   // configured company display name (`GET /api/platform-account`, already
@@ -290,6 +327,33 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     if (openId) void resources.issue(openId).revalidate();
   }, [openId]);
 
+  const invalidatePersonal = useCallback(() => {
+    if (personalWanted.current) void resources.myWork.invalidate();
+    else resources.myWork.markInvalid();
+  }, []);
+
+  useEffect(() => {
+    if (screen === "myWork" && previousScreen.current !== "myWork") restorePersonal.current = true;
+    previousScreen.current = screen;
+    if (screen !== "myWork" || !restorePersonal.current || !personalReturn.current ||
+        !personalState?.data || personalState.status === "failed" || personalState.status === "stale") return;
+    const saved = personalReturn.current;
+    const frame = requestAnimationFrame(() => {
+      restorePersonal.current = false;
+      window.scrollTo(0, saved.scroll);
+      let trigger: HTMLElement | null = null;
+      document.querySelectorAll<HTMLElement>("[data-my-work-inspect]").forEach((element) => {
+        if (element.dataset.myWorkInspect === saved.id) trigger = element;
+      });
+      const target = trigger ?? document.querySelector<HTMLElement>("[data-my-work] h1");
+      if (target) {
+        if (!trigger) target.tabIndex = -1;
+        target.focus({ preventScroll: true });
+      }
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [screen, personalState?.data, personalState?.status]);
+
   // The overview costs a daemon probe + gh cache read (~seconds), so it
   // is fetched only while a screen that reads it is on screen —
   // revalidated when that screen comes back, painting the last payload
@@ -317,6 +381,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       void resources.issues.refresh();
       void resources.agents.refresh();
       if (overviewWantedRef.current) void resources.overview.refresh();
+      if (personalWanted.current) void resources.myWork.refresh();
       loadDetail();
     });
   }, [loadDetail, recheck]);
@@ -340,9 +405,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       else cache.invalidate(key);
     }
     cache.invalidate("lane");
+    invalidatePersonal();
     noteThreadsChanged();
     refresh();
-  }, [refresh]);
+  }, [refresh, invalidatePersonal]);
 
   const liveUpdates = useRef<LiveUpdates | null>(null);
   useEffect(() => {
@@ -353,6 +419,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         // or jobs. Entity patches queue that through LiveUpdates; legacy
         // resource names still have to.
         if (laneFollowsStream([key])) cache.invalidate("lane");
+        if (key === "issues" || key === "issue" || key === "agents") invalidatePersonal();
         if (key === "threads") noteThreadsChanged();
         if (key === "overview" && !overviewWantedRef.current) {
           resources.overview.markInvalid();
@@ -367,6 +434,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           if (resources.issues.get().data === null) {
             void resources.issues.invalidate();
           } else resources.issues.mutate((rows) => patchRows(rows, data.id as string, data.op, data.issue as IssueCard, (row) => row.id));
+          resources.myWork.mutate((body) => data.op === "delete"
+            ? { ...body, issues: body.issues.filter((row) => row.id !== data.id) }
+            : mergePersonalCard(body, data.issue as IssueCard, false));
+          invalidatePersonal();
         } else if (event.type === "agent") {
           if (typeof data.id !== "string" || !["upsert", "delete"].includes(String(data.op)) ||
               (data.op === "upsert" && (!data.agent || typeof data.agent !== "object"))) {
@@ -405,7 +476,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       sub.close();
       if (liveUpdates.current === updates) liveUpdates.current = null;
     };
-  }, [reconcile]);
+  }, [reconcile, invalidatePersonal]);
 
   // Reload is explicit — never automatic. The composer draft is
   // stashed first so one click costs no text (CAD-573).
@@ -487,6 +558,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   /// board and the fresh detail into the drawer — no second fetch.
   const applyWrite = useCallback(
     (resp: WriteResp, verb: string) => {
+      // A response can arrive after a newer GET retired this record. A
+      // successful current read, not an older write response, restores it.
+      if (resources.issue(resp.issue.id).get().discarded) {
+        void resources.issue(resp.issue.id).invalidate();
+        invalidatePersonal();
+        return;
+      }
       resources.issues.mutate((prev) => {
         const i = prev.findIndex((c) => c.id === resp.card.id);
         if (i === -1) return [...prev, resp.card];
@@ -495,6 +573,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         return next;
       });
       resources.issue(resp.issue.id).write(() => resp.issue);
+      resources.myWork.mutate((body) => mergePersonalCard(body, resp.card));
       const warns = (resp.warnings ?? []).filter(Boolean);
       if (warns.length) {
         say("warn", `${verb} · ${warns.join(" · ")}`);
@@ -502,7 +581,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         say("ok", verb);
       }
     },
-    [say],
+    [say, invalidatePersonal],
   );
 
   const writeError = useCallback(
@@ -510,7 +589,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       const err = e as ApiError;
       // A conflict carries the fresh card — resync so the board shows
       // the state that won.
-      if (err.card) {
+      if (err.card && !resources.issue(err.card.id).get().discarded) {
         resources.issues.mutate((prev) => {
           const i = prev.findIndex((c) => c.id === err.card!.id);
           if (i === -1) return prev;
@@ -518,6 +597,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           next[i] = err.card!;
           return next;
         });
+        resources.myWork.mutate((body) => mergePersonalCard(body, err.card!));
       }
       say("err", `${verb} failed: ${err.message ?? e}`);
     },
@@ -551,6 +631,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
 
   const openIssue = useCallback((id: string) => update((c) => ({ ...c, openId: id })), []);
   const closeIssue = useCallback(() => update((c) => ({ ...c, openId: null })), []);
+  const rememberPersonal = useCallback((id: string) => {
+    personalReturn.current = { id, scroll: window.scrollY };
+  }, []);
+  const openPersonal = useCallback((id: string) => {
+    rememberPersonal(id);
+    openIssue(id);
+  }, [rememberPersonal, openIssue]);
   const openAgent = useCallback(
     (alias: string | null) => update((c) => ({ ...c, route: { screen: "agents", alias } })),
     [],
@@ -629,14 +716,21 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // Loading, error and ready stay separate: a failed refresh keeps the last
   // good list and says so; a busy daemon is retried before it does.
   // Only the operator may read the list; member and agent sessions would get a
-  // 403 and a permanent notice, so they do not ask.
+  // 403 and a permanent notice, so they do not ask. CAD-1537: a signed-in
+  // viewer of a `--read-only` board reads it as the operator's session does.
+  const screenReader = meta?.operator === false && meta.signed_in === true &&
+    (meta.session?.user?.role === "member" || boardReadOnly);
   const [appsTick, setAppsTick] = useState(0);
   useEffect(() => {
     const bump = () => setAppsTick((n) => n + 1);
     window.addEventListener(APPS_CHANGED_EVENT, bump);
     return () => window.removeEventListener(APPS_CHANGED_EVENT, bump);
   }, []);
-  const installations = useInstallations(meta?.operator === true, `${route.screen}:${appsTick}`);
+  const listReader = meta?.operator === true || screenReader;
+  // CAD-1537: a member resolves app keys from `/api/app-home`, never the
+  // operator-only installed-app list.
+  const memberHome = screenReader && !boardReadOnly;
+  const installations = useInstallations(listReader, `${route.screen}:${appsTick}`, memberHome ? "home" : "list");
   // A soft-removed app is not an app to open: drop it from the menu.
   const installed: VerifiedApp[] = useMemo(
     () => (installations.list ?? []).filter((i) => i.removed == null).map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })),
@@ -677,10 +771,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     operator: meta?.operator ?? null,
     access: metaUnavailable ? ("unavailable" as const) : ("checking" as const),
     onRetryAccess: retryAccess,
+    screenReader,
   };
   const [last, setLast] = useState<LastApp | null>(() => readLastApp());
   const selectedMenuApp = menuApps.find((app) => app.installId === activeId);
-  const activeSection = selectedMenuApp ? sectionFromSearch(selectedMenuApp.kind, search, selectedMenuApp.navigation) : null;
+  const activeSection = selectedMenuApp ? sectionFromSearch(search, selectedMenuApp.navigation) : null;
   useEffect(() => {
     if (activeId === null) return;
     setLast((prev) => {
@@ -873,11 +968,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             <ProjectFilter project={project} projects={projects} hrefFor={filterHref} />
           </div>
         )}
+        {screen === "myWork" && <MyWork onOpen={openPersonal} onDetails={rememberPersonal} />}
 
         {screen === "home" && (
           <Home
             readOnly={readOnly}
             hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
+            viewerSub={meta?.session?.user?.sub ?? null}
+            viewerIsMember={meta?.session?.user?.role === "member"}
+            sessionId={meta?.session?.id ?? null}
             overview={overviewState}
             onOpenIssue={openIssue}
             overviewHref={hrefFor({ screen: "overview" })}
@@ -1058,6 +1157,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             search={search}
             installations={installations}
             viewer={viewer}
+            // CAD-1537: a member resolves only the canonical app-key route;
+            // the retired id route stays unavailable to it.
+            listReader={listReader && !(memberHome && route.screen === "workspaceApp")}
             recheckFinished={recheckFinished}
             onRetryWorkspace={reload}
             onInstallation={reportInstallation}
@@ -1103,7 +1205,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <SectionTabs
             label="settings"
             tabs={[
-              { label: "Models", href: hrefFor({ screen: "settings", section: "models" }), on: route.section === "models" },
+              { label: "Agents", href: hrefFor({ screen: "settings", section: "models" }), on: route.section === "models" },
               { label: "Connections", href: hrefFor({ screen: "settings", section: "connections" }), on: route.section === "connections" },
               // CAD-1312: Email sending leaves the settings nav; its
               // /settings/email route and screen remain reachable directly.
@@ -1155,9 +1257,33 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           detail={detailState?.data?.id === openId ? detailState.data : null}
           readState={detailState}
           onRetry={() => void resources.issue(openId).refresh()}
+          myWork={screen === "myWork" ? {
+            owner: personalState?.data?.owner ?? "",
+            assignment: personalState?.data?.issues.find((row) => row.id === openId)?.assignment ?? null,
+            membership: !personalState?.data || personalState.inFlight || personalState.status === "stale" || personalState.status === "failed"
+              ? "checking"
+              : personalState.data.issues.some((row) => row.id === openId) ? "assigned" : "unassigned",
+            identityKey: personalIdentity,
+            drafts: personalDrafts,
+            draftKey: `${personalIdentity}:${openId}`,
+            onWrite: (resp, verb) => {
+              if (privateReadsAllowed() && privateSessionGeneration() === personalGeneration) applyWrite(resp, verb);
+            },
+            onError: (error, verb) => {
+              if (privateReadsAllowed() && privateSessionGeneration() === personalGeneration) {
+                writeError(error, verb);
+                if (error instanceof ApiError && (error.status === 401 || error.status === 403)) void recheck();
+              }
+            },
+            writeBlock: block,
+            onDraftChange: () => {
+              if (privateSessionGeneration() === personalGeneration) notifyPersonalDrafts((version) => version + 1);
+            },
+          } : undefined}
           href={(() => {
             const fromDetail = detailState?.data?.id === openId ? detailState.data.project : null;
-            const fromCard = issues.find((i) => i.id === openId)?.project ?? null;
+            const fromCard = personalState?.data?.issues.find((row) => row.id === openId)?.project
+              ?? issues.find((i) => i.id === openId)?.project ?? null;
             const key = fromDetail ?? fromCard ?? (project !== "all" ? project : null);
             return key ? issuePath(key, openId) : null;
           })()}
@@ -1176,6 +1302,7 @@ function WorkspaceAppEntry({
   search,
   installations,
   viewer,
+  listReader,
   recheckFinished,
   onRetryWorkspace,
   onInstallation,
@@ -1186,6 +1313,9 @@ function WorkspaceAppEntry({
   search: string;
   installations: InstallationsState;
   viewer: Viewer;
+  /** CAD-1537: this viewer may resolve an installed app (the operator, a
+   *  signed-in `--read-only` board viewer, or a member via app-home). */
+  listReader: boolean;
   recheckFinished: boolean;
   onRetryWorkspace: () => void;
   onInstallation: (installation: ActiveInstallation | null) => void;
@@ -1204,7 +1334,7 @@ function WorkspaceAppEntry({
       </main>
     );
   }
-  if (viewer.operator !== true) {
+  if (!listReader) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
         <h1 className="text-section font-semibold text-ink-100">{t(route.screen === "workspaceApp" ? "App link unavailable" : "App unavailable")}</h1>
@@ -1314,7 +1444,7 @@ function WorkspaceAppEntry({
       viewer={viewer}
       onInstallation={onInstallation}
     >
-      {(onMediaAttach) => <WorkspaceApp installId={installation.install_id} appKey={appKey} viewer={viewer} onBack={onBack} onMediaAttach={onMediaAttach} />}
+      {(onMediaAttach, contextId) => <WorkspaceApp installId={installation.install_id} appKey={appKey} viewer={viewer} onBack={onBack} contextId={contextId} onMediaAttach={onMediaAttach} />}
     </AppShell>
   );
 }

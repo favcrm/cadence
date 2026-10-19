@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { ApiError, api } from "../../lib/api";
-import { withPrivateOperation } from "../../lib/privateSession";
+import { onPrivateSessionReset, withPrivateOperation } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
 import { useResource } from "../../lib/useResource";
 import { navigate, useHref } from "../../lib/useLocation";
 import { fmtTime } from "../../lib/fmt";
 import { useWriteBlock } from "../auth/WriteGate";
 import { useTranslate } from "../../lib/locale";
-import { displayUiNotice, type UiNotice } from "../app-shell/campaign/useEmailDraft";
+import { displayUiNotice, type UiNotice } from "../../lib/uiNotice";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import NewHumanConversation from "./NewHumanConversation";
@@ -15,8 +15,13 @@ import Link from "../../ui/Link";
 import PageState from "../../ui/PageState";
 import { issuePath } from "../issues/model";
 import { IconClose, IconRefresh, IconSearch, IconThreads } from "../../ui/icons";
+import type { Agent } from "../../lib/types";
 import Composer from "../app-shell/chat/Composer";
+import { attachItems, removeAttach, setComposerContent } from "../app-shell/chat/composerStore";
 import { asEntry, newMessageId, type ThreadEntry } from "../home/thread";
+import AgentAvatar, { lookFor } from "../agents/AgentAvatar";
+import { activeTasks } from "../agents/AgentBlocks";
+import { lifecycleBadge, lifecycleOf } from "../agents/agentView";
 import { StageLabel, ThreadComposerFrame, Turn } from "./ThreadChatParts";
 import {
   changeSubscriber,
@@ -39,11 +44,16 @@ import {
   threadsRevisionNow,
 } from "./threadsClient";
 import {
+  boundedQuote,
+  contextualReplyText,
   conversationTitle,
+  dmExpectation,
   kindFilterMatches,
   operatorDmAlias,
+  operatorDmParticipant,
   participantLabel,
   readThreadsUrl,
+  replyTarget,
   threadsUrlSearch,
   type ThreadsUrlState,
 } from "./threadsView";
@@ -66,11 +76,74 @@ import "./threads.css";
  * the same panel opens in a native dialog (Context).
  *
  * Authority is the daemon's. The page only issues operator requests and
- * shows what the daemon answers. Agent pairs are read-only (Reply opens the
- * agent's own page). A group post notifies; Ask agent sends one request to
- * one selected member.
+ * shows what the daemon answers. Agent pairs are read-only; a per-message
+ * "Reply as you" (CAD-1591) opens the operator's own DM pinned to that
+ * message's recorded sender, and the plain Message buttons open a generic
+ * DM with no context. A group post notifies; Ask agent sends one request
+ * to one selected member.
  */
 
+/** Envelope ids per composer scope, surviving a remount: a draft DM that
+ *  lands as a real row swaps components under the same `threads:<alias>`
+ *  key, and a repeat submit of the same envelope must reuse its client id
+ *  (the daemon's idempotency), not mint a new message. Bounded so a long
+ *  session can't grow it without limit. */
+const envelopeIds = new Map<string, { key: string; id: string }>();
+onPrivateSessionReset(() => envelopeIds.clear());
+function envelopeId(scope: string, contentKey: string): string {
+  const held = envelopeIds.get(scope);
+  if (held && held.key === contentKey) return held.id;
+  const id = newMessageId();
+  envelopeIds.delete(scope);
+  envelopeIds.set(scope, { key: contentKey, id });
+  if (envelopeIds.size > 64) {
+    const oldest = envelopeIds.keys().next().value;
+    if (oldest !== undefined) envelopeIds.delete(oldest);
+  }
+  return id;
+}
+
+
+/** CAD-1591 contextual "Reply as you" context: the recorded sender of one
+ *  pair-transcript message the operator is answering as themselves. The
+ *  captured uid is the recipient constraint (`expected_recipient_uid`) sent
+ *  on every attempt, so a replaced participant is refused, never silently
+ *  re-addressed. Held in page state — never the URL, so a reload or a
+ *  copied link cannot fabricate a reply context. */
+interface ReplyIntent {
+  /** The recipient's DM route: the recorded sender's alias. */
+  alias: string;
+  /** The recorded sender's durable uid — the recipient constraint. */
+  senderUid: string;
+  /** The recorded sender's display label for the strip. */
+  sender: string;
+  /** The original message's id, quoted in the strip and the sent text. */
+  messageId: string;
+  created: number;
+  /** The original body (the strip and the sent text bound it). */
+  body: string;
+  /** Back to the pair conversation under the list filters it was read
+   *  with — the strip's backlink. */
+  backHref: string;
+  conversationTitle: string;
+  /** Set when this intent's send was accepted; the context stays until an
+   *  explicit cancel so post-submit edits keep their reply context. */
+  sent?: boolean;
+}
+
+/** The composer scope of a contextual reply: the recorded sender uid and
+ *  the original message id, so an in-flight or parked reply bundle can
+ *  never land on the plain DM draft or another message's reply. */
+function replyScope(intent: Pick<ReplyIntent, "senderUid" | "messageId">): string {
+  return `threads-reply:${intent.senderUid}:${intent.messageId}`;
+}
+
+/** Drop one composer's draft bundle: text/refs and every queued row. Used
+ *  only for a scoped reply the operator explicitly cancels. */
+function clearScopedDraft(scope: string): void {
+  setComposerContent(scope, "", []);
+  for (const item of attachItems(scope)) removeAttach(scope, item.key);
+}
 export default function ThreadsPage({ operator }: { operator: boolean }) {
   const href = useHref();
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
@@ -102,6 +175,19 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
   const agents = useHumanAgents(human.me !== null);
   const [humanState, setHumanState] = useState<HumanRoomState | null>(null);
   const [humanRefresh, setHumanRefresh] = useState(0);
+  // CAD-1591: the one contextual reply in progress, bound to the recorded
+  // sender uid and original message id. Only rendered while its DM is the
+  // view, so a stale intent can never attach to another conversation.
+  const [replyIntent, setReplyIntent] = useState<ReplyIntent | null>(null);
+  // Late callbacks (a delayed draft-send landing on the canonical row)
+  // read the current intent through the ref, never a captured render.
+  const replyIntentRef = useRef<ReplyIntent | null>(null);
+  useEffect(() => {
+    replyIntentRef.current = replyIntent;
+  }, [replyIntent]);
+  // A private-session reset drops composer state page-wide; the reply
+  // context clears with it rather than pointing at a vanished draft.
+  useEffect(() => onPrivateSessionReset(() => setReplyIntent(null)), []);
   const onHumanState = useCallback((s: HumanRoomState) => setHumanState(s), []);
   const humanRoom = humanId ? humanRooms.rooms?.find((r) => r.id === humanId) ?? null : null;
   const humanContext = human.me && humanRoom && humanState !== null && humanState.id === humanId ? (
@@ -168,6 +254,7 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
   const visible = rows
     .filter((r) => kindFilterMatches(url.kind, r.kind))
     .filter((r) => (query.trim() === "" ? true : conversationTitle(r).toLowerCase().includes(query.trim().toLowerCase())));
+
   const open = rows.find((r) => r.id === url.conversation) ?? null;
   // The agents on the board: the live roster the filter and chooser name. A
   // removed agent is absent from it.
@@ -187,13 +274,77 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
 
   const setUrl = (next: Partial<typeof url>) =>
     navigate(`/threads${threadsUrlSearch({ ...url, ...next })}`, { replace: true });
-  // Open a You ↔ agent conversation by alias: the existing row if one exists,
-  // else the local draft (`?dm=`), so the page never creates an empty server row.
-  const openDm = (alias: string) => {
-    const row = rows.find((r) => r.kind === "operator" && operatorDmAlias(r) === alias);
+
+  // A `?dm=<alias>` deep link (from the Agents catalog) lands on the
+  // existing You ↔ agent row when one already exists: the draft state is
+  // only the not-yet-created case. The replace keeps the link copyable.
+  useEffect(() => {
+    if (existingDm && url.conversation === null) {
+      setUrl({ conversation: existingDm.id });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [existingDm, url.conversation]);
+  // Open a You ↔ agent conversation: the existing row if one exists for
+  // this participant, else the local draft (`?dm=`), so the page never
+  // creates an empty server row. A `uid` (CAD-1591 contextual reply) pins
+  // the recorded sender's durable identity — a same-alias row recorded
+  // for a different uid is a different agent and is never chosen.
+  const openDm = (alias: string, uid?: string) => {
+    const row = rows.find((r) => {
+      const p = operatorDmParticipant(r);
+      return p !== null && p.alias === alias && (uid === undefined || p.uid === uid);
+    });
     if (row) setUrl({ conversation: row.id });
     else navigate(draftHref(url, alias), { replace: true });
   };
+
+  // CAD-1591 "Reply as you": open the existing operator DM to the message's
+  // recorded sender with the original context held for the composer. A
+  // sender without a complete recorded identity is unreachable here — the
+  // row action is not even offered. The intent's draft is keyed by sender
+  // uid + message id, so an unrelated DM draft is never touched.
+  const startReply = (row: ConversationRow, message: ThreadMessage) => {
+    const target = replyTarget(message);
+    if (!target) return;
+    setReplyIntent({
+      alias: target.alias,
+      senderUid: target.uid,
+      sender: participantLabel(message.sender, t),
+      messageId: message.id,
+      created: message.created,
+      body: message.body,
+      // The backlink keeps the list filters the conversation was read
+      // under, so it resolves to the same row on the way back.
+      backHref: `/threads${threadsUrlSearch({ ...url, conversation: message.conversation || row.id })}`,
+      conversationTitle: conversationTitle(row, t),
+    });
+    openDm(target.alias, target.uid);
+  };
+  const cancelReply = () => {
+    if (replyIntent) clearScopedDraft(replyScope(replyIntent));
+    setReplyIntent(null);
+  };
+  // A contextual send completed: mark THAT intent sent — never a newer
+  // reply the operator started to another message while this one was in
+  // flight, and never a plain DM send. The intent (and its context) stays
+  // visible until an explicit cancel, so edits made after the submission
+  // keep their reply context in the scoped composer key.
+  const sentReply = (sent: ReplyIntent) => {
+    setReplyIntent((cur) => (cur !== null && cur === sent ? { ...cur, sent: true } : cur));
+  };
+
+  // The intent binds one recipient: the recorded sender's uid AND alias.
+  // A real `c=` row must be its operator DM — a same-alias row recorded
+  // for a different uid (a replaced participant) never shows the context.
+  // A `?dm=` draft of the matching alias still carries the captured uid
+  // through every send, so the daemon fences a replacement. Any other
+  // selection parks the intent invisibly.
+  const dmParticipant = open && open.kind === "operator" ? operatorDmParticipant(open) : null;
+  const dmReplyIntent =
+    replyIntent !== null &&
+    (open ? dmParticipant?.alias === replyIntent.alias && dmParticipant.uid === replyIntent.senderUid : draft === replyIntent.alias)
+      ? replyIntent
+      : null;
 
   if (!operator && human.me === null && human.loading) {
     return (
@@ -312,9 +463,14 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
               liveStamp={agentsTick}
               threadsTick={threadsTick}
               issueProjects={issueProjects}
+              agents={agentsState.data?.agents ?? null}
               onOpenContext={() => setContextOpen(true)}
               onChanged={() => void loadList()}
               openDm={openDm}
+              reply={dmReplyIntent}
+              onReplyStart={(m) => startReply(open, m)}
+              onReplyCancel={cancelReply}
+              onReplySent={sentReply}
             />
           ) : draft ? (
             <DraftDm
@@ -323,13 +479,29 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
               writeBlock={writeBlock}
               threadsTick={threadsTick}
               liveStamp={agentsTick}
+              issueProjects={issueProjects}
+              agents={agentsState.data?.agents ?? null}
+              reply={dmReplyIntent}
+              onReplyCancel={cancelReply}
+              onReplySent={sentReply}
               onSent={() => {
                 // The send created the thread: open its canonical row once listed.
                 void loadList().then((fresh) => {
                   // Only if the user is still on this draft: a late reply must not
                   // pull them off a conversation or draft they chose since.
                   if (currentSelection.current !== draft) return;
-                  const row = fresh?.find((r) => r.kind === "operator" && operatorDmAlias(r) === draft);
+                  // A contextual send also must not retarget a newer intent:
+                  // if the current reply binds another recipient or message
+                  // this draft's canonical navigation stays quiet.
+                  const intent = replyIntentRef.current;
+                  if (intent !== null && intent.alias !== draft) return;
+                  // A contextual draft names the recorded uid, so only the
+                  // canonical row of THAT participant is opened — a row
+                  // recorded for a same-alias replacement is not it.
+                  const row = fresh?.find((r) => {
+                    const p = operatorDmParticipant(r);
+                    return p !== null && p.alias === draft && (intent === null || p.uid === intent.senderUid);
+                  });
                   if (row) setUrl({ conversation: row.id });
                 });
               }}
@@ -337,7 +509,16 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
           ) : (
             <div className="threads-empty">
               <span aria-hidden><IconThreads size={28} /></span>
-              <p>{t("Select a conversation to read it.")}</p>
+              {draftAlias !== null ? (
+                <p>
+                  {agentsState.data === null
+                    ? t("Checking the agent roster…")
+                    : t("No registered agent named {alias} — the draft link may be stale.")
+                        .replace("{alias}", () => draftAlias)}
+                </p>
+              ) : (
+                <p>{t("Select a conversation to read it.")}</p>
+              )}
             </div>
           )}
         </main>
@@ -489,7 +670,6 @@ function rowDescriptor(row: ConversationRow, t: (english: string) => string = (e
 function initialOf(label: string): string {
   return label.trim().charAt(0).toUpperCase() || "?";
 }
-
 function Timeline({
   row,
   scope,
@@ -497,15 +677,23 @@ function Timeline({
   liveStamp,
   threadsTick,
   issueProjects,
+  agents,
   onOpenContext,
   onChanged,
   openDm,
+  reply,
+  onReplyStart,
+  onReplyCancel,
+  onReplySent,
 }: {
   row: ConversationRow;
   /** The list's filter context: the timeline reads the same scope. */
   scope: ConversationListFilter;
   writeBlock: string | null;
   issueProjects: IssueProjects;
+  /** The live roster (null while it loads): the DM's recipient context
+   *  strip reads it; a missing alias after load is honestly absent. */
+  agents: Agent[] | null;
   /** The live `agents` payload: a new object on every stream frame. */
   liveStamp: unknown;
   /** The `threads` frame revision: a topic or message change on any thread. */
@@ -513,6 +701,11 @@ function Timeline({
   openDm: (alias: string) => void;
   onOpenContext: () => void;
   onChanged: () => void;
+  /** The page's contextual reply when this view is its recipient DM. */
+  reply: ReplyIntent | null;
+  onReplyStart: (message: ThreadMessage) => void;
+  onReplyCancel: () => void;
+  onReplySent: (intent: ReplyIntent) => void;
 }) {
   const isGroup = row.kind === "group";
   const dm = operatorDmAlias(row);
@@ -644,6 +837,7 @@ function Timeline({
           </Button>
         </div>
       </header>
+      {dm && <DmContext alias={dm} agents={agents} issueProjects={issueProjects} />}
       <div className="threads-messages" aria-live="polite">
         {error ? (
           <p className="threads-note" role="status">{t("This conversation could not load:")} {error}</p>
@@ -655,10 +849,18 @@ function Timeline({
               <Button variant="ghost" size="sm" onClick={() => void loadEarlier()}>{t("Load earlier")}</Button>
             )}
             {dm
-              ? (entries ?? []).map((e) => <EntryRow key={e.seq} entry={e} />)
+              ? (entries ?? []).map((e) => <EntryRow key={e.seq} entry={e} issueProjects={issueProjects} />)
               : isGroup
                 ? (posts ?? []).map((p) => <PostRow key={p.id} post={p} />)
-                : (messages ?? []).map((m) => <MessageRow key={m.id} message={m} issueProjects={issueProjects} />)}
+                : (messages ?? []).map((m) => (
+                    <MessageRow
+                      key={m.id}
+                      message={m}
+                      issueProjects={issueProjects}
+                      writeBlock={writeBlock}
+                      onReply={row.kind === "pair" ? () => onReplyStart(m) : undefined}
+                    />
+                  ))}
             {isGroup
               ? (posts ?? []).length === 0 && <p className="threads-note">{t("No posts yet.")}</p>
               : (dm ? entries ?? [] : messages ?? []).length === 0 && <p className="threads-note">{t("No messages yet.")}</p>}
@@ -666,9 +868,17 @@ function Timeline({
         )}
       </div>
       {row.kind === "operator" && dm && (
-        <OperatorComposer alias={dm} writeBlock={writeBlock} onSent={reload} />
+        <OperatorComposer
+          alias={dm}
+          agent={agents?.find((a) => a.alias === dm)}
+          writeBlock={writeBlock}
+          onSent={reload}
+          reply={reply}
+          onReplyCancel={onReplyCancel}
+          onReplySent={onReplySent}
+        />
       )}
-      {row.kind === "pair" && <ReplyBar row={row} openDm={openDm} />}
+      {row.kind === "pair" && <ReplyBar row={row} openDm={openDm} writeBlock={writeBlock} />}
       {isGroup && (
         <GroupComposer
           row={row}
@@ -712,28 +922,75 @@ function mergeBySeq<T extends { seq: number }>(cur: T[] | null, incoming: T[]): 
 }
 
 /** Stages the daemon's `payload.delivery` may carry and the page shows. */
-const STAGES = new Set<string>(["queued", "running", "completed", "failed", "unknown", "refused"]);
+const STAGES = new Set<string>(["queued", "claimed", "available", "running", "completed", "failed", "unknown", "refused", "interrupted"]);
 
 /** An operator DM entry from the agent's thread. Its stage is the daemon's
  *  `payload.delivery.state`, present only for a message-linked entry; an
- *  unlinked entry or an unknown state shows no stage. */
-function EntryRow({ entry }: { entry: ThreadEntry }) {
+ *  unlinked entry or an unknown state shows no stage. `payload.refs` are
+ *  the cited subjects the send carried, and a verified `payload.human`
+ *  the recorded owner behind an owner write — both shown, never inferred. */
+function EntryRow({ entry, issueProjects }: { entry: ThreadEntry; issueProjects: IssueProjects }) {
   const t = useTranslate();
-  const who = entry.role === "operator" ? t("You") : entry.role === "agent" ? t("Agent") : t("System");
   const delivery = entry.payload?.delivery as { state?: unknown } | undefined;
   const stage = typeof delivery?.state === "string" && STAGES.has(delivery.state) ? delivery.state : null;
+  const refs = Array.isArray(entry.payload?.refs)
+    ? (entry.payload.refs as { kind?: unknown; id?: unknown }[]).filter(
+        (r): r is { kind: string; id: string } => typeof r?.kind === "string" && typeof r?.id === "string",
+      )
+    : [];
+  const human = entry.payload?.human as { display?: unknown } | null | undefined;
+  const senderName =
+    entry.role === "operator" && typeof human?.display === "string" && human.display.trim() !== ""
+      ? human.display
+      : null;
+  const who = entry.role === "operator"
+    ? senderName ?? t("Operator (name unknown)")
+    : entry.role === "agent" ? t("Agent") : t("System");
   return (
     <article className="threads-msg" data-role={entry.role}>
       <Turn who={who} at={entry.created ? fmtTime(entry.created) : undefined} me={entry.role === "operator"} state={stage}>
         {entry.text}
       </Turn>
+      {refs.length > 0 && (
+        <div className="threads-refs">
+          {refs.map((r) => {
+            const project = r.kind === "issue" ? issueProjects.get(r.id) : undefined;
+            return project ? (
+              <Link key={`${r.kind}:${r.id}`} href={issuePath(project, r.id)} className="threads-ref">{r.id}</Link>
+            ) : (
+              <span key={`${r.kind}:${r.id}`} className="threads-ref">
+                {r.kind === "issue" ? r.id : `${r.kind}:${r.id}`}
+              </span>
+            );
+          })}
+        </div>
+      )}
     </article>
   );
 }
 
-function MessageRow({ message, issueProjects }: { message: ThreadMessage; issueProjects: IssueProjects }) {
+function MessageRow({
+  message,
+  issueProjects,
+  writeBlock,
+  onReply,
+}: {
+  message: ThreadMessage;
+  issueProjects: IssueProjects;
+  writeBlock: string | null;
+  /** Set only in a pair timeline: opens the contextual operator reply. */
+  onReply?: () => void;
+}) {
   const t = useTranslate();
   const issueProject = message.issue ? issueProjects.get(message.issue) : undefined;
+  const routed = (message.routed ?? []).filter((r) => typeof r.id === "string");
+  const recipient =
+    message.recipient && message.recipient.kind !== "unknown"
+      ? participantLabel(message.recipient, t)
+      : null;
+  // CAD-1591: a contextual reply is offered only where the recorded sender
+  // identity pins a real recipient (agent kind, non-removed, uid + alias).
+  const replyTo = onReply ? replyTarget(message) : null;
   return (
     <article className="threads-msg" data-role={message.sender.kind} data-state={message.state}>
       <Turn
@@ -744,19 +1001,61 @@ function MessageRow({ message, issueProjects }: { message: ThreadMessage; issueP
       >
         {message.body}
       </Turn>
-      {(message.issue || message.task_id) && (
+      {(message.issue || message.task_id || message.origin || routed.length > 0 || recipient) && (
         <div className="threads-refs">
+          {recipient && (
+            <span className="threads-ref">
+              {t("To {name}").replace("{name}", () => recipient)}
+            </span>
+          )}
+          {message.origin && (
+            <span className="threads-ref">
+              {t("Reply to message {id}").replace("{id}", () => message.origin as string)}
+            </span>
+          )}
           {message.issue && (issueProject ? (
             <Link href={issuePath(issueProject, message.issue)} className="threads-ref">{message.issue}</Link>
           ) : (
             <span className="threads-ref">{message.issue}</span>
           ))}
           {message.task_id && <span className="threads-ref">{t("task {task}").replace("{task}", () => String(message.task_id))}</span>}
+          {routed.map((r) => (
+            <span key={r.id} className="threads-ref">
+              {t("Reply routed · {source}").replace("{source}", () => t(SOURCE_LABEL[r.source] ?? r.source))}
+              {" — "}
+              <StageLabel state={receiptState(r.state)} />
+            </span>
+          ))}
         </div>
       )}
+      {replyTo && (
+        <div className="threads-msg-actions">
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={writeBlock !== null}
+            title={writeBlock ?? undefined}
+            onClick={onReply}
+          >
+            {t("Reply as you")}
+          </Button>
+        </div>
+      )}
+      {message.error && <p className="threads-msg-error" role="status">{message.error}</p>}
     </article>
   );
 }
+
+/** A routed copy's `source` as a readable label; unknown values stay verbatim. */
+const SOURCE_LABEL: Record<string, string> = {
+  worker_result: "worker result",
+  worker_notice: "worker notice",
+  job_event: "job event",
+  nudge: "nudge",
+  topic_notice: "topic notice",
+  kickoff: "kickoff",
+  job_dispatch: "job dispatch",
+};
 
 /** Every delivery state, in display order: attention states first. */
 const RECEIPT_ORDER: DeliveryState[] = ["failed", "refused", "interrupted", "unknown", "pending", "queued", "claimed", "running", "available", "completed"];
@@ -833,53 +1132,226 @@ function DeliveryFeedback({ deliveries }: { deliveries: PostDelivery[] }) {
 
 function OperatorComposer({
   alias,
+  agent,
   writeBlock,
   onSent,
+  reply,
+  onReplyCancel,
+  onReplySent,
 }: {
   alias: string;
+  /** The recipient's roster row when it is live, else undefined. */
+  agent?: Agent;
   writeBlock: string | null;
   onSent: () => void;
+  /** The contextual reply this DM view is carrying, else null. */
+  reply?: ReplyIntent | null;
+  onReplyCancel?: () => void;
+  onReplySent?: (intent: ReplyIntent) => void;
 }) {
   // One client id per logical envelope: an exact retry after a failed
   // attempt reuses it (one DM, not two); any change to the submitted
-  // body, refs or attachments mints a new id.
-  const envelope = useRef<{ key: string; id: string } | null>(null);
+  // body, refs or attachments mints a new id. The id lives in a module
+  // map, so a draft→row remount of this composer keeps the same id.
   const t = useTranslate();
+  const [notice, setNotice] = useState<UiNotice | null>(null);
+  // A contextual reply owns its own composer scope (sender uid + original
+  // message id): the plain DM draft is untouched, and a parked or
+  // in-flight reply can never migrate into another conversation.
+  const scope = reply ? replyScope(reply) : `threads:${alias}`;
   return (
-    <Composer
-      density="full"
-      block={writeBlock}
-      storeKey={`threads:${alias}`}
-      onSend={async ({ body, refs, attachments }) => {
-        const key = JSON.stringify({ alias, body: body.trim(), refs, attachments: attachments ?? [] });
-        if (envelope.current?.key !== key) envelope.current = { key, id: newMessageId() };
-        await withPrivateOperation(async (op) => {
-          await api.threadSend(alias, body, envelope.current!.id, refs, undefined, undefined, attachments, op);
-          op.assertCurrent();
-          envelope.current = null;
-          onSent();
-        });
-      }}
-      refocusAfterSend
-      attach
-      ariaLabel={t("Message to {alias}").replace("{alias}", () => alias)}
-      placeholder={t("Message {alias}…").replace("{alias}", () => alias)}
-      className="card p-2.5 relative"
-    />
+    <ThreadComposerFrame
+      showModes={false}
+      allowAsk={false}
+      helper={t(dmExpectation(agent))}
+      notice={notice ? displayUiNotice(notice, t) : null}
+    >
+      {reply && onReplyCancel && <ReplyStrip reply={reply} onCancel={onReplyCancel} />}
+      <Composer
+        density="full"
+        block={writeBlock}
+        storeKey={scope}
+        onSend={async ({ body, refs, attachments }) => {
+          // A contextual reply sends the typed text plus the bounded quote
+          // as ordinary message text — context, never a routing field.
+          const text = reply
+            ? contextualReplyText(body.trim(), { id: reply.messageId, body: reply.body })
+            : body;
+          const key = JSON.stringify({ alias, body: text, refs, attachments: attachments ?? [], reply: reply?.messageId ?? null });
+          const id = envelopeId(scope, key);
+          try {
+            await withPrivateOperation(async (op) => {
+              // The captured sender uid pins the recipient on every attempt
+              // — plain sends carry no constraint.
+              await api.threadSend(alias, text, id, refs, undefined, undefined, attachments, op, undefined, reply?.senderUid);
+              op.assertCurrent();
+              envelopeIds.delete(scope);
+              onSent();
+              // Only a contextual send completes a reply, and only the
+              // exact intent this composer submitted — an older in-flight
+              // send can never clear a newer reply to another message.
+              if (reply) onReplySent?.(reply);
+            });
+            setNotice(null);
+          } catch (e) {
+            // A lost response cannot establish whether the server accepted it.
+            setNotice({
+              key: e instanceof ApiError && e.status >= 400 && e.status < 500
+                ? "Send refused. Your draft is kept. "
+                : "Delivery uncertain — check history before retrying. Your draft is kept. ",
+              detail: e instanceof Error ? e.message : String(e),
+            });
+            throw e;
+          }
+        }}
+        onNotice={setNotice}
+        refocusAfterSend
+        attach
+        ariaLabel={reply
+          ? t("Reply to {alias} as you").replace("{alias}", () => alias)
+          : t("Message to {alias}").replace("{alias}", () => alias)}
+        placeholder={reply
+          ? t("Reply as you to {alias}…").replace("{alias}", () => alias)
+          : t("Message {alias}…").replace("{alias}", () => alias)}
+        className="card p-2.5 relative"
+      />
+    </ThreadComposerFrame>
   );
 }
 
-/** Agent-to-agent conversations have no composer. Reply opens a direct message
- *  to one chosen participant, inside Threads. */
-function ReplyBar({ row, openDm }: { row: ConversationRow; openDm: (alias: string) => void }) {
+/** CAD-1591: the contextual reply banner above a DM composer. It names the
+ *  operator-authored reply explicitly ("Replying as you"), shows the
+ *  original message's id, time and a bounded excerpt, and links back to
+ *  the pair conversation it came from. The quote travels inside the sent
+ *  body as ordinary text — it is context, never a routing field. Cancel
+ *  drops the scoped reply draft and the context. */
+function ReplyStrip({ reply, onCancel }: { reply: ReplyIntent; onCancel: () => void }) {
+  const t = useTranslate();
+  return (
+    <div className="threads-replyctx">
+      <div className="threads-replyctx-head">
+        <strong>
+          {t("Replying as you to {alias}").replace("{alias}", () => reply.alias)}
+        </strong>
+        <Button variant="ghost" size="sm" onClick={onCancel}>
+          {t("Cancel reply")}
+        </Button>
+      </div>
+      <blockquote className="threads-replyctx-quote">
+        {boundedQuote(reply.body)}
+      </blockquote>
+      <div className="threads-replyctx-meta">
+        <span className="threads-ref">
+          {t("{sender} · message {id} · {at}")
+            .replace("{sender}", () => reply.sender)
+            .replace("{id}", () => reply.messageId)
+            .replace("{at}", () => fmtTime(reply.created))}
+        </span>
+        <Link href={reply.backHref} className="threads-ref">{reply.conversationTitle}</Link>
+      </div>
+      <p className="threads-note">
+        {reply.sent
+          ? t("Reply queued — the context stays until you cancel this reply.")
+          : t("Your message and this quote go to {alias} — nothing is sent as an agent.")
+              .replace("{alias}", () => reply.alias)}
+      </p>
+    </div>
+  );
+}
+
+
+/** The DM's recipient context strip: the live roster's avatar, lifecycle
+ *  badge and first active task as the recorded work context. An agent
+ *  absent from a loaded roster — removed or otherwise unregistered —
+ *  says so; while the roster is still loading nothing is claimed. */
+function DmContext({
+  alias,
+  agents,
+  issueProjects,
+}: {
+  alias: string;
+  /** The live roster; null while it loads. */
+  agents: Agent[] | null;
+  issueProjects: IssueProjects;
+}) {
+  const t = useTranslate();
+  const agent = agents?.find((a) => a.alias === alias);
+  const badge = agent ? lifecycleBadge(agent, t) : null;
+  const task = agent ? activeTasks(agent)[0] : undefined;
+  const issueProject = task?.issue ? issueProjects.get(task.issue) : undefined;
+  return (
+    <div className="threads-recipient">
+      {agent ? (
+        <AgentAvatar
+          slug={lookFor(agent.alias)}
+          active={lifecycleOf(agent) === "active"}
+          still={lifecycleOf(agent) !== "active"}
+          size={26}
+        />
+      ) : (
+        <span aria-hidden className="threads-avatar">{initialOf(alias)}</span>
+      )}
+      <span className="threads-recipient-line">
+        <strong>{t("To {alias}").replace("{alias}", () => alias)}</strong>
+        {badge && (
+          <span className={`stateb tone-${badge.tone}`}>
+            <i aria-hidden="true" />
+            {badge.label}
+          </span>
+        )}
+        {!agent && (
+          <span className="threads-ref">
+            {agents !== null
+              ? t("Not in the live roster — removed or unavailable")
+              : t("Loading roster…")}
+          </span>
+        )}
+      </span>
+      <span className="threads-recipient-work">
+        {task ? (
+          <>
+            {task.issue && issueProject ? (
+              <Link href={issuePath(issueProject, task.issue)} className="threads-ref">{task.issue}</Link>
+            ) : task.issue ? (
+              <span className="threads-ref">{task.issue}</span>
+            ) : null}
+            <span className="threads-ref">{task.title ?? task.task}</span>
+          </>
+        ) : agent ? (
+          <span className="threads-ref">{t("No recorded work context")}</span>
+        ) : null}
+      </span>
+    </div>
+  );
+}
+/** Agent-to-agent conversations have no composer. The honest generic
+ *  action opens a plain direct message to one chosen participant — no
+ *  reply context, no quote. Contextual replies live on each transcript
+ *  message ("Reply as you"), pinned to that message's recorded sender. */
+function ReplyBar({
+  row,
+  openDm,
+  writeBlock,
+}: {
+  row: ConversationRow;
+  openDm: (alias: string) => void;
+  writeBlock: string | null;
+}) {
   const t = useTranslate();
   const agents = row.participants.filter((p) => p.kind === "agent" && !p.removed && p.alias);
   return (
     <div className="threads-reply">
       <span>{t("Agent conversation · read only.")}</span>
       {agents.map((p) => (
-        <Button key={p.uid ?? p.alias ?? "agent"} variant="secondary" size="sm" onClick={() => openDm(p.alias as string)}>
-          {t("Reply to {alias}").replace("{alias}", () => p.alias as string)}
+        <Button
+          key={p.uid ?? p.alias ?? "agent"}
+          variant="secondary"
+          size="sm"
+          disabled={writeBlock !== null}
+          title={writeBlock ?? undefined}
+          onClick={() => openDm(p.alias as string)}
+        >
+          {t("Message {alias}").replace("{alias}", () => p.alias as string)}
         </Button>
       ))}
     </div>
@@ -930,13 +1402,25 @@ function DraftDm({
   writeBlock,
   threadsTick,
   liveStamp,
+  issueProjects,
+  agents,
   onSent,
+  reply,
+  onReplyCancel,
+  onReplySent,
 }: {
   alias: string;
   writeBlock: string | null;
   threadsTick: number;
   liveStamp: unknown;
+  issueProjects: IssueProjects;
+  /** The live roster; null while it loads. */
+  agents: Agent[] | null;
   onSent: () => void;
+  /** The contextual reply this draft view is carrying, else null. */
+  reply: ReplyIntent | null;
+  onReplyCancel: () => void;
+  onReplySent: (intent: ReplyIntent) => void;
 }) {
   const [entries, setEntries] = useState<ThreadEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -961,9 +1445,10 @@ function DraftDm({
   return (
     <div className="threads-timeline">
       <header className="threads-head">
-        <div className="threads-kicker">{KIND_LABEL.operator}</div>
+        <div className="threads-kicker">{t(KIND_LABEL.operator)}</div>
         <h2>{t("You ↔ {alias}").replace("{alias}", () => alias)}</h2>
       </header>
+      <DmContext alias={alias} agents={agents} issueProjects={issueProjects} />
       <div className="threads-messages" aria-live="polite">
         {error ? (
           <p className="threads-note" role="status">This conversation could not load: {error}</p>
@@ -971,12 +1456,20 @@ function DraftDm({
           <p className="threads-note">Loading…</p>
         ) : (
           <>
-            {entries.map((e) => <EntryRow key={e.seq} entry={e} />)}
+            {entries.map((e) => <EntryRow key={e.seq} entry={e} issueProjects={issueProjects} />)}
             {entries.length === 0 && <p className="threads-note">{t("No messages yet. Sending starts the thread.")}</p>}
           </>
         )}
       </div>
-      <OperatorComposer alias={alias} writeBlock={writeBlock} onSent={onSent} />
+      <OperatorComposer
+        alias={alias}
+        agent={agents?.find((a) => a.alias === alias)}
+        writeBlock={writeBlock}
+        onSent={onSent}
+        reply={reply}
+        onReplyCancel={onReplyCancel}
+        onReplySent={onReplySent}
+      />
     </div>
   );
 }
@@ -1008,8 +1501,6 @@ function GroupComposer({
   const [target, setTarget] = useState("");
   const t = useTranslate();
   const [notice, setNotice] = useState<UiNotice | null>(null);
-  // The id for the current envelope, reused on retry and reset when it changes.
-  const envelope = useRef<{ key: string; id: string } | null>(null);
   const noMembers = members.length === 0;
   const askBlocked = mode === "ask" && (noMembers || !members.some((m) => m.alias === target));
 
@@ -1025,8 +1516,8 @@ function GroupComposer({
       targetOptions={members.map((m) => ({ id: m.alias as string, label: m.alias as string }))}
       targetPlaceholder={noMembers ? t("No current members") : t("Choose a member")}
       helper={mode === "post"
-        ? "A post notifies members. It does not start agents."
-        : "One request, to the member you choose. Nothing else is sent."}
+        ? t("A post notifies members. It does not start agents.")
+        : t("One request, to the member you choose. Nothing else is sent.")}
       notice={notice ? displayUiNotice(notice, t) : null}
     >
       <Composer
@@ -1034,17 +1525,22 @@ function GroupComposer({
         block={writeBlock !== null ? writeBlock : askBlocked ? "Choose a current member to ask" : null}
         storeKey={`threads-group:${row.id}`}
         onSend={async ({ body }) => {
-          const key = groupEnvelopeKey(mode, target, body);
-          if (envelope.current?.key !== key) envelope.current = { key, id: newMessageId() };
-          const id = envelope.current.id;
-          if (mode === "ask") {
-            await requestFromTopic(row.id, target, body, id);
+          const scope = `threads-group:${row.id}`;
+          const id = envelopeId(scope, groupEnvelopeKey(mode, target, body));
+          try {
+            if (mode === "ask") {
+              await requestFromTopic(row.id, target, body, id);
+            } else {
+              await postToTopic(row.id, body, id);
+            }
+            envelopeIds.delete(scope);
+            setNotice(null);
             onSent();
-          } else {
-            await postToTopic(row.id, body, id);
-            onSent();
+          } catch (e) {
+            // The draft stays for an explicit same-id retry; say why it failed.
+            setNotice(e instanceof Error ? e.message : String(e));
+            throw e;
           }
-          envelope.current = null;
         }}
         onNotice={setNotice}
         refocusAfterSend

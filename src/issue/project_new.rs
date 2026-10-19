@@ -4,9 +4,17 @@
 //!
 //! The write runs in the daemon (`project_new` RPC), which decides who
 //! the caller is; this module is the tracker side and trusts the actor
-//! it is handed. `project.yaml` gets only the keys `project add` already
-//! writes (`key`, `prefix`, `repos`) — it is `deny_unknown_fields`, and
-//! an older binary would refuse a new key. The seeded gate keys equal
+//! it is handed.
+//!
+//! `project.yaml` is `deny_unknown_fields`. A new project therefore now
+//! records `id` and `policy` (AOS-274): an older Cadence refuses to parse
+//! such a project rather than silently ignoring a policy that hides its
+//! content. That refusal is the intended fail-closed behavior, not a
+//! regression. New projects are created workspace-visible only; the
+//! explicit visibility choice (and any private policy) is set by the
+//! visibility verb once the isolation gate passes.
+//!
+//! The seeded gate keys equal
 //! the defaults, so no `approve-work` step is needed.
 //!
 //! Idempotent: a second run with the same key and mode changes nothing.
@@ -379,6 +387,7 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
                         vec![project::Repo {
                             path: Some(root.to_string_lossy().to_string()),
                             remote: remote.clone(),
+                            base: None,
                         }]
                     })
                     .unwrap_or_default(),
@@ -388,6 +397,11 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
                 build: None,
                 memory: None,
                 intake: None,
+                // AOS-274: identity is minted once, and every project
+                // records an explicit policy. Only workspace-visible is
+                // created until the isolation gate passes.
+                id: Some(project::new_id()),
+                policy: Some(project::ProjectPolicy::workspace_visible()),
             })
             .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
             let file = dir.join("project.yaml");

@@ -137,6 +137,20 @@ impl RegistryFile {
     }
 }
 
+/// The saved default org, if the registry is already there. A missing
+/// file is "no saved org". This does not create the directory, the
+/// registry, or the lock, and it never changes the selection.
+pub(super) fn selected_org_readonly() -> Result<Option<String>> {
+    let path = match RegistryFile::path() {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(read_registry(&path)?.selected.map(|selected| selected.org))
+}
+
 /// Read and validate `orgs.json` at `path` — the body of
 /// `RegistryFile::read` split out so a read-only caller (`cadence
 /// update` routing) shares the exact shape checks without taking the
@@ -686,6 +700,77 @@ fn local_resolved(org: &str, state_dir: PathBuf, tracker_dir: PathBuf) -> Result
     Ok(Resolved::Local(state_dir))
 }
 
+/// Which local-maintenance command is resolving, so a remote selector can
+/// name that command. Not a mode framework: only `update` and `dev`.
+#[derive(Clone, Copy)]
+enum LocalMaintenance {
+    Update,
+    Dev,
+}
+
+impl LocalMaintenance {
+    fn remote_rejected(self, name: &str) -> Error {
+        match self {
+            // Kept byte-for-byte with the CAD-1355 update refusal.
+            Self::Update => Error::rejected(format!(
+                "`cadence update` maintains a local install only — org '{name}' \
+                 is remote. Run it on the host whose install you mean to update \
+                 (a local selection such as `CADENCE_ORG=local` works there)."
+            )),
+            Self::Dev => Error::rejected(format!(
+                "`cadence dev` runs a local disposable Cadence only — org '{name}' \
+                 is remote. A saved remote org does not select it. Omit the remote \
+                 `--org`/`CADENCE_ORG`, or choose local (for example `CADENCE_ORG=local`)."
+            )),
+        }
+    }
+
+    /// `update` keeps its pin arm: an explicit root wins and `CADENCE_ORG`
+    /// is not consulted. `dev` still keeps that root, but a remote
+    /// `CADENCE_ORG` beside it is a deliberate selection and must refuse
+    /// instead of being dropped on the floor.
+    fn refuse_remote_env_beside_pins(self) -> bool {
+        matches!(self, Self::Dev)
+    }
+}
+
+fn maintenance_pins(state: Option<&Path>, tracker: Option<&Path>) -> bool {
+    state.is_some()
+        || tracker.is_some()
+        || [
+            "CADENCE_STATE_DIR",
+            "CADENCE_PM_DIR",
+            "CADENCE_HOME",
+            "CADENCE_PROFILE",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+}
+
+/// `Some(name)` when `CADENCE_ORG` names a stored remote connection.
+/// `local`, a local connection, an unknown name, or a missing registry are
+/// not remote. A present but unreadable registry fails closed.
+fn remote_org_env() -> Result<Option<String>> {
+    let Some(name) = std::env::var("CADENCE_ORG").ok() else {
+        return Ok(None);
+    };
+    if name == LOCAL_ORG {
+        return Ok(None);
+    }
+    let registry = match RegistryFile::path() {
+        Ok(path) if path.exists() => read_registry(&path)?,
+        _ => return Ok(None),
+    };
+    Ok(registry
+        .connections
+        .iter()
+        .find(|c| c.selection.org == name)
+        .and_then(|c| match c.destination {
+            Destination::Remote { .. } => Some(name),
+            Destination::Local { .. } => None,
+        }))
+}
+
 /// CAD-1355: `cadence update` is local maintenance — a *saved* remote
 /// default must never route it. This resolves only for the updater:
 /// a managed caller keeps the pre-assignment rule (no `--org`, inherited
@@ -704,27 +789,52 @@ pub(super) fn resolve_update(
     state: Option<PathBuf>,
     tracker: Option<PathBuf>,
 ) -> Result<Resolved> {
+    resolve_local_maintenance(LocalMaintenance::Update, org, state, tracker)
+}
+
+/// `cadence dev` (`sandbox` alias) is local maintenance of a disposable
+/// Cadence. Same selector rules as [`resolve_update`], plus: a remote
+/// `CADENCE_ORG` is refused even when a local pin or managed inherited
+/// root is present, so that env is not silently discarded. `--org` on a
+/// pin still conflicts exactly as [`resolve`]; `--org` on a managed caller
+/// is still the managed-caller refusal, before any assignment lookup.
+pub(super) fn resolve_dev(
+    org: Option<&str>,
+    state: Option<PathBuf>,
+    tracker: Option<PathBuf>,
+) -> Result<Resolved> {
+    resolve_local_maintenance(LocalMaintenance::Dev, org, state, tracker)
+}
+
+fn resolve_local_maintenance(
+    command: LocalMaintenance,
+    org: Option<&str>,
+    state: Option<PathBuf>,
+    tracker: Option<PathBuf>,
+) -> Result<Resolved> {
     // Local maintenance never follows a hosted assignment selector.
     if std::env::var_os("CADENCE_ALIAS").is_some() {
         if org.is_some() {
             return Err(managed_org_refused());
+        }
+        if command.refuse_remote_env_beside_pins() {
+            if let Some(name) = remote_org_env()? {
+                return Err(command.remote_rejected(&name));
+            }
         }
         return state
             .map(Resolved::Local)
             .map(Ok)
             .unwrap_or_else(|| cadence_agent::client::state_dir().map(Resolved::Local));
     }
-    if state.is_some()
-        || tracker.is_some()
-        || [
-            "CADENCE_STATE_DIR",
-            "CADENCE_PM_DIR",
-            "CADENCE_HOME",
-            "CADENCE_PROFILE",
-        ]
-        .iter()
-        .any(|name| std::env::var_os(name).is_some())
-    {
+    if maintenance_pins(state.as_deref(), tracker.as_deref()) {
+        // A remote env beside a local pin is deliberate. `--org` is left
+        // to [`resolve`], which refuses the pin conflict before transport.
+        if org.is_none() && command.refuse_remote_env_beside_pins() {
+            if let Some(name) = remote_org_env()? {
+                return Err(command.remote_rejected(&name));
+            }
+        }
         return resolve(org, state, tracker);
     }
     let org_env = std::env::var("CADENCE_ORG").ok();
@@ -752,11 +862,7 @@ pub(super) fn resolve_update(
                     cadence_agent::client::state_dir().map(Resolved::Local)
                 }
                 None => Err(Error::rejected("unknown org")),
-                Some(Destination::Remote { .. }) => Err(Error::rejected(format!(
-                    "`cadence update` maintains a local install only — org '{name}' \
-                     is remote. Run it on the host whose install you mean to update \
-                     (a local selection such as `CADENCE_ORG=local` works there)."
-                ))),
+                Some(Destination::Remote { .. }) => Err(command.remote_rejected(name)),
             }
         }
         // No explicit selector: the saved default is a preference for

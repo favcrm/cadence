@@ -31,7 +31,7 @@
 //! gives the rollout order (the reader everywhere before the first
 //! `plan propose`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -290,6 +290,10 @@ pub fn propose(
     workflow: Option<&str>,
     allow: &crate::secret::Allowlist,
     actor: &str,
+    // CAD-225: ids a durable unattended intent reserved but never wrote
+    // (a crashed admission) — allocation must skip them so the intent
+    // stays reconcilable. Evaluated under the PM write lock.
+    avoid: &dyn Fn() -> Result<HashSet<String>>,
 ) -> Result<Value> {
     if text.len() > MAX_PLAN_BYTES {
         return Err(Error::rejected(format!(
@@ -305,7 +309,7 @@ pub fn propose(
             doc.tickets.len()
         )));
     }
-    let mut out = write::create_plan(pm, project_key, &doc, workflow, actor)?;
+    let mut out = write::create_plan(pm, project_key, &doc, workflow, actor, avoid)?;
     if !warnings.is_empty() {
         out["secret_warnings"] = crate::secret::warnings_json(&warnings);
     }

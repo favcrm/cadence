@@ -3,7 +3,7 @@
 //! One JSON object per line over a Unix-domain socket. Each request is
 //! `{"method": ..., "params": {...}}`; each response is either
 //! `{"ok": true, "result": ...}` or `{"ok": false, "error": {"kind", "message"}}`.
-//! See docs/PROTOCOL.md for the full contract.
+//! See docs/ARCHITECTURE.md for the surrounding boundaries.
 
 use serde_json::{json, Value};
 

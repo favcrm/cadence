@@ -1,8 +1,8 @@
 //! CAD-1019 slice 2: dispatch for a `Remote` org selection — maps the
 //! allowlisted local commands to AOS-128 verbs and runs them through
-//! [`cadence_agent::remote_cli`]. Anything outside the read-only allowlist
-//! is refused *here*, before a request is ever built — remote writes land
-//! in their own slice, and operator-only verbs never do.
+//! [`cadence_agent::remote_cli`]. Anything outside the allowlist is refused
+//! *here*, before a request is ever built. Operator-only verbs never map.
+//! `issue project policy` is `project_policy`; project add/list stay local.
 
 use super::*;
 use cadence_agent::wiki::cli::WikiAction;
@@ -22,6 +22,7 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
     }
     let mut args = serde_json::Map::new();
     let verb = match command {
+        Commands::MyWork => "my_work",
         Commands::Status {
             group,
             all,
@@ -429,6 +430,32 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             args.insert("if_rev".into(), json!(rev));
             "issue_set"
         }
+        Commands::Issue {
+            action:
+                cadence_agent::issue::cli::IssueAction::Project {
+                    action:
+                        cadence_agent::issue::cli::ProjectAction::Policy {
+                            key,
+                            visibility,
+                            grants,
+                        },
+                },
+        } => {
+            // Exact shared arguments. Visibility is the canonical spelling
+            // (`workspace-visible` | `private`), never the serde rename of
+            // the tracker enum. Grants replace the recorded list; an empty
+            // list is sent as `[]`, not omitted. No role, actor, or org.
+            let visibility = match visibility {
+                cadence_agent::issue::cli::PolicyVisibility::WorkspaceVisible => {
+                    "workspace-visible"
+                }
+                cadence_agent::issue::cli::PolicyVisibility::Private => "private",
+            };
+            args.insert("project".into(), json!(key));
+            args.insert("visibility".into(), json!(visibility));
+            args.insert("grants".into(), json!(grants));
+            "project_policy"
+        }
         Commands::Message {
             action:
                 MessageAction::Read {
@@ -445,6 +472,54 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
                 args.insert("limit".into(), json!(n));
             }
             "message_read"
+        }
+        // CAD-1568: `cadence send` and `cadence message send` map to
+        // `message_send`. The remote send is a durable hosted enqueue:
+        // `--message` (the caller-chosen stable id) is REQUIRED so a lost
+        // reply can be reconciled by id instead of re-delivering blindly.
+        // The local-endpoint surfaces (`--ready`/`--force`/`--nudge`),
+        // local routing (`--reply-to`, `--task`) and the steering flags
+        // (`--priority`/`--supersedes`, an operator-or-PM gate the remote
+        // caller cannot satisfy) are refused before a request exists —
+        // never silently dropped onto the wire.
+        Commands::Send {
+            alias,
+            to,
+            text,
+            file,
+            message,
+            reply_to,
+            task,
+            ready,
+            force,
+            nudge,
+            steer,
+        } => {
+            let recipient = alias.as_deref().or(to.as_deref()).unwrap_or_default();
+            return remote_send_args(
+                recipient, text, file, message, reply_to, task, *ready, *force, *nudge, steer,
+            )
+            .map(|args| ("message_send", args));
+        }
+        Commands::Message {
+            action:
+                MessageAction::Send {
+                    alias,
+                    text,
+                    file,
+                    message,
+                    reply_to,
+                    task,
+                    ready,
+                    force,
+                    nudge,
+                    steer,
+                },
+        } => {
+            return remote_send_args(
+                alias, text, file, message, reply_to, task, *ready, *force, *nudge, steer,
+            )
+            .map(|args| ("message_send", args));
         }
         Commands::Inbox {
             alias,
@@ -512,9 +587,137 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             "message_inbox"
         }
         Commands::Team { action } => team_for(action, &mut args),
+        // CAD-1586: `cadence master status` on a remote org — the hosted
+        // `master_status` verb (settings.read) carrying only an optional
+        // grant id; it translates to the same `master.status` settings
+        // operation the local RPC path takes.
+        Commands::Master {
+            action: MasterAction::Status { grant },
+        } => {
+            if let Some(id) = grant {
+                args.insert("grant_id".into(), json!(id));
+            }
+            "master_status"
+        }
+        // CAD-1586: `cadence master resume` on a remote org — the bounded
+        // recovery action rides the existing `settings_agents` verb as
+        // operation `master.resume` (settings.write; no dedicated hosted
+        // verb, no caller-supplied alias).
+        Commands::Master {
+            action: MasterAction::Resume { grant },
+        } => {
+            args.insert("operation".into(), json!("master.resume"));
+            args.insert("expected_revision".into(), Value::Null);
+            let mut payload = serde_json::Map::new();
+            if let Some(id) = grant {
+                payload.insert("grant_id".into(), json!(id));
+            }
+            args.insert("payload".into(), Value::Object(payload));
+            "settings_agents"
+        }
         _ => return Err(unavailable(command)),
     };
     Ok((verb, args))
+}
+
+/// CAD-1568: `send`/`message send` → `message_send` arguments. Exactly
+/// `{alias, text, message}` crosses the wire — three strings, the same
+/// recipient + body + stable-id the local `agent_send` call would take,
+/// minus every surface that cannot ride the remote envelope faithfully.
+/// Sender identity lives only in the verified envelope; no flag in this
+/// build may name a sender, a role, or a different recipient class.
+#[allow(clippy::too_many_arguments)]
+fn remote_send_args(
+    recipient: &str,
+    text: &Option<String>,
+    file: &Option<std::path::PathBuf>,
+    message: &Option<String>,
+    reply_to: &Option<String>,
+    task: &Option<String>,
+    ready: bool,
+    force: bool,
+    nudge: bool,
+    steer: &SteerArgs,
+) -> Result<serde_json::Map<String, Value>> {
+    if ready || force {
+        return Err(unsupported(
+            "send",
+            "--ready/--force",
+            "they claim a local pane — the remote send is a durable hosted enqueue",
+        ));
+    }
+    if nudge {
+        return Err(unsupported(
+            "send",
+            "--nudge",
+            "mid-turn steering pastes into a local endpoint; a remote send is a queued message",
+        ));
+    }
+    if steer.priority.is_some() || !steer.supersedes.is_empty() {
+        return Err(unsupported(
+            "send",
+            "--priority/--supersedes",
+            "steering ranks need the local operator-or-PM gate, which a remote call never carries",
+        ));
+    }
+    if reply_to.is_some() {
+        return Err(unsupported(
+            "send",
+            "--reply-to",
+            "the remote send has no result-routing surface — read the outcome with \
+             `cadence message read <id> --org <org>`",
+        ));
+    }
+    if task.is_some() {
+        return Err(unsupported(
+            "send",
+            "--task",
+            "a remote send cannot bind to a local job task",
+        ));
+    }
+    let Some(id) = message.as_deref().map(str::trim).filter(|m| !m.is_empty()) else {
+        return Err(Error::rejected(
+            "remote `send` needs an explicit --message <id> — a stable caller-chosen id is \
+             the reconciliation key if the reply is lost. Pick one (1-64 lowercase letters, \
+             digits or hyphens, not starting with '-', never `sys-*`) and reuse it to retry \
+             this exact send; nothing was sent",
+        ));
+    };
+    let id = cadence_agent::proto::identifier(id, "--message")?;
+    if id.starts_with(cadence_agent::proto::DAEMON_MESSAGE_PREFIX) {
+        return Err(Error::rejected(
+            "--message may not start with `sys-` — that prefix is daemon-reserved; \
+             pick another id",
+        ));
+    }
+    if recipient.trim().is_empty() {
+        return Err(Error::rejected(
+            "remote `send` needs a recipient alias — nothing was sent",
+        ));
+    }
+    // Body: `--text` verbatim, or a client-side file/stdin read bounded by
+    // the daemon's enqueue cap — a hosted caller has no file access, and an
+    // oversized body is refused whole rather than truncated (no silent cut).
+    let body = read_body_capped(
+        text.clone(),
+        file.clone(),
+        cadence_agent::store::ENQUEUE_BYTES as u64,
+    )?;
+    if body.len() > cadence_agent::store::ENQUEUE_BYTES {
+        return Err(Error::rejected(
+            "message body exceeds the enqueue cap — trim it; nothing was sent",
+        ));
+    }
+    if body.trim().is_empty() {
+        return Err(Error::rejected(
+            "message body is empty — pass --text or --file; nothing was sent",
+        ));
+    }
+    let mut args = serde_json::Map::new();
+    args.insert("alias".into(), json!(recipient));
+    args.insert("text".into(), json!(body));
+    args.insert("message".into(), json!(id));
+    Ok(args)
 }
 
 /// `cadence wiki …` → the contract action (CAD-1401). `ls` and `search` are
@@ -971,9 +1174,11 @@ fn unavailable(command: &Commands) -> Error {
         "`cadence {}` is not available on a remote org in this build - \
          remote verbs are: status, agent list, agent show, issue ls, \
          issue show, issue log, issue new, issue comment, issue set, \
-         message read, inbox (peek), wiki ls, wiki search, wiki cat, \
-         wiki put (text), wiki cp, team list, team invites, team invite, \
-         team revoke-invite, team set-role, team remove. \
+         send/message send (--message required), message read, inbox (peek), \
+         issue project policy, wiki ls, wiki search, wiki cat, \
+         wiki put (text), wiki cp, settings agents <verb>, master status, \
+         team list, team invites, team invite, team revoke-invite, \
+         team set-role, team remove. \
          Use `--org local` or `cadence org switch` to run locally.",
         name(command)
     ))
@@ -1012,6 +1217,8 @@ fn name(command: &Commands) -> &'static str {
         Commands::Inbox { .. } => "inbox",
         Commands::Status { .. } => "status",
         Commands::Team { .. } => "team <verb>",
+        Commands::Settings { .. } => "settings agents <verb>",
+        Commands::Master { .. } => "master <verb>",
         _ => "<command>",
     }
 }
@@ -1029,6 +1236,49 @@ pub(super) fn run(
 ) -> Result<i32> {
     if let Commands::Org { action } = command {
         return org::run(action);
+    }
+    // CAD-1586: remote settings authority is the stored LOGIN credential —
+    // the gateway mints an envelope from it, and a `user`+`owner` envelope
+    // lands as RemoteOwner: blanket settings authority with no agent
+    // grant binding. A managed caller (CADENCE_ALIAS — worker, master or
+    // a daemon-approved argv child under CADENCE_GRANT_TOKEN) spending it
+    // would impersonate the human owner. There is no client-side
+    // agents/<h> credential path yet (remote_auth notes per-agent
+    // enrollment is not configured), so remote settings verbs are refused
+    // for managed callers outright — never narrowed to "no grant" and
+    // never silently allowed. Operators on their own shell unaffected.
+    if (matches!(&command, Commands::Settings { .. })
+        || matches!(
+            &command,
+            Commands::Master {
+                action: MasterAction::Status { .. } | MasterAction::Resume { .. },
+            }
+        ))
+        && (target.identity.is_some()
+            || std::env::var_os("CADENCE_ALIAS").is_some()
+            || std::env::var_os("CADENCE_GRANT_TOKEN").is_some())
+    {
+        return Err(Error::invalid(
+            "settings_agent_session_required",
+            format!(
+                "remote `{}` refused for a managed caller: the call would spend the \
+             stored owner login — owner-class settings authority an agent can \
+             never hold — and there is no hosted agent-principal credential to \
+             bind a settings grant to yet; the operator runs this from a plain \
+             shell, or grant-bound ops run on the local daemon (`cadence \
+             settings agents grant request …`)",
+                name(&command)
+            ),
+        ));
+    }
+    // CAD-1586: resource commands carry their payloads directly through the
+    // explicit `settings_agents` verb before the generic
+    // verb map; nothing settings-shaped ever falls back to local state.
+    if let Commands::Settings {
+        action: settings::SettingsAction::Agents { action, grant },
+    } = &command
+    {
+        return settings::run_remote(&target, action, grant, wake_timeout, local_state.as_deref());
     }
     if let Commands::LocalAgent { action } = &command {
         return local_agent::run(&target, action, wake_timeout, local_state);
@@ -1119,6 +1369,19 @@ pub(super) fn run(
         );
     }
     let (verb, args) = verb_for(&command)?;
+    // CAD-1568: a remote send keeps its caller-chosen `--message` id for
+    // reconciliation. An `unknown` outcome — the response was lost after
+    // the call was attempted — may have recorded the message anyway; the
+    // note names the id and the readback so the caller reconciles by id
+    // instead of resubmitting a possible duplicate. Definite refusals
+    // (`rejected`) and pre-forward `busy` verdicts name their own remedy.
+    let send_key = (verb == "message_send")
+        .then(|| {
+            args.get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten();
     let deadline = std::time::Instant::now()
         .checked_add(std::time::Duration::from_secs(wake_timeout))
         .ok_or_else(|| Error::rejected("invalid wake timeout"))?;
@@ -1131,7 +1394,19 @@ pub(super) fn run(
         |line| eprintln!("{line}"),
     ) {
         Ok(out) => out,
-        Err(error) => return remote_failure(error),
+        Err(error) => {
+            if let Some(id) = send_key.filter(|_| error.kind() == "unknown") {
+                eprintln!(
+                    "remote send `{id}` was not confirmed — it may or may not have \
+                     been recorded. Reconcile before resubmitting: `cadence message \
+                     read {id} --org {}` returns your durable message and its state. \
+                     If nothing is recorded, retry `send` with the same --message {id} \
+                     — the same id and content does not enqueue another message.",
+                    target.org
+                );
+            }
+            return remote_failure(error);
+        }
     };
     match out {
         cadence_agent::remote_cli::RemoteAnswer::Ok(body) => {
@@ -1163,7 +1438,7 @@ pub(super) fn run(
     }
 }
 
-fn remote_failure(error: Error) -> Result<i32> {
+pub(super) fn remote_failure(error: Error) -> Result<i32> {
     if error.kind() == "busy" && error.code() == Some("waking") {
         eprintln!("{}", json!({"kind": "busy", "state": "waking"}));
         Ok(75)
@@ -1601,6 +1876,142 @@ mod read_contract_tests {
         }
         let (verb, _) = outcome(&inbox_cmd(Some("m"), true, None, 0, false, None, None)).unwrap();
         assert_eq!(verb, "message_inbox");
+    }
+
+    #[test]
+    fn remote_project_add_and_list_stay_unmapped() {
+        use cadence_agent::issue::cli::ProjectAction;
+        let add = outcome(&Commands::Issue {
+            action: IssueAction::Project {
+                action: ProjectAction::Add {
+                    key: "cadence".into(),
+                    prefix: "CAD".into(),
+                    repos: vec![],
+                    components: vec![],
+                    tags: vec![],
+                    owner: None,
+                },
+            },
+        })
+        .unwrap_err();
+        assert!(add.contains("not available on a remote org"), "{add}");
+        let ls = outcome(&Commands::Issue {
+            action: IssueAction::Project {
+                action: ProjectAction::Ls {
+                    sort: None,
+                    limit: None,
+                    fields: vec![],
+                    json: false,
+                },
+            },
+        })
+        .unwrap_err();
+        assert!(ls.contains("not available on a remote org"), "{ls}");
+    }
+
+    /// CAD-1568: `cadence send`/`message send` become `message_send` with
+    /// exactly `alias`+`text`+`message`. `--message` is required: it is the
+    /// stable key a lost reply reconciles by and a safe resubmission dedupes
+    /// under. Every local-only surface is refused before a request exists.
+    fn send_cmd(f: impl FnOnce(&mut Commands)) -> Commands {
+        let mut command = Commands::Send {
+            alias: Some("master".into()),
+            to: None,
+            text: Some("please coordinate".into()),
+            file: None,
+            message: Some("cad1568-proof-1".into()),
+            reply_to: None,
+            task: None,
+            ready: false,
+            force: false,
+            nudge: false,
+            steer: SteerArgs::default(),
+        };
+        f(&mut command);
+        command
+    }
+
+    #[test]
+    fn remote_send_requires_an_explicit_stable_message_id() {
+        let missing_id = send_cmd(|c| {
+            let Commands::Send { message, .. } = c else {
+                unreachable!()
+            };
+            *message = None;
+        });
+        assert!(outcome(&missing_id).is_err());
+        let reserved_id = send_cmd(|c| {
+            let Commands::Send { message, .. } = c else {
+                unreachable!()
+            };
+            *message = Some("sys-wake-9".into());
+        });
+        assert!(outcome(&reserved_id).is_err());
+    }
+
+    #[test]
+    fn remote_send_refuses_local_only_flags_before_any_request() {
+        let cases: [fn(&mut Commands); 6] = [
+            |c| {
+                let Commands::Send { ready, .. } = c else {
+                    unreachable!()
+                };
+                *ready = true;
+            },
+            |c| {
+                let Commands::Send { nudge, .. } = c else {
+                    unreachable!()
+                };
+                *nudge = true;
+            },
+            |c| {
+                let Commands::Send { steer, .. } = c else {
+                    unreachable!()
+                };
+                steer.priority = Some("urgent".into());
+            },
+            |c| {
+                let Commands::Send { steer, .. } = c else {
+                    unreachable!()
+                };
+                steer.supersedes = vec!["m1".into()];
+            },
+            |c| {
+                let Commands::Send { reply_to, .. } = c else {
+                    unreachable!()
+                };
+                *reply_to = Some("pm".into());
+            },
+            |c| {
+                let Commands::Send { task, .. } = c else {
+                    unreachable!()
+                };
+                *task = Some("j1-t1".into());
+            },
+        ];
+        for mutate in cases {
+            assert!(outcome(&send_cmd(mutate)).is_err());
+        }
+    }
+
+    #[test]
+    fn remote_send_refuses_missing_or_empty_body() {
+        let root = tempfile::tempdir().unwrap();
+        let missing_file = send_cmd(|c| {
+            let Commands::Send { text, file, .. } = c else {
+                unreachable!()
+            };
+            *text = None;
+            *file = Some(root.path().join("absent.md"));
+        });
+        assert!(outcome(&missing_file).is_err());
+        let empty_text = send_cmd(|c| {
+            let Commands::Send { text, .. } = c else {
+                unreachable!()
+            };
+            *text = Some("   ".into());
+        });
+        assert!(outcome(&empty_text).is_err());
     }
 
     #[test]

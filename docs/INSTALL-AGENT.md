@@ -187,7 +187,12 @@ check is the operator's own `gh` session, not Cadence remote credentials.
 ## Updates and current limits
 
 The native daemon updater is `cadence update [--to <sha>]`, the operator path
-for a host that runs the local daemon. `cadence upgrade` is recovery only.
+for a host that runs the local daemon. The same command synchronizes bundled
+public guidance for the activated build, including when the binary is already
+current and after rollback. `--check` does not write guidance. `cadence skill
+install` is only the manual repair. Updating the files does not reload an
+agent session that is already open. Client-only update does not install that
+guidance or start a daemon. `cadence upgrade` is recovery only.
 Both use the authenticated, attested internal CI channel. On macOS the native
 daemon updater is unsupported and refuses (it cannot prove the operator there
 without procfs); upgrade a macOS client with `install.sh --client-only` and

@@ -73,9 +73,31 @@ const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 /// retry is the only loop, and it fires only on a pre-forward `waking`
 /// verdict, re-minting because that refusal happens before the envelope is
 /// consumed. Anything else stays unresolved.
+///
+/// The cli.write half (`issue_new`/`issue_comment`/`issue_set`/
+/// `project_policy`/`message_send`/`team_*`) rides the same envelope — the
+/// caller's authority never travels as a request field, only inside the
+/// verified, single-use envelope. A failed or ambiguous call is never retried
+/// by the client: the wake retry is the only loop, and it fires only on a
+/// pre-forward `waking` verdict. Anything else — a timeout, a dropped
+/// connection, a 5xx after forward — stays explicitly unresolved: the
+/// mutation may or may not have landed, so reconcile before blindly
+/// re-issuing. For `project_policy`, reconcile by reading the project record;
+/// a refusal is final. For `message_send`, the caller-chosen `message` id in
+/// `arguments` is the reconciliation key: `message_read` returns the
+/// principal's own durable message by id, and resubmitting the same id
+/// dedupes server-side — never a blind replay. A 2xx proves the enqueue
+/// only as the complete correlated receipt
+/// ([`send_receipt_correlates`]): an absent, malformed or foreign-bound
+/// body is `unknown`, the same unresolved outcome a lost response has.
+///
+/// CAD-1586 / AOS-290: `settings_agents` and `master_status` mint narrow
+/// `settings.*` envelopes (per operation, never the broad `cli.*` pair) —
+/// see [`settings_op_scope`].
 pub const REMOTE_VERBS: &[&str] = &[
     // cli.read
     "status",
+    "my_work",
     "agent_list",
     "agent_show",
     "issue_ls",
@@ -93,6 +115,11 @@ pub const REMOTE_VERBS: &[&str] = &[
     "team_revoke_invite",
     "team_set_role",
     "team_remove",
+    "project_policy",
+    "message_send",
+    // CAD-1586 / AOS-290: scoped settings + master diagnostics.
+    "settings_agents",
+    "master_status",
 ];
 
 /// Scope a cli authorize request asks for. Existing container verbs keep
@@ -144,6 +171,33 @@ fn team_argument_shape(verb: &str, arguments: &Map<String, Value>) -> Result<()>
         }
     }
     Ok(())
+}
+
+/// CAD-1586 / AOS-290: `settings_agents` carries the explicit
+/// `{operation, expected_revision, payload}` resource command for
+/// Settings > Agents — the same object the local `agent_settings_command`
+/// RPC takes, forwarded verbatim to the hosted daemon. `master_status`
+/// takes no arguments. Both mint narrow envelopes (`settings.read` /
+/// `settings.write` per operation; `settings.read` for master status)
+/// instead of the broad cli.* pair the other verbs request.
+pub const REMOTE_SETTINGS_VERB: &str = "settings_agents";
+pub const REMOTE_MASTER_STATUS_VERB: &str = "master_status";
+
+/// The hosted scope a `settings_agents` operation needs — the AOS-290
+/// operation table in `hosted-cadence-auth.ts` classifies the same names;
+/// anything not an explicit read fails closed as a write.
+pub fn settings_op_scope(operation: &str) -> &'static str {
+    match operation {
+        "snapshot" | "history" | "master.status" | "harness.list" | "harness.show"
+        | "provider.list" | "provider.show" | "model.list" | "model.show" | "role.list"
+        | "profile.list" | "profile.show" | "profile.preview" | "pin.list" | "grant.list" => {
+            "settings.read"
+        }
+        // master.resume is write explicitly — it starts a process;
+        // every other non-read fails closed the same way.
+        "master.resume" => "settings.write",
+        _ => "settings.write",
+    }
 }
 
 /// The wiki actions this build sends over `/__platform/wiki/call` (CAD-1401,
@@ -321,6 +375,10 @@ const CAPABILITIES: &[&str] = &[
     "wiki.write",
     "web.read",
     "web.prepare",
+    // CAD-1586: settings management scopes are opt-in like wiki — an
+    // existing login without them stays valid for every other verb.
+    "settings.read",
+    "settings.write",
 ];
 const RENEW_BEFORE: u64 = 60;
 const SKEW: u64 = 5;
@@ -1075,6 +1133,17 @@ fn call_once(
     deadline: Instant,
 ) -> Result<(u16, Option<u64>, Option<Value>)> {
     let scopes: &[&str] = match surface {
+        // CAD-1586: the settings verb mints a narrow envelope scoped to
+        // the operation (read vs write); master status exposes the
+        // configured model/allowlist, so it mints settings.read (manager
+        // ruling — generic cli.read never implies Settings access).
+        Surface::Cli if verb == REMOTE_SETTINGS_VERB => &[settings_op_scope(
+            arguments
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )],
+        Surface::Cli if verb == REMOTE_MASTER_STATUS_VERB => &["settings.read"],
         Surface::Cli => cli_requested_scopes(verb),
         Surface::Wiki if verb == "write" => &["wiki.write"],
         Surface::Wiki => &["wiki.read"],
@@ -1097,6 +1166,11 @@ fn call_once(
     if !arguments.is_empty() {
         body["arguments"] = Value::Object(arguments.clone());
     }
+    // CAD-1568: a mutating verb's transport failure after the call was
+    // attempted is outcome-unknown, not a rejection — the mutation may
+    // have landed, so the caller must reconcile by idempotency key, never
+    // assume nothing landed. `message_send` reconciles on `arguments.message`.
+    let mutating = matches!(surface, Surface::Cli) && verb == "message_send";
     post(
         &target.endpoint,
         &format!("{relay}/call"),
@@ -1104,6 +1178,13 @@ fn call_once(
         &body,
         request_timeout(deadline, CALL_TIMEOUT)?,
     )
+    .map_err(|e| {
+        if mutating && e.kind() != "unknown" {
+            Error::unknown(format!("{e} — the send may or may not have been recorded"))
+        } else {
+            e
+        }
+    })
 }
 
 /// CAD-913: one `POST /__platform/wiki/upload` multipart request — the same
@@ -1563,11 +1644,17 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
             // — the payload `write_reply` maps a stale `if_rev` to) is a
             // definite "not written" verdict, never a refusal of the
             // call itself and never retried. The body rides up so the
-            // CLI can print `current_rev`/`card` for the caller to
-            // resync on the spot. A 409 without that shape is the same
-            // generic refusal as any other unhandled status.
+            // CLI can resync on the spot. Settings RPC uses the typed
+            // `{ok:false,error:{code:"revision_conflict",message}}` shape.
+            // Other 409 bodies remain generic refusals.
             match body {
-                Some(b) if b.get("conflict").is_some() => Verdict::Conflict(b),
+                Some(b)
+                    if b.get("conflict").is_some()
+                        || b.pointer("/error/code").and_then(Value::as_str)
+                            == Some("revision_conflict") =>
+                {
+                    Verdict::Conflict(b)
+                }
                 _ => Verdict::Done(Err(refusal_error(status, body.as_ref()))),
             }
         }
@@ -1590,6 +1677,68 @@ fn refusal_error(status: u16, body: Option<&Value>) -> Error {
         Error::unknown(text)
     } else {
         reject(text)
+    }
+}
+
+/// CAD-1568: actionable text for the `cli_message_*` family's typed
+/// refusals, keyed on the container's bounded `error.code` — the raw
+/// `error.message` the route returns is never shown (a `cli_fail` body
+/// can carry arbitrary server text). Unknown or absent codes keep the
+/// generic decoded refusal unchanged.
+fn message_family_refusal(verb: &str, status: u16, code: Option<&str>, base: Error) -> Error {
+    let action: Option<(&'static str, &'static str)> = match (verb, code) {
+        ("message_send", Some("recipient_class_unsupported")) => Some((
+            "recipient_class_unsupported",
+            "remote send reaches `master` for a human workspace owner only; \
+             personal assistants require separate assistant authority, and local \
+             workers use the local-assignment plane",
+        )),
+        ("message_send", Some("message_id_conflict")) => Some((
+            "message_id_conflict",
+            "that --message id was already used with different content (or \
+             belongs to another member) — mint a fresh id; different content \
+             under a reused id is a conflict, never a resubmit",
+        )),
+        ("message_send", Some("rejected")) => Some((
+            "rejected",
+            "the recipient or the --message id was refused — `sys-` ids are \
+             daemon-owned; inspect the selected workspace's master and use a \
+             non-reserved stable message id",
+        )),
+        ("message_send", Some("not_permitted")) => Some((
+            "not_permitted",
+            "remote `send master` requires a verified human workspace owner; \
+             agent, service and ordinary-member credentials do not grant master chat",
+        )),
+        ("message_send", Some("insufficient_scope")) => Some((
+            "insufficient_scope",
+            "this remote login lacks the cli.write grant a send needs — re-login \
+             with write scope, then retry",
+        )),
+        ("message_send", Some("invalid_request")) => Some((
+            "invalid_request",
+            "the send was refused at the request boundary — the remote call \
+             needs a non-empty body and the stable --message id",
+        )),
+        ("message_read", Some("not_permitted")) | ("message_inbox", Some("not_permitted")) => {
+            Some((
+                "not_permitted",
+                "remote message readback requires the sending human's identity; \
+                 passive inbox inspection requires a human workspace owner",
+            ))
+        }
+        ("message_read", Some("not_found")) => Some((
+            "not_found",
+            "no CLI message with that id is visible to this human identity; \
+             reconcile the original workspace and login before retrying the same id",
+        )),
+        _ => None,
+    };
+    match action {
+        Some((wire_code, text)) => {
+            Error::invalid(wire_code, format!("{text} ({wire_code}, HTTP {status})"))
+        }
+        None => base,
     }
 }
 
@@ -1863,6 +2012,69 @@ pub(crate) fn call_bounded(
     )
 }
 
+/// CAD-1568 revision: a `message_send` 2xx is a usable receipt only when it
+/// carries the complete correlated enqueue binding:
+///
+/// - `message` — the caller-chosen stable id echoed exactly (the
+///   reconciliation key a lost reply is retried under);
+/// - `state` — a known lifecycle state and `duplicate` — a real bool;
+/// - `alias` — the requested canonical recipient echoed exactly (only
+///   `master` is ever requested);
+/// - `workspace_id` — the immutable organization id for this destination
+///   (the `org_id` pinned at login, never the registry slug);
+/// - `sender_subject` — the authenticated human's canonical subject; when
+///   the saved login recorded one it must be exactly that subject;
+/// - `sender` — the retained `cli-<handle>` display attribution, nonempty;
+/// - `conversation` — the persisted message_conversation Home thread id
+///   the enqueue fixed, nonempty (returned again on duplicates/readback).
+///
+/// Anything less cannot establish that THIS send landed as THIS caller's
+/// message in the target workspace — the outcome is unknown and is
+/// reconciled by the stable id, never called a success or replayed.
+fn send_receipt_correlates(
+    receipt: &Value,
+    arguments: &Map<String, Value>,
+    target: &RemoteTarget,
+    cred: &Credential,
+) -> bool {
+    let bound = |key: &str| {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|expected| {
+                !expected.is_empty() && receipt.get(key).and_then(Value::as_str) == Some(expected)
+            })
+    };
+    bound("message")
+        && bound("alias")
+        && matches!(
+            receipt.get("state").and_then(Value::as_str),
+            Some(
+                "queued"
+                    | "submitting"
+                    | "running"
+                    | "completed"
+                    | "failed"
+                    | "cancelled"
+                    | "unknown"
+            )
+        )
+        && receipt.get("duplicate").and_then(Value::as_bool).is_some()
+        && receipt.get("workspace_id").and_then(Value::as_str) == Some(target.org_id.as_str())
+        && receipt
+            .get("sender_subject")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty() && cred.subject_id.as_deref().is_none_or(|sub| sub == s))
+        && receipt
+            .get("sender")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+        && receipt
+            .get("conversation")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn call_verb_until_retry(
     target: &RemoteTarget,
@@ -1928,6 +2140,36 @@ fn call_verb_until_retry(
                 )));
             }
         }
+        // CAD-1586: `settings_agents` needs the operation's narrow
+        // settings.* scope; `master_status` needs settings.read. A login
+        // without the needed scope is refused here, before a request is
+        // built — never downgraded to another verb or the local org.
+        if verb == REMOTE_SETTINGS_VERB && !cred.capabilities.is_empty() {
+            let operation = arguments
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let scope = settings_op_scope(operation);
+            if !cred.capabilities.iter().any(|c| c == scope) {
+                return Err(reject(format!(
+                    "`settings agents` operation '{operation}' needs the {scope} \
+                     capability, which this remote login lacks — nothing was sent. \
+                     `cadence login` does not request settings access by default; \
+                     settings access needs a login the workspace owner grants with {scope}"
+                )));
+            }
+        }
+        if verb == REMOTE_MASTER_STATUS_VERB
+            && !cred.capabilities.is_empty()
+            && !cred.capabilities.iter().any(|c| c == "settings.read")
+        {
+            return Err(reject(
+                "`master status` needs the settings.read capability, which this \
+                 remote login lacks — nothing was sent. `cadence login` does not \
+                 request settings access by default; it needs a login the workspace \
+                 owner grants with settings.read",
+            ));
+        }
         if Instant::now() >= deadline {
             return Err(Error::busy_coded(
                 "timeout",
@@ -1936,7 +2178,43 @@ fn call_verb_until_retry(
         }
         let (status, retry_after, body) =
             call_once(target, &cred, surface, verb, &arguments, deadline)?;
+        // A successful status without the complete, correlated enqueue
+        // receipt cannot establish whether — or as whose message, in which
+        // workspace and conversation — the mutation landed. Unknown, never
+        // a rejection and never a false success to replay blindly.
+        if verb == "message_send"
+            && (200..300).contains(&status)
+            && !body
+                .as_ref()
+                .is_some_and(|receipt| send_receipt_correlates(receipt, &arguments, target, &cred))
+        {
+            return Err(Error::unknown(
+                "remote send returned no usable correlated receipt — enqueue outcome is unknown",
+            ));
+        }
+        let refusal_code = refusal_fields(body.as_ref()).0.map(str::to_owned);
+        // CAD-1568: a 5xx carrying a worker `state` is a pre-forward
+        // verdict (waking handled below, wake_failed/unavailable = nothing
+        // ran). A 5xx with no `state` may come from the container *after*
+        // the send was attempted — outcome unknown, reconcile by
+        // `arguments.message`, never a blind resubmission.
+        let send_outcome_unknown = verb == "message_send"
+            && status >= 500
+            && body.as_ref().and_then(|b| b["state"].as_str()).is_none();
         match classify(status, retry_after, body) {
+            Verdict::Done(Err(e)) if send_outcome_unknown => {
+                return Err(Error::unknown(format!(
+                    "{e} — the send may or may not have been recorded"
+                )));
+            }
+            Verdict::Done(Err(e)) => {
+                return Err(message_family_refusal(
+                    verb,
+                    status,
+                    refusal_code.as_deref(),
+                    e,
+                ));
+            }
             Verdict::Done(result) => return result.map(RemoteAnswer::Ok),
             Verdict::Conflict(body) => return Ok(RemoteAnswer::Conflict(body)),
             Verdict::Waking(wait) => {
@@ -3064,6 +3342,246 @@ mod tests {
         let envs = envelopes(&requests);
         assert_eq!(envs.len(), 2);
         assert_ne!(envs[0], envs[1], "a wake retry reused the envelope");
+    }
+
+    /// The complete correlated receipt a `message_send` 2xx must carry
+    /// (CAD-1568 revision): the request's stable `message` id and canonical
+    /// `alias` echoed, a known lifecycle `state`, a real `duplicate` bool,
+    /// the immutable `workspace_id`, the sender's canonical
+    /// `sender_subject` and the persisted `conversation` Home thread id.
+    fn send_receipt(id: &str) -> Value {
+        json!({
+            "message": id,
+            "alias": "master",
+            "state": "queued",
+            "duplicate": false,
+            "workspace_id": ORG_ID,
+            "sender_subject": "sub_owner_1",
+            "sender": "cli-owner",
+            "conversation": "conv_home_1",
+        })
+    }
+
+    #[test]
+    fn successful_send_without_a_receipt_is_unknown_and_not_retried() {
+        for receipt in [
+            Value::Null,
+            json!({"message":"lost-receipt","state":"waking","duplicate":false}),
+            json!({"message":"another-request","state":"queued","duplicate":false}),
+        ] {
+            let (out, requests) = run(
+                vec![(200, "", receipt)],
+                "message_send",
+                json!({"alias": "master", "text": "coordinate", "message": "lost-receipt"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                10,
+            );
+            assert_eq!(out.unwrap_err().kind(), "unknown");
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+        }
+    }
+
+    #[test]
+    fn send_with_a_missing_or_malformed_binding_is_unknown_and_not_retried() {
+        // Each corruption removes or falsifies one correlation field of the
+        // complete receipt: a 2xx carrying it cannot prove THIS send landed
+        // as this caller's message in this workspace's conversation, so the
+        // outcome is `unknown` — and the send is still never replayed.
+        let tampered = |damage: &dyn Fn(&mut Map<String, Value>)| {
+            let mut receipt = send_receipt("lost-receipt");
+            damage(receipt.as_object_mut().unwrap());
+            receipt
+        };
+        let receipts = [
+            tampered(&|r| {
+                r.remove("workspace_id");
+            }),
+            tampered(&|r| {
+                r["workspace_id"] = json!("ws_foreign");
+            }),
+            tampered(&|r| {
+                r["workspace_id"] = json!("");
+            }),
+            tampered(&|r| {
+                r.remove("sender_subject");
+            }),
+            tampered(&|r| {
+                r["sender_subject"] = json!("");
+            }),
+            tampered(&|r| {
+                r.remove("conversation");
+            }),
+            tampered(&|r| {
+                r["conversation"] = json!("");
+            }),
+            tampered(&|r| {
+                r["alias"] = json!("assistant-personal");
+            }),
+            tampered(&|r| {
+                r.remove("sender");
+            }),
+            tampered(&|r| {
+                r["sender"] = json!("");
+            }),
+            tampered(&|r| {
+                r["duplicate"] = json!("yes");
+            }),
+            tampered(&|r| {
+                r["state"] = json!("delivered");
+            }),
+        ];
+        for receipt in receipts {
+            let (out, requests) = run(
+                vec![(200, "", receipt)],
+                "message_send",
+                json!({"alias": "master", "text": "coordinate", "message": "lost-receipt"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                10,
+            );
+            assert_eq!(out.unwrap_err().kind(), "unknown");
+            assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+        }
+    }
+
+    #[test]
+    fn send_without_expected_message_identity_is_unknown_and_not_retried() {
+        let mut receipt = send_receipt("lost-receipt");
+        receipt.as_object_mut().unwrap().remove("message");
+        let (out, requests) = run(
+            vec![(200, "", receipt)],
+            "message_send",
+            json!({"alias": "master", "text": "coordinate"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            10,
+        );
+        assert_eq!(out.unwrap_err().kind(), "unknown");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+
+    #[test]
+    fn send_receipt_for_another_subject_is_unknown_and_not_retried() {
+        // A login that recorded its canonical subject binds the receipt to
+        // it: a 2xx answering a different `sender_subject` cannot be this
+        // send's enqueue proof.
+        let (listener, requests, _s) = fake_worker(vec![(200, "", send_receipt("lost-receipt"))]);
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        let path = dir.join(format!("cli-{ORG}.json"));
+        let mut cred: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        cred["subject_id"] = json!("sub_the_login");
+        fs::write(&path, serde_json::to_vec(&cred).unwrap()).unwrap();
+        let out = call_verb_in(
+            &target,
+            "message_send",
+            json!({"alias": "master", "text": "coordinate", "message": "lost-receipt"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            10,
+            &dir,
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(out.unwrap_err().kind(), "unknown");
+        assert_eq!(
+            hits(&requests.lock().unwrap(), "/__platform/cli/call"),
+            1,
+            "an unknown send outcome was replayed"
+        );
+    }
+
+    #[test]
+    fn a_send_wake_retry_keeps_its_durable_message_id() {
+        // A pre-forward wake retry needs a fresh envelope but must not
+        // mint another durable message id.
+        let args: Map<String, Value> = json!({
+            "alias": "master",
+            "text": "please coordinate",
+            "message": "cad1568-proof-1",
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let (out, requests) = run(
+            vec![
+                (503, "", json!({"state": "waking", "retry_after_s": 1})),
+                (200, "", send_receipt("cad1568-proof-1")),
+            ],
+            "message_send",
+            args,
+            120,
+        );
+        out.unwrap();
+        let mut calls = 0;
+        for request in requests
+            .iter()
+            .filter(|r| r["path"] == json!("/__platform/cli/call"))
+        {
+            calls += 1;
+            assert_eq!(request["body"]["arguments"]["message"], "cad1568-proof-1");
+        }
+        assert_eq!(calls, 2);
+        let envs = envelopes(&requests);
+        assert_ne!(envs[0], envs[1], "a send retry reused the envelope");
+    }
+
+    #[test]
+    fn cli_message_refusals_map_bounded_codes_never_server_text() {
+        // CAD-1568: the container's `cli_fail` body is
+        // `{ok:false,error:{code,message}}` and `message` is arbitrary
+        // server text — the client answers the bounded code with its own
+        // actionable text, and the server string never surfaces.
+        let poisonous = |code: &str| {
+            json!({"ok": false, "error": {
+                "code": code,
+                "message": "internal-server-text /private/path"}})
+        };
+        for (verb, status, code) in [
+            ("message_send", 400u16, "recipient_class_unsupported"),
+            ("message_send", 400, "message_id_conflict"),
+            ("message_send", 403, "not_permitted"),
+            ("message_read", 404, "not_found"),
+        ] {
+            let (out, requests) = run(vec![(status, "", poisonous(code))], verb, Map::new(), 10);
+            let err = out.unwrap_err();
+            let shown = err.to_string();
+            assert_eq!(
+                err.code(),
+                Some(code),
+                "{verb}: machine-readable refusal code changed"
+            );
+            assert!(
+                !shown.contains("internal-server-text") && !shown.contains("/private/path"),
+                "{verb} {code} leaked server text: {shown}"
+            );
+            assert_eq!(
+                hits(&requests, "/__platform/cli/call"),
+                1,
+                "a refusal was retried"
+            );
+        }
+        // An unlisted code on a message verb keeps the generic refusal —
+        // never a fabricated action.
+        let (out, _) = run(
+            vec![(400, "", poisonous("some_future_code"))],
+            "message_send",
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("unknown"), "{shown}");
+        assert!(!shown.contains("internal-server-text"), "{shown}");
     }
 
     #[test]

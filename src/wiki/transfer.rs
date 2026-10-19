@@ -534,11 +534,11 @@ fn stage_path(state_dir: &Path, job_id: &str, entry_id: &str) -> PathBuf {
     state_dir.join(STAGING_DIR).join(job_id).join(entry_id)
 }
 
-fn sha256_bytes(bytes: &[u8]) -> String {
+pub(crate) fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     let mut file = open_nofollow(path)?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 8192];
@@ -1897,12 +1897,26 @@ pub fn export(
     offset: u64,
     bytes: Option<u64>,
     rev: Option<&str>,
+    at: Option<&str>,
 ) -> Result<Value> {
     let want = bytes.unwrap_or(MAX_CHUNK_BYTES as u64);
     if want == 0 || want > MAX_CHUNK_BYTES as u64 {
         return Err(reject(format!(
             "wiki transfer export refused: bytes must be 1 to {MAX_CHUNK_BYTES}"
         )));
+    }
+    if let Some(selector) = at {
+        if selector.is_empty() {
+            return Err(reject(
+                "wiki transfer export refused: at must be a non-empty revision",
+            ));
+        }
+        if rev.is_some_and(|pinned| pinned != selector) {
+            return Err(reject(
+                "wiki transfer export refused: rev does not match the historical selector",
+            ));
+        }
+        return super::revision::export_slice(pm, caller, path, selector, offset, want);
     }
     if let Some(file) = export_read::file_export(pm, caller, path, offset, want, rev)? {
         return Ok(file);

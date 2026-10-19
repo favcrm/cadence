@@ -1012,6 +1012,11 @@ fn finish_pid_scan(
     aggregate_pid_error(use_, pid, pending);
 }
 
+/// Reads of one fd entry before a link that keeps vanishing under a still
+/// present entry counts as an incomplete scan.
+#[cfg(target_os = "linux")]
+const FD_REREAD_ATTEMPTS: u32 = 8;
+
 #[cfg(target_os = "linux")]
 fn inspect_pid(view: &ProcView, dir: &Path, pid: u32, use_: &mut ProcessUse, caller: Caller) {
     let proc_dir = view.scan_root.join(pid.to_string());
@@ -1091,34 +1096,48 @@ fn inspect_pid(view: &ProcView, dir: &Path, pid: u32, use_: &mut ProcessUse, cal
                     }
                 };
                 let path = fd.path();
-                match std::fs::read_link(&path) {
-                    Ok(target) if target.starts_with(dir) => {
-                        holds = true;
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        match std::fs::symlink_metadata(&path) {
-                            Err(metadata_error)
-                                if metadata_error.kind() == io::ErrorKind::NotFound => {}
-                            Err(metadata_error) => remember_pid_error(
-                                &mut pending,
-                                "confirm file descriptor entry disappearance",
-                                metadata_error,
-                                false,
-                            ),
-                            Ok(_) => remember_pid_error(
-                                &mut pending,
-                                "inspect file descriptor",
-                                error,
-                                false,
-                            ),
+                // CAD-1558: a live process that closes fd N and reopens the
+                // same number between our readlink and lstat leaves an entry
+                // whose link we could not read. The new descriptor may point
+                // into the checkout, so it is read again (bounded), never
+                // skipped; still unreadable after the bound refuses.
+                let mut attempts = 0;
+                loop {
+                    attempts += 1;
+                    match std::fs::read_link(&path) {
+                        Ok(target) if target.starts_with(dir) => holds = true,
+                        Ok(_) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            match std::fs::symlink_metadata(&path) {
+                                Err(metadata_error)
+                                    if metadata_error.kind() == io::ErrorKind::NotFound => {}
+                                Err(metadata_error) => remember_pid_error(
+                                    &mut pending,
+                                    "confirm file descriptor entry disappearance",
+                                    metadata_error,
+                                    false,
+                                ),
+                                Ok(_) if attempts < FD_REREAD_ATTEMPTS => continue,
+                                Ok(_) => remember_pid_error(
+                                    &mut pending,
+                                    "inspect file descriptor",
+                                    error,
+                                    false,
+                                ),
+                            }
                         }
+                        Err(error) if unreadable_by_policy(&error) => {}
+                        Err(error) => remember_pid_error(
+                            &mut pending,
+                            "inspect file descriptor",
+                            error,
+                            false,
+                        ),
                     }
-                    Err(error) if unreadable_by_policy(&error) => {}
-                    Err(error) => {
-                        remember_pid_error(&mut pending, "inspect file descriptor", error, false)
-                    }
+                    break;
+                }
+                if holds {
+                    break;
                 }
             }
             if holds {

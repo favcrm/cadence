@@ -190,6 +190,12 @@ pub struct ReadyEvidence {
     pub pr: u64,
     pub head: String,
     pub base: String,
+    /// The PR's actual target branch name (CAD-1561) — binds the
+    /// evidence to `staging` vs `main`, not just the base OID.
+    /// `default` keeps pre-1561 serialized records readable; an empty
+    /// bind never matches a named target, which fails closed.
+    #[serde(default)]
+    pub base_ref: String,
     pub policy_digest: String,
     pub ci_run_id: u64,
     pub ci_run_url: String,
@@ -204,6 +210,8 @@ pub struct ReadyBinding {
     pub pr: u64,
     pub head: String,
     pub base: String,
+    #[serde(default)]
+    pub base_ref: String,
     pub policy_digest: String,
     pub ci_run_id: u64,
     pub ci_run_url: String,
@@ -265,6 +273,18 @@ pub struct Record {
     /// Why the operator was brought in, or the decline reason.
     #[serde(default)]
     pub note: Option<String>,
+    /// An unattended operation is held for an explicit operator decision.
+    /// Presentation only; native grant/receipt checks own authorization.
+    #[serde(default, skip_serializing_if = "not_held")]
+    pub unattended_hold: bool,
+    /// Owned unresolved/failed turn behind a completion hold. Presentation
+    /// correlation only: the overview confirms it against the native store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unattended_turn: Option<String>,
+    /// Known authorized request awaiting native queue admission. Decision
+    /// presentation only, never evidence of authority or enqueue.
+    #[serde(default, skip_serializing_if = "not_held")]
+    pub unattended_pending: bool,
     /// Who declined the merge (CAD-140) — the deciding actor, so a
     /// tailnet decline is attributed to the operator's login.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -292,6 +312,10 @@ pub struct Record {
     pub risk: Option<String>,
 }
 
+fn not_held(held: &bool) -> bool {
+    !held
+}
+
 impl Record {
     pub fn new(issue: &str, project: &str, worker: &str, now: i64) -> Self {
         Record {
@@ -315,6 +339,9 @@ impl Record {
             observed: None,
             disable_auto: false,
             note: None,
+            unattended_hold: false,
+            unattended_turn: None,
+            unattended_pending: false,
             declined_by: None,
             excluded: vec![],
             ticket_done: None,
@@ -364,12 +391,13 @@ impl Record {
         }
         let binding = self.ready_binding.as_ref()?;
         Some(format!(
-            "{}/{}:{}:{}:{}:{}:{}:{}@{}",
+            "{}/{}:{}:{}:{}:{}:{}:{}:{}@{}",
             self.issue,
             binding.repo,
             binding.pr,
             binding.head,
             binding.base,
+            binding.base_ref,
             binding.policy_digest,
             binding.ci_run_id,
             binding.outcome_report,
@@ -380,6 +408,9 @@ impl Record {
     /// The merge decision is ready: either a PASS plus its observed green
     /// head, or a routine receipt plus its freshly validated exact binding.
     pub fn merge_ready(&self) -> bool {
+        if self.unattended_pending {
+            return false;
+        }
         if self.state == State::Ready {
             return self
                 .ready_evidence
@@ -418,6 +449,12 @@ impl Record {
                         && e.pr == b.pr
                         && e.head == b.head
                         && e.base == b.base
+                        // CAD-1561: evidence must name its actual target
+                        // branch — a pre-1561 record deserializes base_ref
+                        // empty and can never merge-ready without a fresh
+                        // binding.
+                        && e.base_ref == b.base_ref
+                        && !b.base_ref.is_empty()
                         && e.policy_digest == b.policy_digest
                         && e.ci_run_id == b.ci_run_id
                         && e.ci_run_url == b.ci_run_url
@@ -907,7 +944,12 @@ pub fn review_kickoff(
              pinned to the sha, and if the head moves the daemon sends a new review. File \
              the verdict: `cadence report file --task {issue} --kind verdict --file <f>` \
              with frontmatter `verdict: pass` or `verdict: revise` and `sha: {sha}`, the \
-             findings in the body. Only you can file it, and only for this head.",
+             findings in the body. Include the actual policy class in `risk:`: `auto`, \
+             `human (<triggers>)` or `delegated (<triggers>)`, according to the change and \
+             repository rules, not the diff-size Risk above. An unattended PASS needs an \
+             explicit, genuinely eligible `risk: auto`; protected or sensitive work must \
+             retain its actual classification and operator hold. Only you can file it, \
+             and only for this head.",
             note = note.display()
         )
     };
@@ -1041,7 +1083,7 @@ pub(crate) fn pr_view(gh_bin: &str, slug: &str, number: u64) -> Result<Value> {
             "-R",
             slug,
             "--json",
-            "headRefOid,state,statusCheckRollup,additions,deletions,changedFiles,autoMergeRequest",
+            "headRefOid,baseRefOid,baseRefName,state,statusCheckRollup,additions,deletions,changedFiles,autoMergeRequest",
         ],
     )?;
     serde_json::from_str(&view)

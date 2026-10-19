@@ -304,6 +304,15 @@ release evidence. They no longer repeat in every Rust test shard.
 `tests/scripts/test_ci_shared_checks.py` (retired under CAD-1073) checks that each command remains
 once-only and blocking, including early failures in multi-command steps.
 
+The enqueue consumer checks run through
+`python3 scripts/test_enqueue_requirements.py` in `fmt`. Its
+`RequirementsConsumer` inherits all 18 evidence-posting checks and adds
+10 requirements cases, so one command runs both sets without duplicating
+the inherited checks. Local pre-push discovers that same command from the
+workflow. These checks drive the real enqueue consumer with synthetic
+external transports; they do not establish daemon identity or live
+GitHub/merge-queue acceptance.
+
 Each `test-shard` job selects the scope from the base policy, proves
 Cargo/nextest inventory parity, compiles on a rust-cache hit, builds its
 SPA, executes its assigned tests and uploads assignment/cost artifacts.

@@ -141,10 +141,36 @@ head, the evidence read, blockers and separate non-blocking notes. If the
 agreed budget runs out first, the reviewer files a scoped blocker naming the
 remaining work — not an automatic PASS and not open-ended continuation.
 
-A new head on the same ticket goes back to the same reviewer for delta
-review; they file a fresh verdict on the new head rather than carrying the
-old PASS forward. Valid unchanged-head evidence is reused, and optional
-notes go to a follow-up ticket instead of more polish rounds.
+### Converge instead of restarting
+
+The first pass covers the complete change against ticket acceptance and its
+relevant dependencies. Before returning REVISE, verify each blocking finding:
+name the file/function, concrete failure scenario and supporting source or
+runtime evidence. Report the bug class and all known affected instances in one
+response, not one instance per round. Optional polish stays non-blocking.
+
+A new head on the same ticket goes back to the same reviewer. The existing
+handoff names the previously reviewed head, new head, prior findings and fix
+evidence. Review the delta and affected behavior/dependencies rather than
+restarting the whole inspection. Widen when assumptions, scope or risks change;
+if the prior review is unavailable, perform a complete first pass. Do not
+repeat resolved findings without new evidence that the fix is incomplete.
+
+Delta review is a way to inspect the new head, not to carry an old PASS forward.
+File a fresh exact-head verdict and revalidate the required evidence; only
+still-valid evidence may be reused. New heads still invalidate old verdicts,
+and required CI, Browser QA, refusal acceptance and approval bindings remain
+unchanged. Read-only review may overlap CI; pending CI never permits enqueue.
+
+If a third round still returns REVISE, stop the automatic fix/review loop and
+escalate to the PM or operator with the remaining failure scenarios, attempted
+fixes and a recommended approach. A round cap is not permission to auto-pass,
+ignore a real bug or weaken the existing risk-class rules. Resume after the
+approach or disagreement is resolved, with the required exact-head checks.
+
+This applies the convergence lessons from
+[How the Claude Code team does code review](https://claude.dev/blog/solving-code-review-at-anthropic/):
+reduce repeated review and human waiting, not the safeguards.
 
 ## What #738 taught us
 

@@ -235,12 +235,16 @@ jobs:
       - run: python3 scripts/test_release_reuse.py
       - run: python3 -m unittest scripts/test_enqueue_human_paths.py
       - run: python3 -m unittest scripts/test_enqueue_scope_approval.py
+      - run: python3 scripts/test_enqueue_requirements.py
       - run: python3 scripts/test_operator_preflight.py
       # CAD-1475: the operator-owned publicity lifecycle guard — the real
       # helper driven through a stateful s3api boundary (conditional write,
       # fixed-endpoint/bucket and bad-case refusals).
       - run: python3 tests/cad1475_publicity_acceptance.py
       - run: python3 tests/cad1479_r2_publish_gate_acceptance.py
+      # CAD-1540: the cross-build required-check gate — the real gate script is
+      # driven through all four matrix outcomes and must refuse failure/cancelled.
+      - run: python3 tests/cad1540_cross_build_gate_acceptance.py
       - run: scripts/design-kit --check
       - name: Check contributor documentation paths
         run: python3 scripts/check-doc-links.py
@@ -656,11 +660,11 @@ jobs:
         if: ${{ !cancelled() }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
 
-  # CAD-1480: warms the cross-build gates' per-target caches on merged
-  # code only — the same save-on-main-only rule as cache-warm. One leg
-  # per cross-build matrix row; `cargo test --no-run` covers the binary
-  # and the acceptance's dev-dependency tree in a single compile, and
-  # the gate's later `cargo build` sees a warm target dir either way.
+  # CAD-1551: warm both cross-build dependency profiles on merged code only.
+  # The test profile optimizes dependencies differently from dev, so test
+  # artifacts alone do not warm the gate's default production-feature build.
+  # Bump the shared epoch in producer and consumer when warm inputs change:
+  # an existing immutable cache entry would otherwise skip the new work.
   cache-warm-cross:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     strategy:
@@ -680,13 +684,14 @@ jobs:
       - id: cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cross-${{ matrix.target }}
-          cache-on-failure: true
-      - name: Warm the cross-build test profile
+          shared-key: cross-dual1-${{ matrix.target }}
+      - name: Warm the cross-build test and dev profiles
         if: steps.cache.outputs.cache-hit != 'true'
         env:
           CARGO_BUILD_JOBS: 4
-        run: cargo test --no-run --locked --test cad1425_client_update_refusal_acceptance
+        run: |
+          cargo test --no-run --locked --features test-seam --test cad1425_client_update_refusal_acceptance
+          cargo build --locked
 
   # CAD-1131: build the release binary once per git TREE. A queue entry's
   # merge_group run builds the shipping binary in parallel with the gates
@@ -1507,6 +1512,14 @@ jobs:
       vars.RELEASES_R2_BUCKET == 'agenticos-v2-release-artifacts'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # CAD-1506: the release-store write credentials live in the
+    # `release-store` environment (branch policy: main and v* tags), not
+    # at repository scope. A repository secret is readable by any run from
+    # a branch of this repo, including a PR run of the PR's own code; the
+    # environment's branch policy keeps the key off PR refs. The
+    # environment has no required reviewers, so this adds no approval
+    # click: `release-publish` above stays the only gate on a tag.
+    environment: release-store
     permissions:
       contents: read
       actions: read
@@ -1610,11 +1623,11 @@ jobs:
         if: matrix.target == 'aarch64-macos'
         working-directory: ui
       - run: scripts/ci-rust-toolchain --profile minimal
-      # CAD-1480: restore-only cache, warmed by cache-warm's cross legs on
-      # main pushes — gate jobs still never save a cache.
+      # Restore-only cache with both test-seam/test and default/dev dependencies.
+      # Keep the epoch aligned with cache-warm-cross; only main saves it.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cross-${{ matrix.target }}
+          shared-key: cross-dual1-${{ matrix.target }}
           save-if: false
       # The acceptance links CARGO_BIN_EXE_cadence, so `cargo test` builds
       # the binary too; run it first and let `cargo build` verify the
@@ -1627,6 +1640,24 @@ jobs:
         run: cargo test --locked --features test-seam --test cad1425_client_update_refusal_acceptance -- --test-threads 2
       - run: cargo build --locked
       - run: target/debug/cadence --version
+
+  # CAD-1540: `cross-build` cannot be a required check itself — `change-scope`
+  # skips it on docs-only changes, and a skipped or absent context blocks merges
+  # instead of guarding them. This job always runs and reports the matrix's real
+  # outcome, so its check name is the one to require. Operator step, after this
+  # merges: add `cross-build (required)` to the required status checks.
+  cross-build-required:
+    name: cross-build (required)
+    needs: [cross-build]
+    if: ${{ always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Gate on the cross-build matrix result
+        env:
+          CROSS_BUILD_RESULT: ${{ needs.cross-build.result }}
+        run: scripts/cross-build-gate.sh
 
   # CAD-109 backstop: gitleaks, an implementation independent of cadence's
   # in-process scanner, runs over the PR's own commits (base..head) with its

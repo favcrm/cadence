@@ -202,6 +202,25 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     // campaign before the operator applies it.
     "Bash(cadence app content assistant-proposals *)",
     "Bash(cadence app content assistant-proposal-show *)",
+    // CAD-1586: the bounded Settings > Agents namespace. Every verb is
+    // admitted to the *tool* guard so a granted operation is actually
+    // invocable; authority lives entirely daemon-side — a mutation or
+    // grant decision with no bound settings grant refuses there, so a
+    // broader tool stem cannot widen what an agent may do. The legacy
+    // approved-argv path still never covers settings mutations or
+    // grant verbs (master_perm NEVER list, unchanged).
+    "Bash(cadence settings agents)",
+    "Bash(cadence settings agents *)",
+    // The master's own diagnosis and the granted recovery resume —
+    // `master status` reads only (its daemon op refuses a free agent
+    // read anyway; a designated management agent's exact grant opens
+    // it), `master resume` carries no authority without the bound
+    // `master.resume` settings grant. Neither delegates: argv approval
+    // still cannot mint either (master_perm NEVER list).
+    "Bash(cadence master status)",
+    "Bash(cadence master status *)",
+    "Bash(cadence master resume)",
+    "Bash(cadence master resume *)",
 ];
 
 /// CAD-1098 Gate 1: which tool profile a master session launches with.
@@ -296,37 +315,67 @@ pub fn clear_tmp(state_dir: &Path) -> std::io::Result<()> {
     first_err.map_or(Ok(()), Err)
 }
 
-/// CAD-1009: the argument shape of each scoped verb, keyed by the
-/// allowlist stem after `cadence app `. The per-turn reference
+/// CAD-1009: the daemon RPC and argument shape of each scoped verb, keyed
+/// by the allowlist stem after `cadence app `. The per-turn reference
 /// ([`scoped_verb_reference`]) is built by walking
 /// [`CLAUDE_ALLOWED_TOOLS`], so a verb allowlisted without a row here
 /// (or a row whose verb left the allowlist) fails
-/// `scoped_reference_tracks_the_allowlist` rather than drifting.
-pub const SCOPED_VERB_SHAPES: &[(&str, &str)] = &[
+/// `scoped_reference_tracks_the_allowlist` rather than drifting. The RPC
+/// names the declaration the verb needs ([`crate::app_assistant::scoped_need`],
+/// CAD-1518), so the reference offers exactly what the daemon admits.
+pub const SCOPED_VERB_SHAPES: &[(&str, &str, &str)] = &[
     (
         "audience segment-assistant-save",
+        "app_segment_assistant_save",
         "--segment-id seg-<slug of the name: lowercase a-z0-9-, never `new`> --name \"<exact human name, spaces kept>\" --predicates P [--expected-revision R]",
     ),
-    ("audience segment-assistant-ls", ""),
-    ("audience segment-assistant-show", "--segment-id S"),
-    ("audience segment-assistant-preview", "--segment-id S"),
+    ("audience segment-assistant-ls", "app_segment_assistant_list", ""),
+    (
+        "audience segment-assistant-show",
+        "app_segment_assistant_show",
+        "--segment-id S",
+    ),
+    (
+        "audience segment-assistant-preview",
+        "app_segment_assistant_preview",
+        "--segment-id S",
+    ),
     (
         "record csv-assistant-import",
+        "app_record_csv_assistant_import",
         "--request-id R --confirm-token C",
     ),
-    ("record csv-assistant-preview", "--csv F"),
-    ("assistant actions", ""),
+    (
+        "record csv-assistant-preview",
+        "app_record_csv_assistant_preview",
+        "--csv F",
+    ),
+    ("assistant actions", "app_assistant_actions", ""),
     (
         "assistant invoke",
+        "app_assistant_invoke",
         "--action-id A --operation-id O --input F",
     ),
-    ("assistant operation-show", "--operation-id O"),
+    (
+        "assistant operation-show",
+        "app_assistant_operation_show",
+        "--operation-id O",
+    ),
     (
         "content assistant-draft",
+        "app_content_assistant_draft",
         "--campaign-id C --proposal-id P --draft F",
     ),
-    ("content assistant-proposals", "[--campaign-id C]"),
-    ("content assistant-proposal-show", "--proposal-id P"),
+    (
+        "content assistant-proposals",
+        "app_content_assistant_proposals",
+        "[--campaign-id C]",
+    ),
+    (
+        "content assistant-proposal-show",
+        "app_content_assistant_proposal_show",
+        "--proposal-id P",
+    ),
 ];
 
 /// One example rule per supported predicate field (value shown is a
@@ -351,14 +400,29 @@ pub fn scoped_verb_stems() -> Vec<&'static str> {
 /// with its token. `install`/`context`/`message_id`/`token` are the
 /// real values (the caller passes the adapter's slot for `token`);
 /// `tmp` is the master's private temp dir. Verbs come from
-/// [`CLAUDE_ALLOWED_TOOLS`]; nothing outside it is named.
+/// [`CLAUDE_ALLOWED_TOOLS`]; nothing outside it is named. CAD-1518: only
+/// the verbs `declared` admits are listed, and an installation that
+/// declares none gets no block at all.
 pub fn scoped_verb_reference(
     install: &str,
     context: &str,
     message_id: &str,
     token: &str,
     tmp: &Path,
-) -> String {
+    declared: &crate::app_assistant::Declared,
+) -> Option<String> {
+    let verbs: Vec<(&str, &str)> = scoped_verb_stems()
+        .into_iter()
+        .filter_map(|stem| {
+            let (_, rpc, args) = SCOPED_VERB_SHAPES.iter().find(|(s, _, _)| *s == stem)?;
+            crate::app_assistant::scoped_need(rpc)
+                .is_some_and(|need| declared.admits(need))
+                .then_some((stem, *args))
+        })
+        .collect();
+    if verbs.is_empty() {
+        return None;
+    }
     let mut out = format!(
         "[Scoped chat turn — message \"{message_id}\", turn token \"{token}\". \
          Turn-only; never repeat the token.\n\
@@ -366,28 +430,30 @@ pub fn scoped_verb_reference(
          Form: `cadence app <verb> {install} --context-id {context} <args> --message {message_id} --token {token}`\n\
          Verbs (verb: args):\n"
     );
-    for stem in scoped_verb_stems() {
-        let args = SCOPED_VERB_SHAPES
-            .iter()
-            .find(|(s, _)| *s == stem)
-            .map_or("(see AGENT.md)", |(_, a)| *a);
+    for (stem, args) in verbs {
         out.push_str(&format!("{stem}: {args}\n"));
     }
-    out.push_str(&format!(
-        "Predicates P: {}/preds.json; JSON rules array, AND, op eq|ne per field:\n",
-        tmp.display()
-    ));
-    for (field, value) in PREDICATE_EXAMPLES {
+    if declared.admits(crate::app_assistant::ScopedNeed::Action("segments.save")) {
         out.push_str(&format!(
-            "[{{\"field\": \"{field}\", \"op\": \"eq\", \"value\": \"{value}\"}}]\n"
+            "Predicates P: {}/preds.json; JSON rules array, AND, op eq|ne per field:\n",
+            tmp.display()
         ));
+        for (field, value) in PREDICATE_EXAMPLES {
+            out.push_str(&format!(
+                "[{{\"field\": \"{field}\", \"op\": \"eq\", \"value\": \"{value}\"}}]\n"
+            ));
+        }
     }
-    out.push_str(
-        "Inspect only the attached retained image. If media.refine.prepare is listed, \
-         prepare pinned asset_id, revision, sha256 and operator instructions; do not invent.\n",
-    );
+    if declared.admits(crate::app_assistant::ScopedNeed::Action(
+        "media.refine.prepare",
+    )) {
+        out.push_str(
+            "Inspect only the attached retained image. If media.refine.prepare is listed, \
+             prepare pinned asset_id, revision, sha256 and operator instructions; do not invent.\n",
+        );
+    }
     out.push_str("[end scoped chat turn]");
-    out
+    Some(out)
 }
 
 /// The only built-in tool the master's Claude session has (`--tools`):
@@ -1302,7 +1368,10 @@ fn real_dir(pm_dir: &Path, slug: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn default_template(slug: &str, name: &str) -> Option<&'static str> {
+/// The file `install_defaults` writes when `name` is missing —
+/// `master status` resolves would-be prefs against the same templates
+/// without installing anything.
+pub(crate) fn default_template(slug: &str, name: &str) -> Option<&'static str> {
     match (slug, name) {
         (ALIAS, "SOUL.md") => Some(SOUL_TEMPLATE),
         (ALIAS, "AGENT.md") => Some(AGENT_TEMPLATE),
@@ -1410,6 +1479,56 @@ pub fn write_file(pm: &Pm, slug: &str, name: &str, text: &str, actor: &str) -> R
     Ok(out)
 }
 
+/// Remove one agent file through the same lock and tracker commit as
+/// [`write_file`]. The master slug is refused: those files are the
+/// running master's briefing, not a settings profile.
+pub fn remove_file(pm: &Pm, slug: &str, name: &str, actor: &str) -> Result<Value> {
+    if slug == ALIAS {
+        return Err(Error::rejected(
+            "agents/master is the master briefing — settings cannot remove it",
+        ));
+    }
+    if !FILES.contains(&name) {
+        return Err(Error::rejected(format!(
+            "'{name}' is not an agent file — one of {}",
+            FILES.join(", ")
+        )));
+    }
+    let dir = real_dir(&pm.dir, slug)?;
+    let _lock = pm.lock()?;
+    let path = dir.join(name);
+    if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{} is a symlink — refusing to remove through it",
+            path.display()
+        )));
+    }
+    let before = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({"agent": slug, "file": name, "removed": false}));
+        }
+        Err(e) => {
+            return Err(Error::rejected(format!(
+                "cannot read {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    std::fs::remove_file(&path)?;
+    if let Err(e) = crate::issue::write::commit(
+        pm,
+        std::slice::from_ref(&path),
+        &format!("agents/{slug}: remove {name}"),
+        &[],
+        actor,
+    ) {
+        let _ = std::fs::write(&path, &before);
+        return Err(e);
+    }
+    Ok(json!({"agent": slug, "file": name, "removed": true}))
+}
+
 /// Read the agent's files in [`FILES`] order, refusing symlinks and
 /// files over their caps. `all` requires every file; otherwise a
 /// missing one is skipped.
@@ -1500,6 +1619,27 @@ pub fn verify(state_dir: &Path, slug: &str, files: &[(String, String)]) -> Resul
         record(state_dir, slug, name, &d)?;
     }
     Ok(())
+}
+
+/// The read-only half of [`verify`] (CAD-1586): `Some(reason)` when a
+/// file's current digest contradicts the recorded baseline — the same
+/// refusal `verify` raises — without the trust-once recording `verify`
+/// performs. `master status` reports drift; it never records.
+pub fn tampered_file(state_dir: &Path, slug: &str, files: &[(String, String)]) -> Option<String> {
+    let all = load_records(state_dir);
+    for (name, text) in files {
+        match all[slug][name]["digest"].as_str() {
+            Some(known) if known != digest(text) => {
+                return Some(format!(
+                    "agents/{slug}/{name} changed outside `cadence master edit` — \
+                     `master start` refuses to brief the master from it. Review it, \
+                     then re-save it as the operator: `cadence master edit {name} --file <path>`"
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Longest escalation summary the operator is shown.
@@ -1744,8 +1884,15 @@ mod tests {
         );
         // The block's opener and rules are quoted verbatim, and the
         // section says the per-turn block is authoritative.
-        let block =
-            scoped_verb_reference("<install>", "<ctx>", "<msg>", "<token>", Path::new("/t"));
+        let block = scoped_verb_reference(
+            "<install>",
+            "<ctx>",
+            "<msg>",
+            "<token>",
+            Path::new("/t"),
+            &everything_declared(),
+        )
+        .unwrap();
         for line in block.lines().take(3) {
             assert!(AGENT_TEMPLATE.contains(line), "{line}");
         }
@@ -1765,6 +1912,19 @@ mod tests {
         }
     }
 
+    /// An installation that declares every registered action and the CSV
+    /// attachment: the full reference.
+    fn everything_declared() -> crate::app_assistant::Declared {
+        crate::app_assistant::Declared {
+            actions: crate::app_assistant::registered_ids()
+                .iter()
+                .map(|id| id.to_string())
+                .collect(),
+            attachments: ["csv-import".to_string()].into(),
+            ..Default::default()
+        }
+    }
+
     fn sample_reference() -> String {
         scoped_verb_reference(
             "inst-1",
@@ -1772,7 +1932,9 @@ mod tests {
             "msg-1",
             "pi-1-fake-tok",
             Path::new("/s/master/tmp"),
+            &everything_declared(),
         )
+        .unwrap()
     }
 
     /// CAD-1009: the per-turn reference is built from the allowlist, so
@@ -1787,16 +1949,16 @@ mod tests {
         assert!(stems.len() >= 9, "{stems:?}");
         let text = sample_reference();
         for stem in &stems {
-            let (_, args) = SCOPED_VERB_SHAPES
+            let (_, _, args) = SCOPED_VERB_SHAPES
                 .iter()
-                .find(|(s, _)| s == stem)
+                .find(|(s, _, _)| s == stem)
                 .unwrap_or_else(|| panic!("allowlisted `{stem}` has no shape row"));
             assert!(
                 text.contains(&format!("{stem}: {args}\n")),
                 "{stem}\n{text}"
             );
         }
-        for (stem, _) in SCOPED_VERB_SHAPES {
+        for (stem, _, _) in SCOPED_VERB_SHAPES {
             assert!(
                 stems.contains(stem),
                 "shape row `{stem}` is not allowlisted"

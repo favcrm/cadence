@@ -88,6 +88,119 @@ Resource admission and provider quota are also different. A free build slot does
 not prove provider allowance, and attaching/detaching a terminal does not prove
 its provider process ended. Reclamation must prove ownership at action time.
 
+### Bounded workflow preauthorization
+
+Unattended authority is an explicit operator opt-in on an existing standalone
+workflow, not permission for an agent to approve arbitrary plans or merges.
+For a stored `ship` workflow with a `worker` input, the operator can bind one
+render to a registered GitHub repository and file allowlist:
+
+```sh
+cadence workflow approve ship --project widgets --unattended \
+  --repo acme/widgets --allow-path 'src/**' --input worker=dev-1 --ttl 3600
+```
+
+The master consumes that authority with
+`cadence plan propose --project widgets --workflow ship --input worker=dev-1`.
+The full template and rendered content must still match; changing wording,
+inputs, the registered repository or worker does not admit a different plan.
+One grant admits one plan. Repeating the same proposal recovers the same IDs,
+not another dispatchable copy. Free-form files, app workflows and approvals
+without `--unattended` keep their ordinary manual plan-approval path.
+
+Grant lifetime defaults to 3600 seconds and is bounded to 1–86400 seconds.
+Only the operator may renew the same grant with
+`cadence workflow approve ship --project widgets --renew <grant-id> --ttl 3600`;
+renewal preserves its immutable bounds and one-plan credit. Ordinary
+`cadence workflow approve ship --project widgets` replaces the approval without
+a grant and revokes future automatic authority. These commands require native
+operator proof; a chat decision or client-supplied identity is not a grant.
+Native renewal revisions order same-second changes. Reappending a captured
+approval cannot resurrect a replaced grant or roll back a newer renewal,
+including a deliberately shortened lifetime. This relies on intact native
+history; it is not confinement against arbitrary same-UID database rewrites.
+
+Issue semantics use deterministic JSON of the selected identity, plan,
+dependency and body fields, with sorted dependency IDs. Escaped strings and
+typed options/arrays keep multiline content and metadata boundaries unambiguous;
+runtime-status changes remain excluded.
+
+Canonical issue dispatch and its native revision/CI-fix turns recheck current
+authority and use the recorded issue's repository and worker lane. Automatic
+dispatch preserves daemon-authenticated origin through its self-RPC and
+revalidates at the final enqueue gate, after blocking worktree/Git setup.
+Bound kickoff and follow-up writes carry the server-derived grant deadline
+into the queue transaction; connection/SQLite writer waits cannot extend it.
+The initial admission intent also checks its server-derived deadline after
+acquiring the SQL writer, before creating any logical issue or tracker commit.
+The tracker snapshot stays locked from each final canonical check through
+kickoff/follow-up enqueue and landing intent/remote attempt; ordinary edits
+serialize against that snapshot. Explicit operator hand-dispatch and repair
+retain their existing authority. A done report alone
+cannot start review: the owned queue turn must have completed
+with that exact SHA. Unknown outcomes remain held for reconciliation; a known
+failed provider turn stays failed and requires deliberate recovery, not a
+fabricated successful result or a blind replay. A grant does not authorize
+caller-authored job/task specifications or monitor dispatch; those unsupported
+bound-job paths refuse rather than borrowing the issue's approval.
+
+Before a bound repair produces another head, any earlier native merge request
+must be proved removed: fresh same-head OPEN PR, no auto-merge request and no
+queue entry. Active or unreadable state holds for operator inspection/removal,
+not an automatic cancellation or retry. Grant→delivery locks serialize repair
+and enqueue; an admitted repair clears its old standing PASS. Landing rechecks
+the latest owned completion even after review, covering a crash between native
+follow-up insertion and saving `Working`. Initial and follow-up instructions
+require a final `SHA: <full head>` result line matching the done report.
+
+Automatic landing requires a native independent exact-head PASS with explicit
+`risk: auto` verdict frontmatter, applicable current CI and complete file/policy
+evidence. Sensitive, protected, out-of-scope, unknown, deleted, renamed or
+mode-changing work still needs an explicit operator decision. The latest
+canonical `ci.yml` PR run supplies prequeue head feedback: a newer pending or
+failed attempt cannot be hidden by an older success. Neither historical run
+titles nor mutable `pull_requests[]` metadata prove current-base integration.
+
+Automatic landing remains default-branch-only; approved integration targets use
+ordinary delivery approval. Final integration authority comes from an enforced
+merge queue with no bypass actors or mutation-identity bypass. Administrator-enforced
+protection must bind the canonical `fmt`, `clippy`, `test`, `build` and `ui`
+gates to GitHub Actions, plus `cross-build (required)` when that existing
+aggregate is present. The trusted workflow must handle `merge_group`.
+Missing settings or an unsupported gate inventory hold automatic landing for
+operator setup; agents do not change repository rules. This reuses existing
+CI jobs and the queue rather than adding a status publisher or secrets.
+`--auto` enabled alone is not admission: a native `mergeQueueEntry` must be
+observed and recorded before the loop calls the work enqueued.
+Final PR/queue reads bind destination branch and base OID, with another target
+check after the intent writer wait and before the remote attempt. Intent/queue
+receipts retain the destination for repair and postmerge; missing or changed
+target evidence holds.
+
+The final tracker snapshot also binds the whole resolved delivery policy,
+including approval source and drift note. Native project-policy approval uses
+that same tracker lock, so it cannot cross intent or remote mutation.
+
+Native admission and enqueue intents precede logical tracker writes and remote
+mutation. ID directories reserve resources across interrupted admission; they
+are not approval evidence. Identical files are not commit proof. An uncertain
+enqueue is reconciled against the exact remote queue state, never blindly
+repeated. Same-grant renewal does not rewrite the original intent's historical
+expiry. Postmerge completion, including retries, must still have applicable
+native authority, recorded queue admission and enforceable integration checks.
+After remote collection, final canonical and deadline validation shares the
+actual non-waiting tracker writer with the status CAS and ordinary plan gate;
+observed `MERGED` alone is insufficient. Revocation stops future daemon actions;
+it does not itself guarantee cancellation of an already-issued remote queue request.
+
+An `unattended_held` observation belongs to the operator. Its existing board
+Details show the reason and inspection command; a matching owned-turn lane
+fence and ticket hold share one escalation with both causes. Dismissal is not
+resolution. Audit output distinguishes scoped workflow authority from a
+per-head operator approval and does not claim a verified external attestation.
+Implementation and isolated fixtures do not establish deployment, genuine
+provider operation or completion of CAD-225's full acceptance.
+
 ## Memory implementation boundaries
 
 `src/issue/dispatch.rs` matches accepted project memories, writes a bounded

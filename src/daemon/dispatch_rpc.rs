@@ -68,6 +68,32 @@ impl Shared {
             )));
         }
         let caller = self.agent_caller(peer_pid, VERB)?;
+        // Only a proven daemon self-peer can mark an automatic send.
+        // The marker requests stricter validation; it never grants authority.
+        let automatic = match params.get("unattended") {
+            None => false,
+            Some(Value::Bool(true))
+                if peer_pid == std::process::id() && matches!(&caller, AgentCaller::Operator) =>
+            {
+                true
+            }
+            Some(_) => {
+                return Err(Error::rejected(format!(
+                    "{VERB}: `unattended` marks the daemon's own automatic \
+                     dispatch — it is not a caller field"
+                )));
+            }
+        };
+        // Automatic callers retain their outer read guard across self-RPC;
+        // do not reacquire it here while a grant writer may be waiting.
+        let _grant = match &caller {
+            AgentCaller::Agent(_) => Some(
+                self.unattended_lock
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner()),
+            ),
+            AgentCaller::Operator => None,
+        };
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let id = issue::model::check_id(required_str(params, "issue")?)?;
         let text = required_str(params, "text")?;
@@ -131,8 +157,46 @@ impl Shared {
             }
         }
         let sender = self.thread_sender(&alias, peer_pid)?;
-        let (duplicate, state) = self.store.enqueue_steered(
+        // CAD-1586: a dispatch is a master-target send too — the same
+        // configuration-unlaunchable refusal, before the enqueue.
+        // A retry of an ID that already names a row is decided by the
+        // store's exact-envelope comparison; the refusal is for new sends.
+        if crate::master::is_master(&alias) && !self.store.message_exists(&mid)? {
+            self.master_send_preflight(&alias)?;
+        }
+        let gated = (matches!(&caller, AgentCaller::Agent(_)) || automatic)
+            && self.unattended_issue_bound(&id)?;
+        // Grant→tracker order; keep canonical semantics and owner stable
+        // through enqueue. Resolve blocking reads/Git before the live helper,
+        // whose final expiry check must follow all dispatch setup waits.
+        let _tracker = gated.then(|| pm.lock()).transpose()?;
+        let mut authorized_until = None;
+        if gated {
+            let (live_front, _) = issue::write::load_front(&dir)?;
+            let actual = issue::project::repo_identity(&worktree);
+            let authority = self.unattended_dispatch_authority(&id)?.ok_or_else(|| {
+                Error::rejected(
+                    "the unattended run's live authority vanished during dispatch — refused",
+                )
+            })?;
+            if live_front.owner.as_deref() != Some(alias.as_str()) {
+                return Err(Error::rejected(
+                    "an unattended kickoff must target the workflow's authorized worker",
+                ));
+            }
+            let actual = actual.ok_or_else(|| {
+                Error::rejected("the unattended worktree has no proven repository identity")
+            })?;
+            if actual.0.as_path() != Path::new(&authority.checkout) {
+                return Err(Error::rejected(
+                    "the unattended worktree is outside the workflow's authorized repository",
+                ));
+            }
+            authorized_until = Some(authority.expires_at);
+        }
+        let (duplicate, state) = self.store.enqueue_steered_for_with_conversation(
             &alias,
+            None,
             text,
             Some(reply_to),
             &mid,
@@ -145,6 +209,10 @@ impl Shared {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            authorized_until,
         )?;
         self.notify_agent(&alias);
         self.wake();
@@ -289,10 +357,7 @@ impl Shared {
             }
             crate::model_defaults::validate_model_id(model)?;
             if provider == "pi" {
-                let policy = match self.pm_dir() {
-                    Ok(dir) => crate::pi_policy::read(&dir)?,
-                    Err(_) => None,
-                };
+                let policy = self.stored_pi_policy()?;
                 crate::pi_policy::require_allowed(policy.as_ref(), "worker", model)?;
             }
         }
@@ -460,7 +525,7 @@ impl Shared {
                 let effective = match effective {
                     Some(m) => m,
                     None => {
-                        let policy = crate::pi_policy::read(&pm_dir)?;
+                        let policy = self.stored_pi_policy()?;
                         crate::pi_policy::resolve_model(policy.as_ref(), "worker", None)?
                     }
                 };
@@ -516,7 +581,15 @@ impl Shared {
             take_over: None,
         };
         let mut out = crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
-            issue::dispatch::run(&pm, &id, &args, "operator", &self.state_dir, Some(group))
+            issue::dispatch::run(
+                &pm,
+                &id,
+                &args,
+                "operator",
+                &self.state_dir,
+                Some(group),
+                issue::dispatch::DispatchOrigin::Explicit,
+            )
         })?;
         if let Some(note) = &note {
             // A comment on the ticket — never the file the kickoff
@@ -557,10 +630,7 @@ impl Shared {
         let (front, body) = issue::write::load_front(&dir)?;
         let items = issue::parse::acceptance_items(&body);
         let lane = self.kickoff_existing_lane(&project, &front)?;
-        let policy = match self.pm_dir() {
-            Ok(dir) => crate::pi_policy::read(&dir)?,
-            Err(_) => None,
-        };
+        let policy = self.stored_pi_policy()?;
         let mut providers = Vec::new();
         let mut seen: Vec<&str> = Vec::new();
         for spec in crate::adapter::registry::SPECS {

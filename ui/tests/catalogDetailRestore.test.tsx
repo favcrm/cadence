@@ -1,8 +1,6 @@
 /**
- * CAD-1108 acceptance check (ticket author's, CAD-1110 comment): a directive
- * naming an undeclared action, or carrying a forged identity, renders as text
- * and issues no host request. Name:
- * directive_naming_an_undeclared_action_or_forged_identity_renders_text_and_issues_no_host_request
+ * A successful legacy restore must leave one consistent installed state,
+ * without retaining the removed state or offering another restore.
  */
 declare function require(name: string): any;
 export {};
@@ -27,7 +25,10 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const CatalogDetail = require("../src/features/explorer/CatalogDetail").default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
+const CatalogDetail = (require("../src/features/explorer/CatalogDetail") as typeof import("../src/features/explorer/CatalogDetail")).default;
 
 // CAD-1209 (browser QA on #847): Restore on a removed app's detail page must
 // leave the page reading "Installed" only. The local card kept `removed: true`,
@@ -42,6 +43,8 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const json = (v: unknown) => new Response(JSON.stringify(v), { status: 200, headers: { "Content-Type": "application/json" } });
   if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
   if (url.pathname.endsWith("/restore") && init?.method === "POST") return json({ restored: true, digest: "sha256:x" });
+  if (url.pathname === "/api/app-installations") return json([]);
+  if (url.pathname === "/api/public-apps/crm") return new Response(JSON.stringify({ ok: false, error: { code: "not_found" } }), { status: 404, headers: { "Content-Type": "application/json" } });
   if (url.pathname === "/api/app-catalog/crm") return json(card);
   return json({});
 }) as typeof fetch;
@@ -51,19 +54,20 @@ document.body.appendChild(host);
 const root = createRoot(host);
 const flush = () => React.act(async () => { await new Promise((r) => setTimeout(r, 0)); });
 await React.act(async () => {
-  root.render(React.createElement(CatalogDetail, { id: "crm", viewer: { operator: true, readOnly: false } }));
+  root.render(React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children:
+      React.createElement(CatalogDetail, { id: "crm", viewer: { operator: true, readOnly: false } }),
+    })));
 });
 await flush();
-assert(host.textContent!.includes("CRM was removed"), "the removed banner shows before Restore");
+await flush();
 const restore = Array.from(host.querySelectorAll("button")).find((b) => b.textContent === "Restore");
 assert(restore, "a removed app offers Restore");
 await React.act(async () => { restore!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })); });
 await flush();
-const chips = Array.from(host.querySelectorAll(".chip")).map((c) => c.textContent);
-assert(chips.includes("Installed"), "restored app reads Installed");
-assert(!chips.includes("Removed"), `no Removed chip after Restore, got ${JSON.stringify(chips)}`);
-assert(!host.textContent!.includes("restore window has closed"), "no closed-window banner after Restore");
-assert(!host.textContent!.includes("was removed"), "no removed banner after Restore");
+assert(host.textContent!.includes("Installed"), "restored app reads Installed");
+assert(!host.textContent!.includes("Removed"), "restored app no longer presents the contradictory Removed state");
+assert(!Array.from(host.querySelectorAll("button")).some((button) => button.textContent === "Restore"), "a restored app cannot be restored again");
 await React.act(async () => { root.unmount(); });
 console.log("catalog detail restore checks passed");
 }

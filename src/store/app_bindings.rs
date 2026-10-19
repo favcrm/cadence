@@ -937,4 +937,177 @@ impl Store {
         })
         .transpose()
     }
+
+    /// CAD-1508: `proof` is an earlier incarnation of `current` reached only
+    /// by approved upgrade carries. Each carry rewrites `bundle_digest` and
+    /// nothing else. Any other move, a gap, or a malformed carry record
+    /// returns `Ok(false)` — the caller keeps refusing.
+    pub(crate) fn app_binding_upgrade_carried(
+        &self,
+        install: &str,
+        context: Option<&str>,
+        slot: &str,
+        proof: &BindingProof,
+        current: &BindingProof,
+    ) -> Result<bool> {
+        if proof.id != current.id
+            || proof.revision <= 0
+            || proof.revision >= current.revision
+            || config_digest(install, context, slot, &proof.config) != proof.digest
+            || config_digest(install, context, slot, &current.config) != current.digest
+            || !same_receipt_except_bundle(&proof.config, &current.config)
+        {
+            return Ok(false);
+        }
+        let Some(proof_bundle) = canonical_digest(proof.config["bundle_digest"].as_str()) else {
+            return Ok(false);
+        };
+        let Some(current_bundle) = canonical_digest(current.config["bundle_digest"].as_str())
+        else {
+            return Ok(false);
+        };
+        let payloads: Vec<String> = self.conn().query_vec(
+            "SELECT payload FROM events WHERE alias='app_bindings' AND kind='app_binding_migrated'
+             AND json_extract(payload,'$.install_id')=?1
+             AND json_extract(payload,'$.binding_id')=?2
+             ORDER BY seq ASC",
+            params![install, proof.id],
+            |row| row.get(0),
+        )?;
+        let mut links = Vec::new();
+        for payload in &payloads {
+            match parse_upgrade_carry(payload, install, &proof.id) {
+                CarryParse::Other => {}
+                CarryParse::Corrupt => return Ok(false),
+                CarryParse::Link(link) => links.push(link),
+            }
+        }
+        if links.len() > UPGRADE_CARRY_MAX {
+            return Ok(false);
+        }
+        // One carry per revision. A repeated from-digest is legitimate when
+        // a later upgrade returns to an earlier bundle: the binding digest
+        // is a pure function of the receipt, so the same receipt can be
+        // left twice. Two carries at one revision is a fork.
+        let mut revisions: Vec<i64> = links.iter().map(|link| link.revision).collect();
+        revisions.sort_unstable();
+        if revisions.windows(2).any(|pair| pair[0] == pair[1])
+            || links.iter().any(|link| link.revision > current.revision)
+        {
+            return Ok(false);
+        }
+        let mut cursor_digest = proof.digest.clone();
+        let mut cursor_rev = proof.revision;
+        let mut cursor_bundle = proof_bundle.to_string();
+        for _ in 0..links.len() {
+            if cursor_digest == current.digest
+                && cursor_rev == current.revision
+                && cursor_bundle == current_bundle
+            {
+                break;
+            }
+            let Some(next_rev) = cursor_rev.checked_add(1) else {
+                return Ok(false);
+            };
+            let Some(link) = links
+                .iter()
+                .find(|link| link.from_digest == cursor_digest && link.revision == next_rev)
+            else {
+                return Ok(false);
+            };
+            if link.from_bundle != cursor_bundle {
+                return Ok(false);
+            }
+            cursor_digest = link.digest.clone();
+            cursor_rev = next_rev;
+            cursor_bundle = link.to_bundle.clone();
+        }
+        // Carries at or before the proof are earlier history. Every later
+        // carry has a unique revision at or below the live row, and the
+        // walk consumes proof+1..=current, so a side carry cannot hide.
+        Ok(cursor_digest == current.digest
+            && cursor_rev == current.revision
+            && cursor_bundle == current_bundle)
+    }
+}
+
+const UPGRADE_CARRY_MAX: usize = 32;
+
+struct UpgradeCarryLink {
+    from_digest: String,
+    digest: String,
+    revision: i64,
+    from_bundle: String,
+    to_bundle: String,
+}
+
+enum CarryParse {
+    Other,
+    Corrupt,
+    Link(UpgradeCarryLink),
+}
+
+fn canonical_digest(digest: Option<&str>) -> Option<&str> {
+    let digest = digest?;
+    let hex = digest.strip_prefix("sha256:")?;
+    (hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+    .then_some(digest)
+}
+
+fn same_receipt_except_bundle(proof: &Value, current: &Value) -> bool {
+    if !proof.is_object() || !current.is_object() {
+        return false;
+    }
+    let mut expected = proof.clone();
+    expected["bundle_digest"] = current["bundle_digest"].clone();
+    expected == *current
+}
+
+fn parse_upgrade_carry(payload: &str, install: &str, binding_id: &str) -> CarryParse {
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return CarryParse::Corrupt;
+    };
+    if value.get("via") != Some(&json!("upgrade")) {
+        return CarryParse::Other;
+    }
+    let Some(from_digest) = canonical_digest(value["from_digest"].as_str()) else {
+        return CarryParse::Corrupt;
+    };
+    let Some(digest) = canonical_digest(value["digest"].as_str()) else {
+        return CarryParse::Corrupt;
+    };
+    let Some(revision) = value["revision"].as_i64().filter(|revision| *revision > 0) else {
+        return CarryParse::Corrupt;
+    };
+    let Some(changes) = value["changes"].as_array() else {
+        return CarryParse::Corrupt;
+    };
+    let Some(change) = changes.first().filter(|_| changes.len() == 1) else {
+        return CarryParse::Corrupt;
+    };
+    let Some(from_bundle) = canonical_digest(change["from"].as_str()) else {
+        return CarryParse::Corrupt;
+    };
+    let Some(to_bundle) = canonical_digest(change["to"].as_str()) else {
+        return CarryParse::Corrupt;
+    };
+    if value["actor"] != "daemon"
+        || value["install_id"] != install
+        || value["binding_id"] != binding_id
+        || change["field"] != "bundle_digest"
+        || from_digest == digest
+        || from_bundle == to_bundle
+    {
+        return CarryParse::Corrupt;
+    }
+    CarryParse::Link(UpgradeCarryLink {
+        from_digest: from_digest.to_string(),
+        digest: digest.to_string(),
+        revision,
+        from_bundle: from_bundle.to_string(),
+        to_bundle: to_bundle.to_string(),
+    })
 }

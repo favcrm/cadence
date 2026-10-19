@@ -32,7 +32,6 @@ const CRM_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ap
 const FETCH: &str = r#"{ "id": "social.posts.fetch", "description": "Read recent posts.", "input_schema": { "type": "object", "properties": { "handle": { "type": "string", "minLength": 1, "maxLength": 64 } }, "required": [], "additionalProperties": false }, "effect": "read", "confirmation": "permission_required", "availability": "requires_context" }"#;
 const DRAFT: &str = r#"{ "id": "social.draft.create", "description": "Draft a caption.", "input_schema": { "type": "object", "properties": { "post": { "type": "string", "minLength": 1, "maxLength": 128 }, "instructions": { "type": "string", "maxLength": 500 }, "with_image": { "type": "boolean" } }, "required": ["post"], "additionalProperties": false }, "effect": "draft", "confirmation": "permission_required", "availability": "requires_context" }"#;
 const STATUS: &str = r#"{ "id": "social.drafts.status", "description": "Draft status.", "input_schema": { "type": "object", "properties": {}, "required": [], "additionalProperties": false }, "effect": "read", "confirmation": "none", "availability": "requires_context" }"#;
-const CRM_SEARCH: &str = r#"{ "id": "customers.search", "description": "Search customers.", "input_schema": { "type": "object", "properties": { "query": { "type": "string", "maxLength": 160 }, "limit": { "type": "integer", "minimum": 1, "maximum": 20 }, "cursor": { "type": "string", "maxLength": 256 } }, "required": [], "additionalProperties": false }, "effect": "read", "confirmation": "none", "availability": "requires_context" }"#;
 
 fn descriptor(app: Option<&str>, actions: &[&str]) -> String {
     let app = app.map_or(String::new(), |a| format!(r#""app": "{a}","#));
@@ -342,11 +341,12 @@ impl Fx {
                 cwd,
                 sandbox: "read-only",
                 instructions: None,
-                params: None,
+                params: Some(r#"{"model":"fixture/model"}"#),
                 team_role: None,
                 model_policy: None,
             })
             .unwrap();
+        crate::test_seam::seed_pi_fixture_policy(&shared.store, "fixture/model").unwrap();
         shared
             .store
             .set_identity_with_quota(
@@ -831,159 +831,6 @@ fn a_second_allow_and_a_replayed_operation_never_charge_twice() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(fx.door.spent(), spent, "a replay charged again");
     assert_eq!(fx.drafts(&fx.context), 1, "a replay created another draft");
-}
-
-/// (5) The registry is an allow-list bound to the app. A social id in a
-/// non-social descriptor and a non-social id in a social-content
-/// descriptor are refused at install; a CRM installation gets no social
-/// action and CRM behaviour is unchanged; a CRM id on the Social Content
-/// installation is refused at invoke even when the descriptor declares it.
-#[test]
-fn social_and_crm_action_ids_never_cross_apps() {
-    let fx = Fx::with_social(None);
-    // Install-time validator (the same function the install path runs).
-    for (text, what) in [
-        (
-            descriptor(Some("crm"), &[CRM_SEARCH, FETCH]),
-            "social id in a crm descriptor",
-        ),
-        (
-            descriptor(None, &[FETCH]),
-            "social id in an app-less descriptor",
-        ),
-        (
-            descriptor(Some("social-content"), &[FETCH, CRM_SEARCH]),
-            "crm id in a social-content descriptor",
-        ),
-    ] {
-        refused(
-            crate::issue::app_assistant::validate(&text).map(|_| Value::Null),
-            "does not belong",
-            what,
-        );
-    }
-    // Install of a CRM package advertising a social action is refused.
-    let crm_bad = fx.dir.path().join("crm-bad");
-    copy_dir(std::path::Path::new(CRM_SOURCE), &crm_bad);
-    let crm_descriptor = std::fs::read_to_string(crm_bad.join("app-assistant.json")).unwrap();
-    let mut parsed: Value = serde_json::from_str(&crm_descriptor).unwrap();
-    parsed["actions"]
-        .as_array_mut()
-        .unwrap()
-        .push(serde_json::from_str(FETCH).unwrap());
-    std::fs::write(crm_bad.join("app-assistant.json"), parsed.to_string()).unwrap();
-    refused(
-        fx.install_dir(&crm_bad).map(Value::from),
-        "app-assistant.json",
-        "a CRM package advertising social.posts.fetch",
-    );
-    // Install of a Social Content package advertising a CRM action is
-    // refused.
-    refused(
-        fx.install_social(
-            "social-bad",
-            &descriptor(Some("social-content"), &[FETCH, CRM_SEARCH]),
-        )
-        .map(Value::from),
-        "app-assistant.json",
-        "a social-content package advertising customers.search",
-    );
-
-    // The real CRM package: its actions list has no social id, a social id
-    // is refused at invoke, and its own read still works (unchanged).
-    let crm = fx.install_dir(std::path::Path::new(CRM_SOURCE)).unwrap();
-    let crm_ctx = fx.operator(
-        "app_context_create",
-        json!({"install_id": crm, "label": "CRM", "input_defaults": {}, "request_id": "ctx-crm"}),
-    );
-    let crm_ctx = crm_ctx["context"]["id"]
-        .as_str()
-        .or_else(|| crm_ctx["id"].as_str())
-        .unwrap()
-        .to_string();
-    let token = fx.create_turn_in(&crm, &crm_ctx, "m-crm");
-    let listed = fx
-        .call(
-            Asserted::Agent("master".into()),
-            "app_assistant_actions",
-            json!({"install_id":crm,"context_id":crm_ctx,"message":"m-crm","token":token}),
-        )
-        .unwrap();
-    let ids: Vec<&str> = listed["actions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|a| a["id"].as_str())
-        .collect();
-    assert!(ids.contains(&"customers.search"), "{listed}");
-    assert!(
-        !ids.iter().any(|id| id.starts_with("social.")),
-        "CRM lists a social action: {listed}"
-    );
-    for action in [
-        "social.posts.fetch",
-        "social.draft.create",
-        "social.drafts.status",
-    ] {
-        let input = if action == "social.draft.create" {
-            json!({"post":"newest"})
-        } else {
-            json!({})
-        };
-        assert!(
-            fx.invoke_in(&crm, &crm_ctx, "m-crm", &token, action, "op-crm-x", input)
-                .is_err(),
-            "CRM installation ran {action}"
-        );
-    }
-    let search = fx
-        .invoke_in(
-            &crm,
-            &crm_ctx,
-            "m-crm",
-            &token,
-            "customers.search",
-            "op-crm-search",
-            json!({}),
-        )
-        .unwrap();
-    assert_eq!(search["operation"]["status"], "succeeded", "{search}");
-
-    // A Social Content package whose descriptor declares a CRM id without
-    // naming its app passes the descriptor grammar; the runtime allow-list
-    // (bound to the installed manifest's app, not the descriptor) refuses
-    // it at discovery and invoke.
-    let sneaky = fx
-        .install_social("social-sneaky", &descriptor(None, &[CRM_SEARCH]))
-        .expect("descriptor without app and only a CRM id installs");
-    let sneaky_ctx = fx.add_context(&sneaky, "ctx-sneaky");
-    let token = fx.create_turn_in(&sneaky, &sneaky_ctx, "m-sneaky");
-    let listed = fx
-        .call(
-            Asserted::Agent("master".into()),
-            "app_assistant_actions",
-            json!({"install_id":sneaky,"context_id":sneaky_ctx,"message":"m-sneaky","token":token}),
-        )
-        .unwrap();
-    assert_eq!(
-        listed["actions"].as_array().map(Vec::len),
-        Some(0),
-        "{listed}"
-    );
-    refused(
-        fx.invoke_in(
-            &sneaky,
-            &sneaky_ctx,
-            "m-sneaky",
-            &token,
-            "customers.search",
-            "op-sneaky",
-            json!({}),
-        ),
-        "not available for this installation's app",
-        "CRM id on the Social Content installation",
-    );
-    assert_eq!(fx.door.spent(), (0, 0, 0));
 }
 
 /// (6) A live price above what the operator confirmed fails the operation

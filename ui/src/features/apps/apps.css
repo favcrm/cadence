@@ -127,3 +127,192 @@
 .apps-home.flex {
   min-height: calc(100dvh - 2.25rem);
 }
+
+/* The Installed gallery (CAD catalogue directory): whole-card links —
+   no nested buttons. Artwork comes from the shared AppCover, text from
+   the real app_home row. The card's own border motion is the shared
+   `.card` transition; nothing here adds animation, so reduced-motion
+   needs no extra rule. */
+.apps-home .apps-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(290px, 100%), 1fr));
+  gap: 1.25rem;
+}
+.apps-home .app-card {
+  min-width: 0;
+  overflow: hidden;
+}
+.apps-home .app-card:has(> a):hover {
+  border-color: var(--color-ink-500);
+}
+.apps-home .app-card:has(a:focus-visible) {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+.apps-home .app-card-link,
+.apps-home .app-card-link:hover {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  color: var(--color-ink-300);
+  text-decoration: none;
+}
+.apps-home .app-card-link:focus-visible {
+  outline: none;
+}
+.apps-home .app-card-copy {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  padding: 1.125rem;
+}
+.apps-home .card-category {
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+  margin-bottom: 0.375rem;
+}
+.apps-home .app-card-name {
+  margin: 0;
+  font-size: var(--text-cardtitle);
+  font-weight: 600;
+  color: var(--color-ink-100);
+}
+.apps-home .app-card-summary {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  min-height: 2.9em;
+  margin: 0.5rem 0 0;
+  color: var(--color-ink-400);
+  font-size: var(--text-secondary);
+  line-height: 1.45;
+}
+.apps-home .card-publisher {
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+  margin-top: 0.875rem;
+}
+.apps-home .card-publisher + .card-publisher {
+  margin-top: 0.125rem;
+}
+.apps-home .card-footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: auto;
+  padding-top: 1.25rem;
+  font-size: var(--text-micro);
+  color: var(--color-ink-400);
+}
+.apps-home .card-footer b {
+  font-weight: 500;
+  color: var(--color-ink-200);
+}
+.apps-home .app-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  font-size: var(--text-micro);
+  color: var(--color-ink-500);
+}
+.apps-home .app-status[data-state="info"] {
+  color: var(--color-info);
+}
+.apps-home .app-status[data-state="warn"] {
+  color: var(--color-warn);
+}
+.apps-home .app-status::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+}
+.apps-home .app-card-copy-note {
+  padding: 0 1.125rem 1.125rem;
+  font-size: var(--text-micro);
+  color: var(--color-ink-500);
+}
+
+/* Choose favorites: the pin picker for every installed app, kept
+   outside the gallery cards so they stay single-link. Native
+   <details>/<summary>; disabled rows wait on the favorites read. */
+.apps-home .favpick {
+  position: relative;
+}
+.apps-home .favpick > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--text-label);
+  color: var(--color-ink-300);
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.375rem;
+  padding: 0.25rem 0.625rem;
+  user-select: none;
+}
+.apps-home .favpick > summary::-webkit-details-marker {
+  display: none;
+}
+.apps-home .favpick > summary::after {
+  content: "▾";
+  margin-left: 0.375rem;
+  color: var(--color-ink-500);
+}
+.apps-home .favpick[open] > summary::after {
+  content: "▴";
+}
+.apps-home .favpick > summary:hover {
+  border-color: var(--color-ink-500);
+  color: var(--color-ink-100);
+}
+.apps-home .favpick > summary:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.apps-home .favpick-list {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 0.375rem);
+  z-index: 10;
+  min-width: 13rem;
+  max-width: min(20rem, calc(100vw - 2rem));
+  max-height: 60dvh;
+  overflow-y: auto;
+  padding: 0.375rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  background: var(--color-ink-850);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--color-ink-950, #000) 45%, transparent);
+}
+.apps-home .favpick-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.5rem;
+  border-radius: 0.25rem;
+  font-size: var(--text-label);
+  color: var(--color-ink-200);
+  cursor: pointer;
+}
+.apps-home .favpick-row:hover {
+  background: var(--color-ink-800, var(--color-ink-875));
+}
+.apps-home .favpick-row:has(input:disabled) {
+  color: var(--color-ink-500);
+  cursor: default;
+}
+.apps-home .favpick-row input {
+  flex: none;
+  accent-color: var(--color-accent);
+}
+.apps-home .favpick-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

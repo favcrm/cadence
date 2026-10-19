@@ -14,14 +14,14 @@ use super::notify_service;
 use super::setup::{board_boot_agent_uid, setup_get, setup_refusal, WRITE_LOCK};
 use super::stream::stream_events;
 use super::write_path::{
-    artifact_response, header_value, model_defaults_get, request_identity, send, with_agents,
-    write_route, HttpResp,
+    agent_settings_get, artifact_response, header_value, model_defaults_get, request_identity,
+    send, with_agents, write_route, HttpResp,
 };
 use super::{
     app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
     app_release, app_runs, app_screens, approvals, apps, assist_route, business_templates,
-    cli_route, connections, crm_send, delivery_sync, home, lane, locale, operator,
-    platform_account, read_model, social_publish, stages, threads, topics, updates, wiki,
+    cli_route, connections, crm_send, delivery_sync, home, lane, locale, member_assist, my_work,
+    operator, platform_account, read_model, social_publish, stages, threads, topics, updates, wiki,
     wiki_envelope, work_conversations, workflows,
 };
 use super::{
@@ -211,15 +211,151 @@ pub(crate) fn static_file(dist: Option<&Path>, path: &str) -> Option<(String, Ve
     None
 }
 
+/// Whether a `q` value carries any positive weight, per the RFC 9110
+/// §12.4.2 grammar: `("0" ["." 0*3DIGIT]) / ("1" ["." 0*3"0"])`. The
+/// `0.` form is positive when a fraction digit is nonzero (`0.` alone
+/// is zero); the `1.` form only when every fraction digit is zero —
+/// including an empty one, `1.` is the full weight. Anything outside
+/// the grammar (non-numeric, NaN/inf, negative, above 1, more than
+/// three fraction digits) is malformed and admits nothing.
+fn qvalue_allowed(raw: &str) -> bool {
+    let (whole, frac) = match raw.split_once('.') {
+        Some((whole, frac)) => (whole, frac),
+        // "1" is the full weight; everything else whole is refused.
+        None => return raw == "1",
+    };
+    if frac.len() > 3 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match whole {
+        "0" => frac.bytes().any(|b| b != b'0'),
+        "1" => frac.bytes().all(|b| b == b'0'),
+        _ => false,
+    }
+}
+
+/// Whether a `;`-separated parameter list's `q` admits the token:
+/// `q=<value>` matches case-insensitively and trims whitespace; a
+/// token with no `q` parameter admits at full weight.
+fn token_allowed(params: &str) -> bool {
+    for param in params.split(';') {
+        let (key, value) = param.split_once('=').unwrap_or((param.trim(), ""));
+        if key.trim().eq_ignore_ascii_case("q") {
+            return qvalue_allowed(value.trim());
+        }
+    }
+    true
+}
+
+/// Whether `Accept-Encoding` allows `want`. An explicit token for `want`
+/// answers with its own q (an explicit `q=0` refuses even when a `*`
+/// offer would count); a positive `*` admits an unlisted coding; no
+/// match at all refuses. `identity` is what the raw file is — a client
+/// can refuse it, and then raw must not be served either.
+pub(crate) fn accepts_encoding(header: Option<&str>, want: &str) -> bool {
+    let Some(header) = header else {
+        return false;
+    };
+    let mut star = false;
+    for part in header.split(',') {
+        let mut it = part.splitn(2, ';');
+        let token = it.next().unwrap_or("").trim();
+        let allowed = it.next().map(token_allowed).unwrap_or(true);
+        if token.eq_ignore_ascii_case(want) {
+            return allowed;
+        }
+        if token == "*" && allowed {
+            star = true;
+        }
+    }
+    star
+}
+
+/// Whether `Accept-Encoding` refuses the raw, identity-coded file. Per
+/// RFC 9110 §12.5.3 a `*;q=0` offer excludes identity too — unless a
+/// more-specific `identity` entry overrides it with its own q (an
+/// explicit `identity;q=0` refuses regardless of `*`, an explicit
+/// positive `identity` allows regardless of `*`; first explicit wins).
+/// A missing header or no matching token allows the raw file. A refused
+/// identity with no acceptable coded answer is a refusal the route
+/// reports (406), never raw bytes against the client's stated rule.
+fn identity_refused(header: Option<&str>) -> bool {
+    let Some(header) = header else {
+        return false;
+    };
+    let mut star_zero = false;
+    for part in header.split(',') {
+        let mut it = part.splitn(2, ';');
+        let token = it.next().unwrap_or("").trim();
+        let allowed = it.next().map(token_allowed).unwrap_or(true);
+        if token.eq_ignore_ascii_case("identity") {
+            return !allowed;
+        }
+        if token == "*" {
+            star_zero = !allowed;
+        }
+    }
+    star_zero
+}
+
+/// The precompressed sibling the build emits (`<file>.br` / `<file>.gz`),
+/// when the client accepts it. Nothing is compressed at request time and
+/// nothing compressed leaves this path: the bytes are the build's own
+/// artifact, and the answer keeps the plain file's name and Content-Type.
+pub(crate) fn encoded_file(
+    dist: Option<&Path>,
+    target: &str,
+    accept_encoding: Option<&str>,
+) -> Option<(String, Vec<u8>, &'static str)> {
+    for (suffix, encoding) in [(".br", "br"), (".gz", "gzip")] {
+        if !accepts_encoding(accept_encoding, encoding) {
+            continue;
+        }
+        if let Some(dist) = dist {
+            // Filesystem mode: the sibling sits beside the file in dist.
+            let compressed = format!("{target}{suffix}");
+            if let Some((_, bytes)) = static_file(Some(dist), &compressed) {
+                return Some((target.to_string(), bytes, encoding));
+            }
+            continue;
+        }
+        #[cfg(feature = "ui")]
+        {
+            // Embedded mode: match the target directly — no path
+            // construction on the request path.
+            let bytes: Option<&[u8]> = match (target, encoding) {
+                ("/assets/index.js", "br") => Some(embedded::JS_BR),
+                ("/assets/index.js", "gzip") => Some(embedded::JS_GZ),
+                ("/assets/index.css", "br") => Some(embedded::CSS_BR),
+                ("/assets/index.css", "gzip") => Some(embedded::CSS_GZ),
+                ("/index.html", "br") => Some(embedded::INDEX_BR),
+                ("/index.html", "gzip") => Some(embedded::INDEX_GZ),
+                _ => None,
+            };
+            if let Some(b) = bytes {
+                return Some((target.to_string(), b.to_vec(), encoding));
+            }
+        }
+        #[allow(unreachable_code)]
+        continue;
+    }
+    None
+}
+
 /// What a non-API GET answers with.
 #[derive(Debug)]
 pub(crate) enum StaticAnswer {
-    /// A file of the build — or the SPA shell (`index.html`) for a client route.
-    File(String, Vec<u8>),
+    /// A file of the build — or the SPA shell (`index.html`) for a client
+    /// route. The `Option<&'static str>` is a `Content-Encoding` name when
+    /// the build's precompressed sibling answers instead of the raw bytes.
+    File(String, Vec<u8>, Option<&'static str>),
     /// A path that names a file the build does not have.
     Missing,
     /// No build to serve at all.
     NoBuild,
+    /// The client refused the only representation the file has
+    /// (`identity;q=0` and no coded sibling it accepts).
+    NotAcceptable,
 }
 
 /// Extensions the build serves as files. A missing one is a 404, never
@@ -246,6 +382,8 @@ pub(crate) fn is_static_ext(ext: &str) -> bool {
             | "map"
             | "json"
             | "webmanifest"
+            | "br"
+            | "gz"
     )
 }
 
@@ -292,24 +430,48 @@ pub(crate) fn prefers_json(accept: Option<&str>) -> bool {
 }
 
 /// A build file when one matches; else the SPA shell for a client route.
-/// `accept` is the request's Accept header. A wiki GET that prefers JSON
-/// stays a 404 so the file API remains `/api/wiki/file`.
+/// `accept` is the request's Accept header and `accept_encoding` its
+/// Accept-Encoding: a precompressed sibling the build emitted answers
+/// only when the client named its coding, else the raw file stands —
+/// unless the client refused identity (`identity;q=0`, or `*;q=0` with
+/// no more-specific identity entry), and then a file with no acceptable
+/// coded answer is a 406, never raw bytes against the client's stated
+/// rule. A wiki GET that prefers JSON stays a 404 so the
+/// file API remains `/api/wiki/file`.
 pub(crate) fn static_answer_for(
     dist: Option<&Path>,
     path: &str,
     accept: Option<&str>,
+    accept_encoding: Option<&str>,
 ) -> StaticAnswer {
     let target = if path == "/" { "/index.html" } else { path };
+    let refuse_raw = identity_refused(accept_encoding);
     if !path.starts_with("/api/") {
+        if let Some((name, bytes, encoding)) = encoded_file(dist, target, accept_encoding) {
+            return StaticAnswer::File(name, bytes, Some(encoding));
+        }
         if let Some((name, bytes)) = static_file(dist, target) {
-            return StaticAnswer::File(name, bytes);
+            return if refuse_raw {
+                StaticAnswer::NotAcceptable
+            } else {
+                StaticAnswer::File(name, bytes, None)
+            };
         }
     }
     if !is_client_route(path) || (is_wiki_path(path) && prefers_json(accept)) {
         return StaticAnswer::Missing;
     }
+    if let Some((name, bytes, encoding)) = encoded_file(dist, "/index.html", accept_encoding) {
+        return StaticAnswer::File(name, bytes, Some(encoding));
+    }
     match static_file(dist, "/index.html") {
-        Some((name, bytes)) => StaticAnswer::File(name, bytes),
+        Some((name, bytes)) => {
+            if refuse_raw {
+                StaticAnswer::NotAcceptable
+            } else {
+                StaticAnswer::File(name, bytes, None)
+            }
+        }
         None => StaticAnswer::NoBuild,
     }
 }
@@ -322,6 +484,13 @@ mod embedded {
     pub const INDEX: &str = include_str!("../../ui/dist/index.html");
     pub const JS: &str = include_str!("../../ui/dist/assets/index.js");
     pub const CSS: &str = include_str!("../../ui/dist/assets/index.css");
+    /// Brotli and gzip siblings the build's precompress step emits beside them.
+    pub const INDEX_BR: &[u8] = include_bytes!("../../ui/dist/index.html.br");
+    pub const INDEX_GZ: &[u8] = include_bytes!("../../ui/dist/index.html.gz");
+    pub const JS_BR: &[u8] = include_bytes!("../../ui/dist/assets/index.js.br");
+    pub const JS_GZ: &[u8] = include_bytes!("../../ui/dist/assets/index.js.gz");
+    pub const CSS_BR: &[u8] = include_bytes!("../../ui/dist/assets/index.css.br");
+    pub const CSS_GZ: &[u8] = include_bytes!("../../ui/dist/assets/index.css.gz");
     pub const FAVICON: &[u8] = include_bytes!("../../ui/dist/favicon.svg");
     pub const ICON: &[u8] = include_bytes!("../../ui/dist/icon.svg");
     pub const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../../ui/dist/apple-touch-icon.png");
@@ -983,18 +1152,25 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         }
         return;
     }
-    // Closed screen services use the SAME admitted OperatorOnly HTTP peer
-    // proof as the ordinary write dispatcher, on local and public surfaces.
+    // Closed screen services use the SAME admitted HTTP peer proof as the
+    // ordinary write dispatcher, on local and public surfaces. CAD-1537:
+    // `call` is `ScreenRead` — a member or `--read-only` board caller is
+    // held to the read allowlist; the SLOT routes stay OperatorOnly.
     if let Some(rpc) = app_screens::service_route(&path) {
         if method != Method::Post {
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        if let Err(response) = operator::admit(&request, method.as_str(), &path, state_dir, opts) {
-            send(request, response);
-            return;
-        }
-        let response = app_screens::service(&mut request, state_dir, opts, rpc);
+        let caller = match operator::admit(&request, method.as_str(), &path, state_dir, opts) {
+            Ok(caller) => caller,
+            Err(response) => {
+                send(request, response);
+                return;
+            }
+        };
+        let read_only = opts.read_only
+            || matches!(&caller, Some(operator::Caller::Named(named)) if !named.operator);
+        let response = app_screens::service(&mut request, state_dir, opts, rpc, read_only);
         read_model::get(state_dir, pm_dir).invalidate();
         send(request, response);
         return;
@@ -1060,6 +1236,18 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         // check. A browser session never satisfies it.
         if let Some(tail) = path.strip_prefix("/api/internal/notifications/") {
             let resp = notify_service::post(&mut request, &method, tail, state_dir, opts);
+            send(request, resp);
+            return;
+        }
+        // CAD-1485: `/api/member-assistant/<verb>` — the member's own
+        // browser chat. Cookie-facing twin of `/api/assist`: the public
+        // session cookie is the credential, and the route mints a fresh
+        // assistant envelope server-side (the AOS `board-authorize`
+        // issuer) before running the same member dispatch. Diverted ahead
+        // of the cookie gates alongside the assist family; the route's
+        // own write_guard + verified-session check run inside.
+        if let Some(tail) = path.strip_prefix("/api/member-assistant/") {
+            let resp = member_assist::post(&mut request, &method, tail, state_dir, pm_dir, opts);
             send(request, resp);
             return;
         }
@@ -1175,6 +1363,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     };
 
     match path.as_str() {
+        "/api/my-work" => {
+            let response = my_work::get(&request, state_dir, pm_dir, opts, raw_query);
+            send(request, response);
+        }
         "/api/locale" => {
             let response = locale::get(&request, state_dir, opts);
             send(request, response);
@@ -1272,6 +1464,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         "/api/settings/model-defaults" => {
             send(request, model_defaults_get(state_dir, opts.read_only));
         }
+        "/api/settings/agents" => match operator::admit_operator_read(&request, state_dir, opts) {
+            Ok(()) => send(request, agent_settings_get(state_dir, opts.read_only)),
+            Err(resp) => send(request, resp),
+        },
         "/api/platform-account" => send(request, platform_account::get(opts)),
         // CAD-1393: operator-only reads of company templates and drafts.
         "/api/templates/show"
@@ -1412,14 +1608,57 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     }
                 }
             }
-            send(request, json_response(overview))
+            let actor = match read_admission
+                .as_ref()
+                .map(|a| operator::read_actor(a, &request, state_dir, opts))
+            {
+                Some(Ok(actor)) => actor,
+                Some(Err(resp)) => {
+                    send(request, resp);
+                    return;
+                }
+                None => {
+                    send(request, err_response(503, "read admission is missing"));
+                    return;
+                }
+            };
+            match Pm::at(pm_dir) {
+                Ok(pm) => {
+                    let readable = super::project_policy::readable(&pm, &actor);
+                    super::project_policy::retain_overview(&mut overview, &readable);
+                    send(request, json_response(overview));
+                }
+                Err(e) => send(request, err_response(503, &e.to_string())),
+            }
         }
         "/api/projects" => match Pm::at(pm_dir) {
             Ok(pm) => {
-                send(
-                    request,
-                    json_response(read_model::get(state_dir, pm_dir).projects(&pm)),
-                );
+                let actor = match read_admission
+                    .as_ref()
+                    .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => actor,
+                    Some(Err(resp)) => {
+                        send(request, resp);
+                        return;
+                    }
+                    None => {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    }
+                };
+                // AOS-274: a project this caller may not read contributes
+                // no row, and no issue count, to the listing.
+                let readable = super::project_policy::readable(&pm, &actor);
+                let mut payload = read_model::get(state_dir, pm_dir).projects(&pm);
+                if let Some(rows) = payload.get_mut("projects").and_then(|v| v.as_array_mut()) {
+                    rows.retain(|row| {
+                        row.get("key")
+                            .and_then(|k| k.as_str())
+                            .is_some_and(|key| readable.contains(key))
+                    });
+                }
+                send(request, json_response(payload));
             }
             Err(e) => send(request, err_response(503, &e.to_string())),
         },
@@ -1455,11 +1694,28 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 // CAD-405: each card carries its `work` block.
                 let by_id = read.by_id();
                 let ctx = read.ctx(&by_id);
+                let actor = match read_admission
+                    .as_ref()
+                    .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => actor,
+                    Some(Err(resp)) => {
+                        send(request, resp);
+                        return;
+                    }
+                    None => {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    }
+                };
+                // AOS-274: filter before the slice and the card, so a
+                // restricted project contributes no row or count.
+                let readable = super::project_policy::readable(&pm, &actor);
                 let mut body = json!({
                     "issues": read
                         .views
                         .iter()
-                        .filter(|v| slice.matches(v))
+                        .filter(|v| slice.matches(v) && readable.contains(&v.issue.project))
                         .map(|v| read.card(&ctx, v))
                         .collect::<Vec<_>>(),
                 });
@@ -1477,14 +1733,37 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, err_response(400, "bad project key"));
                     return;
                 }
-                // Every project loads so cross-project children count.
+                // Every project loads so cross-project children count, so
+                // the caller's readable set is applied to the view slice
+                // first: a restricted project contributes no epic, child
+                // or count.
                 let read = read_model::get(state_dir, pm_dir).board(&pm, None);
+                let actor = match read_admission
+                    .as_ref()
+                    .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => actor,
+                    Some(Err(resp)) => {
+                        send(request, resp);
+                        return;
+                    }
+                    None => {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    }
+                };
+                let readable = super::project_policy::readable(&pm, &actor);
+                let visible: Vec<&crate::issue::board::View> = read
+                    .views
+                    .iter()
+                    .filter(|v| readable.contains(&v.issue.project))
+                    .collect();
                 send(
                     request,
                     json_response(json!({
                         "epics": crate::issue::work::epics_json(
                             &pm.dir,
-                            &read.views,
+                            &visible,
                             filter.as_deref(),
                             crate::issue::time::now_epoch(),
                             &read.approvals,
@@ -1560,12 +1839,33 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             if head_only {
                 send(request, err_response(405, "stream is GET only"));
             } else {
-                stream_events(
-                    request,
-                    state_dir,
-                    pm_dir,
-                    read_admission.expect("private stream admission"),
-                );
+                let admission = read_admission.expect("private stream admission");
+                // AOS-274: the stream is one shared, unfiltered frame
+                // source. A caller who cannot read every project is
+                // refused live updates rather than served rows and
+                // counts from projects it may not see.
+                let complete = match Pm::at(pm_dir) {
+                    Ok(pm) => match operator::read_actor(&admission, &request, state_dir, opts) {
+                        Ok(actor) => super::project_policy::reads_every_project(&pm, &actor),
+                        Err(resp) => {
+                            send(request, resp);
+                            return;
+                        }
+                    },
+                    // Fail closed when the tracker cannot be read.
+                    Err(_) => false,
+                };
+                if !complete {
+                    send(
+                        request,
+                        err_response(
+                            403,
+                            "live updates are unavailable for a project-restricted workspace",
+                        ),
+                    );
+                    return;
+                }
+                stream_events(request, state_dir, pm_dir, admission);
             }
         }
         _ => {
@@ -1600,15 +1900,40 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     match Pm::at(pm_dir) {
                         Ok(pm) => match project::list(&pm.dir) {
                             Ok(projects) => match projects.iter().find(|p| p.key == key) {
-                                Some(selected) => send(
-                                    request,
-                                    json_response(context::bundle(
-                                        &pm,
-                                        selected,
-                                        role.as_deref(),
-                                        expected_revision.as_deref(),
-                                    )),
-                                ),
+                                Some(selected) => {
+                                    let actor = match read_admission
+                                        .as_ref()
+                                        .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                                    {
+                                        Some(Ok(actor)) => actor,
+                                        Some(Err(resp)) => {
+                                            send(request, resp);
+                                            return;
+                                        }
+                                        None => {
+                                            send(
+                                                request,
+                                                err_response(503, "read admission is missing"),
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    // AOS-274: a restricted project answers
+                                    // like an absent one, with no bundle.
+                                    if super::project_policy::refused(&pm, &selected.key, &actor) {
+                                        send(request, err_response(404, "unknown project"));
+                                        return;
+                                    }
+                                    send(
+                                        request,
+                                        json_response(context::bundle(
+                                            &pm,
+                                            selected,
+                                            role.as_deref(),
+                                            expected_revision.as_deref(),
+                                        )),
+                                    )
+                                }
                                 None => send(request, err_response(404, "unknown project")),
                             },
                             Err(error) => send(request, err_response(503, &error.to_string())),
@@ -1682,7 +2007,8 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, err_response(405, "method not allowed"));
                     return;
                 }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                // CAD-1537: a member's screen needs the context receipt.
+                if let Err(response) = operator::admit_screen_read(&request, state_dir, opts) {
                     send(request, response);
                     return;
                 }
@@ -1837,11 +2163,18 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     .strip_prefix("/api/app-installations/")
                     .is_some_and(|id| !id.is_empty() && !id.contains('/'))
             {
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                let id = path.strip_prefix("/api/app-installations/");
+                // CAD-1537: one installation's receipt is a screen read a
+                // member may make; the list stays the operator's.
+                let admitted = if id.is_some() {
+                    operator::admit_screen_read(&request, state_dir, opts).map(|_| ())
+                } else {
+                    operator::admit_operator_read(&request, state_dir, opts)
+                };
+                if let Err(response) = admitted {
                     send(request, response);
                     return;
                 }
-                let id = path.strip_prefix("/api/app-installations/");
                 let method = if id.is_some() {
                     "app_workspace_show"
                 } else {
@@ -2009,6 +2342,26 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                             send(request, err_response(404, "unknown issue"));
                             return;
                         };
+                        // AOS-274: a restricted project answers like an
+                        // absent issue, without naming the project.
+                        let actor = match read_admission
+                            .as_ref()
+                            .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                        {
+                            Some(Ok(actor)) => actor,
+                            Some(Err(resp)) => {
+                                send(request, resp);
+                                return;
+                            }
+                            None => {
+                                send(request, err_response(503, "read admission is missing"));
+                                return;
+                            }
+                        };
+                        if super::project_policy::refused(&pm, &view.issue.project, &actor) {
+                            send(request, err_response(404, "unknown issue"));
+                            return;
+                        }
                         match sub {
                             Some("kickoff") => {
                                 let resp = home::kickoff_options(&request, state_dir, opts, &id);
@@ -2093,16 +2446,26 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 opts.dist.as_deref(),
                 &path,
                 header_value(&request, "Accept").as_deref(),
+                header_value(&request, "Accept-Encoding").as_deref(),
             ) {
-                StaticAnswer::File(name, bytes) => {
+                StaticAnswer::File(name, bytes, encoding) => {
                     let mut resp = Response::from_data(bytes);
                     resp.add_header(
                         Header::from_bytes("Content-Type", content_type(&name)).unwrap(),
                     );
                     resp.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
+                    // Raw and compressed answers differ on this header,
+                    // so it varies every file answer, not only the coded one.
+                    resp.add_header(Header::from_bytes("Vary", "Accept-Encoding").unwrap());
+                    if let Some(encoding) = encoding {
+                        resp.add_header(Header::from_bytes("Content-Encoding", encoding).unwrap());
+                    }
                     send(request, resp);
                 }
                 StaticAnswer::Missing => send(request, err_response(404, "no such file")),
+                StaticAnswer::NotAcceptable => {
+                    send(request, err_response(406, "no acceptable content encoding"))
+                }
                 StaticAnswer::NoBuild => send(
                     request,
                     err_response(

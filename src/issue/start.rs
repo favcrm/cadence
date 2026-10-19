@@ -114,40 +114,96 @@ pub(crate) fn resolve_repo(
     )))
 }
 
-/// Base resolution: an explicit `--base`, else fetch and pin the repo's
-/// `origin/HEAD` target, else use the local branch (for repos without a remote
-/// default). Returns the selected ref and its exact commit SHA.
-pub(crate) fn resolve_base(root: &Path, flag: Option<&str>) -> Result<(String, String)> {
-    let (base, fetch_default) = if let Some(b) = flag {
-        (b.to_string(), false)
-    } else if let Ok(origin_head) = git(
+/// The ref and commit a new lane is cut from.
+#[derive(Debug)]
+pub(crate) struct ResolvedBase {
+    pub name: String,
+    pub sha: String,
+    /// Set when the main checkout's tip is not contained in `sha`.
+    /// The lane is still cut from `sha`; this only names the mismatch.
+    pub warning: Option<String>,
+}
+
+/// The integration branch configured on the project repo whose checkout
+/// is `root`, if any.
+pub(crate) fn configured_integration<'a>(
+    project: &'a project::Project,
+    root: &Path,
+) -> Option<&'a str> {
+    let root = root.canonicalize().ok()?;
+    project.repos.iter().find_map(|repo| {
+        let path = repo.path.as_deref()?;
+        let expanded = project::expand_home(path);
+        let canon = expanded.canonicalize().ok()?;
+        if canon == root {
+            repo.base.as_deref()
+        } else {
+            None
+        }
+    })
+}
+
+/// Base resolution for a new lane.
+///
+/// An explicit `--base` is used as given. Otherwise the base is the
+/// project's integration ref, fetched from the remote: `configured`
+/// (`repos[].base`), else `origin/HEAD` when that symbolic ref exists,
+/// else the remote's symbolic HEAD (`git ls-remote --symref origin
+/// HEAD`). A repository with no `origin` remote still uses its current
+/// branch — there is no remote integration ref to adopt instead.
+///
+/// When `origin` exists but its integration branch cannot be resolved,
+/// this refuses. It does not adopt the main checkout's current branch.
+/// When the checkout's tip is not contained in the integration commit,
+/// the lane is still cut from that commit and [`ResolvedBase::warning`]
+/// names the mismatch.
+pub(crate) fn resolve_base(
+    root: &Path,
+    flag: Option<&str>,
+    configured: Option<&str>,
+) -> Result<ResolvedBase> {
+    if let Some(base) = flag {
+        return Ok(ResolvedBase {
+            sha: verify_base(root, base)?,
+            name: base.to_string(),
+            warning: None,
+        });
+    }
+    if let Some(configured) = configured {
+        return pin_integration(root, normalize_integration(configured)?);
+    }
+    if let Ok(origin_head) = git(
         root,
         &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
     ) {
-        (origin_head, true)
-    } else {
-        (
-            git(root, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_else(|_| "HEAD".to_string()),
-            false,
-        )
-    };
-    if fetch_default {
-        let (remote, branch) = base.split_once('/').ok_or_else(|| {
-            Error::rejected(format!("origin/HEAD resolved to invalid ref '{base}'"))
-        })?;
-        let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
-        git(
-            root,
-            &["fetch", "--no-tags", "--no-write-fetch-head", remote, &refspec],
-        )
-        .map_err(|e| {
-            Error::rejected(format!(
-                "Could not refresh default base '{base}' in {} ({e}) — retry when origin is reachable or pass --base <ref>",
-                root.display()
-            ))
-        })?;
+        return pin_integration(root, origin_head);
     }
-    let sha = git(
+    if origin_configured(root) {
+        let branch = remote_head_branch(root)?;
+        return pin_integration(root, format!("origin/{branch}"));
+    }
+    let base =
+        git(root, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_else(|_| "HEAD".to_string());
+    Ok(ResolvedBase {
+        sha: verify_base(root, &base)?,
+        name: base,
+        warning: None,
+    })
+}
+
+fn pin_integration(root: &Path, base: String) -> Result<ResolvedBase> {
+    fetch_integration(root, &base)?;
+    let sha = verify_base(root, &base)?;
+    let warning = checkout_divergence(root, &base, &sha);
+    Ok(ResolvedBase {
+        name: base,
+        sha,
+        warning,
+    })
+}
+
+fn verify_base(root: &Path, base: &str) -> Result<String> {
+    git(
         root,
         &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
     )
@@ -156,8 +212,141 @@ pub(crate) fn resolve_base(root: &Path, flag: Option<&str>) -> Result<(String, S
             "Base '{base}' does not resolve in {} — pass --base <ref>",
             root.display()
         ))
+    })
+}
+
+fn origin_configured(root: &Path) -> bool {
+    git(root, &["config", "--get", "remote.origin.url"])
+        .ok()
+        .is_some_and(|url| !url.is_empty())
+}
+
+fn remote_head_branch(root: &Path) -> Result<String> {
+    let label = checkout_label(root);
+    let out = git(root, &["ls-remote", "--symref", "origin", "HEAD"]).map_err(|e| {
+        Error::rejected(format!(
+            "Refusing to adopt the main checkout's branch '{label}' as the lane base in {}: \
+             origin has no resolvable integration branch ({e}). Pass --base <ref>, or set \
+             repos[].base to the integration branch",
+            root.display()
+        ))
     })?;
-    Ok((base, sha))
+    let branch = out.lines().find_map(|line| {
+        let rest = line.strip_prefix("ref:")?.trim_start();
+        let name = rest.split_whitespace().next()?;
+        name.strip_prefix("refs/heads/")
+    });
+    match branch {
+        Some(branch) if valid_branch(branch) => Ok(branch.to_string()),
+        _ => Err(Error::rejected(format!(
+            "Refusing to adopt the main checkout's branch '{label}' as the lane base in {}: \
+             origin HEAD is not a branch. Pass --base <ref>, or set repos[].base to the \
+             integration branch",
+            root.display()
+        ))),
+    }
+}
+
+fn fetch_integration(root: &Path, base: &str) -> Result<()> {
+    let (remote, branch) = base.split_once('/').ok_or_else(|| {
+        Error::rejected(format!(
+            "Integration ref '{base}' is not a remote-tracking name — expected 'origin/<branch>'"
+        ))
+    })?;
+    if !valid_remote(remote) || !valid_branch(branch) {
+        return Err(Error::rejected(format!(
+            "Integration ref '{base}' is not a branch on origin"
+        )));
+    }
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+    git(
+        root,
+        &[
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            remote,
+            &refspec,
+        ],
+    )
+    .map(|_| ())
+    .map_err(|e| {
+        Error::rejected(format!(
+            "Could not refresh integration ref '{base}' in {} ({e}) — retry when origin is \
+             reachable or pass --base <ref>",
+            root.display()
+        ))
+    })
+}
+
+/// `staging` and `origin/staging` both mean `origin/staging`.
+fn normalize_integration(spec: &str) -> Result<String> {
+    let spec = spec.trim();
+    let branch = spec
+        .strip_prefix("refs/remotes/origin/")
+        .or_else(|| spec.strip_prefix("refs/heads/"))
+        .or_else(|| spec.strip_prefix("origin/"))
+        .unwrap_or(spec);
+    if !valid_branch(branch) {
+        return Err(Error::rejected(format!(
+            "Integration ref '{spec}' is not a branch name — set repos[].base to a branch such \
+             as 'staging' or 'origin/staging'"
+        )));
+    }
+    Ok(format!("origin/{branch}"))
+}
+
+fn valid_remote(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn valid_branch(branch: &str) -> bool {
+    branch != "HEAD"
+        && !branch.is_empty()
+        && !branch.starts_with('/')
+        && !branch.ends_with('/')
+        && !branch.contains("//")
+        && branch.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+}
+
+fn checkout_label(root: &Path) -> String {
+    let raw =
+        git(root, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_else(|_| "HEAD".to_string());
+    raw.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+fn short_sha(sha: &str) -> &str {
+    let n = sha.len().min(12);
+    &sha[..n]
+}
+
+/// `None` when the main checkout's tip is contained in the integration
+/// commit (equal, or behind it). A foreign tip is named, not adopted.
+fn checkout_divergence(root: &Path, base: &str, base_sha: &str) -> Option<String> {
+    let sha = git(root, &["rev-parse", "--verify", "HEAD^{commit}"]).ok()?;
+    if git(root, &["merge-base", "--is-ancestor", &sha, base_sha]).is_ok() {
+        return None;
+    }
+    Some(format!(
+        "main checkout '{}' ({}) is not contained in integration ref {base} ({}); the lane is \
+         based on {base}, not that checkout",
+        checkout_label(root),
+        short_sha(&sha),
+        short_sha(base_sha),
+    ))
 }
 
 fn branch_base(root: &Path, branch: &str, fallback: &str) -> String {
@@ -556,10 +745,16 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         && (!initial_open.is_empty()
             || initial_refs_recorded
             || initial_lifecycle_record.is_some());
-    let (base, base_sha) = if initial_reuse && args.base.is_none() {
-        resolve_existing_base(&root, &initial_branch)?
+    let (base, base_sha, base_warning) = if initial_reuse && args.base.is_none() {
+        let (name, sha) = resolve_existing_base(&root, &initial_branch)?;
+        (name, sha, None)
     } else {
-        resolve_base(&root, args.base.as_deref())?
+        let resolved = resolve_base(
+            &root,
+            args.base.as_deref(),
+            configured_integration(&project, &root),
+        )?;
+        (resolved.name, resolved.sha, resolved.warning)
     };
     let shared_deps = worktree::shared_deps_enabled(&project)?;
 
@@ -1013,6 +1208,10 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         "slot_env": slot_env,
         "claim": claim_out,
     });
+    if let Some(warning) = &base_warning {
+        eprintln!("cadence: {warning}");
+        out["base"]["warning"] = json!(warning);
+    }
     if let (Some(job), Some((state_dir, spec, spec_sha256))) = (&args.job, job_probe) {
         // CAD-159: the issue's acceptance items ride the scoped task,
         // so the daemon's `job dispatch` kickoff lists them — all of
@@ -1169,4 +1368,156 @@ fn write_slot_env(wt_dir: &Path, pm_dir: &Path) -> Result<PathBuf> {
         return Err(e);
     }
     Ok(file)
+}
+
+#[cfg(test)]
+mod resolve_base_tests {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use super::resolve_base;
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn rev(dir: &Path, spec: &str) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", spec])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        checkout: PathBuf,
+        main_sha: String,
+        staging_sha: String,
+        side_sha: String,
+    }
+
+    fn fixture() -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let checkout = tmp.path().join("checkout");
+        std::fs::create_dir(&origin).unwrap();
+        run_git(
+            &origin,
+            &["init", "--quiet", "--bare", "--initial-branch=main"],
+        );
+        std::fs::create_dir(&checkout).unwrap();
+        run_git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(&checkout, &["config", "user.email", "t@example.com"]);
+        run_git(&checkout, &["config", "user.name", "t"]);
+        std::fs::write(checkout.join("f"), "main\n").unwrap();
+        run_git(&checkout, &["add", "f"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "main"]);
+        let main_sha = rev(&checkout, "HEAD");
+        run_git(
+            &checkout,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        run_git(
+            &checkout,
+            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+        );
+        run_git(&checkout, &["checkout", "--quiet", "-b", "staging"]);
+        std::fs::write(checkout.join("s"), "staging\n").unwrap();
+        run_git(&checkout, &["add", "s"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "staging"]);
+        let staging_sha = rev(&checkout, "HEAD");
+        run_git(
+            &checkout,
+            &["push", "--quiet", "origin", "HEAD:refs/heads/staging"],
+        );
+        run_git(&checkout, &["checkout", "--quiet", "-b", "side", &main_sha]);
+        std::fs::write(checkout.join("x"), "foreign\n").unwrap();
+        run_git(&checkout, &["add", "x"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "foreign"]);
+        let side_sha = rev(&checkout, "HEAD");
+        run_git(&checkout, &["fetch", "--quiet", "origin"]);
+        // Reproduce a checkout whose clone never recorded origin/HEAD.
+        // `--no-deref` matters: without it `update-ref -d` resolves the symbolic
+        // ref and deletes its *target*, leaving the symref in place — which is
+        // how this fixture passed locally (no symref to begin with) and failed
+        // in CI (a fresh clone writes one).
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["update-ref", "--no-deref", "-d", "refs/remotes/origin/HEAD"])
+            .output();
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .output()
+            .unwrap();
+        assert!(!head.status.success(), "fixture must not have origin/HEAD");
+        Fixture {
+            _tmp: tmp,
+            checkout,
+            main_sha,
+            staging_sha,
+            side_sha,
+        }
+    }
+
+    #[test]
+    fn parked_checkout_does_not_become_the_lane_base() {
+        let fix = fixture();
+        let resolved = resolve_base(&fix.checkout, None, None).expect("remote HEAD");
+        assert_eq!(resolved.name, "origin/main");
+        assert_eq!(resolved.sha, fix.main_sha);
+        assert_ne!(resolved.sha, fix.side_sha);
+        let warning = resolved.warning.expect("foreign checkout is named");
+        assert!(warning.contains("side"), "{warning}");
+        assert!(warning.contains("origin/main"), "{warning}");
+        assert!(!warning.contains(&fix.side_sha), "{warning}");
+    }
+
+    #[test]
+    fn configured_base_is_the_integration_ref() {
+        let fix = fixture();
+        let resolved = resolve_base(&fix.checkout, None, Some("staging")).expect("configured");
+        assert_eq!(resolved.name, "origin/staging");
+        assert_eq!(resolved.sha, fix.staging_sha);
+        assert_ne!(resolved.sha, fix.side_sha);
+        assert!(resolved.warning.is_some());
+    }
+
+    #[test]
+    fn explicit_base_is_the_operator_override() {
+        let fix = fixture();
+        let resolved = resolve_base(&fix.checkout, Some("side"), None).expect("override");
+        assert_eq!(resolved.sha, fix.side_sha);
+        assert!(resolved.warning.is_none());
+    }
+
+    #[test]
+    fn a_repo_with_no_origin_still_uses_its_current_branch() {
+        let fix = fixture();
+        run_git(&fix.checkout, &["remote", "remove", "origin"]);
+        let resolved = resolve_base(&fix.checkout, None, None).expect("local only");
+        assert_eq!(resolved.name, "side");
+        assert_eq!(resolved.sha, fix.side_sha);
+        assert!(resolved.warning.is_none());
+    }
 }

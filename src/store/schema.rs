@@ -1354,6 +1354,31 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=50", [])?;
                 tx.commit()?;
             }
+            if version < 51 {
+                // CAD-792: one receipt per successful worker dependency fetch.
+                // v20 already shipped `app_runs::SCHEMA`, so a store past that
+                // block never runs DDL added there. This idempotent create is
+                // what those stores apply. Fresh opens that already created the
+                // table from SCHEMA converge here.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS app_run_artifact_fetches(
+ artifact_id TEXT NOT NULL REFERENCES app_run_artifacts(id),
+ message_id TEXT NOT NULL, turn_hash TEXT NOT NULL, created REAL NOT NULL,
+ PRIMARY KEY(artifact_id,message_id,turn_hash));",
+                )?;
+                tx.execute("UPDATE schema_version SET version=51", [])?;
+                tx.commit()?;
+            }
+            if version < 52 {
+                // CAD-1548: Pi policy and profile text beside model_defaults.
+                // Keep the v51 artifact-fetch migration independent.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::settings_authority::SCHEMA_V52)?;
+                super::settings_authority::lift_embedded_authority(&tx)?;
+                tx.execute("UPDATE schema_version SET version=52", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

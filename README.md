@@ -76,6 +76,28 @@ deliberately serving a board in the foreground without one already running.
 [project context](docs/START-HERE.md) for contracts and source ownership, or the
 [contribution guide](CONTRIBUTING.md) for development and validation.
 
+### Browse and update apps
+
+Open **Apps → Explore apps**. Each card opens its full
+details; installed apps keep local Open and operator Manage links even when
+the public catalogue is unavailable. **Choose favorites** keeps quick links
+on the Apps page and in the sidebar.
+
+Standalone boards use `https://api-v2.agenticos.hk` for the public catalogue
+by default. Set `AGENTICOS_BOARD_CATALOG_ORIGIN` only for a custom catalogue;
+invalid explicit values are refused, not replaced with the default. Hosted
+boards retain their internal catalogue route. These reads do not grant
+installation, connection or execution approval.
+
+An operator selects a published version, chooses **Review installation** or
+**Review update**, inspects access and compatibility, then confirms the exact
+package. **Other versions** permits an eligible older fresh install or an
+intermediate update; existing installations never downgrade or auto-update.
+Changing the selection discards the check. An unconfirmed result stays blocked
+across navigation until **Check installation** reads it back; it is not retried.
+Package installation does not approve connections or execution. Manual-source
+operations remain on the installation's Manage page.
+
 ### Start a conversation
 
 On a signed-in hosted board, open **Threads → Add** and choose **Direct** or
@@ -90,6 +112,43 @@ are distinct, and **Retry search** repeats a failed search without losing picks.
 The server rechecks sign-in and live workspace membership on every search and
 creation request; search results never grant access.
 
+From **Agents**, choose **Message** to open that agent's conversation in
+Threads. The recipient and any recorded work context stay visible. Delivery
+labels describe the stored message state, not whether someone read it or
+finished the work. A refused or uncertain send keeps the draft; check the
+history before explicitly retrying an uncertain send.
+
+**Home** remains the Assistant chat with its docked composer. The compact
+**Since you left** summary expands into real issue links; the separate
+**To do / Updates** rail keeps operator actions apart from information.
+**Ask the Assistant** prefills a draft for inspection and editing, never
+sends it automatically, and does not resolve the item.
+
+An issue's **Overview** brings its current result, next action, output links
+and verification together. A worker report is not independent review,
+merge or deployment evidence. Activity, Conversation, Pull request and
+Evidence remain the detailed views; feedback uses the existing conversation.
+
+### Create minutes from a transcript
+
+In an approved Meeting minutes installation, **New minutes** opens the content
+form immediately. The app's declaration controls its field order and defaults:
+app 0.2.3 puts the transcript first and makes the title optional. Paste the
+transcript as one paragraph; native workflow inputs currently reject line breaks
+and unsupported whitespace rather than silently rewriting the text.
+
+If the app has no usable team, you can still enter the draft. **Set up app**
+opens the existing team settings; **Back to draft** keeps the exact entered
+text. Saving a valid team returns to the form without starting work. A configured
+team is reused; its assignments and **Manage team** are under **App setup**.
+Neither the form nor setup automatically chooses workers or providers.
+
+**Review draft** prepares a scope-bound snapshot. Review its inputs and distinct
+writer/reviewer assignments, then explicitly **Approve and start**. Setup alone
+never creates, approves or dispatches a run. Draft text stays in this dialog's
+memory, not browser storage: closing it, losing authorization or changing its
+installation/context ends that draft. Recording and speech-to-text are not part
+of this flow.
 ## What it gives you
 
 - **Durable messaging** — every assignment, acknowledgement and result is a

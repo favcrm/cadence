@@ -11,7 +11,7 @@ import type { ThreadRef } from "../../../lib/types";
 import { useLocale } from "../../../lib/locale";
 import { parseSlash, SLASH_COMMANDS, slashMatches, type SlashCommand } from "../../home/master";
 import { ATTACH_ACCEPT, attachMeta, displayAttachError, unresolvedHint, unresolvedHintNotice, type AttachDestination, type AttachItem } from "./attach";
-import type { UiNotice } from "../campaign/useEmailDraft";
+import type { UiNotice } from "../../../lib/uiNotice";
 import {
   addFiles,
   attachHold,
@@ -521,7 +521,7 @@ export default function Composer({
     }
   };
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.nativeEvent.isComposing) return;
+    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
     if (matches.length) {
       if (e.key === "ArrowDown") {
         e.preventDefault();

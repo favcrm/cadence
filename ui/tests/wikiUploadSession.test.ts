@@ -20,45 +20,101 @@ function sameCount(actual: number, expected: number): boolean {
   return actual === expected;
 }
 
-function currentTransfer(name: string, previous: FakeXHR | undefined): FakeXHR {
-  const xhr = FakeXHR.sent.at(-1);
-  if (!xhr || xhr === previous || xhr.aborted || xhr.sentName !== name) {
-    throw new Error(`missing current transfer for ${name}`);
-  }
-  return xhr;
+interface PendingCall {
+  name: string;
+  op: string;
+  init: RequestInit;
+  aborted: boolean;
+  settled: boolean;
+  resolve: (response: Response) => void;
+  reject: (error: unknown) => void;
+  respond: (status: number, body: unknown) => void;
 }
 
-class FakeXHR {
-  static sent: FakeXHR[] = [];
-  status = 0;
-  statusText = "";
-  responseText = "";
-  aborted = false;
-  sentName = "";
-  onload: (() => void) | null = null;
-  onerror: (() => void) | null = null;
-  onabort: (() => void) | null = null;
-  upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
-  open(_method: string, _url: string): void {}
-  setRequestHeader(_name: string, _value: string): void {}
-  send(body: unknown): void {
-    if (typeof FormData !== "undefined" && body instanceof FormData) {
-      const file = body.get("file");
-      if (file instanceof File) this.sentName = file.name;
+const calls: PendingCall[] = [];
+const jobNames = new Map<string, string>();
+
+function requestName(body: { transfer?: { op?: string; job_id?: string; manifest?: { entries?: { path?: string }[] } } }): string {
+  const transfer = body.transfer;
+  if (transfer?.op === "begin") return transfer.manifest?.entries?.[0]?.path ?? "";
+  return jobNames.get(transfer?.job_id ?? "") ?? "";
+}
+
+function installFetch(meta: () => Response): void {
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input), "http://localhost");
+    if (url.pathname === "/api/meta") return meta();
+    if (url.pathname !== "/api/wiki/transfer" && url.pathname !== "/api/wiki/job_status") {
+      throw new Error(`unexpected ${url.pathname}`);
     }
-    FakeXHR.sent.push(this);
+    const parsed = JSON.parse(String(init?.body ?? "{}")) as { transfer?: { op?: string; job_id?: string; manifest?: { entries?: { path?: string }[] } } };
+    const op = parsed.transfer?.op ?? "";
+    const name = requestName(parsed);
+    return await new Promise<Response>((resolve, reject) => {
+      const call: PendingCall = {
+        name,
+        op,
+        init: init ?? {},
+        aborted: false,
+        settled: false,
+        resolve,
+        reject,
+        respond(status: number, body: unknown) {
+          if (call.settled) return;
+          call.settled = true;
+          if (op === "begin" && status >= 200 && status < 300) {
+            const record = body as { job_id?: string };
+            if (record.job_id) jobNames.set(record.job_id, name);
+          }
+          resolve(new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } }));
+        },
+      };
+      calls.push(call);
+      init?.signal?.addEventListener("abort", () => {
+        if (call.settled) return;
+        call.settled = true;
+        call.aborted = true;
+        reject(new DOMException("aborted", "AbortError"));
+      }, { once: true });
+    });
+  };
+}
+
+async function waitCall(name: string, previous: PendingCall | undefined, flush: () => Promise<void>): Promise<PendingCall> {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    await flush();
+    const call = calls.find((item) => item.name === name && !item.settled && item !== previous);
+    if (call) return call;
   }
-  abort(): void {
-    if (this.aborted) return;
-    this.aborted = true;
-    this.onabort?.();
+  throw new Error(`missing transfer for ${name}; saw ${calls.map((item) => `${item.name}:${item.op}`).join(",")}`);
+}
+
+async function finishFile(
+  name: string,
+  previous: PendingCall | undefined,
+  extraction: { status: string; reason?: string },
+  flush: () => Promise<void>,
+  act: (fn: () => void) => Promise<void>,
+): Promise<PendingCall> {
+  const jobId = `job-${name}`;
+  const ops = ["begin", "status", "chunk", "apply", "finish"] as const;
+  let prior = previous;
+  for (const op of ops) {
+    const call = await waitCall(name, prior, flush);
+    if (call.op !== op) throw new Error(`${name} expected ${op}, got ${call.op}`);
+    const body = op === "begin"
+      ? { job_id: jobId, digest: `digest-${name}`, root: "global/guides", source_id: "board", state: "open", entries: 1 }
+      : op === "status"
+        ? { job_id: jobId, digest: `digest-${name}`, source_id: "board", root: "global/guides", state: "open", index: "pending", entries: [{ entry_id: "file", path: name, received: 0, size: name.length, outcome: "pending", extraction: "not_applicable" }], next_offset: null }
+        : op === "chunk"
+          ? { job_id: jobId, entry_id: "file", received: name.length, size: name.length }
+          : op === "apply"
+            ? { job_id: jobId, entry_id: "file", path: name, outcome: "applied", extraction: extraction.status, rev: "fnv1a:0123456789abcdef", ...(extraction.reason ? { error: extraction.reason } : {}) }
+            : { job_id: jobId, digest: `digest-${name}`, root: "global/guides", state: "complete", index: extraction.status === "indexed" ? "covered" : "pending" };
+    await act(() => { call.respond(200, body); });
+    prior = call;
   }
-  respond(status: number, body: unknown): void {
-    this.status = status;
-    this.statusText = status >= 200 && status < 300 ? "OK" : "Error";
-    this.responseText = JSON.stringify(body);
-    this.onload?.();
-  }
+  return prior!;
 }
 
 function fileList(files: File[]): FileList {
@@ -104,7 +160,6 @@ async function main(): Promise<void> {
   Object.defineProperty(globalThis, "localStorage", { value: win.localStorage, configurable: true });
   for (const name of ["addEventListener", "removeEventListener"] as const)
     Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
-  Object.defineProperty(globalThis, "XMLHttpRequest", { value: FakeXHR, configurable: true });
   Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true, configurable: true });
   const loader = require<{ prototype: { require: (this: unknown, id: string) => unknown } }>("module");
   const originalRequire = loader.prototype.require;
@@ -144,13 +199,7 @@ async function main(): Promise<void> {
       user: { sub: "operator", name: "Operator", email: "op@example.test", handle: "op", role: "operator" },
     },
   };
-  globalThis.fetch = async (input: RequestInfo | URL) => {
-    const url = new URL(String(input), "http://localhost");
-    if (url.pathname === "/api/meta") {
-      return new Response(JSON.stringify(signedIn), { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-    throw new Error(`unexpected ${url.pathname}`);
-  };
+  installFetch(() => new Response(JSON.stringify(signedIn), { status: 200, headers: { "Content-Type": "application/json" } }));
 
   const host = document.createElement("div");
   document.body.appendChild(host);
@@ -190,21 +239,21 @@ async function main(): Promise<void> {
     });
     await React.act(async () => { input.dispatchEvent(new Event("change", { bubbles: true })); });
   };
+  const act = (fn: () => void) => React.act(async () => { fn(); });
   await add(["one.txt", "two.txt"]);
+  const first = await waitCall("one.txt", undefined, flush);
   assert(JSON.stringify(rowStates(host)) === JSON.stringify(["one.txt:uploading", "two.txt:queued"]), "the first file is in flight and the next stays queued");
-  const opened = FakeXHR.sent.length;
-  const first = FakeXHR.sent.at(-1);
-  if (!first) throw new Error("missing first transfer");
+  const opened = calls.length;
 
   await React.act(async () => { pausePrivateReads(); });
   assert(first.aborted, "hiding the admitted workspace aborts the live transfer");
   assert(JSON.stringify(rowStates(host)) === JSON.stringify(["one.txt:queued", "two.txt:queued"]), "both files stay queued for an explicit retry");
-  await React.act(async () => { first.respond(200, { extraction: { status: "indexed" } }); });
+  await React.act(async () => { first.respond(200, { job_id: "late", digest: "late", state: "open", entries: 1 }); });
   assert(sameCount(uploaded, 0) && sameCount(toasts.length, 0), "the hidden completion does not finish or toast");
   assert(JSON.stringify(rowStates(host)) === JSON.stringify(["one.txt:queued", "two.txt:queued"]), "the hidden completion does not mark a retained row done");
   await React.act(async () => { allowPrivateReads(); });
   await flush();
-  assert(FakeXHR.sent.length === opened, "resume does not open the next transfer");
+  assert(calls.length === opened, "resume does not open the next transfer");
   assert(JSON.stringify(rowStates(host)) === JSON.stringify(["one.txt:queued", "two.txt:queued"]), "resume leaves the queue waiting");
   assert(sessionKey() === "admitted-tab-key" && host.querySelector("[data-private-workspace='wiki']"), "pause and resume keep the admitted view and key");
 
@@ -212,23 +261,21 @@ async function main(): Promise<void> {
   assert(retry, "the held queue offers retry");
   await React.act(async () => { retry.click(); });
   assert(rowStates(host)[0] === "one.txt:uploading" && rowStates(host)[1] === "two.txt:queued", "retry uploads the abandoned file and holds the next");
-  const retried = currentTransfer("one.txt", first);
-  await React.act(async () => { retried.respond(200, { extraction: { status: "indexed" } }); });
+  const retried = await finishFile("one.txt", first, { status: "indexed" }, flush, act);
   assert(rowStates(host)[0] === "one.txt:done" && rowStates(host)[1] === "two.txt:uploading", "a live success advances to the next file");
   assert(sameCount(uploaded, 1), "a live success reports the upload");
-  const second = currentTransfer("two.txt", retried);
-  await React.act(async () => { second.respond(200, { extraction: { status: "skipped", reason: "binary" } }); });
+  const second = await finishFile("two.txt", retried, { status: "skipped", reason: "binary" }, flush, act);
   assert(JSON.stringify(rowStates(host)) === JSON.stringify(["one.txt:done", "two.txt:done"]), "the following file completes");
-  assert(toasts.includes("two.txt was saved; text extraction skipped: binary"), "a live extraction warning still toasts");
+  assert(toasts.includes("two.txt was saved; extraction skipped; index pending: binary"), "a live extraction warning still toasts");
 
   await React.act(async () => { pausePrivateReads(); });
   await React.act(async () => { allowPrivateReads(); });
   await add(["fresh.txt"]);
   assert(!Array.from(host.querySelectorAll("button")).some((button) => button.textContent === "Retry uploads"), "a new selection after an empty pause starts without retry");
   assert(rowStates(host).includes("fresh.txt:uploading"), "a new selection after an empty pause uploads");
-  const fresh = currentTransfer("fresh.txt", second);
-  await React.act(async () => { fresh.respond(200, { extraction: { status: "indexed" } }); });
+  await finishFile("fresh.txt", second, { status: "indexed" }, flush, act);
 
+  const beforeBatch = calls.length;
   await React.act(async () => {
     const input = mountedInput();
     Object.defineProperty(input, "files", {
@@ -238,36 +285,34 @@ async function main(): Promise<void> {
     input.dispatchEvent(new Event("change", { bubbles: true }));
     pausePrivateReads();
   });
-  const openedBeforePause = FakeXHR.sent.filter((xhr) => xhr.sentName === "batch-a.txt" || xhr.sentName === "batch-b.txt");
-  assert(openedBeforePause.every((xhr) => xhr.aborted), "pause aborts a transfer the selection already opened");
+  const openedBeforePause = calls.slice(beforeBatch).filter((call) => call.name === "batch-a.txt" || call.name === "batch-b.txt");
+  assert(openedBeforePause.every((call) => call.aborted), "pause aborts a transfer the selection already opened");
   assert(JSON.stringify(rowStates(host).slice(-2)) === JSON.stringify(["batch-a.txt:queued", "batch-b.txt:queued"]), "the paused batch stays queued");
-  const heldTransfer = FakeXHR.sent.at(-1);
+  const heldTransfer = calls.at(-1);
   await React.act(async () => { allowPrivateReads(); });
   await flush();
-  assert(FakeXHR.sent.at(-1) === heldTransfer, "resume does not open a new transfer");
+  assert(calls.at(-1) === heldTransfer, "resume does not open a new transfer");
   const gapRetry = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Retry uploads");
   assert(gapRetry, "the paused batch offers retry");
   await React.act(async () => { gapRetry.click(); });
-  const gap = currentTransfer("batch-a.txt", heldTransfer);
-  await React.act(async () => { gap.respond(200, { extraction: { status: "indexed" } }); });
-  const gapNext = currentTransfer("batch-b.txt", gap);
-  await React.act(async () => { gapNext.respond(200, { extraction: { status: "indexed" } }); });
+  const gap = await finishFile("batch-a.txt", heldTransfer, { status: "indexed" }, flush, act);
+  const gapNext = await finishFile("batch-b.txt", gap, { status: "indexed" }, flush, act);
 
   await add(["forbidden.txt"]);
-  const forbidden = currentTransfer("forbidden.txt", gapNext);
+  const forbidden = await waitCall("forbidden.txt", gapNext, flush);
   await React.act(async () => { forbidden.respond(403, { error: "operator only", check: "operator_only" }); });
   assert(host.querySelector("[data-auth-state='ready']") && host.querySelector("[data-private-workspace='wiki']"), "a role 403 leaves the admitted workspace mounted");
   assert(sessionKey() === "admitted-tab-key", "a role 403 keeps the tab credential");
   assert(rowStates(host).includes("forbidden.txt:error"), "the role refusal stays on that file");
 
   await add(["unrelated.txt"]);
-  const unrelated = currentTransfer("unrelated.txt", forbidden);
+  const unrelated = await waitCall("unrelated.txt", forbidden, flush);
   await React.act(async () => { unrelated.respond(401, { error: "not a session", code: "caller_identity" }); });
   assert(host.querySelector("[data-auth-state='ready']") && sessionKey() === "admitted-tab-key", "an unrelated 401 keeps the admitted view and key");
   assert(rowStates(host).includes("unrelated.txt:error"), "an unrelated 401 stays a file error");
 
   await add(["late.txt"]);
-  const late = currentTransfer("late.txt", unrelated);
+  const late = await waitCall("late.txt", unrelated, flush);
   await React.act(async () => { setSessionKey("replacement-tab-key"); });
   await flush();
   assert(host.querySelector("[data-private-workspace='wiki']"), "the replacement session verifies a new private view");
@@ -279,7 +324,7 @@ async function main(): Promise<void> {
   assert(sessionKey() === "replacement-tab-key", "a late 401 does not clear the replacement credential");
 
   await add(["local.txt"]);
-  const local = currentTransfer("local.txt", late);
+  const local = await waitCall("local.txt", late, flush);
   await React.act(async () => { local.respond(401, { error: "sign in", code: "operator_session_required" }); });
   await flush();
   assert(host.querySelector("[data-auth-state='expired']"), "a current local session 401 ends the admitted view");
@@ -316,7 +361,7 @@ async function main(): Promise<void> {
   await flush();
   assert(host.querySelector("[data-private-workspace='wiki']") && sessionKey() === "hosted-tab-key", "a new key verifies the workspace again");
   await add(["hosted.txt"]);
-  const hosted = currentTransfer("hosted.txt", local);
+  const hosted = await waitCall("hosted.txt", local, flush);
   await React.act(async () => {
     hosted.respond(401, { ok: false, error: { code: "board_session_required", message: "sign in through your workspace" } });
   });

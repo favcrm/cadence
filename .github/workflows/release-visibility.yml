@@ -36,6 +36,12 @@ jobs:
     # The catalogue visibility flip is an operator lifecycle decision on the
     # production release store; it sits behind the same `production`
     # environment approval as a native-host promotion.
+    # CAD-1506: this job's release-store credentials come from the
+    # `production` environment; the publishing jobs read the `release-store`
+    # environment instead (branch policy main + v* tags, no reviewers, so no
+    # approval click is added). The key is held in both environments —
+    # rotate both. `production` stays here: dropping it would drop the
+    # operator approval that gates this outward flip.
     environment: production
     # Only a manual dispatch from a main ref may reach the mutation step.
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'

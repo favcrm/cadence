@@ -21,6 +21,7 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::unattended::DispatchAuthority;
 use super::{
     optional_str, optional_strs, reject_identity_fields, required_str, Caller, Shared, DAEMON_ALIAS,
 };
@@ -86,6 +87,9 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "master_ask_permission",
     "master_peek_grant",
     "master_permission_use",
+    // CAD-1586: petitions and exact operator-approved settings operations.
+    // The handler owns grants; app turns keep their separate allowlist.
+    "agent_settings_command",
     // CAD-1014(b): the master's scoped-chat redeem verbs — a bounded CSV
     // import and a segment save, each redeeming the operator's own
     // stamped scoped chat message on the live assigned turn. Narrow
@@ -138,7 +142,7 @@ fn now_epoch() -> i64 {
 /// `preferred` / `fallbacks` of AGENT.md's frontmatter: the provider,
 /// model and effort the master launches with unless the operator names
 /// them. Unreadable frontmatter just yields nothing.
-fn preferred(agent_md: &str) -> Vec<(String, Option<String>, Option<String>)> {
+pub(super) fn preferred(agent_md: &str) -> Vec<(String, Option<String>, Option<String>)> {
     let Ok((yaml, _)) = crate::issue::parse::split_front(agent_md) else {
         return vec![];
     };
@@ -164,7 +168,7 @@ fn preferred(agent_md: &str) -> Vec<(String, Option<String>, Option<String>)> {
 /// `fallbacks` entry, taking the first the daemon accepts
 /// ([`master::PROVIDERS`]); none usable → the first accepted provider
 /// (CAD-322 round 2, I2).
-fn resolve_provider(
+pub(super) fn resolve_provider(
     requested: Option<&str>,
     prefs: &[(String, Option<String>, Option<String>)],
 ) -> String {
@@ -444,6 +448,10 @@ impl Shared {
         // dispatch runs under, so a concurrent second call sees `doing`
         // and is refused having written nothing. The dispatch's own
         // daemon calls (agent_show, dispatch_send) never take this lock.
+        let _grant = self
+            .unattended_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let _serial = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
         // CAD-431: a dispatch the review loop cannot record does not
         // happen — an unreadable delivery.json refuses before anything.
@@ -457,6 +465,9 @@ impl Shared {
         let ticket = issue::board::find_issue(&pm.dir, id)?;
         let front = &ticket.front;
         crate::issue::plan::gate_master(&pm.dir, front, &ticket.body)?;
+        let repo = self
+            .unattended_dispatch_authority(id)?
+            .map(|authority| authority.checkout);
         if front.status != "ready" {
             return Err(Error::invalid(
                 "master_dispatch_state",
@@ -515,7 +526,7 @@ impl Shared {
             note: None,
             name: None,
             base: None,
-            repo: None,
+            repo: repo.map(Into::into),
             reply_to: Some(ALIAS.to_string()),
             summary: None,
             job_spec: None,
@@ -532,7 +543,15 @@ impl Shared {
         // proves in production, rather than leaning on the daemon's own
         // ambient ancestry (which a test pane marks as an agent's).
         let out = crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
-            issue::dispatch::run(&pm, id, &args, ALIAS, &self.state_dir, Some(ALIAS))
+            issue::dispatch::run(
+                &pm,
+                id,
+                &args,
+                ALIAS,
+                &self.state_dir,
+                Some(ALIAS),
+                issue::dispatch::DispatchOrigin::Automatic,
+            )
         })?;
         // Only a real send is the master's dispatch: a duplicate answers
         // with the live kickoff someone else sent (`dispatched: false`),
@@ -551,6 +570,68 @@ impl Shared {
             );
         }
         Ok(out)
+    }
+
+    /// Pin an unattended kickoff to the grant's registered checkout, never
+    /// the controller cwd's default repository in a multi-repository project.
+    /// Carry the live expiry into enqueue for its in-transaction deadline check.
+    pub(super) fn unattended_dispatch_authority(
+        &self,
+        id: &str,
+    ) -> Result<Option<DispatchAuthority>> {
+        let Some(run) = self.unattended_authorization_for_issue(id)? else {
+            return Ok(None);
+        };
+        let pm = self.pm()?;
+        let mut file = pm.dir.join(&run.project);
+        file.push("project.yaml");
+        let project = issue::project::load(&file)?;
+        let remote = format!("github.com/{}", run.repo);
+        let mut selected = None;
+        for repo in &project.repos {
+            if !repo.remote.as_deref().is_some_and(|value| {
+                issue::project::normalize_remote(value).eq_ignore_ascii_case(&remote)
+            }) {
+                continue;
+            }
+            let path = repo.path.as_deref().ok_or_else(|| {
+                Error::rejected("the authorized repository has no registered local checkout")
+            })?;
+            let (root, origin) = issue::project::repo_identity(&issue::project::expand_home(path))
+                .ok_or_else(|| {
+                    Error::rejected("the authorized checkout has no proven Git identity")
+                })?;
+            if !origin
+                .as_deref()
+                .is_some_and(|origin| origin.eq_ignore_ascii_case(&remote))
+            {
+                return Err(Error::rejected(
+                    "the authorized checkout's actual Git origin differs from the registered repository",
+                ));
+            }
+            if selected.as_ref().is_some_and(|previous| previous != &root) {
+                return Err(Error::rejected(
+                    "the authorized repository has multiple local roots; operator must resolve the ambiguity",
+                ));
+            }
+            selected = Some(root);
+        }
+        if crate::issue::time::now_epoch() as f64 >= run.expires_at {
+            return Err(Error::rejected(
+                "the workflow grant expired before dispatch",
+            ));
+        }
+        let root = selected.ok_or_else(|| {
+            Error::rejected("the workflow grant's repository is no longer registered")
+        })?;
+        let root = root
+            .into_os_string()
+            .into_string()
+            .map_err(|_| Error::rejected("the authorized checkout path is not valid UTF-8"))?;
+        Ok(Some(DispatchAuthority {
+            checkout: root,
+            expires_at: run.expires_at,
+        }))
     }
 
     /// `question_escalate` — hand an open question the master cannot
@@ -618,6 +699,17 @@ impl Shared {
         let slug = required_str(params, "agent")?;
         let name = required_str(params, "file")?;
         let text = required_str(params, "text")?;
+        // Master SOUL.md, AGENT.md, and permissions stay on this writer
+        // and its digest record. Only a migrated non-master profile
+        // definition has moved into the settings row.
+        if name == "AGENT.md"
+            && slug != crate::master::ALIAS
+            && self.store.settings()?.legacy_imported
+        {
+            return Err(Error::rejected(
+                "legacy_authority_retired: AGENT.md is a settings export; edit profiles through agent_settings_set",
+            ));
+        }
         let pm = self.pm()?;
         let out = master::write_file(&pm, slug, name, text, "operator")?;
         master::record(&self.state_dir, slug, name, &master::digest(text))?;
@@ -735,7 +827,7 @@ impl Shared {
         // is never used. Whatever wins must be on `[pi].models.allow`.
         let mut pi_selection = None;
         let model = if provider == "pi" {
-            let policy = crate::pi_policy::read(&pm.dir)?;
+            let policy = self.stored_pi_policy()?;
             let chosen = model.as_deref();
             let (resolved, fallback) =
                 crate::pi_policy::resolve_model_with_source(policy.as_ref(), "master", chosen)?;
