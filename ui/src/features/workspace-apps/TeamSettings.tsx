@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
 import { workspaceApps, type Agent, type InstallTeam, type Installation } from "./workspaceApps";
 import { useTranslate } from "../../lib/locale";
@@ -17,9 +18,11 @@ export function teamRoles(installation: Installation): string[] {
  * app's screen start runs with exactly this team; the daemon refuses a run
  * without one. Saving is a compare-and-swap on the stored revision.
  */
-export function TeamSettings({ installation, managers, workers, canWrite, busy, mutate }: {
+export function TeamSettings({ installation, managers, workers, canWrite, busy, mutate, onSaved, onAccessDenied }: {
   installation: Installation; managers: Agent[]; workers: Agent[]; canWrite: boolean; busy: boolean;
   mutate: (work: () => Promise<void>) => Promise<void>;
+  onSaved?: (team: InstallTeam) => void;
+  onAccessDenied?: () => void;
 }) {
   const t = useTranslate();
   const installId = installation.install_id;
@@ -33,7 +36,11 @@ export function TeamSettings({ installation, managers, workers, canWrite, busy, 
     setTeam(undefined);
     workspaceApps.team(installId, controller.signal)
       .then(value => { if (!controller.signal.aborted) { setTeam(value); setOwner(value?.owner_pm ?? ""); setPicked(value?.roles ?? {}); } })
-      .catch(() => { if (!controller.signal.aborted) setError("The team could not be read."); });
+      .catch((reason: unknown) => {
+        if (controller.signal.aborted) return;
+        if (reason instanceof ApiError && [401, 403].includes(reason.status)) onAccessDenied?.();
+        setError("The team could not be read.");
+      });
     return () => controller.abort();
   }, [installId]);
   if (roles.length === 0) return null;
@@ -72,7 +79,11 @@ export function TeamSettings({ installation, managers, workers, canWrite, busy, 
           try {
             const saved = await workspaceApps.setTeam(installId, { owner_pm: owner, roles: picked, expected_revision: team?.revision ?? 0 });
             setTeam(saved); setError(null);
-          } catch { setError("The team was not saved. Reload and try again."); }
+            onSaved?.(saved);
+          } catch (reason: unknown) {
+            if (reason instanceof ApiError && [401, 403].includes(reason.status)) onAccessDenied?.();
+            setError("The team was not saved. Reload and try again.");
+          }
         })}>{t("Save team")}</Button>
     </section>
   );

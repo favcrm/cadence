@@ -1,7 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
-import Select from "../../ui/Select";
 import { useTranslate } from "../../lib/locale";
 import type { Viewer } from "../projects/work";
 import type { Agent, AppContext, InstallTeam, Installation, WorkspaceRun } from "../workspace-apps/workspaceApps";
@@ -67,7 +66,7 @@ export default function RunLauncher({
   const [readError, setReadError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [values, setValues] = useState<Record<string, string>>({});
-  const [picked, setPicked] = useState<Record<string, string>>({});
+  const [showTeamSettings, setShowTeamSettings] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<{ id: string; state: string } | null>(null);
@@ -126,62 +125,48 @@ export default function RunLauncher({
   const workers = agents === null ? [] : localWorkers(agents).filter((agent) => agent.group === ownerPm);
   const managers = agents === null ? [] : agents.filter((agent) => agent.role === "pm" && !agent.dead && !agent.fenced);
 
-  /** Preserve declared input text; never send a role the app team injects. */
+  /** Keep content separate from the configured worker roles frozen below. */
   const collectedInputs = () => {
     const inputs: Record<string, string> = {};
-    for (const input of workflow.inputs) {
-      if (team !== null && team !== undefined && teamCovered(team, input.name)) continue;
-      const value = input.name in picked ? (picked[input.name] ?? "") : (values[input.name] ?? "");
+    for (const input of contentInputs) {
+      const value = values[input.name] ?? "";
       if (value !== "") inputs[input.name] = value;
     }
     return inputs;
   };
 
   const missingRequired = () =>
-    workflow.inputs
+    contentInputs
       .filter((input) =>
         input.optional !== true &&
         input.default == null &&
         !(input.context_default === true && (context?.config.input_defaults[input.name] ?? "") !== "") &&
-        !(team !== null && team !== undefined && teamCovered(team, input.name)) &&
-        (input.name in picked ? (picked[input.name] ?? "") : (values[input.name] ?? "")) === "")
+        (values[input.name] ?? "") === "")
       .map((input) => input.name);
 
-  const distinctError = () => {
-    const declared = workflow.distinct ?? [];
-    const seen = new Map<string, string>();
-    for (const name of declared) {
-      const alias = team !== null && team !== undefined && teamCovered(team, name)
-        ? team.roles[name]
-        : picked[name] ?? "";
-      if (alias === "") continue;
-      const first = seen.get(alias);
-      if (first) return `${name} must be a different registered worker than ${first}.`;
-      seen.set(alias, name);
+  const distinctTeam = () => {
+    const seen = new Set<string>();
+    for (const name of workflow.distinct ?? []) {
+      const alias = team?.roles[name] ?? "";
+      if (alias === "" || seen.has(alias)) return false;
+      seen.add(alias);
     }
-    return null;
+    return true;
   };
+
+  const teamReady = team !== null && team !== undefined && agents !== null &&
+    managers.some((manager) => manager.alias === ownerPm) &&
+    roleInputs.every((input) => teamCovered(team, input.name) &&
+      workers.some((worker) => worker.alias === team.roles[input.name])) &&
+    distinctTeam();
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (busy || team === null || team === undefined || agents === null || !canWrite) return;
+    if (busy || !teamReady || team === null || team === undefined || !canWrite) return;
     const missing = missingRequired();
     if (missing.length > 0) {
       setError(`Missing required input: ${missing.join(", ")}.`);
       return;
-    }
-    const distinct = distinctError();
-    if (distinct !== null) {
-      setError(distinct);
-      return;
-    }
-    for (const input of roleInputs) {
-      if (teamCovered(team, input.name)) continue;
-      const alias = picked[input.name] ?? "";
-      if (!workers.some((worker) => worker.alias === alias)) {
-        setError(`Choose a registered worker in ${ownerPm}'s group for ${input.name.replace(/_/g, " ")}.`);
-        return;
-      }
     }
     if (!ownsDialog()) { onClose(); return; }
     setError(null);
@@ -252,20 +237,21 @@ export default function RunLauncher({
   return (
     <WorkspaceDialog title={title} onClose={close}>
       {error !== null && <p className="wa-alert" data-tone="fail" role="alert">{error}</p>}
-      {team === undefined || agents === null ? (
-        readError !== null
-          ? <div className="wa-stack"><p className="wa-alert" data-tone="fail" role="alert">{readError}</p>
-              <Button size="sm" onClick={() => { setReadError(null); setTeam(undefined); setAttempt((n) => n + 1); }}>{t("Retry")}</Button></div>
-          : <p className="wa-muted" role="status">{t("Reading the app's team…")}</p>
-      ) : team === null ? (
-        // No configured team means no owner PM to pin — start is ABI-refused
-        // without one, so the operator sets the team here first.
+      {showTeamSettings ? (
+        <div className="wa-stack">
+          <Button disabled={busy} onClick={() => setShowTeamSettings(false)}>{t("Back to draft")}</Button>
         <TeamSettings
           installation={installation}
           managers={managers}
-          workers={localWorkers(agents)}
+          workers={localWorkers(agents ?? [])}
           canWrite={canWrite}
           busy={busy}
+          onSaved={(saved) => {
+            if (!ownsDialog()) return;
+            setTeam(saved);
+            setShowTeamSettings(false);
+          }}
+          onAccessDenied={() => { if (ownsDialog()) onClose(); }}
           mutate={async (work) => {
             setBusy(true);
             try {
@@ -280,10 +266,11 @@ export default function RunLauncher({
               setReadError(reason instanceof Error ? reason.message : "The app team could not be confirmed.");
               setTeam(undefined);
             } finally {
-              setBusy(false);
+              if (ownsDialog()) setBusy(false);
             }
           }}
         />
+        </div>
       ) : result !== null ? (
         <div className="wa-stack">
           <p className="wa-muted" role="status">
@@ -297,7 +284,7 @@ export default function RunLauncher({
         </div>
       ) : prepared !== null ? (
         <div className="wa-stack">
-          <h2>{t("Review frozen plan")}</h2>
+          <h2>{t("Review before starting")}</h2>
           <p className="wa-muted">{prepared.run.state === "approved"
             ? t("Approval is already recorded for this frozen plan. Confirm to dispatch it.")
             : t("Nothing is dispatched until you approve this exact plan. Changed native receipts refuse approval or dispatch.")}</p>
@@ -329,8 +316,7 @@ export default function RunLauncher({
       ) : (
         <form className="wa-stack" onSubmit={submit}>
           <p className="wa-muted">
-            {t("Prepare a draft in {context}, then review its frozen inputs and assignments before starting it.").replace("{context}", () => context?.config.label ?? t("this scope"))}
-            {" "}{t("The team below is the configured default read for this form; these displayed assignments are frozen into the draft.")}
+            {t("Add your details for {context}. You can review everything before starting.").replace("{context}", () => context?.config.label ?? t("this scope"))}
           </p>
           {contentInputs.map((input) => {
             const id = `wa-run-${input.name}`;
@@ -340,9 +326,9 @@ export default function RunLauncher({
             const saved = input.context_default === true ? context?.config.input_defaults[input.name] : undefined;
             const hint = [
               input.example ? t("Example: {example}").replace("{example}", () => input.example!) : null,
-              required ? null : input.default != null
-                ? t("Leave empty to use the app default.")
-                : saved ? t("Leave empty to use this context's saved default.") : t("Optional."),
+              required ? null : saved
+                ? t("Leave empty to use this context's saved default.")
+                : input.default != null ? t("Leave empty to use the app default.") : t("Optional."),
             ].filter(Boolean).join(" ");
             return (
               <div className="wa-field" key={input.name}>
@@ -350,7 +336,7 @@ export default function RunLauncher({
                 <textarea
                   id={id}
                   name={input.name}
-                  className="wa-input"
+                  className={required ? "wa-input" : "wa-input wa-prompt-input"}
                   value={values[input.name] ?? ""}
                   onChange={(event) => setValues((previous) => ({ ...previous, [input.name]: event.target.value }))}
                   rows={3}
@@ -361,38 +347,30 @@ export default function RunLauncher({
               </div>
             );
           })}
-          <div className="wa-field">
-            <span className="wa-kicker">{t("Owner PM")}</span>
-            <p className="wa-muted">{team.owner_pm}</p>
-          </div>
-          {roleInputs.map((input) => {
-            const covered = teamCovered(team, input.name);
-            return (
-              <div className="wa-field" key={input.name}>
-                <label htmlFor={`wa-run-${input.name}`}>
-                  {input.ask?.trim() || input.name.replace(/_/g, " ")}
-                </label>
-                {covered ? (
-                  <p className="wa-muted">{team.roles[input.name]} <span className="wa-kicker">{t("(app team)")}</span></p>
-                ) : (
-                  <Select
-                    id={`wa-run-${input.name}`}
-                    value={picked[input.name] ?? ""}
-                    onChange={(value) => setPicked((previous) => ({ ...previous, [input.name]: value }))}
-                    options={workers.map((worker) => ({ value: worker.alias, label: worker.alias, hint: worker.state_label || worker.state }))}
-                    placeholder={t("Choose a registered worker")}
-                    disabled={busy || workers.length === 0}
-                    full
-                  />
-                )}
-              </div>
-            );
-          })}
-          {roleInputs.some((input) => !teamCovered(team, input.name)) && workers.length === 0 && (
-            <p className="wa-alert">{t("No registered worker in this owner group can fill the role. Register one first.")}</p>
+          {team === undefined || agents === null ? (
+            readError !== null
+              ? <div className="wa-stack"><p className="wa-alert" data-tone="fail" role="alert">{readError}</p>
+                  <Button size="sm" onClick={() => { setReadError(null); setTeam(undefined); setAttempt((n) => n + 1); }}>{t("Retry")}</Button></div>
+              : <p className="wa-muted" role="status">{t("Reading the app's team…")}</p>
+          ) : !teamReady ? (
+            <div className="wa-panel wa-stack" role="status">
+              <p>{t("Set up this app once before starting. Your draft stays here while you do.")}</p>
+              <Button disabled={!canWrite || busy} onClick={() => { setError(null); setShowTeamSettings(true); }}>{t("Set up app")}</Button>
+            </div>
+          ) : (
+            <details className="wa-details">
+              <summary>{t("App setup")}</summary>
+              <p className="wa-muted">{t("Owner PM")}: {team?.owner_pm}</p>
+              {roleInputs.map((input) => (
+                <p className="wa-muted" key={input.name}>
+                  {input.name.replace(/_/g, " ")}: {team?.roles[input.name]}
+                </p>
+              ))}
+              <Button disabled={!canWrite || busy} onClick={() => { setError(null); setShowTeamSettings(true); }}>{t("Manage team")}</Button>
+            </details>
           )}
-          <Button type="submit" variant="primary" loading={busy} disabled={!canWrite}>
-            {t("Prepare {label}").replace("{label}", () => title)}
+          <Button type="submit" variant="primary" loading={busy} disabled={!canWrite || !teamReady}>
+            {t("Review draft")}
           </Button>
         </form>
       )}
