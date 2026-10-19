@@ -84,12 +84,12 @@ where
     }
 }
 
-/// The reviewed hosted media manifest pins: @3 (media + source, text stays
-/// refused) and @4 (adds `generate_text`). Anything else is not a pin.
+/// Reviewed hosted manifests: @3 media/source, @4 text, @6 speech.
 fn reviewed_media_pin(pin: &str) -> Option<&'static str> {
     [
         crate::platform::agenticos_external::MANIFEST_PIN,
         crate::platform::agenticos_external::TEXT_MANIFEST_PIN,
+        crate::platform::agenticos_external::RECORDING_MANIFEST_PIN,
     ]
     .into_iter()
     .find(|reviewed| *reviewed == pin)
@@ -99,8 +99,7 @@ fn reviewed_media_pin(pin: &str) -> Option<&'static str> {
 /// authorizes one fixed internal media door, not arbitrary HTTP or a lease.
 #[derive(Clone, Debug)]
 pub(crate) struct HostedMediaAdmission {
-    /// The reviewed manifest pin the image metadata asserted — only
-    /// `MANIFEST_PIN` (@3) or `TEXT_MANIFEST_PIN` (@4), never a free string.
+    /// A code-reviewed manifest version, never an arbitrary metadata string.
     pin: &'static str,
 }
 

@@ -14,10 +14,10 @@ use tiny_http::{Header, Method, Request, Response, StatusCode};
 use super::serve::{add_security_headers, err_response, json_response};
 use super::ServeOpts;
 use super::{
-    app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_media, app_records,
-    app_release, app_runs, app_screens, app_social_drafts, approvals, apps, business_templates,
-    connections, crm_send, crm_smtp, home, lane, operator, read_model, social_publish, stages,
-    threads, updates, whatsapp, wiki, workflows,
+    app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_media,
+    app_recordings, app_records, app_release, app_runs, app_screens, app_social_drafts, approvals,
+    apps, business_templates, connections, crm_send, crm_smtp, home, lane, operator, read_model,
+    social_publish, stages, threads, updates, whatsapp, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -1328,6 +1328,11 @@ pub(crate) fn write_route(
             return;
         }
         let response = app_audiences::handle(&mut request, state_dir, route, true);
+        send(request, response);
+        return;
+    }
+    if let Some(route) = app_recordings::route(path) {
+        let response = app_recordings::handle(&mut request, state_dir, route, opts);
         send(request, response);
         return;
     }

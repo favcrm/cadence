@@ -101,6 +101,7 @@ pub mod app_contexts;
 pub mod app_effects;
 pub mod app_explorer;
 pub mod app_media;
+pub mod app_recordings;
 pub mod app_records;
 pub mod app_runs;
 pub mod app_sends;

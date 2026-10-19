@@ -1,0 +1,61 @@
+/* Approved meeting-minutes preview: native workspace only, never global kit overrides. */
+.recording-workspace { container: recording / inline-size; min-width: 0; padding: 24px; color: var(--color-ink-200); }
+.recording-workspace .mm-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+.recording-workspace .mm-head h1 { margin: 0; font-size: var(--text-drawer); font-weight: 600; color: var(--color-ink-100); overflow-wrap: anywhere; }
+.recording-workspace .mm-head > .btn { margin-left: auto; }
+.recording-workspace .mm-lead { margin: 0 0 16px; max-width: 68ch; color: var(--color-ink-400); font-size: var(--text-secondary); }
+.recording-workspace .back { flex: 1 0 100%; text-align: left; font-size: var(--text-label); color: var(--color-ink-400); }
+.recording-workspace .back:hover, .recording-workspace .rowlink:hover { color: var(--color-accent); }
+.recording-workspace .stage { display: grid; grid-template-columns: minmax(220px, 280px) minmax(0, 1fr); gap: 16px; align-items: stretch; }
+.recording-workspace .deck, .recording-workspace .transcript { border: 1px solid var(--color-ink-700); border-radius: .5rem; background: var(--color-ink-850); padding: 20px; }
+.recording-workspace .deck { display: flex; flex-direction: column; gap: 14px; }
+.recording-workspace .transcript { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.recording-workspace .transcript-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.recording-workspace .transcript-head h2 { margin: 0; font-size: var(--text-label); letter-spacing: .04em; text-transform: uppercase; color: var(--color-ink-500); }
+.recording-workspace .rec { display: inline-flex; align-items: center; gap: 8px; color: var(--color-ink-400); font-size: var(--text-label); }
+.recording-workspace .rec i { width: .55rem; height: .55rem; border-radius: 50%; background: var(--color-ink-500); }
+.recording-workspace .deck[data-state="recording"] .rec { color: var(--color-fail); }
+.recording-workspace .deck[data-state="recording"] .rec i { background: var(--color-fail); }
+.recording-workspace .deck[data-state="paused"] .rec { color: var(--color-warn); }
+.recording-workspace .deck[data-state="paused"] .rec i { background: var(--color-warn); }
+.recording-workspace .rec-time { font-size: var(--text-drawer); color: var(--color-ink-100); letter-spacing: .04em; font-variant-numeric: tabular-nums; }
+.recording-workspace .wave { display: flex; align-items: flex-end; gap: 4px; height: 28px; }
+.recording-workspace .wave span { width: 4px; border-radius: 999px; background: var(--color-ink-500); }
+.recording-workspace .deck[data-state="recording"] .wave span { background: var(--color-fail); }
+.recording-workspace .rec-title { display: flex; flex-direction: column; gap: 6px; font-size: var(--text-label); color: var(--color-ink-400); }
+.recording-workspace .field { width: 100%; min-width: 0; border: 1px solid var(--color-ink-700); border-radius: .375rem; background: var(--color-ink-900); color: var(--color-ink-100); padding: .5rem .65rem; font-size: var(--text-label); }
+.recording-workspace .field:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.recording-workspace .field:disabled { opacity: .65; }
+.recording-workspace .rec-hint { margin: -6px 0 0; color: var(--color-ink-500); font-size: var(--text-micro); line-height: 1.45; }
+.recording-workspace .rec-note { margin: 0; color: var(--color-ink-400); font-size: var(--text-label); line-height: 1.45; }
+.recording-workspace .rec-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: auto; }
+.recording-workspace .kicker, .recording-workspace .cite { font-family: var(--font-mono); font-size: var(--text-micro); color: var(--color-ink-500); }
+.recording-workspace .muted { color: var(--color-ink-400); font-size: var(--text-secondary); }
+.recording-workspace .steps { margin: 0; padding-left: 18px; display: grid; gap: 8px; color: var(--color-ink-300); font-size: var(--text-secondary); }
+.recording-workspace .stack { display: flex; flex-direction: column; gap: 24px; margin-top: 20px; }
+.recording-workspace .block h2 { margin: 0 0 8px; font-size: var(--text-label); font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--color-ink-500); }
+.recording-workspace .prose { margin: 0; color: var(--color-ink-200); font-size: var(--text-secondary); line-height: 1.55; max-width: 68ch; white-space: pre-wrap; overflow-wrap: anywhere; }
+.recording-workspace .decisions { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.recording-workspace .decisions li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; align-items: baseline; padding: 8px 10px; border: 1px solid var(--color-ink-700); border-radius: .375rem; background: var(--color-ink-850); color: var(--color-ink-200); font-size: var(--text-secondary); overflow-wrap: anywhere; }
+.recording-workspace .decisions li > span:last-child { white-space: pre-wrap; }
+.recording-workspace .recording-error { margin: 0 0 12px; padding: 10px 12px; border: 1px solid var(--color-fail); border-radius: .375rem; color: var(--color-fail); font-size: var(--text-label); overflow-wrap: anywhere; }
+.recording-workspace .recording-empty { padding: 28px 20px; border: 1px solid var(--color-ink-700); border-radius: .5rem; color: var(--color-ink-400); }
+.recording-workspace .recording-empty h2 { margin-bottom: 8px; color: var(--color-ink-200); }
+.recording-workspace .recording-table-wrap { overflow-x: auto; }
+.recording-workspace .recording-table { width: 100%; border-collapse: collapse; font-size: var(--text-label); text-align: left; }
+.recording-workspace .recording-table th { color: var(--color-ink-500); font-size: var(--text-micro); font-weight: 500; }
+.recording-workspace .recording-table th, .recording-workspace .recording-table td { padding: 12px 10px; border-bottom: 1px solid var(--color-ink-700); vertical-align: top; }
+.recording-workspace .rowlink { color: var(--color-ink-100); text-align: left; }
+.recording-workspace .sub { display: block; margin-top: 4px; color: var(--color-ink-500); }
+.recording-workspace .num { font-variant-numeric: tabular-nums; }
+.recording-workspace .rename, .recording-workspace .people { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 14px; }
+.recording-workspace .rename .field { max-width: 320px; }
+.recording-workspace .recording-chip { padding: 2px 6px; border: 1px solid var(--color-ink-700); border-radius: 4px; color: var(--color-ink-300); font-size: var(--text-micro); }
+.recording-workspace .recording-recovery { padding: 14px; margin-bottom: 16px; border: 1px solid var(--color-ink-700); border-radius: .5rem; }
+.recording-workspace .recording-recovery p { margin-bottom: 10px; font-size: var(--text-label); color: var(--color-ink-400); }
+.recording-workspace .recording-recovery .btn { margin-right: 8px; }
+@container recording (max-width: 560px) {
+  .recording-workspace .stage { grid-template-columns: minmax(0, 1fr); }
+  .recording-workspace .recording-table th, .recording-workspace .recording-table td { padding: 10px 6px; }
+}
+@media (max-width: 640px) { .recording-workspace { padding: 16px; } }

@@ -35,6 +35,7 @@ mod app_content;
 mod app_contexts;
 mod app_explorer;
 mod app_media;
+mod app_recordings;
 mod app_records;
 mod app_release;
 mod app_runs;

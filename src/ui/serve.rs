@@ -18,11 +18,11 @@ use super::write_path::{
     send, with_agents, write_route, HttpResp,
 };
 use super::{
-    app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
-    app_release, app_runs, app_screens, approvals, apps, assist_route, business_templates,
-    cli_route, connections, crm_send, delivery_sync, home, lane, locale, member_assist, my_work,
-    operator, platform_account, read_model, social_publish, stages, threads, topics, updates, wiki,
-    wiki_envelope, work_conversations, workflows,
+    app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer,
+    app_recordings, app_records, app_release, app_runs, app_screens, approvals, apps, assist_route,
+    business_templates, cli_route, connections, crm_send, delivery_sync, home, lane, locale,
+    member_assist, my_work, operator, platform_account, read_model, social_publish, stages,
+    threads, topics, updates, wiki, wiki_envelope, work_conversations, workflows,
 };
 use super::{
     push_device_login_config, ready_file, startup_failed_file, tailnet_url, ServeOpts,
@@ -2026,6 +2026,15 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     return;
                 }
                 let response = app_audiences::handle(&mut request, state_dir, route, false);
+                send(request, response);
+                return;
+            }
+            if let Some(route) = app_recordings::route(&path) {
+                if !route.is_read() {
+                    send(request, err_response(405, "method not allowed"));
+                    return;
+                }
+                let response = app_recordings::handle(&mut request, state_dir, route, opts);
                 send(request, response);
                 return;
             }

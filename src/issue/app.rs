@@ -131,6 +131,8 @@ pub struct Manifest {
     pub version: String,
     pub connections: Vec<String>,
     pub capabilities: BTreeMap<String, CapabilityNeed>,
+    /// A generic trusted recording workspace; slots are verified declarations.
+    pub recording: Option<RecordingNeed>,
     pub summary: Option<String>,
     /// CAD-864: `needs.views.contract` — the one descriptor contract
     /// this bundle's `views/app-views-v1.json` declares. `Some` only
@@ -144,6 +146,59 @@ pub struct Manifest {
     /// JSON already host-validated — it can declare no capability.
     pub listing: Option<crate::issue::app_listing::Listing>,
     pub guide: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingNeed {
+    pub transcription: String,
+    pub consolidation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+impl RecordingNeed {
+    fn validate(&self, capabilities: &BTreeMap<String, CapabilityNeed>) -> Result<()> {
+        if self.transcription == self.consolidation {
+            return Err(Error::rejected(
+                "recording needs two distinct capability slots",
+            ));
+        }
+        for (slot, capability, action) in [
+            (&self.transcription, "audio.transcribe", "transcribe_audio"),
+            (&self.consolidation, "text.generate", "generate_text"),
+        ] {
+            check_name(slot, "recording capability slot")?;
+            let need = capabilities.get(slot).ok_or_else(|| {
+                Error::rejected("recording references an undeclared capability slot")
+            })?;
+            if need.schema != 1
+                || need.version != 1
+                || need.capability != capability
+                || need.action != action
+                || need.resource_kind != "connection_account"
+                || need.effect != "draft"
+            {
+                return Err(Error::rejected(
+                    "recording capability declaration is incompatible",
+                ));
+            }
+        }
+        if [&self.label, &self.title]
+            .into_iter()
+            .flatten()
+            .any(|text| {
+                text.trim().is_empty() || text.len() > 100 || text.chars().any(char::is_control)
+            })
+        {
+            return Err(Error::rejected(
+                "recording labels must be bounded single-line text",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Manifest {
@@ -510,6 +565,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
     };
     let mut connections = Vec::new();
     let mut capabilities = BTreeMap::new();
+    let mut recording = None;
     let mut view_contract: Option<String> = None;
     if let Some(needs) = get("needs") {
         let serde_yaml::Value::Mapping(needs) = needs else {
@@ -519,10 +575,13 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         };
         for key in needs.keys() {
             let k = key.as_str().unwrap_or_default();
-            if !matches!(k, "connections" | "capabilities" | "views" | "requires") {
+            if !matches!(
+                k,
+                "connections" | "capabilities" | "views" | "requires" | "recording"
+            ) {
                 return Err(Error::rejected(format!(
                     "app.md `needs.{k}` is unknown — v0 knows `needs.connections`, \
-                     `needs.capabilities`, `needs.views`, `needs.requires`"
+                     `needs.capabilities`, `needs.views`, `needs.requires`, `needs.recording`"
                 )));
             }
         }
@@ -575,6 +634,12 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
                 declaration.validate()?;
             }
         }
+        if let Some(value) = needs.get(serde_yaml::Value::String("recording".into())) {
+            let need: RecordingNeed = serde_yaml::from_value(value.clone())
+                .map_err(|_| Error::rejected("app.md needs.recording has an invalid shape"))?;
+            need.validate(&capabilities)?;
+            recording = Some(need);
+        }
         if let Some(list) = needs.get(serde_yaml::Value::String("connections".to_string())) {
             let serde_yaml::Value::Sequence(list) = list else {
                 return Err(Error::rejected(
@@ -624,6 +689,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         version,
         connections,
         capabilities,
+        recording,
         summary,
         view_contract,
         requires,
@@ -723,16 +789,21 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             root.display()
         )));
     }
-    // CAD-1177: an app bundles workflows and/or screens — a standalone
-    // tools plugin ships only `screens/` (the v2 tool declarations are
-    // its unit of work, checked later in `validate_texts`); a
-    // workflow-driven app ships `workflows/`. One of the two must be
-    // present or the bundle installs nothing usable.
-    if !dirs.iter().any(|(d, _)| d == "workflows" || d == "screens") {
-        return Err(Error::rejected(
-            "an app needs workflows/ or screens/ — an app with neither installs \
-             nothing runnable",
-        ));
+    // A verified recording declaration is itself an executable native view.
+    if !dirs
+        .iter()
+        .any(|(dir, _)| dir == "workflows" || dir == "screens")
+    {
+        let path = root.join(MANIFEST);
+        if std::fs::metadata(&path)?.len() > MAX_APP_BYTES
+            || parse_manifest(&std::fs::read_to_string(path)?)?
+                .recording
+                .is_none()
+        {
+            return Err(Error::rejected(
+                "an app needs workflows/, screens/, or a verified needs.recording declaration",
+            ));
+        }
     }
     for (top, dir) in &dirs {
         for entry in std::fs::read_dir(dir)?.flatten() {
@@ -1023,6 +1094,7 @@ fn validate_contents(
                     version: String::new(),
                     connections: vec![],
                     capabilities: BTreeMap::new(),
+                    recording: None,
                     summary: None,
                     view_contract: None,
                     requires: Compat::legacy(),
@@ -1037,6 +1109,7 @@ fn validate_contents(
             version: String::new(),
             connections: vec![],
             capabilities: BTreeMap::new(),
+            recording: None,
             summary: None,
             view_contract: None,
             requires: Compat::legacy(),
@@ -1200,15 +1273,12 @@ fn validate_contents(
             }
         }
     }
-    // CAD-1177: an app may ship no workflows only when it is a genuine
-    // standalone-tools plugin — it carries at least one integrity-checked
-    // `app-screens/v2` screen whose declared `tools` map resolves every
-    // alias to a real `needs.capabilities` slot. That is the v2
-    // no-workflow-file path: the tool, not a run, is the unit of work.
-    // An empty app, a screen that fails integrity, or a tool whose slot
-    // the manifest never declares cannot substitute for workflows and
-    // still refuses.
-    if workflow_count == 0 && !has_tools_only_screen(&files, &manifest) {
+    // A verified native recording declaration is executable without a run or
+    // iframe. Other workflow-free bundles still need a genuine tools screen.
+    if workflow_count == 0
+        && manifest.recording.is_none()
+        && !has_tools_only_screen(&files, &manifest)
+    {
         errors.push("workflows/ holds no *.md workflow".to_string());
     }
     let compatibility = match compat::host().and_then(|host| manifest.requires.check(&host)) {
@@ -1393,6 +1463,12 @@ fn digest_over(pm_dir: &Path, project: &str, name: &str, over: &[(&str, &str)]) 
         keys.push_str(&format!(
             "capabilities={}\n",
             serde_json::to_string(&manifest.capabilities)?
+        ));
+    }
+    if let Some(recording) = &manifest.recording {
+        keys.push_str(&format!(
+            "recording={}\n",
+            serde_json::to_string(recording)?
         ));
     }
     keys.push_str(&manifest.requires.digest_line());
@@ -2876,6 +2952,7 @@ fn describe(
     row["title"] = json!(manifest.title);
     row["version"] = json!(manifest.version);
     row["summary"] = json!(manifest.summary);
+    row["recording"] = json!(manifest.recording);
     row["workflows"] = json!(workflows);
     // The card's primary action (CAD-563 r2): the app's first workflow
     // (sorted, so the choice is deterministic) and the human label the

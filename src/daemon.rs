@@ -36,6 +36,7 @@ mod app_media_rpc;
 mod app_record_actions_rpc;
 #[cfg(feature = "test-seam")]
 pub use app_image_jobs::test_probe as image_job_probe;
+mod app_recordings_rpc;
 mod app_records_rpc;
 mod app_runs_rpc;
 mod app_screen_services_rpc;
@@ -2997,6 +2998,14 @@ impl Shared {
             "app_context_archive" => self.rpc_app_context(method, params, peer_pid),
             "app_record_create" => self.rpc_app_record(method, params, peer_pid),
             "app_record_list" => self.rpc_app_record(method, params, peer_pid),
+            "app_recording_quote"
+            | "app_recording_list"
+            | "app_recording_create"
+            | "app_recording_detail"
+            | "app_recording_segment"
+            | "app_recording_finish"
+            | "app_recording_retry"
+            | "app_recording_rename" => self.rpc_app_recording(method, params, peer_pid),
             "app_record_show" => self.rpc_app_record(method, params, peer_pid),
             "app_record_update" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_preview" => self.rpc_app_record(method, params, peer_pid),

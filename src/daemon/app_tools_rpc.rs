@@ -141,7 +141,9 @@ enum GenerationSettlement {
 
 fn generation_settlement(error: &AppCapabilityError) -> GenerationSettlement {
     match error {
-        AppCapabilityError::Refused(_) => GenerationSettlement::Refused,
+        AppCapabilityError::Refused(_) | AppCapabilityError::Released(_) => {
+            GenerationSettlement::Refused
+        }
         // `idempotency_in_progress` is the provider's own typed code, carried
         // in the uncertain reason; it only picks the pending sub-state.
         AppCapabilityError::Uncertain(reason) if reason.contains("idempotency_in_progress") => {
