@@ -260,13 +260,27 @@ impl Shared {
             {
                 return Err(Error::rejected("the recorded merge intent does not bind this follow-up; operator inspection is required"));
             }
+            let base_ref = intent["base_ref"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| Error::rejected("the recorded merge intent has no target branch; operator inspection is required"))?;
             let view = crate::delivery::pr_view(&self.delivery_gh.to_string_lossy(), &repo, number)
                 .map_err(|error| Error::rejected(format!("merge-request state is unreadable ({error}); operator must inspect/remove it before repair")))?;
-            if view["headRefOid"].as_str() != Some(head) || view["state"] != "OPEN" {
+            if view["headRefOid"].as_str() != Some(head)
+                || view["state"] != "OPEN"
+                || view["baseRefName"] != base_ref
+            {
                 return Err(Error::rejected(
                     "the PR no longer names this open head; operator must inspect it before repair",
                 ));
             }
+            // A removed request may have an advanced base, never a different destination.
+            let base = view["baseRefOid"]
+                .as_str()
+                .filter(|oid| !oid.is_empty())
+                .ok_or_else(|| {
+                    Error::rejected("the current PR has no base commit; repair is refused")
+                })?;
             let auto = view.get("autoMergeRequest").ok_or_else(|| {
                 Error::rejected(
                     "merge-request evidence is missing; operator must inspect it before repair",
@@ -276,7 +290,7 @@ impl Shared {
                 return Err(Error::rejected("the PR still has an armed auto-merge request; operator must remove it before a new head is produced"));
             }
             let entry = super::delivery_requirements_rpc::unattended_queue_entry(
-                self, &repo, number, head,
+                self, &repo, number, head, base, base_ref,
             ).map_err(|error| Error::rejected(format!("queue-removal proof is unreadable ({error}); operator must inspect/remove it before repair")))?;
             if entry.is_some() {
                 return Err(Error::rejected("the PR still has a native queue entry; operator must remove it before a new head is produced"));
@@ -289,6 +303,9 @@ impl Shared {
             return Err(Error::rejected("the lane has merge-request state without a native intent; operator must inspect/remove it before repair"));
         }
         // Re-prove authority after network reads; carry that expiry into enqueue.
+        // Same global writer lock as supported tracker edits; unrelated
+        // report files remain outside this read-only snapshot's admission scope.
+        let _tracker = pm.lock_for_paths(&[dir.join("issue.md")])?;
         let authorized_until = match self.unattended_dispatch_authority(issue)? {
             Some(reproved) if reproved.checkout == root => reproved.expires_at,
             _ => {

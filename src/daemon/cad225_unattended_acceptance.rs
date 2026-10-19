@@ -274,7 +274,32 @@ if [ "$1" = api ]; then
   esac
   case "$2" in
     graphql)
-      printf '%s\n' "{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"headRefOid\":\"$head\",\"state\":\"OPEN\",\"mergeQueueEntry\":$entry}}}}}}}}"
+      # One-shot rendezvous at the actual final queue observation, after
+      # classification/CI/final PR reads. Reload destination AFTER release:
+      # a retarget effective now must not be hidden by an earlier snapshot.
+      if [ -f "$here/qr-arm" ] && [ ! -f "$here/qr-done" ]; then
+        touch "$here/qr-call" "$here/qr-done"
+        i=0
+        while [ ! -f "$here/qr-go" ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done
+        if [ ! -f "$here/qr-go" ]; then echo "queue rendezvous timed out" >&2; exit 1; fi
+      fi
+      qbase=main
+      if [ -f "$here/gh-base" ]; then qbase=$(cat "$here/gh-base"); fi
+      if [ -f "$here/qr-done" ]; then
+        printf '%s\n' "$head|$qbase|{BASE}" > "$here/qr-observed"
+      fi
+      # Respect the real GraphQL selection. Values come from remote fixture
+      # state, never from client-supplied expected target or base values.
+      target=
+      missing=none
+      if [ -f "$here/qr-missing" ]; then missing=$(cat "$here/qr-missing"); fi
+      case "$*" in *baseRefName*)
+        if [ "$missing" != name ]; then target="$target,\"baseRefName\":\"$qbase\""; fi ;;
+      esac
+      case "$*" in *baseRefOid*)
+        if [ "$missing" != oid ]; then target="$target,\"baseRefOid\":\"{BASE}\""; fi ;;
+      esac
+      printf '%s\n' "{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"headRefOid\":\"$head\",\"state\":\"OPEN\",\"mergeQueueEntry\":$entry$target}}}}}}}}"
       ;;
     repos/{REPO}/compare/{BASE}...{HEAD}|repos/{REPO}/compare/{BASE}...{MOVED}) printf '%s\n' "{{\"merge_base_commit\":{{\"sha\":\"{MERGE}\"}},\"files\":[{{\"filename\":\"$file\",\"status\":\"$status\",\"additions\":1,\"deletions\":0}}]}}" ;;
     repos/{REPO}/git/trees/{MERGE}?recursive=1|repos/{REPO}/git/trees/{BASE}?recursive=1) printf '%s\n' "{{\"truncated\":false,\"tree\":[{{\"path\":\"src/ship.rs\",\"mode\":\"100644\",\"type\":\"blob\"}}]}}" ;;

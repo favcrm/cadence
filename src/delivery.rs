@@ -1083,7 +1083,7 @@ pub(crate) fn pr_view(gh_bin: &str, slug: &str, number: u64) -> Result<Value> {
             "-R",
             slug,
             "--json",
-            "headRefOid,state,statusCheckRollup,additions,deletions,changedFiles,autoMergeRequest",
+            "headRefOid,baseRefOid,baseRefName,state,statusCheckRollup,additions,deletions,changedFiles,autoMergeRequest",
         ],
     )?;
     serde_json::from_str(&view)

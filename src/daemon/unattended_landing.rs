@@ -83,7 +83,7 @@ fn check_scope(answer: &Value, run: &AuthorizedRun) -> Result<()> {
     Ok(())
 }
 
-fn check_view(view: &Value, head: &str) -> Result<()> {
+fn check_view(view: &Value, head: &str, base: &str, base_ref: &str) -> Result<()> {
     if view["headRefOid"].as_str() != Some(head) {
         return Err(Error::invalid(
             "head_moved",
@@ -92,6 +92,11 @@ fn check_view(view: &Value, head: &str) -> Result<()> {
     }
     if view["state"] != "OPEN" {
         return Err(reject("the pull request is no longer open"));
+    }
+    if view["baseRefOid"] != base || view["baseRefName"] != base_ref {
+        return Err(reject(
+            "the pull-request target changed or is unproven before enqueue",
+        ));
     }
     Ok(())
 }
@@ -102,7 +107,11 @@ impl Shared {
     /// uncertainty never authorizes a second mutation.
     /// True preserves this exact head's authorized remote request, including
     /// known pending admission; only an observed entry enters Enqueued.
-    pub(super) fn try_unattended_enqueue(&self, rec: &mut Record) -> Result<bool> {
+    pub(super) fn try_unattended_enqueue(
+        &self,
+        pm: &crate::issue::Pm,
+        rec: &mut Record,
+    ) -> Result<bool> {
         // This display marker cannot authorize reconciliation. Recompute
         // readiness and every authority check independently on each pass.
         rec.unattended_pending = false;
@@ -189,9 +198,10 @@ impl Shared {
         }
         let gh = self.delivery_gh.to_string_lossy();
         let view = delivery::pr_view(&gh, &repo, number)?;
-        check_view(&view, head)?;
-        let mut queue_entry =
-            delivery_requirements_rpc::unattended_queue_entry(self, &repo, number, head)?;
+        check_view(&view, head, base, base_ref)?;
+        let mut queue_entry = delivery_requirements_rpc::unattended_queue_entry(
+            self, &repo, number, head, base, base_ref,
+        )?;
         let auto_merge = !view
             .get("autoMergeRequest")
             .ok_or_else(|| reject("the fresh PR view has no queue-state evidence"))?
@@ -201,6 +211,10 @@ impl Shared {
         if let Some(observed) = rec.observed.as_mut() {
             observed.auto_merge = auto_merge;
         }
+        // Grant→delivery→tracker→store: supported semantic edits cannot
+        // cross the final canonical check, intent write or remote attempt.
+        let (_, dir) = crate::issue::write::issue_dir(pm, &rec.issue)?;
+        let _tracker = pm.lock_for_paths(&[dir.join("issue.md")])?;
         let current = self
             .unattended_authorization_for_issue(&rec.issue)?
             .ok_or_else(|| reject("the native workflow authorization disappeared"))?;
@@ -212,7 +226,7 @@ impl Shared {
         let intent = json!({
             "issue": rec.issue, "project": run.project, "epic": run.epic, "worker": rec.worker,
             "grant_id": run.grant_id, "grant_expires_at": run.expires_at,
-            "repo": run.repo, "pr": number, "head": head, "base": base,
+            "repo": run.repo, "pr": number, "head": head, "base": base, "base_ref": base_ref,
             "policy_digest": classification["policy_digest"], "class": classification["requirements"]["class"],
             "reviewer": verdict.reviewer, "report": verdict.report, "risk": "auto",
             "ci_authority": "enforced_merge_queue",
@@ -257,14 +271,24 @@ impl Shared {
                     "an enqueue intent appeared concurrently; inspect it before retrying",
                 ));
             }
+            // Writer acquisition may block after the earlier remote reads.
+            // Rebind the destination after that wait, before our one attempt.
+            let final_view = delivery::pr_view(&gh, &repo, number)?;
+            check_view(&final_view, head, base, base_ref)?;
+            if crate::issue::time::now_epoch() as f64 >= current.expires_at {
+                return Err(reject(
+                    "the workflow grant expired before the remote queue request",
+                ));
+            }
             delivery::gh(&gh, &[
                 "pr", "merge", &number.to_string(), "-R", &repo,
                 "--auto", "--squash", "--match-head-commit", head,
             ]).map_err(|error| reject(&format!("enqueue did not return success ({error}); its durable intent is held for reconciliation, not replay")))?;
             // Successful --auto only requests admission. Preserve the intent
             // if queue admission is delayed; a later pass reconciles it.
-            queue_entry =
-                delivery_requirements_rpc::unattended_queue_entry(self, &repo, number, head)?;
+            queue_entry = delivery_requirements_rpc::unattended_queue_entry(
+                self, &repo, number, head, base, base_ref,
+            )?;
             false
         };
         let Some(queue_entry) = queue_entry else {
@@ -277,6 +301,7 @@ impl Shared {
         };
         self.store.record_unattended_merge_enqueued(json!({
             "issue": rec.issue, "head": head, "grant_id": run.grant_id,
+            "base": base, "base_ref": base_ref,
             "reconciled": reconciled, "queue_entry": queue_entry,
         }))?;
         let note = format!(
@@ -324,6 +349,19 @@ impl Shared {
             ));
         };
         let (repo, number) = task_report::parse_pr_url(rec.pr.as_deref().unwrap_or_default())?;
+        let Some(base_ref) = intent["base_ref"].as_str().filter(|name| !name.is_empty()) else {
+            return Ok(Some(
+                "native enqueue intent has no trusted target branch".to_string(),
+            ));
+        };
+        let view = match delivery::pr_view(&self.delivery_gh.to_string_lossy(), &repo, number) {
+            Ok(view) => view,
+            Err(error) => {
+                return Ok(Some(format!(
+                    "postmerge target evidence is unreadable: {error}"
+                )));
+            }
+        };
         let verdict = rec.verdict.as_ref();
         let matches = intent["grant_id"] == run.grant_id
             && intent["project"] == run.project
@@ -335,6 +373,13 @@ impl Shared {
             && run.repo == repo.to_ascii_lowercase()
             && intent["pr"] == number
             && intent["ci_authority"] == "enforced_merge_queue"
+            && view["headRefOid"] == head
+            && view["baseRefName"] == base_ref
+            && view["baseRefOid"]
+                .as_str()
+                .is_some_and(|oid| !oid.is_empty())
+            && enqueued["base_ref"] == base_ref
+            && enqueued["base"] == intent["base"]
             && enqueued["grant_id"] == run.grant_id
             && enqueued["queue_entry"]
                 .as_str()
@@ -355,7 +400,7 @@ impl Shared {
                 ));
             };
             if let Err(error) =
-                delivery_requirements_rpc::unattended_queue_authority(self, &repo, base)
+                delivery_requirements_rpc::unattended_queue_authority(self, &repo, base, base_ref)
             {
                 return Ok(Some(format!(
                     "postmerge queue enforcement is unproven: {error}"

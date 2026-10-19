@@ -1123,22 +1123,23 @@ impl Shared {
                 }
             }
         }
-        let (unattended_authorized, unattended_refusal) = match self.try_unattended_enqueue(rec) {
-            Ok(authorized) => (authorized, None),
-            Err(error) => {
-                let reason = error.to_string();
-                if !rec.unattended_hold || rec.note.as_deref() != Some(reason.as_str()) {
-                    self.store.event_public(
-                        store::APPROVAL_STREAM,
-                        "unattended_landing_held",
-                        json!({"issue": id, "head": rec.head, "reason": reason}),
-                    )?;
+        let (unattended_authorized, unattended_refusal) =
+            match self.try_unattended_enqueue(&pm, rec) {
+                Ok(authorized) => (authorized, None),
+                Err(error) => {
+                    let reason = error.to_string();
+                    if !rec.unattended_hold || rec.note.as_deref() != Some(reason.as_str()) {
+                        self.store.event_public(
+                            store::APPROVAL_STREAM,
+                            "unattended_landing_held",
+                            json!({"issue": id, "head": rec.head, "reason": reason}),
+                        )?;
+                    }
+                    rec.unattended_hold = true;
+                    rec.note = Some(reason.clone());
+                    (false, Some(reason))
                 }
-                rec.unattended_hold = true;
-                rec.note = Some(reason.clone());
-                (false, Some(reason))
-            }
-        };
+            };
         // Preserve an authorized pending request without calling it Enqueued.
         let routine_approved = rec.state == State::Enqueued
             && rec

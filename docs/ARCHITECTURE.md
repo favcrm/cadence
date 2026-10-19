@@ -131,8 +131,10 @@ dispatch preserves daemon-authenticated origin through its self-RPC and
 revalidates at the final enqueue gate, after blocking worktree/Git setup.
 Bound kickoff and follow-up writes carry the server-derived grant deadline
 into the queue transaction; connection/SQLite writer waits cannot extend it.
-The tracker snapshot stays locked through enqueue; explicit operator
-hand-dispatch and repair retain their existing authority. A done report alone
+The tracker snapshot stays locked from each final canonical check through
+kickoff/follow-up enqueue and landing intent/remote attempt; ordinary edits
+serialize against that snapshot. Explicit operator hand-dispatch and repair
+retain their existing authority. A done report alone
 cannot start review: the owned queue turn must have completed
 with that exact SHA. Unknown outcomes remain held for reconciliation; a known
 failed provider turn stays failed and requires deliberate recovery, not a
@@ -168,6 +170,10 @@ operator setup; agents do not change repository rules. This reuses existing
 CI jobs and the queue rather than adding a status publisher or secrets.
 `--auto` enabled alone is not admission: a native `mergeQueueEntry` must be
 observed and recorded before the loop calls the work enqueued.
+Final PR/queue reads bind destination branch and base OID, with another target
+check after the intent writer wait and before the remote attempt. Intent/queue
+receipts retain the destination for repair and postmerge; missing or changed
+target evidence holds.
 
 Native admission and enqueue intents precede logical tracker writes and remote
 mutation. ID directories reserve resources across interrupted admission; they

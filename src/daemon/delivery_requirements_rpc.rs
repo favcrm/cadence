@@ -575,8 +575,18 @@ pub(super) fn full_ci_green(
 }
 
 /// Recheck the external enforcement boundary before postmerge settlement.
-pub(super) fn unattended_queue_authority(shared: &Shared, repo: &str, base: &str) -> Result<()> {
-    let branch = default_branch(shared, repo)?;
+pub(super) fn unattended_queue_authority(
+    shared: &Shared,
+    repo: &str,
+    base: &str,
+    base_ref: &str,
+) -> Result<()> {
+    if default_branch(shared, repo)? != base_ref {
+        return Err(reject(
+            "the authorized target is no longer the repository default",
+        ));
+    }
+    let branch = branch_segment(base_ref);
     let rules = api(shared, &format!("repos/{repo}/rules/branches/{branch}"))?;
     let protection = api(
         shared,
@@ -726,12 +736,14 @@ pub(super) fn unattended_queue_entry(
     repo: &str,
     number: u64,
     head: &str,
+    base: &str,
+    base_ref: &str,
 ) -> Result<Option<String>> {
     let (owner, name) = repo
         .split_once('/')
         .ok_or_else(|| reject("invalid queue repository"))?;
     let query = format!(
-        "query {{ repository(owner:{},name:{}) {{ pullRequest(number:{number}) {{ headRefOid state mergeQueueEntry {{ id }} }} }} }}",
+        "query {{ repository(owner:{},name:{}) {{ pullRequest(number:{number}) {{ headRefOid baseRefOid baseRefName state mergeQueueEntry {{ id }} }} }} }}",
         json!(owner), json!(name),
     );
     let response: Value = serde_json::from_str(&gh(
@@ -746,7 +758,11 @@ pub(super) fn unattended_queue_entry(
         return Err(reject("native merge queue query failed"));
     }
     let pr = &response["data"]["repository"]["pullRequest"];
-    if pr["headRefOid"] != head || pr["state"] != "OPEN" {
+    if pr["headRefOid"] != head
+        || pr["state"] != "OPEN"
+        || pr["baseRefOid"] != base
+        || pr["baseRefName"] != base_ref
+    {
         return Err(reject(
             "queue observation no longer names the open authorized head",
         ));

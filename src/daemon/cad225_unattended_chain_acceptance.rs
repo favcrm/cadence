@@ -1580,3 +1580,538 @@ fn cad225_approved_integration_target_cannot_consume_automatic_authority() {
         "the refused landing ran the queue mutation"
     );
 }
+
+// ---- Independent v4 race acceptance ---------------------------------------
+
+struct CanonicalWriterWait {
+    entered: mpsc::Sender<()>,
+    seen: AtomicBool,
+    release: AtomicBool,
+}
+
+thread_local! {
+    static CANONICAL_WRITER_WAIT: std::cell::RefCell<Option<Arc<CanonicalWriterWait>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// SQLite itself calls this only when the real connection cannot acquire
+/// its writer. TLS routes the witness to this test's producer, so concurrent
+/// tests cannot consume one another's barrier. No daemon guard is replaced.
+fn canonical_writer_busy(_attempt: i32) -> bool {
+    let wait = CANONICAL_WRITER_WAIT.with(|slot| slot.borrow().clone());
+    let Some(wait) = wait else {
+        return false;
+    };
+    if !wait.seen.swap(true, Ordering::SeqCst) {
+        let _ = wait.entered.send(());
+    }
+    let deadline = Instant::now() + crate::store::BUSY_TIMEOUT;
+    while !wait.release.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    wait.release.load(Ordering::SeqCst)
+}
+
+/// The foreign connection, SQLite contention witness and producer are one
+/// cleanup unit. Even an assertion panic releases the writer/callback,
+/// joins the producer and restores the normal connection busy timeout.
+struct CanonicalSqlRace<T: Send + 'static> {
+    shared: Arc<Shared>,
+    writer: Option<rusqlite::Connection>,
+    wait: Arc<CanonicalWriterWait>,
+    entered: mpsc::Receiver<()>,
+    producer: Option<std::thread::JoinHandle<Result<T>>>,
+}
+
+impl<T: Send + 'static> CanonicalSqlRace<T> {
+    fn start(world: &World, run: impl FnOnce(Arc<Shared>) -> Result<T> + Send + 'static) -> Self {
+        let writer = rusqlite::Connection::open(world.root.path().join("cadence.sqlite3"))
+            .expect("foreign SQLite connection");
+        writer
+            .busy_timeout(Duration::from_millis(250))
+            .expect("foreign timeout");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("foreign writer owns the database");
+        let (entered_tx, entered) = mpsc::channel();
+        let wait = Arc::new(CanonicalWriterWait {
+            entered: entered_tx,
+            seen: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+        });
+        world
+            .shared
+            .store
+            .try_conn()
+            .expect("idle fixture store connection")
+            .busy_handler(Some(canonical_writer_busy))
+            .expect("install SQLite contention witness");
+        let shared = world.shared.clone();
+        let producer_wait = wait.clone();
+        let producer = std::thread::spawn(move || {
+            CANONICAL_WRITER_WAIT.with(|slot| *slot.borrow_mut() = Some(producer_wait));
+            let result = run(shared);
+            CANONICAL_WRITER_WAIT.with(|slot| *slot.borrow_mut() = None);
+            result
+        });
+        Self {
+            shared: world.shared.clone(),
+            writer: Some(writer),
+            wait,
+            entered,
+            producer: Some(producer),
+        }
+    }
+
+    fn at_writer(&self) {
+        self.entered
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the real producer must reach SQLite writer contention");
+        assert!(self.wait.seen.load(Ordering::SeqCst));
+        assert!(!self.wait.release.load(Ordering::SeqCst));
+        assert!(
+            !self.producer.as_ref().expect("producer").is_finished(),
+            "an unrelated early refusal cannot count as the writer race"
+        );
+    }
+
+    fn finish(&mut self) -> Result<T> {
+        let released = self
+            .writer
+            .take()
+            .expect("held writer")
+            .execute_batch("ROLLBACK");
+        self.wait.release.store(true, Ordering::SeqCst);
+        let result = self.producer.take().expect("producer").join();
+        self.shared
+            .store
+            .try_conn()
+            .expect("producer released its store connection")
+            .busy_timeout(crate::store::BUSY_TIMEOUT)
+            .expect("restore normal busy timeout");
+        released.expect("release the foreign SQLite writer");
+        result.expect("producer thread must not panic")
+    }
+}
+
+impl<T: Send + 'static> Drop for CanonicalSqlRace<T> {
+    fn drop(&mut self) {
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.execute_batch("ROLLBACK");
+        }
+        self.wait.release.store(true, Ordering::SeqCst);
+        if let Some(producer) = self.producer.take() {
+            let _ = producer.join();
+        }
+        if let Ok(conn) = self.shared.store.try_conn() {
+            let _ = conn.busy_timeout(crate::store::BUSY_TIMEOUT);
+        }
+    }
+}
+
+/// This is the supported tracker transaction: the same scoped PM lock,
+/// parsed frontmatter writer and Git commit used by issue writes. A busy
+/// PM lock means the action owns the snapshot; no file bypass is attempted.
+/// Returning true proves the semantic edit COMMITTED while SQL was held.
+fn try_canonical_title_edit(world: &World, ticket: &str, title: &str) -> bool {
+    let pm = crate::issue::Pm::at(&world.pm()).expect("open tracker");
+    let dir = world.pm().join(PROJECT).join(ticket);
+    let file = dir.join("issue.md");
+    let Some(lock) = pm
+        .try_lock_for_paths(std::slice::from_ref(&file))
+        .expect("probe the real tracker writer")
+    else {
+        return false;
+    };
+    let (mut front, body) = crate::issue::write::load_front(&dir).expect("read current issue");
+    assert_ne!(
+        front.title, title,
+        "the attempted edit must change semantics"
+    );
+    front.title = title.to_string();
+    crate::issue::write::save_front(&dir, &front, &body).expect("supported issue writer");
+    crate::issue::write::commit_scoped(
+        &pm,
+        &lock,
+        std::slice::from_ref(&file),
+        &format!("{ticket}: change bound title at writer barrier"),
+        &[ticket],
+        "operator",
+    )
+    .expect("supported tracker commit");
+    drop(lock);
+    assert_eq!(
+        world.issue(ticket).front.title,
+        title,
+        "committed edit reads back"
+    );
+    true
+}
+
+/// If the snapshot lock won, perform the supported edit only AFTER the
+/// action returned. This is a valid serialization, not a demanded refusal.
+fn edit_title_after_action(world: &World, ticket: &str, title: &str) {
+    let pm = crate::issue::Pm::at(&world.pm()).expect("open tracker");
+    crate::issue::write::set_fields_if_rev(
+        &pm,
+        &[ticket.to_string()],
+        &[format!("title={title}")],
+        "operator",
+        None,
+        None,
+    )
+    .expect("the deferred supported edit commits after the action");
+    assert_eq!(world.issue(ticket).front.title, title);
+}
+
+fn bound_followup(shared: Arc<Shared>, rec: Record, mid: String) -> Result<bool> {
+    let _grant = shared
+        .unattended_lock
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let _delivery = shared
+        .delivery_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    shared.send_issue_followup(&rec, &mid, "fix the red CI on this bound issue")
+}
+
+fn observe_canonical_race(shared: Arc<Shared>, ticket: String) -> Result<Value> {
+    scoped(Asserted::Operator, || {
+        shared.rpc_delivery_observe(
+            &json!({
+                "issue": ticket, "head": HEAD, "pr_state": "OPEN",
+                "ci_green": true, "additions": 1, "deletions": 0, "files": 1,
+            }),
+            std::process::id(),
+        )
+    })
+}
+
+fn assert_canonical_landing_requested(world: &World, ticket: &str, outcome: &Result<Value>) {
+    let body = outcome.as_ref().expect("valid automatic landing answers");
+    assert!(body["unattended_refusal"].is_null(), "{body}");
+    assert!(
+        world
+            .shared
+            .store
+            .unattended_merge_intent(ticket, HEAD)
+            .unwrap()
+            .is_some(),
+        "a valid default-target action must record its native intent"
+    );
+    assert_eq!(
+        world.gh_calls("pr merge"),
+        1,
+        "exactly one remote enqueue request"
+    );
+    assert_eq!(
+        world.recorded_merge_approvals(),
+        0,
+        "no fabricated operator approval"
+    );
+    assert!(!record(world, ticket).unattended_hold);
+}
+
+fn assert_canonical_landing_refused(world: &World, ticket: &str, outcome: &Result<Value>) {
+    match outcome {
+        Err(error) => assert!(
+            matches!(error.kind(), "rejected" | "gate" | "conflict"),
+            "contention/transport faults are not authority refusal: {error:?}"
+        ),
+        Ok(body) => assert!(
+            body["unattended_refusal"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "the live consumer must report an authority refusal: {body}"
+        ),
+    }
+    let rec = record(world, ticket);
+    assert!(
+        rec.unattended_hold,
+        "refused landing must be held for the operator"
+    );
+    assert_ne!(rec.state, State::Enqueued);
+    assert_ne!(rec.state, State::Merged);
+    assert!(
+        world
+            .shared
+            .store
+            .unattended_merge_intent(ticket, HEAD)
+            .unwrap()
+            .is_none(),
+        "a refused action must not leave a fresh native intent"
+    );
+    assert_eq!(
+        world.gh_calls("pr merge"),
+        0,
+        "no unauthorized remote mutation"
+    );
+    assert_eq!(world.recorded_merge_approvals(), 0, "no operator approval");
+}
+
+fn canonical_default_landing_control() {
+    let world = World::open();
+    let admitted = world.grant_and_admit(Some(120));
+    world.save_pass(&admitted.ticket, "reviewer");
+    let outcome = world.observe(Asserted::Operator, &admitted.ticket, HEAD);
+    assert_canonical_landing_requested(&world, &admitted.ticket, &outcome);
+}
+
+#[test]
+fn cad225_followup_canonical_snapshot_survives_sql_writer_wait() {
+    let world = World::open();
+    let admitted = world.grant_and_admit(Some(120));
+    world.dispatch_turn(&admitted.ticket, 1, true, Some(Some(HEAD)));
+    world.save_red(&admitted.ticket);
+
+    // Same run, producer and lane, without mutation: admission really works.
+    let control = "canonical-followup-control";
+    assert!(bound_followup(
+        world.shared.clone(),
+        record(&world, &admitted.ticket),
+        control.into()
+    )
+    .expect("valid bound follow-up control"));
+    let message = world
+        .shared
+        .store
+        .message(control)
+        .unwrap()
+        .expect("control row");
+    assert_eq!(message.source, "review");
+    assert_eq!(message.issue.as_deref(), Some(admitted.ticket.as_str()));
+    assert_eq!(message.worktree.as_deref(), world.checkout().to_str());
+    finish_turn(&world, control, json!({"sha": HEAD}));
+
+    let expiry = world
+        .shared
+        .unattended_authorization_for_issue(&admitted.ticket)
+        .expect("live authority")
+        .expect("bound run")
+        .expires_at;
+    assert!(expiry > now_secs() + 60.0, "this is not an expiry test");
+    let mid = format!(
+        "checkup-fix-{}-{}",
+        admitted.ticket.to_lowercase(),
+        &HEAD[..12]
+    );
+    let rec = record(&world, &admitted.ticket);
+    let send_mid = mid.clone();
+    let mut race =
+        CanonicalSqlRace::start(&world, move |shared| bound_followup(shared, rec, send_mid));
+    race.at_writer();
+    let title = "Changed work while follow-up writer is parked";
+    let edited_first = try_canonical_title_edit(&world, &admitted.ticket, title);
+    assert!(
+        expiry > now_secs() + 30.0,
+        "authority must remain comfortably live"
+    );
+    let outcome = race.finish();
+    if edited_first {
+        let error = outcome.expect_err("changed canonical work must refuse a fresh follow-up");
+        assert!(
+            matches!(error.kind(), "rejected" | "gate" | "conflict"),
+            "an unrelated busy/transport fault cannot satisfy the guard: {error:?}"
+        );
+        assert!(
+            world.shared.store.message(&mid).unwrap().is_none(),
+            "no stale follow-up row"
+        );
+        let before = record(&world, &admitted.ticket);
+        let report = world.lane_done_ref(&admitted.ticket, 2_000, HEAD);
+        world
+            .shared
+            .checkup_idle_lane(&world.worker_agent(), &[report])
+            .expect("operator-facing checkup answers");
+        let after = record(&world, &admitted.ticket);
+        assert!(after.unattended_hold, "the invalid run must be held");
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.since, before.since);
+        assert_eq!(after.verdict, before.verdict);
+        assert_eq!(after.ready_evidence, before.ready_evidence);
+        assert_eq!(after.ready_binding, before.ready_binding);
+        assert_eq!(after.unattended_pending, before.unattended_pending);
+        assert!(world.shared.store.message(&mid).unwrap().is_none());
+    } else {
+        assert!(outcome.expect("snapshot owner may authorize before the edit"));
+        let message = world
+            .shared
+            .store
+            .message(&mid)
+            .unwrap()
+            .expect("authorized follow-up");
+        assert_eq!(message.source, "review");
+        assert_eq!(message.issue.as_deref(), Some(admitted.ticket.as_str()));
+        assert_eq!(message.worktree.as_deref(), world.checkout().to_str());
+        edit_title_after_action(&world, &admitted.ticket, title);
+    }
+    world.assert_invalid_run(&admitted.ticket);
+}
+
+#[test]
+fn cad225_landing_canonical_snapshot_survives_sql_writer_wait() {
+    canonical_default_landing_control();
+    let world = World::open();
+    let admitted = world.grant_and_admit(Some(120));
+    world.save_pass(&admitted.ticket, "reviewer");
+    let expiry = world
+        .shared
+        .unattended_authorization_for_issue(&admitted.ticket)
+        .expect("live authority")
+        .expect("bound run")
+        .expires_at;
+    assert!(expiry > now_secs() + 60.0, "this is not an expiry test");
+    let ticket = admitted.ticket.clone();
+    let mut race =
+        CanonicalSqlRace::start(&world, move |shared| observe_canonical_race(shared, ticket));
+    race.at_writer();
+    // The valid control and actual SQLite callback exclude an earlier
+    // profile/CI/refusal branch from masquerading as the intent boundary.
+    assert!(world.gh_calls("workflows/ci.yml/runs") > 0);
+    assert!(world.gh_calls("graphql") > 0);
+    let title = "Changed work while landing intent writer is parked";
+    let edited_first = try_canonical_title_edit(&world, &admitted.ticket, title);
+    assert!(
+        expiry > now_secs() + 30.0,
+        "authority must remain comfortably live"
+    );
+    let outcome = race.finish();
+    if edited_first {
+        assert_canonical_landing_refused(&world, &admitted.ticket, &outcome);
+    } else {
+        assert_canonical_landing_requested(&world, &admitted.ticket, &outcome);
+        edit_title_after_action(&world, &admitted.ticket, title);
+    }
+    world.assert_invalid_run(&admitted.ticket);
+}
+
+/// One-shot final queue-observation rendezvous; release/join on panic too.
+struct CanonicalQueueRead {
+    root: PathBuf,
+    producer: Option<std::thread::JoinHandle<Result<Value>>>,
+}
+
+impl CanonicalQueueRead {
+    fn start(world: &World, ticket: String) -> Self {
+        std::fs::write(world.root.path().join("qr-arm"), "1\n").expect("arm queue read");
+        let shared = world.shared.clone();
+        Self {
+            root: world.root.path().to_path_buf(),
+            producer: Some(std::thread::spawn(move || {
+                observe_canonical_race(shared, ticket)
+            })),
+        }
+    }
+
+    fn finish(&mut self) -> Result<Value> {
+        std::fs::write(self.root.join("qr-go"), "1\n").expect("release queue read");
+        self.producer
+            .take()
+            .expect("producer")
+            .join()
+            .expect("observe thread")
+    }
+}
+
+impl Drop for CanonicalQueueRead {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.root.join("qr-go"), "1\n");
+        if let Some(producer) = self.producer.take() {
+            let _ = producer.join();
+        }
+    }
+}
+
+fn canonical_ordinary_integration_control() {
+    let world = World::open();
+    std::fs::write(
+        world.pm().join(PROJECT).join("PROJECT.md"),
+        "---\ndelivery:\n  integration_branch: integration\n  reviews:\n    review:\n      kind: agent\n      focus: general\n  risk:\n    - require: [review]\n---\n# Widgets\n",
+    )
+    .expect("ordinary integration policy");
+    world
+        .call(Asserted::Operator, |shared| {
+            shared.rpc_project_work_approve(&json!({"project": PROJECT}), std::process::id())
+        })
+        .expect("native operator policy approval");
+    let admitted = world.grant_and_admit(Some(120));
+    world.set_base("integration");
+    let classified = super::super::delivery_requirements_rpc::classify(
+        &world.shared,
+        &json!({
+            "issue": admitted.ticket,
+            "pr": format!("https://github.com/{REPO}/pull/{PR}"),
+            "head": HEAD,
+        }),
+    )
+    .expect("ordinary approved integration target classifies");
+    assert_eq!(classified["base_ref"].as_str(), Some("integration"));
+    assert!(
+        super::super::delivery_requirements_rpc::full_ci_green(
+            &world.shared,
+            REPO,
+            PR,
+            HEAD,
+            BASE,
+            "integration",
+            false,
+        )
+        .expect("ordinary approved-target CI answers"),
+        "ordinary approved integration delivery remains allowed"
+    );
+}
+
+#[test]
+fn cad225_final_queue_observation_binds_target_and_base() {
+    canonical_default_landing_control();
+    canonical_ordinary_integration_control();
+    for missing in [None, Some("name"), Some("oid")] {
+        let world = World::open();
+        let admitted = world.grant_and_admit(Some(120));
+        world.save_pass(&admitted.ticket, "reviewer");
+        let mut read = CanonicalQueueRead::start(&world, admitted.ticket.clone());
+        assert!(
+            world.wait_for("qr-call", 30),
+            "otherwise-valid default landing must reach its final queue observation"
+        );
+        assert!(
+            world.gh_calls("workflows/ci.yml/runs") > 0,
+            "canonical CI was consulted"
+        );
+        assert!(
+            world.gh_calls(&format!("compare/{BASE}...{HEAD}")) >= 2,
+            "both authorized classifications completed before the injection"
+        );
+        assert_eq!(
+            world.gh_calls("pr merge"),
+            0,
+            "barrier precedes remote mutation"
+        );
+        if let Some(field) = missing {
+            std::fs::write(world.root.path().join("qr-missing"), field)
+                .expect("omit target evidence from the final queue response");
+        } else {
+            // Same head AND base OID: only destination identity changes.
+            world.set_base("integration");
+        }
+        let outcome = read.finish();
+        let observed = std::fs::read_to_string(world.root.path().join("qr-observed"))
+            .expect("the fixture recorded its actual final remote observation");
+        let target = if missing.is_some() {
+            "main"
+        } else {
+            "integration"
+        };
+        assert_eq!(observed.trim(), format!("{HEAD}|{target}|{BASE}"));
+        assert_canonical_landing_refused(&world, &admitted.ticket, &outcome);
+        assert!(
+            world
+                .shared
+                .unattended_authorization_for_issue(&admitted.ticket)
+                .expect("tracker/grant were unchanged")
+                .is_some(),
+            "this must be a target-evidence refusal, not lost workflow authority"
+        );
+    }
+}
