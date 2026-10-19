@@ -707,8 +707,8 @@ fn cad1568_hosted_cli_scenario() {
     // Recipient-class boundary through the packaged CLI: the request is
     // forwarded, and the container's own recipient-class guard refuses it
     // with its typed code — that code is the native runtime's, not the
-    // board's (a board refusal names `error.hop = "board"` and a reason
-    // instead), and the refusal is never a silent reroute.
+    // board's (a board refusal names `error.hop = "board"` and, when
+    // known, a reason instead), and the refusal is never a silent reroute.
     let before_local = hosted_cli_requests(root.path());
     let local_refused = cli_exe.run(
         &owner_home,
@@ -737,7 +737,8 @@ fn cad1568_hosted_cli_scenario() {
     // container's role guard refuses it — master coordination needs a
     // verified human workspace owner. Its code is the container's own
     // (`not_permitted` is minted only by the container's `cli_recipient`;
-    // a board refusal names `error.hop = "board"` and a reason instead).
+    // a board refusal names `error.hop = "board"` and, when known, a
+    // reason instead).
     // The member's own read of the owner's message is privacy evidence:
     // it is refused as not found and proves nothing about which rows
     // exist, so it is never used as an enqueue-absence oracle.
@@ -957,9 +958,9 @@ fn cad1568_hosted_cli_scenario() {
     // refuses the under-scoped envelope, and the board's wrong-workspace
     // guard refuses an authorize that names another workspace. Each
     // refusal says which hop produced it — the board's own refusals
-    // carry `error.hop = "board"` and a reason, the container's carry
-    // their own typed code — so a forwarded status is never counted as
-    // another hop's evidence.
+    // carry `error.hop = "board"` and, when known, a reason, the
+    // container's carry their own typed code — so a forwarded status is
+    // never counted as another hop's evidence.
     let envelope = authorize(&target, &owner, Surface::Cli, &["cli.read"], AUTH_TIMEOUT).unwrap();
     let read_request = json!({"version":CLI_VERSION,"envelope":envelope,"verb":"message_read", "arguments":{"message":"cad1568-packaged-roundtrip"}});
     let (status, _, _) = post(
@@ -985,7 +986,8 @@ fn cad1568_hosted_cli_scenario() {
     // `assertion_replayed`), after the board forwarded the still valid
     // envelope. The typed code in the relayed body is what binds this
     // refusal to that hop: a status alone cannot, and a board refusal
-    // carries `error.hop = "board"` with a reason instead of a code.
+    // carries `error.hop = "board"` (with a reason, when known) instead
+    // of a code.
     let replay_error = replay_body.unwrap()["error"].clone();
     assert_eq!(replay_error["code"], "assertion_replayed");
     assert!(
