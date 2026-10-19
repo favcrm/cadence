@@ -638,6 +638,7 @@ fn self_routed(fx: &Fx, alias: &str) -> Option<String> {
     fx.store()
         .messages(alias)
         .unwrap()
+        .into_iter()
         .rev()
         .find(|m| m.source == "worker_result" && m.state == "completed")
         .map(|m| m.id)
