@@ -157,8 +157,9 @@ canonical `ci.yml` PR run supplies prequeue head feedback: a newer pending or
 failed attempt cannot be hidden by an older success. Neither historical run
 titles nor mutable `pull_requests[]` metadata prove current-base integration.
 
-Final integration authority comes from an enforced default-branch merge queue
-with no bypass actors or mutation-identity bypass. Administrator-enforced
+Automatic landing remains default-branch-only; approved integration targets use
+ordinary delivery approval. Final integration authority comes from an enforced
+merge queue with no bypass actors or mutation-identity bypass. Administrator-enforced
 protection must bind the canonical `fmt`, `clippy`, `test`, `build` and `ui`
 gates to GitHub Actions, plus `cross-build (required)` when that existing
 aggregate is present. The trusted workflow must handle `merge_group`.

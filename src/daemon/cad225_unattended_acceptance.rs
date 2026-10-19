@@ -234,6 +234,8 @@ issue=$(cat "$here/issue-id" 2>/dev/null || echo {PREFIX}-225)
 runs=$(cat "$here/gh-runs" 2>/dev/null || echo green)
 queue=ok
 if [ -f "$here/gh-queue" ]; then queue=$(cat "$here/gh-queue"); fi
+base=main
+if [ -f "$here/gh-base" ]; then base=$(cat "$here/gh-base"); fi
 protect=ok
 if [ -f "$here/gh-protect" ]; then protect=$(cat "$here/gh-protect"); fi
 wf=full
@@ -249,13 +251,13 @@ if [ "$1" = pr ] && [ "$2" = view ]; then
     *autoMergeRequest*)
       vhead=$head
       if [ "$want" = latemove ]; then vhead={MOVED}; fi
-      printf '%s\n' "{{\"number\":{PR},\"state\":\"OPEN\",\"headRefOid\":\"$vhead\",\"headRefName\":\"cad-225\",\"baseRefName\":\"main\",\"baseRefOid\":\"{BASE}\",\"statusCheckRollup\":[{{\"context\":\"fmt\",\"state\":\"SUCCESS\"}},{{\"context\":\"clippy\",\"state\":\"SUCCESS\"}},{{\"context\":\"test\",\"state\":\"SUCCESS\"}},{{\"context\":\"build\",\"state\":\"SUCCESS\"}},{{\"context\":\"ui\",\"state\":\"SUCCESS\"}},{{\"context\":\"cross-build-required\",\"state\":\"SUCCESS\"}},{{\"context\":\"ci\",\"state\":\"SUCCESS\"}},{{\"context\":\"external/sonar\",\"state\":\"SUCCESS\"}}],\"additions\":1,\"deletions\":0,\"changedFiles\":1,\"autoMergeRequest\":$automr}}"
+      printf '%s\n' "{{\"number\":{PR},\"state\":\"OPEN\",\"headRefOid\":\"$vhead\",\"headRefName\":\"cad-225\",\"baseRefName\":\"$base\",\"baseRefOid\":\"{BASE}\",\"statusCheckRollup\":[{{\"context\":\"fmt\",\"state\":\"SUCCESS\"}},{{\"context\":\"clippy\",\"state\":\"SUCCESS\"}},{{\"context\":\"test\",\"state\":\"SUCCESS\"}},{{\"context\":\"build\",\"state\":\"SUCCESS\"}},{{\"context\":\"ui\",\"state\":\"SUCCESS\"}},{{\"context\":\"cross-build-required\",\"state\":\"SUCCESS\"}},{{\"context\":\"ci\",\"state\":\"SUCCESS\"}},{{\"context\":\"external/sonar\",\"state\":\"SUCCESS\"}}],\"additions\":1,\"deletions\":0,\"changedFiles\":1,\"autoMergeRequest\":$automr}}"
       ;;
     *headRefOid,baseRefOid,statusCheckRollup*)
       printf '%s\n' "{{\"headRefOid\":\"$head\",\"baseRefOid\":\"{BASE}\",\"statusCheckRollup\":[{{\"context\":\"fmt\",\"state\":\"SUCCESS\"}},{{\"context\":\"clippy\",\"state\":\"SUCCESS\"}},{{\"context\":\"test\",\"state\":\"SUCCESS\"}},{{\"context\":\"build\",\"state\":\"SUCCESS\"}},{{\"context\":\"ui\",\"state\":\"SUCCESS\"}},{{\"context\":\"cross-build-required\",\"state\":\"SUCCESS\"}},{{\"context\":\"ci\",\"state\":\"SUCCESS\"}},{{\"context\":\"external/sonar\",\"state\":\"SUCCESS\"}}]}}"
       ;;
     *)
-      printf '%s\n' "{{\"number\":{PR},\"state\":\"OPEN\",\"title\":\"$issue: fixture\",\"headRefOid\":\"$head\",\"headRefName\":\"cad-225\",\"baseRefName\":\"main\",\"baseRefOid\":\"{BASE}\",\"author\":{{\"login\":\"worker\"}},\"statusCheckRollup\":[{{\"context\":\"fmt\",\"state\":\"SUCCESS\"}},{{\"context\":\"clippy\",\"state\":\"SUCCESS\"}},{{\"context\":\"test\",\"state\":\"SUCCESS\"}},{{\"context\":\"build\",\"state\":\"SUCCESS\"}},{{\"context\":\"ui\",\"state\":\"SUCCESS\"}},{{\"context\":\"cross-build-required\",\"state\":\"SUCCESS\"}},{{\"context\":\"ci\",\"state\":\"SUCCESS\"}},{{\"context\":\"external/sonar\",\"state\":\"SUCCESS\"}}],\"additions\":1,\"deletions\":0,\"changedFiles\":1,\"autoMergeRequest\":$automr}}"
+      printf '%s\n' "{{\"number\":{PR},\"state\":\"OPEN\",\"title\":\"$issue: fixture\",\"headRefOid\":\"$head\",\"headRefName\":\"cad-225\",\"baseRefName\":\"$base\",\"baseRefOid\":\"{BASE}\",\"author\":{{\"login\":\"worker\"}},\"statusCheckRollup\":[{{\"context\":\"fmt\",\"state\":\"SUCCESS\"}},{{\"context\":\"clippy\",\"state\":\"SUCCESS\"}},{{\"context\":\"test\",\"state\":\"SUCCESS\"}},{{\"context\":\"build\",\"state\":\"SUCCESS\"}},{{\"context\":\"ui\",\"state\":\"SUCCESS\"}},{{\"context\":\"cross-build-required\",\"state\":\"SUCCESS\"}},{{\"context\":\"ci\",\"state\":\"SUCCESS\"}},{{\"context\":\"external/sonar\",\"state\":\"SUCCESS\"}}],\"additions\":1,\"deletions\":0,\"changedFiles\":1,\"autoMergeRequest\":$automr}}"
       ;;
   esac
   exit 0
@@ -279,11 +281,11 @@ if [ "$1" = api ]; then
     repos/{REPO}/git/trees/{HEAD}?recursive=1|repos/{REPO}/git/trees/{MOVED}?recursive=1) printf '%s\n' "{{\"truncated\":false,\"tree\":[{{\"path\":\"$file\",\"mode\":\"$mode\",\"type\":\"blob\"}}]}}" ;;
     repos/{REPO}/contents/docs/roles/risk-paths.toml?ref={BASE}) printf '%s\n' "{{\"encoding\":\"base64\",\"content\":\"{risk}\"}}" ;;
     repos/{REPO}/contents/docs/roles/one-review-paths.toml?ref={BASE}) printf '%s\n' "{{\"encoding\":\"base64\",\"content\":\"{review}\"}}" ;;
-    repos/{REPO}/rules/branches/main)
+    repos/{REPO}/rules/branches/$base)
       if [ -f "$here/rules-$queue.json" ]; then cat "$here/rules-$queue.json"; else cat "$here/rules-ok.json"; fi ;;
     repos/{REPO}/rulesets/*)
       if [ -f "$here/ruleset-$queue.json" ]; then cat "$here/ruleset-$queue.json"; else cat "$here/ruleset-ok.json"; fi ;;
-    repos/{REPO}/branches/main/protection)
+    repos/{REPO}/branches/$base/protection)
       if [ -f "$here/protect-$protect.json" ]; then cat "$here/protect-$protect.json"; else cat "$here/protect-ok.json"; fi ;;
     repos/{REPO}/contents/.github/workflows/ci.yml?ref={BASE})
       wff=wf-full.yml
@@ -852,6 +854,15 @@ impl World {
     /// `pr merge` itself.
     fn queue_admitted(&self) {
         std::fs::write(self.root.path().join("gh-queued"), "1\n").unwrap();
+    }
+
+    /// Which branch the scripted `gh` reports as the PR's `baseRefName` —
+    /// `main` by default (the repository default). A non-default name is
+    /// also the branch whose `rules`/`protection` fixtures the same
+    /// controls select, so the actual target's authority is read, never
+    /// silently substituted for the default branch's.
+    fn set_base(&self, branch: &str) {
+        std::fs::write(self.root.path().join("gh-base"), format!("{branch}\n")).unwrap();
     }
 
     /// An `autoMergeRequest` exists without a queue entry — a request the

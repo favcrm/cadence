@@ -1446,3 +1446,137 @@ fn cad225_moved_epic_body_tail_refuses_native_authorization() {
         "the lane is held for the operator — the run's authority cannot be read as live"
     );
 }
+
+/// CAD-1561 compatibility on the bound automatic lane: an ordinary
+/// delivery whose `delivery:` policy is operator-approved to land on a
+/// non-default integration branch is legitimately delivered there —
+/// `classify` binds `base_ref` to the approved target and the explicit
+/// (`require_queue=false`) floor greens it. The bound workflow's
+/// automatic landing keeps the old default-branch-only rule —
+/// `full_ci_green` runs `require_queue` authority on the repository
+/// default — so `delivery_observe`'s automatic enqueue refuses the
+/// same otherwise-authorized request with no queue request and no
+/// durable intent. The controls prove the refusal is the retained
+/// target gate itself: the same fixtures carry the ordinary path on
+/// `integration` and the full automatic floor on `main`, so a missing
+/// policy, a malformed fixture or a dropped queue check cannot pass
+/// here by accident — were the target gate silently removed, the
+/// integration branch's branch-scoped rules/protection/workflow
+/// fixtures (which the stub serves verbatim, identical to the
+/// enforced default set) would carry the landing instead.
+#[test]
+fn cad225_approved_integration_target_cannot_consume_automatic_authority() {
+    const INTEGRATION: &str = "integration";
+    let world = World::open();
+
+    // A legitimate `delivery:` policy approving `integration` as THE
+    // non-default target, recorded through the real operator RPC — the
+    // daemon itself reads the file and records the policy plus digest,
+    // so `approved_integration_target`'s provenance check binds this
+    // exact section rather than test-injected halves.
+    std::fs::write(
+        world.pm().join(PROJECT).join("PROJECT.md"),
+        format!(
+            "---\ndelivery:\n  integration_branch: {INTEGRATION}\n  reviews:\n    review:\n      kind: agent\n      focus: general\n  risk:\n    - require: [review]\n---\n# Widgets\n"
+        ),
+    )
+    .expect("PROJECT.md writes");
+    world
+        .call(Asserted::Operator, |shared| {
+            shared.rpc_project_work_approve(&json!({"project": PROJECT}), std::process::id())
+        })
+        .expect("the operator approves the delivery policy");
+
+    let admitted = world.grant_and_admit(None);
+    world.set_case("in");
+    world.set_head(HEAD);
+    world.set_base(INTEGRATION);
+    world.save_pass(&admitted.ticket, "reviewer");
+    let pr = format!("https://github.com/{REPO}/pull/{PR}");
+    let request = json!({"issue": admitted.ticket, "pr": pr, "head": HEAD});
+
+    // The approved-target ordinary path: `classify` admits the
+    // non-default base and the explicit delivery floor
+    // (`require_queue=false`) greens it — queue authority is
+    // intentionally not required there.
+    let classified = super::super::delivery_requirements_rpc::classify(&world.shared, &request)
+        .expect("the approved integration target classifies");
+    assert_eq!(
+        classified["base_ref"].as_str(),
+        Some(INTEGRATION),
+        "classification must bind the actual target, never the default"
+    );
+    assert!(
+        super::super::delivery_requirements_rpc::full_ci_green(
+            &world.shared,
+            REPO,
+            PR,
+            HEAD,
+            BASE,
+            INTEGRATION,
+            false
+        )
+        .expect("the ordinary approved-target floor answers"),
+        "ordinary delivery to the approved target must remain allowed"
+    );
+
+    // The target gate at the guard level: the SAME otherwise-green
+    // request under the automatic floor (`require_queue=true`) is a
+    // typed refusal, not a wait — the default-branch rule fires before
+    // the integration branch's branch-scoped enforcement fixtures are
+    // even consulted, so it cannot hide behind observe's earlier
+    // eligibility checks.
+    let refusal = super::super::delivery_requirements_rpc::full_ci_green(
+        &world.shared,
+        REPO,
+        PR,
+        HEAD,
+        BASE,
+        INTEGRATION,
+        true,
+    )
+    .expect_err("automatic authority must refuse the approved non-default target");
+    assert!(
+        matches!(refusal.kind(), "rejected" | "gate"),
+        "the target refusal is a typed authority answer, not a fault: {refusal:?}"
+    );
+
+    // The default-target control: identical fixtures pass the FULL
+    // automatic floor (`require_queue=true`) on `main`. Together with
+    // the `integration` ordinary green and the refused landing below,
+    // the triplet isolates the default-branch rule — enforcement on
+    // either branch alone cannot produce it.
+    world.set_base("main");
+    assert!(
+        super::super::delivery_requirements_rpc::full_ci_green(
+            &world.shared,
+            REPO,
+            PR,
+            HEAD,
+            BASE,
+            "main",
+            true
+        )
+        .expect("the enforced-queue floor on the default branch answers"),
+        "the automatic floor still greens the default target"
+    );
+    world.set_base(INTEGRATION);
+
+    // The bound automatic path answers the same otherwise-authorized
+    // request: `delivery_observe` -> `try_unattended_enqueue` ->
+    // `full_ci_green(require_queue)` refuses the non-default target —
+    // the observe holds for the operator with no queue-entry probe, no
+    // `pr merge`, no durable intent and a live grant.
+    let landed = world.observe(Asserted::Operator, &admitted.ticket, HEAD);
+    world.assert_not_enqueued(&admitted.ticket, &landed);
+    assert_eq!(
+        world.gh_calls("graphql"),
+        0,
+        "the queue-entry probe ran before automatic authority proved"
+    );
+    assert_eq!(
+        world.gh_calls("pr merge"),
+        0,
+        "the refused landing ran the queue mutation"
+    );
+}
