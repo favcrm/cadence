@@ -2088,8 +2088,10 @@ models follows the approved mockup without a Role defaults editor; stored
 defaults are preserved and inherited profiles still resolve them. Launch
 eligibility comes from saved-state Preview, not an optimistic unsaved badge.
 The operator-approved clean presentation omits the registry banner, subtitles
-and explanatory paragraphs. Muted information icons expose page and field help
-through native tooltips and accessible labels. Validation, failures, live
+and explanatory paragraphs. Information buttons expose page and field help on
+hover, keyboard focus or tap in styled, viewport-bounded top-layer tooltips.
+Escape dismisses help before closing its drawer; outside taps and scrolling
+dismiss help too. Touch pointers get 44px targets. Validation, failures, live
 status and concise empty states stay visible; Save and Discard remain grouped
 on narrow screens.
 

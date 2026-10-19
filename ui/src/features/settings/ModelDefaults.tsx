@@ -1,4 +1,4 @@
-import { useContext, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useContext, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { InformationCircleIcon } from "@hugeicons/core-free-icons";
 import { READ_ONLY_REASON } from "../auth/gate";
@@ -179,8 +179,69 @@ function activate(event: KeyboardEvent, run: () => void) {
   }
 }
 
-function HelpHint({ text }: { text: string }) {
-  return <span className="agent-help" role="img" tabIndex={0} title={text} aria-label={text}><HugeiconsIcon icon={InformationCircleIcon} size={14} strokeWidth={1.7} aria-hidden="true" /></span>;
+function HelpHint({ text, label = "About agent settings" }: { text: string; label?: string }) {
+  const id = useId();
+  const trigger = useRef<HTMLButtonElement>(null);
+  const tooltip = useRef<HTMLDivElement>(null);
+  const hideTimer = useRef<number | undefined>(undefined);
+  const [open, setOpen] = useState(false);
+
+  function hide() {
+    window.clearTimeout(hideTimer.current);
+    tooltip.current?.hidePopover();
+  }
+
+  function show() {
+    window.clearTimeout(hideTimer.current);
+    const button = trigger.current;
+    const popup = tooltip.current;
+    if (!button || !popup) return;
+    popup.showPopover();
+    const anchor = button.getBoundingClientRect();
+    const bounds = popup.getBoundingClientRect();
+    popup.style.left = `${Math.max(12, Math.min(anchor.left, window.innerWidth - bounds.width - 12))}px`;
+    popup.style.top = `${anchor.bottom + 8 + bounds.height <= window.innerHeight - 12
+      ? anchor.bottom + 8
+      : Math.max(12, anchor.top - bounds.height - 8)}px`;
+  }
+
+  function leave() {
+    window.clearTimeout(hideTimer.current);
+    hideTimer.current = window.setTimeout(() => {
+      if (!trigger.current?.matches(":focus") && !tooltip.current?.matches(":hover")) hide();
+    }, 120);
+  }
+
+  useEffect(() => () => window.clearTimeout(hideTimer.current), []);
+
+  useEffect(() => {
+    if (!open) return;
+    const dismiss = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      hide();
+    };
+    document.addEventListener("keydown", dismiss, true);
+    window.addEventListener("scroll", hide, true);
+    window.addEventListener("resize", hide);
+    return () => {
+      document.removeEventListener("keydown", dismiss, true);
+      window.removeEventListener("scroll", hide, true);
+      window.removeEventListener("resize", hide);
+    };
+  }, [open]);
+
+  return <span className="agent-help-wrap">
+    <button ref={trigger} type="button" className="agent-help" aria-label={label} aria-describedby={id} aria-expanded={open}
+      onFocus={show} onBlur={hide} onClick={show}
+      onPointerEnter={(event) => { if (event.pointerType !== "touch") show(); }} onPointerLeave={leave}>
+      <HugeiconsIcon icon={InformationCircleIcon} size={16} strokeWidth={1.7} aria-hidden="true" />
+    </button>
+    <div ref={tooltip} id={id} role="tooltip" popover="auto" className="agent-help-tooltip"
+      onToggle={(event) => setOpen(event.newState === "open")}
+      onPointerEnter={() => window.clearTimeout(hideTimer.current)} onPointerLeave={leave}>{text}</div>
+  </span>;
 }
 
 function ModelIdCombo({
@@ -226,7 +287,8 @@ function ModelIdCombo({
 
   return (
     <div className="fld">
-      <span className="slabel" id="agent-model-id-label">id <HelpHint text={hint} /></span>
+      <span className="slabel" id="agent-model-id-label">id</span>
+      <HelpHint text={hint} label="About model IDs" />
       <div className="combo">
         <input
           className="field"
@@ -777,7 +839,7 @@ export default function ModelDefaults() {
   }
 
   function field(label: string, node: ReactNode, hint?: string) {
-    return <label className="fld"><span className="slabel">{label}{hint && <HelpHint text={hint} />}</span>{node}</label>;
+    return <div className="fld"><label className="field-control"><span className="slabel">{label}</span>{node}</label>{hint && <HelpHint text={hint} label={`About ${label}`} />}</div>;
   }
 
   function renderDrawer() {
