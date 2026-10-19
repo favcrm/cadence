@@ -68,6 +68,7 @@ describe.skipIf(!enabled)("CAD-1568 real hosted messaging authority", () => {
         .bind(org, people[role].id, role, at).run();
     }
     ctx.env.BETTER_AUTH_URL = "https://api.example.test";
+    ctx.env.WEB_PUBLIC_URL = "https://web.example.test";
     // Capture OTP only at testkit's local origin; switch to a canonical
     // portless API origin only after synthetic users have signed in.
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
@@ -97,6 +98,7 @@ describe.skipIf(!enabled)("CAD-1568 real hosted messaging authority", () => {
 
     let dropped = false;
     let cliCalls = 0;
+    let deviceApprovals = 0;
     const { promise: finished, resolve: finish } = Promise.withResolvers();
     bridge = await startTlsBridge({
       files: { certPath: required("CAD1434_TLS_CERT"), keyPath: required("CAD1434_TLS_KEY") },
@@ -106,8 +108,23 @@ describe.skipIf(!enabled)("CAD-1568 real hosted messaging authority", () => {
         async fetch(request, env) {
           const path = new URL(request.url).pathname;
           const input = path === "/__platform/cli/call" ? await request.clone().json() : undefined;
+          const deviceCode = path === "/v1/hosted-cadence/device/code"
+            ? await request.clone().json() : undefined;
           const response = await ctx.app.fetch(request, env);
           if (path === "/__platform/cli/call") cliCalls++;
+          // Packaged `cadence login` is the ticketed journey: the issued
+          // device grant is consented through the real /v2 approve route
+          // under the owner's own browser session. Only the human's click
+          // is synthetic — same concession as the seeded grants above.
+          if (deviceCode && response.status === 200) {
+            const grant = await response.clone().json();
+            const approved = await postJson(ctx, "/v2/hosted-cadence/device/approve", {
+              user_code: grant.user_code, organization_id: org, audience,
+              capabilities: deviceCode.requested_capabilities,
+            }, { cookie: people.owner.cookie });
+            expect(approved.status).toBe(200);
+            deviceApprovals++;
+          }
           if (!dropped && input?.verb === "message_send" &&
               input.arguments?.message === "cad1568-lost-receipt") {
             expect(response.status).toBe(200); // native handler already committed
@@ -127,6 +144,8 @@ describe.skipIf(!enabled)("CAD-1568 real hosted messaging authority", () => {
         } else if (op === "finish") {
           expect(dropped).toBe(true);
           expect(cliCalls).toBeGreaterThan(0);
+          // Exactly the packaged owner login consumed a real device grant.
+          expect(deviceApprovals).toBe(1);
           setImmediate(finish);
         } else {
           throw new Error("unsupported CAD-1568 fixture control");
