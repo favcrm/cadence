@@ -18,7 +18,6 @@
 .agents-settings .tabn { display: inline-block; margin-left: 6px; padding: 0 0.3rem; border-radius: 0.2rem; background: var(--color-ink-800); color: var(--color-ink-400); font: var(--text-micro) var(--font-mono); }
 .agents-settings .pane { padding-top: 6px; }
 .agents-settings .card { border: 1px solid var(--color-ink-700); background: var(--color-ink-850); border-radius: 0.5rem; overflow: hidden; }
-.agents-settings .grp { padding: 9px 14px; border-bottom: 1px solid var(--color-ink-700); background: var(--color-ink-875); font: 500 var(--text-micro) var(--font-mono); letter-spacing: 0.07em; text-transform: uppercase; color: var(--color-ink-500); }
 .agents-settings .hrow, .agents-settings .prow { display: grid; gap: 14px; align-items: center; padding: 11px 14px; border-bottom: 1px solid var(--color-ink-800); }
 .agents-settings .hrow { grid-template-columns: minmax(0, 13rem) minmax(0, 1fr) 8rem 6rem; }
 .agents-settings .prow { grid-template-columns: minmax(0, 1fr) 13rem 9rem auto; cursor: pointer; }
@@ -50,22 +49,13 @@
 .agents-settings .meta, .agents-settings .use, .agents-settings .always { font-size: var(--text-micro); color: var(--color-ink-500); text-align: right; }
 .agents-settings .use { color: var(--color-ink-400); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agents-settings .mrow.off .mid { color: var(--color-ink-400); }
-.agents-settings .mrow select, .agents-settings .drow select, .agents-settings .fld select, .agents-settings .fld input, .agents-settings .fld textarea {
+.agents-settings .mrow select, .agents-settings .fld select, .agents-settings .fld input, .agents-settings .fld textarea {
   width: 100%; border: 1px solid var(--color-edge); border-radius: 0.25rem; background: var(--color-ink-900); color: var(--color-ink-100);
 }
 .agents-settings .mrow select { height: 1.75rem; padding: 0 0.5rem; font: var(--text-label) var(--font-mono); }
 .agents-settings .mrow select[data-scope="allow"] { border-color: color-mix(in srgb, var(--color-accent) 55%, transparent); color: var(--color-accent); }
 .agents-settings .mrow select[data-scope="master"], .agents-settings .mrow select[data-scope="worker"] { border-color: color-mix(in srgb, var(--color-info) 50%, transparent); color: var(--color-info); }
 .agents-settings .mrow select[data-scope="off"] { color: var(--color-ink-500); }
-.agents-settings .drow { display: grid; grid-template-columns: 9rem minmax(0, 24rem) minmax(0, 1fr); gap: 12px; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--color-ink-800); }
-.agents-settings .drow:last-child { border-bottom: 0; }
-.agents-settings .drow select { height: 2rem; padding: 0 0.6rem; font: var(--text-table) var(--font-mono); }
-.agents-settings .rlabel { color: var(--color-ink-200); font-size: var(--text-secondary); }
-.agents-settings .drow select.inherit { color: var(--color-ink-400); }
-.agents-settings .drow select.bad { border-color: var(--color-fail); color: var(--color-fail); background: color-mix(in srgb, var(--color-fail) 8%, transparent); }
-.agents-settings .rwhy { display: flex; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end; }
-.agents-settings .rwhy .eff { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: var(--text-table) var(--font-mono); color: var(--color-ink-400); }
-.agents-settings .rhint { grid-column: 1 / -1; margin: 2px 0 0; font: var(--text-micro)/1.5 var(--font-mono); color: var(--color-fail); }
 .agents-settings .pins { margin-top: 12px; }
 .agents-settings .pins summary { cursor: pointer; padding: 10px 14px; font-size: var(--text-secondary); color: var(--color-ink-300); }
 .agents-settings .pins[open] summary { border-bottom: 1px solid var(--color-ink-700); }
@@ -117,13 +107,12 @@
 .agents-settings .badge.b-fail { color: var(--color-fail); }
 @media (max-width: 1000px) {
   .agents-settings .page-head { flex-direction: column; align-items: stretch; }
-  .agents-settings .hrow, .agents-settings .prow, .agents-settings .drow { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .agents-settings .hrow, .agents-settings .prow { grid-template-columns: minmax(0, 1fr); gap: 8px; }
   .agents-settings .hmodels, .agents-settings .hlive { text-align: left; }
   .agents-settings .mrow { grid-template-columns: minmax(0, 1fr) 11rem; row-gap: 4px; }
   .agents-settings .mrow .meta, .agents-settings .mrow .use { display: none; }
   .agents-settings .grid2 { grid-template-columns: minmax(0, 1fr); }
   .agents-settings .pfiles, .agents-settings .pact { justify-content: flex-start; text-align: left; }
-  .agents-settings .drow .rwhy { justify-content: flex-start; }
   .agents-settings .pinrow { grid-template-columns: minmax(0, 1fr) auto; }
   .agents-settings .pinrow .path { grid-column: 1 / -1; }
   .agents-settings .drawer { top: auto; left: 0; width: 100%; height: min(90dvh, 100%); border-left: 0; border-top: 1px solid var(--color-ink-700); }

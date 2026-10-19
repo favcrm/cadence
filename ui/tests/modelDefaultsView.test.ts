@@ -115,16 +115,19 @@ const click = async (el: Element | null | undefined) => {
   await React.act(async () => el.dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0 })));
   await flush();
 };
-const roleDefault = () => host.querySelector<HTMLSelectElement>('[aria-label="Developer default model"]');
-const setSelect = async (value: string) => {
-  const input = roleDefault();
-  assert(input, "Role default exists");
-  const setter = Object.getOwnPropertyDescriptor(win.HTMLSelectElement.prototype, "value")!.set!;
+const harnessNote = () => host.querySelector(".hnote")?.textContent;
+const setHarnessNote = async (value: string) => {
+  await click(button("Harnesses"));
+  await click(host.querySelector(".hrow"));
+  const input = host.querySelector<HTMLTextAreaElement>("[role=dialog] textarea");
+  assert(input, "Harness note editor exists");
+  const setter = Object.getOwnPropertyDescriptor(win.HTMLTextAreaElement.prototype, "value")!.set!;
   await React.act(async () => {
     setter.call(input, value);
-    input.dispatchEvent(new Event("change", { bubbles: true }));
+    input.dispatchEvent(new Event("input", { bubbles: true }));
   });
   await flush();
+  await click(button("Close"));
 };
 const fresh = async (gate: string | null = null) => {
   await React.act(async () => root.unmount());
@@ -147,37 +150,39 @@ async function main() {
   await click(button("Retry"));
   assert(host.querySelector("[role=tablist]") && button("Save")?.disabled, "Loaded saved revision is not dirty");
 
-  await openModels();
-  await setSelect("");
-  assert(!button("Save")?.disabled, "Role-default edit dirties the whole draft");
+  await setHarnessNote("saved note");
+  assert(!button("Save")?.disabled, "Harness edit dirties the whole draft");
   await click(button("Save"));
-  assert(saves[0].expected_revision === "4" && saves[0].config.roleDefaults.dev === "" && saves[0].config.harnesses[0].note === "start", "Save posts the string revision and the whole draft");
-  assert(button("Save")?.disabled && roleDefault()?.value === "", "Successful save adopts the returned snapshot");
+  assert(saves[0].expected_revision === "4" && saves[0].config.harnesses[0].note === "saved note" && saves[0].config.roleDefaults.dev === "gpt", "Save posts the string revision and retains stored inherited defaults");
+  assert(button("Save")?.disabled && harnessNote() === "saved note", "Successful save adopts the returned snapshot");
 
-  await setSelect("gpt");
+  await setHarnessNote("unsaved note");
   failSave = "error";
   await click(button("Save"));
-  assert(!button("Save")?.disabled && roleDefault()?.value === "gpt", "Failed save keeps the draft editable");
+  assert(!button("Save")?.disabled && harnessNote() === "unsaved note", "Failed save keeps the draft editable");
   failSave = "conflict";
   await click(button("Save"));
-  assert(button("Save")?.disabled && button("Reload server copy") && roleDefault()?.value === "gpt", "Conflict keeps the draft and blocks another write");
+  assert(button("Save")?.disabled && button("Reload server copy") && harnessNote() === "unsaved note", "Conflict keeps the draft and blocks another write");
   failSave = null;
   await click(button("Discard"));
-  assert(!button("Reload server copy") && button("Save")?.disabled && roleDefault()?.value === "", "Discard restores the saved revision and clears the conflict");
+  assert(!button("Reload server copy") && button("Save")?.disabled && harnessNote() === "saved note", "Discard restores the saved revision and clears the conflict");
 
-  await setSelect("gpt");
+  await setHarnessNote("unsaved note");
   failSave = "conflict";
   await click(button("Save"));
   failSave = null;
-  snapshot = { ...snapshot, revision: "9", config: { ...baseConfig(), roleDefaults: { ...baseConfig().roleDefaults, dev: "gpt" } } };
+  const serverConfig = baseConfig();
+  serverConfig.harnesses[0].note = "server note";
+  snapshot = { ...snapshot, revision: "9", config: serverConfig };
   holdRead = true;
   await click(button("Reload server copy"));
-  assert(button("Save")?.disabled && roleDefault()?.disabled, "Reload freezes editing while the server copy replaces the draft");
+  assert(button("Save")?.disabled && button("Add harness")?.disabled, "Reload freezes editing while the server copy replaces the draft");
   holdRead = false;
   await React.act(async () => resolveRead!(json(snapshot)));
   await flush();
-  assert(button("Save")?.disabled && !button("Reload server copy") && roleDefault()?.value === "gpt", "Reload adopts the server revision and drops the draft");
+  assert(button("Save")?.disabled && !button("Reload server copy") && harnessNote() === "server note", "Reload adopts the server revision and drops the draft");
 
+  await openModels();
   await click(button("Add pin"));
   assert(button("Save")?.disabled && host.querySelectorAll(".pinrow").length === 1, "Incomplete pin blocks save");
   await click(button("Discard"));
@@ -185,14 +190,14 @@ async function main() {
 
   await fresh("Sign in to act as operator");
   await openModels();
-  assert(roleDefault()?.disabled && button("Save")?.disabled, "Operator gate freezes editing");
+  assert(button("Add provider")?.disabled && button("Save")?.disabled, "Operator gate freezes editing");
   const count = saves.length;
   await click(button("Save"));
   assert(saves.length === count, "Read-only click makes no write");
   snapshot = { ...snapshot, read_only: true };
   await fresh();
   await openModels();
-  assert(roleDefault()?.disabled && button("Save")?.disabled, "Server read-only snapshot keeps editing blocked");
+  assert(button("Add provider")?.disabled && button("Save")?.disabled, "Server read-only snapshot keeps editing blocked");
 
   snapshot = { ...snapshot, read_only: false, config: { harnesses: [], providers: [], models: [], profiles: [], scope: {}, roleDefaults: {}, pins: [] }, revision: "10" };
   await fresh();

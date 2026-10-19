@@ -2083,9 +2083,10 @@ label (for example, `claude` versus “Claude Code”). Closing a drawer keeps e
 to existing rows in the page draft; Discard resets that draft and its status.
 An existing model's blank or duplicate ID stays visible as a validation error;
 Save model stays disabled until the ID is corrected.
-An empty registry shows empty states, not the mockup's demo rows. Role defaults
-remain editable under Providers & models; launch eligibility comes from the
-saved-state Preview, not an optimistic badge on an unsaved profile.
+An empty registry shows empty states, not the mockup's demo rows. Providers &
+models follows the approved mockup without a Role defaults editor; stored
+defaults are preserved and inherited profiles still resolve them. Launch
+eligibility comes from saved-state Preview, not an optimistic unsaved badge.
 
 Save commits harness/provider/model declarations, role defaults, Pi policy,
 pins and profile definitions in one revision-bound SQLite transaction.

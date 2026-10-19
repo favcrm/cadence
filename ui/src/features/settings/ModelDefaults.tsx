@@ -695,48 +695,9 @@ export default function ModelDefaults() {
   }
 
   function renderModels() {
-    const roles = ROLES;
     return (
       <div>
         <p className="lead">{t("Providers first, then the models under each. Toggle a model into the allow list; profiles pick from what is enabled. Native CLIs have no allow list.")}</p>
-        <div className="card" style={{ marginBottom: 12 }}>
-          <div className="grp">{t("Role defaults")}</div>
-          {roles.map(([id, label]) => {
-            const defId = draft.roleDefaults[id] ?? "";
-            const defModel = defId ? draft.models.find((model) => model.id === defId) : undefined;
-            const defProvider = defId ? providerOf(draft, defId) : undefined;
-            const defBad = Boolean(defId) && (!defModel || (defProvider?.gate === true && !allowed(draft, defId)));
-            const eff = !defId
-              ? "unset"
-              : !defModel
-                ? "—"
-                : defProvider?.gate
-                  ? allowed(draft, defId)
-                    ? (draft.scope[defId] ?? "off")
-                    : "not enabled"
-                  : "always available";
-            return (
-              <div className="drow" key={id}>
-                <span className="rlabel">{label}</span>
-                <select
-                  className={defId ? (defBad ? "bad" : "") : "inherit"}
-                  aria-label={`${label} default model`}
-                  disabled={frozen}
-                  value={defId}
-                  onChange={(event) => edit((config) => ({ ...config, roleDefaults: { ...config.roleDefaults, [id]: event.target.value } }))}
-                >
-                  <option value="">unset</option>
-                  {draft.models.map((model) => <option key={model.id} value={model.id}>{model.id}</option>)}
-                  {defId && !defModel && <option value={defId}>{defId}</option>}
-                </select>
-                <span className="rwhy"><span className="eff">{eff}</span></span>
-                {defBad && (
-                  <p className="rhint">{!defModel ? `“${defId}” no longer exists` : `“${defId}” is not enabled for worker agents`}</p>
-                )}
-              </div>
-            );
-          })}
-        </div>
         {draft.providers.map((provider) => {
           const models = draft.models.filter((model) => model.provider === provider.id);
           const on = models.filter((model) => !provider.gate || (draft.scope[model.id] ?? "off") !== "off").length;
