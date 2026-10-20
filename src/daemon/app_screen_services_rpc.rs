@@ -742,7 +742,10 @@ impl Shared {
                 }
                 if let Some((args, facts)) = &proof.confirmed {
                     if &self.screen_slot_facts_locked(proof, args)? != facts {
-                        return Err(Error::rejected("confirmation facts changed; prepare again"));
+                        return Err(Error::conflict_coded(
+                            "facts_changed",
+                            "confirmation facts changed; prepare again",
+                        ));
                     }
                 }
                 action()

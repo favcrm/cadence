@@ -28,6 +28,8 @@ function refusal(error: unknown, operation?: RecordCallVerb): ActionRefusal {
   }
   // Apart from explicit sender-state codes on smtp.show, the child consumes
   // canonical classes (a revision_conflict must still reach the editor as conflict).
+  // CAD-1656: the confirm-time recompute refusal keeps its own code.
+  if (status === 409 && error instanceof ApiError && error.code === "facts_changed") return { code: "facts_changed", text: "That changed. Refresh before trying again." };
   const code = ({ 401: "unauthorized", 403: "forbidden", 404: "not_found", 409: "conflict", 503: "unavailable" } as Record<number, string>)[status] ?? "failed";
   return { code, text: status === 401 || status === 403 ? "This app's access is no longer available." : status === 409 ? "That changed. Refresh before trying again." : "Cadence refused this request. Inspect fresh status before retrying an effect." };
 }

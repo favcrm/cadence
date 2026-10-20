@@ -301,8 +301,15 @@ pub(super) fn service(
         {
             super::coded_response(404, "not_found", &error.to_string(), None)
         }
+        // CAD-1656: only the confirm-time facts refusal keeps its own code;
+        // every other conflict still reaches the frame as `conflict`.
         Err(error) if error.kind() == "conflict" => {
-            super::coded_response(409, "conflict", &error.to_string(), error.revision())
+            let code = if error.code() == Some("facts_changed") {
+                "facts_changed"
+            } else {
+                "conflict"
+            };
+            super::coded_response(409, code, &error.to_string(), error.revision())
         }
         Err(error) => home::rpc_err(&error, method),
     }
