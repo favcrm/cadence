@@ -223,6 +223,14 @@ pub trait PlatformAdapter: Send + Sync {
     /// to the manifest version it was reviewed against (§5.2).
     fn table(&self) -> &ToolTable;
 
+    /// Whether a plain `platform_call` can execute `tool`. Adapters whose
+    /// only execution path is a frozen app-run capability return `false`;
+    /// `platform tools` reports it so a listing never promises a call the
+    /// gate would refuse.
+    fn direct_call(&self, _tool: &str) -> bool {
+        true
+    }
+
     /// Reviewed discovery metadata. Legacy adapters default unavailable.
     fn connection_descriptor(&self) -> Option<super::connections::ProviderDescriptor> {
         None

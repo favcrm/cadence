@@ -1272,6 +1272,8 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("crm_unsubscribe_redeem", Rule::Bearer),
     ("platform_accounts", Rule::Read),
     ("platform_defaults", Rule::Read),
+    // CAD-1640: the reviewed tables only — no credential, no network.
+    ("platform_tools", Rule::Read),
     (
         "platform_grants",
         Rule::Handler(

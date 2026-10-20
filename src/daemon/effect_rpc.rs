@@ -128,12 +128,59 @@ impl Shared {
         }
     }
 
-    /// The caller's project default account for `platform` (the same
-    /// resolution `platform_check` documents): `params.project`, else
-    /// the caller agent's cwd's project. A platform with a built-in
-    /// account (the `local` outbox, CAD-577) falls back to it when the
-    /// project names no default — so a slot bound to `local` needs no
-    /// setup.
+    /// `platform_tools {project?}` — every registered adapter's reviewed
+    /// table. Read-only: no credential, no grant check, no network. A tool
+    /// whose only execution path is a frozen app-run capability carries
+    /// `direct: false`, so a listing never promises a call the gate refuses.
+    pub(super) fn rpc_platform_tools(&self, params: &Value) -> Result<Value> {
+        if let Some(fields) = params.as_object() {
+            if let Some(field) = fields.keys().find(|key| key.as_str() != "project") {
+                return Err(Error::rejected(format!(
+                    "platform tools: unknown field '{field}'"
+                )));
+            }
+        }
+        let project = match optional_str(params, "project") {
+            Some(project) => Some(identifier(project, "Project")?.to_string()),
+            None => None,
+        };
+        let mut platforms: Vec<(&String, &Arc<dyn PlatformAdapter>)> =
+            self.platforms.iter().collect();
+        platforms.sort_by(|left, right| left.0.cmp(right.0));
+        let mut out = Vec::new();
+        for (platform, adapter) in platforms {
+            let table = adapter.table();
+            let mut tools: Vec<Value> = table
+                .tools
+                .iter()
+                .map(|decl| {
+                    json!({
+                        "tool": decl.tool.clone(),
+                        "effect": decl.effect.clone(),
+                        "scopes": decl.scopes.clone(),
+                        "label": decl.label.clone(),
+                        "direct": adapter.direct_call(&decl.tool),
+                    })
+                })
+                .collect();
+            tools.sort_by(|left, right| left["tool"].as_str().cmp(&right["tool"].as_str()));
+            let default_account = match project.as_deref() {
+                Some(project) => self
+                    .store
+                    .platform_default(project, platform)?
+                    .map(|default| default.account),
+                None => None,
+            };
+            out.push(json!({
+                "platform": platform,
+                "manifest_version": table.manifest_version.clone(),
+                "default_account": default_account,
+                "tools": tools,
+            }));
+        }
+        Ok(json!({"platforms": out}))
+    }
+
     fn default_account(&self, agent: &str, platform: &str, params: &Value) -> Result<String> {
         let project = match optional_str(params, "project") {
             Some(p) => identifier(p, "Project")?,

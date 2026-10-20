@@ -24,6 +24,8 @@ const OUTPUT_LIMIT: usize = 512 * 1024;
 pub fn run(state_dir: &Path) -> Result<i32> {
     let alias = std::env::var("CADENCE_ALIAS")
         .map_err(|_| Error::rejected("Cadence agent MCP requires CADENCE_ALIAS"))?;
+    // One listing per server start; a failure only means no platform tools.
+    let platform_tools = platform_tools(state_dir);
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -41,7 +43,9 @@ pub fn run(state_dir: &Path) -> Result<i32> {
                 "capabilities":{"tools":{}},
                 "serverInfo":{"name":"cadence-agent","version":env!("CARGO_PKG_VERSION")}
             }}),
-            Some("tools/list") => json!({"jsonrpc":"2.0","id":id,"result":{"tools":tools()}}),
+            Some("tools/list") => {
+                json!({"jsonrpc":"2.0","id":id,"result":{"tools":tools(&platform_tools)}})
+            }
             Some("tools/call") => {
                 let name = request
                     .pointer("/params/name")
@@ -51,8 +55,8 @@ pub fn run(state_dir: &Path) -> Result<i32> {
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or(json!({}));
-                let result =
-                    command_args(name, &args).and_then(|argv| invoke(state_dir, &alias, &argv));
+                let result = command_args(name, &args, &platform_tools)
+                    .and_then(|argv| invoke(state_dir, &alias, &argv));
                 match result {
                     Ok(text) => json!({"jsonrpc":"2.0","id":id,"result":{
                         "content":[{"type":"text","text":text}]
@@ -77,8 +81,8 @@ pub fn run(state_dir: &Path) -> Result<i32> {
     Ok(0)
 }
 
-fn tools() -> Value {
-    json!([
+fn tools(platform_tools: &[PlatformTool]) -> Value {
+    let mut tools = json!([
         {"name":"self","description":"Show your Cadence identity and your own held turns. Each running entry is {id, turn_id, task} for this endpoint only. Use id as message and turn_id as token with app_run_artifact.",
          "inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"wiki_search","description":"Lexical search of wiki pages visible to your Cadence identity. Not semantic: every token in q must appear (AND); punctuation splits tokens; only the first 12 tokens are used; q is at most 256 bytes. A full question usually matches nothing, so pass scoped keywords instead: the vendor, product or entity, the operation or field name, and the exact identifier, version or number from the question (e.g. '<vendor> <operation>', '<product> <field> <version>'). Drop filler words. Use path to limit to a collection you are authorized for (an organization/global folder, a project folder such as projects/<key>, or a private folder your identity may read); do not narrow by default. Results are candidates, not evidence: wiki_read each source before answering, and an empty result is not proof of absence.",
@@ -102,7 +106,95 @@ fn tools() -> Value {
              "message":{"type":"string"},
              "token":{"type":"string"}},
              "required":["artifact_id","message","token"],"additionalProperties":false}}
-    ])
+    ]);
+    if let Some(array) = tools.as_array_mut() {
+        for tool in platform_tools {
+            array.push(json!({
+                "name": tool.name,
+                "description": format!(
+                    "{} (platform {}, effect {}). Runs through the Cadence platform gate; the caller is this connection.",
+                    tool.description, tool.platform, tool.effect
+                ),
+                "inputSchema": {"type":"object","properties":{},"additionalProperties":true}
+            }));
+        }
+    }
+    tools
+}
+
+/// One reviewed adapter tool exposed to the agent. Only tools the adapter
+/// can execute through `platform_call` are listed; an app-run-only tool is
+/// not offered as a promise this surface cannot keep.
+struct PlatformTool {
+    name: String,
+    platform: String,
+    tool: String,
+    description: String,
+    effect: String,
+}
+
+const STATIC_TOOL_NAMES: [&str; 5] = [
+    "self",
+    "wiki_search",
+    "wiki_read",
+    "issue_show",
+    "app_run_artifact",
+];
+
+/// MCP tool names allow only `[A-Za-z0-9_-]`; a platform slug such as
+/// `smtp` and a tool slug such as `email.send` must survive the join.
+fn mcp_name_part(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn platform_tools(state_dir: &Path) -> Vec<PlatformTool> {
+    let Ok(listing) = crate::client::rpc(state_dir, "platform_tools", json!({})) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for platform in listing["platforms"].as_array().into_iter().flatten() {
+        let (Some(platform_name), Some(tools)) =
+            (platform["platform"].as_str(), platform["tools"].as_array())
+        else {
+            continue;
+        };
+        for tool in tools {
+            if tool["direct"].as_bool() != Some(true) {
+                continue;
+            }
+            let Some(tool_name) = tool["tool"].as_str() else {
+                continue;
+            };
+            let name = format!(
+                "{}_{}",
+                mcp_name_part(platform_name),
+                mcp_name_part(tool_name)
+            );
+            if STATIC_TOOL_NAMES.contains(&name.as_str()) {
+                continue;
+            }
+            out.push(PlatformTool {
+                name,
+                platform: platform_name.to_string(),
+                tool: tool_name.to_string(),
+                description: tool["label"]
+                    .as_str()
+                    .unwrap_or("Cadence platform tool")
+                    .to_string(),
+                effect: tool["effect"].as_str().unwrap_or("unknown").to_string(),
+            });
+        }
+    }
+    out
 }
 
 fn fields<'a>(
@@ -147,7 +239,22 @@ fn positional(value: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
-fn command_args(name: &str, args: &Value) -> Result<Vec<String>> {
+fn command_args(name: &str, args: &Value, platform_tools: &[PlatformTool]) -> Result<Vec<String>> {
+    if let Some(tool) = platform_tools.iter().find(|tool| tool.name == name) {
+        if !args.is_object() {
+            return Err(Error::rejected("tool arguments must be an object"));
+        }
+        return Ok(vec![
+            "platform".into(),
+            "call".into(),
+            tool.tool.clone(),
+            "--platform".into(),
+            tool.platform.clone(),
+            "--input".into(),
+            serde_json::to_string(args)
+                .map_err(|_| Error::internal("platform tool arguments do not serialize"))?,
+        ]);
+    }
     match name {
         "self" => {
             fields(args, &[], &[])?;
@@ -346,7 +453,43 @@ mod tests {
                 json!({"artifact_id":"--help","message":"m1","token":"t1"}),
             ),
         ] {
-            assert!(command_args(name, &args).is_err(), "{name}: {args}");
+            assert!(command_args(name, &args, &[]).is_err(), "{name}: {args}");
         }
+    }
+
+    #[test]
+    fn a_generated_platform_tool_marshals_its_arguments() {
+        let generated = [PlatformTool {
+            name: "agenticos_post_draft".into(),
+            platform: "agenticos".into(),
+            tool: "post_draft".into(),
+            description: "Draft".into(),
+            effect: "draft".into(),
+        }];
+        let argv = command_args(
+            "agenticos_post_draft",
+            &json!({"connection_id":"conn-1"}),
+            &generated,
+        )
+        .unwrap();
+        let expected: Vec<String> = [
+            "platform",
+            "call",
+            "post_draft",
+            "--platform",
+            "agenticos",
+            "--input",
+            "{\"connection_id\":\"conn-1\"}",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(argv, expected);
+        // The static five stay reachable, and the listing grows by one.
+        assert_eq!(tools(&[]).as_array().unwrap().len(), 5);
+        assert_eq!(tools(&generated).as_array().unwrap().len(), 6);
+        // A dotted tool slug survives as an MCP-safe name.
+        assert_eq!(mcp_name_part("email.send"), "email_send");
+        assert_eq!(mcp_name_part("account-images"), "account-images");
     }
 }

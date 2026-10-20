@@ -184,6 +184,12 @@ impl PlatformAdapter for AccountMediaAdapter {
         &self.table
     }
 
+    /// `execute` refuses: this adapter only runs under a frozen app-run
+    /// image capability, never a plain `platform_call`.
+    fn direct_call(&self, _tool: &str) -> bool {
+        false
+    }
+
     fn connection_descriptor(&self) -> Option<ProviderDescriptor> {
         Some(ProviderDescriptor {
             schema: 1,

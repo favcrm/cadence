@@ -138,6 +138,32 @@ pub(crate) enum PlatformAction {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// List every registered adapter's reviewed tool table (local only).
+    Tools {
+        /// Machine output: the RPC answer unchanged.
+        #[arg(long)]
+        json: bool,
+        /// Resolve each platform's stored default account for this project.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Call one reviewed platform tool through the daemon's gate.
+    Call {
+        /// The tool name as `platform tools` prints it.
+        tool: String,
+        /// Inline JSON, `@file`, a file path, or `-` for stdin.
+        #[arg(long)]
+        input: String,
+        /// Disambiguate when several adapters declare the same tool.
+        #[arg(long)]
+        platform: Option<String>,
+        /// Platform account; omitted: the project default.
+        #[arg(long)]
+        account: Option<String>,
+        /// Project whose default account applies.
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// List the per-project default platform accounts.
     Defaults,
     /// Set `project`'s default account for `platform`.
@@ -300,6 +326,50 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
             }
             print_json(&rpc("platform_check", params)?);
         }
+        PlatformAction::Tools { json, project } => {
+            let mut params = json!({});
+            if let Some(project) = project {
+                params["project"] = json!(project);
+            }
+            let tools = rpc("platform_tools", params)?;
+            if *json {
+                print_json(&tools);
+            } else {
+                print_platform_tools(&tools);
+            }
+        }
+        PlatformAction::Call {
+            tool,
+            input,
+            platform,
+            account,
+            project,
+        } => {
+            let mut listing = json!({});
+            if let Some(project) = project {
+                listing["project"] = json!(project);
+            }
+            let tools = rpc("platform_tools", listing)?;
+            let (owner, direct) = resolve_platform_tool(&tools, tool, platform.as_deref())?;
+            if !direct {
+                return Err(Error::rejected(format!(
+                    "'{tool}' on '{owner}' runs only inside an app run; it has no plain \
+                     platform call"
+                )));
+            }
+            let mut params = json!({
+                "platform": owner,
+                "tool": tool,
+                "input": parse_platform_input(input)?,
+            });
+            if let Some(account) = account {
+                params["account"] = json!(account);
+            }
+            if let Some(project) = project {
+                params["project"] = json!(project);
+            }
+            print_json(&rpc("platform_call", params)?);
+        }
         PlatformAction::Defaults => {
             print_json(&rpc("platform_defaults", json!({}))?);
         }
@@ -350,4 +420,197 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
 
 pub(super) fn run(state_dir: PathBuf, action: PlatformAction) -> Result<i32> {
     run_platform(&state_dir, &action)
+}
+
+/// One tool's owning platform from the listing. `platform` narrows it;
+/// without it the tool must have exactly one owner.
+fn resolve_platform_tool(
+    listing: &Value,
+    tool: &str,
+    platform: Option<&str>,
+) -> Result<(String, bool)> {
+    let mut owners = Vec::new();
+    for entry in listing["platforms"].as_array().into_iter().flatten() {
+        let Some(name) = entry["platform"].as_str() else {
+            continue;
+        };
+        if platform.is_some_and(|wanted| wanted != name) {
+            continue;
+        }
+        if let Some(decl) = entry["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|decl| decl["tool"].as_str() == Some(tool))
+        {
+            owners.push((name.to_string(), decl["direct"].as_bool().unwrap_or(false)));
+        }
+    }
+    match owners.len() {
+        1 => Ok(owners.remove(0)),
+        0 if platform.is_some() => Err(Error::rejected(format!(
+            "platform '{}' does not declare tool '{tool}'",
+            platform.unwrap_or_default()
+        ))),
+        0 => Err(Error::rejected(format!(
+            "no registered platform declares tool '{tool}' — run `cadence platform tools`"
+        ))),
+        _ => {
+            let names: Vec<&str> = owners.iter().map(|(name, _)| name.as_str()).collect();
+            Err(Error::rejected(format!(
+                "'{tool}' is declared by {} platforms ({}) — pass --platform",
+                owners.len(),
+                names.join(", ")
+            )))
+        }
+    }
+}
+
+/// Bounded JSON object for one platform call: inline, `@file`, a path, or
+/// `-` for stdin. The daemon enforces its own bound as well.
+fn parse_platform_input(raw: &str) -> Result<Value> {
+    use std::io::Read;
+    const MAX_INPUT_BYTES: usize = 64 * 1024;
+    let bytes = if raw == "-" {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .lock()
+            .take((MAX_INPUT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| Error::invalid("platform_call", format!("cannot read input: {e}")))?;
+        bytes
+    } else if raw.trim_start().starts_with('{') {
+        raw.as_bytes().to_vec()
+    } else {
+        let path = Path::new(raw.strip_prefix('@').unwrap_or(raw));
+        let mut bytes = Vec::new();
+        let file = std::fs::File::open(path).map_err(|e| {
+            Error::invalid(
+                "platform_call",
+                format!("cannot read {}: {e}", path.display()),
+            )
+        })?;
+        file.take((MAX_INPUT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| {
+                Error::invalid(
+                    "platform_call",
+                    format!("cannot read {}: {e}", path.display()),
+                )
+            })?;
+        bytes
+    };
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(Error::invalid(
+            "platform_call",
+            "platform call input exceeds 64KiB",
+        ));
+    }
+    let input: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| Error::invalid("platform_call", "input must be a JSON object"))?;
+    if !input.is_object() {
+        return Err(Error::invalid(
+            "platform_call",
+            "input must be a JSON object",
+        ));
+    }
+    Ok(input)
+}
+
+fn print_platform_tools(listing: &Value) {
+    println!(
+        "{:<16} {:<24} {:<7} {:<6} {:<16}",
+        "PLATFORM", "TOOL", "EFFECT", "DIRECT", "ACCOUNT"
+    );
+    for entry in listing["platforms"].as_array().into_iter().flatten() {
+        let platform = entry["platform"].as_str().unwrap_or_default();
+        let account = entry["default_account"].as_str().unwrap_or("-");
+        for decl in entry["tools"].as_array().into_iter().flatten() {
+            println!(
+                "{:<16} {:<24} {:<7} {:<6} {:<16}",
+                platform,
+                decl["tool"].as_str().unwrap_or_default(),
+                decl["effect"].as_str().unwrap_or_default(),
+                if decl["direct"].as_bool() == Some(true) {
+                    "yes"
+                } else {
+                    "app"
+                },
+                account,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listing() -> Value {
+        json!({"platforms": [
+            {"platform": "account-images", "manifest_version": "cadence-account-images@1",
+             "default_account": null,
+             "tools": [{"tool":"generate_image","effect":"draft","scopes":["cli.write"],"label":null,"direct":false}]},
+            {"platform": "agenticos", "manifest_version": "agenticos-manifest@1",
+             "default_account": "work",
+             "tools": [{"tool":"post_draft","effect":"draft","scopes":["draft"],"label":"Draft","direct":true},
+                       {"tool":"publish_post","effect":"send","scopes":["publish"],"label":null,"direct":true}]},
+            {"platform": "local", "manifest_version": null, "default_account": null,
+             "tools": [{"tool":"publish","effect":"send","scopes":["publish"],"label":null,"direct":true}]}
+        ]})
+    }
+
+    #[test]
+    fn a_tool_resolves_to_its_one_owner() {
+        let (owner, direct) = resolve_platform_tool(&listing(), "post_draft", None).unwrap();
+        assert_eq!(owner, "agenticos");
+        assert!(direct);
+    }
+
+    #[test]
+    fn an_ambiguous_or_unknown_tool_refuses() {
+        let mut list = listing();
+        // A second adapter claiming the same tool name is ambiguity.
+        list["platforms"][2]["tools"][0]["tool"] = json!("post_draft");
+        let error =
+            resolve_platform_tool(&list, "post_draft", None).expect_err("two owners must refuse");
+        assert!(error.to_string().contains("agenticos, local"), "{error}");
+        // The explicit platform narrows it.
+        assert_eq!(
+            resolve_platform_tool(&list, "post_draft", Some("local"))
+                .unwrap()
+                .0,
+            "local"
+        );
+        let error =
+            resolve_platform_tool(&list, "nope", None).expect_err("an unknown tool must refuse");
+        assert!(error.to_string().contains("platform tools"), "{error}");
+        let error = resolve_platform_tool(&listing(), "generate_image", Some("agenticos"))
+            .expect_err("a platform that lacks the tool must refuse");
+        assert!(error.to_string().contains("does not declare"), "{error}");
+    }
+
+    #[test]
+    fn an_app_run_only_tool_is_listed_but_not_direct() {
+        let (owner, direct) = resolve_platform_tool(&listing(), "generate_image", None).unwrap();
+        assert_eq!(owner, "account-images");
+        assert!(!direct, "account images run only inside an app run");
+    }
+
+    #[test]
+    fn platform_input_accepts_inline_and_at_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            parse_platform_input(r#"{"prompt":"a cat"}"#).unwrap(),
+            json!({"prompt":"a cat"})
+        );
+        let file = dir.path().join("input.json");
+        std::fs::write(&file, r#"{"prompt":"a dog"}"#).unwrap();
+        assert_eq!(
+            parse_platform_input(&format!("@{}", file.display())).unwrap(),
+            json!({"prompt":"a dog"})
+        );
+        assert!(parse_platform_input(r#"[1]"#).is_err());
+        assert!(parse_platform_input("{oops").is_err());
+    }
 }

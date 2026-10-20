@@ -1693,6 +1693,12 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
 }
 
 impl PlatformAdapter for AgenticosExternalAdapter {
+    /// `execute` refuses: every tool here needs a scoped app-run
+    /// capability, never a plain `platform_call`.
+    fn direct_call(&self, _tool: &str) -> bool {
+        false
+    }
+
     fn quote_reference_app_capability(
         &self,
         credential: &[u8],

@@ -3268,6 +3268,7 @@ impl Shared {
             "platform_check" => self.rpc_platform_check(params, peer_pid),
             "platform_defaults" => self.rpc_platform_defaults(params),
             "platform_default_set" => self.rpc_platform_default_set(params, peer_pid),
+            "platform_tools" => self.rpc_platform_tools(params),
             "platform_call" => self.rpc_platform_call(params, peer_pid),
             "platform_effects" => self.rpc_platform_effects(params, peer_pid),
             "platform_effect_close" => self.rpc_platform_effect_close(params, peer_pid),
