@@ -1513,7 +1513,7 @@ fn write_file_no_follow(root: &Path, path: &str, bytes: &[u8], mode: u32) -> std
             fd,
             tmp.as_ptr(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            mode as libc::mode_t,
+            mode as libc::c_uint,
         )
     };
     if file < 0 {
