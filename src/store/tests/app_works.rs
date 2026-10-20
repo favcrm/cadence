@@ -108,6 +108,14 @@ fn cad1649_cas_replay_changes_and_query() {
         .unwrap();
     assert_eq!(changed["reviewStatus"], "changes_requested");
     assert_eq!(changed["exportState"], "blocked");
+    let changes = store
+        .app_works_query("ctx-1", &json!({"review": "changes_requested"}))
+        .unwrap();
+    assert_eq!(changes.as_array().unwrap().len(), 1);
+    let pending = store
+        .app_works_query("ctx-1", &json!({"review": "pending"}))
+        .unwrap();
+    assert!(pending.as_array().unwrap().is_empty());
     assert!(store
         .app_works_export("ctx-1", "retention", 2, "html", "bob", None)
         .is_err());
@@ -181,6 +189,65 @@ fn cad1649_invalid_content_refuses_without_write() {
     }))
     .is_err());
     assert!(store.app_works_get("ctx-1", "x").is_err());
+}
+
+#[test]
+fn cad1649_content_cannot_shadow_metadata() {
+    let (_dir, store) = open();
+    let forged = json!({
+        "blocks": [{"type": "h2", "text": "Retention"}],
+        "title": "forged",
+        "author": "mallory",
+        "reviewStatus": "approved",
+        "reviewedRevision": 1,
+        "exportState": "ready",
+    });
+    assert!(WorksDraft::parse(&json!({
+        "kind": "doc",
+        "title": "Retention",
+        "content": forged.clone(),
+        "tags": [],
+    }))
+    .is_err());
+    assert!(WorksDraft::parse(&json!({
+        "kind": "doc",
+        "title": "Retention",
+        "content": {"blocks": [{"type": "h2", "text": "Retention", "author": "mallory"}]},
+        "tags": [],
+    }))
+    .is_err());
+    store
+        .app_works_create("ctx-1", &doc("Retention"), "alice", "create-1", None)
+        .unwrap();
+    assert!(store
+        .app_works_patch(
+            "ctx-1",
+            "retention",
+            1,
+            &[json!({"type": "set_content", "content": forged})],
+            "alice",
+            "patch-1",
+            None,
+        )
+        .is_err());
+    let fetched = store.app_works_get("ctx-1", "retention").unwrap();
+    assert_eq!(fetched["title"], "Retention");
+    assert_eq!(fetched["author"], "alice");
+    assert_eq!(fetched["reviewStatus"], "none");
+    assert_eq!(fetched["exportState"], "blocked");
+}
+
+#[test]
+fn cad1649_long_title_is_addressable() {
+    let (_dir, store) = open();
+    let title = "A".repeat(240);
+    let created = store
+        .app_works_create("ctx-1", &doc(&title), "alice", "create-1", None)
+        .unwrap();
+    let id = created["id"].as_str().unwrap();
+    assert!(id.len() <= 48, "{id}");
+    let fetched = store.app_works_get("ctx-1", id).unwrap();
+    assert_eq!(fetched["title"], title);
 }
 
 #[test]

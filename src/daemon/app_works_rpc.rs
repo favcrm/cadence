@@ -19,7 +19,34 @@ fn required_i64(params: &Value, key: &str) -> Result<i64> {
         .get(key)
         .and_then(Value::as_i64)
         .filter(|value| *value > 0)
-        .ok_or_else(|| Error::rejected(format!("{key} must be a positive integer")))
+        .ok_or_else(|| Error::invalid("invalid", format!("{key} must be a positive integer")))
+}
+
+/// The durable principal for a verified board human, scoped by the
+/// proof's company, or the local operator. `verified_owner_human`
+/// returns an object; reading it as a string would collapse every human
+/// into `operator`, losing authorship and the self-review fence.
+fn works_actor(human: Option<&Value>) -> Result<String> {
+    let Some(human) = human else {
+        return Ok("operator".to_string());
+    };
+    let company = human
+        .get("company")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::invalid("invalid", "works identity is malformed"))?;
+    let sub = human
+        .get("sub")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::invalid("invalid", "works identity is malformed"))?;
+    Ok(format!("human:{company}:{sub}"))
+}
+
+fn required_str<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::invalid("invalid", format!("{key} is required")))
 }
 
 impl Shared {
@@ -95,14 +122,15 @@ impl Shared {
                 "revision",
                 "format",
             ],
-            _ => return Err(Error::rejected("unknown Works content method")),
+            _ => return Err(Error::invalid("invalid", "unknown Works content method")),
         };
         let fields = params
             .as_object()
-            .ok_or_else(|| Error::rejected("Works content payload must be an object"))?;
+            .ok_or_else(|| Error::invalid("invalid", "Works content payload must be an object"))?;
         for key in fields.keys() {
             if !allowed.contains(&key.as_str()) {
-                return Err(Error::rejected(
+                return Err(Error::invalid(
+                    "invalid",
                     "Works content payload has unsupported fields",
                 ));
             }
@@ -110,11 +138,7 @@ impl Shared {
         let install = required_str(params, "install_id")?.to_string();
         let context = required_str(params, "context_id")?.to_string();
         let human = self.verified_owner_human(params)?;
-        let actor = human
-            .as_ref()
-            .and_then(Value::as_str)
-            .unwrap_or("operator")
-            .to_string();
+        let actor = works_actor(human.as_ref())?;
         let result = self.screen_service_scope(&install, &context, true, None, || {
             let records = RecordStore::open(&self.state_dir, &install)?;
             match method {
@@ -131,7 +155,7 @@ impl Shared {
                     let operations = params
                         .get("operations")
                         .and_then(Value::as_array)
-                        .ok_or_else(|| Error::rejected("operations must be an array"))?;
+                        .ok_or_else(|| Error::invalid("invalid", "operations must be an array"))?;
                     let key = required_str(params, "idempotency_key")?;
                     records.app_works_patch(
                         &context,
@@ -168,10 +192,13 @@ impl Shared {
                 "app_works_export" => {
                     let id = required_str(params, "id")?;
                     let revision = required_i64(params, "revision")?;
-                    let format = required_str(params, "format")?;
+                    let format = params
+                        .get("format")
+                        .and_then(Value::as_str)
+                        .unwrap_or("html");
                     records.app_works_export(&context, id, revision, format, &actor, None)
                 }
-                _ => Err(Error::rejected("unknown Works content method")),
+                _ => Err(Error::invalid("invalid", "unknown Works content method")),
             }
         })?;
         Ok(result)
@@ -181,9 +208,25 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "test-seam")]
     use crate::test_seam::{scoped, Asserted};
     use serde_json::json;
 
+    #[test]
+    fn cad1649_actor_derives_from_verified_human() {
+        let alice = json!({"sub": "u-alice", "company": "acme"});
+        let bob = json!({"sub": "u-bob", "company": "acme"});
+        assert_eq!(works_actor(Some(&alice)).unwrap(), "human:acme:u-alice");
+        assert_eq!(works_actor(Some(&bob)).unwrap(), "human:acme:u-bob");
+        assert_ne!(
+            works_actor(Some(&alice)).unwrap(),
+            works_actor(Some(&bob)).unwrap()
+        );
+        assert_eq!(works_actor(None).unwrap(), "operator");
+        assert!(works_actor(Some(&json!({"sub": "u"}))).is_err());
+    }
+
+    #[cfg(feature = "test-seam")]
     fn pid() -> u32 {
         std::process::id()
     }
@@ -191,6 +234,7 @@ mod tests {
     /// CAD-1649 ticket-authored acceptance: the real operator connection
     /// refuses a registered agent and an unproven caller before the
     /// installation/context is read or any record file is opened.
+    #[cfg(feature = "test-seam")]
     #[test]
     fn cad1649_works_rpc_refuses_agent_and_unproven() {
         let dir = tempfile::Builder::new()
