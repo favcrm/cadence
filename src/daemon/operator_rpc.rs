@@ -693,23 +693,32 @@ impl Shared {
         let company = config.company.clone();
         let mut audit = None;
         let mut opened_row = None;
-        let result = self.operator_auth().open_public_bound_with_intent(
-            identity.user(),
-            (parsed.jti(), parsed.exp()),
-            user_agent,
-            realm,
-            now,
-            |row| {
-                let a = open_audit(&company, &request, row);
-                self.prepare_mutation(&a, std::slice::from_ref(row))?;
-                audit = Some(a);
-                opened_row = Some(row.clone());
-                if let Some(session) = prior_consent_session.as_deref() {
-                    self.store.push_consents_revoke_session(session)?;
-                }
-                Ok(())
-            },
-        );
+        let deadline = crate::board_identity::accepted_until(parsed.exp());
+        let result = {
+            // The verifier's clock predates the JWKS fetch. Sample again
+            // while the Auth lock is held so the store cannot be reached
+            // after the deadline with a stale time (a concurrent check may
+            // already have pruned the jti).
+            let mut auth = self.operator_auth();
+            let opened_at = self.operator_now();
+            auth.open_public_bound_with_intent(
+                identity.user(),
+                (parsed.jti(), deadline),
+                user_agent,
+                realm,
+                opened_at,
+                |row| {
+                    let a = open_audit(&company, &request, row);
+                    self.prepare_mutation(&a, std::slice::from_ref(row))?;
+                    audit = Some(a);
+                    opened_row = Some(row.clone());
+                    if let Some(session) = prior_consent_session.as_deref() {
+                        self.store.push_consents_revoke_session(session)?;
+                    }
+                    Ok(())
+                },
+            )
+        };
         let opened = match result {
             Ok(opened) => opened,
             Err(e) => {
