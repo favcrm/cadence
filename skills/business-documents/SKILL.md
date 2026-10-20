@@ -78,6 +78,30 @@ Use this when the reusable standard is guidelines and reference assets rather th
 3. Run `cadence template show NAME --version N --out NEW_DIRECTORY`. The directory must not already exist. It is created mode 0700, with files inside created mode 0644. Read `guidelines.md` and the reference files. `template.json` is the exact returned version, digest and spec. Do not execute packed bytes or fetch remote assets.
 4. Stop there for approval. `template approve` needs an operator connection and the exact `content_sha256`. Do not run `template sample`, `document create` or `document export` on an authoring pack; those commands are the financial renderer and they refuse it. The user prints or exports PDF.
 
+## 6c. Template packs: check and render-sheet (AOS-310)
+
+The hosted converter exposes two fixed API actions over a company **template
+pack** (`manifest.json`, `profile.json`, `rules.md`, `sample/`, and the
+company's own DOCX or XLSX). They are not agent tools and have no local CLI
+verb; a worker or app calls the hosted document routes, and adding a customer
+with a different template needs no code change.
+
+- `check` compares an output with its template and the profile's declarative
+  rules — structure, formats, required cells, row tables, declared totals — and
+  returns `report.json` and `report.txt`. A finding is a *successful* run whose
+  report says `passed: false`; only malformed input is refused. Source-pack
+  findings count in the verdict, and `pagination.block_fits_one_page` measures
+  the printed block from the PDF, so "one page wide and one page tall" is
+  asserted rather than eyeballed.
+- `render-sheet` fills an XLSX template: it writes only the profile's
+  `input_ranges` and `row_tables`, keeps every other label, formula,
+  validation, style, print area and page setup, and refuses a workbook whose
+  parts or OOXML extensions openpyxl cannot preserve.
+
+Both XLSX paths need LibreOffice **Calc**, not only Writer. The canonical
+helpers are `scripts/pack.py`, `scripts/check.py` and `scripts/render_sheet.py`;
+the hosted converter image carries byte-identical copies, so edit here.
+
 ## 7. Validate and hand off
 
 Before handoff, verify:
