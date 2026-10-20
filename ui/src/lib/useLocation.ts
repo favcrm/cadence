@@ -11,11 +11,12 @@ import { browserStoredProjectView } from "./urlState";
  */
 
 const listeners = new Set<() => void>();
-let navigationGuard: (() => boolean) | null = null;
+let navigationGuard: ((href: string) => boolean) | null = null;
+let lastHref = typeof location === "undefined" ? "" : location.pathname + location.search;
 
 /** Host-owned synchronous leave check. An older owner cannot remove its replacement. */
-export function registerNavigationGuard(guard: () => boolean): () => void {
-  const owned = () => guard();
+export function registerNavigationGuard(guard: (href: string) => boolean): () => void {
+  const owned = (href: string) => guard(href);
   navigationGuard = owned;
   return () => { if (navigationGuard === owned) navigationGuard = null; };
 }
@@ -41,7 +42,14 @@ function subscribe(listener: () => void): () => void {
 }
 
 function onPopState(): void {
+  if (navigationGuard && !navigationGuard(snapshot())) {
+    // popstate cannot be cancelled. Restore the mounted route without
+    // notifying React; the user can retry Back after the leave check clears.
+    history.pushState(null, "", lastHref);
+    return;
+  }
   applyLegacyRedirect();
+  lastHref = snapshot();
   notify();
 }
 
@@ -49,9 +57,10 @@ const snapshot = () => location.pathname + location.search;
 
 export function navigate(href: string, opts: { replace?: boolean } = {}): void {
   if (href === snapshot()) return;
-  if (navigationGuard && !navigationGuard()) return;
+  if (navigationGuard && !navigationGuard(href)) return;
   if (opts.replace) history.replaceState(null, "", href);
   else history.pushState(null, "", href);
+  lastHref = snapshot();
   notify();
 }
 

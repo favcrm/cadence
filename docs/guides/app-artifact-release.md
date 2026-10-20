@@ -88,3 +88,37 @@ Inspect the effect and resolve its exact digest with `cadence app effect resolve
 App effect receipts are a separate schema-1 `app_artifact` contract. Their `record.kind` is `app_artifact_effect`, and `needs_you` is explicit in the effect envelope. Unlike the legacy connected-platform v1 pending-effect record, app receipts intentionally retain decision and outcome after reconciliation is closed. Legacy pending-effect schemas and publication behavior are unchanged. Operator history retains the original reviewed receipt after context or binding revocation. Retirement of a reviewer does not rewrite a historical accepted review; current installation and release authority still apply.
 
 These checks are broker authority and storage integrity guarantees. They do not claim filesystem confinement against a process sharing the daemon's operating-system user.
+
+## Native recordings
+
+A verified `needs.recording` declaration selects the host recording workspace,
+not an app-owned screen or writer/reviewer workflow. Its distinct audio and text
+capability slots use reviewed connections. Recording-only bundles need neither
+workflow files nor PM projects. Keep the shared assistant and selected context;
+the recording controls do not expose provider credentials or accept provider URLs.
+
+Before starting, the operator accepts cumulative speech and text ceilings in
+USD micro-units. The browser captures mono PCM, resamples to 16 kHz when needed,
+and sends ordered eight-second WAV batches plus the final partial batch. Pause
+and resume preserve the sample timeline. Stop flushes capture before finishing;
+leaving waits for saved audio or requires explicit discard. No transcript is
+invented when the microphone or speech connection is unavailable.
+
+The broker retains each batch until transcription is confirmed and retains
+private billing receipts. Unknown paid outcomes reuse their original operation
+key; a fresh authentication or price refusal does not prove an older request
+was uncharged. Only an authoritative released outcome frees that reservation.
+Current operator, installation approval and binding authority are rechecked
+before publishing results. A paid response that loses authority is retained
+privately without replacing the transcript, minutes or manual title.
+
+Minutes cite confirmed numbered source batches. Empty speech produces no
+invented minutes; unknown follow-up owners and dates stay null. A manual title
+is not overwritten. Recording and consolidation do not create tasks, messages
+or outward app effects.
+
+Roll out the published speech contract and operator-reviewed pricing/connection
+first, then the supporting Native host, then the matching app artifact. Do not
+activate an unpriced draft registry row or claim paid-path acceptance from a
+synthetic preview. The app CI validator must pin an actually promoted supporting
+host binary and its verified artifact hashes.

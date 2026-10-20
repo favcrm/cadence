@@ -26,6 +26,7 @@ import { useLocale } from "../../lib/locale";
 import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
 import type { ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
 import RunLauncher from "./RunLauncher";
+import RecordingWorkspace from "./recording/RecordingWorkspace";
 import type { MediaChatAttach } from "../workspace-apps/screen/screenLifecycle";
 import { parseRoutePatch, type RoutePatch } from "../workspace-apps/screen/screenRoute";
 import type { HostCommand } from "../workspace-apps/screen/screenServices";
@@ -795,7 +796,8 @@ export default function AppShell({
   // that screen (presentation only; authorization stays in the
   // session/epoch/digest gates). Social keeps its legacy outlet.
   const hasPortableScreen = installation !== null && screenTag(installation) !== null;
-  const screenOutlet = isSocial || hasPortableScreen;
+  const hasRecording = Boolean(installation?.recording && installation.executable);
+  const screenOutlet = isSocial || hasPortableScreen || hasRecording;
   const cachedPreviewSnapshot = !receiptReady && viewer.operator === true && loadError === null
     ? readWorkspaceAppSnapshot(installId)
     : null;
@@ -844,7 +846,7 @@ export default function AppShell({
   // Host execution and priced capability calls keep their existing approval UI.
   // `scope.contextId` is exactly the context the run binds to; "" is the
   // install scope itself.
-  const launchableWorkflows = verified && contextAdoptionReady && !isSocialContent(installation)
+  const launchableWorkflows = verified && contextAdoptionReady && !isSocialContent(installation) && !hasRecording
     ? (installation?.workflows ?? []).filter((flow) =>
       (flow.execution ?? "agent") !== "host" && (flow.capability_slots ?? []).length === 0)
     : [];
@@ -1157,6 +1159,18 @@ export default function AppShell({
                   exampleKey={previewKey}
                   installationKind={installation.name}
                 />
+              ) : hasRecording && installation.recording ? (
+                contextAdoptionReady && canLaunch && scope.contextId && activeContexts.some((context) => context.id === scope.contextId) ? (
+                  <RecordingWorkspace
+                    key={`${installation.digest}:${scope.contextId}:${activeContexts.find((context) => context.id === scope.contextId)?.digest}`}
+                    installId={installId}
+                    contextId={scope.contextId}
+                    title={title}
+                    declaration={installation.recording}
+                  />
+                ) : <p className="card px-4 py-5 text-secondary text-ink-400" role="status">
+                  {t("The operator must verify this app before opening its recordings.")}
+                </p>
               ) : isSocial && children && contextAdoptionReady ? (
                 // Social keeps its legacy native workspace (and its
                 // `?screen=native` back door). Every other app mounts the
@@ -1223,7 +1237,8 @@ export function chatBinding({ installId, wanted, known, activeIds }: {
 /** The apps the shell sets up a General context for: an approved,
  *  executable, installed screen it can mount (Social Content owns its own). */
 function wantsGeneralContext(installation: Installation | null): installation is Installation {
-  return installation !== null && installation.removed == null && !isSocialContent(installation) && screenTag(installation) !== null;
+  return installation !== null && installation.removed == null && !isSocialContent(installation) &&
+    (screenTag(installation) !== null || installation.executable && installation.recording != null);
 }
 
 function contextLabel(contexts: AppContext[], contextId: string): string | null {

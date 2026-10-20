@@ -34,6 +34,8 @@ use image::{fit_to_custody, image_checked, image_prompt, ImageFault, ASSET_LIMIT
 pub const PLATFORM: &str = "agenticos_external";
 pub const MANIFEST_PIN: &str = "agenticos-external-provider-tools@3";
 pub(crate) const TEXT_MANIFEST_PIN: &str = "agenticos-external-provider-tools@4";
+pub(crate) const RECORDING_MANIFEST_PIN: &str = "agenticos-external-provider-tools@6";
+const AUDIO_TOOL: &str = "transcribe_audio";
 /// CAD-1096: the generic workspace-visible source tool (AOS-140). The raw
 /// provider slug stays hidden from workspaces (AOS-103).
 const POSTS_TOOL: &str = "read_instagram_posts";
@@ -105,6 +107,23 @@ const TABLE_JSON_V4: &str = r#"{
     ]
 }"#;
 
+const TABLE_JSON_V6: &str = r#"{
+  "platform":"agenticos_external",
+  "manifest_version":"agenticos-external-provider-tools@6",
+  "tools":[
+    {"tool":"read_instagram_posts","effect":"read","scopes":["provider.read"],"label":"Read public Instagram profile posts"},
+    {"tool":"generate_image","effect":"draft","scopes":["provider.draft"],"label":"Generate an image draft"},
+    {"tool":"generate_text","effect":"draft","scopes":["provider.draft"],"label":"Generate a text draft"},
+    {"tool":"documents_skill","effect":"read","scopes":["provider.read"],"label":"Load the business-documents skill"},
+    {"tool":"documents_intake","effect":"draft","scopes":["provider.draft"],"label":"Extract an admitted document source"},
+    {"tool":"documents_render","effect":"draft","scopes":["provider.draft"],"label":"Render an approved document draft"},
+    {"tool":"documents_upload_source","effect":"draft","scopes":["provider.draft"],"label":"Admit a document source file"},
+    {"tool":"get_document_job","effect":"read","scopes":["provider.read"],"label":"Read a document job's status"},
+    {"tool":"documents_download","effect":"read","scopes":["provider.read"],"label":"Download a produced document artifact"},
+    {"tool":"transcribe_audio","effect":"draft","scopes":["provider.draft"],"label":"Transcribe authorized audio"}
+  ]
+}"#;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Transport {
     ExternalBearer,
@@ -148,10 +167,10 @@ impl AgenticosExternalAdapter {
             .http_status_as_error(false)
             .max_redirects(0)
             .build();
-        let table_json = if deployment_pin == Some(TEXT_MANIFEST_PIN) {
-            TABLE_JSON_V4
-        } else {
-            TABLE_JSON
+        let table_json = match deployment_pin {
+            Some(RECORDING_MANIFEST_PIN) => TABLE_JSON_V6,
+            Some(TEXT_MANIFEST_PIN) => TABLE_JSON_V4,
+            _ => TABLE_JSON,
         };
         let table = ToolTable::from_json(&serde_json::from_str(table_json).expect("table JSON"))
             .expect("reviewed tool table");
@@ -194,7 +213,7 @@ impl AgenticosExternalAdapter {
         self.transport == Transport::AccountImage
             || matches!(
                 self.deployment_pin.as_deref(),
-                Some(MANIFEST_PIN | TEXT_MANIFEST_PIN)
+                Some(MANIFEST_PIN | TEXT_MANIFEST_PIN | RECORDING_MANIFEST_PIN)
             )
     }
 
@@ -375,7 +394,20 @@ impl AgenticosExternalAdapter {
                 Some("generate_text"),
                 Some("draft"),
                 Some(TEXT_TOOL),
-            ) if self.deployment_pin.as_deref() == Some(TEXT_MANIFEST_PIN) => TEXT_TOOL,
+            ) if matches!(
+                self.deployment_pin.as_deref(),
+                Some(TEXT_MANIFEST_PIN | RECORDING_MANIFEST_PIN)
+            ) =>
+            {
+                TEXT_TOOL
+            }
+            (
+                Some("audio.transcribe"),
+                Some(1),
+                Some("transcribe_audio"),
+                Some("draft"),
+                Some(AUDIO_TOOL),
+            ) if self.deployment_pin.as_deref() == Some(RECORDING_MANIFEST_PIN) => AUDIO_TOOL,
             _ => return Err("provider quote names an unreviewed action".into()),
         };
         let token = self.lease_token(credential, config)?;
@@ -403,6 +435,12 @@ impl AgenticosExternalAdapter {
                 })
                 .unwrap_or("unavailable");
             return Err(format!("AgenticOS provider quote refused: {code}"));
+        }
+        if tool == AUDIO_TOOL
+            && (money_micros(&envelope["data"]["price"]) != Some(0)
+                || money_micros(&envelope["data"]["unitPrice"]).is_none_or(|price| price == 0))
+        {
+            return Err("AgenticOS speech requires a per-second price with zero base".into());
         }
         quote_view(
             tool,
@@ -663,8 +701,13 @@ impl AgenticosExternalAdapter {
     ) -> std::result::Result<AppCapabilityOutput, AppCapabilityError> {
         const UNCERTAIN: &str =
             "AgenticOS text generation outcome is uncertain; retry reuses the same key";
-        if self.deployment_pin.as_deref() != Some(TEXT_MANIFEST_PIN) {
-            return Err(AppCapabilityError::Refused("AgenticOS text generation is unavailable without the reviewed manifest v4 deployment".into()));
+        if !matches!(
+            self.deployment_pin.as_deref(),
+            Some(TEXT_MANIFEST_PIN | RECORDING_MANIFEST_PIN)
+        ) {
+            return Err(AppCapabilityError::Refused(
+                "AgenticOS text generation is unavailable without the reviewed manifest v4 (or newer) deployment".into(),
+            ));
         }
         validate_text_authority(authority).map_err(AppCapabilityError::Refused)?;
         let body = validate_text_input(input).map_err(AppCapabilityError::Refused)?;
@@ -711,6 +754,211 @@ impl AgenticosExternalAdapter {
         // a missing acknowledgment is uncertain, never free.
         let result = validate_text_result(&envelope["data"]["result"])
             .map_err(AppCapabilityError::Uncertain)?;
+        Ok(AppCapabilityOutput {
+            result,
+            asset: None,
+        })
+    }
+
+    fn call_recording(
+        &self,
+        credential: &[u8],
+        authority: &Value,
+        input: &Value,
+        key: &str,
+    ) -> std::result::Result<AppCapabilityOutput, AppCapabilityError> {
+        let refuse = |text: &str| AppCapabilityError::Refused(text.into());
+        let uncertain = || {
+            AppCapabilityError::Uncertain(
+            "The recording service outcome is uncertain; the same paid operation must be reconciled".into(),
+        )
+        };
+        let config = &authority["binding"]["config"];
+        let mapping = &config["mapping"];
+        let tool = match mapping["capability"].as_str() {
+            Some("audio.transcribe") => AUDIO_TOOL,
+            Some("text.generate") => TEXT_TOOL,
+            _ => return Err(refuse("recording capability is unsupported")),
+        };
+        let expected_capability = if tool == AUDIO_TOOL {
+            "audio.transcribe"
+        } else {
+            "text.generate"
+        };
+        if self.deployment_pin.as_deref() != Some(RECORDING_MANIFEST_PIN)
+            || authority["schema"] != 1
+            || authority["source"]["kind"] != "recording"
+            || config["provider"] != PLATFORM
+            || config["install_id"] != authority["install_id"]
+            || config["connection_id"].as_str().is_none_or(str::is_empty)
+            || config["account"].as_str().is_none_or(str::is_empty)
+            || mapping["capability"] != expected_capability
+            || mapping["version"] != 1
+            || mapping["resource_kind"] != "connection_account"
+            || mapping["effect"] != "draft"
+            || mapping["tool"] != tool
+            || mapping["action"] != tool
+            || !valid_caller_key(key)
+            || authority["call_id"] != key
+            || authority["source"]["job_key"] != key
+            || authority["input_digest"] != crate::store::app_runs::material_digest(input)
+        {
+            return Err(refuse(
+                "recording service authority is invalid or its reviewed deployment is unavailable",
+            ));
+        }
+        for (field, label) in [
+            (authority["install_id"].as_str(), "installation ID"),
+            (authority["context_id"].as_str(), "context ID"),
+            (authority["source"]["recording_id"].as_str(), "recording ID"),
+        ] {
+            crate::proto::identifier(
+                field.ok_or_else(|| refuse("recording scope is missing"))?,
+                label,
+            )
+            .map_err(|_| refuse("recording scope is invalid"))?;
+        }
+        if !config["context_id"].is_null() && config["context_id"] != authority["context_id"] {
+            return Err(refuse(
+                "recording context differs from its capability binding",
+            ));
+        }
+        let fields = input
+            .as_object()
+            .ok_or_else(|| refuse("recording service input must be an object"))?;
+        if tool == AUDIO_TOOL {
+            let audio = input["audio"]
+                .as_object()
+                .ok_or_else(|| refuse("recording audio is missing"))?;
+            if fields.len() != 1
+                || audio.len() != 2
+                || input["audio"]["format"] != "wav"
+                || input["audio"]["data"]
+                    .as_str()
+                    .is_none_or(|data| data.is_empty() || data.len() > 341_392)
+            {
+                return Err(refuse("recording audio exceeds its supported contract"));
+            }
+        } else {
+            let messages = input["messages"]
+                .as_array()
+                .ok_or_else(|| refuse("recording transcript messages are missing"))?;
+            if fields
+                .keys()
+                .any(|field| !matches!(field.as_str(), "messages" | "maxOutputTokens"))
+                || messages.is_empty()
+                || messages.len() > 100
+                || input["maxOutputTokens"]
+                    .as_u64()
+                    .is_none_or(|tokens| !(1..=8192).contains(&tokens))
+                || messages.iter().any(|message| {
+                    message.as_object().is_none_or(|message| message.len() != 2)
+                        || !matches!(message["role"].as_str(), Some("system" | "user"))
+                        || message["content"]
+                            .as_str()
+                            .is_none_or(|text| text.len() > 64_000)
+                })
+            {
+                return Err(refuse(
+                    "recording transcript exceeds the funded text contract",
+                ));
+            }
+        }
+        let ceiling = frozen_charge_ceiling(authority).map_err(AppCapabilityError::Refused)?;
+        let token = self
+            .lease_token(credential, config)
+            .map_err(AppCapabilityError::Refused)?;
+        #[derive(serde::Serialize)]
+        struct Call<'a> {
+            slug: &'a str,
+            body: &'a Value,
+            max_charge_minor: u64,
+        }
+        let mut response = authorized(self.http.post(format!("{}{CALL_PATH}", self.base)), token)
+            .config()
+            .timeout_global(Some(Duration::from_secs(95)))
+            .build()
+            .header("idempotency-key", key)
+            .send_json(Call {
+                slug: tool,
+                body: input,
+                max_charge_minor: ceiling,
+            })
+            .map_err(|_| uncertain())?;
+        let status = response.status().as_u16();
+        let not_charged = response
+            .headers()
+            .get("x-agenticos-call-outcome")
+            .is_some_and(|value| value == "not-charged");
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(RESPONSE_CAP)
+            .read_to_vec()
+            .map_err(|_| uncertain())?;
+        let mut envelope: Value = serde_json::from_slice(&bytes).map_err(|_| uncertain())?;
+        if status != 200 || envelope["ok"] != true {
+            let code = refused_code(&envelope);
+            // Only the gateway's durable terminal proof can clear a hold from
+            // an earlier lost response. A new auth/price refusal cannot.
+            if not_charged && matches!(status, 402 | 409 | 502) {
+                return Err(AppCapabilityError::Released(format!(
+                    "Recording operation released: {code}"
+                )));
+            }
+            if matches!(status, 400 | 401 | 402 | 403 | 404 | 413 | 415 | 422)
+                || status == 409
+                    && matches!(
+                        code.as_str(),
+                        "quote_required"
+                            | "price_changed"
+                            | "price_limit"
+                            | "disabled"
+                            | "unpriced"
+                            | "unpriced_default"
+                            | "not_configured"
+                            | "invalid_request"
+                    )
+            {
+                return Err(AppCapabilityError::Refused(format!(
+                    "Recording service refused: {code}"
+                )));
+            }
+            return Err(uncertain());
+        }
+        let charge = money_micros(&envelope["data"]["price"])
+            .filter(|charge| *charge > 0 && *charge <= ceiling)
+            .ok_or_else(uncertain)?;
+        let mut result = if tool == TEXT_TOOL {
+            validate_text_result(&envelope["data"]["result"]).map_err(|_| uncertain())?
+        } else {
+            let result = &envelope["data"]["result"];
+            if result.as_object().is_none_or(|result| result.len() != 6)
+                || result["text"]
+                    .as_str()
+                    .is_none_or(|text| text.len() > 65_536 || text.as_bytes().contains(&0))
+                || result["model"] != "assemblyai/universal-3-6-pro"
+                || result["provider"] != "openrouter"
+                || result["durationMs"]
+                    .as_u64()
+                    .is_none_or(|duration| duration == 0 || duration > 8000)
+                || result["binding"]["entryId"] != "assemblyai/universal-3-6-pro"
+                || result["binding"]["publishedVersion"]
+                    .as_u64()
+                    .is_none_or(|version| version == 0)
+                || result["binding"]["rateVersion"]
+                    .as_str()
+                    .is_none_or(str::is_empty)
+                || result["usage"]["seconds"]
+                    .as_f64()
+                    .is_none_or(|seconds| !seconds.is_finite() || !(0.0..=9.0).contains(&seconds))
+            {
+                return Err(uncertain());
+            }
+            envelope["data"]["result"].take()
+        };
+        // This is the verified customer receipt, never private upstream USD.
+        result["_charge_minor"] = json!(charge);
         Ok(AppCapabilityOutput {
             result,
             asset: None,
@@ -1752,6 +2000,11 @@ impl PlatformAdapter for AgenticosExternalAdapter {
             Some("media.generate") => {
                 self.call_image(credential, authority, input, idempotency_key)
             }
+            Some("audio.transcribe" | "text.generate")
+                if authority["source"]["kind"] == "recording" =>
+            {
+                self.call_recording(credential, authority, input, idempotency_key)
+            }
             Some("text.generate") => self.call_text(credential, authority, input, idempotency_key),
             _ => Err(AppCapabilityError::Refused(
                 "AgenticOS capability slot has no reviewed execution adapter".into(),
@@ -1876,7 +2129,10 @@ impl PlatformAdapter for AgenticosExternalAdapter {
                 },
             ],
         };
-        if self.deployment_pin.as_deref() == Some(TEXT_MANIFEST_PIN) {
+        if matches!(
+            self.deployment_pin.as_deref(),
+            Some(TEXT_MANIFEST_PIN | RECORDING_MANIFEST_PIN)
+        ) {
             descriptor.capabilities.push(CapabilityDescriptor {
                 id: "text.generate".into(),
                 version: 1,
@@ -1904,6 +2160,29 @@ impl PlatformAdapter for AgenticosExternalAdapter {
             descriptor.revision = "agenticos-hosted-connections/2".into();
             descriptor.enrollment_shapes.clear();
             descriptor.builtin_accounts = vec!["hosted".into()];
+        }
+        if self.deployment_pin.as_deref() == Some(RECORDING_MANIFEST_PIN) {
+            descriptor.revision = format!("{}-recording/1", descriptor.revision);
+            descriptor.capabilities.push(CapabilityDescriptor {
+                id: "audio.transcribe".into(),
+                version: 1,
+                tools: vec![AUDIO_TOOL.into()],
+                scopes: vec!["provider.draft".into()],
+                effect: "draft".into(),
+                semantics: CapabilitySemantics::PreviewOnly,
+            });
+            descriptor.action_mappings.push(BoundActionMapping {
+                capability: "audio.transcribe".into(),
+                version: 1,
+                action: "transcribe_audio".into(),
+                resource_kind: "connection_account".into(),
+                tool: AUDIO_TOOL.into(),
+                scopes: vec!["provider.draft".into()],
+                effect: "draft".into(),
+                semantics: CapabilitySemantics::PreviewOnly,
+                input_contract: "audio.transcribe.input@1".into(),
+                output_contract: "audio.transcribe.result@1".into(),
+            });
         }
         Some(descriptor)
     }

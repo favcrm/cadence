@@ -63,20 +63,23 @@ impl std::error::Error for AppArtifactError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCapabilityError {
     Refused(String),
+    /// The same provider operation has an authoritative terminal zero-charge
+    /// outcome, including when an earlier transport response was lost.
+    Released(String),
     Uncertain(String),
 }
 
 impl AppCapabilityError {
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Refused(_) => "refused",
+            Self::Refused(_) | Self::Released(_) => "refused",
             Self::Uncertain(_) => "uncertain",
         }
     }
 
     pub fn reason(&self) -> &str {
         match self {
-            Self::Refused(reason) | Self::Uncertain(reason) => reason,
+            Self::Refused(reason) | Self::Released(reason) | Self::Uncertain(reason) => reason,
         }
     }
 }
@@ -300,7 +303,7 @@ pub trait PlatformAdapter: Send + Sync {
     ) -> std::result::Result<super::AppCapabilityOutput, ImageFailure> {
         self.execute_app_capability_outcome(credential, authority, input, idempotency_key)
             .map_err(|error| match error {
-                AppCapabilityError::Refused(m) => {
+                AppCapabilityError::Refused(m) | AppCapabilityError::Released(m) => {
                     ImageFailure::refused(ImageReason::SubmitRefused, m)
                 }
                 AppCapabilityError::Uncertain(m) => {

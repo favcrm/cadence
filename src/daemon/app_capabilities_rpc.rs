@@ -25,7 +25,7 @@ impl CapabilityQuoteRequest {
         self
     }
 
-    pub(super) fn fetch(self) -> Result<crate::platform::AppCapabilityQuote> {
+    pub(super) fn fetch(&self) -> Result<crate::platform::AppCapabilityQuote> {
         let quote = if self.reference_edit {
             self.adapter
                 .quote_reference_app_capability(&self.credential, &self.binding)
@@ -38,6 +38,24 @@ impl CapabilityQuoteRequest {
             return Err(Error::rejected("bound capability price quote is invalid"));
         }
         Ok(quote)
+    }
+
+    pub(super) fn execute(
+        &self,
+        authority: &Value,
+        input: &Value,
+        key: &str,
+    ) -> std::result::Result<
+        crate::platform::AppCapabilityOutput,
+        crate::platform::AppCapabilityError,
+    > {
+        if authority["binding"] != self.binding {
+            return Err(crate::platform::AppCapabilityError::Refused(
+                "prepared capability binding differs from its frozen authority".into(),
+            ));
+        }
+        self.adapter
+            .execute_app_capability_outcome(&self.credential, authority, input, key)
     }
 }
 
@@ -419,7 +437,7 @@ impl Shared {
                 error.reason().chars().take(250).collect::<String>()
             } else { "Provider failure details were withheld because they matched credential custody.".into() };
             match error {
-                crate::platform::AppCapabilityError::Refused(_) => Error::provider(reason),
+                crate::platform::AppCapabilityError::Refused(_) | crate::platform::AppCapabilityError::Released(_) => Error::provider(reason),
                 crate::platform::AppCapabilityError::Uncertain(_) => Error::unknown(reason),
             }
         })?;

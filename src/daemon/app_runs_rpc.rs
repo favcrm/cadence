@@ -79,10 +79,9 @@ fn freeze_content_inputs(
     (effective, origins)
 }
 
-/// The installed bundle checks an installation approval rests on: a
-/// typed manifest with no legacy untyped connection slots and at least one
-/// supported local workflow. Shared by the explicit operator approval and
-/// the consent an operator install or update records (CAD-1119).
+/// Installation approval requires a typed manifest, no legacy untyped
+/// connections, and a supported workflow or verified native recorder.
+/// Shared by explicit approval and operator install/update consent.
 pub(super) fn local_execution_contract(
     files: &BTreeMap<String, String>,
 ) -> Result<crate::issue::app::Manifest> {
@@ -103,9 +102,9 @@ pub(super) fn local_execution_contract(
             count += 1;
         }
     }
-    if count == 0 {
+    if count == 0 && manifest.recording.is_none() {
         return Err(Error::rejected(
-            "installed app has no supported local workflow",
+            "installed app has no supported local workflow or native recording declaration",
         ));
     }
     Ok(manifest)
@@ -1470,7 +1469,8 @@ impl Shared {
                                 &message,
                             )?;
                             return Err(match error {
-                                crate::platform::AppCapabilityError::Refused(_) => {
+                                crate::platform::AppCapabilityError::Refused(_)
+                                | crate::platform::AppCapabilityError::Released(_) => {
                                     Error::provider(message)
                                 }
                                 crate::platform::AppCapabilityError::Uncertain(_) => {

@@ -40,6 +40,14 @@ export interface Installation {
    * daemon that omits the field means) keeps the worker path.
    */
   workflows?: { name: string; source_digest?: string; label?: string | null; capability_slots?: string[]; distinct?: string[]; execution?: "agent" | "host"; inputs: { name: string; ask?: string | null; optional?: boolean; kind?: string | null; example?: string | null; default?: string | null; context_default?: boolean }[] }[];
+  /**
+   * Declarative native recording capability from the verified manifest's
+   * `needs.recording` (CAD-1477). Present only when the reviewed manifest
+   * declares it; the shell then opens the trusted host recorder instead of
+   * the generic RunLauncher. Slots name the declared transcription and
+   * consolidation capability slots.
+   */
+  recording?: { transcription: string; consolidation: string; label?: string; title?: string } | null;
 }
 /** A write acknowledgement, distinct from a later installation read. */
 export type CommittedInstallation = Installation & { committed: true };
