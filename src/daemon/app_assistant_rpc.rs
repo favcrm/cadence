@@ -197,6 +197,18 @@ impl Shared {
                 required_str(params, "operation_id")?,
                 &scoped.context,
             )?;
+            // CAD-1636: a WhatsApp operation's stored output reads back only
+            // in that conversation's own subject chat; a row without a
+            // stored conversation id refuses.
+            if op["action_id"]
+                .as_str()
+                .is_none_or(|action| action.starts_with("whatsapp."))
+            {
+                let conversation = op["_input"]["conversation_id"].as_str().ok_or_else(|| {
+                    Error::rejected("WhatsApp assistant operation names no conversation")
+                })?;
+                scoped.require_whatsapp(conversation)?;
+            }
             let op = normalize_interrupted_operation(&records, &scoped.context, op)?;
             return Ok(json!({"operation":op}));
         }
