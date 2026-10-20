@@ -772,9 +772,10 @@ pub(crate) enum Commands {
     Dispatch {
         /// Issue id (e.g. CAD-55).
         issue: String,
-        /// Worker agent to dispatch to.
+        /// Worker agent to dispatch to. Required outside the master;
+        /// the master derives the ticket's owner.
         #[arg(long)]
-        to: String,
+        to: Option<String>,
         /// Kickoff note the worker reads (`read <note> — …`) [default:
         /// the ticket's own issue.md].
         #[arg(long)]

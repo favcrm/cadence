@@ -1356,6 +1356,9 @@ pub(super) fn run(
                 "hosted dispatch does not open a job. Nothing was sent.",
             ));
         }
+        let Some(to) = to.as_deref() else {
+            return Err(Error::usage("hosted dispatch requires --to <alias>"));
+        };
         return local_agent::dispatch(&target, issue, to);
     }
     if let Commands::Issue {

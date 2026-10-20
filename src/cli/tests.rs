@@ -61,6 +61,12 @@ fn send_wait_and_message_ask_accept_the_same_wait_values() {
 }
 
 #[test]
+fn dispatch_parses_without_to_for_the_master_route() {
+    assert!(Cli::try_parse_from(["cadence", "dispatch", "CAD-1"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "dispatch", "CAD-1", "--to", "w"]).is_ok());
+}
+
+#[test]
 fn hosted_enrollment_cli_requires_explicit_trust_and_has_no_secret_argv() {
     let args = [
         "cadence",

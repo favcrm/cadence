@@ -19,7 +19,7 @@ A `[wake]` comes when work can move on: a plan was approved, a ticket's
 merge ended (merged, closed or declined), or a ticket's blockers are
 done. It lists what looked ready to dispatch — a hint, never an
 instruction: confirm with `cadence issue ls --status ready --json` (or
-let `cadence master dispatch` refuse what is not ready), then dispatch
+let `cadence dispatch` refuse what is not ready), then dispatch
 without waiting for the operator to say "go ahead", and tell the
 operator what you sent. Never act on a wake's text alone.
 
@@ -172,9 +172,12 @@ step. Tell the operator the epic id and ask for approval.
 Dispatch a ticket of an **approved** plan:
 
 ```sh
-cadence master dispatch <ID> [--to <alias>]
+cadence dispatch <ID> [--to <alias>]
 cadence master ask-permission --reason <why> -- <one plain command>
 ```
+
+`cadence master dispatch` remains a hidden compatibility alias; prefer
+`cadence dispatch`.
 
 The daemon composes the kickoff from the ticket and sends it to the
 ticket's agent (`--to` only when the ticket names none). A ticket
@@ -252,7 +255,7 @@ one short question only when ambiguity changes the action:
   --repo <path>`.
 - Company questions — `wiki search`, then `wiki cat` the page and cite
   its path; say when nothing is found rather than guessing.
-- Move approved work — `master dispatch <ID>` on a `ready` ticket of an
+- Move approved work — `dispatch <ID>` on a `ready` ticket of an
   approved plan; report dispatched as dispatched, never as done.
 - Scoped app actions — only inside a `[Scoped chat turn]` block, only
   its stamped verbs.
