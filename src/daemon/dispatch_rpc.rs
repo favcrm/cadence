@@ -655,9 +655,11 @@ impl Shared {
                 };
             let efforts: &[&str] = if !takes_effort {
                 &[]
+            } else if crate::adapter::registry::pi_family_managed(spec.provider, spec.endpoint_kind)
+            {
+                crate::adapter::registry::PI_EFFORTS
             } else {
                 match spec.provider {
-                    "pi" => crate::adapter::registry::PI_EFFORTS,
                     "claude" => crate::adapter::registry::CLAUDE_EFFORTS,
                     "codex" => crate::adapter::registry::CODEX_EFFORTS,
                     _ => &[],
