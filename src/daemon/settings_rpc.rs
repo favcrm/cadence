@@ -672,10 +672,12 @@ fn role_resolution(
 ) -> Result<Value> {
     let mut rows = serde_json::Map::new();
     // The launch providers a claim or an inherit can land on: the pi
-    // policy when a Pi extension provider exists, plus every native
+    // policy when a Pi-family provider exists, plus every native
     // provider id.
     let wants_pi = has_pi_provider(config)
-        || !claim.is_empty() && launch_provider_of(config, claim).as_deref() == Some("pi");
+        || !claim.is_empty()
+            && launch_provider_of(config, claim)
+                .is_some_and(|provider| crate::adapter::registry::pi_family_provider(&provider));
     if wants_pi {
         // Pi defaults are runtime-role shaped; the final resolver also
         // supplies the platform fallback when no policy default is set.
@@ -688,9 +690,14 @@ fn role_resolution(
         if provider == "pi" {
             continue;
         }
+        let policy = if crate::adapter::registry::pi_family_provider(provider) {
+            pi
+        } else {
+            None
+        };
         rows.insert(
             provider.to_string(),
-            provider_role_row(defaults, provider, role, None)?,
+            provider_role_row(defaults, provider, role, policy)?,
         );
     }
     Ok(json!({
@@ -724,7 +731,7 @@ fn provider_role_row(
         Some((crate::model_defaults::ModelSelector::Model { model }, source)) => {
             Ok(json!({"model": model, "source": source}))
         }
-        _ if provider == "pi" => {
+        _ if crate::adapter::registry::pi_family_provider(provider) => {
             let runtime_role = if role == "master" { "master" } else { "worker" };
             let configured = pi.and_then(|policy| {
                 if runtime_role == "master" {

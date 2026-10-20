@@ -947,11 +947,12 @@ fn require_split_launch_path(
     if agent_uid.is_none() {
         return Ok(());
     }
-    // `pty` and `fake` carry their own split proofs. `managed`+`pi` is the
-    // single managed seam under construction (CAD-1012) — it constructs so
-    // `open` can reach the fail-closed protected-prereq gate, never to launch.
-    let allowed =
-        matches!(endpoint_kind, "pty" | "fake") || (endpoint_kind == "managed" && provider == "pi");
+    // `pty` and `fake` carry their own split proofs. A `managed` row of the
+    // Pi family (pi, omp) is the single managed seam under construction
+    // (CAD-1012) — it constructs so `open` can reach the fail-closed
+    // protected-prereq gate, never to launch.
+    let allowed = matches!(endpoint_kind, "pty" | "fake")
+        || crate::adapter::registry::pi_family_managed(provider, endpoint_kind);
     if !allowed {
         return Err(crate::error::Error::rejected(
             "This endpoint does not implement protected agent-UID launch; refusing operator-UID fallback",
@@ -966,10 +967,10 @@ mod split_launch_tests {
     use crate::store::Agent;
     #[test]
     fn actual_adapter_entrypoint_refuses_every_uncovered_provider_and_master() {
-        // managed/pi is the one constructed seam — it is covered separately
-        // below: build succeeds so `open` can reach the fail-closed
-        // protected-prereq gate, but no launch can occur. Every other
-        // provider/endpoint still refuses at construction.
+        // A managed Pi-family row is the one constructed seam — it is
+        // covered separately below: build succeeds so `open` can reach the
+        // fail-closed protected-prereq gate, but no launch can occur. Every
+        // other provider/endpoint still refuses at construction.
         for (provider, endpoint) in [
             ("claude", "managed"),
             ("codex", "managed"),
@@ -1030,61 +1031,70 @@ mod split_launch_tests {
             }
         }
     }
-    /// managed+pi constructs under split so `open` reaches the protected
-    /// gate — but `open` itself must fail closed on the unavailable external
-    /// prerequisites. Construction is not launch authority.
+    /// A managed Pi-family row constructs under split so `open` reaches the
+    /// protected gate — but `open` itself must fail closed on the
+    /// unavailable external prerequisites. Construction is not launch
+    /// authority.
     #[test]
-    fn managed_pi_constructs_but_open_fails_closed_on_prereqs() {
-        let agent = Agent {
-            alias: "fixture-worker".into(),
-            uid: "agt-fixture-worker".into(),
-            provider: "pi".into(),
-            endpoint_kind: "managed".into(),
-            role: "worker".into(),
-            team_role: None,
-            cwd: "/tmp".into(),
-            sandbox: "".into(),
-            instructions: None,
-            thread_id: None,
-            session_id: None,
-            model: None,
-            effort: None,
-            pid: None,
-            pid_start: None,
-            endpoint: None,
-            params: Some(serde_json::json!({"model":"devin/swe-2-high"})),
-            model_selection: None,
-            quota: None,
-            generation: None,
-            state: "registered".into(),
-            enabled: true,
-            error: None,
-            created: 0.0,
-            updated: 0.0,
-        };
-        let hooks = AdapterHooks {
-            on_event: Box::new(|_, _| {}),
-            on_request: Box::new(|_| {}),
-        };
-        let adapter = build(
-            &agent,
-            hooks,
-            std::path::Path::new("/nonexistent/fixture.log"),
-            &ProviderEnv::refusing_providers(),
-            Some(21001),
-        )
-        .unwrap_or_else(|e| panic!("managed/pi constructs under split: {e}"));
-        // open() must fail closed — the protected prerequisites are absent.
-        let e = match adapter.open(&agent) {
-            Err(e) => e,
-            Ok(_) => panic!("open succeeded with the prerequisites unavailable"),
-        };
-        assert!(e.to_string().contains("UNKNOWN"), "{e}");
+    fn managed_pi_family_constructs_but_open_fails_closed_on_prereqs() {
+        for provider in ["pi", "omp"] {
+            let agent = Agent {
+                alias: "fixture-worker".into(),
+                uid: "agt-fixture-worker".into(),
+                provider: provider.into(),
+                endpoint_kind: "managed".into(),
+                role: "worker".into(),
+                team_role: None,
+                cwd: "/tmp".into(),
+                sandbox: "".into(),
+                instructions: None,
+                thread_id: None,
+                session_id: None,
+                model: None,
+                effort: None,
+                pid: None,
+                pid_start: None,
+                endpoint: None,
+                params: Some(serde_json::json!({"model":"devin/swe-2-high"})),
+                model_selection: None,
+                quota: None,
+                generation: None,
+                state: "registered".into(),
+                enabled: true,
+                error: None,
+                created: 0.0,
+                updated: 0.0,
+            };
+            let hooks = AdapterHooks {
+                on_event: Box::new(|_, _| {}),
+                on_request: Box::new(|_| {}),
+            };
+            let adapter = build(
+                &agent,
+                hooks,
+                std::path::Path::new("/nonexistent/fixture.log"),
+                &ProviderEnv::refusing_providers(),
+                Some(21001),
+            )
+            .unwrap_or_else(|e| panic!("managed/{provider} constructs under split: {e}"));
+            // open() must fail closed — the protected prerequisites are absent.
+            let e = match adapter.open(&agent) {
+                Err(e) => e,
+                Ok(_) => panic!("{provider}: open succeeded with the prerequisites unavailable"),
+            };
+            assert!(e.to_string().contains("UNKNOWN"), "{provider}: {e}");
+        }
     }
     #[test]
     fn split_managed_and_remote_paths_refuse_before_constructors() {
-        // pi/managed constructs; every other managed/remote path refuses.
-        assert!(require_split_launch_path(Some(21001), "pi", "managed").is_ok());
+        // The managed Pi family constructs; every other managed/remote
+        // path refuses.
+        for provider in ["pi", "omp"] {
+            assert!(
+                require_split_launch_path(Some(21001), provider, "managed").is_ok(),
+                "{provider}/managed"
+            );
+        }
         for (provider, endpoint) in [
             ("claude", "managed"),
             ("codex", "managed"),
@@ -1093,6 +1103,9 @@ mod split_launch_tests {
             ("pi", "managed-ws"),
             ("pi", "cloud"),
             ("pi", "unknown"),
+            ("omp", "managed-ws"),
+            ("omp", "cloud"),
+            ("omp", "unknown"),
         ] {
             assert!(
                 require_split_launch_path(Some(21001), provider, endpoint).is_err(),

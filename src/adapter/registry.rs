@@ -1704,11 +1704,15 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
             }
         }
     }
-    if provider == "pi" {
+    if pi_family_managed(provider, kind) {
         if let Some(v) = params.get("model") {
             match v.as_str() {
                 Some(model) if !model.trim().is_empty() => {}
-                _ => return Err(Error::rejected("pi model must be a non-empty string")),
+                _ => {
+                    return Err(Error::rejected(format!(
+                        "{provider} model must be a non-empty string"
+                    )))
+                }
             }
         }
         if let Some(v) = params.get("effort") {
@@ -1716,7 +1720,7 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
                 Some(level) => pi_effort(level)?,
                 None => {
                     return Err(Error::rejected(format!(
-                        "pi effort must be a string, one of: {}",
+                        "{provider} effort must be a string, one of: {}",
                         PI_EFFORTS.join(", ")
                     )))
                 }
