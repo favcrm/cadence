@@ -1114,6 +1114,38 @@ fn acquire_write_lock(within: Duration) -> Option<MutexGuard<'static, ()>> {
     }
 }
 
+/// Whether this request takes the board's one writer. Every method
+/// `handle` treats as a write is serialized — `PUT` included, because the
+/// wiki serves PUT writes — except the device sign-in exchange (CAD-777:
+/// its handlers call the issuer, and its own state is separately locked).
+fn serialized_write(method: &Method, url: &str) -> bool {
+    matches!(
+        method,
+        Method::Post | Method::Patch | Method::Delete | Method::Put
+    ) && !matches!(
+        url.split('?').next().unwrap_or(""),
+        "/api/session/device/code" | "/api/session/device/poll"
+    )
+}
+
+/// Run one write under [`WRITE_LOCK`]. The guard is dropped only after
+/// `handle` returns, so no write can dispatch without it. `Some(request)`
+/// means the writer stayed busy for `within`: the request is unanswered
+/// and the caller refuses it (CAD-1658).
+fn run_serialized_write(
+    request: Request,
+    state_dir: &Path,
+    pm_dir: &Path,
+    opts: &ServeOpts,
+    within: Duration,
+) -> Option<Request> {
+    let Some(_guard) = acquire_write_lock(within) else {
+        return Some(request);
+    };
+    handle(request, state_dir, pm_dir, opts);
+    None
+}
+
 /// The board's writer is still busy: transient, like a daemon `busy`
 /// refusal (`busy_response`), so the client retries instead of failing.
 fn board_busy_response() -> HttpResp {
@@ -2736,22 +2768,15 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
             // unrelated board write. Safe: their only shared state is
             // the pending map under its own mutex, and the daemon
             // serializes the mint itself.
-            let is_write = matches!(
-                request.method(),
-                Method::Post | Method::Patch | Method::Delete
-            ) && !matches!(
-                request.url().split('?').next().unwrap_or(""),
-                "/api/session/device/code" | "/api/session/device/poll"
-            );
-            if is_write {
-                let Some(_guard) = acquire_write_lock(WRITE_LOCK_WAIT) else {
+            if serialized_write(request.method(), request.url()) {
+                if let Some(busy) =
+                    run_serialized_write(request, &state_dir, &pm_dir, &opts, WRITE_LOCK_WAIT)
+                {
                     // A writer that never returns must not queue the board
                     // behind it: answer the retryable refusal the client
                     // already renders as busy (CAD-1653).
-                    let _ = request.respond(board_busy_response());
-                    return;
-                };
-                handle(request, &state_dir, &pm_dir, &opts);
+                    let _ = busy.respond(board_busy_response());
+                }
             } else {
                 handle(request, &state_dir, &pm_dir, &opts);
             }
@@ -2982,6 +3007,68 @@ mod write_lock_tests {
                 .iter()
                 .any(|h| h.field.equiv("Retry-After")),
             "a busy board must tell the client when to retry"
+        );
+    }
+
+    #[test]
+    fn every_write_method_is_serialized_including_put() {
+        for method in [Method::Post, Method::Patch, Method::Delete, Method::Put] {
+            assert!(
+                serialized_write(&method, "/api/wiki/items/x/files/y"),
+                "{method:?} writes and must take the one writer"
+            );
+        }
+        for method in [Method::Get, Method::Head] {
+            assert!(
+                !serialized_write(&method, "/api/health"),
+                "{method:?} is a read"
+            );
+        }
+        for path in ["/api/session/device/code", "/api/session/device/poll"] {
+            assert!(
+                !serialized_write(&Method::Post, path),
+                "{path} stays exempt"
+            );
+            assert!(
+                !serialized_write(&Method::Post, &format!("{path}?retry=1")),
+                "a query string does not bypass the exemption"
+            );
+        }
+        assert!(serialized_write(&Method::Post, "/api/session"));
+    }
+
+    #[test]
+    fn a_busy_writer_returns_the_request_without_dispatching() {
+        let state = tempfile::tempdir().expect("state dir");
+        let pm = tempfile::tempdir().expect("pm dir");
+        let request = || -> Request {
+            tiny_http::TestRequest::new()
+                .with_method(Method::Post)
+                .with_path("/api/locale")
+                .into()
+        };
+
+        let held = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let refused = run_serialized_write(
+            request(),
+            state.path(),
+            pm.path(),
+            &ServeOpts::default(),
+            Duration::from_millis(50),
+        );
+        assert!(refused.is_some(), "a held writer must not dispatch");
+        drop(held);
+
+        assert!(
+            run_serialized_write(
+                request(),
+                state.path(),
+                pm.path(),
+                &ServeOpts::default(),
+                Duration::from_millis(50),
+            )
+            .is_none(),
+            "a free writer dispatches and consumes the request"
         );
     }
 
