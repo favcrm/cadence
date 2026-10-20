@@ -1245,7 +1245,12 @@ impl Shared {
             .map_err(|_| Error::rejected("confirmation entropy unavailable"))?;
         let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         // Only the trusted host receives card facts and token. No frame proof.
-        let card = json!({"operation": request.operation, "facts": facts});
+        let mut card = json!({"operation": request.operation, "facts": facts});
+        // CAD-1590: the stop card also shows live counts, outside the
+        // facts the confirmation binds.
+        if request.operation == ScreenOperation::WhatsappBroadcastStop {
+            card["live"] = self.whatsapp_stop_live(&args)?;
+        }
         confirmations.insert(
             token.clone(),
             ScreenServiceConfirmation {

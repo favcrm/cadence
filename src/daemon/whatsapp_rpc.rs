@@ -617,8 +617,9 @@ impl Shared {
         }))
     }
 
-    /// CAD-1590: the SLOT card for `whatsapp.broadcast.stop`: the live
-    /// broadcast and what has already been sent (never recalled).
+    /// CAD-1590: the SLOT card for `whatsapp.broadcast.stop`. Only stable
+    /// fields are bound (they are recomputed at confirm), so a broadcast
+    /// that keeps sending between card and tap can still be stopped.
     pub(super) fn whatsapp_stop_facts(&self, args: &Value) -> Result<Value> {
         let broadcast_id = required_str(args, "broadcast_id")?;
         let shown = self.whatsapp_door()?.broadcast(broadcast_id)?;
@@ -631,10 +632,18 @@ impl Shared {
         Ok(json!({
             "broadcast_id": broadcast_id,
             "name": shown["name"],
-            "status": shown["status"],
+            "template": shown["template"],
             "scheduled_at": shown["scheduledAt"],
-            "delivery_stats": shown["deliveryStats"],
         }))
+    }
+
+    /// CAD-1590: the stop card's live, unbound part — status and delivery
+    /// counts as of drawing, approximate by the time of the tap.
+    pub(super) fn whatsapp_stop_live(&self, args: &Value) -> Result<Value> {
+        let shown = self
+            .whatsapp_door()?
+            .broadcast(required_str(args, "broadcast_id")?)?;
+        Ok(json!({"status": shown["status"], "delivery_stats": shown["deliveryStats"]}))
     }
 
     /// Approval, declaration and live context for one installation. Screen
@@ -1033,5 +1042,53 @@ impl Shared {
             "whatsapp_broadcast_stop" => door.broadcast_stop(broadcast()?, &mint("wbs_")),
             _ => Err(Error::rejected("unknown WhatsApp method")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! CAD-1590 (Spec/security REVISE): the stop card binds only stable
+    //! fields. The confirm step recomputes `whatsapp_stop_facts` and refuses
+    //! on any difference, so a broadcast whose sent count rises between the
+    //! card and the tap must yield identical facts (the stop is accepted),
+    //! while the unbound live part reflects the new count.
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn cad1590_stop_facts_survive_a_rising_sent_count() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let sent = Arc::new(AtomicU64::new(3));
+        let counter = sent.clone();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let now = counter.fetch_add(5, Ordering::SeqCst);
+                let body = json!({"ok": true, "data": {
+                    "contract": door::CONTRACT_V2, "broadcastId": "cmp_live", "name": "Autumn",
+                    "status": "SENDING",
+                    "template": {"templateId": "tpl_1", "name": "promo", "language": "en",
+                        "revision": "2026-10-19T00:00:00.000Z"},
+                    "scheduledAt": "2026-10-20T09:00:00.000Z", "deliveryStats": {"sent": now}}});
+                let _ = request.respond(tiny_http::Response::from_string(body.to_string()));
+            }
+        });
+        let root = tempfile::Builder::new().prefix("c1590s").tempdir().unwrap();
+        let opts = ServeOptions {
+            provider_env: crate::adapter::ProviderEnv::refusing_providers(),
+            hosted_whatsapp: Some(door::HostedWhatsapp::new(&base).unwrap()),
+            ..Default::default()
+        };
+        let shared = Shared::new(root.path(), &opts).unwrap();
+        let args = json!({"broadcast_id": "cmp_live"});
+        let card = shared.whatsapp_stop_facts(&args).unwrap();
+        let live_at_card = shared.whatsapp_stop_live(&args).unwrap();
+        // Sending continues between drawing the card and the tap.
+        let at_tap = shared.whatsapp_stop_facts(&args).unwrap();
+        let live_at_tap = shared.whatsapp_stop_live(&args).unwrap();
+        assert_eq!(card, at_tap, "stop facts must not move while sending");
+        assert!(card.get("delivery_stats").is_none() && card.get("status").is_none());
+        assert_ne!(live_at_card, live_at_tap, "live counts are shown, unbound");
+        assert_eq!(card["template"]["revision"], "2026-10-19T00:00:00.000Z");
     }
 }
