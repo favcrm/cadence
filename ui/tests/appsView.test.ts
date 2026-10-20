@@ -372,7 +372,6 @@ async function main() {
   await React.act(() =>
     renderWithNavigation(
       React.createElement(Apps, {
-        project: "all",
         viewer: { readOnly: true, operator: false },
       }),
     ),

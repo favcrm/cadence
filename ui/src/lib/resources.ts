@@ -147,8 +147,8 @@ export const resources = {
   ),
   /**
    * `GET /api/apps` — every installed app across the projects (CAD-557).
-   * The list is one store; a scoped Apps screen filters client-side so
-   * changing the project scope does not refetch.
+   * One store for the whole list: the Apps home lists every legacy
+   * project app (CAD-1607) and names each card's project.
    */
   apps: cache.resource<AppRow[]>("apps", () => api.apps().then((r) => r.apps), {
     isEmpty: (rows) => rows.length === 0,

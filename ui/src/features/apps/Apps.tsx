@@ -30,7 +30,7 @@ import "../explorer/explorer.css";
  * behind `/apps/<project>/<name>` (unchanged); this screen is the
  * workspace-level home the ticket describes.
  */
-export default function Apps({ project, viewer }: { project: string; viewer: Viewer }) {
+export default function Apps({ viewer }: { viewer: Viewer }) {
   const t = useTranslate();
   const [revision, setRevision] = useState(0);
   const [q, setQ] = useState("");
@@ -68,7 +68,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
   const needs = homeNeeds(overview.data?.needs_me);
   // Only the operator may read the installation list; others keep the legacy link.
   const installs = useInstallations(isOp, revision).list;
-  const projectRows = (projectApps.data ?? []).filter((r) => project === "all" || r.project === project);
+  const projectRows = projectApps.data ?? [];
 
   const byId = useMemo(() => {
     const map = new Map<string, HomeInstallation>();
@@ -383,18 +383,18 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
         />
         {projectApps.data && projectRows.length === 0 && (
           <div className="apps-substate text-label text-ink-500">
-            <p>{t("No project apps installed")}{project === "all" ? "" : ` ${t("in")} ${project}`}.</p>
+            <p>{t("No project apps installed")}.</p>
             <details className="apps-substate-install">
               <summary>{t("Install a project app")}</summary>
               <code className="num text-ink-300">
-                cadence app install &lt;path|git-url&gt; --project {project === "all" ? "<key>" : project}
+                cadence app install &lt;path|git-url&gt; --project &lt;key&gt;
               </code>
             </details>
           </div>
         )}
         <ul className="space-y-2.5">
           {projectRows.map((row, i) => (
-            <AppCard key={`${row.project}/${row.name ?? i}`} row={row} installs={installs} needs={needs} showProject={project === "all"} />
+            <AppCard key={`${row.project}/${row.name ?? i}`} row={row} installs={installs} needs={needs} />
           ))}
         </ul>
       </section>
@@ -477,12 +477,10 @@ function AppCard({
   row,
   installs,
   needs,
-  showProject,
 }: {
   row: AppRow;
   installs: Installation[] | null;
   needs: HomeNeed[];
-  showProject: boolean;
 }) {
   const t = useTranslate();
   const approval = appApprovalChip(row, t);
@@ -506,7 +504,7 @@ function AppCard({
             )}
             <span className={`chip shrink-0 ${approval.cls}`}>{approval.text}</span>
           </div>
-          {showProject && <p className="text-micro text-ink-500 mt-0.5 break-words">{t("Project")}: {row.project}</p>}
+          <p className="text-micro text-ink-500 mt-0.5 break-words">{t("Project")}: {row.project}</p>
           <p className="text-label text-ink-400 mt-0.5 break-words">{appPurpose(row)}</p>
           <p className="text-micro text-ink-500 mt-1" data-summary>
             {row.error ? (
