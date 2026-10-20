@@ -648,6 +648,29 @@ impl Shared {
         Ok(json!({"status": shown["status"], "delivery_stats": shown["deliveryStats"]}))
     }
 
+    /// CAD-1651: the SLOT card for `whatsapp.handoff.release`. Only the
+    /// conversation and its takeover time are bound; the confirm-time
+    /// recompute refuses a takeover that changed since the card was drawn.
+    pub(super) fn whatsapp_release_facts(&self, args: &Value) -> Result<Value> {
+        let conversation_id = required_str(args, "conversation_id")?;
+        let shown = self.whatsapp_door()?.conversation(conversation_id)?;
+        let Some(handoff_at) = shown["handoffAt"].as_str() else {
+            return Err(Error::rejected("this conversation is not taken over"));
+        };
+        Ok(json!({"conversation_id": conversation_id, "handoff_at": handoff_at}))
+    }
+
+    /// CAD-1651: the release card's live, unbound part: who the
+    /// conversation is with.
+    pub(super) fn whatsapp_release_live(&self, args: &Value) -> Result<Value> {
+        let shown = self
+            .whatsapp_door()?
+            .conversation(required_str(args, "conversation_id")?)?;
+        Ok(
+            json!({"contact": {"name": shown["contact"]["name"], "phone": shown["contact"]["phone"]}}),
+        )
+    }
+
     /// Approval, declaration and live context for one installation. Screen
     /// calls use the screen fence, which proves all of this and more.
     pub(super) fn whatsapp_scope<R>(
@@ -733,6 +756,8 @@ impl Shared {
             | "whatsapp_broadcast_estimate"
             | "whatsapp_broadcast_stop" => &["broadcast_id"],
             "whatsapp_broadcast_results" => &["broadcast_id", "cursor", "limit", "status"],
+            // CAD-1651: door v3, takeover.
+            "whatsapp_handoff_set" | "whatsapp_handoff_release" => &["conversation_id"],
             "whatsapp_broadcast_draft" => &[
                 "broadcast_id",
                 "name",
@@ -1046,6 +1071,12 @@ impl Shared {
                 )
             }
             "whatsapp_broadcast_stop" => door.broadcast_stop(broadcast()?, &mint("wbs_")),
+            "whatsapp_handoff_set" => {
+                door.conversation_handoff(required_str(params, "conversation_id")?, true)
+            }
+            "whatsapp_handoff_release" => {
+                door.conversation_handoff(required_str(params, "conversation_id")?, false)
+            }
             _ => Err(Error::rejected("unknown WhatsApp method")),
         }
     }

@@ -14,7 +14,7 @@ function RecordConfirmation({ view, card, onTap, onCancel }: {
     "origin.manage": "Change the daemon-global unsubscribe origin?", "chat.campaign.open": "Open this campaign's assistant?", "chat.campaign.brief": "Send this campaign brief?", "chat.whatsapp.brief": "Ask the assistant to draft this reply?",
     "whatsapp.reply.send": "Send this WhatsApp reply?",
     "whatsapp.template.send": "Send this WhatsApp template?", "whatsapp.broadcast.test.send": "Send one WhatsApp test message?",
-    "whatsapp.broadcast.send": "Approve this WhatsApp broadcast?", "whatsapp.broadcast.stop": "Stop this WhatsApp broadcast?",
+    "whatsapp.broadcast.send": "Approve this WhatsApp broadcast?", "whatsapp.broadcast.stop": "Stop this WhatsApp broadcast?", "whatsapp.handoff.release": "Hand this conversation back to AI?",
   };
   const field = card.input;
   const invalid = field?.choices ? !field.choices.some(c => c.value === input) : field?.field === "to_email" ? !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) : false;

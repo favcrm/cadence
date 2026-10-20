@@ -365,7 +365,7 @@ fn call_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
         WhatsappBroadcastDraft => typed::<WaDraft>(value),
         WhatsappBroadcastTestPrepare => typed::<WaTestPrepare>(value),
         WhatsappBroadcastPrepare => typed::<WaBroadcastPrepare>(value),
-        ChatWhatsappOpen | WhatsappDraftShow | WhatsappDraftDiscard => {
+        ChatWhatsappOpen | WhatsappDraftShow | WhatsappDraftDiscard | WhatsappHandoffSet => {
             typed::<WaConversation>(value)
         }
         ScreenPreviewShow => typed::<PreviewShow>(value),
@@ -408,6 +408,7 @@ fn slot_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
             typed::<WaEffect>(value)
         }
         ScreenOperation::WhatsappBroadcastStop => typed::<WaBroadcast>(value),
+        ScreenOperation::WhatsappHandoffRelease => typed::<WaConversation>(value),
         ScreenOperation::ChatWhatsappBrief => typed::<WaBrief>(value),
         _ => Err(Error::rejected("screen SLOT operation is not implemented")),
     }
@@ -485,6 +486,8 @@ fn native_method(operation: ScreenOperation) -> Result<&'static str> {
         WhatsappBroadcastPrepare => "whatsapp_broadcast_prepare",
         WhatsappBroadcastSend => "whatsapp_broadcast_send",
         WhatsappBroadcastStop => "whatsapp_broadcast_stop",
+        WhatsappHandoffSet => "whatsapp_handoff_set",
+        WhatsappHandoffRelease => "whatsapp_handoff_release",
         _ => {
             return Err(Error::rejected(
                 "screen operation has no implemented executor",
@@ -1040,6 +1043,7 @@ impl Shared {
                 self.whatsapp_broadcast_facts(install, context, args)
             }
             ScreenOperation::WhatsappBroadcastStop => self.whatsapp_stop_facts(args),
+            ScreenOperation::WhatsappHandoffRelease => self.whatsapp_release_facts(args),
             ScreenOperation::ChatWhatsappBrief => self.whatsapp_brief_facts(args),
             ScreenOperation::OriginManage => Ok(json!({"scope": "daemon-global",
                 "unsubscribe_origin": self.store.crm_setting("unsubscribe_origin")?.or_else(|| self.unsubscribe_origin.clone())})),
@@ -1105,6 +1109,15 @@ impl Shared {
                     .ok_or_else(|| Error::rejected("confirmation missing"))?
                     .1;
                 *args = json!({"broadcast_id": facts["broadcast_id"]});
+            }
+            // CAD-1651: the release tap confirms the card's own conversation.
+            (WhatsappHandoffRelease, Confirmation::Tap(tap)) if tap.confirmed => {
+                let facts = &proof
+                    .confirmed
+                    .as_ref()
+                    .ok_or_else(|| Error::rejected("confirmation missing"))?
+                    .1;
+                *args = json!({"conversation_id": facts["conversation_id"]});
             }
             (ChatCampaignBrief, Confirmation::Brief(input))
                 if input.confirmed && args["brief"].as_str() == Some(input.brief.as_str()) => {}
@@ -1295,6 +1308,9 @@ impl Shared {
         // facts the confirmation binds.
         if request.operation == ScreenOperation::WhatsappBroadcastStop {
             card["live"] = self.whatsapp_stop_live(&args)?;
+        }
+        if request.operation == ScreenOperation::WhatsappHandoffRelease {
+            card["live"] = self.whatsapp_release_live(&args)?;
         }
         confirmations.insert(
             token.clone(),

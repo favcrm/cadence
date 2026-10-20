@@ -3253,6 +3253,8 @@ impl Shared {
             "whatsapp_broadcast_prepare" => self.rpc_whatsapp(method, params, peer_pid),
             "whatsapp_broadcast_send" => self.rpc_whatsapp(method, params, peer_pid),
             "whatsapp_broadcast_stop" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_handoff_set" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_handoff_release" => self.rpc_whatsapp(method, params, peer_pid),
             "crm_send_prepare" => self.rpc_crm_send(method, params, peer_pid),
             "crm_send_approve" => self.rpc_crm_send(method, params, peer_pid),
             "crm_send_show" => self.rpc_crm_send(method, params, peer_pid),

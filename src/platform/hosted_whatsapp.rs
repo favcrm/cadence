@@ -32,6 +32,9 @@ pub const CONTRACT: &str = "agenticos.whatsapp-door.v1";
 /// (`packages/contracts/src/whatsapp-door-v2.ts`, AOS-288). Pinned per
 /// verb: a v1 verb never accepts v2 and a v2 verb never accepts v1.
 pub const CONTRACT_V2: &str = "agenticos.whatsapp-door.v2";
+/// CAD-1651: the contract of the takeover verb (AOS-318). Pinned per verb,
+/// like v2: no other verb accepts it and it accepts no other contract.
+pub const CONTRACT_V3: &str = "agenticos.whatsapp-door.v3";
 const PATH: &str = "/v1/runtime/whatsapp";
 const TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_CAP: u64 = 1024 * 1024;
@@ -424,6 +427,10 @@ impl HostedWhatsapp {
         Self::read_pinned(wire, CONTRACT_V2)
     }
 
+    fn read_v3(wire: Wire) -> Result<Value> {
+        Self::read_pinned(wire, CONTRACT_V3)
+    }
+
     /// §3.1 `templates.list`: `status` is `approved` (default) or `all`.
     pub fn templates(&self, status: Option<&str>) -> Result<Value> {
         let mut query = Vec::new();
@@ -633,6 +640,28 @@ impl HostedWhatsapp {
     pub fn broadcast_stop(&self, id: &str, key: &str) -> Result<Value> {
         check_path_id(id, "broadcast id")?;
         Self::read_v2(self.post(&format!("/broadcasts/{id}/stop"), Some(key), &json!({})))
+    }
+
+    /// CAD-1651 takeover: `handoff: true` pauses FavCRM's automatic replies,
+    /// `false` lets them resume. An unknown conversation is the door's 404
+    /// refusal; the answer must name the conversation it applied to.
+    pub fn conversation_handoff(&self, id: &str, handoff: bool) -> Result<Value> {
+        check_conversation_id(id)?;
+        let data = Self::read_v3(self.post(
+            &format!("/conversations/{id}/handoff"),
+            None,
+            &json!({"handoff": handoff}),
+        ))?;
+        if data["conversation_id"].as_str() != Some(id)
+            || data
+                .get("handoff_at")
+                .is_none_or(|at| at.is_null() == handoff)
+        {
+            return Err(Error::rejected(
+                "AgenticOS WhatsApp door answer was not understood (handoff)",
+            ));
+        }
+        Ok(data)
     }
 }
 
