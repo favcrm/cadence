@@ -54,6 +54,10 @@ equal(cdnImage.includes("preview"), true, "blocked Markdown image keeps its alt 
 const localImage = render("![local](/assets/local.png)");
 equal(localImage.includes('src="/assets/local.png"'), true, "same-origin Markdown images keep rendering");
 equal(localImage.includes('href="/assets/local.png"'), true, "a same-origin Markdown image opens full size");
+const linkedImage = render("[![local](/assets/local.png)](https://example.com/details)");
+equal((linkedImage.match(/<a /g) ?? []).length, 1, "a linked image keeps one anchor");
+equal(linkedImage.includes('href="https://example.com/details"'), true, "a linked image keeps its destination");
+equal(linkedImage.includes('class="md-image"'), false, "a linked image gets no nested image anchor");
 const data = render("[x](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)");
 equal(/data:text\/html/i.test(data), false, "a data:text/html link is stripped too");
 

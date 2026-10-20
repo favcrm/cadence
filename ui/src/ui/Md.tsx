@@ -1,5 +1,5 @@
-import { isValidElement, useState, type ReactNode } from "react";
-import Markdown, { defaultUrlTransform } from "react-markdown";
+import { createContext, isValidElement, useContext, useState, type ReactNode } from "react";
+import Markdown, { defaultUrlTransform, type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { citationSpans, isWikiRevisionHref, wikiRevisionHref } from "../features/wiki/citations";
 import { useTranslate } from "../lib/localeText";
@@ -140,6 +140,75 @@ function CodeBlock({ children }: { children?: ReactNode }) {
   );
 }
 
+const InLinkContext = createContext(false);
+const handlerComponents = new WeakMap<object, Components>();
+let noHandlerComponents: Components | null = null;
+
+/** The renderer set is cached per issue handler. Recreating these component
+ *  types on every thread update would make React unmount and reinsert old
+ *  code, links and images, which a live log would announce as new content. */
+function buildComponents(onOpen?: (id: string) => void): Components {
+  return {
+    img: ({ src, alt }) => {
+      const linked = useContext(InLinkContext);
+      const safe = markdownImageSrc(src);
+      if (!safe) return <span>{alt || "Image unavailable"}</span>;
+      const image = <img src={safe} alt={alt ?? ""} loading="lazy" decoding="async" />;
+      return linked ? (
+        image
+      ) : (
+        <a className="md-image" href={safe} target="_blank" rel="noreferrer">
+          {image}
+        </a>
+      );
+    },
+    pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
+    a: ({ href, children }) => {
+      const issueId = href?.startsWith("issue:") ? href.slice(6) : null;
+      const revisionHref = href?.startsWith("wiki-rev:") ? href.slice("wiki-rev:".length) : null;
+      const nested = <InLinkContext.Provider value={true}>{children}</InLinkContext.Provider>;
+      if (revisionHref !== null) {
+        return isWikiRevisionHref(revisionHref) ? (
+          <Link className="lnk" href={revisionHref}>{nested}</Link>
+        ) : (
+          <>{children}</>
+        );
+      }
+      return !href ? (
+        // react-markdown blanked an unsafe target: show text, not an
+        // anchor that would reopen the board in a new tab.
+        <>{children}</>
+      ) : issueId !== null ? (
+        WHOLE_ISSUE_ID.test(issueId) ? (
+          onOpen ? (
+            <button className="lnk num" onClick={() => onOpen(issueId)}>
+              {nested}
+            </button>
+          ) : (
+            <span className="num">{children}</span>
+          )
+        ) : (
+          // A malformed id is shown as text: no button, no anchor.
+          <>{children}</>
+        )
+      ) : (
+        <SafeLink className="lnk" href={href} encoded>
+          {nested}
+        </SafeLink>
+      );
+    },
+  };
+}
+
+function componentsFor(onOpen?: (id: string) => void): Components {
+  if (!onOpen) return (noHandlerComponents ??= buildComponents());
+  const cached = handlerComponents.get(onOpen);
+  if (cached) return cached;
+  const built = buildComponents(onOpen);
+  handlerComponents.set(onOpen, built);
+  return built;
+}
+
 export default function Md({
   text,
   onOpen,
@@ -155,51 +224,7 @@ export default function Md({
       // `issue:` ids and pinned wiki revisions are ours; everything else
       // takes react-markdown's safe transform (no `javascript:` and friends).
       urlTransform={(url) => (url.startsWith("issue:") || url.startsWith("wiki-rev:") ? url : defaultUrlTransform(url))}
-      components={{
-        img: ({ src, alt }) => {
-          const safe = markdownImageSrc(src);
-          if (!safe) return <span>{alt || "Image unavailable"}</span>;
-          return (
-            <a className="md-image" href={safe} target="_blank" rel="noreferrer">
-              <img src={safe} alt={alt ?? ""} loading="lazy" decoding="async" />
-            </a>
-          );
-        },
-        pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
-        a: ({ href, children }) => {
-          const issueId = href?.startsWith("issue:") ? href.slice(6) : null;
-          const revisionHref = href?.startsWith("wiki-rev:") ? href.slice("wiki-rev:".length) : null;
-          if (revisionHref !== null) {
-            return isWikiRevisionHref(revisionHref) ? (
-              <Link className="lnk" href={revisionHref}>{children}</Link>
-            ) : (
-              <>{children}</>
-            );
-          }
-          return !href ? (
-            // react-markdown blanked an unsafe target: show text, not an
-            // anchor that would reopen the board in a new tab.
-            <>{children}</>
-          ) : issueId !== null ? (
-            WHOLE_ISSUE_ID.test(issueId) ? (
-              onOpen ? (
-                <button className="lnk num" onClick={() => onOpen(issueId)}>
-                  {children}
-                </button>
-              ) : (
-                <span className="num">{children}</span>
-              )
-            ) : (
-              // A malformed id is shown as text: no button, no anchor.
-              <>{children}</>
-            )
-          ) : (
-            <SafeLink className="lnk" href={href} encoded>
-              {children}
-            </SafeLink>
-          );
-        },
-      }}
+      components={componentsFor(onOpen)}
     >
       {text}
     </Markdown>
