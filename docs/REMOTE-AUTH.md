@@ -95,7 +95,14 @@ AgenticOS portal, where you choose a workspace and approve access. To
 preselect a workspace, use `cadence login <slug>`; the issuer verifies
 that selection and returns the authoritative workspace ID and slug. The
 CLI validates the returned slug and canonical audience before recording
-the remote org and credential. Use `cadence login --use` (or
+the remote org and credential. Re-running `cadence login <slug>` after the
+workspace was recreated or its ID rotated replaces the stored endpoint and
+workspace ID for that slug; the browser approval is the intent, so no manual
+edit of the org registry is needed. A `local` connection with the same name
+is never overwritten. If the new credential cannot be written, the previous
+binding is restored. `cadence auth logout` revokes the session but does not
+remove an org binding; a verified re-login replaces it. Use
+`cadence login --use` (or
 `cadence login <slug> --use`) to make it the saved default; without
 `--use`, the current default is unchanged. `--no-open` prints the approval
 URL and code without opening a browser.

@@ -225,7 +225,9 @@ the operator's own trust decision — never create it for them, and never
 retry a pin refusal expecting it to pass. A pin that exists but cannot be
 opened (symlink, permissions) refuses differently and prints no write
 command. Bare `cadence login` records the remote org without moving the
-saved default; `--use` is what makes a remote org the default. Full steps:
+saved default; `--use` is what makes a remote org the default. A later
+verified login for the same slug replaces a stale endpoint/workspace id, so
+a recreated workspace does not need a manual org-registry edit. Full steps:
 `docs/REMOTE-AUTH.md` "First login on a fresh machine".
 
 ## Rules

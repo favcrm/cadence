@@ -16,7 +16,10 @@ pub(crate) enum Commands {
     /// the portal's workspace picker at the hosted issuer; an optional
     /// positional slug is a server-verified selection hint. The issuer's
     /// grant must carry the approved workspace, its slug and the canonical
-    /// audience before anything is recorded.
+    /// audience before anything is recorded. A later verified login for an
+    /// already-stored slug replaces its endpoint and workspace id (for a
+    /// recreated workspace); a `local` connection with the same name is
+    /// never overwritten.
     Login {
         /// Workspace slug hint preselecting the approval (for example
         /// `cadence login fav-limited`). Verified against the grant, never

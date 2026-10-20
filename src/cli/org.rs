@@ -118,22 +118,52 @@ impl RegistryFile {
     fn read(&self) -> Result<Registry> {
         read_registry(&self.path)
     }
+    fn read_snapshot(&self) -> Result<(Registry, Option<Vec<u8>>)> {
+        read_registry_raw(&self.path)
+    }
     fn write(&self, registry: &Registry) -> Result<()> {
-        let dir = self.path.parent().expect("registry parent");
-        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
         let raw =
             serde_json::to_vec_pretty(registry).map_err(|e| Error::internal(e.to_string()))?;
+        self.write_raw(&raw)
+    }
+    fn write_raw(&self, raw: &[u8]) -> Result<()> {
+        let dir = self.path.parent().expect("registry parent");
         if raw.len() > 65536 {
             return Err(Error::rejected(
                 "org registry exceeds 64 KiB; no configuration changed",
             ));
         }
-        temp.write_all(&raw)?;
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        temp.write_all(raw)?;
         temp.as_file().sync_all()?;
+        // Once persist renames the registry, it is published. A directory
+        // fsync is best-effort: reporting an error here would make login
+        // skip the credential save with the new binding already installed.
+        let dir_handle = File::open(dir).ok();
         temp.persist(&self.path)
             .map_err(|e| Error::internal(e.to_string()))?;
-        File::open(dir)?.sync_all()?;
+        if let Some(dir) = &dir_handle {
+            let _ = dir.sync_all();
+        }
         Ok(())
+    }
+    /// Put back the exact bytes read before a replacement, including a
+    /// compact registry whose pretty form would exceed the write limit.
+    /// `None` means the file did not exist.
+    fn restore(&self, raw: Option<&[u8]>) -> Result<()> {
+        let Some(raw) = raw else {
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            let dir = self.path.parent().expect("registry parent");
+            if let Ok(dir) = File::open(dir) {
+                let _ = dir.sync_all();
+            }
+            return Ok(());
+        };
+        self.write_raw(raw)
     }
 }
 
@@ -156,13 +186,22 @@ pub(super) fn selected_org_readonly() -> Result<Option<String>> {
 /// update` routing) shares the exact shape checks without taking the
 /// write lock or creating the lock file.
 fn read_registry(path: &Path) -> Result<Registry> {
+    Ok(read_registry_raw(path)?.0)
+}
+
+/// Read the registry and keep the exact bytes read. The bytes let a failed
+/// credential save restore a compact file that `to_vec_pretty` would refuse
+/// at the write cap.
+fn read_registry_raw(path: &Path) -> Result<(Registry, Option<Vec<u8>>)> {
     let mut file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Registry::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Registry::default(), None))
+        }
         Err(e) => return Err(e.into()),
     };
     let metadata = file.metadata()?;
@@ -197,7 +236,7 @@ fn read_registry(path: &Path) -> Result<Registry> {
             return Err(Error::rejected("selected org is missing"));
         }
     }
-    Ok(registry)
+    Ok((registry, Some(raw)))
 }
 
 fn absolute(path: &Path) -> Result<()> {
@@ -407,10 +446,11 @@ fn ensure_local(state_dir: &Path, tracker_dir: &Path) -> Result<()> {
 
 /// Pure registry mutation for `cadence login` (CAD-1019 slice 1b), unit-tested
 /// without the registry file. `org_name` is the issuer-verified slug and
-/// `endpoint`/`org_id` come only from the verified grant. A stored remote is
-/// never re-pointed, a `local` row is never overwritten, and the new org is
-/// selected only when `use_default` (`--use`) is passed — a bare first
-/// login leaves `selected` unset so ambient local stays the default
+/// `endpoint`/`org_id` come only from the verified grant. A newer verified
+/// grant replaces a stale remote binding for the same slug (a workspace can
+/// be recreated or its id rotated); a `local` row is never overwritten. The
+/// new org is selected only when `use_default` (`--use`) is passed — a bare
+/// first login leaves `selected` unset so ambient local stays the default
 /// (CAD-1125).
 fn apply_record_remote(
     registry: &mut Registry,
@@ -428,21 +468,14 @@ fn apply_record_remote(
     let selection = Selection { org: org.clone() };
     if let Some(existing) = registry
         .connections
-        .iter()
+        .iter_mut()
         .find(|c| c.selection == selection)
     {
-        // Re-login must re-point at the same endpoint + org id — a changed
-        // slug or forged audience refuses, never silently moves the org.
         match &existing.destination {
-            Destination::Remote {
-                endpoint: ep,
-                org_id: oid,
-            } if ep == endpoint && oid == org_id => {}
             Destination::Remote { .. } => {
-                return Err(Error::rejected(
-                    "a different endpoint or org id is already stored for this org; \
-                     remove it first",
-                ));
+                // The grant is issuer-verified and already validated above;
+                // re-login is the operator's replacement intent.
+                existing.destination = destination.clone();
             }
             Destination::Local { .. } => {
                 return Err(Error::rejected(
@@ -475,18 +508,33 @@ fn apply_record_remote(
     ))
 }
 
-/// File-locked wrapper over `apply_record_remote`; returns the stored view.
-pub(super) fn record_remote(
+/// File-locked wrapper over `apply_record_remote`. The registry is written
+/// first and `commit` (the credential save) runs while the registry lock is
+/// still held; a failed commit restores the previous binding. Returns the
+/// stored view.
+pub(super) fn record_remote<F>(
     org_name: &str,
     endpoint: &str,
     org_id: &str,
     use_default: bool,
-) -> Result<Value> {
+    commit: F,
+) -> Result<Value>
+where
+    F: FnOnce() -> Result<()>,
+{
     let file = RegistryFile::open()?;
-    let mut registry = file.read()?;
+    let (mut registry, previous_raw) = file.read_snapshot()?;
     let (connection, selected) =
         apply_record_remote(&mut registry, org_name, endpoint, org_id, use_default)?;
     file.write(&registry)?;
+    if let Err(error) = commit() {
+        if let Err(rollback) = file.restore(previous_raw.as_deref()) {
+            return Err(Error::internal(format!(
+                "credential write failed ({error}); restoring the previous org registry also failed ({rollback})"
+            )));
+        }
+        return Err(error);
+    }
     Ok(view(&connection, selected))
 }
 
@@ -909,6 +957,7 @@ pub(crate) enum OrgAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
     const EP_A: &str = "https://alpha.cadencecloud.app";
@@ -1092,24 +1141,221 @@ mod tests {
     }
 
     #[test]
-    fn changed_endpoint_or_org_id_is_refused_never_moved() {
-        // A changed slug or forged audience refuses instead of silently
-        // re-pointing the stored remote at another workspace.
+    fn changed_endpoint_or_org_id_replaces_the_stale_binding() {
+        // A verified grant for the same slug is authoritative: a recreated
+        // or rotated workspace re-points the stored remote instead of
+        // requiring a manual registry edit.
         let mut registry = Registry::default();
         apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
-        assert!(apply_record_remote(&mut registry, "alpha", EP_B, "ws_alpha", false).is_err());
-        assert!(apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).is_err());
+        apply_record_remote(&mut registry, "alpha", EP_B, "ws_alpha", false).unwrap();
+        assert_eq!(registry.connections.len(), 1);
+        assert_remote(&registry, "alpha", EP_B, "ws_alpha");
+
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).unwrap();
+        assert_eq!(registry.connections.len(), 1);
+        assert_remote(&registry, "alpha", EP_A, "ws_other");
+    }
+
+    #[test]
+    fn identical_relogin_is_idempotent() {
+        let mut registry = Registry::default();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+        assert_eq!(registry.connections.len(), 1);
+        assert_remote(&registry, "alpha", EP_A, "ws_alpha");
+    }
+
+    #[test]
+    fn local_name_collision_is_still_refused() {
+        let mut registry = Registry::default();
+        registry.connections.push(Connection {
+            selection: Selection {
+                org: "alpha".into(),
+            },
+            destination: Destination::Local {
+                state_dir: "/local/state".into(),
+                tracker_dir: "/local/tracker".into(),
+            },
+        });
+        let error = apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false)
+            .expect_err("local row must not be replaced");
+        assert!(
+            error.to_string().contains("exists as a local connection"),
+            "{error}"
+        );
+        assert_eq!(registry.connections.len(), 1);
+        assert!(matches!(
+            registry.connections[0].destination,
+            Destination::Local { .. }
+        ));
+    }
+
+    #[test]
+    fn replacement_leaves_other_orgs_and_the_default_untouched() {
+        let mut registry = Registry::default();
+        apply_record_remote(&mut registry, "beta", EP_B, "ws_beta", true).unwrap();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+
+        let selected =
+            apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).unwrap();
+        assert!(!selected.1, "replacement without --use must not select");
+        assert_eq!(
+            registry.selected.as_ref().map(|s| s.org.as_str()),
+            Some("beta")
+        );
+        assert_remote(&registry, "alpha", EP_A, "ws_other");
+        assert_remote(&registry, "beta", EP_B, "ws_beta");
+    }
+
+    #[test]
+    fn replacing_the_selected_org_keeps_it_selected_and_use_can_move_it() {
+        let mut registry = Registry::default();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", true).unwrap();
+        let replaced =
+            apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).unwrap();
+        assert!(replaced.1, "an already selected org stays selected");
+        assert_eq!(
+            registry.selected.as_ref().map(|s| s.org.as_str()),
+            Some("alpha")
+        );
+
+        apply_record_remote(&mut registry, "beta", EP_B, "ws_beta", false).unwrap();
+        apply_record_remote(&mut registry, "beta", EP_B, "ws_beta2", true).unwrap();
+        assert_eq!(
+            registry.selected.as_ref().map(|s| s.org.as_str()),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn registry_write_succeeds_when_the_config_directory_cannot_be_opened_for_read() {
+        // persist publishes the registry; a write+execute-only config dir
+        // cannot be opened for the fsync, but must not turn a published
+        // binding into a failed login that skips the credential save.
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("alpha", EP_A, "ws_alpha", true));
+        let dir = env.registry_path().parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+        let stored = record_remote("alpha", EP_A, "ws_other", false, || Ok(())).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(stored["destination"]["org_id"], "ws_other");
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(env.registry_path()).unwrap()).unwrap();
+        assert_eq!(raw["connections"][0]["destination"]["org_id"], "ws_other");
+    }
+
+    #[test]
+    fn failed_credential_commit_restores_the_previous_binding() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let previous = remote_registry("alpha", EP_A, "ws_alpha", true);
+        env.write_registry(&previous);
+
+        let error = record_remote("alpha", EP_A, "ws_other", false, || {
+            Err(Error::rejected("credential write refused"))
+        })
+        .expect_err("a failed credential save must fail the login");
+        assert!(
+            error.to_string().contains("credential write refused"),
+            "{error}"
+        );
+
+        let stored: Value =
+            serde_json::from_slice(&std::fs::read(env.registry_path()).unwrap()).unwrap();
+        assert_eq!(stored, previous, "the previous binding must be restored");
+    }
+
+    #[test]
+    fn failed_credential_commit_restores_a_compact_registry_verbatim() {
+        // read_registry accepts a compact file up to 64 KiB, but write
+        // pretty-prints. A compact registry just under the read cap can be
+        // impossible to reserialize; rollback must put the original bytes
+        // back instead of failing after the replacement was published.
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let long_id = format!("ws_{}", "a".repeat(196));
+        let mut compact = None;
+        for endpoint_len in 64_000..=65_400 {
+            let registry = Registry {
+                selected: Some(Selection {
+                    org: "alpha".into(),
+                }),
+                connections: vec![Connection {
+                    selection: Selection {
+                        org: "alpha".into(),
+                    },
+                    destination: Destination::Remote {
+                        endpoint: format!("https://{}.test", "a".repeat(endpoint_len)),
+                        org_id: long_id.clone(),
+                    },
+                }],
+            };
+            let raw = serde_json::to_vec(&registry).unwrap();
+            if raw.len() <= 65536 && serde_json::to_vec_pretty(&registry).unwrap().len() > 65536 {
+                compact = Some(raw);
+                break;
+            }
+        }
+        let compact = compact.expect("no compact registry crosses the pretty-print cap");
+        let path = env.registry_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &compact).unwrap();
+
+        let error = record_remote("alpha", EP_A, "ws_new", false, || {
+            Err(Error::rejected("credential write refused"))
+        })
+        .expect_err("a failed credential save must fail the login");
+        assert!(
+            error.to_string().contains("credential write refused"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            compact,
+            "rollback must restore the compact registry bytes verbatim"
+        );
+    }
+
+    #[test]
+    fn successful_relogin_commits_the_credential_after_replacing() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("alpha", EP_A, "ws_alpha", true));
+        let mut committed = false;
+
+        let stored = record_remote("alpha", EP_A, "ws_other", false, || {
+            committed = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(committed);
+        assert_eq!(stored["destination"]["org_id"], "ws_other");
+        assert_eq!(stored["selected"], true);
+
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(env.registry_path()).unwrap()).unwrap();
+        assert_eq!(raw["connections"][0]["destination"]["org_id"], "ws_other");
+        assert_eq!(raw["connections"][0]["destination"]["endpoint"], EP_A);
+    }
+
+    fn assert_remote(registry: &Registry, org: &str, endpoint: &str, org_id: &str) {
         let stored = registry
             .connections
             .iter()
-            .find(|c| c.selection.org == "alpha")
-            .unwrap();
+            .find(|c| c.selection.org == org)
+            .unwrap_or_else(|| panic!("{org} is missing from the registry"));
         match &stored.destination {
-            Destination::Remote { endpoint, org_id } => {
-                assert_eq!(endpoint, EP_A);
-                assert_eq!(org_id, "ws_alpha");
+            Destination::Remote {
+                endpoint: actual_endpoint,
+                org_id: actual_org_id,
+            } => {
+                assert_eq!(actual_endpoint, endpoint);
+                assert_eq!(actual_org_id, org_id);
             }
-            Destination::Local { .. } => panic!("stored remote changed shape"),
+            Destination::Local { .. } => panic!("{org} is not a remote"),
         }
     }
 

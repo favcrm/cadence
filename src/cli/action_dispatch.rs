@@ -249,10 +249,16 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                     |url, code| show_login_code(url, code, *no_open),
                 )?
             };
-            // Record first: a refused registry write (changed endpoint, name
-            // taken by `local`) must leave no credential behind.
-            org::record_remote(&grant.slug, &grant.endpoint, &grant.organization_id, *use_)?;
-            grant.save_credential(&dir)?;
+            // Registry replacement and credential save are one recovery
+            // unit: a failed credential write restores the old binding, so a
+            // replay never leaves a new binding pointing at an old token.
+            org::record_remote(
+                &grant.slug,
+                &grant.endpoint,
+                &grant.organization_id,
+                *use_,
+                || grant.save_credential(&dir),
+            )?;
             println!("Signed in to {} ({})", grant.slug, grant.endpoint);
             return Ok(0);
         }

@@ -59,8 +59,10 @@ into CAD-657's registry (`src/cli/org.rs` `Destination::Remote{endpoint,
 org_id}`, inert until this work): `org_id = organization_id`,
 `endpoint = <audience>` (which is `https://<slug>.cadencecloud.app`), plus
 the enrollment record reference. The slug comes only from the issuer's grant,
-never derived from `org_id` — same rule as `platform_account.rs`. Select as
-default only when none exists or `--use` is passed.
+never derived from `org_id` — same rule as `platform_account.rs`. A later
+verified grant for an already-stored slug replaces that remote row's endpoint
+and workspace id (workspace recreation or rotation); a `local` row with the
+same name is never replaced. Select as default only with `--use`.
 
 ## Credential lifetime (revised — load-bearing)
 
