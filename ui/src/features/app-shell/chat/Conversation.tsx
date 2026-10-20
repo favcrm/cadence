@@ -196,7 +196,7 @@ export default function Conversation(props: HomeListProps | AppPaneProps) {
 function HomeList({ items, readOnly, liveAfter, onOpenIssue, onRetry, onDiscard, after, activity }: HomeListProps) {
   const { t } = useLocale();
   return (
-    <ol className="space-y-3 min-w-0" aria-label={t("messages")} data-rendered={items.length}>
+    <ol className="space-y-3 min-w-0" role="log" aria-live="polite" aria-relevant="additions" aria-label={t("messages")} data-rendered={items.length}>
       {items.map((item, index) => {
         // Live items (or the operator's pending ones) enter with the
         // rise animation; anything at or below the mount seq is history.
@@ -335,7 +335,6 @@ function AppRow({
         item={shown}
         density={density}
         readOnly={readOnly}
-        onOpenIssue={() => undefined}
         onRetry={onRetry}
         onDiscard={onDiscard}
       />
@@ -1487,7 +1486,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           </button>
         </div>
       )}
-      <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} aria-label={t("Conversation messages")}>
+      <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} role="log" aria-live="polite" aria-relevant="additions" aria-label={t("Conversation messages")}>
         {shown.map((item, i) => (
           <li
             key={item.key}

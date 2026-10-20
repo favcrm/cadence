@@ -158,10 +158,11 @@ export default function Md({
       components={{
         img: ({ src, alt }) => {
           const safe = markdownImageSrc(src);
-          return safe ? (
-            <img src={safe} alt={alt ?? ""} loading="lazy" decoding="async" />
-          ) : (
-            <span>{alt || "Image unavailable"}</span>
+          if (!safe) return <span>{alt || "Image unavailable"}</span>;
+          return (
+            <a className="md-image" href={safe} target="_blank" rel="noreferrer">
+              <img src={safe} alt={alt ?? ""} loading="lazy" decoding="async" />
+            </a>
           );
         },
         pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
@@ -181,12 +182,13 @@ export default function Md({
             <>{children}</>
           ) : issueId !== null ? (
             WHOLE_ISSUE_ID.test(issueId) ? (
-              <button
-                className="lnk num"
-                onClick={() => onOpen?.(issueId)}
-              >
-                {children}
-              </button>
+              onOpen ? (
+                <button className="lnk num" onClick={() => onOpen(issueId)}>
+                  {children}
+                </button>
+              ) : (
+                <span className="num">{children}</span>
+              )
             ) : (
               // A malformed id is shown as text: no button, no anchor.
               <>{children}</>

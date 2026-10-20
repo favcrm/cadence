@@ -589,6 +589,15 @@ pre {
 .issue-reader h2 { font-size: 1rem; }
 .issue-reader h3,
 .issue-reader h4 { font-size: .9rem; }
+.issue-reader h5,
+.issue-reader h6 {
+  margin: 1.15rem 0 .5rem;
+  color: var(--color-ink-100);
+  font-weight: 600;
+  line-height: 1.25;
+}
+.issue-reader h5 { font-size: .85rem; }
+.issue-reader h6 { font-size: .8rem; }
 .issue-reader > :first-child { margin-top: 0; }
 .issue-reader p,
 .issue-reader ul,
@@ -605,6 +614,20 @@ pre {
 .issue-reader ul { list-style: disc; }
 .issue-reader ol { list-style: decimal; }
 .issue-reader li + li { margin-top: .25rem; }
+.issue-reader ul.contains-task-list { padding-inline-start: .25rem; }
+.issue-reader li.task-list-item { list-style: none; }
+.issue-reader li.task-list-item > input[type="checkbox"] {
+  margin: 0 .45rem 0 0;
+  accent-color: var(--color-accent);
+  vertical-align: -0.05em;
+}
+.issue-reader hr {
+  margin: 1rem 0;
+  border: 0;
+  block-size: 1px;
+  background: var(--color-ink-700);
+}
+.issue-reader del { color: var(--color-ink-400); }
 .issue-reader blockquote {
   border-inline-start: 2px solid var(--color-ink-600);
   color: var(--color-ink-400);
@@ -644,6 +667,14 @@ pre {
 .chat-bubble img {
   display: block;
   border-radius: 0.5rem;
+}
+.md-image {
+  display: block;
+  max-inline-size: 100%;
+}
+.md-image img {
+  max-inline-size: 100%;
+  block-size: auto;
 }
 .issue-reader a,
 .issue-reader button {

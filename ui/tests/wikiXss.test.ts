@@ -53,6 +53,7 @@ equal(/<img/i.test(cdnImage), false, "agent Markdown cannot auto-load a newly CS
 equal(cdnImage.includes("preview"), true, "blocked Markdown image keeps its alt text");
 const localImage = render("![local](/assets/local.png)");
 equal(localImage.includes('src="/assets/local.png"'), true, "same-origin Markdown images keep rendering");
+equal(localImage.includes('href="/assets/local.png"'), true, "a same-origin Markdown image opens full size");
 const data = render("[x](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)");
 equal(/data:text\/html/i.test(data), false, "a data:text/html link is stripped too");
 
