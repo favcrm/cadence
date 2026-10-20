@@ -104,6 +104,8 @@ mod cad1537_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1562_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
+mod cad1588_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
 mod cad1590_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad225_unattended_acceptance;
