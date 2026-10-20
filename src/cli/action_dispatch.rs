@@ -330,7 +330,11 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 ))
             }
         };
-        return web::run(action, &target, cli.wake_timeout);
+        let local_state = match cli.state_dir.clone() {
+            Some(dir) => dir,
+            None => cadence_agent::client::state_dir()?,
+        };
+        return web::run(&local_state, action, &target, cli.wake_timeout);
     }
     // CAD-1425: a client-only installation runs local commands never; it
     // routes only through an actual remote org, before any local action.

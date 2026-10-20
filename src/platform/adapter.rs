@@ -231,6 +231,12 @@ pub trait PlatformAdapter: Send + Sync {
         true
     }
 
+    /// Whether the adapter resolves its own account credential (the saved
+    /// `--web` login) instead of a custody-enrolled one.
+    fn credentialless(&self) -> bool {
+        false
+    }
+
     /// Reviewed discovery metadata. Legacy adapters default unavailable.
     fn connection_descriptor(&self) -> Option<super::connections::ProviderDescriptor> {
         None

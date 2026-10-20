@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{optional_str, required_str, AgentCaller, Shared};
+use super::{optional_str, reject_identity_fields, required_str, AgentCaller, Shared};
 use crate::contract_fixture::{classify_call, Effect};
 use crate::error::{Error, Result};
 use crate::platform::{self, PlatformAdapter};
@@ -68,22 +68,26 @@ impl Shared {
     /// defaults like `platform_check`'s: the caller's project default
     /// for the platform.
     pub(super) fn rpc_platform_call(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        let agent = self.request_caller(params, peer_pid, "platform call")?;
-        self.store
-            .app_effect_guard(&agent, optional_str(params, "task"))?;
-        // The caller is the connection — `agent`/`alias` are request
-        // fields only where they name a target; a platform call has no
-        // such field, so any present is refused, even one naming the
-        // caller itself (§5.4: the record's agent is never a field).
-        for field in ["agent", "alias"] {
-            if params.get(field).is_some() {
-                return Err(Error::rejected(format!(
-                    "platform call: caller identity is connection-bound; request \
-                     field '{field}' is not accepted"
-                )));
+        reject_identity_fields(params, "platform call")?;
+        // An agent caller is connection-derived. A proven operator may run
+        // read/draft tools from an attached shell; a send still needs an
+        // agent, because only an agent's effect can be released.
+        let agent = match self.request_caller(params, peer_pid, "platform call") {
+            Ok(agent) => Some(agent),
+            Err(error) => {
+                if self.proven_operator("platform call", peer_pid).is_err() {
+                    return Err(error);
+                }
+                None
             }
+        };
+        if let Some(agent) = agent.as_deref() {
+            self.store
+                .app_effect_guard(agent, optional_str(params, "task"))?;
+            self.store.agent(agent)?;
+        } else if params.get("task").is_some() {
+            return Err(Error::rejected("platform call: 'task' is an agent field"));
         }
-        self.store.agent(&agent)?;
         let platform = identifier(required_str(params, "platform")?, "Platform")?;
         let tool = required_str(params, "tool")?;
         let input = match params.get("input") {
@@ -99,7 +103,14 @@ impl Shared {
         }
         let account = match optional_str(params, "account") {
             Some(a) => identifier(a, "Account")?,
-            None => self.default_account(&agent, &platform, params)?,
+            None => match agent.as_deref() {
+                Some(agent) => self.default_account(agent, &platform, params)?,
+                None => {
+                    return Err(Error::rejected(
+                        "platform call: a proven operator passes 'account'",
+                    ))
+                }
+            },
         };
         let task = optional_str(params, "task")
             .map(|t| identifier(t, "Task"))
@@ -108,23 +119,34 @@ impl Shared {
         if adapter.app_artifact_tool(tool) {
             return Err(Error::rejected("this reviewed tool requires an exact accepted app artifact and explicit app release"));
         }
-        // The §5.3 grant check gates even staging — a caller holding no
-        // grant on the account learns that before a row exists.
-        self.check_grant(&agent, &platform, &account, &adapter, tool)?;
-        // The §5.4 cancel scan runs on every touchpoint: a source edit
-        // since the row staged cancels it before this call proceeds.
-        self.scan_effect_sources(Some(&agent));
+        if let Some(agent) = agent.as_deref() {
+            // The §5.3 grant check gates even staging — a caller holding no
+            // grant on the account learns that before a row exists.
+            self.check_grant(agent, &platform, &account, &adapter, tool)?;
+            // The §5.4 cancel scan runs on every touchpoint: a source edit
+            // since the row staged cancels it before this call proceeds.
+            self.scan_effect_sources(Some(agent));
+        }
 
         let reported = adapter.reported_manifest_version();
         let table = adapter.table();
         match classify_call(table, reported.as_deref(), tool) {
             Effect::Read | Effect::Draft => {
                 let draft = table.effect_of(tool) == Effect::Draft;
-                self.execute_immediate(&agent, &platform, &account, tool, &input, draft, &adapter)
+                // The actor label is the event/draft-log identity only; a
+                // send never reaches here without an agent.
+                let actor = agent.as_deref().unwrap_or("operator");
+                self.execute_immediate(actor, &platform, &account, tool, &input, draft, &adapter)
             }
-            Effect::Send => self.stage_send(
-                &agent, &platform, &account, tool, &input, task, params, &adapter,
-            ),
+            Effect::Send => match agent.as_deref() {
+                Some(agent) => self.stage_send(
+                    agent, &platform, &account, tool, &input, task, params, &adapter,
+                ),
+                None => Err(Error::rejected(
+                    "platform call: a send effect needs an agent; the operator releases it \
+                     with the effect decision",
+                )),
+            },
         }
     }
 
@@ -304,8 +326,11 @@ impl Shared {
         draft: bool,
         adapter: &Arc<dyn PlatformAdapter>,
     ) -> Result<Value> {
-        let bytes =
-            platform::load_credential(&self.store, &self.platform_custody, platform_name, account)?;
+        let bytes = if adapter.credentialless() {
+            Vec::new()
+        } else {
+            platform::load_credential(&self.store, &self.platform_custody, platform_name, account)?
+        };
         let key = format!("call-{}", uuid::Uuid::new_v4().simple());
         let result = adapter
             .execute(&bytes, tool, input, &key, None)

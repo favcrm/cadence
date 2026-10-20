@@ -91,6 +91,7 @@ pub mod ui;
 pub mod update;
 pub mod upgrade;
 pub mod web_publish;
+pub mod web_sites;
 pub mod wiki;
 pub mod worktree;
 

@@ -17,9 +17,9 @@
 //! Compiled into the library unit-test binary through `web_cli_test_harness`,
 //! so the production `web.rs` functions run unchanged.
 
-use super::web::{run, WebAction};
-use cadence_agent::remote_cli::{web_envelope, RemoteTarget, WebResponse};
-use cadence_agent::web_publish;
+use crate::remote_cli::{web_envelope, RemoteTarget, WebResponse};
+use crate::web_publish;
+use crate::web_sites::{run, WebAction};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -1303,7 +1303,7 @@ fn a_malformed_success_leaves_the_intent_open_with_the_same_key_and_body() {
 /// that merely contains the words must not.
 #[test]
 fn web_envelope_types_only_a_409_with_the_exact_revision_conflict_shape() {
-    fn refusal(status: u16, body: Option<Value>) -> cadence_agent::Error {
+    fn refusal(status: u16, body: Option<Value>) -> crate::Error {
         web_envelope(WebResponse { status, body }).expect_err("a refusal was expected")
     }
 

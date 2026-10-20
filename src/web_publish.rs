@@ -50,7 +50,7 @@ const MIME_BY_EXTENSION: &[(&str, &str)] = &[
     ("pdf", "application/pdf"),
 ];
 
-fn mime_for(path: &str) -> Result<&'static str> {
+pub fn mime_for(path: &str) -> Result<&'static str> {
     let ext = path.rsplit_once('.').map_or("", |(_, e)| e);
     let ext = ext.to_ascii_lowercase();
     MIME_BY_EXTENSION
@@ -75,6 +75,8 @@ pub struct FrozenSite {
     pub manifest: Value,
     pub digest: String,
     pub total_bytes: u64,
+    /// The exact canonical manifest bytes `digest` covers.
+    pub canonical: String,
 }
 
 fn reject(message: impl Into<String>) -> Error {
@@ -188,6 +190,7 @@ pub fn freeze(input: &Path) -> Result<FrozenSite> {
         manifest,
         digest,
         total_bytes: total,
+        canonical,
     })
 }
 

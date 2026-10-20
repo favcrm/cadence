@@ -1310,9 +1310,11 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: cadence_agent::memory::cli::MemoryAction,
     },
-    /// CAD-1429: publish a plain HTML page or built static site. `prepare`
-    /// freezes the output locally; the hosted actions need a selected
-    /// AgenticOS workspace and never run project code.
+    /// CAD-1429/CAD-1642: publish a plain HTML page or built static site.
+    /// `prepare` freezes the output locally, stages it under the daemon's
+    /// state directory and sends every web request through `platform call`,
+    /// so the local daemon must be running. The hosted actions need a
+    /// selected AgenticOS workspace and never run project code.
     Web {
         #[command(subcommand)]
         action: WebAction,

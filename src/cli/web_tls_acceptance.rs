@@ -1,6 +1,6 @@
 //! CAD-1429 independent TLS acceptance driver (acceptance author, not the
 //! implementer). Included as a sibling `tls_acceptance` module of `web` by
-//! `web_cli_test_harness.rs`, so `super::web::run` is the SAME production
+//! `web_cli_test_harness.rs`, so `web_sites::run` is the SAME production
 //! command function the binary runs. Compiled only under `cfg(test)`.
 //!
 //! What it exercises, against the NodeHTTPS bridge owned by
@@ -13,7 +13,7 @@
 //!     owned `XDG_CONFIG_HOME`. The driver asserts that equality before writing;
 //!   * a `RemoteTarget` built ONLY from the verified `LoginGrant` fields
 //!     (`organization_id`, `endpoint`) plus the operator-selected slug;
-//!   * the production `super::web::run` for Prepare (HTML), Publish, Status and
+//!   * the production `web_sites::run` for Prepare (HTML), Publish, Status and
 //!     Releases, asserting on the values those calls return and on the durable
 //!     non-secret pending record they persist under that directory.
 //!
@@ -25,10 +25,10 @@
 //! Runs only when explicitly selected: `#[ignore]`, invoked later by Node with
 //! `--ignored --exact` against the owned bridge environment.
 
-use super::web::{run, WebAction};
 use crate::remote_cli::RemoteTarget;
 use crate::remote_enrollment::{login_portal_scoped, LoginGrant};
 use crate::test_web_issuer_tls::{TestWebIssuerTls, ISSUER};
+use crate::web_sites::{run, WebAction};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -48,7 +48,7 @@ fn required(name: &str) -> String {
 /// controller-owned environment. Asserted, never assumed: the production code
 /// reads its credentials and pending record from here.
 fn production_auth_dir(out_root: &Path) -> PathBuf {
-    let resolved = cadence_agent::remote_auth::auth_dir(None)
+    let resolved = crate::remote_auth::auth_dir(None)
         .expect("auth_dir(None) must resolve under the owned XDG_CONFIG_HOME");
     assert!(
         resolved.starts_with(out_root),
@@ -347,10 +347,10 @@ fn cli_publish_web_real_device_login_spa_library_lifecycle() {
 
     let v1_dir = site_input(&out_root, "site");
     let v2_dir = site_input(&out_root, "site-v2");
-    let v1_digest = cadence_agent::web_publish::freeze(&v1_dir)
+    let v1_digest = crate::web_publish::freeze(&v1_dir)
         .expect("v1 build output must freeze locally")
         .digest;
-    let v2_digest = cadence_agent::web_publish::freeze(&v2_dir)
+    let v2_digest = crate::web_publish::freeze(&v2_dir)
         .expect("v2 build output must freeze locally")
         .digest;
     assert_ne!(v1_digest, v2_digest, "v2 must be a different release");

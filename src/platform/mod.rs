@@ -11,6 +11,7 @@ pub mod account_media;
 pub mod adapter;
 pub mod agenticos;
 pub mod agenticos_external;
+pub mod agenticos_web;
 pub mod connections;
 pub mod custody;
 pub mod deployments;
