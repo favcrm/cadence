@@ -536,7 +536,7 @@ pub fn run(
         .as_str()
         .unwrap_or_default()
         .to_string();
-    if provider == "pi" && endpoint_kind == "managed" {
+    if crate::adapter::registry::pi_family_managed(&provider, &endpoint_kind) {
         crate::adapter::pi::refuse_confined_devin(
             args.to.as_str(),
             agent["params"]["confine"].as_bool() == Some(true),

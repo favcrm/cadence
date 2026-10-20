@@ -356,7 +356,7 @@ impl Shared {
                 )));
             }
             crate::model_defaults::validate_model_id(model)?;
-            if provider == "pi" {
+            if crate::adapter::registry::pi_family_managed(provider, kind) {
                 let policy = self.stored_pi_policy()?;
                 crate::pi_policy::require_allowed(policy.as_ref(), "worker", model)?;
             }
@@ -368,9 +368,11 @@ impl Shared {
                 )));
             }
             match provider {
-                "pi" => crate::adapter::registry::pi_effort(effort)?,
                 "claude" => crate::adapter::registry::claude_effort(effort)?,
                 "codex" => crate::adapter::registry::codex_effort(effort)?,
+                _ if crate::adapter::registry::pi_family_managed(provider, kind) => {
+                    crate::adapter::registry::pi_effort(effort)?
+                }
                 other => {
                     return Err(Error::rejected(format!(
                         "issue kickoff: provider '{other}' has no effort vocabulary"
@@ -496,7 +498,7 @@ impl Shared {
         // `issue start` creates a lane before `rpc_register` runs. Apply
         // the same effective-model gate here so a refused configuration
         // leaves no worktree or issue side effect behind.
-        if provider == "pi" && kind == "managed" {
+        if crate::adapter::registry::pi_family_managed(provider, kind) {
             let pm_dir = self.pm_dir()?;
             let confined = crate::doctor::host::read_host_overrides(&pm_dir)
                 .map_err(Error::rejected)?
@@ -640,21 +642,24 @@ impl Shared {
             seen.push(spec.provider);
             let takes_model = spec.launch_params.contains(&"model");
             let takes_effort = spec.launch_params.contains(&"effort");
-            let models = if spec.provider == "pi" {
-                json!(policy
-                    .as_ref()
-                    .map(|p| p.models.allow_for("worker"))
-                    .unwrap_or(&[]))
-            } else if takes_model {
-                Value::Null
-            } else {
-                json!([])
-            };
+            let models =
+                if crate::adapter::registry::pi_family_managed(spec.provider, spec.endpoint_kind) {
+                    json!(policy
+                        .as_ref()
+                        .map(|p| p.models.allow_for("worker"))
+                        .unwrap_or(&[]))
+                } else if takes_model {
+                    Value::Null
+                } else {
+                    json!([])
+                };
             let efforts: &[&str] = if !takes_effort {
                 &[]
+            } else if crate::adapter::registry::pi_family_managed(spec.provider, spec.endpoint_kind)
+            {
+                crate::adapter::registry::PI_EFFORTS
             } else {
                 match spec.provider {
-                    "pi" => crate::adapter::registry::PI_EFFORTS,
                     "claude" => crate::adapter::registry::CLAUDE_EFFORTS,
                     "codex" => crate::adapter::registry::CODEX_EFFORTS,
                     _ => &[],

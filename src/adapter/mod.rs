@@ -256,6 +256,20 @@ impl ProviderEnv {
             .insert(name.to_string(), value.into());
     }
 
+    /// A copy whose own map carries `name = value`. The shared map is never
+    /// mutated, so one endpoint's program override (an `omp` agent's
+    /// `CADENCE_PI_COMMAND`) cannot reach a `pi` agent in the same daemon.
+    pub fn with_var(&self, name: &str, value: impl Into<String>) -> Self {
+        let mut vars = self.0.read().unwrap().clone();
+        vars.insert(name.to_string(), value.into());
+        Self(
+            Arc::new(RwLock::new(vars)),
+            self.1.clone(),
+            self.2.clone(),
+            self.3.clone(),
+        )
+    }
+
     pub fn remove(&self, name: &str) {
         self.0.write().unwrap().remove(name);
     }
@@ -836,8 +850,26 @@ pub fn build(
             "pi" => Ok(Box::new(pi::PiAdapter::new(
                 hooks, log_path, env, agent_uid,
             ))),
+            // CAD-1624: omp is pi-compatible on every flag the adapter uses, so
+            // it is the same adapter with its own program — and therefore the
+            // same Settings allowlist gate (`PiAdapter::open`), not a bypass.
+            // Only a default program is replaced: a fixture's sealed command
+            // (`refusing_providers`/`isolate_for_test`) or an operator's
+            // explicit command must win, or a test daemon would spawn the real
+            // binary.
+            "omp" => {
+                // A blank override is the same as an absent one: it would
+                // otherwise reach the adapter and fall back to bare `pi`.
+                let env = match env.var("CADENCE_PI_COMMAND") {
+                    Some(value) if !value.trim().is_empty() && value.trim() != "pi" => env.clone(),
+                    _ => env.with_var("CADENCE_PI_COMMAND", "omp"),
+                };
+                Ok(Box::new(pi::PiAdapter::new(
+                    hooks, log_path, &env, agent_uid,
+                )))
+            }
             other => Err(crate::error::Error::rejected(format!(
-                "No managed adapter for provider '{other}' (implemented: codex, claude, pi)"
+                "No managed adapter for provider '{other}' (implemented: codex, claude, pi, omp)"
             ))),
         },
         "managed-ws" => match agent.provider.as_str() {
@@ -1079,6 +1111,18 @@ mod split_launch_tests {
 
 #[cfg(test)]
 mod tests {
+    /// CAD-1624: omp rides the Pi adapter with its own program. The override
+    /// must stay on the copy — a shared map would silently launch every pi
+    /// agent as omp, and vice versa.
+    #[test]
+    fn with_var_does_not_mutate_the_shared_env() {
+        let env = ProviderEnv::default();
+        env.set("CADENCE_PI_COMMAND", "pi");
+        let omp = env.with_var("CADENCE_PI_COMMAND", "omp");
+        assert_eq!(env.var("CADENCE_PI_COMMAND").as_deref(), Some("pi"));
+        assert_eq!(omp.var("CADENCE_PI_COMMAND").as_deref(), Some("omp"));
+    }
+
     /// CAD-1009: the slot stands for the token wherever the daemon's
     /// block puts it (many places), all filled with the one token; and
     /// an endpoint that cannot redeem loses the whole block, not just
