@@ -109,6 +109,28 @@ The intake helper opens the source with a no-follow descriptor, snapshots the bo
 
 The renderer independently opens each template, brief and optional rate workbook with a no-follow descriptor and takes bounded private snapshots before parsing. All parsing, calculations, template rendering and input hashes use those same snapshot bytes. It stages every final artifact privately, rechecks each original source identity/content before publication, and records each original filename and snapshot hash in render metadata. Read-only bind mounts alone do not prevent host-side mutation; observed mutation or pathname replacement during a render refuses publication and removes outputs created by that invocation. Meaningful text in unsupported DOCX parts or structures is refused rather than omitted. Limits: 20 MiB/input, 100 PDF pages, 100 MiB expanded Office ZIP, 20,000 nonempty XLSX cells, 100,000 PDF objects; PDF previews from rendered drafts are capped at 64 MiB. Blank/scanned PDF pages, encrypted/corrupt/unsupported files, formulas in inputs, macros, external/embedded active content, interactive PDFs and output collisions are explicit nonzero refusals with no extracted-content artifact. No OCR is performed. The renderer uses pinned LibreOffice Writer only inside the offline container, exports PDF from the generated editable DOCX, and creates per-page PNG previews; PDF artifacts require independent visual review. It never exports XLSX to PDF.
 
+## Template-pack actions (AOS-310)
+
+The hosted converter exposes two fixed actions beside intake/render/render-template.
+A company supplies one *template pack* (`manifest.json`, `profile.json`,
+`rules.md`, `sample/`, its own DOCX or XLSX); a different customer template
+needs no code change.
+
+- `check` — roles `profile`, `template`, `output`, optional `manifest`, and
+  optional `source_profile`/`source_template`/`source_output`. Returns
+  `report.json` and `report.txt`. `passed: false` is a successful check with
+  findings; exit 2 is reserved for a refused input, and reference-source
+  findings count in the verdict.
+- `render-sheet` — roles `profile`, `template`, `context`, optional `manifest`,
+  plus a boolean `sample`. Writes only the declared input ranges, preserves the
+  rest of the workbook, and refuses unpreservable parts or OOXML extensions.
+
+The XLSX paths require LibreOffice **Calc** in the converter image; Writer
+alone cannot open a spreadsheet, and the helper process bound must fit the
+spreadsheet save path. Helper source lives here (`scripts/pack.py`,
+`scripts/check.py`, `scripts/render_sheet.py`); the hosted image carries
+byte-identical copies, so change the source here.
+
 ## Review and limits
 
 A qualified human must review factual support, source provenance, audience fit, fidelity to the retrieved reference files, assumptions, exclusions, and unresolved inputs. For tender/bid tasks, review requirement coverage and compliance statements. For financial content only, review approved source dates, calculation-tool inputs/rules/results, and unresolved amounts. An authoring pack is not a quotation and does not export PDF. Obtain required internal approvals through the company's normal process. The skill and CLI commands do not enforce company policy or authorize external actions. No email, customer submission, purchasing, approval recording, or commercial commitment is performed through this workflow.
