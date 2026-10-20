@@ -1028,6 +1028,70 @@ fn legacy_task_view(state_dir: &Path, alias: &str) -> (Value, Vec<String>) {
     (tasks, issues)
 }
 
+/// A board read block's route, by whether it is a read at all.
+///
+/// One impl per module's `Route` enum (`read_route_enums!`), so a block
+/// cannot be copied without the check: [`read_admit`] runs it before any
+/// guard or handler.
+trait ReadRoute {
+    fn is_read_route(&self) -> bool;
+}
+
+macro_rules! read_route_enums {
+    ($($t:ty),* $(,)?) => {$(
+        impl ReadRoute for $t {
+            fn is_read_route(&self) -> bool {
+                <$t>::is_read(*self)
+            }
+        }
+    )*};
+}
+
+read_route_enums!(
+    app_assistant::Route<'_>,
+    app_contexts::Route<'_>,
+    app_audiences::Route<'_>,
+    app_records::Route<'_>,
+    app_content::Route<'_>,
+    connections::Route<'_>,
+    crm_send::Route,
+    app_release::Route<'_>,
+    app_runs::Route<'_>,
+    social_publish::Route<'_>,
+);
+
+/// [`operator::admit_screen_read`] as the unit refusal [`read_admit`] takes
+/// — the screen blocks discard the admitted caller, as they always did.
+fn screen_read_only(
+    request: &Request,
+    state_dir: &Path,
+    opts: &ServeOpts,
+) -> std::result::Result<(), HttpResp> {
+    operator::admit_screen_read(request, state_dir, opts).map(|_| ())
+}
+
+/// The one admit sequence for a board read block: a route that matched a
+/// write surface is `405`, the guard runs before the handler, and only an
+/// admitted caller reaches it. `None` means no route matched and the
+/// caller's chain continues; `Some` is the response to send.
+fn read_admit<R: ReadRoute>(
+    request: &mut Request,
+    state_dir: &Path,
+    opts: &ServeOpts,
+    matched: Option<R>,
+    admit: fn(&Request, &Path, &ServeOpts) -> std::result::Result<(), HttpResp>,
+    handle: impl FnOnce(&mut Request, R) -> HttpResp,
+) -> Option<HttpResp> {
+    let route = matched?;
+    if !route.is_read_route() {
+        return Some(err_response(405, "method not allowed"));
+    }
+    if let Err(response) = admit(request, state_dir, opts) {
+        return Some(response);
+    }
+    Some(handle(request, route))
+}
+
 fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
     // CAD-482: a seam-armed board honors the assertion headers; the
     // scope makes the asserted identity visible to attribution and to
@@ -1958,16 +2022,14 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 send(request, app_chat::handle(state_dir, install));
                 return;
             }
-            if let Some(route) = app_assistant::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = app_assistant::handle(&mut request, state_dir, route, raw_query);
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                app_assistant::route(&path),
+                operator::admit_operator_read,
+                |req, route| app_assistant::handle(req, state_dir, route, raw_query),
+            ) {
                 send(request, response);
                 return;
             }
@@ -1986,141 +2048,122 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 send(request, response);
                 return;
             }
-            if let Some(route) = app_contexts::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                // CAD-1537: a member's screen needs the context receipt.
-                if let Err(response) = operator::admit_screen_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = app_contexts::handle(&mut request, state_dir, route, false);
+            // CAD-1537: a member's screen needs the context receipt.
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                app_contexts::route(&path),
+                screen_read_only,
+                |req, route| app_contexts::handle(req, state_dir, route, false),
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = app_audiences::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = app_audiences::handle(&mut request, state_dir, route, false);
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                app_audiences::route(&path),
+                operator::admit_operator_read,
+                |req, route| app_audiences::handle(req, state_dir, route, false),
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = app_records::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = app_records::handle(
-                    &mut request,
-                    state_dir,
-                    route,
-                    false,
-                    operator::PublicRelay::NotPublic,
-                );
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                app_records::route(&path),
+                operator::admit_operator_read,
+                |req, route| {
+                    app_records::handle(
+                        req,
+                        state_dir,
+                        route,
+                        false,
+                        operator::PublicRelay::NotPublic,
+                    )
+                },
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = app_content::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = app_content::handle(
-                    &mut request,
-                    state_dir,
-                    route,
-                    false,
-                    operator::PublicRelay::NotPublic,
-                );
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                app_content::route(&path),
+                operator::admit_operator_read,
+                |req, route| {
+                    app_content::handle(
+                        req,
+                        state_dir,
+                        route,
+                        false,
+                        operator::PublicRelay::NotPublic,
+                    )
+                },
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = connections::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = connections::handle(&mut request, state_dir, route, false);
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                connections::route(&path),
+                operator::admit_operator_read,
+                |req, route| connections::handle(req, state_dir, route, false),
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = crm_send::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = crm_send::handle_read(state_dir, route, &query);
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                crm_send::route(&path),
+                operator::admit_operator_read,
+                |_, route| crm_send::handle_read(state_dir, route, &query),
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = app_release::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let relay = operator::public_relay(&request, opts);
-                let response = app_release::handle_with_relay(
-                    &mut request,
-                    state_dir,
-                    route,
-                    false,
-                    relay,
-                    opts,
-                );
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                app_release::route(&path),
+                operator::admit_operator_read,
+                |req, route| {
+                    let relay = operator::public_relay(req, opts);
+                    app_release::handle_with_relay(req, state_dir, route, false, relay, opts)
+                },
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = app_runs::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = app_runs::handle(&mut request, state_dir, route, false, opts);
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                app_runs::route(&path),
+                operator::admit_operator_read,
+                |req, route| app_runs::handle(req, state_dir, route, false, opts),
+            ) {
                 send(request, response);
                 return;
             }
-            if let Some(route) = social_publish::route(&path) {
-                if !route.is_read() {
-                    send(request, err_response(405, "method not allowed"));
-                    return;
-                }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response = social_publish::handle(&mut request, state_dir, route, false);
+            if let Some(response) = read_admit(
+                &mut request,
+                state_dir,
+                opts,
+                social_publish::route(&path),
+                operator::admit_operator_read,
+                |req, route| social_publish::handle(req, state_dir, route, false),
+            ) {
                 send(request, response);
                 return;
             }
@@ -2751,4 +2794,98 @@ fn activity_params(raw_query: &str) -> std::result::Result<Value, &'static str> 
         }
     }
     Ok(Value::Object(out))
+}
+
+#[cfg(test)]
+mod read_admit_tests {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Probe {
+        Read,
+        Write,
+    }
+
+    impl ReadRoute for Probe {
+        fn is_read_route(&self) -> bool {
+            *self == Probe::Read
+        }
+    }
+
+    fn admit(_: &Request, _: &Path, _: &ServeOpts) -> std::result::Result<(), HttpResp> {
+        Ok(())
+    }
+
+    fn refuse(_: &Request, _: &Path, _: &ServeOpts) -> std::result::Result<(), HttpResp> {
+        Err(err_response(403, "refused"))
+    }
+
+    fn request() -> Request {
+        tiny_http::TestRequest::new().with_path("/api/probe").into()
+    }
+
+    #[test]
+    fn no_matched_route_continues_the_chain() {
+        let mut request = request();
+        let response = read_admit::<Probe>(
+            &mut request,
+            Path::new("/nonexistent"),
+            &ServeOpts::default(),
+            None,
+            admit,
+            |_, _| panic!("handler must not run without a route"),
+        );
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn a_write_route_is_405_before_any_guard_or_handler() {
+        let mut request = request();
+        let response = read_admit(
+            &mut request,
+            Path::new("/nonexistent"),
+            &ServeOpts::default(),
+            Some(Probe::Write),
+            admit,
+            |_, _| panic!("handler must not run for a write route"),
+        )
+        .expect("a matched route answers");
+        assert_eq!(response.status_code(), StatusCode(405));
+    }
+
+    #[test]
+    fn a_refused_read_never_reaches_the_handler() {
+        let mut request = request();
+        let response = read_admit(
+            &mut request,
+            Path::new("/nonexistent"),
+            &ServeOpts::default(),
+            Some(Probe::Read),
+            refuse,
+            |_, _| panic!("handler must not run for a refused caller"),
+        )
+        .expect("a matched route answers");
+        assert_eq!(response.status_code(), StatusCode(403));
+    }
+
+    #[test]
+    fn an_admitted_read_reaches_its_handler_once() {
+        let mut request = request();
+        let mut calls = 0;
+        let response = read_admit(
+            &mut request,
+            Path::new("/nonexistent"),
+            &ServeOpts::default(),
+            Some(Probe::Read),
+            admit,
+            |_, route| {
+                calls += 1;
+                assert_eq!(route, Probe::Read);
+                json_response(json!({"ok": true}))
+            },
+        )
+        .expect("a matched route answers");
+        assert_eq!(calls, 1);
+        assert_eq!(response.status_code(), StatusCode(200));
+    }
 }
