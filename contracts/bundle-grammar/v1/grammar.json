@@ -1,0 +1,93 @@
+{
+  "caps": {
+    "bundleBytes": 2097152,
+    "fileBytes": 262144,
+    "files": 128,
+    "screenAssetBytes": 393216
+  },
+  "definitions": {
+    "exact": {
+      "leaf": "the name carried by the directory entry"
+    },
+    "screensPackage": {
+      "assetStem": "validTag",
+      "declaration": "screens.json",
+      "extensions": [
+        "js",
+        "css",
+        "svg",
+        "json"
+      ],
+      "path": "screens/<tag>/<leaf>",
+      "tag": "validTag"
+    },
+    "svgLeaf": {
+      "maxLeafBytes": 128,
+      "segment": true,
+      "suffix": ".svg"
+    },
+    "validTag": {
+      "charset": "abcdefghijklmnopqrstuvwxyz0123456789-",
+      "forbidLeading": "-",
+      "maxBytes": 32,
+      "minBytes": 1,
+      "wholeInput": true
+    },
+    "visibleLeaf": {
+      "segment": true
+    },
+    "workflowMdTag": {
+      "segment": true,
+      "stem": "validTag of the leaf with every trailing suffix removed",
+      "suffix": ".md"
+    }
+  },
+  "directories": [
+    {
+      "dir": "workflows",
+      "rule": "workflow_md_tag"
+    },
+    {
+      "dir": "views",
+      "name": "app-views-v1.json",
+      "rule": "exact"
+    },
+    {
+      "dir": "rubrics",
+      "rule": "visible_leaf"
+    },
+    {
+      "dir": "templates",
+      "rule": "visible_leaf"
+    },
+    {
+      "dir": "assets",
+      "maxLeafBytes": 128,
+      "rule": "svg_leaf"
+    },
+    {
+      "declaration": "screens.json",
+      "dir": "screens",
+      "leaf": "tag_stem.(js|css|svg|json)",
+      "rule": "screens_package"
+    }
+  ],
+  "rootFiles": [
+    "app.md",
+    "app-chat.json",
+    "app-assistant.json",
+    "app-actions.json"
+  ],
+  "segments": {
+    "asciiOnly": true,
+    "forbidBackslash": true,
+    "forbidExact": [
+      ".",
+      ".."
+    ],
+    "forbidLeadingDot": true,
+    "forbidNul": true,
+    "nonEmpty": true
+  },
+  "version": 1
+}

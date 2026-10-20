@@ -117,11 +117,15 @@ pub(crate) fn file_cap(rel: &str) -> u64 {
 /// the catalogue importer and the board's files-mode transport. CAD-1415 added
 /// `app-actions.json` to the first two and missed the third, so a bundle the
 /// daemon accepts was refused before it ever reached the daemon.
+pub(crate) const ROOT_MEMBERS: &[&str] = &[
+    MANIFEST,
+    crate::issue::app_chat::FILE,
+    crate::issue::app_assistant::FILE,
+    crate::issue::app_action::FILE,
+];
+
 pub(crate) fn root_member(name: &str) -> bool {
-    name == MANIFEST
-        || name == crate::issue::app_chat::FILE
-        || name == crate::issue::app_assistant::FILE
-        || name == crate::issue::app_action::FILE
+    ROOT_MEMBERS.contains(&name)
 }
 
 /// Visible, ASCII, flat leaf name — no dotfile, no separator, no escape.
@@ -134,11 +138,74 @@ fn plain_leaf_ok(seg: &str) -> bool {
         && !seg.contains('\0')
 }
 
-/// A workflow leaf: `<tag>.md`, the installer's own tag rule.
+/// A workflow leaf: `<tag>.md`, the installer's own tag rule. Every trailing
+/// `.md` is stripped before the tag check, which the published document states
+/// explicitly.
 fn workflow_leaf_ok(seg: &str) -> bool {
     plain_leaf_ok(seg)
-        && seg.ends_with(".md")
-        && crate::issue::model::valid_tag(seg.trim_end_matches(".md"))
+        && seg.ends_with(WORKFLOW_SUFFIX)
+        && crate::issue::model::valid_tag(seg.trim_end_matches(WORKFLOW_SUFFIX))
+}
+
+/// How one flat top-level directory admits its leaves.
+#[derive(Clone, Copy)]
+pub(crate) enum DirRule {
+    /// `<tag>.md`, the installer's own tag rule.
+    WorkflowMdTag,
+    /// Exactly this leaf name.
+    Exact(&'static str),
+    /// Any visible, ASCII, flat leaf.
+    VisibleLeaf,
+    /// A visible flat `<leaf>.svg`, bounded in bytes.
+    SvgLeaf { max_leaf_bytes: usize },
+    /// A `screens/<tag>/` package: the declaration or a tag-shaped stem plus
+    /// `js|css|svg|json`.
+    ScreensPackage,
+}
+
+/// The directory half of the grammar, in one table. [`bundle_path_ok`]
+/// evaluates it and [`bundle_grammar_json`] publishes it; there is no second
+/// list to keep in step.
+pub(crate) const DIR_RULES: &[(&str, DirRule)] = &[
+    ("workflows", DirRule::WorkflowMdTag),
+    ("views", DirRule::Exact(crate::issue::app_view::FILE)),
+    ("rubrics", DirRule::VisibleLeaf),
+    ("templates", DirRule::VisibleLeaf),
+    // CAD-1129: catalog icons and screenshots are flat SVG leaves.
+    (
+        "assets",
+        DirRule::SvgLeaf {
+            max_leaf_bytes: ASSET_MAX_LEAF_BYTES,
+        },
+    ),
+    ("screens", DirRule::ScreensPackage),
+];
+
+/// Version of the published grammar document. Bump only for a shape change.
+#[cfg(test)]
+pub(crate) const GRAMMAR_VERSION: u32 = 1;
+
+/// The lexical pieces the published document must state normatively. They are
+/// constants so the predicate and the document cannot disagree.
+const WORKFLOW_SUFFIX: &str = ".md";
+const ASSET_SUFFIX: &str = ".svg";
+const ASSET_MAX_LEAF_BYTES: usize = 128;
+#[cfg(test)]
+const SCREEN_ASSET_EXTS: &[&str] = &["js", "css", "svg", "json"];
+/// `model::valid_tag`: every byte drawn from this set, 1..=32 bytes, never
+/// leading with `-`. Stated as a charset, not a regex: `$` admits a trailing
+/// line terminator in JavaScript, which would let a consumer accept a tag the
+/// host refuses.
+#[cfg(test)]
+const VALID_TAG_CHARSET: &str = "abcdefghijklmnopqrstuvwxyz0123456789-";
+#[cfg(test)]
+const VALID_TAG_MAX_BYTES: usize = 32;
+
+fn dir_rule(directory: &str) -> Option<DirRule> {
+    DIR_RULES
+        .iter()
+        .find(|(name, _)| *name == directory)
+        .map(|(_, rule)| *rule)
 }
 
 /// The one bundle path grammar. The board's files-mode transport (install and
@@ -162,18 +229,100 @@ pub(crate) fn bundle_path_ok(path: &str) -> bool {
     }
     match segs.as_slice() {
         [name] => root_member(name),
-        ["workflows", leaf] => workflow_leaf_ok(leaf),
-        ["views", leaf] => *leaf == crate::issue::app_view::FILE,
-        ["rubrics", leaf] | ["templates", leaf] => plain_leaf_ok(leaf),
-        // CAD-1129: catalog icons and screenshots are flat `*.svg` leaves,
-        // capped at 128 bytes like the snapshot and catalogue walkers.
-        ["assets", leaf] => plain_leaf_ok(leaf) && leaf.ends_with(".svg") && leaf.len() <= 128,
+        [directory, leaf] => match dir_rule(directory) {
+            Some(DirRule::WorkflowMdTag) => workflow_leaf_ok(leaf),
+            Some(DirRule::Exact(name)) => *leaf == name,
+            Some(DirRule::VisibleLeaf) => plain_leaf_ok(leaf),
+            Some(DirRule::SvgLeaf { max_leaf_bytes }) => {
+                plain_leaf_ok(leaf) && leaf.ends_with(ASSET_SUFFIX) && leaf.len() <= max_leaf_bytes
+            }
+            // A screens package is a directory, never a flat leaf.
+            Some(DirRule::ScreensPackage) | None => false,
+        },
         // CAD-1006: one tag-named package dir per screen.
         ["screens", tag, leaf] => {
             crate::issue::model::valid_tag(tag) && crate::issue::app_screen_pkg::leaf_ok(leaf)
         }
         _ => false,
     }
+}
+
+/// The published grammar document, generated from [`ROOT_MEMBERS`],
+/// [`DIR_RULES`] and the caps. `contracts/bundle-grammar/v1/grammar.json` must
+/// equal this byte for byte; the test below refuses drift.
+#[cfg(test)]
+pub(crate) fn bundle_grammar_json() -> String {
+    let directories: Vec<serde_json::Value> = DIR_RULES
+        .iter()
+        .map(|(directory, rule)| match rule {
+            DirRule::WorkflowMdTag => {
+                serde_json::json!({ "dir": directory, "rule": "workflow_md_tag" })
+            }
+            DirRule::Exact(name) => {
+                serde_json::json!({ "dir": directory, "rule": "exact", "name": name })
+            }
+            DirRule::VisibleLeaf => serde_json::json!({ "dir": directory, "rule": "visible_leaf" }),
+            DirRule::SvgLeaf { max_leaf_bytes } => serde_json::json!({
+                "dir": directory,
+                "rule": "svg_leaf",
+                "maxLeafBytes": max_leaf_bytes,
+            }),
+            DirRule::ScreensPackage => serde_json::json!({
+                "dir": directory,
+                "rule": "screens_package",
+                "declaration": crate::issue::app_screen_pkg::SCREEN_MANIFEST,
+                "leaf": "tag_stem.(js|css|svg|json)",
+            }),
+        })
+        .collect();
+    let document = serde_json::json!({
+        "version": GRAMMAR_VERSION,
+        "rootFiles": ROOT_MEMBERS,
+        "segments": {
+            "asciiOnly": true,
+            "nonEmpty": true,
+            "forbidExact": [".", ".."],
+            "forbidLeadingDot": true,
+            "forbidBackslash": true,
+            "forbidNul": true,
+        },
+        "definitions": {
+            "validTag": {
+                "wholeInput": true,
+                "minBytes": 1,
+                "maxBytes": VALID_TAG_MAX_BYTES,
+                "charset": VALID_TAG_CHARSET,
+                "forbidLeading": "-",
+            },
+            "workflowMdTag": {
+                "segment": true,
+                "suffix": WORKFLOW_SUFFIX,
+                "stem": "validTag of the leaf with every trailing suffix removed",
+            },
+            "visibleLeaf": { "segment": true },
+            "svgLeaf": {
+                "segment": true,
+                "suffix": ASSET_SUFFIX,
+                "maxLeafBytes": ASSET_MAX_LEAF_BYTES,
+            },
+            "screensPackage": {
+                "path": "screens/<tag>/<leaf>",
+                "tag": "validTag",
+                "declaration": crate::issue::app_screen_pkg::SCREEN_MANIFEST,
+                "assetStem": "validTag",
+                "extensions": SCREEN_ASSET_EXTS,
+            },
+            "exact": { "leaf": "the name carried by the directory entry" },
+        },
+        "directories": directories,
+        "caps": {
+            "fileBytes": MAX_FILE_BYTES,
+            "screenAssetBytes": MAX_SCREEN_ASSET_BYTES,
+            "bundleBytes": MAX_APP_BYTES,
+            "files": MAX_FILES,
+        },
+    });
+    serde_json::to_string_pretty(&document).expect("grammar document serializes") + "\n"
 }
 
 #[cfg(test)]
@@ -220,6 +369,69 @@ mod bundle_grammar_tests {
             assert!(!bundle_path_ok(path), "{path}");
         }
         // The snapshot and catalogue walkers cap an asset leaf at 128 bytes.
+        assert!(bundle_path_ok(&format!("assets/{}.svg", "a".repeat(124))));
+        assert!(!bundle_path_ok(&format!("assets/{}.svg", "a".repeat(125))));
+    }
+
+    fn grammar_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("contracts/bundle-grammar/v1/grammar.json")
+    }
+
+    /// The published document is generated, never hand-written: this test is
+    /// the only thing keeping `contracts/bundle-grammar/v1/grammar.json` equal
+    /// to the predicate consumers are expected to apply.
+    #[test]
+    fn published_artifact_matches_the_predicate() {
+        let path = grammar_path();
+        let published = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        assert_eq!(
+            published,
+            bundle_grammar_json(),
+            "regenerate with `cargo test --lib regenerate_bundle_grammar -- --ignored`"
+        );
+    }
+
+    /// Regenerates the artifact. Ignored so an ordinary run can never bless
+    /// drifted bytes by rewriting them before comparing.
+    #[test]
+    #[ignore = "writes the checked-in grammar artifact"]
+    fn regenerate_bundle_grammar() {
+        let path = grammar_path();
+        std::fs::create_dir_all(path.parent().expect("grammar dir")).expect("create grammar dir");
+        std::fs::write(&path, bundle_grammar_json()).expect("write grammar");
+    }
+
+    /// The document's normative claims must match the functions that enforce
+    /// them, not just the table it was serialized from.
+    #[test]
+    fn published_definitions_match_the_predicate() {
+        for byte in VALID_TAG_CHARSET.bytes() {
+            let tag = format!("a{}", byte as char);
+            assert!(crate::issue::model::valid_tag(&tag), "{tag}");
+        }
+        assert!(crate::issue::model::valid_tag(
+            &"a".repeat(VALID_TAG_MAX_BYTES)
+        ));
+        // A trailing line terminator is the case a `$`-anchored regex would
+        // wrongly admit in JavaScript; the host refuses it.
+        for tag in ["", "-a", "A", "a_b", "a.b", "a ", "a\n"] {
+            assert!(!crate::issue::model::valid_tag(tag), "{tag}");
+        }
+        assert!(!crate::issue::model::valid_tag(
+            &"a".repeat(VALID_TAG_MAX_BYTES + 1)
+        ));
+        for ext in SCREEN_ASSET_EXTS {
+            assert!(
+                crate::issue::app_screen_pkg::leaf_ok(&format!("x.{ext}")),
+                "{ext}"
+            );
+        }
+        assert!(!crate::issue::app_screen_pkg::leaf_ok("x.txt"));
+        // The workflow rule strips every trailing suffix, as the document says.
+        assert!(bundle_path_ok("workflows/post.md.md"));
+        // The asset rule is bounded by the published leaf cap.
         assert!(bundle_path_ok(&format!("assets/{}.svg", "a".repeat(124))));
         assert!(!bundle_path_ok(&format!("assets/{}.svg", "a".repeat(125))));
     }
