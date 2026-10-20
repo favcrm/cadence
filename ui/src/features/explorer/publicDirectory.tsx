@@ -7,6 +7,7 @@ import { useHref, navigate } from "../../lib/useLocation";
 import { appExplorer, workspaceApps, APPS_CHANGED_EVENT, type HomeInstallation, type Installation } from "../workspace-apps/workspaceApps";
 import { loadFailureMessage, loadWithBackoff } from "../workspace-apps/installationsLoad";
 import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
+import { sessionHeaders } from "../../lib/sessionKey";
 import { installationAppHref } from "../apps/appViewModel";
 import AppCover from "./AppCover";
 import ReleasePanel, { InstalledActions } from "./releasePanel";
@@ -211,7 +212,7 @@ async function boardGet(path: string, signal: AbortSignal): Promise<Response> {
       credentials: "same-origin",
       cache: "no-store",
       signal,
-      headers: { "X-Cadence-Board": "1" },
+      headers: { "X-Cadence-Board": "1", ...sessionHeaders() },
     });
   } catch (error) {
     if (signal.aborted) throw error;

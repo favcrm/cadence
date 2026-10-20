@@ -1,29 +1,8 @@
-//! CAD-1471: the public app directory is a read-only document surface.
-//! It does not admit workspace reads or writes. The browser only talks to
-//! this board. The board reads the configured catalog origin itself, with
+//! CAD-1471/CAD-1638: the app catalogue is a signed-in read.
+//! The container no longer serves an anonymous directory; every document and
+//! `/api/public-apps*` request is admitted against the board session before
+//! dispatch. The board reads the configured catalog origin itself, with
 //! no cookies and no caller-chosen URL.
-
-/// SPA documents and the static files they need, plus nothing else.
-pub(super) fn directory_surface(path: &str) -> bool {
-    if path == "/apps/explore"
-        || path == "/favicon.svg"
-        || path == "/favicon.ico"
-        || path.starts_with("/assets/")
-    {
-        return path != "/assets/" && !path.contains("..");
-    }
-    let Some(id) = path.strip_prefix("/apps/catalog/") else {
-        return false;
-    };
-    !id.is_empty()
-        && !id.contains('/')
-        && !id.contains("..")
-        && !id.starts_with('.')
-        && id.len() <= 64
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-}
 
 /// Hosted boards retain their internal metadata route. Other boards use the
 /// operator's explicit catalog, or the public AgenticOS catalog by default.
@@ -266,21 +245,6 @@ fn fetch_public_catalog(url: &str) -> super::write_path::HttpResp {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn surface_is_only_the_directory_and_its_assets() {
-        assert!(directory_surface("/apps/explore"));
-        assert!(directory_surface("/apps/catalog/social-content"));
-        assert!(directory_surface("/assets/index.js"));
-        assert!(!directory_surface("/"));
-        assert!(!directory_surface("/apps"));
-        assert!(!directory_surface("/apps/manage/inst"));
-        assert!(!directory_surface("/api/apps"));
-        assert!(!directory_surface("/api/app-installations/upload"));
-        assert!(!directory_surface("/apps/catalog/a/b"));
-        assert!(!directory_surface("/apps/catalog/.."));
-        assert!(!directory_surface("/assets/"));
-    }
 
     #[test]
     fn the_catalog_is_the_board_api_or_a_named_catalog_never_the_web_app() {
