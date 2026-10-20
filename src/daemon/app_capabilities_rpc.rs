@@ -662,7 +662,7 @@ impl Shared {
         use std::os::unix::fs::MetadataExt;
 
         let agent = self.store.agent(alias)?;
-        if agent.provider != "pi" || agent.endpoint_kind != "managed" {
+        if !crate::adapter::registry::pi_family_managed(&agent.provider, &agent.endpoint_kind) {
             return Ok(false);
         }
         let Some(&tool_pid) = proof.segment.get(proof.segment.len().saturating_sub(2)) else {

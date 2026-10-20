@@ -2537,12 +2537,15 @@ impl Shared {
                     }
                 }
                 // CAD-556: the emitted Landlock policy for a confined
-                // pi worker — recomputed from the same inputs `open`
+                // Pi-family worker — recomputed from the same inputs `open`
                 // uses, like `master confinement` prints the master's.
-                // `confined` reports the launch intent on every
-                // pi/managed row so `agent show` answers "is it
-                // sandboxed" without parsing the argv.
-                if agent.provider == "pi" && agent.endpoint_kind == "managed" {
+                // `confined` reports the launch intent on every family row
+                // so `agent show` answers "is it sandboxed" without parsing
+                // the argv.
+                if crate::adapter::registry::pi_family_managed(
+                    &agent.provider,
+                    &agent.endpoint_kind,
+                ) {
                     if crate::master::is_master(&agent.alias) {
                         agent_json["confined"] = json!(crate::master::is_confined(
                             agent.params.as_ref(),
@@ -2552,11 +2555,13 @@ impl Shared {
                         let confined = adapter::pi::worker_confined(&agent);
                         agent_json["confined"] = json!(confined);
                         if confined {
-                            let (_exe, policy) = adapter::pi::pi_worker_confinement(
-                                &self.provider_env,
-                                &self.state_dir,
-                                &agent,
-                            );
+                            // The policy must be built with the environment
+                            // the adapter would launch with (omp's own
+                            // program), not the daemon's defaults.
+                            let env =
+                                adapter::provider_env_for(&agent.provider, &self.provider_env);
+                            let (_exe, policy) =
+                                adapter::pi::pi_worker_confinement(&env, &self.state_dir, &agent);
                             agent_json["confinement"] =
                                 json!({"read": policy.read, "write": policy.write});
                         }

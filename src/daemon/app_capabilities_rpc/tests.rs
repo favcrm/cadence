@@ -394,3 +394,168 @@ fn cad1096_quote_refusal_surfaces_only_a_bounded_code() {
     }
     assert_eq!(price_refusal("provider quote is not JSON"), bare);
 }
+
+// CAD-1633 independent admission acceptance, written by a reviewer other than
+// the implementer (AGENTS.md "Gates and security work"). It lives in this
+// in-crate module, not `tests/`, because `pi_bash_tool_session` is `pub(super)`.
+//
+// Guard proven: a direct, live, session-leading bash/sh child of a managed
+// pi-family endpoint is admitted, and family membership comes from the
+// managed-family predicate, not the provider name. Refused: managed codex and
+// pi/pty (outside the family), and a family row whose proof does not bind
+// (tool pid is not the caller session, tool is not a session leader, or the
+// tool executable is neither bash nor sh).
+
+fn cad1633_shared() -> (tempfile::TempDir, Arc<Shared>) {
+    let dir = tempfile::Builder::new()
+        .prefix("cad1633")
+        .tempdir()
+        .unwrap();
+    let pm = dir.path().join("pm");
+    crate::issue::Pm::init(&pm).unwrap();
+    let opts = ServeOptions::default();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+    let shared = Shared::new(dir.path(), &opts).unwrap();
+    (dir, shared)
+}
+
+fn cad1633_register(shared: &Shared, cwd: &Path, alias: &str, provider: &str, kind: &str) {
+    shared
+        .store
+        .register_agent(&crate::store::NewAgent {
+            alias,
+            provider,
+            endpoint_kind: kind,
+            role: "worker",
+            cwd: cwd.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+}
+
+fn cad1633_proof(alias: &str, root: u32, tool: u32) -> crate::slots::StrictCaller {
+    crate::slots::StrictCaller {
+        enrollment_id: "enr-cad1633".into(),
+        lane: alias.into(),
+        segment: vec![tool, root],
+    }
+}
+
+/// A spawned process killed (with its group) on drop.
+struct Tool(std::process::Child);
+
+impl Drop for Tool {
+    fn drop(&mut self) {
+        let pid = self.0.id() as i32;
+        // A session leader is its own process group: reap its children too.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn cad1633_spawn(program: &str, args: &[&str], session_leader: bool) -> Tool {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if session_leader {
+        // Mirrors pi's built-in bash tool: the spawned shell leads a new session.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    Tool(cmd.spawn().unwrap())
+}
+
+#[test]
+fn cad1633_managed_omp_bash_tool_session_is_admitted_like_managed_pi() {
+    let (dir, shared) = cad1633_shared();
+    cad1633_register(&shared, dir.path(), "omp-worker", "omp", "managed");
+    cad1633_register(&shared, dir.path(), "pi-worker", "pi", "managed");
+    let root = std::process::id();
+    for program in ["/bin/sh", "/bin/bash"] {
+        let tool = cad1633_spawn(program, &["-c", "sleep 30; true"], true);
+        let pid = tool.0.id();
+        for alias in ["omp-worker", "pi-worker"] {
+            let proof = cad1633_proof(alias, root, pid);
+            let admitted = shared.pi_bash_tool_session(alias, &proof, pid).unwrap();
+            assert!(
+                admitted,
+                "{alias} bash tool child via {program} must be admitted"
+            );
+        }
+    }
+}
+
+#[test]
+fn cad1633_non_family_endpoints_stay_refused_even_with_a_bound_bash_proof() {
+    let (dir, shared) = cad1633_shared();
+    cad1633_register(&shared, dir.path(), "codex-worker", "codex", "managed");
+    cad1633_register(&shared, dir.path(), "pi-pty", "pi", "pty");
+    let root = std::process::id();
+    let tool = cad1633_spawn("/bin/sh", &["-c", "sleep 30; true"], true);
+    let pid = tool.0.id();
+    for alias in ["codex-worker", "pi-pty"] {
+        let proof = cad1633_proof(alias, root, pid);
+        let admitted = shared.pi_bash_tool_session(alias, &proof, pid).unwrap();
+        assert!(
+            !admitted,
+            "{alias} is outside the pi family and must stay refused"
+        );
+    }
+}
+
+#[test]
+fn cad1633_family_row_with_an_unbound_proof_stays_refused() {
+    let (dir, shared) = cad1633_shared();
+    cad1633_register(&shared, dir.path(), "omp-worker", "omp", "managed");
+    let root = std::process::id();
+
+    // Tool pid does not own the caller session: the caller is this test process.
+    let tool = cad1633_spawn("/bin/sh", &["-c", "sleep 30; true"], true);
+    let pid = tool.0.id();
+    let proof = cad1633_proof("omp-worker", root, pid);
+    assert!(
+        !shared
+            .pi_bash_tool_session("omp-worker", &proof, root)
+            .unwrap(),
+        "a caller session that is not the tool pid must be refused"
+    );
+
+    // Tool is not a session leader: same shell without setsid, caller session = its pid.
+    let plain = cad1633_spawn("/bin/sh", &["-c", "sleep 30; true"], false);
+    let plain_pid = plain.0.id();
+    let proof = cad1633_proof("omp-worker", root, plain_pid);
+    assert!(
+        !shared
+            .pi_bash_tool_session("omp-worker", &proof, plain_pid)
+            .unwrap(),
+        "a tool that is not its own session leader must be refused"
+    );
+
+    // Tool executable is not bash/sh: a session leader running sleep.
+    let other = cad1633_spawn("/bin/sleep", &["30"], true);
+    let other_pid = other.0.id();
+    let proof = cad1633_proof("omp-worker", root, other_pid);
+    assert!(
+        !shared
+            .pi_bash_tool_session("omp-worker", &proof, other_pid)
+            .unwrap(),
+        "a session-leading tool that is not bash/sh must be refused"
+    );
+}

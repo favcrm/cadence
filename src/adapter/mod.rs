@@ -858,12 +858,7 @@ pub fn build(
             // explicit command must win, or a test daemon would spawn the real
             // binary.
             "omp" => {
-                // A blank override is the same as an absent one: it would
-                // otherwise reach the adapter and fall back to bare `pi`.
-                let env = match env.var("CADENCE_PI_COMMAND") {
-                    Some(value) if !value.trim().is_empty() && value.trim() != "pi" => env.clone(),
-                    _ => env.with_var("CADENCE_PI_COMMAND", "omp"),
-                };
+                let env = provider_env_for("omp", env);
                 Ok(Box::new(pi::PiAdapter::new(
                     hooks, log_path, &env, agent_uid,
                 )))
@@ -939,6 +934,22 @@ pub fn build(
     }
 }
 
+/// The environment an endpoint actually launches with. The omp arm runs the
+/// Pi adapter on its own program: an absent, blank or default-`pi` command is
+/// replaced on a copy (never the shared map), and every other command —
+/// including a fixture's sealed one — is preserved. Display code that
+/// recomputes launch policy (confinement) must use this, or it reports the
+/// wrong program's grants.
+pub fn provider_env_for(provider: &str, env: &ProviderEnv) -> ProviderEnv {
+    if provider != "omp" {
+        return env.clone();
+    }
+    match env.var("CADENCE_PI_COMMAND") {
+        Some(value) if !value.trim().is_empty() && value.trim() != "pi" => env.clone(),
+        _ => env.with_var("CADENCE_PI_COMMAND", "omp"),
+    }
+}
+
 fn require_split_launch_path(
     agent_uid: Option<u32>,
     provider: &str,
@@ -947,11 +958,12 @@ fn require_split_launch_path(
     if agent_uid.is_none() {
         return Ok(());
     }
-    // `pty` and `fake` carry their own split proofs. `managed`+`pi` is the
-    // single managed seam under construction (CAD-1012) — it constructs so
-    // `open` can reach the fail-closed protected-prereq gate, never to launch.
-    let allowed =
-        matches!(endpoint_kind, "pty" | "fake") || (endpoint_kind == "managed" && provider == "pi");
+    // `pty` and `fake` carry their own split proofs. A `managed` row of the
+    // Pi family (pi, omp) is the single managed seam under construction
+    // (CAD-1012) — it constructs so `open` can reach the fail-closed
+    // protected-prereq gate, never to launch.
+    let allowed = matches!(endpoint_kind, "pty" | "fake")
+        || crate::adapter::registry::pi_family_managed(provider, endpoint_kind);
     if !allowed {
         return Err(crate::error::Error::rejected(
             "This endpoint does not implement protected agent-UID launch; refusing operator-UID fallback",
@@ -966,10 +978,10 @@ mod split_launch_tests {
     use crate::store::Agent;
     #[test]
     fn actual_adapter_entrypoint_refuses_every_uncovered_provider_and_master() {
-        // managed/pi is the one constructed seam — it is covered separately
-        // below: build succeeds so `open` can reach the fail-closed
-        // protected-prereq gate, but no launch can occur. Every other
-        // provider/endpoint still refuses at construction.
+        // A managed Pi-family row is the one constructed seam — it is
+        // covered separately below: build succeeds so `open` can reach the
+        // fail-closed protected-prereq gate, but no launch can occur. Every
+        // other provider/endpoint still refuses at construction.
         for (provider, endpoint) in [
             ("claude", "managed"),
             ("codex", "managed"),
@@ -1030,61 +1042,70 @@ mod split_launch_tests {
             }
         }
     }
-    /// managed+pi constructs under split so `open` reaches the protected
-    /// gate — but `open` itself must fail closed on the unavailable external
-    /// prerequisites. Construction is not launch authority.
+    /// A managed Pi-family row constructs under split so `open` reaches the
+    /// protected gate — but `open` itself must fail closed on the
+    /// unavailable external prerequisites. Construction is not launch
+    /// authority.
     #[test]
-    fn managed_pi_constructs_but_open_fails_closed_on_prereqs() {
-        let agent = Agent {
-            alias: "fixture-worker".into(),
-            uid: "agt-fixture-worker".into(),
-            provider: "pi".into(),
-            endpoint_kind: "managed".into(),
-            role: "worker".into(),
-            team_role: None,
-            cwd: "/tmp".into(),
-            sandbox: "".into(),
-            instructions: None,
-            thread_id: None,
-            session_id: None,
-            model: None,
-            effort: None,
-            pid: None,
-            pid_start: None,
-            endpoint: None,
-            params: Some(serde_json::json!({"model":"devin/swe-2-high"})),
-            model_selection: None,
-            quota: None,
-            generation: None,
-            state: "registered".into(),
-            enabled: true,
-            error: None,
-            created: 0.0,
-            updated: 0.0,
-        };
-        let hooks = AdapterHooks {
-            on_event: Box::new(|_, _| {}),
-            on_request: Box::new(|_| {}),
-        };
-        let adapter = build(
-            &agent,
-            hooks,
-            std::path::Path::new("/nonexistent/fixture.log"),
-            &ProviderEnv::refusing_providers(),
-            Some(21001),
-        )
-        .unwrap_or_else(|e| panic!("managed/pi constructs under split: {e}"));
-        // open() must fail closed — the protected prerequisites are absent.
-        let e = match adapter.open(&agent) {
-            Err(e) => e,
-            Ok(_) => panic!("open succeeded with the prerequisites unavailable"),
-        };
-        assert!(e.to_string().contains("UNKNOWN"), "{e}");
+    fn managed_pi_family_constructs_but_open_fails_closed_on_prereqs() {
+        for provider in ["pi", "omp"] {
+            let agent = Agent {
+                alias: "fixture-worker".into(),
+                uid: "agt-fixture-worker".into(),
+                provider: provider.into(),
+                endpoint_kind: "managed".into(),
+                role: "worker".into(),
+                team_role: None,
+                cwd: "/tmp".into(),
+                sandbox: "".into(),
+                instructions: None,
+                thread_id: None,
+                session_id: None,
+                model: None,
+                effort: None,
+                pid: None,
+                pid_start: None,
+                endpoint: None,
+                params: Some(serde_json::json!({"model":"devin/swe-2-high"})),
+                model_selection: None,
+                quota: None,
+                generation: None,
+                state: "registered".into(),
+                enabled: true,
+                error: None,
+                created: 0.0,
+                updated: 0.0,
+            };
+            let hooks = AdapterHooks {
+                on_event: Box::new(|_, _| {}),
+                on_request: Box::new(|_| {}),
+            };
+            let adapter = build(
+                &agent,
+                hooks,
+                std::path::Path::new("/nonexistent/fixture.log"),
+                &ProviderEnv::refusing_providers(),
+                Some(21001),
+            )
+            .unwrap_or_else(|e| panic!("managed/{provider} constructs under split: {e}"));
+            // open() must fail closed — the protected prerequisites are absent.
+            let e = match adapter.open(&agent) {
+                Err(e) => e,
+                Ok(_) => panic!("{provider}: open succeeded with the prerequisites unavailable"),
+            };
+            assert!(e.to_string().contains("UNKNOWN"), "{provider}: {e}");
+        }
     }
     #[test]
     fn split_managed_and_remote_paths_refuse_before_constructors() {
-        // pi/managed constructs; every other managed/remote path refuses.
-        assert!(require_split_launch_path(Some(21001), "pi", "managed").is_ok());
+        // The managed Pi family constructs; every other managed/remote
+        // path refuses.
+        for provider in ["pi", "omp"] {
+            assert!(
+                require_split_launch_path(Some(21001), provider, "managed").is_ok(),
+                "{provider}/managed"
+            );
+        }
         for (provider, endpoint) in [
             ("claude", "managed"),
             ("codex", "managed"),
@@ -1093,6 +1114,9 @@ mod split_launch_tests {
             ("pi", "managed-ws"),
             ("pi", "cloud"),
             ("pi", "unknown"),
+            ("omp", "managed-ws"),
+            ("omp", "cloud"),
+            ("omp", "unknown"),
         ] {
             assert!(
                 require_split_launch_path(Some(21001), provider, endpoint).is_err(),
@@ -1121,6 +1145,56 @@ mod tests {
         let omp = env.with_var("CADENCE_PI_COMMAND", "omp");
         assert_eq!(env.var("CADENCE_PI_COMMAND").as_deref(), Some("pi"));
         assert_eq!(omp.var("CADENCE_PI_COMMAND").as_deref(), Some("omp"));
+    }
+
+    /// CAD-1624/CAD-1633: the omp endpoint runs its own program only when
+    /// the configured command is absent, blank or the bare default `pi`;
+    /// any explicit command (operator or sealed fixture) wins, and the
+    /// shared map is never mutated. Display code recomputing launch policy
+    /// uses the same rule.
+    #[test]
+    fn provider_env_keeps_explicit_commands_and_defaults_omp() {
+        let absent = ProviderEnv::default();
+        assert_eq!(
+            provider_env_for("omp", &absent)
+                .var("CADENCE_PI_COMMAND")
+                .as_deref(),
+            Some("omp")
+        );
+        for default in ["", "   ", "pi", " pi "] {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_PI_COMMAND", default);
+            assert_eq!(
+                provider_env_for("omp", &env)
+                    .var("CADENCE_PI_COMMAND")
+                    .as_deref(),
+                Some("omp"),
+                "{default:?}"
+            );
+            assert_eq!(
+                env.var("CADENCE_PI_COMMAND").as_deref(),
+                Some(default),
+                "shared env mutated for {default:?}"
+            );
+        }
+        for explicit in ["/bin/false", "/opt/omp/bin/omp --flag"] {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_PI_COMMAND", explicit);
+            assert_eq!(
+                provider_env_for("omp", &env)
+                    .var("CADENCE_PI_COMMAND")
+                    .as_deref(),
+                Some(explicit)
+            );
+        }
+        let env = ProviderEnv::default();
+        env.set("CADENCE_PI_COMMAND", "pi");
+        assert_eq!(
+            provider_env_for("pi", &env)
+                .var("CADENCE_PI_COMMAND")
+                .as_deref(),
+            Some("pi")
+        );
     }
 
     /// CAD-1009: the slot stands for the token wherever the daemon's
