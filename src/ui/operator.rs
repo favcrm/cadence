@@ -1133,10 +1133,11 @@ fn require_own_origin(request: &Request, origin: Origin) -> Result<(), HttpResp>
 
 /// Ask the daemon whether `token` is a live session on `origin`.
 /// The header carrying a session's second credential (review round 2,
-/// PR #249). The page holds it in `sessionStorage` — scoped to its exact
-/// origin, port included — so a listener on another port that receives
-/// the cookie (cookies ignore ports) never has it, and a cross-site page
-/// cannot set a custom header without a preflight this board refuses.
+/// PR #249). The page keeps it in this browser's `localStorage` — scoped
+/// to its exact origin, port included — so a listener on another port
+/// that receives the cookie (cookies ignore ports) never has it, and a
+/// cross-site page cannot set a custom header without a preflight this
+/// board refuses.
 /// Public sessions (CAD-526) have no page key: the `__Host-` cookie is
 /// the whole credential on an origin no other port can share.
 pub(super) const SESSION_HEADER: &str = "X-Cadence-Session";
@@ -1830,10 +1831,10 @@ pub(super) fn meta(
         "session": session.flatten(),
         "login_hint": hint,
         "device_login": device_login,
-        // A cookie but no live session for this page: typically a new
-        // tab — the key lives in the signing-in tab's `sessionStorage`.
-        // Public sessions have no page key, so the cookie alone answers.
-        // An unanswerable check is NOT this state.
+        // A cookie but no live session for this browser: typically its
+        // key storage was cleared. Public sessions have no page key, so
+        // the cookie alone answers. An unanswerable check is NOT this
+        // state.
         "tab_signed_out": cookie && proven_signed_out,
     })
 }
@@ -1976,8 +1977,8 @@ pub(super) fn open(
     }
     let now = crate::issue::time::now_epoch();
     let expires = opened["session"]["expires_at"].as_i64().unwrap_or(now);
-    // The key goes to this page only, once: it keeps it in
-    // `sessionStorage` and sends it as `X-Cadence-Session`.
+    // The key goes to this browser only, once: it keeps it in
+    // `localStorage` and sends it as `X-Cadence-Session`.
     let key = opened["key"].as_str().unwrap_or_default();
     let body = serde_json::to_vec(&json!({ "session_key": key })).unwrap_or_default();
     let mut resp = Response::from_data(body).with_status_code(StatusCode(200));

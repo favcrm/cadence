@@ -656,10 +656,11 @@ pub struct SessionView {
 pub struct Opened {
     pub token: String,
     /// The session's second credential (review round 2, PR #249): the
-    /// page keeps it in `sessionStorage` — scoped to its exact origin,
-    /// port included — and sends it as `X-Cadence-Session` on every
-    /// write. A cookie leaked to another port's listener is worthless
-    /// without it, and a cross-site request cannot set the header.
+    /// page keeps it in this browser's `localStorage` — scoped to its
+    /// exact origin, port included — and sends it as
+    /// `X-Cadence-Session` on every write. A cookie leaked to another
+    /// port's listener is worthless without it, and a cross-site request
+    /// cannot set the header.
     pub key: String,
     pub session: SessionView,
 }

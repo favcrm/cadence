@@ -2,7 +2,7 @@ import { Activity, useCallback, useEffect, useRef, useState, type ReactNode } fr
 import { api, ApiError } from "../../lib/api";
 import { useLocale } from "../../lib/locale";
 import { allowPrivateReads, pausePrivateReads, privateSessionGeneration, resetPrivateSession } from "../../lib/privateSession";
-import { sessionKey, setSessionKey } from "../../lib/sessionKey";
+import { applySharedSessionChange, sessionKey, setSessionKey } from "../../lib/sessionKey";
 import type { Meta } from "../../lib/types";
 import { navigate, useHref } from "../../lib/useLocation";
 import { Logo } from "../../ui/Logo";
@@ -225,6 +225,15 @@ export default function AuthBoundary({ children }: {
       publish({ ...previous, status: expired ? "expired" : "signedout", accepted: null, generation: privateSessionGeneration() });
     };
     const focused = () => { if (!document.hidden) void recheck(); };
+    const online = () => { void recheck(); };
+    const shared = (event: StorageEvent) => {
+      // Another tab replaced or removed the shared key. Drop this tab's
+      // fallback copy and let `changed` re-verify (or sign out) before any
+      // further private work.
+      if (applySharedSessionChange(event)) changed();
+    };
+    window.addEventListener("online", online);
+    window.addEventListener("storage", shared);
     window.addEventListener("cadence:session-changed", changed);
     window.addEventListener("cadence:session-ending", ending);
     window.addEventListener("cadence:session-ended", finished);
@@ -245,9 +254,21 @@ export default function AuthBoundary({ children }: {
       window.removeEventListener("cadence:session-logout-unavailable", logoutUnavailable);
       window.removeEventListener("cadence:session-required", required);
       window.removeEventListener("focus", focused);
+      window.removeEventListener("online", online);
+      window.removeEventListener("storage", shared);
       document.removeEventListener("visibilitychange", focused);
     };
   }, [discard, publish, recheck]);
+
+  // A local daemon restart or a brief identity outage leaves the session
+  // intact (`unavailable` is not a sign-out). Retry on a short cadence so
+  // the workspace comes back by itself instead of waiting for the 30 s
+  // heartbeat or a manual click.
+  useEffect(() => {
+    if (state.status !== "unavailable") return;
+    const timer = window.setInterval(() => { void recheck(); }, 3_000);
+    return () => window.clearInterval(timer);
+  }, [state.status, recheck]);
 
   useEffect(() => {
     if (state.status !== "ready" && state.status !== "checking") title.current?.focus();
@@ -287,8 +308,8 @@ export default function AuthBoundary({ children }: {
   const hostedLogin = `/__platform/login?to=${encodeURIComponent(new URL(loginRoute ? returnDestination() : safeReturnPath(href) ?? "/", location.origin).href)}`;
   const checking = state.status === "checking";
   const copy: Record<Exclude<Status, "ready">, { eyebrow: string; heading: string; text: string; icon: "lock" | "alert" | "shield" | "clock" }> = {
-    checking: { eyebrow: !state.meta || hosted ? "Secure workspace" : "Local Cadence UI", heading: "Checking your session", text: !state.meta || hosted ? "Just a moment while we verify your access. Your workspace stays private until the check is complete." : "Verifying this tab’s session with the local Cadence daemon. Nothing from your workspace is shown before access is confirmed.", icon: "lock" },
-    signedout: { eyebrow: hosted ? "Welcome to Cadence" : "Local Cadence UI", heading: hosted ? "Your work, behind a sign-in." : "Sign in to your local board.", text: hosted ? "Sign in with AgenticOS to open your workspace. We’ll bring you back here once your access is verified." : "On the computer running Cadence, run the command below. Open the one-use sign-in link in this browser tab.", icon: "lock" },
+    checking: { eyebrow: !state.meta || hosted ? "Secure workspace" : "Local Cadence UI", heading: "Checking your session", text: !state.meta || hosted ? "Just a moment while we verify your access. Your workspace stays private until the check is complete." : "Verifying this browser’s session with the local Cadence daemon. Nothing from your workspace is shown before access is confirmed.", icon: "lock" },
+    signedout: { eyebrow: hosted ? "Welcome to Cadence" : "Local Cadence UI", heading: hosted ? "Your work, behind a sign-in." : "Sign in to your local board.", text: hosted ? "Sign in with AgenticOS to open your workspace. We’ll bring you back here once your access is verified." : "On the computer running Cadence, run the command below. Open the one-use sign-in link in this browser.", icon: "lock" },
     unavailable: { eyebrow: "Verification unavailable", heading: "We couldn’t verify your session.", text: "This doesn’t mean you’ve been signed out. The connection may be interrupted. Retry to confirm your access.", icon: "alert" },
     refused: { eyebrow: hosted ? "Access required" : "Local session refused", heading: hosted ? "This workspace isn’t available to you." : "This link can’t sign you in.", text: hosted ? "Your account is signed in, but doesn’t have access to this workspace. Ask its owner for an invitation, or use another account." : "The sign-in link may have expired or already been used. Generate a fresh link on the computer running Cadence.", icon: "shield" },
     expired: { eyebrow: "Session ended", heading: "Sign in to continue.", text: "Your session has expired. Workspace content has been cleared from this view. Sign in again to reopen your work.", icon: "clock" },
@@ -318,13 +339,13 @@ export default function AuthBoundary({ children }: {
             <p className="auth-eyebrow">{t(gate.eyebrow)}</p>
             <h1 id="auth-title" ref={title} tabIndex={-1}>{t(gate.heading)}</h1>
             <p className="auth-intro">{t(gate.text)}</p>
-            {checking ? <p role="status" className="auth-session-line">{t(hosted ? "Verifying session & workspace access" : "Confirming this tab’s local session")}</p> : <div className="auth-actions">
+            {checking ? <p role="status" className="auth-session-line">{t(hosted ? "Verifying session & workspace access" : "Confirming this browser’s local session")}</p> : <div className="auth-actions">
               {state.status === "unavailable" ? <>
                 <Button variant="primary" full onClick={() => { retryFocus.current = true; void recheck(); }}>{t("Retry verification")}</Button>
                 {hosted ? <a className="auth-back-link" href={hostedLogin}>{t("Use another account")}</a> : <details className="auth-new-signin">
                   <summary className="auth-back-link">{t("Start a new local sign-in")}</summary>
                   <div className="auth-login-command"><code>{state.meta?.login_hint ?? SIGN_IN_COMMAND}</code><span aria-hidden="true">›_</span></div>
-                  <p className="auth-quiet">{t("A fresh link is required for each tab. No AgenticOS account is needed for local operator login.")}</p>
+                  <p className="auth-quiet">{t("A fresh link is required only when this browser has no saved session. No AgenticOS account is needed for local operator login.")}</p>
                   {state.meta?.device_login === true && <DeviceSignIn onSignedIn={onSignedIn} />}
                 </details>}
               </> : hosted ? <>
@@ -332,7 +353,7 @@ export default function AuthBoundary({ children }: {
                 <p className="auth-quiet auth-centered">{t("No separate Cadence account needed.")}</p>
               </> : <>
                 <div className="auth-login-command"><code>{state.meta?.login_hint ?? SIGN_IN_COMMAND}</code><span aria-hidden="true">›_</span></div>
-                <p className="auth-quiet">{t("A fresh link is required for each tab. No AgenticOS account is needed for local operator login.")}</p>
+                <p className="auth-quiet">{t("A fresh link is required only when this browser has no saved session. No AgenticOS account is needed for local operator login.")}</p>
                 {state.meta?.device_login === true && <DeviceSignIn onSignedIn={onSignedIn} />}
                 <button className="auth-back-link" onClick={() => { void recheck(); }}>{t("Check again")}</button>
               </>}
@@ -340,7 +361,7 @@ export default function AuthBoundary({ children }: {
             {!checking && <p className="auth-assurance"><GateIcon kind="shield" /><span>{t("Workspace content only appears after access is confirmed.")}</span></p>}
           </section>}
         </main>
-        <footer className="auth-public-footer"><GateIcon kind="lock" />{t(hosted ? "Protected by AgenticOS" : "Tab-bound Cadence session")}</footer>
+        <footer className="auth-public-footer"><GateIcon kind="lock" />{t(hosted ? "Protected by AgenticOS" : "Browser-bound Cadence session")}</footer>
       </div>}
       {state.accepted !== null && !loginRoute && <Activity key={state.generation} mode={showGate ? "hidden" : "visible"}>{children(state.accepted, recheck)}</Activity>}
     </div>

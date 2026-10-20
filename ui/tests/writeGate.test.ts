@@ -44,6 +44,6 @@ equal(parseLoginNonce("#n="), null, "empty");
 equal(parseLoginNonce(""), null, "no fragment");
 console.log("write gate checks passed");
 
-// A cookie but no key for this tab: say that each tab signs in.
+// A cookie but no key for this browser: say that the browser is not signed in.
 const tab = writeBlock({ ...base, signed_in: false, tab_signed_out: true, login_hint: "cadence ui login" }) ?? "";
-equal(tab.includes("each tab signs in"), true, "new-tab reason");
+equal(tab.includes("browser isn’t signed in"), true, "missing-key reason");

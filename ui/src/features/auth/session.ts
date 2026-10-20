@@ -43,8 +43,8 @@ async function sessionPost(path: string, body: object, signal?: AbortSignal): Pr
 
 /**
  * `POST /api/session` — exchange the nonce for the session: the server
- * sets the HttpOnly cookie and answers `{session_key}`, which this tab
- * keeps in `sessionStorage` and sends on every request.
+ * sets the HttpOnly cookie and answers `{session_key}`, which this
+ * browser keeps in `localStorage` and sends on every request.
  */
 export async function openSession(nonce: string): Promise<void> {
   nonceRequest?.abort();

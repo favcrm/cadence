@@ -60,19 +60,25 @@ var ConditionalGet = class {
 /**
 * The operator session's second credential (CAD-313, review round 2 of
 * PR #249). The board's HttpOnly cookie alone is no session: every
-* request also carries `X-Cadence-Session: <key>`. The key lives in
-* THIS tab's `sessionStorage` — scoped to the exact origin, port
-* included — so a server on another port that receives the cookie
-* (cookies ignore ports) never sees it, and a cross-site page cannot
-* set the header. It survives a reload; a new tab signs in again.
+* request also carries `X-Cadence-Session: <key>`. The key is scoped to
+* the exact origin, port included — so a server on another port that
+* receives the cookie (cookies ignore ports) never sees it, and a
+* cross-site page cannot set the header.
+*
+* It lives in `localStorage` so the same browser (a new tab, a reload,
+* or a browser restart) keeps the session the cookie already carries;
+* `sessionStorage` is read as a fallback so a tab opened before this
+* change still works, and written too so a store that blocks
+* `localStorage` degrades to the old per-tab behavior instead of
+* signing out. Clearing the key is what ends this browser's session.
 */
-var STORE = "cadence.sessionKey";
+var SESSION_KEY_STORE = "cadence.sessionKey";
 function sessionKey() {
-	try {
-		return sessionStorage.getItem(STORE);
-	} catch {
-		return null;
-	}
+	for (const kind of ["local", "session"]) try {
+		const key = (kind === "local" ? globalThis.localStorage : globalThis.sessionStorage).getItem(SESSION_KEY_STORE);
+		if (key) return key;
+	} catch {}
+	return null;
 }
 //#endregion
 //#region src/lib/privateSession.ts

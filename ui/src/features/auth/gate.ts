@@ -31,7 +31,7 @@ export function writeBlock(meta: Meta | null): string | null {
   if (meta.signed_in === false) {
     const cmd = meta.login_hint ?? SIGN_IN_COMMAND;
     if (meta.tab_signed_out) {
-      return `This tab is not signed in — each tab signs in on its own. Run ${cmd} and open the new link in this tab.`;
+      return `This browser isn’t signed in — run ${cmd} and open the new link here.`;
     }
     return `Sign in with ${cmd} to act as the operator.`;
   }
