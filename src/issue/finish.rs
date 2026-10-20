@@ -63,7 +63,8 @@ pub(crate) use evidence::{branch_tip, not_started};
 pub(crate) use git::{default_ref, git, git_branch, merge_rule};
 pub(crate) use guard::cwd_holder_aliases;
 pub(crate) use run::{run, FinishArgs};
-pub(crate) use sweep::{lexical_path, registered_branch_path, same_path, sweep, sweep_selected};
+pub use sweep::sweep;
+pub(crate) use sweep::{lexical_path, registered_branch_path, same_path, sweep_selected};
 
 #[cfg(test)]
 mod tests {
