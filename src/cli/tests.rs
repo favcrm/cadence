@@ -46,6 +46,21 @@ fn send_wait_refuses_flags_that_the_ask_path_cannot_carry() {
 }
 
 #[test]
+fn send_wait_and_message_ask_accept_the_same_wait_values() {
+    for secs in ["0", "1", "600", "601"] {
+        assert!(
+            Cli::try_parse_from(["cadence", "send", "w", "--wait", secs]).is_ok(),
+            "send --wait {secs}"
+        );
+        assert!(
+            Cli::try_parse_from(["cadence", "message", "ask", "w", "--text", "hi", "--wait", secs])
+                .is_ok(),
+            "message ask --wait {secs}"
+        );
+    }
+}
+
+#[test]
 fn hosted_enrollment_cli_requires_explicit_trust_and_has_no_secret_argv() {
     let args = [
         "cadence",

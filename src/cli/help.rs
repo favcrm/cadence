@@ -395,7 +395,7 @@ fn master_listing() -> String {
             Some(h) => (h, true),
             None => (inner, false),
         };
-        if head == "help" {
+        if head == "help" || head == "master dispatch" {
             continue;
         }
         out.push_str(&format!(
@@ -702,5 +702,12 @@ mod tests {
     fn help_all_lists_nested_paths() {
         let all = all_help_text();
         assert!(all.contains("    issue epic stage\n"), "{all}");
+    }
+
+    #[test]
+    fn master_listing_shows_canonical_dispatch_only() {
+        let listing = master_listing();
+        assert!(listing.contains("cadence dispatch"));
+        assert!(!listing.contains("cadence master dispatch"));
     }
 }
