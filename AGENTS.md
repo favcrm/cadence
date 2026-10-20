@@ -421,10 +421,12 @@ name. Never run `rm <scratchpad>/*`.
   write because of a Git-global state. A legacy or foreign `.write.lock`
   is not this build's crash to clear: never delete it as routine, and
   never treat a file's age as authority.
-- The operator-facing recovery flow for an interrupted write is a separate
-  operator decision, not something an agent performs. Until it exists, the
-  only remedy is the tracker's owner settling the leftovers by hand; an
-  agent may explain the evidence, never choose or perform that mutation.
+- The operator-facing recovery flow for an interrupted write is
+  `cadence issue recover review|decide|execute|status` (CAD-1601, merged).
+  Running it is a separate operator decision, not something an agent
+  performs: `review` is read-only, and `decide`/`execute` require an
+  operator connection. An agent may explain the evidence the review shows,
+  never choose the outcome or perform that mutation.
 - `~/pm` is written only through the `cadence issue …` commands. Never edit
   the PM dir, the marker, the snapshot or the index by hand, and never
   impersonate an operator to get around a refusal.
