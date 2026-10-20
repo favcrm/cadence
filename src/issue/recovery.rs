@@ -519,15 +519,20 @@ fn execute_inner(
                     .collect();
                 let mut worktree_preimages: Vec<Value> = Vec::new();
                 for p in &selected {
-                    let regular = std::fs::symlink_metadata(pm.dir.join(p))
-                        .map(|m| m.is_file())
-                        .map_err(|e| {
-                            Error::internal(format!(
+                    // A path absent from the working tree (a staged
+                    // deletion) has no worktree layer to preserve.
+                    let state = match std::fs::symlink_metadata(pm.dir.join(p)) {
+                        Ok(m) => Some(m),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            return Err(Error::internal(format!(
                                 "the state of {p} could not be read ({e}); nothing was \
                                  discarded. A retry is safe once the filesystem is readable."
-                            ))
-                        })?;
-                    if !regular {
+                            )))
+                        }
+                    };
+                    let Some(meta) = state else { continue };
+                    if !meta.is_file() {
                         continue;
                     }
                     let blob = git(&pm.dir, &["hash-object", "-w", "--no-filters", "--", p])

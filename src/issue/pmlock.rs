@@ -800,9 +800,14 @@ fn read_snapshot(git_dir: &Path) -> Result<Option<HashSet<String>>> {
         Err(e) => return Err(io_unknown(&path, "the dirty-path snapshot", e)),
     };
     let mut buf = Vec::new();
-    file.take(16 << 20)
+    // One byte past the cap: a snapshot larger than this build reads is
+    // truncated, so its protected set is unknown and it is not trusted.
+    file.take((16 << 20) + 1)
         .read_to_end(&mut buf)
         .map_err(|e| io_unknown(&path, "the dirty-path snapshot", e))?;
+    if buf.len() > (16 << 20) {
+        return Ok(None);
+    }
     let mut names: Vec<String> = String::from_utf8_lossy(&buf)
         .split('\0')
         .filter(|p| !p.is_empty())
@@ -845,14 +850,15 @@ fn files_since(
     let mut visited = 0usize;
     while let Some(dir) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(root.join(&dir)) else {
-            continue;
+            // A directory that cannot be read makes the scan incomplete.
+            return true;
         };
         for e in rd.flatten() {
             visited += 1;
             if out.len() >= CAP || visited > 500_000 {
                 return true;
             }
-            let Ok(m) = e.metadata() else { continue };
+            let Ok(m) = e.metadata() else { return true };
             let name = format!("{dir}/{}", e.file_name().to_string_lossy());
             if m.is_dir() {
                 stack.push(name);

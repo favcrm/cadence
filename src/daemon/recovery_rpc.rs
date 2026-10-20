@@ -32,6 +32,7 @@ fn with_note(e: Error, note: &str) -> Error {
         "conflict" => Error::conflict_coded(known_code(code, "recovery_failed"), msg),
         "busy" => Error::busy_coded(known_code(code, "resource_busy"), msg),
         "gate" => Error::gate_coded(known_code(code, "recovery_gate"), msg),
+        "unknown" => Error::unknown(msg),
         "internal" => Error::internal(msg),
         _ => Error::rejected(msg),
     }
