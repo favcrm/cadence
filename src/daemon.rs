@@ -104,6 +104,8 @@ mod cad1537_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1562_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
+mod cad1588_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
 mod cad1590_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad225_unattended_acceptance;
@@ -133,7 +135,6 @@ mod identity;
 #[cfg(target_os = "linux")]
 mod installer_client;
 mod installer_enrollment_wire;
-mod whatsapp_rpc;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRecord;
 mod bootstrap_files;
@@ -181,6 +182,7 @@ mod topics_rpc;
 mod unattended;
 mod unattended_landing;
 mod watch;
+mod whatsapp_rpc;
 mod wiki_rpc;
 
 use crate::adapter;
