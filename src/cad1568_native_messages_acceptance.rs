@@ -952,6 +952,74 @@ fn cad1568_hosted_cli_scenario() {
         conversations["cad1568-packaged-roundtrip"]
     );
 
+    // Body boundary on the remote send: a body at exactly the enqueue cap
+    // is accepted and stored whole, and one byte over is refused locally
+    // before any request — never truncated, never silently cut.
+    let cap = cadence_agent::store::ENQUEUE_BYTES;
+    let at_cap_body = root.path().join("cad1568-at-cap.txt");
+    fs::write(&at_cap_body, "a".repeat(cap)).unwrap();
+    let at_cap: Value = serde_json::from_slice(
+        &cli_exe
+            .ok(
+                &owner_home,
+                &owner_cfg,
+                &[
+                    "--org",
+                    SLUG,
+                    "send",
+                    "master",
+                    "--message",
+                    "cad1568-at-cap",
+                    "--file",
+                    at_cap_body.to_str().unwrap(),
+                ],
+            )
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(at_cap["state"], "queued");
+    assert_eq!(at_cap["duplicate"], false);
+    let at_cap_read = cli(
+        &owner_auth,
+        "message_read",
+        json!({"message": "cad1568-at-cap"}),
+    )
+    .unwrap();
+    assert_eq!(
+        at_cap_read["chars_total"], cap,
+        "the body at the cap must be stored whole, never truncated: {at_cap_read}"
+    );
+    let over_cap_body = root.path().join("cad1568-over-cap.txt");
+    fs::write(&over_cap_body, "a".repeat(cap + 1)).unwrap();
+    let before_over_cap = hosted_cli_requests(root.path());
+    let over_cap = cli_exe.run(
+        &owner_home,
+        &owner_cfg,
+        &[
+            "--org",
+            SLUG,
+            "send",
+            "master",
+            "--message",
+            "cad1568-over-cap",
+            "--file",
+            over_cap_body.to_str().unwrap(),
+        ],
+    );
+    assert!(!over_cap.status.success());
+    // A local refusal: no wire code, and no request reached the boundary.
+    let over_cap_error = cli_exe.error(&over_cap);
+    assert_eq!(over_cap_error["kind"], "rejected");
+    assert!(
+        over_cap_error.get("code").is_none(),
+        "the body cap must refuse locally, not at a hosted hop: {over_cap_error}"
+    );
+    assert_eq!(
+        hosted_cli_requests(root.path()).len(),
+        before_over_cap.len(),
+        "an over-cap body must never reach the hosted boundary"
+    );
+
     // Signed-envelope authority checks stay on the direct wire, and each
     // one names the hop that refused it: the container's single-use
     // envelope check refuses the replayed answer, the board's scope check
@@ -1106,6 +1174,7 @@ fn cad1568_hosted_cli_scenario() {
         ("cad1568-removed-owner", "board live-membership re-check"),
         ("cad1568-revoked-cli", "board authorization hop"),
         ("cad1568-other-workspace", "local credential pin"),
+        ("cad1568-over-cap", "local body cap"),
     ] {
         assert!(
             !durable.contains(id),
