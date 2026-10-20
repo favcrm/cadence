@@ -100,7 +100,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
       if (!permitted(operation) || !(RECORD_SLOT_VERBS as readonly string[]).includes(operation)) return { code: "forbidden", text: "This operation is unavailable." };
       try {
         const raw = await post("slot-prepare", { operation, args });
-        if (!object(raw) || !exact(raw, ["confirmation_token", "card"]) || typeof raw.confirmation_token !== "string" || !TOKEN.test(raw.confirmation_token) || !object(raw.card) || !exact(raw.card, operation === "whatsapp.broadcast.stop" ? ["operation", "facts", "live"] : ["operation", "facts"]) || raw.card.operation !== operation || !object(raw.card.facts)) throw new ApiError("Invalid confirmation card", 502);
+        if (!object(raw) || !exact(raw, ["confirmation_token", "card"]) || typeof raw.confirmation_token !== "string" || !TOKEN.test(raw.confirmation_token) || !object(raw.card) || !exact(raw.card, operation === "whatsapp.broadcast.stop" || operation === "whatsapp.handoff.release" ? ["operation", "facts", "live"] : ["operation", "facts"]) || raw.card.operation !== operation || !object(raw.card.facts)) throw new ApiError("Invalid confirmation card", 502);
         const facts = raw.card.facts;
         const card = recordCard(operation, facts, object(raw.card.live) ? raw.card.live : undefined);
         let used = false;
@@ -209,6 +209,13 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionA
     show("Scheduled for", facts.scheduled_at);
     if (live) { show("Status (approximate, as of this card)", live.status); show("Delivery so far (approximate, still changing)", stats); }
     show("Effect", "Stops unsent recipients only. Messages already sent cannot be recalled. A stopped broadcast cannot resume; inside the undo window it returns to a draft instead.");
+  }
+  if (operation === "whatsapp.handoff.release") {
+    // CAD-1651: the takeover time is the bound fact; the contact is live and unbound.
+    const contact = live && object(live.contact) ? live.contact : null;
+    if (contact) show("Contact", [contact.name, contact.phone].filter(v => typeof v === "string" && v).join(" · "));
+    show("Conversation", facts.conversation_id); show("Taken over since", facts.handoff_at);
+    show("Effect", "FavCRM's AI may reply automatically again on this conversation.");
   }
   if (typeof facts.state === "string" && facts.state === "pending" && operation.startsWith("whatsapp.")) show("Approval", "Awaiting the workspace owner's approval; tapping again after approval sends it once.");
   show("Scope", facts.scope); show("Unsubscribe origin", facts.unsubscribe_origin ?? (operation === "origin.manage" ? "Not configured" : undefined));

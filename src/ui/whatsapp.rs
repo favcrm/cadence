@@ -116,6 +116,16 @@ const V2_ROUTES: &[(&str, &str, &[&str])] = &[
         "whatsapp_broadcast_stop",
         &["broadcast_id"],
     ),
+    (
+        "/api/whatsapp/handoff/set",
+        "whatsapp_handoff_set",
+        &["conversation_id"],
+    ),
+    (
+        "/api/whatsapp/handoff/release",
+        "whatsapp_handoff_release",
+        &["conversation_id"],
+    ),
 ];
 
 pub(super) fn route(path: &str) -> Option<Route> {

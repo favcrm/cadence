@@ -194,6 +194,7 @@ var RECORD_CALL_VERBS = [
 	"whatsapp.broadcast.draft",
 	"whatsapp.broadcast.test.prepare",
 	"whatsapp.broadcast.prepare",
+	"whatsapp.handoff.set",
 	"chat.whatsapp.open",
 	"whatsapp.draft.show",
 	"whatsapp.draft.discard"
@@ -217,6 +218,7 @@ var RECORD_SLOT_VERBS = [
 	"whatsapp.broadcast.test.send",
 	"whatsapp.broadcast.send",
 	"whatsapp.broadcast.stop",
+	"whatsapp.handoff.release",
 	"chat.whatsapp.brief"
 ];
 [...RECORD_CALL_VERBS, ...RECORD_SLOT_VERBS];

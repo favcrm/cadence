@@ -251,6 +251,12 @@ pub enum ScreenOperation {
     WhatsappBroadcastSend,
     #[serde(rename = "whatsapp.broadcast.stop")]
     WhatsappBroadcastStop,
+    // CAD-1651: takeover. Set only reduces automation (no SLOT); release
+    // lets FavCRM's AI reply again, so it is a confirm SLOT.
+    #[serde(rename = "whatsapp.handoff.set")]
+    WhatsappHandoffSet,
+    #[serde(rename = "whatsapp.handoff.release")]
+    WhatsappHandoffRelease,
     // CAD-1636: the reply copilot. Not door verbs (`is_whatsapp`): the
     // host serves them itself, on a hosted daemon only.
     #[serde(rename = "chat.whatsapp.open")]
@@ -285,6 +291,7 @@ impl ScreenOperation {
                 | Self::WhatsappBroadcastTestSend
                 | Self::WhatsappBroadcastSend
                 | Self::WhatsappBroadcastStop
+                | Self::WhatsappHandoffRelease
                 | Self::ChatWhatsappBrief
         )
     }
@@ -315,6 +322,8 @@ impl ScreenOperation {
                 | Self::WhatsappBroadcastPrepare
                 | Self::WhatsappBroadcastSend
                 | Self::WhatsappBroadcastStop
+                | Self::WhatsappHandoffSet
+                | Self::WhatsappHandoffRelease
         )
     }
     /// CAD-1537: the closed allowlist a read-only screen (a member or a

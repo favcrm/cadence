@@ -1270,6 +1270,9 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("whatsapp_broadcast_prepare", Rule::Handler("rpc_whatsapp")),
     ("whatsapp_broadcast_send", Rule::Handler("rpc_whatsapp")),
     ("whatsapp_broadcast_stop", Rule::Handler("rpc_whatsapp")),
+    // CAD-1651: door v3 takeover, same handler.
+    ("whatsapp_handoff_set", Rule::Handler("rpc_whatsapp")),
+    ("whatsapp_handoff_release", Rule::Handler("rpc_whatsapp")),
     // CAD-786: the send verbs all enter `rpc_crm_send`, whose first
     // act is `operator_connection`.
     ("crm_send_prepare", Rule::Handler("rpc_crm_send")),
