@@ -1303,8 +1303,15 @@ impl ReadAdmission {
     }
 }
 
-pub(super) fn anonymous_reads(opts: &ServeOpts) -> bool {
-    opts.allow_anonymous_reads && !opts.board_public_only && opts.public.is_none()
+/// `--allow-anonymous-reads` is a local bootstrap policy: only the
+/// loopback origin. `admit_read` and `/api/meta` share this predicate so a
+/// tailnet client is never told unsigned reads are available while its
+/// private reads are refused.
+pub(super) fn anonymous_reads_on(opts: &ServeOpts, origin: Option<Origin>) -> bool {
+    opts.allow_anonymous_reads
+        && !opts.board_public_only
+        && opts.public.is_none()
+        && origin == Some(Origin::Loopback)
 }
 
 pub(super) fn admit_read(
@@ -1314,13 +1321,15 @@ pub(super) fn admit_read(
 ) -> Result<ReadAdmission, HttpResp> {
     let checked_at = std::time::Instant::now();
     let admission = |proof| ReadAdmission { proof, checked_at };
-    if anonymous_reads(opts) {
-        return Ok(admission(None));
-    }
     let origin = match request_origin(request, opts) {
         ReqOrigin::Known(origin) => Some(origin),
         ReqOrigin::NoSession(_) => None,
     };
+    // Only the loopback origin can use the local bootstrap allowance; a
+    // tailnet proxy or any other Host still needs a session.
+    if anonymous_reads_on(opts, origin) {
+        return Ok(admission(None));
+    }
     if let Some(origin) = origin {
         if let Some(token) = session_cookie(request, opts, origin) {
             let key = session_key(request);

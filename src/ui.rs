@@ -829,9 +829,14 @@ pub(crate) fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpt
             "board public-only mode requires a public board identity",
         ));
     }
-    if eff.allow_anonymous_reads && (eff.board_public_only || eff.board.is_some()) {
+    if eff.allow_anonymous_reads
+        && (eff.board_public_only
+            || eff.board.is_some()
+            || eff.tailscale.is_some()
+            || flags.tailscale.is_some())
+    {
         return Err(Error::rejected(
-            "anonymous reads are local-only — clear --allow-anonymous-reads before configuring a hosted board",
+            "anonymous reads are local-only — clear --allow-anonymous-reads before configuring a hosted board or tailnet sharing",
         ));
     }
     if eff.tailscale.is_some() {
@@ -1320,6 +1325,60 @@ mod tests {
             &hosted,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn anonymous_reads_refuse_tailnet_sharing() {
+        let persisted = super::UiOpts {
+            port: Some(3120),
+            allow_anonymous_reads: true,
+            tailscale: Some(super::TailscaleOpts {
+                dns_name: "board.tailnet.ts.net".to_string(),
+                https_port: 9450,
+                target: "http://127.0.0.1:3120".to_string(),
+            }),
+            ..Default::default()
+        };
+        let err = super::resolve_opts(&super::UiFlags::default(), &persisted)
+            .err()
+            .expect("anonymous reads with tailnet sharing must be refused");
+        assert!(
+            err.to_string().contains("anonymous reads are local-only"),
+            "unexpected refusal: {err}"
+        );
+
+        // A newly requested share, with no persisted record, is caught too.
+        let flags = super::UiFlags {
+            allow_anonymous_reads: true,
+            tailscale: Some(9450),
+            ..Default::default()
+        };
+        let err = super::resolve_opts(&flags, &super::UiOpts::default())
+            .err()
+            .expect("anonymous reads with a new --tailscale must be refused");
+        assert!(
+            err.to_string().contains("anonymous reads are local-only"),
+            "unexpected refusal: {err}"
+        );
+
+        // Persisted anonymous reads plus a new --tailscale.
+        let persisted_anon = super::UiOpts {
+            allow_anonymous_reads: true,
+            ..Default::default()
+        };
+        let err = super::resolve_opts(
+            &super::UiFlags {
+                tailscale: Some(9450),
+                ..Default::default()
+            },
+            &persisted_anon,
+        )
+        .err()
+        .expect("a new --tailscale with persisted anonymous reads must be refused");
+        assert!(
+            err.to_string().contains("anonymous reads are local-only"),
+            "unexpected refusal: {err}"
+        );
     }
 
     #[test]
