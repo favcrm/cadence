@@ -57,14 +57,15 @@ export function setSessionKey(key: string | null): void {
  */
 export function applySharedSessionChange(event: Pick<StorageEvent, "key" | "newValue">): boolean {
   if (event.key !== null && event.key !== SESSION_KEY_STORE) return false;
-  if (event.newValue === null) {
-    setSessionKey(null);
-  } else {
-    try {
-      globalThis.sessionStorage.removeItem(SESSION_KEY_STORE);
-    } catch {
-      // Blocked store: nothing to drop.
-    }
+  // The event says the shared store changed, but its `newValue` can be
+  // historical: a suspended tab may process an old removal after another
+  // tab has already signed in again. Never write the event back. Drop only
+  // this tab's per-tab fallback; the caller re-reads the current durable
+  // value and verifies that.
+  try {
+    globalThis.sessionStorage.removeItem(SESSION_KEY_STORE);
+  } catch {
+    // Blocked store: nothing to drop.
   }
   return true;
 }
