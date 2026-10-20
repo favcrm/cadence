@@ -116,7 +116,11 @@ open install request names — a tombstone row with the retired reason and
 the install's real state — and refuses anything else.
 
 The directory is rendered by the Cadence UI, not by the catalogue API or a
-separate server-rendered page. Its browser requests stay on the board origin
+separate server-rendered page. It is a signed-in surface: the board serves its
+documents, assets and catalogue reads only to a live board session, and a
+signed-out visitor is redirected to the platform sign-in (a public catalogue
+belongs on a public origin, not on a tenant board). Its browser requests stay on
+the board origin
 (`/api/public-apps`, `/api/public-apps/<id>` and `/api/public-apps/<id>/versions`);
 the board reads catalogue JSON. `/versions` accepts no query. A release
 document is `/api/public-apps/<id>/release?version=<exact>&digest=<sha256:…>`

@@ -1308,43 +1308,13 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         return;
     }
 
-    // CAD-1471: the public directory documents and the origin config are
-    // readable without a board session. Every other board route stays gated.
-    if matches!(method, Method::Get | Method::Head) && path == "/api/public-directory-config" {
-        let resp = match super::public_directory::catalog_origin() {
-            Some(origin) => json_response(json!({"origin": origin})),
-            None => err_response(404, "public directory is not configured"),
-        };
-        send(request, resp);
-        return;
-    }
-    // The browser must not be sent at the catalog origin. Loopback is this
-    // board's machine, which a tunneled viewer cannot reach.
-    if super::public_directory::is_public_catalog_route(&path) {
-        if !matches!(method, Method::Get | Method::Head) {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let resp = super::public_directory::proxy_public_catalog(&path, raw_query);
-        send(request, resp);
-        return;
-    }
-
     // Every private API read is admitted before dispatch, including future
     // routes and streams. Local bootstrap/static files are public. The
     // screen document instead owns a one-use, live-session-bound capability.
     let private_api = path.starts_with("/api/")
-        && !matches!(
-            path.as_str(),
-            "/api/meta" | "/api/health" | "/api/version" | "/api/public-directory-config"
-        )
+        && !matches!(path.as_str(), "/api/meta" | "/api/health" | "/api/version")
         && app_screens::frame_route(&path).is_none();
-    let public_read = public_host
-        && !matches!(
-            path.as_str(),
-            "/api/health" | "/api/version" | "/api/public-directory-config"
-        )
-        && !super::public_directory::directory_surface(&path);
+    let public_read = public_host && !matches!(path.as_str(), "/api/health" | "/api/version");
     let read_admission = if private_api || public_read {
         match operator::admit_read(&request, state_dir, opts) {
             Ok(admission) => Some(admission),
@@ -1361,6 +1331,20 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     } else {
         None
     };
+
+    // The catalogue proxy is a signed-in read: the container no longer serves
+    // an anonymous directory. The browser must not be sent at the catalog
+    // origin; loopback is this board's machine, which a tunneled viewer
+    // cannot reach.
+    if super::public_directory::is_public_catalog_route(&path) {
+        if !matches!(method, Method::Get | Method::Head) {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = super::public_directory::proxy_public_catalog(&path, raw_query);
+        send(request, resp);
+        return;
+    }
 
     match path.as_str() {
         "/api/my-work" => {

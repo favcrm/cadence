@@ -4,6 +4,7 @@ import Button from "../../ui/Button";
 import { useModal } from "./shared";
 import { useTranslate } from "../../lib/locale";
 import { ApiError } from "../../lib/api";
+import { sessionHeaders } from "../../lib/sessionKey";
 import {
   onPrivateReadsPaused,
   onPrivateSessionReset,
@@ -272,7 +273,7 @@ export async function loadReleaseFiles(
         credentials: "same-origin",
         cache: "no-store",
         signal,
-        headers: { "X-Cadence-Board": "1" },
+        headers: { "X-Cadence-Board": "1", ...sessionHeaders() },
       },
     );
   } catch (error) {

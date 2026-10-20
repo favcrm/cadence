@@ -12,9 +12,6 @@ import LocalLanguage from "../../ui/LocalLanguage";
 import DeviceSignIn from "./DeviceSignIn";
 import Login from "./Login";
 import { SIGN_IN_COMMAND } from "./gate";
-import Explorer from "../explorer/Explorer";
-import CatalogDetail from "../explorer/CatalogDetail";
-import type { Viewer } from "../projects/work";
 import "./auth.css";
 import { captureLoginNonce } from "./session";
 
@@ -33,19 +30,6 @@ function safeReturnPath(candidate: string | null): string | null {
     return `${url.pathname}${url.search}${url.hash}`;
   } catch { return null; }
 }
-
-/** Published catalog routes stay readable without a workspace session. */
-function publicDirectoryTarget(href: string): { kind: "list" } | { kind: "detail"; id: string } | null {
-  const path = href.split(/[?#]/)[0];
-  if (path === "/apps/explore") return { kind: "list" };
-  if (!path.startsWith("/apps/catalog/")) return null;
-  const id = path.slice("/apps/catalog/".length);
-  if (!id || id.includes("/") || id.includes("..") || id.startsWith(".") || id.length > 64) return null;
-  if (![...id].every((ch) => /[A-Za-z0-9._-]/.test(ch))) return null;
-  return { kind: "detail", id };
-}
-
-const ANONYMOUS_DIRECTORY: Viewer = { operator: null, readOnly: true };
 
 function returnDestination(): string {
   try { return safeReturnPath(sessionStorage.getItem(RETURN_STORE)) ?? "/"; } catch { return "/"; }
@@ -316,16 +300,6 @@ export default function AuthBoundary({ children }: {
   };
   const gate = copy[state.status === "ready" ? "checking" : state.status];
   const showGate = state.status !== "ready" || loginRoute;
-  const directory = !loginRoute && state.status !== "ready" ? publicDirectoryTarget(href) : null;
-  if (directory) {
-    return (
-      <div data-auth-state={state.status} data-public-directory="open">
-        {directory.kind === "list"
-          ? <Explorer viewer={ANONYMOUS_DIRECTORY} />
-          : <CatalogDetail id={directory.id} viewer={ANONYMOUS_DIRECTORY} />}
-      </div>
-    );
-  }
   return (
     <div data-auth-state={state.status}>
       {showGate && <div className="auth-public">
