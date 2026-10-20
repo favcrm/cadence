@@ -165,14 +165,20 @@ fn id_of(data: &Value, field: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// A conversation id travels in a URL path: a bounded opaque token.
-pub fn check_conversation_id(id: &str) -> Result<()> {
-    if id.is_empty()
-        || id.len() > 128
-        || !id
+/// A URL path segment: a bounded opaque token, never made only of dots
+/// (`.` and `..` would walk the path).
+fn path_token(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id.bytes().any(|b| b != b'.')
+        && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
-    {
+}
+
+/// A conversation id travels in a URL path: a bounded opaque token.
+pub fn check_conversation_id(id: &str) -> Result<()> {
+    if !path_token(id) {
         return Err(Error::rejected("WhatsApp conversation id is invalid"));
     }
     Ok(())
@@ -181,12 +187,7 @@ pub fn check_conversation_id(id: &str) -> Result<()> {
 /// CAD-1590: a template, broadcast or effect id travels in a URL path;
 /// the contract admits any 1–128 characters, the host only a token.
 pub fn check_path_id(id: &str, what: &str) -> Result<()> {
-    if id.is_empty()
-        || id.len() > 128
-        || !id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
-    {
+    if !path_token(id) {
         return Err(Error::rejected(format!("WhatsApp {what} is invalid")));
     }
     Ok(())
@@ -328,10 +329,19 @@ impl HostedWhatsapp {
                 }
                 Ok(data)
             }
-            Wire::Answer(http, Some(document)) => Err(Error::rejected(format!(
-                "AgenticOS WhatsApp door refused ({})",
-                code_of(&document, "/error/code").unwrap_or_else(|| format!("HTTP {http}"))
-            ))),
+            // The door's code (an identifier) travels as the error code, so
+            // a screen can name the reason (`test_limit`), not generic text.
+            Wire::Answer(http, Some(document)) => match code_of(&document, "/error/code") {
+                Some(code) => Err(Error::Structured(crate::error::Structured {
+                    kind: "rejected",
+                    message: format!("AgenticOS WhatsApp door refused ({code})"),
+                    code,
+                    revision: None,
+                })),
+                None => Err(Error::rejected(format!(
+                    "AgenticOS WhatsApp door refused (HTTP {http})"
+                ))),
+            },
             Wire::Answer(http, None) => Err(Error::rejected(format!(
                 "AgenticOS WhatsApp door answer was not understood (HTTP {http})"
             ))),
@@ -667,13 +677,14 @@ fn classify_as(effect: Effect, key: &str, wire: Wire) -> ReplyOutcome {
     let Some(data) = document.get("data").filter(|d| d.is_object()) else {
         let code = code_of(&document, "/error/code");
         // Every listed door refusal is checked before FavCRM is called.
-        // `grant_revoked` can follow a FavCRM 401 on the send itself, so
-        // it is not proof the reply stayed unsent.
+        // An envelope `grant_revoked` is the door's local unlink check; a
+        // FavCRM 401 on the send itself answers `data.status=not_executed`.
         let refused = matches!(
             code.as_deref(),
             Some(
                 "not_provisioned"
                     | "lease_lost"
+                    | "grant_revoked"
                     | "capability_unavailable"
                     | "door_disabled"
                     | "favcrm_not_bound"
@@ -989,7 +1000,7 @@ mod tests {
             (
                 409,
                 Some(json!({"ok": false, "error": {"code": "grant_revoked"}})),
-                ReplyState::Uncertain,
+                ReplyState::Refused,
             ),
             (
                 500,

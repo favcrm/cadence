@@ -87,7 +87,7 @@ struct EffectRecord {
 
 fn prefix_of(method: &str) -> &'static str {
     match method {
-        "whatsapp_template_send" | "whatsapp_template_status" => "wat_",
+        "whatsapp_template_send" => "wat_",
         "whatsapp_broadcast_test_send" => "wbt_",
         _ => "wab_",
     }
@@ -97,8 +97,19 @@ fn mint(prefix: &str) -> String {
     format!("{prefix}{}", uuid::Uuid::new_v4().simple())
 }
 
-/// `{"1": "...", ...}`: indexes 1–999, values 1–1024 UTF-16 units with no
+/// A template variable or body parameter: 1–1024 UTF-16 units with no
 /// surrounding whitespace (the contract refuses, never trims).
+fn variable_value(value: &str, what: &str) -> Result<()> {
+    let units = value.encode_utf16().count();
+    if units == 0 || units > 1024 || value.trim() != value {
+        return Err(Error::rejected(format!(
+            "{what} must be 1-1024 characters without surrounding spaces"
+        )));
+    }
+    Ok(())
+}
+
+/// `{"1": "...", ...}`: indexes 1–999, values per [`variable_value`].
 fn template_variables(params: &Value) -> Result<std::collections::BTreeMap<u32, String>> {
     let object = params
         .get("variables")
@@ -114,12 +125,7 @@ fn template_variables(params: &Value) -> Result<std::collections::BTreeMap<u32, 
         let value = value
             .as_str()
             .ok_or_else(|| Error::rejected("template variable must be a string"))?;
-        let units = value.encode_utf16().count();
-        if units == 0 || units > 1024 || value.trim() != value {
-            return Err(Error::rejected(
-                "template variable must be 1-1024 characters without surrounding spaces",
-            ));
-        }
+        variable_value(value, "template variable")?;
         out.insert(index, value.to_string());
     }
     Ok(out)
@@ -191,13 +197,7 @@ fn draft_body(params: &Value) -> Result<Value> {
         .filter(|l| l.len() <= 20)
         .ok_or_else(|| Error::rejected("body_parameters must be a list of at most 20"))?;
     for value in parameters {
-        let value = value.as_str().unwrap_or_default();
-        let units = value.encode_utf16().count();
-        if units == 0 || units > 1024 || value.trim() != value {
-            return Err(Error::rejected(
-                "body parameter must be 1-1024 characters without surrounding spaces",
-            ));
-        }
+        variable_value(value.as_str().unwrap_or_default(), "body parameter")?;
     }
     let audience = params
         .get("audience")
@@ -780,6 +780,10 @@ impl Shared {
                     let reply = reply_from(params, &effect_id)?;
                     let digest = door::reply_digest(&reply);
                     let staged = door.reply_prepare(&reply)?;
+                    // If this save fails the door keeps an orphan staged
+                    // reply with no record. It is harmless: no host record
+                    // means no send is ever claimed, and the door's stale
+                    // bound expires it.
                     self.whatsapp_reply_save(&ReplyRecord {
                         schema: 1,
                         effect_id: effect_id.clone(),

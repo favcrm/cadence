@@ -21,6 +21,11 @@ function refusal(error: unknown, operation?: RecordCallVerb): ActionRefusal {
   if (operation === "smtp.show" && error instanceof ApiError && status === 400 && (error.code === "smtp_sender_unbound" || error.code === "smtp_sender_revoked")) {
     return { code: error.code, text: "No live SMTP sender is bound. Configure a sender before sending." };
   }
+  // CAD-1634: a WhatsApp refusal keeps the host's typed reason (for example
+  // the door's `test_limit`), so the screen can name it.
+  if (operation?.startsWith("whatsapp.") && error instanceof ApiError && status === 400 && error.code && /^[A-Za-z0-9_-]{1,64}$/.test(error.code)) {
+    return { code: error.code, text: "Cadence refused this request. Inspect fresh status before retrying an effect." };
+  }
   // Apart from explicit sender-state codes on smtp.show, the child consumes
   // canonical classes (a revision_conflict must still reach the editor as conflict).
   const code = ({ 401: "unauthorized", 403: "forbidden", 404: "not_found", 409: "conflict", 503: "unavailable" } as Record<number, string>)[status] ?? "failed";
