@@ -368,9 +368,11 @@ impl Shared {
                 )));
             }
             match provider {
-                "pi" => crate::adapter::registry::pi_effort(effort)?,
                 "claude" => crate::adapter::registry::claude_effort(effort)?,
                 "codex" => crate::adapter::registry::codex_effort(effort)?,
+                _ if crate::adapter::registry::pi_family_managed(provider, kind) => {
+                    crate::adapter::registry::pi_effort(effort)?
+                }
                 other => {
                     return Err(Error::rejected(format!(
                         "issue kickoff: provider '{other}' has no effort vocabulary"

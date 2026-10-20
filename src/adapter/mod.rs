@@ -858,8 +858,10 @@ pub fn build(
             // explicit command must win, or a test daemon would spawn the real
             // binary.
             "omp" => {
+                // A blank override is the same as an absent one: it would
+                // otherwise reach the adapter and fall back to bare `pi`.
                 let env = match env.var("CADENCE_PI_COMMAND") {
-                    Some(value) if value.trim() != "pi" => env.clone(),
+                    Some(value) if !value.trim().is_empty() && value.trim() != "pi" => env.clone(),
                     _ => env.with_var("CADENCE_PI_COMMAND", "omp"),
                 };
                 Ok(Box::new(pi::PiAdapter::new(
