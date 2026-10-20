@@ -2,7 +2,7 @@ import { Activity, useCallback, useEffect, useRef, useState, type ReactNode } fr
 import { api, ApiError } from "../../lib/api";
 import { useLocale } from "../../lib/locale";
 import { allowPrivateReads, pausePrivateReads, privateSessionGeneration, resetPrivateSession } from "../../lib/privateSession";
-import { sessionKey, setSessionKey } from "../../lib/sessionKey";
+import { applySharedSessionChange, sessionKey, setSessionKey } from "../../lib/sessionKey";
 import type { Meta } from "../../lib/types";
 import { navigate, useHref } from "../../lib/useLocation";
 import { Logo } from "../../ui/Logo";
@@ -226,7 +226,14 @@ export default function AuthBoundary({ children }: {
     };
     const focused = () => { if (!document.hidden) void recheck(); };
     const online = () => { void recheck(); };
+    const shared = (event: StorageEvent) => {
+      // Another tab replaced or removed the shared key. Drop this tab's
+      // fallback copy and let `changed` re-verify (or sign out) before any
+      // further private work.
+      if (applySharedSessionChange(event)) changed();
+    };
     window.addEventListener("online", online);
+    window.addEventListener("storage", shared);
     window.addEventListener("cadence:session-changed", changed);
     window.addEventListener("cadence:session-ending", ending);
     window.addEventListener("cadence:session-ended", finished);
@@ -248,6 +255,7 @@ export default function AuthBoundary({ children }: {
       window.removeEventListener("cadence:session-required", required);
       window.removeEventListener("focus", focused);
       window.removeEventListener("online", online);
+      window.removeEventListener("storage", shared);
       document.removeEventListener("visibilitychange", focused);
     };
   }, [discard, publish, recheck]);

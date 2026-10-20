@@ -1259,9 +1259,10 @@ navigation, records, polling or streams. The accepted design reference is
 Local sign-in remains the one-use link (or configured device flow); hosted
 sign-in remains the AgenticOS membership/assertion handoff.
 
-Navigation and same-tab reload reuse the cookie and local tab key; they do
-not mint a new session or extend its absolute expiry. A new local tab still
-needs its own link. Hosted cookies retain their existing host-only lifetime.
+Navigation, a same-tab reload, a new tab and a browser restart reuse the
+cookie and the browser's saved key; they do not mint a new session or extend
+its absolute expiry. Clearing the browser's storage needs a fresh link.
+Hosted cookies retain their existing host-only lifetime.
 An unanswered verification conceals the admitted workspace and stops its
 effects, preserving same-session drafts and credentials for Retry. A
 confirmed sign-out, expiry or identity change clears private observations

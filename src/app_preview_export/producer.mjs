@@ -72,10 +72,10 @@ var ConditionalGet = class {
 * `localStorage` degrades to the old per-tab behavior instead of
 * signing out. Clearing the key is what ends this browser's session.
 */
-var STORE = "cadence.sessionKey";
+var SESSION_KEY_STORE = "cadence.sessionKey";
 function sessionKey() {
 	for (const kind of ["local", "session"]) try {
-		const key = (kind === "local" ? globalThis.localStorage : globalThis.sessionStorage).getItem(STORE);
+		const key = (kind === "local" ? globalThis.localStorage : globalThis.sessionStorage).getItem(SESSION_KEY_STORE);
 		if (key) return key;
 	} catch {}
 	return null;

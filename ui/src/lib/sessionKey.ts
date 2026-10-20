@@ -14,7 +14,7 @@
  * signing out. Clearing the key is what ends this browser's session.
  */
 
-const STORE = "cadence.sessionKey";
+export const SESSION_KEY_STORE = "cadence.sessionKey";
 export const SESSION_HEADER = "X-Cadence-Session";
 
 export function sessionKey(): string | null {
@@ -23,7 +23,7 @@ export function sessionKey(): string | null {
   // skipped.
   for (const kind of ["local", "session"] as const) {
     try {
-      const key = (kind === "local" ? globalThis.localStorage : globalThis.sessionStorage).getItem(STORE);
+      const key = (kind === "local" ? globalThis.localStorage : globalThis.sessionStorage).getItem(SESSION_KEY_STORE);
       if (key) return key;
     } catch {
       // Blocked or absent store: fall through to the next one.
@@ -37,8 +37,8 @@ export function setSessionKey(key: string | null): void {
   for (const kind of ["local", "session"] as const) {
     try {
       const storage = kind === "local" ? globalThis.localStorage : globalThis.sessionStorage;
-      if (key) storage.setItem(STORE, key);
-      else storage.removeItem(STORE);
+      if (key) storage.setItem(SESSION_KEY_STORE, key);
+      else storage.removeItem(SESSION_KEY_STORE);
     } catch {
       // Storage blocked: the tab simply stays signed out.
     }
@@ -46,6 +46,27 @@ export function setSessionKey(key: string | null): void {
   if (previous !== sessionKey() && typeof window !== "undefined") {
     window.dispatchEvent(new Event("cadence:session-changed"));
   }
+}
+
+/**
+ * Apply a `storage` event for the shared key from another tab. The browser
+ * has already updated `localStorage`; a removal must also drop this tab's
+ * per-tab fallback so it cannot resurrect the credential, and a replacement
+ * must drop that fallback so it cannot shadow the new value. Returns true
+ * when the event concerns this credential.
+ */
+export function applySharedSessionChange(event: Pick<StorageEvent, "key" | "newValue">): boolean {
+  if (event.key !== null && event.key !== SESSION_KEY_STORE) return false;
+  if (event.newValue === null) {
+    setSessionKey(null);
+  } else {
+    try {
+      globalThis.sessionStorage.removeItem(SESSION_KEY_STORE);
+    } catch {
+      // Blocked store: nothing to drop.
+    }
+  }
+  return true;
 }
 
 /** The header to add to a board request, when this browser holds a key. */
