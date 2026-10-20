@@ -297,6 +297,8 @@ fn reply_from(params: &Value, effect_id: &str) -> Result<Reply> {
     }
     let reply_to = optional_str(params, "reply_to_message_id")?;
     if let Some(id) = reply_to {
+        // FavCRM message ids are UUIDs or `connector_<hex>` (never `=`/`+`),
+        // so the path-token charset admits every real one (CAD-1588).
         door::check_conversation_id(id)
             .map_err(|_| Error::rejected("WhatsApp reply-to message id is invalid"))?;
     }
