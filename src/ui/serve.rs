@@ -2840,13 +2840,21 @@ mod read_admit_tests {
 
     #[test]
     fn a_write_route_is_405_before_any_guard_or_handler() {
+        fn must_not_admit(
+            _: &Request,
+            _: &Path,
+            _: &ServeOpts,
+        ) -> std::result::Result<(), HttpResp> {
+            panic!("admission ran before the 405")
+        }
+
         let mut request = request();
         let response = read_admit(
             &mut request,
             Path::new("/nonexistent"),
             &ServeOpts::default(),
             Some(Probe::Write),
-            admit,
+            must_not_admit,
             |_, _| panic!("handler must not run for a write route"),
         )
         .expect("a matched route answers");
@@ -2866,6 +2874,23 @@ mod read_admit_tests {
         )
         .expect("a matched route answers");
         assert_eq!(response.status_code(), StatusCode(403));
+    }
+
+    #[test]
+    fn the_real_operator_read_guard_refuses_an_anonymous_caller() {
+        let state = tempfile::tempdir().expect("temporary state directory");
+        let mut request = request();
+        let response = read_admit(
+            &mut request,
+            state.path(),
+            &ServeOpts::default(),
+            Some(Probe::Read),
+            operator::admit_operator_read,
+            |_, _| panic!("handler must not run for an anonymous caller"),
+        )
+        .expect("a matched route answers");
+        assert_ne!(response.status_code(), StatusCode(200));
+        assert_ne!(response.status_code(), StatusCode(405));
     }
 
     #[test]
