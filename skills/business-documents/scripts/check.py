@@ -583,9 +583,10 @@ def check_xlsx(profile, template_path, output_path, r, _source):
         else:
             exports[key] = money(currency, amount)
     if ex.get("rate"):
-        rate = val(ex["rate"]["cell"])
+        rate_spec = ex["rate"]
+        rate = values.get(rate_spec["cell"])
         if rate is None:
-            r.fail("export rate", f"no value at {ex['rate']['cell']}")
+            r.fail("export rate", f"no numeric value at {rate_spec['cell']} (recalculated)")
         else:
             exports["rate"] = rate
     ids_spec = ex.get("in_scope_ids")
@@ -817,7 +818,11 @@ def main() -> int:
             if not (args.source_template and args.source_output):
                 raise pack.PackError("--source-profile needs --source-template and --source-output")
             source_profile = pack.load_profile(Path(args.source_profile))
-            source_report, exports = run(source_profile, args.source_template, args.source_output)
+            source_dir = Path(args.output_dir) / "source"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            source_report, exports = run(
+                source_profile, args.source_template, args.source_output, workdir=source_dir
+            )
             source = exports
         if args.expected_total:
             source["local_total"] = args.expected_total

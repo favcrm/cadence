@@ -98,6 +98,11 @@ with a different template needs no code change.
   validation, style, print area and page setup, and refuses a workbook whose
   parts or OOXML extensions openpyxl cannot preserve.
 
+Context values are data: a string that starts with `=` is refused rather
+than becoming a live formula, and LibreOffice loads each job with forced
+recalculation, so declared totals are computed rather than read from a cached
+result the file happens to carry.
+
 Both XLSX paths need LibreOffice **Calc**, not only Writer. The canonical
 helpers are `scripts/pack.py`, `scripts/check.py` and `scripts/render_sheet.py`;
 the hosted converter image carries byte-identical copies, so edit here.

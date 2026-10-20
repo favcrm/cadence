@@ -72,7 +72,13 @@ def input_ranges(profile: dict, sheet: str) -> list[str]:
 
 
 def scalar(value, ref: str):
-    if isinstance(value, bool) or isinstance(value, (int, float, str)):
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str) and value.startswith("="):
+        raise pack.PackError(
+            f"cell {ref} starts with '='; context values are data, not formulas"
+        )
+    if isinstance(value, str):
         return value
     if value is None:
         raise pack.PackError(f"cell {ref} has a null value; omit the cell instead")

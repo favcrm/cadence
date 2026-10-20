@@ -94,9 +94,24 @@ def summary_label(manifest: dict | None) -> str:
     return label.strip()[:40]
 
 
+# An Excel-authored workbook may carry cached formula results. LibreOffice's
+# default load mode can reuse them, which would let `check` verify a stale
+# value instead of the document's own formulas. This profile entry forces a
+# full recalculation on every load; the profile is private to one call.
+RECALC_PROFILE = """<?xml version="1.0" encoding="UTF-8"?>
+<oor:items xmlns:oor="http://openoffice.org/2001/registry" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+ <item oor:path="/org.openoffice.Office.Calc/Formula/Load"><prop oor:name="OOXMLRecalcMode" oor:op="fuse"><value>0</value></prop></item>
+ <item oor:path="/org.openoffice.Office.Calc/Formula/Load"><prop oor:name="ODFRecalcMode" oor:op="fuse"><value>0</value></prop></item>
+</oor:items>
+"""
+
+
 def libreoffice(args: list[str], timeout: int = 85) -> None:
     """Run one bounded headless LibreOffice conversion."""
     with tempfile.TemporaryDirectory(prefix="cadence-lo-profile-") as profile_dir:
+        user = Path(profile_dir) / "profile" / "user"
+        user.mkdir(parents=True, exist_ok=True)
+        (user / "registrymodifications.xcu").write_text(RECALC_PROFILE, encoding="utf-8")
         command = [
             "soffice",
             "--headless",
