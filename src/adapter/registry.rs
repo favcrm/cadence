@@ -1589,6 +1589,16 @@ pub fn pi_family_managed(provider: &str, kind: &str) -> bool {
         && spec(provider, kind).is_ok_and(|spec| spec.capabilities.contains(&"managed_pi_rpc"))
 }
 
+/// Provider-level variant of [`pi_family_managed`]. The Settings allowlist
+/// and confinement policy gate on the provider, so a stored row whose
+/// kind is inconsistent with its provider must still fail closed rather
+/// than skip the policy read.
+pub fn pi_family_provider(provider: &str) -> bool {
+    SPECS
+        .iter()
+        .any(|spec| spec.provider == provider && spec.capabilities.contains(&"managed_pi_rpc"))
+}
+
 /// Register-time validation for enumerated launch params. Params not
 /// named here keep their historical pass-through (claude's modes are
 /// provider-validated — its own CLI rejects bad values on spawn).
@@ -1892,7 +1902,7 @@ mod tests {
         );
         assert_eq!(
             spec("devin", "managed").unwrap_err().to_string(),
-            "No managed adapter for provider 'devin' (implemented: codex, claude, pi)"
+            "No managed adapter for provider 'devin' (implemented: codex, claude, pi, omp)"
         );
         assert_eq!(
             spec("devin", "bogus").unwrap_err().to_string(),
@@ -1936,7 +1946,7 @@ mod tests {
     fn model_matrix_keeps_devin_and_drops_test_doubles() {
         let rows = model_provider_matrix();
         let ids: Vec<&str> = rows.iter().map(|row| row.id).collect();
-        assert_eq!(ids, vec!["codex", "claude", "pi", "devin", "cursor"]);
+        assert_eq!(ids, vec!["codex", "claude", "pi", "omp", "devin", "cursor"]);
         assert!(rows.iter().any(|row| row.id == "claude" && row.eligible));
         assert!(rows.iter().any(|row| row.id == "pi" && row.eligible));
         assert!(rows
@@ -2405,15 +2415,15 @@ mod tests {
     }
 
     /// Adding an endpoint kind forces a decision: every spec row names
-    /// its scheme, and only pty rows, managed claude and managed pi have
-    /// one today.
+    /// its scheme, and only pty rows, managed claude and the managed
+    /// Pi family have one today.
     #[test]
     fn only_generation_minting_endpoints_carry_a_turn_token_scheme() {
         for s in SPECS {
             let expected = match (s.provider, s.endpoint_kind) {
                 (_, "pty") => Some(PTY_TURN_TOKENS),
                 ("claude", "managed") => Some(CLAUDE_MANAGED_TURN_TOKENS),
-                ("pi", "managed") => Some(PI_MANAGED_TURN_TOKENS),
+                _ if pi_family_managed(s.provider, s.endpoint_kind) => Some(PI_MANAGED_TURN_TOKENS),
                 _ => None,
             };
             assert_eq!(s.turn_token, expected, "{}/{}", s.provider, s.endpoint_kind);

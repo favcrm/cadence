@@ -231,7 +231,7 @@ impl Shared {
             return Ok(());
         };
         let verdict = match pi_policy_for(
-            crate::adapter::registry::pi_family_managed(&agent.provider, &agent.endpoint_kind),
+            crate::adapter::registry::pi_family_provider(&agent.provider),
             self,
         )? {
             Ok(policy) => registered_config_refusal(&agent, policy.as_ref()),
@@ -312,7 +312,7 @@ impl Shared {
         // `master_state` refuses only an absent row; the row exists.
         let base = self.rpc_master_state(&Value::Null)?;
         let policy = pi_policy_for(
-            crate::adapter::registry::pi_family_managed(&agent.provider, &agent.endpoint_kind),
+            crate::adapter::registry::pi_family_provider(&agent.provider),
             self,
         )?;
         let launch = match &policy {
@@ -454,12 +454,12 @@ impl Shared {
         // rejected/structured read is a configuration verdict (the same
         // read `master start` and the adapter's `open` fail on).
         let policy = pi_policy_for(
-            crate::adapter::registry::pi_family_managed(&provider, "managed"),
+            crate::adapter::registry::pi_family_provider(&provider),
             self,
         )?;
         let policy_ref = policy.as_ref().ok().and_then(|p| p.as_ref());
         let allowlist_error = policy.as_ref().err().cloned();
-        if refusal.is_none() && crate::adapter::registry::pi_family_managed(&provider, "managed") {
+        if refusal.is_none() && crate::adapter::registry::pi_family_provider(&provider) {
             refusal = match &policy {
                 Err(reason) => Some(MasterRefusal::config("policy_unavailable", reason.clone())),
                 Ok(_) => match crate::pi_policy::resolve_model_with_source(

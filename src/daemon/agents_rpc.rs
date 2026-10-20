@@ -500,7 +500,7 @@ impl Shared {
         // it is refused — and it can never be cleared, because a pi
         // launch without `--model` would silently fall back. CAD-575:
         // the role's own list applies when pm.yaml carries one.
-        if crate::adapter::registry::pi_family_managed(&agent.provider, &agent.endpoint_kind)
+        if crate::adapter::registry::pi_family_provider(&agent.provider)
             && patch.as_object().unwrap().contains_key("model")
         {
             let policy = self.stored_pi_policy()?;
@@ -520,7 +520,7 @@ impl Shared {
                 }
             }
         }
-        if crate::adapter::registry::pi_family_managed(&agent.provider, &agent.endpoint_kind) {
+        if crate::adapter::registry::pi_family_provider(&agent.provider) {
             let mut effective = agent.params.clone().unwrap_or_else(|| json!({}));
             if let (Some(current), Some(changes)) = (effective.as_object_mut(), patch.as_object()) {
                 current.extend(changes.clone());

@@ -826,7 +826,7 @@ impl Shared {
         // `[pi].models.default.master`, else refuse; Pi's own fallback
         // is never used. Whatever wins must be on `[pi].models.allow`.
         let mut pi_selection = None;
-        let model = if crate::adapter::registry::pi_family_managed(&provider, "managed") {
+        let model = if crate::adapter::registry::pi_family_provider(&provider) {
             let policy = self.stored_pi_policy()?;
             let chosen = model.as_deref();
             let (resolved, fallback) =
