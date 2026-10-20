@@ -1,6 +1,6 @@
 import type { ActionArgs, ScreenNavigation, ScreenRoute } from "./screenProtocol";
 import { exact } from "./screenServices";
-const id = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+const id = (value: unknown): value is string => typeof value === "string" && /^[a-z0-9_-]{1,64}$/.test(value);
 export interface RoutePatch { section?: string; view?: "list" | "new"; record_id?: string | null; segment_id?: string | null; replace?: boolean }
 export function parseRoutePatch(args: ActionArgs, nav: ScreenNavigation): RoutePatch | null {
   if (!exact(args, ["section", "view", "record_id", "segment_id", "replace"]) ||

@@ -1177,11 +1177,21 @@ impl Shared {
                 }
                 for key in ["record_id", "segment_id"] {
                     if let Some(id) = args.get(key).filter(|v| !v.is_null()) {
-                        crate::proto::identifier(
-                            id.as_str()
-                                .ok_or_else(|| Error::rejected("invalid screen selector"))?,
-                            "screen selector",
-                        )?;
+                        // CAD-1634: route-only grammar `[a-z0-9_-]{1,64}`, so
+                        // WhatsApp ids with `_` deep-link; `proto::identifier`
+                        // stays strict for every other caller.
+                        let ok = id.as_str().is_some_and(|s| {
+                            (1..=64).contains(&s.len())
+                                && s.bytes().all(|b| {
+                                    b.is_ascii_lowercase()
+                                        || b.is_ascii_digit()
+                                        || b == b'_'
+                                        || b == b'-'
+                                })
+                        });
+                        if !ok {
+                            return Err(Error::rejected("invalid screen selector"));
+                        }
                     }
                 }
             }
