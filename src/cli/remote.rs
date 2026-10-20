@@ -31,15 +31,8 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             all,
             json: _,
             watch,
-            placement,
+            placement: _,
         } => {
-            if placement.is_some() {
-                return Err(unsupported(
-                    "status",
-                    "--placement",
-                    "the remote read model has no placement filter; filter the returned rows locally",
-                ));
-            }
             if watch.is_some() {
                 return Err(unsupported(
                     "status",
@@ -74,17 +67,10 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
                     sort,
                     limit,
                     fields,
-                    placement,
+                    placement: _,
                     json: _,
                 },
         } => {
-            if placement.is_some() {
-                return Err(unsupported(
-                    "agent ls",
-                    "--placement",
-                    "the remote read model has no placement filter; filter the returned rows locally",
-                ));
-            }
             if *all {
                 return Err(unsupported(
                     "agent ls",
@@ -1250,6 +1236,17 @@ fn name(command: &Commands) -> &'static str {
     }
 }
 
+/// The placement filter a remote read carries, if any.
+fn placement_of(command: &Commands) -> Option<registry::Placement> {
+    match command {
+        Commands::Status { placement, .. } => placement.map(PlacementArg::placement),
+        Commands::Agent {
+            action: AgentAction::List { placement, .. },
+        } => placement.map(PlacementArg::placement),
+        _ => None,
+    }
+}
+
 /// Entry point for a `Remote` resolution (called by `action_dispatch`
 /// instead of the local `dispatch`). `Org` stays local — it edits the
 /// registry, not a daemon — so `org switch local` still gets you home.
@@ -1479,7 +1476,13 @@ pub(super) fn run(
         }
     };
     match out {
-        cadence_agent::remote_cli::RemoteAnswer::Ok(body) => {
+        cadence_agent::remote_cli::RemoteAnswer::Ok(mut body) => {
+            // A placement read filter is a client-side projection of the
+            // same derived value, so the hosted read applies it before
+            // printing and recomputes the capacity count it projects.
+            if let Some(want) = placement_of(&command) {
+                retain_by_placement(&mut body, want);
+            }
             match remote_blob_cat(&target, &command, &body, deadline, wake_timeout) {
                 Ok(true) => return Ok(0),
                 Ok(false) => {}

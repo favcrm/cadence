@@ -745,7 +745,8 @@ pub(crate) enum Commands {
         /// Wait for the turn's terminal state, like `message ask`.
         /// Bare `--wait` uses 120 seconds; `--wait 30` uses 30.
         #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "120",
-              value_parser = clap::value_parser!(u64).range(1..=600), conflicts_with = "nudge")]
+              value_parser = clap::value_parser!(u64).range(1..=600),
+              conflicts_with_all = ["nudge", "priority", "supersedes"])]
         wait: Option<u64>,
     },
     /// Hosted coordination for this user's local agent (CAD-1460).

@@ -606,14 +606,7 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
             let stamp = !project.is_empty() || sort.as_deref() == Some("project");
             let mut out = list_agents(&state_dir, &state, &provider, &kind, &project, all, stamp)?;
             if let Some(want) = placement {
-                if let Some(rows) = out["agents"].as_array_mut() {
-                    rows.retain(|r| {
-                        registry::placement(
-                            r["provider"].as_str().unwrap_or_default(),
-                            r["endpoint_kind"].as_str().unwrap_or_default(),
-                        ) == want.placement()
-                    });
-                }
+                retain_by_placement(&mut out, want.placement());
             }
             shape_rows(
                 &mut out,
