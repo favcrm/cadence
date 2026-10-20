@@ -113,6 +113,118 @@ pub(crate) fn file_cap(rel: &str) -> u64 {
     }
 }
 
+/// The root files admitted beside `app.md`. One list for the source loader,
+/// the catalogue importer and the board's files-mode transport. CAD-1415 added
+/// `app-actions.json` to the first two and missed the third, so a bundle the
+/// daemon accepts was refused before it ever reached the daemon.
+pub(crate) fn root_member(name: &str) -> bool {
+    name == MANIFEST
+        || name == crate::issue::app_chat::FILE
+        || name == crate::issue::app_assistant::FILE
+        || name == crate::issue::app_action::FILE
+}
+
+/// Visible, ASCII, flat leaf name — no dotfile, no separator, no escape.
+fn plain_leaf_ok(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg.is_ascii()
+        && !seg.starts_with('.')
+        && seg != ".."
+        && !seg.contains('\\')
+        && !seg.contains('\0')
+}
+
+/// A workflow leaf: `<tag>.md`, the installer's own tag rule.
+fn workflow_leaf_ok(seg: &str) -> bool {
+    plain_leaf_ok(seg)
+        && seg.ends_with(".md")
+        && crate::issue::model::valid_tag(seg.trim_end_matches(".md"))
+}
+
+/// The one bundle path grammar. The board's files-mode transport (install and
+/// upgrade) admits every member through this, and the source loader and the
+/// catalogue importer share [`root_member`] for the root set while keeping
+/// their own directory walkers. The root list is therefore one fact, and the
+/// transport can no longer refuse a member the daemon accepts.
+///
+/// It is lexical only: it says which paths may exist, never whether their bytes
+/// are valid. Splitting on literal `/` and refusing empty, `.` and `..`
+/// segments matters for the upload transport: `Path::components` folds `a//b`,
+/// `a/./b` and `a/../b` onto one staged file and would defeat duplicate
+/// detection.
+pub(crate) fn bundle_path_ok(path: &str) -> bool {
+    if path.is_empty() || !path.is_ascii() || path.contains('\\') || path.contains('\0') {
+        return false;
+    }
+    let segs: Vec<&str> = path.split('/').collect();
+    if segs.iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
+        return false;
+    }
+    match segs.as_slice() {
+        [name] => root_member(name),
+        ["workflows", leaf] => workflow_leaf_ok(leaf),
+        ["views", leaf] => *leaf == crate::issue::app_view::FILE,
+        ["rubrics", leaf] | ["templates", leaf] => plain_leaf_ok(leaf),
+        // CAD-1129: catalog icons and screenshots are flat `*.svg` leaves,
+        // capped at 128 bytes like the snapshot and catalogue walkers.
+        ["assets", leaf] => plain_leaf_ok(leaf) && leaf.ends_with(".svg") && leaf.len() <= 128,
+        // CAD-1006: one tag-named package dir per screen.
+        ["screens", tag, leaf] => {
+            crate::issue::model::valid_tag(tag) && crate::issue::app_screen_pkg::leaf_ok(leaf)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod bundle_grammar_tests {
+    use super::*;
+
+    #[test]
+    fn admits_every_member_the_daemon_accepts() {
+        for path in [
+            "app.md",
+            "app-chat.json",
+            "app-assistant.json",
+            "app-actions.json",
+            "workflows/post.md",
+            "views/app-views-v1.json",
+            "rubrics/brand.md",
+            "templates/base.liquid",
+            "assets/crm.svg",
+            "screens/crm/screens.json",
+            "screens/crm/client.js",
+            "screens/crm/styles.css",
+        ] {
+            assert!(bundle_path_ok(path), "{path}");
+        }
+        // The descriptor the board transport used to refuse.
+        assert!(root_member(crate::issue::app_action::FILE));
+    }
+
+    #[test]
+    fn refuses_members_outside_the_grammar() {
+        for path in [
+            "",
+            "readme.md",
+            "app-actions/actions.json",
+            "assets/crm.png",
+            "assets/nested/icon.svg",
+            "workflows/UPPER.md",
+            "views/other.json",
+            "screens/crm/deep/file.js",
+            "../secret",
+            "app.md/inner",
+            "./app-actions.json",
+        ] {
+            assert!(!bundle_path_ok(path), "{path}");
+        }
+        // The snapshot and catalogue walkers cap an asset leaf at 128 bytes.
+        assert!(bundle_path_ok(&format!("assets/{}.svg", "a".repeat(124))));
+        assert!(!bundle_path_ok(&format!("assets/{}.svg", "a".repeat(125))));
+    }
+}
+
 /// Most files a bundle may carry.
 const MAX_FILES: usize = 128;
 
@@ -693,11 +805,9 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             files.push((name.to_string(), entry.path()));
             continue;
         }
-        // CAD-1110: the data-only chat descriptor sits beside app.md.
-        if name == crate::issue::app_chat::FILE
-            || name == crate::issue::app_assistant::FILE
-            || name == crate::issue::app_action::FILE
-        {
+        // CAD-1110/CAD-1415: the data-only descriptors sit beside app.md —
+        // one list with the source loader and the upload transport.
+        if root_member(name) {
             if !ft.is_file() {
                 return Err(entry_err(name, "app-chat.json is a regular file"));
             }

@@ -364,11 +364,7 @@ fn member_path_ok(name: &str) -> bool {
             _ => None,
         }
     };
-    if name == "app.md"
-        || name == crate::issue::app_chat::FILE
-        || name == crate::issue::app_assistant::FILE
-        || name == crate::issue::app_action::FILE
-    {
+    if crate::issue::app::root_member(name) {
         return true;
     }
     match (parts.len(), normal(0)) {
@@ -579,14 +575,7 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
                     add(format!("{name}/{leaf}"), path.join(leaf))?;
                 }
             }
-            Some(libc::S_IFREG)
-                if name == "app.md"
-                    || name == crate::issue::app_chat::FILE
-                    || name == crate::issue::app_assistant::FILE
-                    || name == crate::issue::app_action::FILE =>
-            {
-                add(name, path)?
-            }
+            Some(libc::S_IFREG) if crate::issue::app::root_member(&name) => add(name, path)?,
             _ => return Err(Error::rejected("unsupported or unsafe app bundle entry")),
         }
     }

@@ -336,63 +336,14 @@ impl<'de> Deserialize<'de> for UpgradeWire {
     }
 }
 
-/// A leaf file name is a visible flat name — non-empty, ASCII, no `.`-lead
-/// (dotfile), no `..`, no embedded `\`/`\0`. `seg` is already a single raw
-/// segment (the caller split on literal `/`). `workflows/` leaves additionally
-/// need a `valid_tag` `.md` stem — the same rule the installer's `snapshot`
-/// enforces, so an upload cannot stage a workflow the validator would reject.
-fn leaf_ok(seg: &str, need_md_tag: bool) -> bool {
-    if seg.is_empty()
-        || !seg.is_ascii()
-        || seg.starts_with('.')
-        || seg == ".."
-        || seg.contains('\\')
-        || seg.contains('\0')
-    {
-        return false;
-    }
-    if need_md_tag {
-        seg.ends_with(".md") && crate::issue::model::valid_tag(seg.trim_end_matches(".md"))
-    } else {
-        true
-    }
-}
-
-/// One uploaded path is admitted only by an EXACT lexical grammar — we split
-/// on literal `/` and never normalize. `Path::components` folds `a//b`,
-/// `a/./b` and `a/../b` together, which would let two distinct raw JSON keys
-/// alias the same staged file and defeat duplicate detection; this grammar
-/// refuses them instead. Admitted shapes (the only flat entries the bundle
-/// allows):
-///   `app.md`, `app-chat.json`, `app-assistant.json` (canonical root files)
-///   `workflows/<tag>.md`              (valid_tag stem — the installer's rule)
-///   `rubrics/<leaf>` `templates/<leaf>` (any visible flat leaf)
-///   `views/app-views-v1.json`         (exact descriptor filename)
-/// Empty segments (`//`, leading `/`, trailing `/`), `.`/`..`, `\`, `\0` and
-/// any other top-level name are refused. `snapshot`/`validate_texts` re-check
-/// daemon-side; this schema refuses bad keys before a single byte is staged.
+/// One uploaded path is admitted only by the host's bundle grammar. The root
+/// set is the same one the source loader and catalogue importer use
+/// (`app::root_member`); this transport applies the full predicate because it
+/// receives a flat path map rather than a directory to walk.
+/// Keeping a private copy here is exactly how CAD-1415's `app-actions.json`
+/// reached the daemon's grammar but not this transport.
 fn upload_path_ok(path: &str) -> bool {
-    if path.is_empty() || !path.is_ascii() || path.contains('\\') || path.contains('\0') {
-        return false;
-    }
-    let segs: Vec<&str> = path.split('/').collect();
-    // Any empty segment means a doubled, leading or trailing slash.
-    if segs.iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
-        return false;
-    }
-    match segs.as_slice() {
-        ["app.md"] | ["app-chat.json"] | [crate::issue::app_assistant::FILE] => true,
-        ["workflows", leaf] => leaf_ok(leaf, true),
-        ["views", leaf] => *leaf == crate::issue::app_view::FILE,
-        ["rubrics", leaf] | ["templates", leaf] => leaf_ok(leaf, false),
-        // CAD-1006: screens/<tag>/<leaf> — the one depth-2 entry: a
-        // tag-named package dir holding `screens.json` or a
-        // `<stem>.<js|css|svg|json>` leaf per the validator grammar.
-        ["screens", tag, leaf] => {
-            crate::issue::model::valid_tag(tag) && crate::issue::app_screen_pkg::leaf_ok(leaf)
-        }
-        _ => false,
-    }
+    crate::issue::app::bundle_path_ok(path)
 }
 
 /// Stage a validated `{files}` map to a server-derived temp dir OUTSIDE
