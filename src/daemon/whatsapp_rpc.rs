@@ -655,7 +655,10 @@ impl Shared {
         let conversation_id = required_str(args, "conversation_id")?;
         let shown = self.whatsapp_door()?.conversation(conversation_id)?;
         let Some(handoff_at) = shown["handoffAt"].as_str() else {
-            return Err(Error::rejected("this conversation is not taken over"));
+            return Err(Error::invalid(
+                "not_taken_over",
+                "this conversation is not taken over",
+            ));
         };
         Ok(json!({"conversation_id": conversation_id, "handoff_at": handoff_at}))
     }

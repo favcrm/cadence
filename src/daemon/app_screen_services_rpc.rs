@@ -741,7 +741,13 @@ impl Shared {
                     }
                 }
                 if let Some((args, facts)) = &proof.confirmed {
-                    if &self.screen_slot_facts_locked(proof, args)? != facts {
+                    // A takeover cleared since the card was drawn is the same
+                    // changed-facts refusal; only this exact code maps.
+                    let now = match self.screen_slot_facts_locked(proof, args) {
+                        Err(e) if e.code() == Some("not_taken_over") => None,
+                        other => Some(other?),
+                    };
+                    if now.as_ref() != Some(facts) {
                         return Err(Error::conflict_coded(
                             "facts_changed",
                             "confirmation facts changed; prepare again",
