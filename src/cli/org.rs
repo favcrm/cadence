@@ -69,7 +69,7 @@ struct Connection {
     destination: Destination,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Registry {
     selected: Option<Selection>,
@@ -407,10 +407,11 @@ fn ensure_local(state_dir: &Path, tracker_dir: &Path) -> Result<()> {
 
 /// Pure registry mutation for `cadence login` (CAD-1019 slice 1b), unit-tested
 /// without the registry file. `org_name` is the issuer-verified slug and
-/// `endpoint`/`org_id` come only from the verified grant. A stored remote is
-/// never re-pointed, a `local` row is never overwritten, and the new org is
-/// selected only when `use_default` (`--use`) is passed — a bare first
-/// login leaves `selected` unset so ambient local stays the default
+/// `endpoint`/`org_id` come only from the verified grant. A newer verified
+/// grant replaces a stale remote binding for the same slug (a workspace can
+/// be recreated or its id rotated); a `local` row is never overwritten. The
+/// new org is selected only when `use_default` (`--use`) is passed — a bare
+/// first login leaves `selected` unset so ambient local stays the default
 /// (CAD-1125).
 fn apply_record_remote(
     registry: &mut Registry,
@@ -428,21 +429,14 @@ fn apply_record_remote(
     let selection = Selection { org: org.clone() };
     if let Some(existing) = registry
         .connections
-        .iter()
+        .iter_mut()
         .find(|c| c.selection == selection)
     {
-        // Re-login must re-point at the same endpoint + org id — a changed
-        // slug or forged audience refuses, never silently moves the org.
         match &existing.destination {
-            Destination::Remote {
-                endpoint: ep,
-                org_id: oid,
-            } if ep == endpoint && oid == org_id => {}
             Destination::Remote { .. } => {
-                return Err(Error::rejected(
-                    "a different endpoint or org id is already stored for this org; \
-                     remove it first",
-                ));
+                // The grant is issuer-verified and already validated above;
+                // re-login is the operator's replacement intent.
+                existing.destination = destination.clone();
             }
             Destination::Local { .. } => {
                 return Err(Error::rejected(
@@ -475,18 +469,34 @@ fn apply_record_remote(
     ))
 }
 
-/// File-locked wrapper over `apply_record_remote`; returns the stored view.
-pub(super) fn record_remote(
+/// File-locked wrapper over `apply_record_remote`. The registry is written
+/// first and `commit` (the credential save) runs while the registry lock is
+/// still held; a failed commit restores the previous binding. Returns the
+/// stored view.
+pub(super) fn record_remote<F>(
     org_name: &str,
     endpoint: &str,
     org_id: &str,
     use_default: bool,
-) -> Result<Value> {
+    commit: F,
+) -> Result<Value>
+where
+    F: FnOnce() -> Result<()>,
+{
     let file = RegistryFile::open()?;
     let mut registry = file.read()?;
+    let previous = registry.clone();
     let (connection, selected) =
         apply_record_remote(&mut registry, org_name, endpoint, org_id, use_default)?;
     file.write(&registry)?;
+    if let Err(error) = commit() {
+        if let Err(rollback) = file.write(&previous) {
+            return Err(Error::internal(format!(
+                "credential write failed ({error}); restoring the previous org registry also failed ({rollback})"
+            )));
+        }
+        return Err(error);
+    }
     Ok(view(&connection, selected))
 }
 
@@ -1092,24 +1102,150 @@ mod tests {
     }
 
     #[test]
-    fn changed_endpoint_or_org_id_is_refused_never_moved() {
-        // A changed slug or forged audience refuses instead of silently
-        // re-pointing the stored remote at another workspace.
+    fn changed_endpoint_or_org_id_replaces_the_stale_binding() {
+        // A verified grant for the same slug is authoritative: a recreated
+        // or rotated workspace re-points the stored remote instead of
+        // requiring a manual registry edit.
         let mut registry = Registry::default();
         apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
-        assert!(apply_record_remote(&mut registry, "alpha", EP_B, "ws_alpha", false).is_err());
-        assert!(apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).is_err());
+        apply_record_remote(&mut registry, "alpha", EP_B, "ws_alpha", false).unwrap();
+        assert_eq!(registry.connections.len(), 1);
+        assert_remote(&registry, "alpha", EP_B, "ws_alpha");
+
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).unwrap();
+        assert_eq!(registry.connections.len(), 1);
+        assert_remote(&registry, "alpha", EP_A, "ws_other");
+    }
+
+    #[test]
+    fn identical_relogin_is_idempotent() {
+        let mut registry = Registry::default();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+        assert_eq!(registry.connections.len(), 1);
+        assert_remote(&registry, "alpha", EP_A, "ws_alpha");
+    }
+
+    #[test]
+    fn local_name_collision_is_still_refused() {
+        let mut registry = Registry::default();
+        registry.connections.push(Connection {
+            selection: Selection {
+                org: "alpha".into(),
+            },
+            destination: Destination::Local {
+                state_dir: "/local/state".into(),
+                tracker_dir: "/local/tracker".into(),
+            },
+        });
+        let error = apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false)
+            .expect_err("local row must not be replaced");
+        assert!(
+            error.to_string().contains("exists as a local connection"),
+            "{error}"
+        );
+        assert_eq!(registry.connections.len(), 1);
+        assert!(matches!(
+            registry.connections[0].destination,
+            Destination::Local { .. }
+        ));
+    }
+
+    #[test]
+    fn replacement_leaves_other_orgs_and_the_default_untouched() {
+        let mut registry = Registry::default();
+        apply_record_remote(&mut registry, "beta", EP_B, "ws_beta", true).unwrap();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", false).unwrap();
+
+        let selected =
+            apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).unwrap();
+        assert!(!selected.1, "replacement without --use must not select");
+        assert_eq!(
+            registry.selected.as_ref().map(|s| s.org.as_str()),
+            Some("beta")
+        );
+        assert_remote(&registry, "alpha", EP_A, "ws_other");
+        assert_remote(&registry, "beta", EP_B, "ws_beta");
+    }
+
+    #[test]
+    fn replacing_the_selected_org_keeps_it_selected_and_use_can_move_it() {
+        let mut registry = Registry::default();
+        apply_record_remote(&mut registry, "alpha", EP_A, "ws_alpha", true).unwrap();
+        let replaced =
+            apply_record_remote(&mut registry, "alpha", EP_A, "ws_other", false).unwrap();
+        assert!(replaced.1, "an already selected org stays selected");
+        assert_eq!(
+            registry.selected.as_ref().map(|s| s.org.as_str()),
+            Some("alpha")
+        );
+
+        apply_record_remote(&mut registry, "beta", EP_B, "ws_beta", false).unwrap();
+        apply_record_remote(&mut registry, "beta", EP_B, "ws_beta2", true).unwrap();
+        assert_eq!(
+            registry.selected.as_ref().map(|s| s.org.as_str()),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn failed_credential_commit_restores_the_previous_binding() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let previous = remote_registry("alpha", EP_A, "ws_alpha", true);
+        env.write_registry(&previous);
+
+        let error = record_remote("alpha", EP_A, "ws_other", false, || {
+            Err(Error::rejected("credential write refused"))
+        })
+        .expect_err("a failed credential save must fail the login");
+        assert!(
+            error.to_string().contains("credential write refused"),
+            "{error}"
+        );
+
+        let stored: Value =
+            serde_json::from_slice(&std::fs::read(env.registry_path()).unwrap()).unwrap();
+        assert_eq!(stored, previous, "the previous binding must be restored");
+    }
+
+    #[test]
+    fn successful_relogin_commits_the_credential_after_replacing() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("alpha", EP_A, "ws_alpha", true));
+        let mut committed = false;
+
+        let stored = record_remote("alpha", EP_A, "ws_other", false, || {
+            committed = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(committed);
+        assert_eq!(stored["destination"]["org_id"], "ws_other");
+        assert_eq!(stored["selected"], true);
+
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(env.registry_path()).unwrap()).unwrap();
+        assert_eq!(raw["connections"][0]["destination"]["org_id"], "ws_other");
+        assert_eq!(raw["connections"][0]["destination"]["endpoint"], EP_A);
+    }
+
+    fn assert_remote(registry: &Registry, org: &str, endpoint: &str, org_id: &str) {
         let stored = registry
             .connections
             .iter()
-            .find(|c| c.selection.org == "alpha")
-            .unwrap();
+            .find(|c| c.selection.org == org)
+            .unwrap_or_else(|| panic!("{org} is missing from the registry"));
         match &stored.destination {
-            Destination::Remote { endpoint, org_id } => {
-                assert_eq!(endpoint, EP_A);
-                assert_eq!(org_id, "ws_alpha");
+            Destination::Remote {
+                endpoint: actual_endpoint,
+                org_id: actual_org_id,
+            } => {
+                assert_eq!(actual_endpoint, endpoint);
+                assert_eq!(actual_org_id, org_id);
             }
-            Destination::Local { .. } => panic!("stored remote changed shape"),
+            Destination::Local { .. } => panic!("{org} is not a remote"),
         }
     }
 
