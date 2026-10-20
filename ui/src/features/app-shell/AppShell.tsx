@@ -147,7 +147,14 @@ export default function AppShell({
   viewer: Viewer;
   /** Installed screen receives only the trusted native chat handoff and
    *  the shell's one verified app scope (CAD-1560). */
-  children?: (onMediaAttach: MediaChatAttach, contextId: string) => React.ReactNode;
+  children?: (onMediaAttach: MediaChatAttach, contextId: string, screen: {
+    /** CAD-1615 — the board-wide drawer the app screen may ask for. Absent
+     *  for a read-only or screen-reader view, so its frames cannot drive it. */
+    onScreenDrawer?: (mode: "outlet" | "drawer", surface?: string) => void;
+    presentation: "outlet" | "drawer";
+    /** The screen went away: the drawer closes with it. */
+    onScreenClosed: () => void;
+  }) => React.ReactNode;
   /** Board menu wiring: receives the verified installation (or null
    *  while loading, failed, or switched away). The parent matches
    *  installId to its route and compares values before storing. */
@@ -194,6 +201,29 @@ export default function AppShell({
   const [generalSetup, setGeneralSetup] = useState<{ key: string; error: string | null } | null>(null);
   const [generalSetupAttempt, setGeneralSetupAttempt] = useState(0);
   const [contextId, setContextId] = useState("");
+  // CAD-1615 — the board-wide drawer for an app screen. The app asks for
+  // it with its own verb; the shell owns the geometry and the scrim, and
+  // Escape or the scrim puts the screen back in the outlet.
+  const [screenDrawer, setScreenDrawer] = useState<string | null>(null);
+  const onScreenDrawer = useCallback((mode: "outlet" | "drawer", surface?: string) => {
+    setScreenDrawer(mode === "drawer" ? (surface ?? "") : null);
+  }, []);
+  const closeScreenDrawer = useCallback(() => setScreenDrawer(null), []);
+  // CAD-1615: the drawer is a write-shaped action. A read-only or
+  // screen-reader view may render the screen, but it never drives the shell
+  // drawer — the frame's callback and the presentation are withheld, so the
+  // verb refuses at the host instead of presenting a surface for a viewer
+  // who cannot act on it.
+  const canDriveScreen = viewer.operator === true && !viewer.readOnly;
+  // A different installation or scope is a different screen: the drawer never
+  // outlives the frame that opened it.
+  useEffect(() => { setScreenDrawer(null); }, [installId, contextId]);
+  useEffect(() => {
+    if (screenDrawer === null) return;
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setScreenDrawer(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [screenDrawer]);
   const [linkNotice, setLinkNotice] = useState<string | null>(null);
   // CAD-1560: one shell-owned scope for every active app view. The
   // in-workspace selection (Social's picker, a screen's saved-context
@@ -840,7 +870,8 @@ export default function AppShell({
   }, [launcherRun, launcherIsCurrent]);
 
   return (
-    <div className="app-shell" data-app-shell-outlet={installId}>
+    <div className="app-shell" data-app-shell-outlet={installId} data-screen-drawer={screenDrawer !== null ? "true" : undefined}>
+      {screenDrawer !== null && <div className="app-shell-screen-scrim" aria-hidden="true" onClick={() => setScreenDrawer(null)} />}
       <div className="app-shell-crumb">
         <Link href="/apps" className="lnk text-label">
           ← {t("All apps")}
@@ -971,7 +1002,7 @@ export default function AppShell({
             onOpenView={openView}
           />
         </div>
-        <section id="app-shell-workspace" className="app-shell-outlet" aria-label={`${title} ${t("workspace")}`}>
+        <section id="app-shell-workspace" className="app-shell-outlet" data-screen-drawer={screenDrawer !== null ? "true" : undefined} aria-label={`${title} ${t("workspace")}`}>
           {cachedPreviewSnapshot?.installation.install_id === installId &&
             isSocialContent(cachedPreviewSnapshot.installation) && loading ? (
               <WorkspaceAppCachedPreview
@@ -1137,11 +1168,12 @@ export default function AppShell({
                 // the social-only workspace, which then rendered its
                 // "no supported board workspace" guide instead of the
                 // screen the package declared.
-                children(attachMediaReference, scope.contextId)
+                children(attachMediaReference, scope.contextId, { onScreenDrawer: canDriveScreen ? onScreenDrawer : undefined, presentation: canDriveScreen && screenDrawer !== null ? "drawer" : "outlet", onScreenClosed: closeScreenDrawer })
               ) : (
                 <InstalledScreenOutlet installation={installation} contexts={contexts} contextId={scope.contextId}
+                  onScreenDrawer={canDriveScreen ? onScreenDrawer : undefined} presentation={canDriveScreen && screenDrawer !== null ? "drawer" : "outlet"}
                   admitted={receiptReady && contextAdoptionReady && (viewer.operator === true && !viewer.readOnly || viewer.screenReader === true)}
-                  onRoute={screenRoute} onCommand={screenCommand} onNavigation={setScreenNavigation} onMediaAttach={attachMediaReference}
+                  onRoute={screenRoute} onCommand={screenCommand} onNavigation={(navigation) => { setScreenNavigation(navigation); if (navigation === null) closeScreenDrawer(); }} onMediaAttach={attachMediaReference}
                   fallback={contextAdoptionReady
                     ? <ScreenUnavailable installation={installation} contexts={contexts} contextId={scope.contextId}
                         admitted={viewer.operator === true && !viewer.readOnly} operator={viewer.operator === true} />

@@ -14,11 +14,11 @@ import { recordServices, object, exact, type HostCommand } from "./screenService
 import { admitDisplaySession, purgeDisplayCache, withReadObservations } from "./screenDisplayCache";
 import InertPreviewLayer, { type InertPreview } from "./InertPreviewLayer";
 import { parseRoutePatch, routeFromHref, type RoutePatch } from "./screenRoute";
-import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation } from "./screenProtocol";
+import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenPresentationMode } from "./screenProtocol";
 import type { MountReceipt } from "./screenLifecycle";
 
 /** App code lives in its independently installed bundle, never in the board. */
-export default function ScreenOutlet({ projection, fallback, loadAsset, actions, onRoute, onCommand, onNavigation, onMediaAttach }: {
+export default function ScreenOutlet({ projection, fallback, loadAsset, actions, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation }: {
   projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader;
   /** The operator's verbs for this frame (HP3); absent for a non-operator, so every `call`/`slot` closes it. */
   actions?: Pick<ScreenActions, "call" | "planner">;
@@ -26,13 +26,17 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
   onCommand?: (command: HostCommand) => void;
   onNavigation?: (navigation: ScreenNavigation | null) => void;
   onMediaAttach?: MediaChatAttach;
+  /** CAD-1615 — the shell opens and closes the board-wide drawer. */
+  onScreenDrawer?: (mode: ScreenPresentationMode, surface?: string) => void;
+  /** CAD-1615 — which surface this frame is presented in. */
+  presentation?: ScreenPresentationMode;
 }) {
   const { t, locale } = useLocale();
   const presentationLocale = useRef(locale);
   presentationLocale.current = locale;
   const href = useHref();
-  const navigationCallbacks = useRef({ onRoute, onCommand, onNavigation, onMediaAttach, href });
-  navigationCallbacks.current = { onRoute, onCommand, onNavigation, onMediaAttach, href };
+  const navigationCallbacks = useRef({ onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, href });
+  navigationCallbacks.current = { onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, href };
   const mounted = useRef<MountReceipt | null>(null);
   const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, presentation_locale: presentationLocale.current, route: routeFromHref(receipt.navigation, receipt.tag, navigationCallbacks.current.href), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : p;
   const container = useRef<HTMLDivElement>(null);
@@ -48,6 +52,13 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
   const [slot, setSlot] = useState<SlotView | null>(null);
   const [link, setLink] = useState<string | null>(null);
   const [state, setState] = useState<"loading" | "ready" | "fallback">("loading");
+  // CAD-1615 — the surface the shell presents this frame in reaches the
+  // child over the same port. The host owns the geometry; the child draws
+  // its surface there.
+  useEffect(() => {
+    if (!presentation) return;
+    channel.current?.present(presentation);
+  }, [presentation, state]);
   const scope = JSON.stringify([projection.install_id, projection.digest, projection.tag, projection.context_id]);
   useLayoutEffect(() => {
     const generation = privateSessionGeneration();
@@ -166,6 +177,9 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
             planner: (verb, args) => services ? (RECORD_SLOT_VERBS as readonly string[]).includes(verb) ? services.planner(verb as RecordSlotVerb, args) : Promise.resolve({ code: "forbidden", text: "This operation is unavailable." }) : acting.current!.planner(verb, args, actionToken ? { actionToken } : undefined),
             onSlot: view => { if (isCurrent()) setSlot(view); },
             onLink: url => { if (isCurrent()) setLink(url); },
+            onScreenDrawer: onScreenDrawer
+              ? (mode, surface) => { if (isCurrent()) navigationCallbacks.current.onScreenDrawer?.(mode, surface); }
+              : undefined,
             ...(actionToken ? { invoke: (alias: string, input: Record<string, unknown>, requestId: string, scope?:import("./screenProtocol").GenerationScope) =>
               invokeTool(actionToken!, alias, input, requestId, scope) } : {}),
           } : undefined, undefined, unsaved => {

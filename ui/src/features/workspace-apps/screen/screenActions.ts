@@ -238,6 +238,24 @@ async function socialDraftCall(verb: CallVerb,args:Record<string,unknown>,ui:{ac
 }
 
 /** Board paths an app may send the operator to. Exact paths only, never a caller-built route. */
+/** CAD-1615 — the app asks the board to present its screen in the
+ *  board-wide drawer. The host owns the geometry (whole window height, the
+ *  board under a scrim); the surface the app draws there is the app's. A
+ *  malformed request changes nothing. */
+function openScreenDrawer(args: Record<string, unknown>, ui: Parameters<ScreenActions["call"]>[2]): ActionResult {
+  const surface = args.surface;
+  if (!exact(args, ["surface"]) || typeof surface !== "string" || !/^[a-z0-9_-]{1,64}$/.test(surface)) return refuse("bad_args", "That request is not valid.");
+  if (!ui.openScreenDrawer) return refuse("unavailable", "This app cannot open a board drawer here.");
+  ui.openScreenDrawer(surface);
+  return { ok: true, data: { mode: "drawer", surface } };
+}
+function closeScreenDrawer(args: Record<string, unknown>, ui: Parameters<ScreenActions["call"]>[2]): ActionResult {
+  if (!exact(args, [])) return refuse("bad_args", "That request is not valid.");
+  if (!ui.closeScreenDrawer) return refuse("unavailable", "This app cannot open a board drawer here.");
+  ui.closeScreenDrawer();
+  return { ok: true, data: { mode: "outlet" } };
+}
+
 export const BOARD_LINK_PATHS: readonly string[] = ["/settings/connections"];
 /** The visible target of an external link: its host plus path, which is what the confirm names. */
 export const linkTarget = (href: string): string => { const url = new URL(href); return url.host + url.pathname + url.search; };
@@ -393,6 +411,8 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "read.run": () => readRun(ctx, args),
     "context.defaults.save": () => saveDefaults(ctx, args),
     "open-link": () => connectOrOpen(ctx, args, ui),
+    "screen.drawer.open": () => openScreenDrawer(args, ui),
+    "screen.drawer.close": () => closeScreenDrawer(args, ui),
     "social.destinations.list": () => listDestinations(args, ctx),
     "social.drafts.list": () => socialDraftCall(verb,args,ui),
     "social.drafts.show": () => socialDraftCall(verb,args,ui),

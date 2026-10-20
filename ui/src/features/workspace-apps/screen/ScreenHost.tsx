@@ -22,7 +22,7 @@ import type { ScreenPush } from "./screenProtocol";
  * host but keep the mounted frame and its handshake; only a context
  * switch, a new bundle or another screen rebuilds it.
  */
-export default function ScreenHost({ projection, fallback, loadAsset, actions, ...callbacks }: { projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader; actions?: Pick<ScreenActions, "call" | "planner"> } & Pick<ComponentProps<typeof ScreenOutlet>, "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach">) {
+export default function ScreenHost({ projection, fallback, loadAsset, actions, ...callbacks }: { projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader; actions?: Pick<ScreenActions, "call" | "planner"> } & Pick<ComponentProps<typeof ScreenOutlet>, "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach" | "onScreenDrawer" | "presentation">) {
   const href = useHref();
   const native = new URLSearchParams(href.split("?")[1] ?? "").get("screen") === "native";
   return native ? fallback : <ScreenOutlet projection={projection} fallback={fallback} loadAsset={loadAsset} actions={actions} {...callbacks} />;
@@ -33,7 +33,7 @@ export default function ScreenHost({ projection, fallback, loadAsset, actions, .
  * a files entry or URL by itself never authorizes execution. */
 export function InstalledScreenOutlet({ installation, contexts, contextId, admitted, fallback, ...callbacks }: {
   installation: Installation; contexts: AppContext[]; contextId: string; admitted: boolean; fallback: ReactNode;
-} & Pick<ComponentProps<typeof ScreenOutlet>, "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach">) {
+} & Pick<ComponentProps<typeof ScreenOutlet>, "onRoute" | "onCommand" | "onNavigation" | "onMediaAttach" | "onScreenDrawer" | "presentation">) {
   const declarations = installation.files.filter(f => /^screens\/[a-z0-9][a-z0-9-]{0,31}\/screens\.json$/.test(f));
   const tag = declarations.length === 1 ? declarations[0].split("/")[1] : null;
   const liveContext = contexts.some(c => c.id === contextId && c.install_id === installation.install_id && c.state === "active");

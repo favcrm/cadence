@@ -1,8 +1,8 @@
 import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseChild, parseInit, pushedAssetRefs, shapeFor, shapeOf,
-  wantsActions, wantsMedia, isMediaVerb, SCREEN_MEDIA_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, CRM_LOCALE_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
+  wantsActions, wantsMedia, isMediaVerb, SCREEN_MEDIA_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, CRM_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
   type ScreenNavigation,
   type ActionResult, type AssetReply, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenPush,
-  type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
+  type ScreenPresentation, type ScreenPresentationMode, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
 
 /** Resolves one pushed asset ref to a downscaled `data:` URL, or `null`
@@ -38,12 +38,19 @@ export interface ScreenActions {
     actionToken?: string;
     signal?: AbortSignal;
     attachMedia?: (args: MediaChatAttachArgs, actionToken: string) => Promise<MediaChatAttached>;
+    /** CAD-1615 — the app asks for the board-wide drawer; the shell owns
+     *  the geometry. Absent (no shell behind this frame) the verb refuses. */
+    openScreenDrawer?(surface: string): boolean;
+    closeScreenDrawer?(): boolean;
   }): Promise<ActionResult>;
   /** Validate a spend verb, fetch what the host must check, and name the work. */
   planner: Planner;
   /** The host-drawn slot to show (or hide, `null`). */
   onSlot(view: SlotView | null): void;
   onLink(url: string): void;
+  /** CAD-1615 — the shell presents this frame in the board-wide drawer
+   *  (`"drawer"`) or back in the app outlet (`"outlet"`). */
+  onScreenDrawer?(mode: ScreenPresentationMode, surface?: string): void;
   /** CAD-1177: invoke one declared tool alias under the operator's own
    *  session + this mount's server-bound action context. Absent (no tool
    *  context was minted, e.g. a v1/read-only screen) the `tool` op closes. */
@@ -225,6 +232,14 @@ export class ScreenChannel extends FrameChannel {
   }
   private records = false;
   private crmLocale = false;
+  private wantsPresentation = false;
+  /** CAD-1615 — tell the child which surface its frame is in. The host
+   *  owns the geometry; the child draws its surface there. */
+  present(mode: ScreenPresentationMode): void {
+    if (this.closed || !this.ready || !this.port || !this.wantsPresentation) return;
+    const message: ScreenPresentation = { v: 1, op: "presentation", mode };
+    this.port.postMessage(message);
+  }
   protected state(data: string): void {
     // Any records-contract screen may publish the hint; the payload's own
     // `contract` field is the declaration (CAD-1543), never the app name.
@@ -284,7 +299,7 @@ export class ScreenChannel extends FrameChannel {
         this.port?.postMessage({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "too_large", text: "That is too large to show." } });
       } else this.port?.postMessage(message);
     };
-    void actions.call(request.verb, request.args, { showLink: url => actions.onLink(url), actionToken: this.receipt.action_token ?? undefined, signal: retire.signal })
+    void actions.call(request.verb, request.args, { showLink: url => actions.onLink(url), actionToken: this.receipt.action_token ?? undefined, signal: retire.signal, openScreenDrawer: actions.onScreenDrawer ? (surface: string) => { actions.onScreenDrawer?.("drawer", surface); return true; } : undefined, closeScreenDrawer: actions.onScreenDrawer ? () => { actions.onScreenDrawer?.("outlet"); return true; } : undefined })
       .catch((): ActionResult => ({ ok: false, refusal: { code: "failed", text: "That didn't work." } }))
       .then(result => {
         this.calls--;
@@ -382,6 +397,9 @@ export class ScreenChannel extends FrameChannel {
    //  tool-less media mount's receipt carries no action token and its
     // calls refuse in `call`).
     this.wantsMedia = wantsMedia(ready.accepts);
+    // Record the presentation opt-in: only a child that advertises it may
+    // be told which surface its frame is in.
+    this.wantsPresentation = accepts.includes(SCREEN_PRESENTATION_V1);
     return true;
   }
   /** Only a v2 child, for a ref the last PUSH carried; anything else closes. */
