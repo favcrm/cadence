@@ -52,8 +52,17 @@ impl AgenticosWebAdapter {
         })
     }
 
-    fn run(&self, tool: &str, input: &Value) -> Result<Value> {
-        let target = target_for(required_str(input, "org")?)?;
+    fn run(&self, account: &str, tool: &str, input: &Value) -> Result<Value> {
+        if input
+            .get("org")
+            .and_then(Value::as_str)
+            .is_some_and(|org| org != account)
+        {
+            return Err(Error::rejected(
+                "agenticos-web: 'org' must equal the authorized account",
+            ));
+        }
+        let target = target_for(account)?;
         let wake = input["wake_timeout"]
             .as_u64()
             .unwrap_or(WAKE_DEFAULT)
@@ -105,21 +114,43 @@ impl AgenticosWebAdapter {
                 "prepare_site: 'staging' must be one staging token",
             ));
         }
-        let root = self.state_dir.join(STAGING_DIR);
-        let dir = root.join(token);
-        if dir.parent() != Some(root.as_path()) {
-            return Err(Error::rejected(
-                "prepare_site: the staging path escapes its root",
-            ));
-        }
+        use crate::web_publish::anchored_fs::{open_child, open_root, Child};
+        let root = open_root(&self.state_dir.join(STAGING_DIR)).map_err(|error| {
+            Error::rejected(format!(
+                "prepare_site: cannot open the staging root: {error}"
+            ))
+        })?;
+        let dir = match open_child(&root, token).map_err(|error| {
+            Error::rejected(format!(
+                "prepare_site: cannot open the staging token: {error}"
+            ))
+        })? {
+            Child::Directory(dir) => dir,
+            _ => {
+                return Err(Error::rejected(
+                    "prepare_site: the staging token is not a plain directory",
+                ))
+            }
+        };
         let mut plan_bytes = Vec::new();
-        std::fs::File::open(dir.join("plan.json"))
-            .and_then(|file| file.take(PLAN_CAP + 1).read_to_end(&mut plan_bytes))
-            .map_err(|error| {
-                Error::rejected(format!("prepare_site: cannot read the plan: {error}"))
-            })?;
-        if plan_bytes.len() as u64 > PLAN_CAP {
-            return Err(Error::rejected("prepare_site: the plan exceeds 8 MiB"));
+        match open_child(&dir, "plan.json").map_err(|error| {
+            Error::rejected(format!("prepare_site: cannot open the plan: {error}"))
+        })? {
+            Child::Regular(file, size) if size <= PLAN_CAP => {
+                file.take(PLAN_CAP + 1)
+                    .read_to_end(&mut plan_bytes)
+                    .map_err(|error| {
+                        Error::rejected(format!("prepare_site: cannot read the plan: {error}"))
+                    })?;
+            }
+            Child::Regular(_, _) => {
+                return Err(Error::rejected("prepare_site: the plan exceeds 8 MiB"))
+            }
+            _ => {
+                return Err(Error::rejected(
+                    "prepare_site: the plan is not a plain file",
+                ))
+            }
         }
         let plan: Value = serde_json::from_slice(&plan_bytes)
             .map_err(|_| Error::rejected("prepare_site: the plan is not valid JSON"))?;
@@ -150,6 +181,35 @@ impl AgenticosWebAdapter {
         if rows.len() > crate::web_publish::MAX_FILES {
             return Err(Error::rejected("prepare_site: too many files"));
         }
+        let manifest_rows = manifest["files"]
+            .as_array()
+            .ok_or_else(|| Error::rejected("prepare_site: the canonical manifest has no files"))?;
+        if manifest_rows.len() != rows.len() {
+            return Err(Error::rejected(
+                "prepare_site: the plan file rows do not match the manifest",
+            ));
+        }
+        let manifest_by_path: std::collections::BTreeMap<&str, &Value> = manifest_rows
+            .iter()
+            .filter_map(|row| row["path"].as_str().map(|path| (path, row)))
+            .collect();
+        if manifest_by_path.len() != manifest_rows.len() {
+            return Err(Error::rejected(
+                "prepare_site: the canonical manifest repeats a path",
+            ));
+        }
+        let files_dir = match open_child(&dir, "files").map_err(|error| {
+            Error::rejected(format!(
+                "prepare_site: cannot open the files directory: {error}"
+            ))
+        })? {
+            Child::Directory(dir) => dir,
+            _ => {
+                return Err(Error::rejected(
+                    "prepare_site: the files entry is not a plain directory",
+                ))
+            }
+        };
         let mut files = Vec::with_capacity(rows.len());
         let mut total = 0u64;
         for row in rows {
@@ -168,21 +228,52 @@ impl AgenticosWebAdapter {
                 .as_str()
                 .ok_or_else(|| Error::rejected("prepare_site: a file row has no hash"))?
                 .to_string();
-            let mut bytes = Vec::new();
-            std::fs::File::open(
-                dir.join("files")
-                    .join(crate::web_publish::encode_artifact_path(&path)),
-            )
-            .and_then(|file| {
-                file.take(crate::web_publish::MAX_FILE_BYTES + 1)
-                    .read_to_end(&mut bytes)
-            })
-            .map_err(|error| {
-                Error::rejected(format!("prepare_site: cannot read '{path}': {error}"))
+            let row_bytes = row["bytes"]
+                .as_u64()
+                .ok_or_else(|| Error::rejected("prepare_site: a file row has no size"))?;
+            let manifest_row = manifest_by_path.get(path.as_str()).ok_or_else(|| {
+                Error::rejected("prepare_site: the plan names a file outside the manifest")
             })?;
+            if manifest_row["sha256"].as_str() != Some(sha256.as_str())
+                || manifest_row["bytes"].as_u64() != Some(row_bytes)
+            {
+                return Err(Error::rejected(
+                    "prepare_site: a plan file row does not match the manifest",
+                ));
+            }
+            let manifest_mime = manifest_row["mime"]
+                .as_str()
+                .ok_or_else(|| Error::rejected("prepare_site: the manifest has no mime"))?;
+            if manifest_mime != crate::web_publish::mime_for(&path)? {
+                return Err(Error::rejected(
+                    "prepare_site: a plan file mime does not match the manifest",
+                ));
+            }
+            let mut bytes = Vec::new();
+            match open_child(&files_dir, &crate::web_publish::encode_artifact_path(&path)).map_err(
+                |error| Error::rejected(format!("prepare_site: cannot open '{path}': {error}")),
+            )? {
+                Child::Regular(file, _) => {
+                    file.take(crate::web_publish::MAX_FILE_BYTES + 1)
+                        .read_to_end(&mut bytes)
+                        .map_err(|error| {
+                            Error::rejected(format!("prepare_site: cannot read '{path}': {error}"))
+                        })?;
+                }
+                _ => {
+                    return Err(Error::rejected(format!(
+                        "prepare_site: '{path}' is not a plain file"
+                    )))
+                }
+            }
             if bytes.len() as u64 > crate::web_publish::MAX_FILE_BYTES {
                 return Err(Error::rejected(format!(
                     "prepare_site: '{path}' exceeds the file bound"
+                )));
+            }
+            if bytes.len() as u64 != row_bytes {
+                return Err(Error::rejected(format!(
+                    "prepare_site: '{path}' does not match its recorded size"
                 )));
             }
             if hex(&Sha256::digest(&bytes)) != sha256 {
@@ -244,15 +335,30 @@ impl PlatformAdapter for AgenticosWebAdapter {
         true
     }
 
+    /// Plain `execute` has no account, so it cannot select the saved login;
+    /// the gate always calls `execute_for_account` for this adapter.
     fn execute(
         &self,
+        _credential: &[u8],
+        _tool: &str,
+        _input: &Value,
+        _idempotency_key: &str,
+        _expected_hash: Option<&str>,
+    ) -> std::result::Result<Value, String> {
+        Err("agenticos-web requires the gate-authorized account".into())
+    }
+
+    fn execute_for_account(
+        &self,
+        account: &str,
         _credential: &[u8],
         tool: &str,
         input: &Value,
         _idempotency_key: &str,
         _expected_hash: Option<&str>,
     ) -> std::result::Result<Value, String> {
-        self.run(tool, input).map_err(|error| error.to_string())
+        self.run(account, tool, input)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -314,6 +420,28 @@ mod tests {
             .err()
             .expect("the digest mismatch must refuse");
         assert!(error.to_string().contains("digest"), "{error}");
+    }
+
+    #[test]
+    fn a_symlinked_staging_token_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("files")).unwrap();
+        std::fs::write(
+            outside.path().join("plan.json"),
+            br#"{"slug":"abc","digest":"00","canonical":"{}","files":[]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(STAGING_DIR)).unwrap();
+        symlink(
+            outside.path(),
+            dir.path().join(STAGING_DIR).join("stage-0123456789abcdef"),
+        )
+        .unwrap();
+        assert!(adapter(dir.path())
+            .read_staging("stage-0123456789abcdef")
+            .is_err());
     }
 
     #[test]

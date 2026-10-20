@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::Path;
 
 #[path = "web_publish_fs.rs"]
-mod anchored_fs;
+pub(crate) mod anchored_fs;
 
 pub const MAX_FILES: usize = 2_000;
 pub const MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;

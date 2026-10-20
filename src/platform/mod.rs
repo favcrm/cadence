@@ -66,6 +66,16 @@ pub fn inventory() -> Vec<ToolInventoryEntry> {
         .clone()
 }
 
+/// A saved AgenticOS web login is a verified account source even though it
+/// has no custody-enrolled credential row: `platform grant` and the project
+/// default accept it, and the adapter resolves the same saved login.
+pub fn saved_login_account(platform: &str, account: &str) -> bool {
+    platform == "agenticos-web"
+        && crate::remote_cli::account_image_targets()
+            .map(|targets| targets.iter().any(|target| target.org == account))
+            .unwrap_or(false)
+}
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

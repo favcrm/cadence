@@ -333,7 +333,7 @@ impl Shared {
         };
         let key = format!("call-{}", uuid::Uuid::new_v4().simple());
         let result = adapter
-            .execute(&bytes, tool, input, &key, None)
+            .execute_for_account(account, &bytes, tool, input, &key, None)
             .map_err(Error::internal)?;
         platform::refuse_leak("platform result", &result.to_string(), &bytes)?;
         let label = adapter.table().declared(tool).and_then(|d| d.label.clone());

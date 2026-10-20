@@ -90,7 +90,7 @@ fn platform_call(
     target: &RemoteTarget,
     input: Value,
 ) -> Result<Value> {
-    client::rpc(
+    let response = client::rpc(
         state_dir,
         "platform_call",
         json!({
@@ -99,7 +99,16 @@ fn platform_call(
             "account": target.org,
             "input": input,
         }),
-    )
+    )?;
+    // `platform_call` answers {result, effect, platform_result}: the command
+    // prints the adapter's own result, as it did before the cutover.
+    Ok(match response {
+        Value::Object(mut envelope) => match envelope.remove("platform_result") {
+            Some(result) => result,
+            None => Value::Object(envelope),
+        },
+        other => other,
+    })
 }
 
 /// Freeze output is written under the daemon's state directory, one bounded
@@ -123,6 +132,14 @@ fn stage(
     );
     let dir = state_dir.join(STAGING_DIR).join(&token);
     std::fs::create_dir_all(dir.join("files"))?;
+    if let Err(error) = stage_plan(&dir, site, slug, spa) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(error);
+    }
+    Ok(token)
+}
+
+fn stage_plan(dir: &Path, site: &web_publish::FrozenSite, slug: &str, spa: bool) -> Result<()> {
     let files: Vec<Value> = site
         .files
         .iter()
@@ -154,7 +171,7 @@ fn stage(
             &file.bytes,
         )?;
     }
-    Ok(token)
+    Ok(())
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {

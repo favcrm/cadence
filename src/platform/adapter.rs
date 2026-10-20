@@ -237,6 +237,21 @@ pub trait PlatformAdapter: Send + Sync {
         false
     }
 
+    /// Execute with the gate-authorized account available. Adapters whose
+    /// credential is selected by that account override this; everyone else
+    /// delegates to [`Self::execute`].
+    fn execute_for_account(
+        &self,
+        _account: &str,
+        credential: &[u8],
+        tool: &str,
+        input: &Value,
+        idempotency_key: &str,
+        expected_hash: Option<&str>,
+    ) -> std::result::Result<Value, String> {
+        self.execute(credential, tool, input, idempotency_key, expected_hash)
+    }
+
     /// Reviewed discovery metadata. Legacy adapters default unavailable.
     fn connection_descriptor(&self) -> Option<super::connections::ProviderDescriptor> {
         None
