@@ -47,6 +47,7 @@ pub mod project;
 pub mod project_new;
 pub mod reclaim;
 pub mod reconcile;
+pub mod recovery;
 pub mod relay;
 pub mod report;
 pub mod retro;
@@ -60,7 +61,7 @@ pub mod work;
 pub mod workflow;
 pub mod write;
 
-pub use pmlock::{LockState, PmLock};
+pub use pmlock::{InterruptionReport, LockState, PmLock};
 
 /// The legacy lock path, kept as the new protocol's fence file.
 const MARKER_LOCK_FILE: &str = ".write.lock";
@@ -374,7 +375,7 @@ impl Pm {
     /// under its own lock, CAD-449) and retries later instead.
     #[track_caller]
     pub fn try_lock(&self) -> Result<Option<PmLock>> {
-        self.acquire(None, None)
+        self.acquire(None, None, false)
     }
 
     /// [`Self::lock`] scoped to `paths`: when a crashed writer left
@@ -394,7 +395,7 @@ impl Pm {
     /// writer holds it.
     #[track_caller]
     pub fn try_lock_for_paths(&self, paths: &[PathBuf]) -> Result<Option<PmLock>> {
-        self.acquire(None, Some(paths))
+        self.acquire(None, Some(paths), false)
     }
 
     /// True when the worktree differs from HEAD.
@@ -595,6 +596,17 @@ impl Pm {
         }
         warn_foreign(&self.dir, &foreign, foreign_extra);
         Ok(foreign_out(foreign, foreign_extra))
+    }
+
+    /// The lease epoch this PM's writes carry, when it is leased. A
+    /// recovery commit that cannot go through [`Pm::commit`] still
+    /// names it, so a reader can order its commit against the others
+    /// across a restart or a holdover.
+    pub fn lease_epoch(&self) -> Option<String> {
+        self.lease
+            .as_ref()
+            .and_then(|lease| lease.epoch())
+            .map(|epoch| epoch.to_string())
     }
 
     /// CAD-538 — the tracker half of the SIGTERM flush: commit whatever

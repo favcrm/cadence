@@ -17,6 +17,8 @@ mod epic;
 mod milestone;
 pub use epic::{run_epic, EpicAction};
 pub use milestone::{run_milestone, MilestoneAction};
+mod recover;
+pub use recover::{run_recover, RecoverAction};
 
 #[derive(Subcommand)]
 pub enum CheckoutAction {
@@ -494,6 +496,13 @@ pub enum IssueAction {
     Epic {
         #[command(subcommand)]
         action: EpicAction,
+    },
+    /// Recover an interrupted tracker write: `review`, then `decide`,
+    /// then `execute`, then `status`. Operator only for decide and
+    /// execute; every verb goes through the daemon.
+    Recover {
+        #[command(subcommand)]
+        action: RecoverAction,
     },
     /// Add a link: `blocked_by|relates|parent|duplicate_of`.
     Link {
@@ -1654,6 +1663,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         }
 
         IssueAction::Epic { action } => run_epic(action, state_dir),
+        IssueAction::Recover { action } => run_recover(action, state_dir),
         IssueAction::Link { id, kind, target } => {
             let pm = open_pm()?;
             let sd = Some(state_dir);

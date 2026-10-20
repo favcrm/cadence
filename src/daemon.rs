@@ -159,6 +159,7 @@ mod platform_rpc;
 mod pm_activity_rpc;
 mod portable_replace_rpc;
 mod public_membership;
+mod recovery_rpc;
 mod requests_rpc;
 mod review_evidence_rpc;
 mod serve;
@@ -2873,6 +2874,10 @@ impl Shared {
             "slot_launch" => self.rpc_slot_launch(params, peer_pid),
             "slot_runner" => self.rpc_slot_runner(params, peer_pid),
             "approval_record" => self.rpc_approval_record(params, peer_pid),
+            "tracker_recovery_review" => self.rpc_tracker_recovery_review(params, peer_pid),
+            "tracker_recovery_decide" => self.rpc_tracker_recovery_decide(params, peer_pid),
+            "tracker_recovery_execute" => self.rpc_tracker_recovery_execute(params, peer_pid),
+            "tracker_recovery_status" => self.rpc_tracker_recovery_status(params, peer_pid),
             "approval_revoke" => self.rpc_approval_revoke(params, peer_pid),
             "approval_state" => self.rpc_approval_state(params, peer_pid),
             "approval_revoke_shown" => self.rpc_approval_revoke_shown(params, peer_pid),
