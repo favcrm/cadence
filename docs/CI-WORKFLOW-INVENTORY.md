@@ -21,7 +21,7 @@ No branch/ruleset settings are changed by this cleanup.
 Dormant dispatch files/scripts are retained as rebuild scaffolding in this
 increment, not deleted or advertised as working checks. Do not dispatch them
 as evidence that the retired suite passes. A separate decision should select
-which to rebuild or archive rather than leaving five misleading manual tools
+which to rebuild or archive rather than leaving misleading manual tools
 indefinitely. `cadence-nextest` itself is still live in the review recipe.
 
 ## Archived in the deep test audit

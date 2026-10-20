@@ -1884,11 +1884,11 @@ mod tests {
     fn master_policy_allowlists_the_method_table() {
         let table = super::super::caller_rule::dispatch_methods();
         let streams = framed_stream_methods();
-        // A parser that misses rustfmt-wrapped `| "next"` arms saw only
-        // 391 of the 424 methods, so a low floor let the completeness
-        // checks below pass while skipping 33 methods. Keep the floor in
-        // the hundreds: the table only grows.
-        assert!(table.len() > 400, "method table parse: {}", table.len());
+        // A parser that misses rustfmt-wrapped `| "next"` arms saw 417
+        // of 450 methods, so a low floor let the completeness checks
+        // below pass while skipping 33 methods. Keep the floor above that
+        // result and below the real count.
+        assert!(table.len() > 440, "method table parse: {}", table.len());
         assert!(
             streams.contains(&"app_media_inspect".to_string()),
             "retained image inspect must stay a framed stream"

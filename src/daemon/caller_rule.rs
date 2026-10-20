@@ -1632,10 +1632,11 @@ mod tests {
     #[test]
     fn every_dispatch_method_has_a_caller_rule() {
         let table = dispatch_methods();
-        // The weak (pre-consolidation) parser saw only 391 of 424 methods
-        // because it skipped rustfmt-wrapped arms; a floor in the
-        // hundreds keeps this completeness check honest.
-        assert!(table.len() > 400, "method table parse: {}", table.len());
+        // The weak (pre-consolidation) parser saw 417 of 450 methods
+        // because it skipped rustfmt-wrapped arms. Keep the floor above
+        // that result and below the real count, so the regression fails
+        // here instead of silently shrinking the table.
+        assert!(table.len() > 440, "method table parse: {}", table.len());
         for m in &table {
             assert!(
                 rule_of(m).is_some(),

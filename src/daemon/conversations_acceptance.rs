@@ -775,9 +775,9 @@ impl Gx {
 fn gate2_app_conversation_turn_is_an_allowlist_over_every_method() {
     let gx = gx();
     let table = super::caller_rule::dispatch_methods();
-    // The weak (pre-consolidation) parser saw only 391 of 424 methods; a
-    // floor in the hundreds keeps this completeness check honest.
-    assert!(table.len() > 400, "method table parse: {}", table.len());
+    // The weak (pre-consolidation) parser saw 417 of 450 methods; keep
+    // the floor above that result and below the real count.
+    assert!(table.len() > 440, "method table parse: {}", table.len());
     for family in ["agent_", "job_", "monitor_", "wiki_", "master_permission_"] {
         assert!(
             table.iter().any(|m| m.starts_with(family)),

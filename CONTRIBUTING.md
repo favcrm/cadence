@@ -161,8 +161,8 @@ Choose tests by the changed contract:
 - CI checks the full test inventory and runs the required suite with `test-seam`.
   Default-feature checks retain real caller-identity coverage; the debug-only
   seam must never appear in release builds. The `ui` feature embeds a previously
-  built SPA. Avoid `--all-features`: `e2e` is an opt-in journey tier with its own
-  release/Node/browser prerequisites.
+  built SPA, so avoid `--all-features`; the retired `e2e` journey tier used to
+  add its own release/Node/browser prerequisites.
 
 Retain real timing budgets and operator-lineage proofs. A new or changed
 enforced rule ships with one independent acceptance check proving the bad
