@@ -3273,6 +3273,7 @@ impl Shared {
             "platform_check" => self.rpc_platform_check(params, peer_pid),
             "platform_defaults" => self.rpc_platform_defaults(params),
             "platform_default_set" => self.rpc_platform_default_set(params, peer_pid),
+            "platform_tools" => self.rpc_platform_tools(params, peer_pid),
             "platform_call" => self.rpc_platform_call(params, peer_pid),
             "platform_effects" => self.rpc_platform_effects(params, peer_pid),
             "platform_effect_close" => self.rpc_platform_effect_close(params, peer_pid),
@@ -5040,6 +5041,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // unconfigured daemon leaves it unregistered and fails closed.
     crate::platform::agenticos::attach(&mut opts, &hosted)?;
     crate::platform::agenticos_external::attach(&mut opts)?;
+    // CAD-1640: one reviewed inventory, snapshotted after every adapter is
+    // registered. The MCP server and the managed Codex allowlist both derive
+    // their names from it, so they cannot drift.
+    crate::platform::record_inventory(&opts.platforms);
     // CAD-798: the production publish transport registers only under
     // explicit config (URL + 0600 credential file); default-off leaves
     // the daemon without a sender and dispatch stays processing.

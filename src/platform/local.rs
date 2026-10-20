@@ -755,6 +755,12 @@ struct Attachment {
 }
 
 impl PlatformAdapter for LocalAdapter {
+    /// `publish_app_text` is the reviewed app-artifact broker's tool: the
+    /// generic gate refuses it, so the listing must not offer it.
+    fn direct_call(&self, tool: &str) -> bool {
+        tool != TOOL_APP_TEXT
+    }
+
     fn prepare_app_text(
         &self,
         title: &str,
@@ -1307,4 +1313,24 @@ fn item_json(dir: &Path, index: &Value) -> Value {
         o.remove("input_sha256");
     }
     item
+}
+
+#[cfg(test)]
+mod direct_call_tests {
+    use super::*;
+
+    /// The app-artifact broker's tool is refused by the generic gate, so the
+    /// reviewed eligibility rule must say so; a plain outbox publish is direct.
+    #[test]
+    fn the_app_artifact_tool_is_not_directly_callable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = crate::daemon::ServeOptions::default();
+        crate::platform::local::register(dir.path(), &mut opts);
+        let adapter = opts
+            .platforms
+            .get(crate::platform::local::PLATFORM)
+            .expect("the local adapter is registered");
+        assert!(!adapter.direct_call(TOOL_APP_TEXT));
+        assert!(adapter.direct_call("publish"));
+    }
 }

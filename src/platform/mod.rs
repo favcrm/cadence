@@ -24,6 +24,47 @@ pub use adapter::{
     AppArtifactError, AppCapabilityError, ImageFailure, ImageReason, ImageSettle, PlatformAdapter,
 };
 
+/// One reviewed adapter tool, as registered at daemon startup.
+#[derive(Clone, Debug)]
+pub struct ToolInventoryEntry {
+    pub platform: String,
+    pub tool: String,
+    /// Whether the generic `platform_call` gate can execute it.
+    pub direct: bool,
+}
+
+static INVENTORY: std::sync::Mutex<Vec<ToolInventoryEntry>> = std::sync::Mutex::new(Vec::new());
+
+/// Snapshot every registered adapter's reviewed table, sorted so the CLI,
+/// the MCP server and the managed Codex allowlist all derive the same names.
+pub fn record_inventory(
+    platforms: &std::collections::HashMap<String, std::sync::Arc<dyn PlatformAdapter>>,
+) {
+    let mut rows = Vec::new();
+    for (platform, adapter) in platforms {
+        for decl in &adapter.table().tools {
+            rows.push(ToolInventoryEntry {
+                platform: platform.clone(),
+                tool: decl.tool.clone(),
+                direct: adapter.direct_call(&decl.tool),
+            });
+        }
+    }
+    rows.sort_by(|left, right| {
+        left.platform
+            .cmp(&right.platform)
+            .then_with(|| left.tool.cmp(&right.tool))
+    });
+    *INVENTORY.lock().unwrap_or_else(|error| error.into_inner()) = rows;
+}
+
+pub fn inventory() -> Vec<ToolInventoryEntry> {
+    INVENTORY
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

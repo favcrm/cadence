@@ -47,25 +47,37 @@ fn agent_mcp_config(agent: &Agent, log_path: &Path) -> Result<Value> {
         ))
     })?;
     let binary = std::env::current_exe()?;
+    // The managed client's allowlist is built from the same reviewed
+    // inventory the MCP server lists, so a generated platform tool cannot be
+    // discoverable but undispatchable (or vice versa). Managed Codex runs
+    // with approvalPolicy=never, so every reviewed tool is approved here;
+    // the server still returns only the static five plus direct-callable
+    // adapter tools.
+    let generated = crate::mcp_agent::generated_tool_names(
+        crate::platform::inventory()
+            .iter()
+            .map(|row| (row.platform.as_str(), row.tool.as_str(), row.direct)),
+    );
+    let mut enabled: Vec<String> = crate::mcp_agent::static_tool_names()
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    let mut approvals = serde_json::Map::new();
+    for name in crate::mcp_agent::static_tool_names() {
+        approvals.insert((*name).to_string(), json!({"approval_mode": "approve"}));
+    }
+    for (name, _, _) in &generated {
+        enabled.push(name.clone());
+        approvals.insert(name.clone(), json!({"approval_mode": "approve"}));
+    }
     Ok(json!({
         "command": binary,
         "args": ["--state-dir", state_dir, "mcp-agent"],
         "env": {"CADENCE_ALIAS": agent.alias, "CADENCE_STATE_DIR": state_dir},
         "startup_timeout_sec": 10,
-        // Managed Codex runs with approvalPolicy=never. Without these
-        // per-tool approvals, it lists the MCP tools but rejects every
-        // model-initiated call before the daemon can apply its own scope.
-        // Keep future tools undiscoverable and subject to a prompt, which
-        // the unattended worker cannot grant.
-        "enabled_tools": ["self", "wiki_search", "wiki_read", "issue_show", "app_run_artifact"],
+        "enabled_tools": enabled,
         "default_tools_approval_mode": "prompt",
-        "tools": {
-            "self": {"approval_mode": "approve"},
-            "wiki_search": {"approval_mode": "approve"},
-            "wiki_read": {"approval_mode": "approve"},
-            "issue_show": {"approval_mode": "approve"},
-            "app_run_artifact": {"approval_mode": "approve"},
-        },
+        "tools": approvals,
     }))
 }
 

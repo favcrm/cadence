@@ -373,6 +373,23 @@ pub fn rpc_timeout(
     proto::unwrap(rpc_frame(state_dir, method, params, timeout)?)
 }
 
+/// One read under a single absolute deadline covering connect, the request
+/// write and the complete reply. Best-effort callers use this instead of
+/// [`rpc_timeout`]: a full listen backlog closes nothing on connect, and a
+/// trickled reply resets a per-read timeout, so both can outlive it.
+pub fn rpc_deadline(
+    state_dir: &Path,
+    method: &str,
+    params: Value,
+    budget: Duration,
+) -> Result<Value> {
+    let deadline = Instant::now() + budget;
+    let socket = rpc_socket_path(state_dir)?;
+    proto::unwrap(rpc_deadline_frame_on(
+        state_dir, &socket, method, params, deadline,
+    )?)
+}
+
 /// CAD-1193: the shared deadline for the read-only dependency RPCs one
 /// `/api/meta` response chains — session validation, the board/agent
 /// identity facts behind the operator proof, daemon build info. Those
@@ -1176,6 +1193,36 @@ mod tests {
             }
             served
         })
+    }
+
+    #[test]
+    fn the_deadline_transport_refuses_a_stalled_peer() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("cadence.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // Accept the connection and never answer: only an absolute deadline
+        // can end this wait.
+        let server = std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            std::thread::sleep(Duration::from_millis(900));
+            drop(stream);
+        });
+        let started = Instant::now();
+        let error = rpc_deadline(
+            dir.path(),
+            "platform_tools",
+            serde_json::json!({}),
+            Duration::from_millis(120),
+        )
+        .expect_err("a stalled peer must not satisfy the deadline");
+        assert!(
+            started.elapsed() < Duration::from_millis(700),
+            "deadline not honored: {error}"
+        );
+        let _ = server.join();
     }
 
     #[test]
