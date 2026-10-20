@@ -20,7 +20,7 @@ import type { ChatBinding, ChatScope, MediaComposerTarget } from "./chat/types";
 import { assertRecordId, type HostScope } from "./hostActions";
 import { isDev } from "../../env";
 import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
-import { useChatCollapsed, selectConversation, setDraftSubject, campaignSubject, conversationList, type ConversationLinkRequest } from "./conversationClient";
+import { useChatCollapsed, selectConversation, setDraftSubject, campaignSubject, whatsappSubject, conversationList, type ConversationLinkRequest } from "./conversationClient";
 import { installedAppHref } from "../apps/appViewModel";
 import { useLocale } from "../../lib/locale";
 import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
@@ -786,6 +786,15 @@ export default function AppShell({
       if (command.conversation_id) selectConversation(installId, command.conversation_id);
       else setDraftSubject(installId, campaignSubject(campaign));
       if (command.operation === "chat.campaign.brief") void conversationList(installId).refresh();
+      setPanel("chat");
+    }
+    if (command.operation === "chat.whatsapp.open" || command.operation === "chat.whatsapp.brief") {
+      // CAD-1636: the subject chat of one WhatsApp conversation; same selection-only rule.
+      const conversation = command.args.conversation_id;
+      if (typeof conversation !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/.test(conversation)) return;
+      if (command.conversation_id) selectConversation(installId, command.conversation_id);
+      else setDraftSubject(installId, whatsappSubject(conversation));
+      if (command.operation === "chat.whatsapp.brief") void conversationList(installId).refresh();
       setPanel("chat");
     }
   };

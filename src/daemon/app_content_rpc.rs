@@ -1045,6 +1045,20 @@ impl ScopedChat {
             _ => Ok(()),
         }
     }
+
+    /// CAD-1636: a WhatsApp copilot action serves only the WhatsApp
+    /// conversation this chat is about; a chat with no subject (General)
+    /// or another subject refuses.
+    pub(super) fn require_whatsapp(&self, conversation: &str) -> Result<()> {
+        if self.subject.as_deref()
+            != Some(super::whatsapp_copilot::subject_of(conversation).as_str())
+        {
+            return Err(Error::rejected(
+                "WhatsApp assistant actions serve only this chat's own WhatsApp conversation",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Shared {

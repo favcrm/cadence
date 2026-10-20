@@ -11,7 +11,7 @@ function RecordConfirmation({ view, card, onTap, onCancel }: {
     "records.csv.import": "Import this CSV plan?", "records.csv.confirm": "Confirm this CSV plan?", "content.approve": "Approve this content revision?",
     "smtp.manage": "Open email sending settings?", "smtp.bind": "Bind this SMTP connection?", "smtp.rebind": "Replace this SMTP binding?", "smtp.revoke": "Revoke this SMTP binding?",
     "smtp.test-send": "Send one test email?", "sends.approve": "Approve this frozen send?", "sends.resolve": "Resolve this uncertain delivery?",
-    "origin.manage": "Change the daemon-global unsubscribe origin?", "chat.campaign.open": "Open this campaign's assistant?", "chat.campaign.brief": "Send this campaign brief?",
+    "origin.manage": "Change the daemon-global unsubscribe origin?", "chat.campaign.open": "Open this campaign's assistant?", "chat.campaign.brief": "Send this campaign brief?", "chat.whatsapp.brief": "Ask the assistant to draft this reply?",
     "whatsapp.reply.send": "Send this WhatsApp reply?",
     "whatsapp.template.send": "Send this WhatsApp template?", "whatsapp.broadcast.test.send": "Send one WhatsApp test message?",
     "whatsapp.broadcast.send": "Approve this WhatsApp broadcast?", "whatsapp.broadcast.stop": "Stop this WhatsApp broadcast?",

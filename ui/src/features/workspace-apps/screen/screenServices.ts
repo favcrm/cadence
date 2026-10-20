@@ -8,7 +8,7 @@ import type { RecordCard, SlotPlan } from "./screenSlot";
 export const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 export function exact(v: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(v).every(k => keys.includes(k)); }
 const TOKEN = /^[a-f0-9]{64}$/;
-const WRITES = new Set(["records.create", "records.update", "segments.save", "exclusions.save", "suppressions.add", "audience.prepare", "content.save", "content.clone", "proposals.apply", "proposals.discard", "sender-bindings.save"]);
+const WRITES = new Set(["records.create", "records.update", "segments.save", "exclusions.save", "suppressions.add", "audience.prepare", "content.save", "content.clone", "proposals.apply", "proposals.discard", "sender-bindings.save", "whatsapp.draft.discard"]);
 const SECRET_FIELDS = new Set(["action_token", "confirmation_token", "confirmation_nonce", "confirm_token", "csv_confirm_token", "scope_proof", "password", "credentials", "credential", "secret", "session_key", "host_command"]);
 /** Service-only DTO projection. Private CSV delegation stays in this closure. */
 function sanitized(value: unknown): unknown {
@@ -131,7 +131,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
             }
             const data = deliver(operation === "records.csv.confirm" && object(result)
               ? { ...result, confirmation_required: result.state === "open" } : result);
-            if (!["smtp.manage", "chat.campaign.open", "chat.campaign.brief", "records.csv.confirm"].includes(operation)) invalidateDisplay(domain);
+            if (!["smtp.manage", "chat.campaign.open", "chat.campaign.brief", "chat.whatsapp.brief", "records.csv.confirm"].includes(operation)) invalidateDisplay(domain);
             return { ok: true, data };
           } catch (error) { return { ok: false, refusal: failed(error) }; }
         } };
@@ -217,6 +217,12 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionA
   if (operation === "sends.resolve") card.input = { field: "resolution", label: "Resolve uncertain outcome — this does not resend", choices: [{ value: "accepted", label: "Accepted by the server" }, { value: "failed", label: "Failed" }] };
   if (operation === "origin.manage") card.input = { field: "unsubscribe_origin", label: "Daemon-global unsubscribe origin (blank clears it)", value: typeof facts.unsubscribe_origin === "string" ? facts.unsubscribe_origin : "" };
   if (operation === "chat.campaign.brief") { show("Effect", facts.effect); card.input = { field: "brief", label: "Send this brief to the assistant", value: typeof facts.brief === "string" ? facts.brief : "" }; }
+  if (operation === "chat.whatsapp.brief") {
+    // CAD-1636: the host names the contact, the bound and the model; the guidance is shown read-only.
+    if (typeof facts.bound !== "string" || typeof facts.model !== "string") throw new ApiError("Incomplete brief facts", 502);
+    show("Contact", facts.contact ?? "Unknown contact"); show("What the assistant reads", facts.bound); show("Model", facts.model); show("Effect", facts.effect);
+    card.input = { field: "brief", label: "Your guidance for the assistant", value: typeof facts.guidance === "string" ? facts.guidance : "" };
+  }
   if (operation === "smtp.bind" || operation === "smtp.rebind") {
     const choices = Array.isArray(facts.connections) ? facts.connections.filter(object).filter(c => typeof c.connection_id === "string").map(c => ({ value: c.connection_id as string, label: `${c.connection_id} — ${JSON.stringify(c.sender)}` })) : [];
     card.input = { field: "connection_id", label: "Admitted SMTP connection", choices };

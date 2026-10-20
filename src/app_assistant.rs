@@ -68,6 +68,17 @@ fn schema(id: &str) -> Option<Value> {
             json!({"asset_id":{"type":"string","minLength":1,"maxLength":64},"revision":{"type":"integer","minimum":1},"sha256":{"type":"string","minLength":71,"maxLength":71},"instructions":{"type":"string","minLength":1,"maxLength":2000}}),
             &["asset_id", "revision", "sha256", "instructions"],
         ),
+        // CAD-1636: the WhatsApp copilot. The registry validator counts
+        // bytes, so draft text gets a 4000-byte transport bound and the
+        // handler enforces the design's 1000-character bound.
+        "whatsapp.conversation.context" => object(
+            json!({"conversation_id":{"type":"string","minLength":1,"maxLength":128}}),
+            &["conversation_id"],
+        ),
+        "whatsapp.reply.draft" => object(
+            json!({"conversation_id":{"type":"string","minLength":1,"maxLength":128},"draft_id":{"type":"string","minLength":1,"maxLength":128},"text":{"type":"string","minLength":1,"maxLength":4000},"basis_message_id":{"type":"string","minLength":1,"maxLength":128}}),
+            &["conversation_id", "draft_id", "text", "basis_message_id"],
+        ),
         _ => return None,
     })
 }
@@ -208,6 +219,8 @@ pub fn registered_action(id: &str) -> Option<RegisteredAction> {
         "social.draft.create" => ("draft", "permission_required"),
         "social.drafts.status" => ("read", "none"),
         "media.refine.prepare" => ("draft", "permission_required"),
+        "whatsapp.conversation.context" => ("read", "none"),
+        "whatsapp.reply.draft" => ("proposal", "none"),
         _ => return None,
     };
     Some(RegisteredAction {
@@ -227,6 +240,8 @@ pub fn registered_action(id: &str) -> Option<RegisteredAction> {
             "social.draft.create" => "social.draft.create",
             "social.drafts.status" => "social.drafts.status",
             "media.refine.prepare" => "media.refine.prepare",
+            "whatsapp.conversation.context" => "whatsapp.conversation.context",
+            "whatsapp.reply.draft" => "whatsapp.reply.draft",
             _ => unreachable!(),
         },
         effect,
@@ -253,6 +268,8 @@ pub fn registered_ids() -> &'static [&'static str] {
         "social.draft.create",
         "social.drafts.status",
         "media.refine.prepare",
+        "whatsapp.conversation.context",
+        "whatsapp.reply.draft",
     ]
 }
 

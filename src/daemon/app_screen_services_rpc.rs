@@ -296,6 +296,11 @@ args!(WaTestPrepare {
     to: String
 });
 args!(WaBroadcastPrepare { broadcast_id: String, send_at: Option<String> });
+// CAD-1636: the reply copilot's brief.
+args!(WaBrief {
+    conversation_id: String,
+    guidance: String
+});
 args!(RoutePatch { section: Option<String>, view: Option<String>, record_id: Option<String>, segment_id: Option<String>, replace: Option<bool> });
 
 fn typed<T: for<'de> Deserialize<'de> + Serialize>(value: &Value) -> Result<Value> {
@@ -360,6 +365,9 @@ fn call_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
         WhatsappBroadcastDraft => typed::<WaDraft>(value),
         WhatsappBroadcastTestPrepare => typed::<WaTestPrepare>(value),
         WhatsappBroadcastPrepare => typed::<WaBroadcastPrepare>(value),
+        ChatWhatsappOpen | WhatsappDraftShow | WhatsappDraftDiscard => {
+            typed::<WaConversation>(value)
+        }
         ScreenPreviewShow => typed::<PreviewShow>(value),
         ScreenPreviewClear => typed::<PreviewClear>(value),
         ScreenRoutePatch => {
@@ -400,6 +408,7 @@ fn slot_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
             typed::<WaEffect>(value)
         }
         ScreenOperation::WhatsappBroadcastStop => typed::<WaBroadcast>(value),
+        ScreenOperation::ChatWhatsappBrief => typed::<WaBrief>(value),
         _ => Err(Error::rejected("screen SLOT operation is not implemented")),
     }
 }
@@ -830,6 +839,28 @@ impl Shared {
                     "receipt": {"message": receipt["message"], "queued": true}}))
             });
         }
+        if matches!(
+            proof.operation,
+            ChatWhatsappOpen | ChatWhatsappBrief | WhatsappDraftShow | WhatsappDraftDiscard
+        ) {
+            let public_session = proof.public_session.clone();
+            return self.screen_service_scope(
+                proof.install(),
+                proof.context()?,
+                true,
+                Some(proof),
+                || {
+                    self.whatsapp_copilot_screen(
+                        proof.operation,
+                        proof.install(),
+                        proof.context()?,
+                        &params,
+                        public_session.as_deref(),
+                        peer_pid,
+                    )
+                },
+            );
+        }
         if matches!(proof.operation, OriginShow | OriginManage) {
             params
                 .as_object_mut()
@@ -1009,6 +1040,7 @@ impl Shared {
                 self.whatsapp_broadcast_facts(install, context, args)
             }
             ScreenOperation::WhatsappBroadcastStop => self.whatsapp_stop_facts(args),
+            ScreenOperation::ChatWhatsappBrief => self.whatsapp_brief_facts(args),
             ScreenOperation::OriginManage => Ok(json!({"scope": "daemon-global",
                 "unsubscribe_origin": self.store.crm_setting("unsubscribe_origin")?.or_else(|| self.unsubscribe_origin.clone())})),
             _ => Err(Error::rejected(
@@ -1076,6 +1108,9 @@ impl Shared {
             }
             (ChatCampaignBrief, Confirmation::Brief(input))
                 if input.confirmed && args["brief"].as_str() == Some(input.brief.as_str()) => {}
+            // CAD-1636: the tap confirms the guidance exactly as the card drew it.
+            (ChatWhatsappBrief, Confirmation::Brief(input))
+                if input.confirmed && args["guidance"].as_str() == Some(input.brief.as_str()) => {}
             (RecordsCsvImport, Confirmation::Csv(input)) if input.confirmed => {
                 let held = self
                     .screen_service_confirmations

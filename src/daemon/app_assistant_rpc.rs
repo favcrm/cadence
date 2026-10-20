@@ -261,6 +261,15 @@ impl Shared {
         ) {
             scoped.require_campaign(required_str(input, "campaign_id")?)?;
         }
+        // CAD-1636: hosted only, and bound to this chat's subject, before
+        // any operation row or draft exists.
+        if matches!(
+            action_id,
+            "whatsapp.conversation.context" | "whatsapp.reply.draft"
+        ) {
+            self.whatsapp_door()?;
+            scoped.require_whatsapp(required_str(input, "conversation_id")?)?;
+        }
         let operation_id = required_str(params, "operation_id")?;
         let semantic = crate::store::app_runs::material_digest(
             &json!({"contract":crate::issue::app_assistant::CONTRACT,"action":action_id,"schema":meta.input_schema,"handler_version":meta.handler_version,"descriptor_digest":descriptor_digest,"input":input}),
@@ -509,6 +518,14 @@ impl Shared {
                         &scoped.caller,
                         &scoped.message_id,
                     )
+                }
+                "whatsapp.conversation.context" => self.whatsapp_copilot_context(
+                    &scoped.install,
+                    &scoped.context,
+                    required_str(input, "conversation_id")?,
+                ),
+                "whatsapp.reply.draft" => {
+                    self.whatsapp_copilot_draft(&scoped.install, &scoped.context, input)
                 }
                 _ => Err(Error::rejected("unknown assistant action")),
             }?;

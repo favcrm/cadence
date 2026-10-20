@@ -251,6 +251,16 @@ pub enum ScreenOperation {
     WhatsappBroadcastSend,
     #[serde(rename = "whatsapp.broadcast.stop")]
     WhatsappBroadcastStop,
+    // CAD-1636: the reply copilot. Not door verbs (`is_whatsapp`): the
+    // host serves them itself, on a hosted daemon only.
+    #[serde(rename = "chat.whatsapp.open")]
+    ChatWhatsappOpen,
+    #[serde(rename = "chat.whatsapp.brief")]
+    ChatWhatsappBrief,
+    #[serde(rename = "whatsapp.draft.show")]
+    WhatsappDraftShow,
+    #[serde(rename = "whatsapp.draft.discard")]
+    WhatsappDraftDiscard,
 }
 
 impl ScreenOperation {
@@ -275,6 +285,7 @@ impl ScreenOperation {
                 | Self::WhatsappBroadcastTestSend
                 | Self::WhatsappBroadcastSend
                 | Self::WhatsappBroadcastStop
+                | Self::ChatWhatsappBrief
         )
     }
     /// CAD-1562: an operation of the hosted WhatsApp door.
@@ -351,6 +362,8 @@ impl ScreenOperation {
                 | Self::WhatsappBroadcastShow
                 | Self::WhatsappBroadcastEstimate
                 | Self::WhatsappBroadcastResults
+                // CAD-1636: members read the parked draft only.
+                | Self::WhatsappDraftShow
         )
     }
     pub fn args_limit(self) -> usize {

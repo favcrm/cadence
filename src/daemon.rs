@@ -182,6 +182,7 @@ mod topics_rpc;
 mod unattended;
 mod unattended_landing;
 mod watch;
+mod whatsapp_copilot;
 mod whatsapp_rpc;
 mod wiki_rpc;
 
