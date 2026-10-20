@@ -396,6 +396,51 @@ pub static SPECS: &[EndpointSpec] = &[
         launch_default: true,
         internal: false,
     },
+    // CAD-1624: omp is the team's primary harness. It ships the same managed-rpc
+    // surface as Pi (`--mode rpc`, `--tools`, `-e`/`--no-extensions`,
+    // `--session-dir`, `--thinking`), so it rides the Pi adapter with its own
+    // program and inherits the same Settings allowlist gate — never a second,
+    // ungated launch path.
+    EndpointSpec {
+        provider: "omp",
+        endpoint_kind: "managed",
+        display: "OMP (managed rpc)",
+        has_actor: true,
+        attach: Attach::Headless,
+        ready_gate: false,
+        screen_probe: false,
+        reports: Reporting::TurnResult,
+        report_hint: Reporting::TurnResult,
+        turn_token: Some(PI_MANAGED_TURN_TOKENS),
+        brokers_requests: false,
+        resumable: true,
+        resume_label: "cadence agent resume <alias> (stored omp session file)",
+        live_settable_params: &["stall_secs", "auto_stop", "auto_stop_idle_secs"],
+        launch_params: &[
+            "model",
+            "effort",
+            "turn_idle_secs",
+            "turn_max_secs",
+            "session",
+            "upstream",
+            "agents_md",
+            "stall_secs",
+            "confine",
+        ],
+        session_id_label: "OMP session",
+        respond_rejection: Some(
+            "managed omp endpoints broker no requests — extension UI dialogs are \
+             auto-cancelled and recorded as pi_ui_request events",
+        ),
+        capabilities: &["managed_pi_rpc", "native_turn_steering"],
+        doctor_caps: &["managed_pi_rpc"],
+        probe_bins: &[("omp", &["--version"])],
+        session_disposable: true,
+        // Not the install default: `join <pm>` keeps resolving to pi until the
+        // operator moves the default deliberately.
+        launch_default: false,
+        internal: false,
+    },
     EndpointSpec {
         provider: "claude",
         endpoint_kind: "pty",

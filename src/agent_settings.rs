@@ -1939,7 +1939,7 @@ fn permission_reasons(
     let kind = provider_kind(overlay, provider);
     let scope = overlay.scope.get(model).map(String::as_str).unwrap_or("");
     let harness_provider = spec.map(|s| s.provider).unwrap_or("");
-    if kind == "Pi extension" || harness_provider == "pi" {
+    if pi_family(kind, spec) {
         if scope == "off" || scope.is_empty() {
             reasons.push(format!("model '{model}' scope is off"));
         }
@@ -1954,12 +1954,20 @@ fn permission_reasons(
     {
         reasons.push(err.to_string());
     }
-    if kind == "Pi extension" || harness_provider == "pi" {
+    if pi_family(kind, spec) {
         if let Err(err) = pi_policy::require_allowed(policy, "worker", model) {
             reasons.push(err.to_string());
         }
     }
     reasons
+}
+
+/// Does this harness consume the Settings Pi policy? A Pi-extension provider
+/// always does, and so does any registered managed-rpc endpoint (pi, omp, and
+/// whatever joins them) — the capability, never a provider name, so a new
+/// pi-compatible runtime cannot arrive ungated (CAD-559, CAD-1624).
+fn pi_family(kind: &str, spec: Option<&EndpointSpec>) -> bool {
+    kind == "Pi extension" || spec.is_some_and(|spec| spec.capabilities.contains(&"managed_pi_rpc"))
 }
 
 fn registry_cli(harness: &str, cli: &str) -> Option<&'static EndpointSpec> {
@@ -2613,5 +2621,30 @@ mod fleet_check_tests {
         assert_eq!(report["launchable"], 0);
         assert_eq!(report["refused"].as_array().map(|rows| rows.len()), Some(1));
         assert_eq!(report["policy"], Value::Null);
+    }
+}
+
+#[cfg(test)]
+mod omp_harness_tests {
+    use super::*;
+
+    /// CAD-1624: omp is a registered managed-rpc harness, so a Settings
+    /// harness row validates (`registry_cli`) and the policy gate covers it by
+    /// capability rather than by a provider name — the generic seam.
+    #[test]
+    fn omp_is_a_registered_gated_harness() {
+        assert!(
+            registry_cli("omp", "omp").is_some(),
+            "harness put omp --cli omp must validate"
+        );
+        let omp = registry::SPECS
+            .iter()
+            .find(|spec| spec.provider == "omp")
+            .expect("omp endpoint spec");
+        assert_eq!(omp.endpoint_kind, "managed");
+        assert!(omp.capabilities.contains(&"managed_pi_rpc"));
+        assert!(pi_family("", Some(omp)));
+        assert!(pi_family("Pi extension", None));
+        assert!(!pi_family("", None));
     }
 }
