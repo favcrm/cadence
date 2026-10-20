@@ -853,7 +853,13 @@ fn files_since(
             // A directory that cannot be read makes the scan incomplete.
             return true;
         };
-        for e in rd.flatten() {
+        for e in rd {
+            let e = match e {
+                Ok(e) => e,
+                // An entry the iterator could not produce makes the scan
+                // incomplete, never silently shorter.
+                Err(_) => return true,
+            };
             visited += 1;
             if out.len() >= CAP || visited > 500_000 {
                 return true;

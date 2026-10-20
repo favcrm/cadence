@@ -1418,15 +1418,21 @@ fn open_parent_no_follow(root: &Path, path: &str) -> std::io::Result<(i32, Vec<u
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     for part in &parts[..parts.len() - 1] {
         let c = CString::new(part.as_bytes()).map_err(|_| bad())?;
-        let next = unsafe {
-            libc::openat(
-                fd,
-                c.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
+        let mut next = unsafe { libc::openat(fd, c.as_ptr(), flags) };
+        if next < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            // The crash removed the directory. The committed state has
+            // it, so it is recreated — every existing component was
+            // already opened without following a link.
+            if unsafe { libc::mkdirat(fd, c.as_ptr(), 0o755) } < 0 {
+                let e = std::io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                return Err(e);
+            }
+            next = unsafe { libc::openat(fd, c.as_ptr(), flags) };
+        }
         unsafe { libc::close(fd) };
         if next < 0 {
             return Err(std::io::Error::last_os_error());
