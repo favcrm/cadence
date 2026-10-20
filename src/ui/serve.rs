@@ -1413,11 +1413,13 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             } else {
                 actor
             };
+            let anonymous_reads_allowed =
+                operator::anonymous_reads_on(opts, operator::request_origin_kind(&request, opts));
             send(
                 request,
                 json_response(json!({
                     "read_only": opts.read_only,
-                    "anonymous_reads": operator::anonymous_reads(opts),
+                    "anonymous_reads": anonymous_reads_allowed,
                     "signed_in": session["signed_in"],
                     "hosted": session["hosted"],
                     "session": session["session"],

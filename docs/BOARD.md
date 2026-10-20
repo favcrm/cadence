@@ -1211,8 +1211,9 @@ Private local reads require a session by default (CAD-1452).
 `--allow-anonymous-reads` explicitly permits local unsigned reads;
 `--no-allow-anonymous-reads` clears a persisted allowance. This policy is
 independent of `--read-only`: disabling writes does not grant read access.
-Configuring it together with a hosted board identity is refused. Changing an
-already-running board's read policy requires restarting that board explicitly.
+Configuring it together with a hosted board identity or tailnet sharing is
+refused. Changing an already-running board's read policy requires restarting
+that board explicitly.
 
 **Signing in (CAD-313, ADR 0004; read boundary CAD-1452).** Private board
 reads and operator writes need a session. `cadence ui login`, run from your own shell, prints a link —
