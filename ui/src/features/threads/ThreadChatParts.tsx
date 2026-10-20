@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
-import { Bubble, USER_BUBBLE } from "../home/ThreadView";
+import { Bubble } from "../home/ThreadView";
 import type { DeliveryState } from "./threadsClient";
 import { deliveryLabel } from "./threadsView";
 
@@ -28,10 +28,10 @@ export function Turn({
   children: ReactNode;
 }) {
   return (
-    <Bubble who={who} at={at} me={me} density="compact">
+    <Bubble who={who} at={at} me={me}>
       <div
-        className={`inline-block text-left px-3 py-2 text-secondary text-ink-100 whitespace-pre-wrap [overflow-wrap:anywhere] ${
-          me ? `bg-accent/10 border border-accent/20 ${USER_BUBBLE}` : "text-ink-200"
+        className={`text-left text-secondary text-ink-100 whitespace-pre-wrap [overflow-wrap:anywhere] ${
+          me ? "chat-bubble" : "inline-block px-3 py-2 text-ink-200"
         }`}
       >
         {children}
