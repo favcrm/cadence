@@ -1227,11 +1227,12 @@ sessions are opened and honoured on this Host only; on any other Host
 the board cannot accept a local sign-in and refuses private reads and writes.
 Opening the link sets an HttpOnly, `SameSite=Strict` session cookie (`Secure` and
 `__Host-` on the https tailnet origin) valid 24 h idle, 7 days at most,
-and hands the page a second key it keeps in that tab's `sessionStorage`
-and sends as `X-Cadence-Session` on every request. The cookie alone is
-no session: a server on another port that receives it (cookies ignore
-ports) never has the key, and a cross-site page cannot set the header.
-A new tab signs in with a fresh link — the board tells it so. Links to
+and hands the page a second key it keeps in this browser's `localStorage`
+(per origin, port included) and sends as `X-Cadence-Session` on every
+request. The cookie alone is no session: a server on another port that
+receives it (cookies ignore ports) never has the key, and a cross-site
+page cannot set the header. A new tab, a reload or a browser restart
+reuses that key; clearing the browser's storage needs a fresh link. Links to
 this machine in agent-written markdown are shown, never clickable.
 The nonce rides in the URL fragment, which a browser never sends to a
 server, so it never reaches `ui.log`. The link is minted only for a

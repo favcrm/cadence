@@ -65,13 +65,13 @@ export default function Login({ onSignedIn }: { onSignedIn: () => void }) {
       <div className="auth-state-icon" aria-hidden="true">{state.kind === "failed" ? "›_" : <span className="auth-loader" />}</div>
       <p className="auth-eyebrow">{t("Local Cadence UI")}</p>
       <h1 ref={title} tabIndex={-1}>{t(state.kind === "failed" ? state.unavailable ? "We couldn’t verify your session." : "This link can’t sign you in." : "Checking your session")}</h1>
-      {state.kind !== "failed" && <p className="auth-intro">{t("The one-use link is exchanged for this tab’s session. Your workspace opens only after access is verified.")}</p>}
+      {state.kind !== "failed" && <p className="auth-intro">{t("The one-use link is exchanged for this browser’s session. Your workspace opens only after access is verified.")}</p>}
       {state.kind === "failed" && (
         <>
           <p className="auth-intro text-warn">{state.why}</p>
           <div className="auth-actions">
             <div className="auth-login-command"><code>{SIGN_IN_COMMAND}</code><span aria-hidden="true">›_</span></div>
-            <p className="auth-quiet">{t("Run a fresh sign-in command on the computer running Cadence. Each link works once and belongs to this tab.")}</p>
+            <p className="auth-quiet">{t("Run a fresh sign-in command on the computer running Cadence. Each link works once and belongs to this browser.")}</p>
           </div>
         </>
       )}

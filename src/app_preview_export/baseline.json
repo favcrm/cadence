@@ -1,6 +1,6 @@
 {
   "contract": "app-screen-projection-fixtures/3",
-  "artifact_sha256": "bb4d0bc43d5a9c05f1895e8dc51db7834d5a19ada67019903fa826874ac4446c",
+  "artifact_sha256": "b741b655ff0130766c8cb76f53aa362f4e8b24b11fd4c454140d6dff18aeeee3",
   "golden_sha256": "b3b7f5069527c1a6d28a81c3d0267d31e88d479fa089cd3ac6e30c194f35c6ad",
   "scenarios": [
     "empty",
@@ -37,7 +37,7 @@
     },
     {
       "path": "ui/src/lib/sessionKey.ts",
-      "sha256": "7b7f2486c5ccbe557657c71f9ab4d8cb7a55cb8c6c3d268ea6d3cd2139c2fdfd"
+      "sha256": "d3d77491cb09a5914c9c5f1bf698dab5a4814f645ee8f6b07a32d97010549815"
     }
   ]
 }
