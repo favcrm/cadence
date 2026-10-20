@@ -2438,11 +2438,19 @@ impl LoginGrant {
             .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp)
             .map_err(|_| reject("CLI credential temporary path refused"))?;
+        // A mode-0300 auth directory is valid for saving (write + execute)
+        // but cannot be opened for read. Keep the handle best-effort: once
+        // the rename publishes the credential, a directory fsync failure
+        // must not make the caller roll the registry back and pair the old
+        // binding with the new credential.
+        let dir_handle = File::open(dir).ok();
         let result = (|| {
             file.write_all(&body)?;
             file.sync_all()?;
             fs::rename(&tmp, destination)?;
-            File::open(dir)?.sync_all()?;
+            if let Some(dir) = &dir_handle {
+                let _ = dir.sync_all();
+            }
             Ok(())
         })();
         if result.is_err() {
@@ -5187,6 +5195,21 @@ mod tests {
         assert_eq!(body["access_token"], BRIDGE);
         assert_eq!(body["audience"], LOGIN_ENDPOINT);
         assert!(!dir.join(RECORD).exists());
+    }
+
+    #[test]
+    fn credential_save_succeeds_when_the_directory_cannot_be_opened_for_read() {
+        // A write+execute-only auth directory accepts the rename; the old
+        // post-rename `File::open(dir)?` failed after publishing the new
+        // credential, which made login roll the registry back.
+        let (out, dir, _root, _script) = run_login(login_grant_body(), vec![]);
+        let grant = out.unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+        grant.save_credential(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let body: Value =
+            serde_json::from_slice(&fs::read(dir.join("cli-acme.json")).unwrap()).unwrap();
+        assert_eq!(body["organization_id"], "ws_real");
     }
 
     #[test]
