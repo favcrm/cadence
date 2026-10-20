@@ -4,7 +4,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -14,8 +15,8 @@ use super::notify_service;
 use super::setup::{board_boot_agent_uid, setup_get, setup_refusal, WRITE_LOCK};
 use super::stream::stream_events;
 use super::write_path::{
-    agent_settings_get, artifact_response, header_value, model_defaults_get, request_identity,
-    send, with_agents, write_route, HttpResp,
+    agent_settings_get, artifact_response, coded_response, header_value, model_defaults_get,
+    request_identity, send, with_agents, write_route, HttpResp, BUSY_RETRY_AFTER_SECS,
 };
 use super::{
     app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
@@ -1090,6 +1091,40 @@ fn read_admit<R: ReadRoute>(
         return Some(response);
     }
     Some(handle(request, route))
+}
+
+/// A board write waits this long for the one writer before answering
+/// `resource_busy`: long enough for an ordinary write queued behind
+/// another, short enough that a stuck request never queues the board.
+const WRITE_LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// [`WRITE_LOCK`] with a deadline. `None` means another write still holds
+/// it after `within`, so the caller answers a retryable refusal instead of
+/// blocking its thread for the holder's whole daemon call. A poisoned lock
+/// is recovered exactly as the blocking `lock()` did.
+fn acquire_write_lock(within: Duration) -> Option<MutexGuard<'static, ()>> {
+    let deadline = Instant::now() + within;
+    loop {
+        match WRITE_LOCK.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) if Instant::now() >= deadline => return None,
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+/// The board's writer is still busy: transient, like a daemon `busy`
+/// refusal (`busy_response`), so the client retries instead of failing.
+fn board_busy_response() -> HttpResp {
+    let mut resp = coded_response(
+        503,
+        "resource_busy",
+        "the board is finishing another write — retry shortly",
+        None,
+    );
+    resp.add_header(Header::from_bytes("Retry-After", BUSY_RETRY_AFTER_SECS.to_string()).unwrap());
+    resp
 }
 
 fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
@@ -2707,7 +2742,13 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
                 "/api/session/device/code" | "/api/session/device/poll"
             );
             if is_write {
-                let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(_guard) = acquire_write_lock(WRITE_LOCK_WAIT) else {
+                    // A writer that never returns must not queue the board
+                    // behind it: answer the retryable refusal the client
+                    // already renders as busy (CAD-1653).
+                    let _ = request.respond(board_busy_response());
+                    return;
+                };
                 handle(request, &state_dir, &pm_dir, &opts);
             } else {
                 handle(request, &state_dir, &pm_dir, &opts);
@@ -2912,5 +2953,44 @@ mod read_admit_tests {
         .expect("a matched route answers");
         assert_eq!(calls, 1);
         assert_eq!(response.status_code(), StatusCode(200));
+    }
+}
+
+#[cfg(test)]
+mod write_lock_tests {
+    use super::*;
+
+    #[test]
+    fn a_held_writer_answers_after_its_budget() {
+        let held = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let started = Instant::now();
+        assert!(acquire_write_lock(Duration::from_millis(50)).is_none());
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        drop(held);
+        assert!(acquire_write_lock(Duration::from_millis(50)).is_some());
+    }
+
+    #[test]
+    fn a_busy_board_answers_a_retryable_refusal() {
+        let response = board_busy_response();
+        assert_eq!(response.status_code(), StatusCode(503));
+        assert!(
+            response
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("Retry-After")),
+            "a busy board must tell the client when to retry"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_lock_is_still_acquired() {
+        let poisoned = std::thread::spawn(|| {
+            let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            panic!("poison the board's write lock");
+        });
+        assert!(poisoned.join().is_err());
+        let guard = acquire_write_lock(Duration::from_millis(50));
+        assert!(guard.is_some(), "a poisoned lock is recovered, as before");
     }
 }
