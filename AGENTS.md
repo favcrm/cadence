@@ -392,12 +392,54 @@ The session scratchpad is shared. Write only inside your own
 `<scratchpad>/<lane>/` subdirectory and delete only your own files, by
 name. Never run `rm <scratchpad>/*`.
 
-### Finish
+### The tracker write lock and an interrupted write
+- The tracker has ONE writer lock: a kernel `flock` on
+  `.git/cadence-write.flock` inside the PM dir. `.write.lock` is the legacy
+  fence and `cadence-write.dirty.v2` is the snapshot of what was already
+  dirty when a writer took it. The kernel lock is what proves liveness; the
+  other two are evidence.
+- A crashed writer leaves its staged work behind. The kernel lock is then
+  FREE and the tracker still refuses every write that touches the leftovers.
+  That refusal is a transaction fence, not contention: "the tracker has an
+  interrupted write" is NOT fixed by waiting, by retrying the same command
+  or by deleting a lock. The leftovers' outcome is uncertain, and only the
+  tracker owner may settle it.
+- A write whose paths are DISJOINT from the leftovers is admitted:
+  `Pm::lock_for_paths` plus `Pm::commit_scoped` (`src/issue/pmlock.rs`,
+  `src/issue/mod.rs`). A whole-tracker lock is disjoint from nothing, so a
+  caller that writes one file must scope its lock to that file — take the
+  scoped lock AND commit through the scoped wrapper. `src/issue/lock_tests.rs`
+  has a guard test that fails the build when a function pairs a scoped lock
+  with the unscoped commit; extend it when you add a caller.
+- While a crashed writer's marker stands, a global Git hazard
+  (`index.lock`, a merge/rebase/cherry-pick state) refuses EVERY write,
+  scoped or not: a path-local recovery cannot settle Git-global state.
+  WITHOUT that marker the hazard is not a refusal at all — the tracker
+  admits the write and hands it to Git, and Git's own answer varies: an
+  `index.lock` makes the commit fail, while a merge or a rebase in
+  progress can accept the commit. Never rely on the tracker to refuse a
+  write because of a Git-global state. A legacy or foreign `.write.lock`
+  is not this build's crash to clear: never delete it as routine, and
+  never treat a file's age as authority.
+- The operator-facing recovery flow for an interrupted write is
+  `cadence issue recover review|decide|execute|status` (CAD-1601, merged).
+  Running it is a separate operator decision, not something an agent
+  performs: `review` is read-only, and `decide`/`execute` require an
+  operator connection. An agent may explain the evidence the review shows,
+  never choose the outcome or perform that mutation.
+- `~/pm` is written only through the `cadence issue …` commands. Never edit
+  the PM dir, the marker, the snapshot or the index by hand, and never
+  impersonate an operator to get around a refusal.
 
+### Finish: clean up as soon as the PR merges
 - Run `cadence issue reconcile --project <key>`. It marks the ticket done
-  from the merge evidence; on a tracker write lock, run it again. If it
-  holds the ticket (an open PR, a claim newer than the merge), say why on
-  the ticket so the PM can close it.
+  from the merge evidence. If it reports the tracker write lock, do NOT run
+  it again until the PREREQUISITE changed — a refusal that names an
+  interrupted write is a transaction fence, and a retry cannot settle it
+  (see "The tracker write lock and an interrupted write"). Re-run it once
+  the leftovers are resolved and the lock is free. If it holds the ticket
+  (an open PR, a claim newer than the merge), say why on the ticket so the
+  PM can close it.
 - Leave the worktree to the sweep. GitHub deletes the merged branch, and a
   later `issue reconcile` (also run by `issue sync`) removes the worktree
   and local branch once no turn, shell or process stands in it. Never
