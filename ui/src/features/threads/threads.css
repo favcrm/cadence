@@ -256,16 +256,11 @@
   gap: 0.2rem 0.6rem;
   padding-left: 0.25rem;
 }
-/* Outgoing rows: Home's compact body wrapper is text-left, which would pull
-   the inline-block bubble and its stage line to the left edge. Right-align
-   only this wrapper (exact child of the outgoing root); the bubble keeps its
-   own text-left so message text stays left-aligned. The bubble is capped at
-   the available column, not a readable-width cap. */
+/* Outgoing rows: right-align this wrapper (exact child of the outgoing
+   root); the bubble keeps its own text-left so message text stays
+   left-aligned, and its own readable-width cap. */
 .threads-msg [data-chat-message="user"] > .min-w-0 {
   text-align: right;
-}
-.threads-msg [data-chat-message="user"] > .min-w-0 > .inline-block {
-  max-inline-size: 100%;
 }
 .threads-msg[data-role="operator"] .threads-refs {
   justify-content: flex-end;

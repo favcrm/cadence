@@ -1,6 +1,8 @@
+import { isValidElement, useState, type ReactNode } from "react";
 import Markdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { citationSpans, isWikiRevisionHref, wikiRevisionHref } from "../features/wiki/citations";
+import { useTranslate } from "../lib/localeText";
 import Link from "./Link";
 import SafeLink from "./SafeLink";
 
@@ -90,6 +92,54 @@ function markdownImageSrc(src?: string): string | null {
 // agent-written Markdown, so the remainder is checked, not trusted.
 const WHOLE_ISSUE_ID = new RegExp(`^${ISSUE_ID_SRC}$`);
 
+function plainText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(plainText).join("");
+  return "";
+}
+
+/** A fenced block's language and text, read from the `<code>` child that
+ *  react-markdown nests inside `<pre>`. */
+function codeBlock(children: ReactNode): { lang: string; code: string } {
+  const child = Array.isArray(children) ? children[0] : children;
+  if (!isValidElement(child)) return { lang: "", code: "" };
+  const props = child.props as { className?: string; children?: ReactNode };
+  const lang = /(?:^|\s)language-([\w+-]+)/.exec(props.className ?? "")?.[1] ?? "";
+  return { lang, code: plainText(props.children) };
+}
+
+/** The one fenced-code renderer: language label, Copy, and the code in
+ *  the theme's mono face. Highlighting is deliberately absent: adding a
+ *  highlighter is a bundle-size decision, not a rendering detail. */
+function CodeBlock({ children }: { children?: ReactNode }) {
+  const t = useTranslate();
+  const { lang, code } = codeBlock(children);
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="codeblock">
+      <div className="codeblock-bar">
+        <span className="codeblock-lang num">{lang || t("code")}</span>
+        <button
+          type="button"
+          className="lnk codeblock-copy"
+          onClick={() => {
+            void navigator.clipboard
+              ?.writeText(code)
+              .then(() => {
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 1600);
+              })
+              .catch(() => undefined);
+          }}
+        >
+          {copied ? t("Copied") : t("Copy")}
+        </button>
+      </div>
+      <pre>{children}</pre>
+    </div>
+  );
+}
+
 export default function Md({
   text,
   onOpen,
@@ -108,8 +158,13 @@ export default function Md({
       components={{
         img: ({ src, alt }) => {
           const safe = markdownImageSrc(src);
-          return safe ? <img src={safe} alt={alt ?? ""} /> : <span>{alt || "Image unavailable"}</span>;
+          return safe ? (
+            <img src={safe} alt={alt ?? ""} loading="lazy" decoding="async" />
+          ) : (
+            <span>{alt || "Image unavailable"}</span>
+          );
         },
+        pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
         a: ({ href, children }) => {
           const issueId = href?.startsWith("issue:") ? href.slice(6) : null;
           const revisionHref = href?.startsWith("wiki-rev:") ? href.slice("wiki-rev:".length) : null;

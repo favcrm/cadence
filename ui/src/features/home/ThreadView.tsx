@@ -13,8 +13,6 @@ import { stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thr
  */
 export type Density = "full" | "compact";
 
-export const USER_BUBBLE = "rounded-[10px_10px_2px_10px]";
-
 export function time(created: string | null | undefined): string {
   if (!created) return "";
   const d = new Date(created);
@@ -94,34 +92,31 @@ function StepsGroup({ entries, density = "full" }: { entries: ThreadEntry[]; den
 
 /** CAD-1168 (approved mock): "You 09:32" / "Assistant 09:33" label above
  *  the body, no avatars. Home and the app panes share it; density only
- *  changes the bubble width and text size. */
+ *  changes the body text size. */
 export function Bubble({
   who,
   at,
   children,
   me,
-  density = "full",
   live,
 }: {
   who: string;
   at?: string;
   children: ReactNode;
   me?: boolean;
-  density?: Density;
   /** CAD-1462: subtle right-aligned live state on the name row (the
    *  mock's `.who .live`) — the working indicator for the turn this
    *  row belongs to. */
   live?: ReactNode;
 }) {
-  const compact = density === "compact";
   return (
     <div className={`min-w-0 ${me ? "ml-6 text-right" : ""}`} data-chat-message={me ? "user" : "assistant"}>
-      <div className={`flex gap-2 items-center text-micro text-ink-400 mb-1 ${me ? "justify-end" : ""}`}>
-        <span className="text-ink-100 font-medium">{who}</span>
-        {at ? <span>{at}</span> : null}
+      <div className={`flex items-baseline gap-2 text-micro text-ink-500 mb-1.5 ${me ? "justify-end" : ""}`}>
+        <span className="text-label font-medium text-ink-200">{who}</span>
+        {at ? <span className="num">{at}</span> : null}
         {live ? <span className="chat-live num">{live}</span> : null}
       </div>
-      <div className={`min-w-0 ${compact ? "" : "max-w-[92%] inline-block"} ${me ? "text-left" : ""}`}>{children}</div>
+      <div className="min-w-0">{children}</div>
     </div>
   );
 }
@@ -159,9 +154,9 @@ export function ThreadItemView({
   switch (item.type) {
     case "operator":
       return (
-        <Bubble who={t("You")} at={time(item.entry.created)} me density={density}>
-          <div className={`inline-block min-w-0 max-w-full text-left px-3 py-2 bg-accent/10 border border-accent/20 ${USER_BUBBLE} ${bodyText} text-ink-100 break-words`}>
-            <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{item.entry.text}</span>
+        <Bubble who={t("You")} at={time(item.entry.created)} me>
+          <div className={`chat-bubble ${bodyText} text-ink-100 whitespace-pre-wrap`}>
+            <span>{item.entry.text}</span>
             <AttachmentRows files={entryAttachments(item.entry.payload)} />
           </div>
           <RefChips refs={entryRefs(item.entry.payload)} onOpenIssue={onOpenIssue} />
@@ -186,11 +181,10 @@ export function ThreadItemView({
           who={t("You")}
           at={pendingAt}
           me
-          density={density}
         >
           <div
-            className={`inline-block text-left px-3 py-2 ${USER_BUBBLE} ${bodyText} whitespace-pre-wrap break-words ${
-              item.pending.state === "failed" ? "border border-fail/50 text-ink-200" : "bg-accent/5 text-ink-300"
+            className={`chat-bubble ${bodyText} whitespace-pre-wrap ${
+              item.pending.state === "failed" ? "text-ink-200" : "text-ink-300"
             }`}
             data-pending={item.pending.state}
           >
@@ -239,14 +233,14 @@ export function ThreadItemView({
       // why, instead of an empty bubble. No Retry here — the turn ran.
       const failure = turnFailure(item.entry, t);
       return (
-        <Bubble who={t("Assistant")} at={time(item.entry.created)} density={density} live={activity}>
+        <Bubble who={t("Assistant")} at={time(item.entry.created)} live={activity}>
           {failure && (
             <div className={`mt-0.5 ${bodyText} text-fail break-words`} role="alert" data-kind="turn-failure">
               {failure}
             </div>
           )}
           {item.entry.text.trim() !== "" && (
-            <div className={`issue-reader mt-0.5 ${bodyText} text-ink-200 break-words`} data-kind="answer">
+            <div className={`chat-bubble issue-reader ${bodyText} text-ink-200`} data-kind="answer">
               <Md text={item.entry.text} onOpen={onOpenIssue} />
             </div>
           )}

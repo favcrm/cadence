@@ -110,7 +110,7 @@ for (const [name, item] of Object.entries(items)) {
 const fullAnswer = render(items.answer, "full");
 ok(!fullAnswer.includes("w-6 h-6") && !fullAnswer.includes("w-5 h-5"), "full: no avatar");
 ok(fullAnswer.includes("Assistant") && !fullAnswer.includes("Master"), "full: Assistant label, no Master");
-ok(fullAnswer.includes("max-w-[92%]"), "full: bubble max-w-[92%]");
+ok(fullAnswer.includes("chat-bubble"), "full: the answer renders its bubble surface");
 ok(fullAnswer.includes("text-body"), "full: answer text-body");
 ok(!render(items.tools, "full").includes("ml-8"), "full: tools unindented");
 ok(render(items.operator, "full").includes("text-body"), "full: operator text-body");
