@@ -639,9 +639,9 @@ pre {
   block-size: auto;
 }
 /* Markdown images in a chat bubble read as content, not as an inline
-   glyph: a block, capped to the bubble, with the one radius. Markdown
-   wraps a lone image in a paragraph, whose margin provides the gap. */
-.chat-bubble .issue-reader img {
+   glyph: a block, capped to the bubble, with the one radius. The bubble
+   itself carries `issue-reader`, so target its images directly. */
+.chat-bubble img {
   display: block;
   border-radius: 0.5rem;
 }
