@@ -134,7 +134,7 @@ export function ThreadItemView({
   item: ThreadItem;
   density?: Density;
   readOnly: boolean;
-  onOpenIssue: (id: string) => void;
+  onOpenIssue?: (id: string) => void;
   onRetry: (
     message: string,
     text: string,
@@ -288,7 +288,7 @@ function SystemNote({
 }: {
   entry: ThreadEntry;
   briefing: boolean;
-  onOpenIssue: (id: string) => void;
+  onOpenIssue?: (id: string) => void;
 }) {
   const t = useTranslate();
   const [open, setOpen] = useState(false);
@@ -321,13 +321,13 @@ function SystemNote({
  *  each under the text. An `issue` ref is a real link to its page so a
  *  result sent with citations is one tap from the work it names
  *  (CAD-1574); other kinds stay a label. */
-function RefChips({ refs, onOpenIssue }: { refs: ThreadRef[]; onOpenIssue: (id: string) => void }) {
+function RefChips({ refs, onOpenIssue }: { refs: ThreadRef[]; onOpenIssue?: (id: string) => void }) {
   const t = useTranslate();
   if (refs.length === 0) return null;
   return (
     <span className="refsrow" aria-label={t("cited rows")}>
       {refs.map((r) =>
-        r.kind === "issue" ? (
+        r.kind === "issue" && onOpenIssue ? (
           <span key={`${r.kind}:${r.id}`} className="refchip num" title={`${r.kind}:${r.id}`}>
             {r.kind}:
             <button type="button" className="lnk num" onClick={() => onOpenIssue(r.id)}>
