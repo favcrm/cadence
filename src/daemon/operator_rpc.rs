@@ -489,7 +489,10 @@ impl Shared {
     /// operator secret, so an agent caller, a detached pane child or a
     /// secret-less caller is refused before the file changes. The
     /// triple is validated exactly as the read path demands, so a bad
-    /// or forged field can never persist.
+    /// or forged field can never persist. Retires the device sessions
+    /// the new authority no longer covers — every session when the
+    /// issuer or workspace changed, the removed subjects otherwise —
+    /// before the config is written.
     pub(super) fn rpc_operator_device_login_set(
         &self,
         params: &Value,
@@ -531,37 +534,75 @@ impl Shared {
         // the then-live authority. Without the shared guard a clear
         // could return between the re-read and `open_device` and a
         // session would mint under already-retired authority (r1).
-        let _auth = self.operator_auth();
+        // Validate the complete proposed allowlist before any retirement:
+        // a rejected set must not end sessions under the unchanged config.
+        config.check()?;
+        // Retire sessions the new authority no longer covers. A changed
+        // issuer or workspace retires every device session; a same-realm
+        // set keeps only the subjects still on the allowlist.
+        let request = uuid::Uuid::new_v4().to_string();
+        let mut frames = Frames::new();
+        let mut auth = self.operator_auth();
+        let keep = match crate::device_login::read_config(&self.state_dir) {
+            Ok(old) if old.issuer == config.issuer && old.org == config.org => {
+                Some(config.subjects.clone())
+            }
+            _ => None,
+        };
+        let result = auth.revoke_device_sessions_with_intent(keep.as_deref(), |targets| {
+            frames = self.prepare_groups(targets, |company, rows| {
+                operator_audit("operator_device_login_retired", company, &request, rows)
+            })?;
+            Ok(())
+        });
+        let revoked = self.settle_frames(frames, result)?;
         crate::device_login::write_config(&self.state_dir, &config)?;
-        // `agent_events` is an open read — the allowlist never enters
-        // the event log, only that a set happened and how many names.
+        // `agent_events` is an open read — the allowlist never enters the
+        // event log, only that a set happened, how many names and how many
+        // sessions the retirement ended.
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "operator_device_login_set",
             json!({"issuer": config.issuer, "org": config.org,
-                   "subject_count": config.subjects.len()}),
+                   "subject_count": config.subjects.len(), "revoked": revoked}),
         );
-        Ok(json!({"configured": true, "issuer": config.issuer, "org": config.org}))
+        Ok(
+            json!({"configured": true, "issuer": config.issuer, "org": config.org,
+                  "revoked": revoked}),
+        )
     }
 
     /// `operator_device_login_clear {secret}` — removes the
-    /// mint-authority config (CAD-841). Afterwards the mint path and
-    /// every board route fail closed until the operator sets it again.
-    /// Clearing on an unconfigured daemon is a no-op success.
+    /// mint-authority config (CAD-841). Every device session is retired
+    /// first; local link and public sessions are untouched. Afterwards
+    /// the mint path and every board route fail closed until the
+    /// operator sets it again. Clearing on an unconfigured daemon is a
+    /// no-op success.
     pub(super) fn rpc_operator_device_login_clear(
         &self,
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
         self.operator_with_secret("ui device-login clear", params, peer_pid)?;
-        // Same session mutex as `set` — the retirement linearizes
-        // against the mint path's post-verify re-check (r1).
-        let _auth = self.operator_auth();
+        // Same session mutex as `set` — the retirement linearizes against
+        // the mint path's post-verify re-check (r1).
+        let request = uuid::Uuid::new_v4().to_string();
+        let mut frames = Frames::new();
+        let mut auth = self.operator_auth();
+        let result = auth.revoke_device_sessions_with_intent(None, |targets| {
+            frames = self.prepare_groups(targets, |company, rows| {
+                operator_audit("operator_device_login_retired", company, &request, rows)
+            })?;
+            Ok(())
+        });
+        let revoked = self.settle_frames(frames, result)?;
         crate::device_login::clear_config(&self.state_dir)?;
-        let _ = self
-            .store
-            .event_public(DAEMON_ALIAS, "operator_device_login_cleared", json!({}));
-        Ok(json!({"configured": false}))
+        let _ = self.store.event_public(
+            DAEMON_ALIAS,
+            "operator_device_login_cleared",
+            json!({"revoked": revoked}),
+        );
+        Ok(json!({"configured": false, "revoked": revoked}))
     }
 
     /// `operator_device_login_show {secret}` — the full triple,

@@ -1381,6 +1381,7 @@ fn session_reason_ok(action: &str, reason: &str) -> bool {
                 | "operator_revoke"
                 | "operator_revoke_all"
                 | "operator_secret_rotate"
+                | "operator_device_login_retired"
                 | "upload_account_setup_compensation"
         ),
         _ => false,

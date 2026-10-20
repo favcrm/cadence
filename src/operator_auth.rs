@@ -1332,6 +1332,42 @@ impl Auth {
         Ok(gone)
     }
 
+    /// End every device-grant session whose subject is not in `keep`, or
+    /// every device session when `keep` is `None`. Device rows are the
+    /// named-user, non-public rows [`Auth::open_device_account`] creates;
+    /// local link and public sessions never match. The callback runs with
+    /// exactly the matched rows before removal.
+    pub(crate) fn revoke_device_sessions_with_intent(
+        &mut self,
+        keep: Option<&[String]>,
+        intent: impl FnOnce(&[AuditTarget]) -> Result<()>,
+    ) -> Result<usize> {
+        let doomed = |r: &Row| {
+            r.user.is_some()
+                && r.origin != Origin::Public
+                && keep.is_none_or(|keep| {
+                    !r.user
+                        .as_ref()
+                        .is_some_and(|u| keep.iter().any(|sub| sub == &u.sub))
+                })
+        };
+        let targets: Vec<AuditTarget> = self
+            .sessions
+            .iter()
+            .filter(|r| doomed(r))
+            .map(Row::audit_target)
+            .collect();
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        intent(&targets)?;
+        let before = self.sessions.len();
+        self.sessions.retain(|r| !doomed(r));
+        let gone = before - self.sessions.len();
+        self.persist()?;
+        Ok(gone)
+    }
+
     /// CAD-1374: the safe identity of every stored session row, as the
     /// audited revocations name them.
     pub(crate) fn audit_targets(&self) -> Vec<AuditTarget> {
@@ -2134,6 +2170,65 @@ mod tests {
         assert!(auth
             .open_device(user("op_1", "member"), Origin::Tailnet, "ua", T0)
             .is_err());
+    }
+
+    /// CAD-1646: retiring device authority ends only device sessions — a
+    /// removed subject, then the whole flow — never a local link or public
+    /// session.
+    #[test]
+    fn device_authority_retirement_revokes_only_device_sessions() {
+        let s = state();
+        let mut auth = Auth::load(s.path());
+        let op1 = auth
+            .open_device(user("op_1", "operator"), Origin::Tailnet, "ua", T0)
+            .unwrap();
+        let op2 = auth
+            .open_device(user("op_2", "operator"), Origin::Loopback, "ua", T0)
+            .unwrap();
+        let link = opened(&mut auth, Origin::Loopback, T0);
+        let public = auth
+            .open_public(user("member", "member"), "jti-retire", T0 + 60, "ua", T0)
+            .unwrap()
+            .unwrap();
+        // Keep `op_1`: only `op_2`'s device session is retired.
+        let keep = vec!["op_1".to_string()];
+        let mut seen = 0;
+        let revoked = auth
+            .revoke_device_sessions_with_intent(Some(&keep), |targets| {
+                seen = targets.len();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(revoked, 1);
+        assert_eq!(seen, 1);
+        assert!(auth
+            .check(&op1.token, &op1.key, Origin::Tailnet, T0)
+            .unwrap()
+            .is_some());
+        assert!(auth
+            .check(&op2.token, &op2.key, Origin::Loopback, T0)
+            .unwrap()
+            .is_none());
+        assert!(auth
+            .check(&link.token, &link.key, Origin::Loopback, T0)
+            .unwrap()
+            .is_some());
+        assert!(auth.check_public(&public.token, T0).unwrap().is_some());
+        // A clear retires the remaining device session; the rest survives.
+        assert_eq!(
+            auth.revoke_device_sessions_with_intent(None, |_| Ok(()))
+                .unwrap(),
+            1
+        );
+        assert!(auth
+            .check(&op1.token, &op1.key, Origin::Tailnet, T0)
+            .unwrap()
+            .is_none());
+        assert!(auth
+            .check(&link.token, &link.key, Origin::Loopback, T0)
+            .unwrap()
+            .is_some());
+        assert!(auth.check_public(&public.token, T0).unwrap().is_some());
     }
 
     /// CAD-777: rows written before `max_idle_secs` existed keep the
