@@ -489,7 +489,7 @@ fn execute_inner(
                         // an internal failure can be a commit whose ref
                         // update went unconfirmed. Only the second is
                         // recorded as possibly applied.
-                        if e.kind() == "internal" {
+                        if matches!(e.kind(), "internal" | "unknown") {
                             *landed = Some(Outcome {
                                 resolved: false,
                                 committed: None,
@@ -508,27 +508,38 @@ fn execute_inner(
             }
             Choice::Discard => {
                 // The preimages, captured BEFORE anything is changed:
-                // the staged blobs and the working tree's own bytes.
-                // Both stay in the object store, so a partial discard
-                // is recoverable.
+                // the staged blobs and the working tree's own RAW bytes
+                // (no Git filters, so the blob reproduces exactly what
+                // the discard would destroy). A capture that fails
+                // refuses the discard: without it a partial failure
+                // could not be recovered.
                 let removed: Vec<String> = selected
                     .iter()
                     .filter_map(|p| staged_blob(pm, p).ok().flatten())
                     .collect();
-                let worktree_preimages: Vec<Value> = selected
-                    .iter()
-                    .filter_map(|p| {
-                        let regular = std::fs::symlink_metadata(pm.dir.join(p))
-                            .map(|m| m.is_file())
-                            .unwrap_or(false);
-                        if !regular {
-                            return None;
-                        }
-                        git(&pm.dir, &["hash-object", "-w", "--", p])
-                            .ok()
-                            .map(|oid| json!({"path": p, "blob": oid.trim()}))
-                    })
-                    .collect();
+                let mut worktree_preimages: Vec<Value> = Vec::new();
+                for p in &selected {
+                    let regular = std::fs::symlink_metadata(pm.dir.join(p))
+                        .map(|m| m.is_file())
+                        .map_err(|e| {
+                            Error::internal(format!(
+                                "the state of {p} could not be read ({e}); nothing was \
+                                 discarded. A retry is safe once the filesystem is readable."
+                            ))
+                        })?;
+                    if !regular {
+                        continue;
+                    }
+                    let blob = git(&pm.dir, &["hash-object", "-w", "--no-filters", "--", p])
+                        .map_err(|e| {
+                            Error::internal(format!(
+                                "the working-tree content of {p} could not be saved before the \
+                                 discard ({e}); NOTHING was discarded. A retry is safe once the \
+                                 object store is writable."
+                            ))
+                        })?;
+                    worktree_preimages.push(json!({"path": p, "blob": blob.trim()}));
+                }
                 match discard_paths(pm, &selected) {
                     Ok(()) => Outcome {
                         resolved: true,
@@ -837,6 +848,20 @@ fn select_paths(
                             .display()
                     )));
                 }
+            }
+        }
+        // A committed entry that is not a regular file has no restore
+        // path this flow can honour: refuse it at selection rather than
+        // preview a restoration it cannot apply.
+        if let Ok(entry) = git(&pm.dir, &["ls-tree", "HEAD", "--", norm]) {
+            let entry = entry.trim();
+            let mode = entry.split_whitespace().next().unwrap_or_default();
+            if !entry.is_empty() && !mode.starts_with("100") {
+                return Err(Error::rejected(format!(
+                    "{norm} is a {mode} entry in the committed tree, not a regular file — a \
+                     recovery restores regular files only. Restore it by hand and leave the \
+                     transaction unresolved. A retry unchanged will not help."
+                )));
             }
         }
         if !selected.iter().any(|s| s == norm) {
@@ -1345,7 +1370,7 @@ fn commit_index_state(pm: &Pm, paths: &[String], message: &str) -> Result<String
         if now.trim() == commit.trim() {
             return Ok(commit);
         }
-        return Err(Error::internal(format!(
+        return Err(Error::unknown(format!(
             "the recovery commit {} was created but HEAD could not be advanced ({e}); HEAD is \
              {}. The outcome is UNKNOWN: the commit may or may not be referenced. Inspect the \
              tracker before doing anything else; a retry is not safe.",

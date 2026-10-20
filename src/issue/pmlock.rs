@@ -980,7 +980,7 @@ fn classify(
         }
     }
     for p in inside {
-        if snapshot.is_some_and(|s| !s.contains(p)) {
+        if snapshot.is_some_and(|s| !snapshot_protects(s, p)) {
             named.push(format!("untracked {p}"));
             paths.push(p.clone());
         } else {
@@ -1240,7 +1240,7 @@ impl Pm {
             if *kind != "untracked" || !p.ends_with('/') {
                 continue;
             }
-            if !snapshot.contains(p) {
+            if !snapshot_protects(&snapshot, p) {
                 if files_since(&self.dir, p, std::time::UNIX_EPOCH, &mut inside) {
                     sampled = true;
                 }
