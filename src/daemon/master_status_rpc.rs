@@ -109,7 +109,7 @@ fn registered_config_refusal(
     agent: &store::Agent,
     policy: Option<&PiPolicy>,
 ) -> Option<MasterRefusal> {
-    if agent.provider != "pi" {
+    if !crate::adapter::registry::pi_family_provider(&agent.provider) {
         return None;
     }
     let model = agent
@@ -144,7 +144,7 @@ fn registered_config_refusal(
 /// and the pm.yaml key it came from, `applicable: false` for a
 /// non-Pi master (no model allowlist governs it).
 fn allowlist_json(provider: &str, policy: Option<&PiPolicy>) -> Value {
-    if provider != "pi" {
+    if !crate::adapter::registry::pi_family_provider(provider) {
         return json!({"applicable": false});
     }
     let (key, allow): (&str, &[String]) = match policy {
