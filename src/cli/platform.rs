@@ -353,8 +353,8 @@ pub(super) fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<
             let (owner, direct) = resolve_platform_tool(&tools, tool, platform.as_deref())?;
             if !direct {
                 return Err(Error::rejected(format!(
-                    "'{tool}' on '{owner}' runs only inside an app run; it has no plain \
-                     platform call"
+                    "'{tool}' on '{owner}' has no plain platform call; it runs through \
+                     its own reviewed path"
                 )));
             }
             let mut params = json!({
@@ -524,7 +524,7 @@ fn print_platform_tools(listing: &Value) {
     );
     for entry in listing["platforms"].as_array().into_iter().flatten() {
         let platform = entry["platform"].as_str().unwrap_or_default();
-        let account = entry["default_account"].as_str().unwrap_or("-");
+        let account = entry["default_account"].as_str().unwrap_or("");
         for decl in entry["tools"].as_array().into_iter().flatten() {
             println!(
                 "{:<16} {:<24} {:<7} {:<6} {:<16}",
@@ -624,7 +624,11 @@ mod tests {
             "a".repeat(64 * 1024 - prefix.len() - suffix.len())
         );
         assert!(parse_platform_input(&exact).is_ok());
-        let over = format!("{exact}a");
+        // Valid JSON one byte over the bound, so the size check is what refuses.
+        let over = format!(
+            "{prefix}{}{suffix}",
+            "a".repeat(64 * 1024 - prefix.len() - suffix.len() + 1)
+        );
         assert!(parse_platform_input(&over).is_err());
     }
 }

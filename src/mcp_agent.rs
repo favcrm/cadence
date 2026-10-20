@@ -161,9 +161,10 @@ fn mcp_name_part(value: &str) -> String {
 }
 
 fn platform_tools(state_dir: &Path) -> Vec<PlatformTool> {
-    // Bounded: a stalled daemon costs this request five seconds, never the
-    // managed client's startup window.
-    let Ok(listing) = crate::client::rpc_timeout(
+    // Bounded end to end: `rpc_deadline` puts connect, the write and the
+    // complete reply under one five-second deadline, so a stale daemon
+    // cannot block the single MCP request loop.
+    let Ok(listing) = crate::client::rpc_deadline(
         state_dir,
         "platform_tools",
         json!({}),
@@ -253,9 +254,23 @@ fn platform_tool_name(
     digest.update(b"\0");
     digest.update(tool.as_bytes());
     let hex = format!("{:x}", digest.finalize());
-    let candidate = format!("{base}_{}", &hex[..6]);
-    used.insert(candidate.clone());
-    candidate
+    // Deterministic and unique: an earlier base may already occupy the
+    // first suffixed spelling, so keep appending an attempt counter (and
+    // stay within the MCP 64-character name bound).
+    let mut attempt = 0u32;
+    loop {
+        let suffix = match attempt {
+            0 => format!("_{}", &hex[..6]),
+            attempt => format!("_{}_{attempt}", &hex[..6]),
+        };
+        let room = 64usize.saturating_sub(suffix.len());
+        let stem: String = base.chars().take(room).collect();
+        let candidate = format!("{stem}{suffix}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        attempt = attempt.saturating_add(1);
+    }
 }
 
 fn fields<'a>(
