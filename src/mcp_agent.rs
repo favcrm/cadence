@@ -24,8 +24,10 @@ const OUTPUT_LIMIT: usize = 512 * 1024;
 pub fn run(state_dir: &Path) -> Result<i32> {
     let alias = std::env::var("CADENCE_ALIAS")
         .map_err(|_| Error::rejected("Cadence agent MCP requires CADENCE_ALIAS"))?;
-    // One listing per server start; a failure only means no platform tools.
-    let platform_tools = platform_tools(state_dir);
+    // Discovery is best effort and happens only after `initialize` has been
+    // answered: the managed client allows ten seconds to start the server,
+    // and a stalled daemon must not cost it even the static tools.
+    let mut discovered: Option<Vec<PlatformTool>> = None;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -44,7 +46,8 @@ pub fn run(state_dir: &Path) -> Result<i32> {
                 "serverInfo":{"name":"cadence-agent","version":env!("CARGO_PKG_VERSION")}
             }}),
             Some("tools/list") => {
-                json!({"jsonrpc":"2.0","id":id,"result":{"tools":tools(&platform_tools)}})
+                let list = discovered.get_or_insert_with(|| platform_tools(state_dir));
+                json!({"jsonrpc":"2.0","id":id,"result":{"tools":tools(&*list)}})
             }
             Some("tools/call") => {
                 let name = request
@@ -55,7 +58,8 @@ pub fn run(state_dir: &Path) -> Result<i32> {
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or(json!({}));
-                let result = command_args(name, &args, &platform_tools)
+                let list = discovered.get_or_insert_with(|| platform_tools(state_dir));
+                let result = command_args(name, &args, &*list)
                     .and_then(|argv| invoke(state_dir, &alias, &argv));
                 match result {
                     Ok(text) => json!({"jsonrpc":"2.0","id":id,"result":{
@@ -157,44 +161,101 @@ fn mcp_name_part(value: &str) -> String {
 }
 
 fn platform_tools(state_dir: &Path) -> Vec<PlatformTool> {
-    let Ok(listing) = crate::client::rpc(state_dir, "platform_tools", json!({})) else {
+    // Bounded: a stalled daemon costs this request five seconds, never the
+    // managed client's startup window.
+    let Ok(listing) = crate::client::rpc_timeout(
+        state_dir,
+        "platform_tools",
+        json!({}),
+        Duration::from_secs(5),
+    ) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
+    let mut rows: Vec<(&str, &str, bool, &Value)> = Vec::new();
     for platform in listing["platforms"].as_array().into_iter().flatten() {
-        let (Some(platform_name), Some(tools)) =
-            (platform["platform"].as_str(), platform["tools"].as_array())
-        else {
+        let Some(platform_name) = platform["platform"].as_str() else {
             continue;
         };
-        for tool in tools {
-            if tool["direct"].as_bool() != Some(true) {
-                continue;
-            }
+        for tool in platform["tools"].as_array().into_iter().flatten() {
             let Some(tool_name) = tool["tool"].as_str() else {
                 continue;
             };
-            let name = format!(
-                "{}_{}",
-                mcp_name_part(platform_name),
-                mcp_name_part(tool_name)
-            );
-            if STATIC_TOOL_NAMES.contains(&name.as_str()) {
-                continue;
-            }
-            out.push(PlatformTool {
-                name,
-                platform: platform_name.to_string(),
-                tool: tool_name.to_string(),
-                description: tool["label"]
-                    .as_str()
-                    .unwrap_or("Cadence platform tool")
-                    .to_string(),
-                effect: tool["effect"].as_str().unwrap_or("unknown").to_string(),
-            });
+            rows.push((
+                platform_name,
+                tool_name,
+                tool["direct"].as_bool() == Some(true),
+                tool,
+            ));
         }
     }
+    let mut out = Vec::new();
+    for (name, platform, tool) in generated_tool_names(rows.iter().map(|row| (row.0, row.1, row.2)))
+    {
+        let Some(row) = rows
+            .iter()
+            .find(|row| row.0 == platform && row.1 == tool)
+            .map(|row| row.3)
+        else {
+            continue;
+        };
+        out.push(PlatformTool {
+            name,
+            platform,
+            tool,
+            description: row["label"]
+                .as_str()
+                .unwrap_or("Cadence platform tool")
+                .to_string(),
+            effect: row["effect"].as_str().unwrap_or("unknown").to_string(),
+        });
+    }
     out
+}
+
+pub(crate) fn static_tool_names() -> &'static [&'static str] {
+    &STATIC_TOOL_NAMES
+}
+
+/// Generated MCP names for one reviewed inventory, in one deterministic
+/// order for every consumer. A name that collides with a static tool or an
+/// earlier generated name gets a stable digest suffix instead of silently
+/// overwriting another tool.
+pub(crate) fn generated_tool_names<'a>(
+    entries: impl Iterator<Item = (&'a str, &'a str, bool)>,
+) -> Vec<(String, String, String)> {
+    let mut used: std::collections::HashSet<String> = STATIC_TOOL_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    let mut out = Vec::new();
+    for (platform, tool, direct) in entries {
+        if !direct {
+            continue;
+        }
+        let name = platform_tool_name(platform, tool, &mut used);
+        out.push((name, platform.to_string(), tool.to_string()));
+    }
+    out
+}
+
+fn platform_tool_name(
+    platform: &str,
+    tool: &str,
+    used: &mut std::collections::HashSet<String>,
+) -> String {
+    let base = format!("{}_{}", mcp_name_part(platform), mcp_name_part(tool));
+    if used.insert(base.clone()) {
+        return base;
+    }
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(platform.as_bytes());
+    digest.update(b"\0");
+    digest.update(tool.as_bytes());
+    let hex = format!("{:x}", digest.finalize());
+    let candidate = format!("{base}_{}", &hex[..6]);
+    used.insert(candidate.clone());
+    candidate
 }
 
 fn fields<'a>(
@@ -491,5 +552,21 @@ mod tests {
         // A dotted tool slug survives as an MCP-safe name.
         assert_eq!(mcp_name_part("email.send"), "email_send");
         assert_eq!(mcp_name_part("account-images"), "account-images");
+    }
+
+    #[test]
+    fn generated_names_do_not_collide() {
+        let names = generated_tool_names(
+            [
+                ("a.b", "c", true),
+                ("a_b", "c", true),
+                ("local", "hidden", false),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(names.len(), 2, "a non-direct tool is absent");
+        assert_ne!(names[0].0, names[1].0);
+        assert_eq!(names[0].0, "a_b_c");
+        assert!(names[1].0.starts_with("a_b_c_"), "{}", names[1].0);
     }
 }

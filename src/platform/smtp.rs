@@ -645,6 +645,12 @@ impl crate::platform::PlatformAdapter for SmtpAdapter {
         &self.table
     }
 
+    /// `execute` refuses: SMTP sends run through the CRM sender path, not
+    /// the generic effect gate.
+    fn direct_call(&self, _tool: &str) -> bool {
+        false
+    }
+
     fn reported_manifest_version(&self) -> Option<String> {
         self.table.manifest_version.clone()
     }
@@ -2293,5 +2299,22 @@ mod tests {
             bad.enrollment_shapes = vec![shape.into()];
             assert!(bad.validate(adapter.table()).is_err(), "{shape}");
         }
+    }
+}
+
+#[cfg(test)]
+mod direct_call_tests {
+
+    /// SMTP sends run through the CRM sender path; the generic gate never
+    /// executes them, so they must not be advertised as directly callable.
+    #[test]
+    fn smtp_has_no_direct_platform_call() {
+        let mut opts = crate::daemon::ServeOptions::default();
+        crate::platform::smtp::attach(&mut opts);
+        let adapter = opts
+            .platforms
+            .get(crate::platform::smtp::PLATFORM)
+            .expect("the smtp adapter is registered");
+        assert!(!adapter.direct_call("email.send"));
     }
 }

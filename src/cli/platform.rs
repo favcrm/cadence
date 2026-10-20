@@ -611,6 +611,20 @@ mod tests {
             json!({"prompt":"a dog"})
         );
         assert!(parse_platform_input(r#"[1]"#).is_err());
+        // A parsed non-object refuses on the JSON branch, not as a path.
+        let array = dir.path().join("array.json");
+        std::fs::write(&array, "[1]").unwrap();
+        assert!(parse_platform_input(&format!("@{}", array.display())).is_err());
         assert!(parse_platform_input("{oops").is_err());
+        // The bound is inclusive at 64 KiB and refuses one byte more.
+        let prefix = "{\"x\":\"";
+        let suffix = "\"}";
+        let exact = format!(
+            "{prefix}{}{suffix}",
+            "a".repeat(64 * 1024 - prefix.len() - suffix.len())
+        );
+        assert!(parse_platform_input(&exact).is_ok());
+        let over = format!("{exact}a");
+        assert!(parse_platform_input(&over).is_err());
     }
 }
