@@ -88,7 +88,7 @@ fn cad1649_cas_replay_changes_and_query() {
         )
         .unwrap();
     assert_eq!(patched["revision"], 2);
-    assert!(store
+    let error = store
         .app_works_patch(
             "ctx-1",
             "retention",
@@ -98,7 +98,8 @@ fn cad1649_cas_replay_changes_and_query() {
             "patch-2",
             None,
         )
-        .is_err());
+        .unwrap_err();
+    assert_eq!(error.code(), Some("conflict"));
 
     store
         .app_works_request_review("ctx-1", "retention", 2, "alice", None)
@@ -129,6 +130,10 @@ fn cad1649_cas_replay_changes_and_query() {
         .app_works_export("ctx-1", "retention", 2, "pdf", "bob", None)
         .unwrap();
     assert!(receipt["digest"].as_str().unwrap().starts_with("sha256:"));
+    let error = store
+        .app_works_export("ctx-1", "retention", 1, "html", "bob", None)
+        .unwrap_err();
+    assert_eq!(error.code(), Some("needs_review"));
 
     let all = store.app_works_query("ctx-1", &json!({})).unwrap();
     assert_eq!(all.as_array().unwrap().len(), 1);
@@ -153,7 +158,8 @@ fn cad1649_trash_restore_and_context_scope() {
         .app_works_trash("ctx-1", "retention", 1, "alice", "trash-1", None)
         .unwrap();
     assert_eq!(trashed["trashed"], true);
-    assert!(store.app_works_get("ctx-1", "retention").is_err());
+    let error = store.app_works_get("ctx-1", "retention").unwrap_err();
+    assert_eq!(error.code(), Some("not_found"));
     let restored = store
         .app_works_restore("ctx-1", "retention", 1, "alice", "restore-1", None)
         .unwrap();
@@ -189,6 +195,35 @@ fn cad1649_invalid_content_refuses_without_write() {
     }))
     .is_err());
     assert!(store.app_works_get("ctx-1", "x").is_err());
+}
+
+#[test]
+fn cad1649_review_requires_two_verified_principals() {
+    let (_dir, store) = open();
+    store
+        .app_works_create("ctx-1", &doc("Retention"), "operator", "create-1", None)
+        .unwrap();
+    store
+        .app_works_request_review("ctx-1", "retention", 1, "operator", None)
+        .unwrap();
+    let error = store
+        .app_works_review("ctx-1", "retention", 1, "approve", None, "bob", None)
+        .unwrap_err();
+    assert_eq!(error.code(), Some("forbidden"));
+
+    store
+        .app_works_create("ctx-1", &doc("Other"), "alice", "create-2", None)
+        .unwrap();
+    store
+        .app_works_request_review("ctx-1", "other", 1, "alice", None)
+        .unwrap();
+    let error = store
+        .app_works_review("ctx-1", "other", 1, "approve", None, "operator", None)
+        .unwrap_err();
+    assert_eq!(error.code(), Some("forbidden"));
+    store
+        .app_works_review("ctx-1", "other", 1, "approve", None, "bob", None)
+        .unwrap();
 }
 
 #[test]

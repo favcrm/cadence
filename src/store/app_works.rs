@@ -459,10 +459,7 @@ impl RecordStore {
             self.works_item(conn, context, id)?
                 .ok_or_else(|| Error::invalid("not_found", "works content was not found"))?;
         if trashed {
-            return Err(Error::invalid(
-                "app_works_missing",
-                "works content was not found",
-            ));
+            return Err(Error::invalid("not_found", "works content was not found"));
         }
         let (content_json, content_digest, author): (String, String, String) = conn
             .query_row(
@@ -737,8 +734,8 @@ impl RecordStore {
                 return Err(Error::invalid("not_found", "works content was not found"));
             }
             if item.4 != if_revision {
-                return Err(Error::conflict(
-                    item.4,
+                return Err(Error::conflict_coded(
+                    "conflict",
                     "works content revision is stale",
                 ));
             }
@@ -799,8 +796,8 @@ impl RecordStore {
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
             if changed != 1 {
-                return Err(Error::conflict(
-                    if_revision,
+                return Err(Error::conflict_coded(
+                    "conflict",
                     "works content revision is stale",
                 ));
             }
@@ -902,8 +899,8 @@ impl RecordStore {
                 .works_item(tx, context, id)?
                 .ok_or_else(|| Error::invalid("not_found", "works content was not found"))?;
             if item.4 != if_revision {
-                return Err(Error::conflict(
-                    item.4,
+                return Err(Error::conflict_coded(
+                    "conflict",
                     "works content revision is stale",
                 ));
             }
@@ -914,8 +911,8 @@ impl RecordStore {
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
             if changed != 1 {
-                return Err(Error::conflict(
-                    if_revision,
+                return Err(Error::conflict_coded(
+                    "conflict",
                     "works content revision is stale",
                 ));
             }
@@ -950,8 +947,8 @@ impl RecordStore {
                 return Err(Error::invalid("not_found", "works content was not found"));
             }
             if item.4 != revision {
-                return Err(Error::conflict(
-                    item.4,
+                return Err(Error::conflict_coded(
+                    "conflict",
                     "works content revision is stale",
                 ));
             }
@@ -999,14 +996,14 @@ impl RecordStore {
                 return Err(Error::invalid("not_found", "works content was not found"));
             }
             if item.4 != revision {
-                return Err(Error::conflict(
-                    item.4,
+                return Err(Error::conflict_coded(
+                    "conflict",
                     "works content revision is stale",
                 ));
             }
             if item.6 != "pending" || item.7 != Some(revision) {
-                return Err(Error::conflict(
-                    item.4,
+                return Err(Error::conflict_coded(
+                    "conflict",
                     "works review is not pending for this revision",
                 ));
             }
@@ -1017,10 +1014,10 @@ impl RecordStore {
                     |row| row.get(0),
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
-            if author == actor {
+            if author == actor || author == "operator" || actor == "operator" {
                 return Err(Error::invalid(
                     "forbidden",
-                    "an author cannot approve their own revision",
+                    "a review requires two verified distinct humans",
                 ));
             }
             if decision == "approve" {
@@ -1074,9 +1071,9 @@ impl RecordStore {
                 return Err(Error::invalid("not_found", "works content was not found"));
             }
             if item.4 != revision {
-                return Err(Error::conflict(
-                    item.4,
-                    "works content revision is stale",
+                return Err(Error::invalid(
+                    "needs_review",
+                    "only the current revision can be exported",
                 ));
             }
             if item.6 != "approved" || item.5 != revision {

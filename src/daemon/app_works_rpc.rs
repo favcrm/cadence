@@ -138,6 +138,15 @@ impl Shared {
         let install = required_str(params, "install_id")?.to_string();
         let context = required_str(params, "context_id")?.to_string();
         let human = self.verified_owner_human(params)?;
+        // A review needs a proven reviewer identity; the unverified local
+        // operator fallback must not approve or be approved. Refuse before
+        // the installation/context or record file is touched.
+        if method == "app_works_review" && human.is_none() {
+            return Err(Error::invalid(
+                "forbidden",
+                "a review requires a verified reviewer",
+            ));
+        }
         let actor = works_actor(human.as_ref())?;
         let result = self.screen_service_scope(&install, &context, true, None, || {
             let records = RecordStore::open(&self.state_dir, &install)?;
@@ -192,10 +201,13 @@ impl Shared {
                 "app_works_export" => {
                     let id = required_str(params, "id")?;
                     let revision = required_i64(params, "revision")?;
-                    let format = params
-                        .get("format")
-                        .and_then(Value::as_str)
-                        .unwrap_or("html");
+                    let format = match params.get("format") {
+                        None => "html",
+                        Some(Value::String(format)) => format.as_str(),
+                        Some(_) => {
+                            return Err(Error::invalid("invalid", "format must be a string"))
+                        }
+                    };
                     records.app_works_export(&context, id, revision, format, &actor, None)
                 }
                 _ => Err(Error::invalid("invalid", "unknown Works content method")),
@@ -291,5 +303,17 @@ mod tests {
                 "{message}"
             );
         }
+        let review = json!({
+            "install_id": "missing",
+            "context_id": "missing",
+            "id": "x",
+            "revision": 1,
+            "decision": "approve",
+        });
+        let error = scoped(Asserted::Operator, || {
+            shared.dispatch("app_works_review", &review, pid())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("verified reviewer"), "{error}");
     }
 }
