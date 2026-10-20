@@ -567,6 +567,27 @@ fn refused_by(result: crate::Result<Value>, reason: &str, case: &str) {
     }
 }
 
+/// (c) only: the confirm-time recompute refusal. CAD-1656 gave the
+/// changed-facts refusal its own conflict code, so besides the original
+/// guard refusal this accepts exactly kind `conflict` with code
+/// `facts_changed` and the recompute's own message, nothing else.
+fn refused_changed(result: crate::Result<Value>, case: &str) {
+    match result {
+        Err(error) if error.kind() == "conflict" => {
+            assert_eq!(
+                error.code(),
+                Some("facts_changed"),
+                "{case}: a conflict that is not the facts refusal: {error}"
+            );
+            assert!(
+                error.to_string().contains("confirmation facts changed"),
+                "{case}: refused for the wrong reason: {error}"
+            );
+        }
+        result => refused_by(result, CHANGED, case),
+    }
+}
+
 /// One release SLOT card: (facts, live, confirmation token).
 fn card(fx: &Fx, op: &Session, action: &str, conversation: &str) -> (Value, Value, String) {
     let card = fx
@@ -806,17 +827,15 @@ fn cad1651_handoff_refuses_agent_member_changed_forged_lying_door_and_self_hoste
     // confirm-time recompute refuses before any door write.
     door.restamp(CONV);
     let before = door.handoffs();
-    refused_by(
+    refused_changed(
         fx.confirm(&operator, &action, &token),
-        CHANGED,
         "release after handoffAt was re-stamped",
     );
     // ... and after it was cleared elsewhere.
     let (_, _, token) = card(&fx, &operator, &action, CONV);
     door.clear(CONV);
-    refused_by(
+    refused_changed(
         fx.confirm(&operator, &action, &token),
-        CHANGED,
         "release after handoffAt was cleared",
     );
     assert_eq!(door.handoffs(), before, "a stale release reached the door");
