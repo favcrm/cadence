@@ -1,7 +1,7 @@
 //! CAD-534: `cadence daemon` plans RPC handlers — moved verbatim from src/daemon.rs.
 
 use super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// `plan propose` `inputs` → the `{k: v}` map both the render and the
@@ -34,6 +34,28 @@ fn proposal_inputs(inputs: Option<&Value>) -> Result<BTreeMap<String, String>> {
 }
 
 impl Shared {
+    /// CAD-1652: every authority that can pin an app bundle. The core store
+    /// covers runs, bindings and capabilities; social effects live in the
+    /// per-installation RecordStore and must be unioned here. Any unreadable
+    /// authority returns `None`, which means prune nothing.
+    fn upgrade_pins(&self, install: &str) -> Option<BTreeSet<String>> {
+        let mut pins = self.store.bundle_digests(install).ok()?;
+        let records = crate::store::app_records::record_db_path(&self.state_dir, install).ok()?;
+        match std::fs::metadata(&records) {
+            Ok(metadata) if metadata.is_file() => {}
+            // A genuine absence means this installation has no social
+            // authority file. Any other lookup error or non-file object is
+            // unreadable authority, not an empty pin set.
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(pins),
+            Err(_) => return None,
+        }
+        let records =
+            crate::store::app_records::RecordStore::open(&self.state_dir, install).ok()?;
+        pins.extend(records.social_effect_bundle_digests().ok()?);
+        Some(pins)
+    }
+
     /// CAD-360: the plan gate for every daemon dispatch of a task —
     /// `task_dispatch` and both monitor paths. A task whose job is bound
     /// to a tracker issue dispatches only if [`crate::issue::plan::gate_id`]
@@ -656,6 +678,7 @@ impl Shared {
                         directory:
                             crate::issue::app_catalog::catalogue::CatalogueDirectory::Configured,
                     },
+                    || self.upgrade_pins(id),
                     |files, manifest| {
                         self.store.app_install_upgrade_ready(id)?;
                         self.store.app_binding_upgrade_capacity(
@@ -727,19 +750,23 @@ impl Shared {
                     },
                 )
             }
-            "app_workspace_upgrade_recover" => workspace::upgrade_recover(
-                &pm,
-                required_str(params, "install_id")?,
-                required_str(params, "request_id")?,
-                |journal| {
-                    self.store.app_binding_upgrade_carry(
-                        required_str(params, "install_id")?,
-                        journal.new_digest(),
-                        &self.store.connection_workspace_id()?,
-                        &journal.bindings,
-                    )
-                },
-            ),
+            "app_workspace_upgrade_recover" => {
+                let install_id = required_str(params, "install_id")?;
+                workspace::upgrade_recover(
+                    &pm,
+                    install_id,
+                    required_str(params, "request_id")?,
+                    || self.upgrade_pins(install_id),
+                    |journal| {
+                        self.store.app_binding_upgrade_carry(
+                            required_str(params, "install_id")?,
+                            journal.new_digest(),
+                            &self.store.connection_workspace_id()?,
+                            &journal.bindings,
+                        )
+                    },
+                )
+            }
             "app_workspace_list" => workspace::list(&pm),
             "app_workspace_show" => workspace::show(&pm, required_str(params, "install_id")?),
             "app_workspace_migrate" => workspace::migrate(&pm),

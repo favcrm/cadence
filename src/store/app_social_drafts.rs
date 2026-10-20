@@ -845,6 +845,31 @@ impl RecordStore {
     pub fn app_social_effect_show(&self, id: &str) -> Result<Value> {
         Self::social_effect_in(&*self.conn(), self.install(), id)
     }
+
+    /// CAD-1652: every bundle digest a social-effect authority still names.
+    /// This is a separate RecordStore database from the core store, so the
+    /// caller must union it into the retain set; an unreadable or malformed
+    /// effect fails the whole collection and disables pruning.
+    pub(crate) fn social_effect_bundle_digests(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let conn = self.conn();
+        let mut out = std::collections::BTreeSet::new();
+        let mut stmt =
+            conn.prepare("SELECT frozen_json FROM app_social_effects WHERE install_id=?1")?;
+        let rows = stmt.query_map([self.install()], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let frozen: Value = serde_json::from_str(&row?)
+                .map_err(|_| Error::rejected("social draft effect is corrupt"))?;
+            let digest = frozen
+                .get("bundle_digest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::rejected("social draft effect lacks bundle_digest"))?;
+            crate::store::app_runs::insert_bundle_digest(&mut out, digest)?;
+        }
+        Ok(out)
+    }
+
     pub fn app_social_effect_list(&self, context: &str) -> Result<Value> {
         self.app_social_effect_list_scoped(Some(context))
     }
@@ -1141,5 +1166,33 @@ impl RecordStore {
             tx.execute("INSERT INTO app_social_source_requests(request_id,install_id,context_id,intent_digest,at) VALUES(?,?,?,?,?)",params![request,self.install(),context,intent,at])?;
             Ok(json!({"revision":next,"handles":normalized,"updated_at":at}))
         })
+    }
+}
+
+#[cfg(test)]
+mod cad1652_tests {
+    use super::*;
+
+    #[test]
+    fn social_effect_bundle_pin_is_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RecordStore::open(dir.path(), "install").unwrap();
+        let digest = "a".repeat(64);
+        let frozen = json!({"bundle_digest": format!("sha256:{digest}")});
+        store
+            .app_social_effect_stage(
+                "context",
+                &EffectStage {
+                    draft: "draft",
+                    revision: 1,
+                    request: "request",
+                    effect_id: "effect",
+                    frozen: &frozen,
+                    approval: "approval",
+                },
+            )
+            .unwrap();
+        let pins = store.social_effect_bundle_digests().unwrap();
+        assert!(pins.contains(&digest), "{pins:?}");
     }
 }

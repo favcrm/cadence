@@ -174,6 +174,7 @@ fn apply(pm: &Pm, request: &UpgradeRequest<'_>) -> Result<Value> {
     upgrade(
         pm,
         request,
+        || None,
         |_, _| Ok((json!({}), Default::default())),
         |_| Ok(Vec::new()),
     )
@@ -876,6 +877,7 @@ fn catalogue_apply_refuses_a_release_disabled_after_successful_check() {
     let result = upgrade(
         &pm,
         &request,
+        || None,
         |_, _| panic!("disabled release reached upgrade preflight"),
         |_| panic!("disabled release reached upgrade delivery"),
     );

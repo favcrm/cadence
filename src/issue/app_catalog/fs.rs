@@ -277,4 +277,16 @@ impl Root {
         parent.sync_all()?;
         Ok(())
     }
+
+    pub(super) fn remove_dir(&self, path: &Path) -> Result<()> {
+        let (parent, leaf) = self.parent(path)?;
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), leaf.as_ptr(), libc::AT_REMOVEDIR) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+        }
+        parent.sync_all()?;
+        Ok(())
+    }
 }

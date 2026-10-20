@@ -137,6 +137,7 @@ fn cad1385_catalog_replacement_retries_whole_show_and_hard_links_still_refuse() 
         crate::issue::app_catalog::workspace::upgrade(
             &upgrade_pm,
             &request,
+            || None,
             |_, _| Ok((serde_json::json!({}), Default::default())),
             |_| Ok(Vec::new()),
         )

@@ -133,6 +133,7 @@ fn cad1189_reads_never_mix_installation_states_during_upgrades() {
                 catalogue: &CatalogueClaim::Absent,
                 directory: CatalogueDirectory::Configured,
             },
+            || None,
             |_, _| Ok((json!({}), Default::default())),
             |_| Ok(Vec::new()),
         )
