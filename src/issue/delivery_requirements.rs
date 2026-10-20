@@ -16,19 +16,28 @@
 //! arrive as texts read at the PR's base, so a PR can never classify
 //! itself under rules it edited.
 //!
-//! Classes: `sensitive` (a risk-trigger/human/excluded path, or an
-//! oversize diff — full checks, one independent security-capable
-//! combined review plus a real exact-head operator approval),
-//! `consequential` (known ordinary paths — one independent combined
-//! review), `routine` (the narrow allowlist — required base CI plus
-//! ticket outcome evidence, zero mandatory reviews, no fabricated
-//! PASS), and `strict` — not a class the profile grants but the
-//! fail-closed fallback: profile inactive/absent/malformed, lists
-//! unreadable, or diff evidence incomplete (deletes, renames, mode or
-//! type changes, unknown top-level paths, empty diff). `strict` reports
-//! exactly today's legacy requirements — one combined review on the
-//! one-review list else two (Standards + Spec/security), the operator
-//! floor on human-class paths/size — never fewer.
+//! `classify` returns one of three classes:
+//!
+//! - `routine` — the narrow allowlist: required base CI plus ticket
+//!   outcome evidence, zero mandatory reviews, no fabricated PASS.
+//! - `consequential` — known ordinary paths: one independent combined
+//!   review and the full check floor, no operator approval.
+//! - `strict` — the fail-closed floor: an activation other than the
+//!   default lean policy (a malformed section, a custom section that is
+//!   not operator-approved or was removed after approval, or a policy that
+//!   is not the default once its solo-operator and integration-branch
+//!   fields are cleared), lists unreadable, incomplete or unsafe diff
+//!   evidence, a delete/rename/type/mode change, a path or change shape
+//!   outside the known one-review include list, or a risk-trigger,
+//!   human-class, excluded or oversize path. It reports exactly today's
+//!   legacy requirements and never fewer: one combined review on the
+//!   one-review list else two (Standards + Spec/security), and the
+//!   operator floor on human-class paths and over `HUMAN_LINES` changed
+//!   lines.
+//!
+//! `DeliveryClass::Sensitive` exists in the type but `classify` does not
+//! currently return it: sensitive conditions resolve to `strict`. No class
+//! sets `security_capable` today.
 
 use serde::{Deserialize, Serialize};
 
@@ -83,8 +92,8 @@ pub enum DeliveryClass {
     Routine,
     /// Activated profile, ordinary listed paths.
     Consequential,
-    /// Activated profile, a sensitive boundary matched — or a human
-    /// trigger the legacy loop already requires the operator for.
+    /// Reserved: `classify` resolves sensitive conditions to `Strict` and
+    /// does not currently return this variant.
     Sensitive,
     /// No relaxation applies: the profile is not in force, the trusted
     /// lists are unavailable, or the diff evidence is incomplete. The
