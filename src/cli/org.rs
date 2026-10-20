@@ -69,7 +69,7 @@ struct Connection {
     destination: Destination,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Registry {
     selected: Option<Selection>,
@@ -118,17 +118,23 @@ impl RegistryFile {
     fn read(&self) -> Result<Registry> {
         read_registry(&self.path)
     }
+    fn read_snapshot(&self) -> Result<(Registry, Option<Vec<u8>>)> {
+        read_registry_raw(&self.path)
+    }
     fn write(&self, registry: &Registry) -> Result<()> {
-        let dir = self.path.parent().expect("registry parent");
-        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
         let raw =
             serde_json::to_vec_pretty(registry).map_err(|e| Error::internal(e.to_string()))?;
+        self.write_raw(&raw)
+    }
+    fn write_raw(&self, raw: &[u8]) -> Result<()> {
+        let dir = self.path.parent().expect("registry parent");
         if raw.len() > 65536 {
             return Err(Error::rejected(
                 "org registry exceeds 64 KiB; no configuration changed",
             ));
         }
-        temp.write_all(&raw)?;
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        temp.write_all(raw)?;
         temp.as_file().sync_all()?;
         // Once persist renames the registry, it is published. A directory
         // fsync is best-effort: reporting an error here would make login
@@ -140,6 +146,24 @@ impl RegistryFile {
             let _ = dir.sync_all();
         }
         Ok(())
+    }
+    /// Put back the exact bytes read before a replacement, including a
+    /// compact registry whose pretty form would exceed the write limit.
+    /// `None` means the file did not exist.
+    fn restore(&self, raw: Option<&[u8]>) -> Result<()> {
+        let Some(raw) = raw else {
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            let dir = self.path.parent().expect("registry parent");
+            if let Ok(dir) = File::open(dir) {
+                let _ = dir.sync_all();
+            }
+            return Ok(());
+        };
+        self.write_raw(raw)
     }
 }
 
@@ -162,13 +186,22 @@ pub(super) fn selected_org_readonly() -> Result<Option<String>> {
 /// update` routing) shares the exact shape checks without taking the
 /// write lock or creating the lock file.
 fn read_registry(path: &Path) -> Result<Registry> {
+    Ok(read_registry_raw(path)?.0)
+}
+
+/// Read the registry and keep the exact bytes read. The bytes let a failed
+/// credential save restore a compact file that `to_vec_pretty` would refuse
+/// at the write cap.
+fn read_registry_raw(path: &Path) -> Result<(Registry, Option<Vec<u8>>)> {
     let mut file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Registry::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Registry::default(), None))
+        }
         Err(e) => return Err(e.into()),
     };
     let metadata = file.metadata()?;
@@ -203,7 +236,7 @@ fn read_registry(path: &Path) -> Result<Registry> {
             return Err(Error::rejected("selected org is missing"));
         }
     }
-    Ok(registry)
+    Ok((registry, Some(raw)))
 }
 
 fn absolute(path: &Path) -> Result<()> {
@@ -490,13 +523,12 @@ where
     F: FnOnce() -> Result<()>,
 {
     let file = RegistryFile::open()?;
-    let mut registry = file.read()?;
-    let previous = registry.clone();
+    let (mut registry, previous_raw) = file.read_snapshot()?;
     let (connection, selected) =
         apply_record_remote(&mut registry, org_name, endpoint, org_id, use_default)?;
     file.write(&registry)?;
     if let Err(error) = commit() {
-        if let Err(rollback) = file.write(&previous) {
+        if let Err(rollback) = file.restore(previous_raw.as_deref()) {
             return Err(Error::internal(format!(
                 "credential write failed ({error}); restoring the previous org registry also failed ({rollback})"
             )));
@@ -1234,6 +1266,57 @@ mod tests {
         let stored: Value =
             serde_json::from_slice(&std::fs::read(env.registry_path()).unwrap()).unwrap();
         assert_eq!(stored, previous, "the previous binding must be restored");
+    }
+
+    #[test]
+    fn failed_credential_commit_restores_a_compact_registry_verbatim() {
+        // read_registry accepts a compact file up to 64 KiB, but write
+        // pretty-prints. A compact registry just under the read cap can be
+        // impossible to reserialize; rollback must put the original bytes
+        // back instead of failing after the replacement was published.
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let long_id = format!("ws_{}", "a".repeat(196));
+        let mut compact = None;
+        for endpoint_len in 64_000..=65_400 {
+            let registry = Registry {
+                selected: Some(Selection {
+                    org: "alpha".into(),
+                }),
+                connections: vec![Connection {
+                    selection: Selection {
+                        org: "alpha".into(),
+                    },
+                    destination: Destination::Remote {
+                        endpoint: format!("https://{}.test", "a".repeat(endpoint_len)),
+                        org_id: long_id.clone(),
+                    },
+                }],
+            };
+            let raw = serde_json::to_vec(&registry).unwrap();
+            if raw.len() <= 65536 && serde_json::to_vec_pretty(&registry).unwrap().len() > 65536 {
+                compact = Some(raw);
+                break;
+            }
+        }
+        let compact = compact.expect("no compact registry crosses the pretty-print cap");
+        let path = env.registry_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &compact).unwrap();
+
+        let error = record_remote("alpha", EP_A, "ws_new", false, || {
+            Err(Error::rejected("credential write refused"))
+        })
+        .expect_err("a failed credential save must fail the login");
+        assert!(
+            error.to_string().contains("credential write refused"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            compact,
+            "rollback must restore the compact registry bytes verbatim"
+        );
     }
 
     #[test]
