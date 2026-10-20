@@ -235,6 +235,27 @@ CREATE TABLE IF NOT EXISTS app_sender_binding_revisions(
  unsubscribe_base TEXT NOT NULL, connection_id TEXT,
  binding_digest TEXT NOT NULL, actor TEXT NOT NULL, at REAL NOT NULL,
  PRIMARY KEY(context_id, binding_id, revision));
+CREATE TABLE IF NOT EXISTS app_works_items(
+ context_id TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL,
+ title TEXT NOT NULL, tags TEXT NOT NULL, owner TEXT NOT NULL,
+ revision INTEGER NOT NULL CHECK(revision>0),
+ reviewed_revision INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_revision>=0),
+ review_status TEXT NOT NULL, pending_revision INTEGER,
+ trashed INTEGER NOT NULL DEFAULT 0, updated REAL NOT NULL,
+ PRIMARY KEY(context_id, id));
+CREATE TABLE IF NOT EXISTS app_works_revisions(
+ context_id TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>0),
+ kind TEXT NOT NULL, title TEXT NOT NULL, content_json TEXT NOT NULL,
+ content_digest TEXT NOT NULL, author TEXT NOT NULL, at REAL NOT NULL,
+ PRIMARY KEY(context_id, id, revision));
+CREATE TABLE IF NOT EXISTS app_works_idempotency(
+ context_id TEXT NOT NULL, key TEXT NOT NULL, actor TEXT NOT NULL,
+ op TEXT NOT NULL, payload_digest TEXT NOT NULL, result_json TEXT NOT NULL,
+ at REAL NOT NULL, PRIMARY KEY(context_id, key));
+CREATE TABLE IF NOT EXISTS app_works_audit(
+ context_id TEXT NOT NULL, at REAL NOT NULL, actor TEXT NOT NULL,
+ on_behalf_of TEXT, action TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS app_works_items_updated ON app_works_items(context_id, updated);
 CREATE TABLE IF NOT EXISTS app_campaign_test_sends(
  context_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
  content_digest TEXT NOT NULL, link_digest TEXT NOT NULL,
@@ -733,7 +754,28 @@ impl RecordStore {
                  sender_name TEXT NOT NULL, sender_address TEXT NOT NULL,
                  unsubscribe_base TEXT NOT NULL, connection_id TEXT,
                  binding_digest TEXT NOT NULL, actor TEXT NOT NULL, at REAL NOT NULL,
-                 PRIMARY KEY(context_id, binding_id, revision))",
+                 PRIMARY KEY(context_id, binding_id, revision));
+                 CREATE TABLE IF NOT EXISTS app_works_items(
+                 context_id TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL,
+                 title TEXT NOT NULL, tags TEXT NOT NULL, owner TEXT NOT NULL,
+                 revision INTEGER NOT NULL CHECK(revision>0),
+                 reviewed_revision INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_revision>=0),
+                 review_status TEXT NOT NULL, pending_revision INTEGER,
+                 trashed INTEGER NOT NULL DEFAULT 0, updated REAL NOT NULL,
+                 PRIMARY KEY(context_id, id));
+                 CREATE TABLE IF NOT EXISTS app_works_revisions(
+                 context_id TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>0),
+                 kind TEXT NOT NULL, title TEXT NOT NULL, content_json TEXT NOT NULL,
+                 content_digest TEXT NOT NULL, author TEXT NOT NULL, at REAL NOT NULL,
+                 PRIMARY KEY(context_id, id, revision));
+                 CREATE TABLE IF NOT EXISTS app_works_idempotency(
+                 context_id TEXT NOT NULL, key TEXT NOT NULL, actor TEXT NOT NULL,
+                 op TEXT NOT NULL, payload_digest TEXT NOT NULL, result_json TEXT NOT NULL,
+                 at REAL NOT NULL, PRIMARY KEY(context_id, key));
+                 CREATE TABLE IF NOT EXISTS app_works_audit(
+                 context_id TEXT NOT NULL, at REAL NOT NULL, actor TEXT NOT NULL,
+                 on_behalf_of TEXT, action TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL);
+                 CREATE INDEX IF NOT EXISTS app_works_items_updated ON app_works_items(context_id, updated)",
             )
             .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
             // CAD-782 revision 2: proposals record their origin

@@ -34,6 +34,7 @@ mod app_explorer_rpc;
 mod app_image_jobs;
 mod app_media_rpc;
 mod app_record_actions_rpc;
+mod app_works_rpc;
 #[cfg(feature = "test-seam")]
 pub use app_image_jobs::test_probe as image_job_probe;
 mod app_records_rpc;
@@ -3062,6 +3063,15 @@ impl Shared {
             "app_content_clone" => self.rpc_app_content(method, params, peer_pid),
             "app_content_list" => self.rpc_app_content(method, params, peer_pid),
             "app_content_render" => self.rpc_app_content(method, params, peer_pid),
+            "app_works_create" => self.rpc_app_works(method, params, peer_pid),
+            "app_works_get" => self.rpc_app_works(method, params, peer_pid),
+            "app_works_query" => self.rpc_app_works(method, params, peer_pid),
+            "app_works_patch" => self.rpc_app_works(method, params, peer_pid),
+            "app_works_trash" => self.rpc_app_works(method, params, peer_pid),
+            "app_works_restore" => self.rpc_app_works(method, params, peer_pid),
+            "app_works_request_review" => self.rpc_app_works(method, params, peer_pid),
+            "app_works_review" => self.rpc_app_works(method, params, peer_pid),
+            "app_works_export" => self.rpc_app_works(method, params, peer_pid),
             "app_content_propose" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_request" => self.rpc_app_content(method, params, peer_pid),
             "app_content_assistant_propose" => {
