@@ -130,9 +130,15 @@ impl RegistryFile {
         }
         temp.write_all(&raw)?;
         temp.as_file().sync_all()?;
+        // Once persist renames the registry, it is published. A directory
+        // fsync is best-effort: reporting an error here would make login
+        // skip the credential save with the new binding already installed.
+        let dir_handle = File::open(dir).ok();
         temp.persist(&self.path)
             .map_err(|e| Error::internal(e.to_string()))?;
-        File::open(dir)?.sync_all()?;
+        if let Some(dir) = &dir_handle {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 }
@@ -919,6 +925,7 @@ pub(crate) enum OrgAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
     const EP_A: &str = "https://alpha.cadencecloud.app";
@@ -1186,6 +1193,26 @@ mod tests {
             registry.selected.as_ref().map(|s| s.org.as_str()),
             Some("beta")
         );
+    }
+
+    #[test]
+    fn registry_write_succeeds_when_the_config_directory_cannot_be_opened_for_read() {
+        // persist publishes the registry; a write+execute-only config dir
+        // cannot be opened for the fsync, but must not turn a published
+        // binding into a failed login that skips the credential save.
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("alpha", EP_A, "ws_alpha", true));
+        let dir = env.registry_path().parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+        let stored = record_remote("alpha", EP_A, "ws_other", false, || Ok(())).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(stored["destination"]["org_id"], "ws_other");
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(env.registry_path()).unwrap()).unwrap();
+        assert_eq!(raw["connections"][0]["destination"]["org_id"], "ws_other");
     }
 
     #[test]
