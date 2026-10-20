@@ -104,6 +104,8 @@ mod cad1537_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1562_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
+mod cad1590_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
 mod cad225_unattended_acceptance;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
@@ -3226,6 +3228,21 @@ impl Shared {
             "whatsapp_reply_prepare" => self.rpc_whatsapp(method, params, peer_pid),
             "whatsapp_reply_send" => self.rpc_whatsapp(method, params, peer_pid),
             "whatsapp_reply_status" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_templates_list" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_template_show" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_template_prepare" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_template_send" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_template_status" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_broadcasts_list" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_broadcast_show" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_broadcast_estimate" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_broadcast_results" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_broadcast_draft" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_broadcast_test_prepare" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_broadcast_test_send" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_broadcast_prepare" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_broadcast_send" => self.rpc_whatsapp(method, params, peer_pid),
+            "whatsapp_broadcast_stop" => self.rpc_whatsapp(method, params, peer_pid),
             "crm_send_prepare" => self.rpc_crm_send(method, params, peer_pid),
             "crm_send_approve" => self.rpc_crm_send(method, params, peer_pid),
             "crm_send_show" => self.rpc_crm_send(method, params, peer_pid),

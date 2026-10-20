@@ -95,9 +95,9 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
       if (!permitted(operation) || !(RECORD_SLOT_VERBS as readonly string[]).includes(operation)) return { code: "forbidden", text: "This operation is unavailable." };
       try {
         const raw = await post("slot-prepare", { operation, args });
-        if (!object(raw) || !exact(raw, ["confirmation_token", "card"]) || typeof raw.confirmation_token !== "string" || !TOKEN.test(raw.confirmation_token) || !object(raw.card) || !exact(raw.card, ["operation", "facts"]) || raw.card.operation !== operation || !object(raw.card.facts)) throw new ApiError("Invalid confirmation card", 502);
+        if (!object(raw) || !exact(raw, ["confirmation_token", "card"]) || typeof raw.confirmation_token !== "string" || !TOKEN.test(raw.confirmation_token) || !object(raw.card) || !exact(raw.card, operation === "whatsapp.broadcast.stop" ? ["operation", "facts", "live"] : ["operation", "facts"]) || raw.card.operation !== operation || !object(raw.card.facts)) throw new ApiError("Invalid confirmation card", 502);
         const facts = raw.card.facts;
-        const card = recordCard(operation, facts);
+        const card = recordCard(operation, facts, object(raw.card.live) ? raw.card.live : undefined);
         let used = false;
         const expires = Date.now() + 60000;
         return { label: "Confirm", records: true, recordCard: card, run: async input => {
@@ -135,7 +135,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
   };
 }
 
-function recordCard(operation: RecordSlotVerb, facts: ActionArgs): RecordCard {
+function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionArgs): RecordCard {
   const rows: RecordCard["facts"] = [];
   const show = (label: string, value: unknown) => { if (value !== undefined && value !== null) rows.push({ label, value: typeof value === "object" ? JSON.stringify(value) : String(value) }); };
   const contentOuter = object(facts.content) ? facts.content : facts;
@@ -160,6 +160,52 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs): RecordCard {
     show("Conversation", facts.conversation_id); show("Message", facts.text); show("Reply to message", facts.reply_to_message_id);
     show("Free-text window open until", facts.freeform_until); show("Reply digest", facts.digest);
   }
+  if (operation === "whatsapp.template.send") {
+    // CAD-1590: recipient from the live conversation; template, revision
+    // and rendered body from the live approved template under the host digest.
+    const recipient = object(facts.recipient) ? facts.recipient : null;
+    const template = object(facts.template) ? facts.template : null;
+    if (!recipient || !template || typeof facts.rendered_body !== "string" || typeof facts.digest !== "string") throw new ApiError("Incomplete template facts", 502);
+    show("To", [recipient.name, recipient.phone].filter(v => typeof v === "string" && v).join(" · ") || facts.conversation_id);
+    show("Number", facts.connection_id); show("Template", `${template.name} (${template.language})`); show("Template revision", template.revision);
+    show("Variables", facts.variables); show("Message", facts.rendered_body);
+    show("Reply window", facts.reply_mode === "freeform" ? "Open" : "Closed — approved templates may still be sent");
+    show("Send digest", facts.digest);
+  }
+  if (operation === "whatsapp.broadcast.test.send") {
+    const template = object(facts.template) ? facts.template : null;
+    if (typeof facts.to !== "string" || typeof facts.digest !== "string") throw new ApiError("Incomplete test facts", 502);
+    show("Test number", facts.to);
+    if (template) { show("Template", `${template.name} (${template.language})`); show("Template revision", template.revision); }
+    show("Sample message", facts.rendered_sample); show("Limit", facts.limit_note); show("Send digest", facts.digest);
+  }
+  if (operation === "whatsapp.broadcast.send") {
+    // CAD-1590: the snapshot FavCRM froze at review; nothing from the frame.
+    const snap = object(facts.snapshot) ? facts.snapshot : null;
+    const template = snap && object(snap.template) ? snap.template : null;
+    const audience = snap && object(snap.audience) ? snap.audience : null;
+    if (!snap || !template || !audience || !Number.isSafeInteger(facts.eligible) || !Number.isSafeInteger(facts.excluded) || typeof facts.digest !== "string") throw new ApiError("Incomplete broadcast facts", 502);
+    const connection = object(snap.connection) ? snap.connection : {};
+    show("Number", connection.connectionId);
+    show("Template", `${template.name} (${template.language})`); show("Template revision", template.revision);
+    show("Variables", facts.body_parameters); show("Header media", facts.header_media_url);
+    show("Audience", audience.source === "segment" ? `Segment ${audience.segmentId}` : `${audience.accounts} selected contacts`);
+    show("Eligible recipients", facts.eligible); show("Excluded", facts.excluded); show("Exclusion breakdown", snap.counts);
+    show("Send time", typeof facts.send_at === "string" ? facts.send_at : "Now, after a 60-second undo window");
+    show("Opt-outs", "Rechecked at send; the recipient count can only fall, never grow.");
+    show("Messaging limit", "Numbers above your Meta messaging limit fail and appear in results.");
+    show("Billing", "Meta charges your WhatsApp Business Account per delivered marketing message.");
+    show("Review expires", snap.expires_at); show("Snapshot digest", snap.snapshotDigest); show("Send digest", facts.digest);
+  }
+  if (operation === "whatsapp.broadcast.stop") {
+    const template = object(facts.template) ? facts.template : null;
+    const stats = live && object(live.delivery_stats) ? live.delivery_stats : null;
+    if (template) { show("Template", `${template.name} (${template.language})`); show("Template revision", template.revision); }
+    show("Scheduled for", facts.scheduled_at);
+    if (live) { show("Status (approximate, as of this card)", live.status); show("Delivery so far (approximate, still changing)", stats); }
+    show("Effect", "Stops unsent recipients only. Messages already sent cannot be recalled. A stopped broadcast cannot resume; inside the undo window it returns to a draft instead.");
+  }
+  if (typeof facts.state === "string" && facts.state === "pending" && operation.startsWith("whatsapp.")) show("Approval", "Awaiting the workspace owner's approval; tapping again after approval sends it once.");
   show("Scope", facts.scope); show("Unsubscribe origin", facts.unsubscribe_origin ?? (operation === "origin.manage" ? "Not configured" : undefined));
   const card: RecordCard = { operation, facts: rows };
   if (operation === "smtp.test-send") card.input = { field: "to_email", label: "Test recipient (one email address)" };

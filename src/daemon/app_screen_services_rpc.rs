@@ -269,6 +269,33 @@ args!(WaMessages { conversation_id: String, cursor: Option<String>, limit: Optio
 args!(WaReply { conversation_id: String, text: String, reply_to_message_id: Option<String> });
 args!(WaReplySend { conversation_id: String, text: String, effect_id: String, reply_to_message_id: Option<String> });
 args!(WaEffect { effect_id: String });
+// CAD-1590: door v2. Nested audience/exclusions/variables stay JSON and
+// are validated natively; no key, digest or connection field exists.
+args!(WaTemplates { status: Option<String> });
+args!(WaTemplate {
+    template_id: String
+});
+args!(WaTemplatePrepare {
+    conversation_id: String,
+    template_id: String,
+    variables: Value
+});
+args!(WaTemplateSend {
+    effect_id: String,
+    conversation_id: String,
+    template_id: String,
+    variables: Value
+});
+args!(WaBroadcast {
+    broadcast_id: String
+});
+args!(WaResults { broadcast_id: String, cursor: Option<String>, limit: Option<u64>, status: Option<String> });
+args!(WaDraft { broadcast_id: Option<String>, name: String, template_id: String, body_parameters: Value, header_media_url: Option<String>, audience: Value, exclusions: Option<Value> });
+args!(WaTestPrepare {
+    broadcast_id: String,
+    to: String
+});
+args!(WaBroadcastPrepare { broadcast_id: String, send_at: Option<String> });
 args!(RoutePatch { section: Option<String>, view: Option<String>, record_id: Option<String>, segment_id: Option<String>, replace: Option<bool> });
 
 fn typed<T: for<'de> Deserialize<'de> + Serialize>(value: &Value) -> Result<Value> {
@@ -323,6 +350,16 @@ fn call_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
         WhatsappMessages => typed::<WaMessages>(value),
         WhatsappReplyPrepare => typed::<WaReply>(value),
         WhatsappReplyStatus => typed::<WaEffect>(value),
+        WhatsappTemplatesList => typed::<WaTemplates>(value),
+        WhatsappTemplateShow => typed::<WaTemplate>(value),
+        WhatsappTemplatePrepare => typed::<WaTemplatePrepare>(value),
+        WhatsappTemplateStatus => typed::<WaEffect>(value),
+        WhatsappBroadcastsList => typed::<WaPage>(value),
+        WhatsappBroadcastShow | WhatsappBroadcastEstimate => typed::<WaBroadcast>(value),
+        WhatsappBroadcastResults => typed::<WaResults>(value),
+        WhatsappBroadcastDraft => typed::<WaDraft>(value),
+        WhatsappBroadcastTestPrepare => typed::<WaTestPrepare>(value),
+        WhatsappBroadcastPrepare => typed::<WaBroadcastPrepare>(value),
         ScreenPreviewShow => typed::<PreviewShow>(value),
         ScreenPreviewClear => typed::<PreviewClear>(value),
         ScreenRoutePatch => {
@@ -358,6 +395,11 @@ fn slot_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
         }
         ScreenOperation::ChatCampaignBrief => typed::<CampaignBrief>(value),
         ScreenOperation::WhatsappReplySend => typed::<WaReplySend>(value),
+        ScreenOperation::WhatsappTemplateSend => typed::<WaTemplateSend>(value),
+        ScreenOperation::WhatsappBroadcastTestSend | ScreenOperation::WhatsappBroadcastSend => {
+            typed::<WaEffect>(value)
+        }
+        ScreenOperation::WhatsappBroadcastStop => typed::<WaBroadcast>(value),
         _ => Err(Error::rejected("screen SLOT operation is not implemented")),
     }
 }
@@ -419,6 +461,21 @@ fn native_method(operation: ScreenOperation) -> Result<&'static str> {
         WhatsappReplyPrepare => "whatsapp_reply_prepare",
         WhatsappReplySend => "whatsapp_reply_send",
         WhatsappReplyStatus => "whatsapp_reply_status",
+        WhatsappTemplatesList => "whatsapp_templates_list",
+        WhatsappTemplateShow => "whatsapp_template_show",
+        WhatsappTemplatePrepare => "whatsapp_template_prepare",
+        WhatsappTemplateSend => "whatsapp_template_send",
+        WhatsappTemplateStatus => "whatsapp_template_status",
+        WhatsappBroadcastsList => "whatsapp_broadcasts_list",
+        WhatsappBroadcastShow => "whatsapp_broadcast_show",
+        WhatsappBroadcastEstimate => "whatsapp_broadcast_estimate",
+        WhatsappBroadcastResults => "whatsapp_broadcast_results",
+        WhatsappBroadcastDraft => "whatsapp_broadcast_draft",
+        WhatsappBroadcastTestPrepare => "whatsapp_broadcast_test_prepare",
+        WhatsappBroadcastTestSend => "whatsapp_broadcast_test_send",
+        WhatsappBroadcastPrepare => "whatsapp_broadcast_prepare",
+        WhatsappBroadcastSend => "whatsapp_broadcast_send",
+        WhatsappBroadcastStop => "whatsapp_broadcast_stop",
         _ => {
             return Err(Error::rejected(
                 "screen operation has no implemented executor",
@@ -942,6 +999,16 @@ impl Shared {
                 }
             }
             ScreenOperation::WhatsappReplySend => self.whatsapp_reply_facts(install, context, args),
+            ScreenOperation::WhatsappTemplateSend => {
+                self.whatsapp_template_facts(install, context, args)
+            }
+            ScreenOperation::WhatsappBroadcastTestSend => {
+                self.whatsapp_test_facts(install, context, args)
+            }
+            ScreenOperation::WhatsappBroadcastSend => {
+                self.whatsapp_broadcast_facts(install, context, args)
+            }
+            ScreenOperation::WhatsappBroadcastStop => self.whatsapp_stop_facts(args),
             ScreenOperation::OriginManage => Ok(json!({"scope": "daemon-global",
                 "unsubscribe_origin": self.store.crm_setting("unsubscribe_origin")?.or_else(|| self.unsubscribe_origin.clone())})),
             _ => Err(Error::rejected(
@@ -985,6 +1052,27 @@ impl Shared {
                     .ok_or_else(|| Error::rejected("confirmation missing"))?
                     .1;
                 *args = json!({"effect_id": facts["effect_id"], "digest": facts["digest"]});
+            }
+            // CAD-1590: each send tap approves the host-drawn card's own
+            // effect and digest; the stop tap the card's broadcast.
+            (
+                WhatsappTemplateSend | WhatsappBroadcastTestSend | WhatsappBroadcastSend,
+                Confirmation::Tap(tap),
+            ) if tap.confirmed => {
+                let facts = &proof
+                    .confirmed
+                    .as_ref()
+                    .ok_or_else(|| Error::rejected("confirmation missing"))?
+                    .1;
+                *args = json!({"effect_id": facts["effect_id"], "digest": facts["digest"]});
+            }
+            (WhatsappBroadcastStop, Confirmation::Tap(tap)) if tap.confirmed => {
+                let facts = &proof
+                    .confirmed
+                    .as_ref()
+                    .ok_or_else(|| Error::rejected("confirmation missing"))?
+                    .1;
+                *args = json!({"broadcast_id": facts["broadcast_id"]});
             }
             (ChatCampaignBrief, Confirmation::Brief(input))
                 if input.confirmed && args["brief"].as_str() == Some(input.brief.as_str()) => {}
@@ -1157,7 +1245,12 @@ impl Shared {
             .map_err(|_| Error::rejected("confirmation entropy unavailable"))?;
         let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         // Only the trusted host receives card facts and token. No frame proof.
-        let card = json!({"operation": request.operation, "facts": facts});
+        let mut card = json!({"operation": request.operation, "facts": facts});
+        // CAD-1590: the stop card also shows live counts, outside the
+        // facts the confirmation binds.
+        if request.operation == ScreenOperation::WhatsappBroadcastStop {
+            card["live"] = self.whatsapp_stop_live(&args)?;
+        }
         confirmations.insert(
             token.clone(),
             ScreenServiceConfirmation {
