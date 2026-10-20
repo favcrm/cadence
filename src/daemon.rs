@@ -2411,11 +2411,26 @@ impl Shared {
                         let mut running = Vec::new();
                         for message in self.store.held_turns(&alias)? {
                             if self.store.agent_reads_message(&message, &alias)? {
-                                running.push(json!({
+                                let mut entry = json!({
                                     "id": message.id,
                                     "turn_id": message.turn_id,
                                     "task": message.task_id,
-                                }));
+                                });
+                                // CAD-1641: the turn's own verified App stamp
+                                // is the only install/context a caller may
+                                // derive, read under the same proof as the
+                                // turn itself.
+                                if let Some(stamp) = self.store.message_app(&message.id)? {
+                                    for (key, field) in [
+                                        ("app_install_id", "install_id"),
+                                        ("app_context_id", "context_id"),
+                                    ] {
+                                        if let Some(value) = stamp.get(field) {
+                                            entry[key] = value.clone();
+                                        }
+                                    }
+                                }
+                                running.push(entry);
                             }
                         }
                         Ok(json!({"alias": alias, "running": running}))

@@ -1401,40 +1401,62 @@ fn effect_params(action: &EffectAction) -> (&'static str, serde_json::Value) {
 
 #[derive(Subcommand)]
 pub(crate) enum AssistantAction {
+    /// List the actions this installation declares for the current context.
     Actions {
-        install_id: String,
+        /// Installation id; omitted means the live turn's verified App scope.
+        install_id: Option<String>,
         #[arg(long)]
-        context_id: String,
+        context_id: Option<String>,
         #[arg(long)]
-        message: String,
+        message: Option<String>,
         #[arg(long)]
-        token: String,
+        token: Option<String>,
     },
     Invoke {
-        install_id: String,
+        /// Installation id; omitted means the live turn's verified App scope.
+        install_id: Option<String>,
         #[arg(long)]
-        context_id: String,
+        context_id: Option<String>,
         #[arg(long)]
-        message: String,
+        message: Option<String>,
         #[arg(long)]
-        token: String,
+        token: Option<String>,
         #[arg(long)]
         action_id: String,
+        /// Idempotency key; omitted derives one from the turn, action and input.
         #[arg(long)]
-        operation_id: String,
+        operation_id: Option<String>,
+        /// Inline JSON, `@file`, a file path, or `-` for stdin.
         #[arg(long)]
-        input: PathBuf,
+        input: String,
+        /// Poll until the operation leaves `running`.
+        #[arg(long)]
+        wait: bool,
     },
     OperationShow {
+        /// Installation id; omitted means the live turn's verified App scope.
+        install_id: Option<String>,
+        #[arg(long)]
+        context_id: Option<String>,
+        #[arg(long)]
+        message: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        operation_id: String,
+    },
+    /// Operator decision on one pending permission request.
+    Decide {
         install_id: String,
         #[arg(long)]
         context_id: String,
         #[arg(long)]
-        message: String,
-        #[arg(long)]
-        token: String,
-        #[arg(long)]
         operation_id: String,
+        /// The operation revision the decision was made against.
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long, value_parser = ["allow_once", "allow_always", "deny"])]
+        decision: String,
     },
 }
 
@@ -1657,19 +1679,40 @@ fn read_run_inputs(path: &Path) -> Result<serde_json::Value> {
     Ok(json!(inputs))
 }
 
-fn read_assistant_input(state_dir: &Path, path: &Path) -> Result<serde_json::Value> {
+/// Bounded JSON object for `app assistant invoke`: inline, `@file`, a path,
+/// or `-` for stdin. The source never changes the 32 KiB bound.
+fn parse_assistant_input(state_dir: &Path, raw: &str) -> Result<serde_json::Value> {
     use std::io::Read;
     const MAX_INPUT_BYTES: usize = 32 * 1024;
-    let file = cadence_agent::master::open_command_file(state_dir, path)?;
-    let mut bytes = Vec::new();
-    file.take((MAX_INPUT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|e| {
-            Error::invalid(
-                "app_assistant_input",
-                format!("cannot read assistant input: {e}"),
-            )
-        })?;
+    let bytes = if raw == "-" {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .lock()
+            .take((MAX_INPUT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| {
+                Error::invalid(
+                    "app_assistant_input",
+                    format!("cannot read assistant input from stdin: {e}"),
+                )
+            })?;
+        bytes
+    } else if raw.trim_start().starts_with('{') {
+        raw.as_bytes().to_vec()
+    } else {
+        let path = Path::new(raw.strip_prefix('@').unwrap_or(raw));
+        let file = cadence_agent::master::open_command_file(state_dir, path)?;
+        let mut bytes = Vec::new();
+        file.take((MAX_INPUT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| {
+                Error::invalid(
+                    "app_assistant_input",
+                    format!("cannot read assistant input: {e}"),
+                )
+            })?;
+        bytes
+    };
     if bytes.len() > MAX_INPUT_BYTES {
         return Err(Error::invalid(
             "app_assistant_input",
@@ -1685,6 +1728,198 @@ fn read_assistant_input(state_dir: &Path, path: &Path) -> Result<serde_json::Val
         ));
     }
     Ok(input)
+}
+
+#[derive(Clone, Debug)]
+struct AssistantScope {
+    install_id: String,
+    context_id: String,
+    message: String,
+    token: String,
+}
+
+impl AssistantScope {
+    /// The daemon's identity fields plus one call's own fields.
+    fn params(&self, extra: serde_json::Value) -> serde_json::Value {
+        let mut params = json!({
+            "install_id": self.install_id,
+            "context_id": self.context_id,
+            "message": self.message,
+            "token": self.token,
+        });
+        if let (Some(params), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                params.insert(key.clone(), value.clone());
+            }
+        }
+        params
+    }
+}
+
+fn assistant_scope(
+    state_dir: &Path,
+    install_id: Option<&str>,
+    context_id: Option<&str>,
+    message: Option<&str>,
+    token: Option<&str>,
+) -> Result<AssistantScope> {
+    // `agent_identity` derives the caller from the connection, exactly as
+    // `cadence self` does. An operator outside a pane has no live turn and
+    // must pass every identity flag.
+    let live = client::rpc(state_dir, "agent_identity", json!({})).ok();
+    resolve_assistant_scope(live.as_ref(), install_id, context_id, message, token)
+}
+
+/// Explicit flags win; anything omitted comes from the caller's one live
+/// turn and its verified App stamp. Ambiguity refuses instead of guessing.
+fn resolve_assistant_scope(
+    live: Option<&serde_json::Value>,
+    install_id: Option<&str>,
+    context_id: Option<&str>,
+    message: Option<&str>,
+    token: Option<&str>,
+) -> Result<AssistantScope> {
+    let turns = live
+        .and_then(|value| value.get("running"))
+        .and_then(serde_json::Value::as_array);
+    let turn = match (message, token) {
+        (Some(id), Some(_)) => {
+            turns.and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(id)))
+        }
+        (None, None) => match turns.map(Vec::as_slice) {
+            Some([only]) => Some(only),
+            Some(rows) if !rows.is_empty() => {
+                return Err(Error::rejected(format!(
+                    "this agent holds {} running turns — pass --message and --token to choose one",
+                    rows.len()
+                )))
+            }
+            _ => None,
+        },
+        _ => {
+            return Err(Error::rejected(
+                "--message and --token are given together or not at all",
+            ))
+        }
+    };
+    let message =
+        match (message, turn.and_then(|row| row["id"].as_str())) {
+            (Some(id), _) => id.to_string(),
+            (None, Some(id)) => id.to_string(),
+            (None, None) if live.is_none() => return Err(Error::rejected(
+                "this process sees no live agent turn — pass --message, --token and the install id",
+            )),
+            (None, None) => {
+                return Err(Error::rejected(
+                    "no running turn to derive the app scope from — pass --message and --token",
+                ))
+            }
+        };
+    let token = match (token, turn.and_then(|row| row["turn_id"].as_str())) {
+        (Some(token), _) => token.to_string(),
+        (None, Some(token)) => token.to_string(),
+        (None, None) => {
+            return Err(Error::rejected(
+                "no live turn token — pass --token together with --message",
+            ))
+        }
+    };
+    let install_id = install_id
+        .map(str::to_string)
+        .or_else(|| {
+            turn.and_then(|row| row["app_install_id"].as_str())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            Error::rejected("this turn carries no App installation — pass the install id")
+        })?;
+    let context_id = context_id
+        .map(str::to_string)
+        .or_else(|| {
+            turn.and_then(|row| row["app_context_id"].as_str())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| Error::rejected("this turn carries no App context — pass --context-id"))?;
+    Ok(AssistantScope {
+        install_id,
+        context_id,
+        message,
+        token,
+    })
+}
+
+/// One idempotency key for one (turn, action, input), so re-running the
+/// same command replays the operation instead of creating a second effect.
+fn derive_operation_id(message: &str, action_id: &str, input: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(message.as_bytes());
+    digest.update(b"\0");
+    digest.update(action_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(serde_json::to_vec(input).expect("assistant input serializes"));
+    let hex = format!("{:x}", digest.finalize());
+    format!("op-{}", &hex[..24])
+}
+
+fn wait_assistant_operation(
+    state_dir: &Path,
+    scope: &AssistantScope,
+    operation_id: &str,
+    first: serde_json::Value,
+) -> Result<serde_json::Value> {
+    use std::time::{Duration, Instant};
+    let seconds = std::env::var("CADENCE_ASSISTANT_WAIT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(120u64);
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut current = first;
+    loop {
+        let status = current
+            .get("operation")
+            .and_then(|operation| operation.get("status"))
+            .or_else(|| current.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if status != "running" {
+            let mut value = current;
+            if status == "pending_permission" {
+                let revision = value
+                    .get("operation")
+                    .and_then(|operation| operation.get("revision"))
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or_default();
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "wait_note".into(),
+                        json!(format!(
+                            "operation {operation_id} waits for an operator decision: \
+                             `cadence app assistant decide {} --context-id {} \
+                             --operation-id {operation_id} --expected-revision {revision} \
+                             --decision allow_once` (or `allow_always` / `deny`)",
+                            scope.install_id, scope.context_id
+                        )),
+                    );
+                }
+            }
+            return Ok(value);
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::rejected(format!(
+                "operation {operation_id} is still running; read it again with \
+                 `cadence app assistant operation-show {} --operation-id {operation_id}`",
+                scope.install_id
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        current = client::rpc(
+            state_dir,
+            "app_assistant_operation_show",
+            scope.params(json!({"operation_id": operation_id})),
+        )?;
+    }
 }
 
 fn run_params(action: &RunAction) -> Result<(&'static str, serde_json::Value)> {
@@ -2035,16 +2270,26 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
             client::rpc(state_dir, method, params)?
         }
         AppAction::Assistant { action } => {
-            let (method, params) = match action {
+            let (method, params, wait): (
+                &'static str,
+                serde_json::Value,
+                Option<(AssistantScope, String)>,
+            ) = match action {
                 AssistantAction::Actions {
                     install_id,
                     context_id,
                     message,
                     token,
-                } => (
-                    "app_assistant_actions",
-                    json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token}),
-                ),
+                } => {
+                    let scope = assistant_scope(
+                        state_dir,
+                        install_id.as_deref(),
+                        context_id.as_deref(),
+                        message.as_deref(),
+                        token.as_deref(),
+                    )?;
+                    ("app_assistant_actions", scope.params(json!({})), None)
+                }
                 AssistantAction::Invoke {
                     install_id,
                     context_id,
@@ -2053,22 +2298,76 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     action_id,
                     operation_id,
                     input,
-                } => (
-                    "app_assistant_invoke",
-                    json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token,"action_id":action_id,"operation_id":operation_id,"input":read_assistant_input(state_dir, input)?}),
-                ),
+                    wait,
+                } => {
+                    // The ticket's refusal order: malformed or oversized
+                    // input never reaches the daemon, not even the read that
+                    // resolves the live turn.
+                    let input = parse_assistant_input(state_dir, input)?;
+                    let scope = assistant_scope(
+                        state_dir,
+                        install_id.as_deref(),
+                        context_id.as_deref(),
+                        message.as_deref(),
+                        token.as_deref(),
+                    )?;
+                    let operation_id = match operation_id {
+                        Some(id) => id.clone(),
+                        None => derive_operation_id(&scope.message, action_id, &input),
+                    };
+                    let params = scope.params(json!({
+                        "action_id": action_id,
+                        "operation_id": operation_id,
+                        "input": input,
+                    }));
+                    let waiting = wait.then(|| (scope.clone(), operation_id));
+                    ("app_assistant_invoke", params, waiting)
+                }
                 AssistantAction::OperationShow {
                     install_id,
                     context_id,
                     message,
                     token,
                     operation_id,
+                } => {
+                    let scope = assistant_scope(
+                        state_dir,
+                        install_id.as_deref(),
+                        context_id.as_deref(),
+                        message.as_deref(),
+                        token.as_deref(),
+                    )?;
+                    (
+                        "app_assistant_operation_show",
+                        scope.params(json!({"operation_id":operation_id})),
+                        None,
+                    )
+                }
+                AssistantAction::Decide {
+                    install_id,
+                    context_id,
+                    operation_id,
+                    expected_revision,
+                    decision,
                 } => (
-                    "app_assistant_operation_show",
-                    json!({"install_id":install_id,"context_id":context_id,"message":message,"token":token,"operation_id":operation_id}),
+                    "app_assistant_decision",
+                    json!({
+                        "install_id": install_id,
+                        "context_id": context_id,
+                        "operation_id": operation_id,
+                        "expected_revision": expected_revision,
+                        "decision": decision,
+                    }),
+                    None,
                 ),
             };
-            client::rpc(state_dir, method, params)?
+            let result = client::rpc(state_dir, method, params)?;
+            match wait {
+                Some((scope, operation_id)) => {
+                    wait_assistant_operation(state_dir, &scope, &operation_id, result)?
+                }
+                None => result,
+            }
         }
         AppAction::FrameKit {
             out,
@@ -2335,5 +2634,117 @@ mod tests {
             }
             assert!(params.get(field).is_none());
         }
+    }
+
+    fn live_turns(rows: serde_json::Value) -> serde_json::Value {
+        json!({"alias": "agent", "running": rows})
+    }
+
+    #[test]
+    fn assistant_scope_derives_from_one_live_turn() {
+        let live = live_turns(json!([{
+            "id": "msg-1", "turn_id": "tok-1", "task": "t1",
+            "app_install_id": "inst-1", "app_context_id": "ctx-1"
+        }]));
+        let scope = resolve_assistant_scope(Some(&live), None, None, None, None).unwrap();
+        assert_eq!(scope.install_id, "inst-1");
+        assert_eq!(scope.context_id, "ctx-1");
+        assert_eq!(scope.message, "msg-1");
+        assert_eq!(scope.token, "tok-1");
+        // The daemon still receives every identity field it validates.
+        assert_eq!(
+            scope.params(json!({"action_id": "customers.search"})),
+            json!({"install_id":"inst-1","context_id":"ctx-1","message":"msg-1",
+                   "token":"tok-1","action_id":"customers.search"})
+        );
+    }
+
+    #[test]
+    fn assistant_scope_flags_win_and_multiple_turns_refuse() {
+        let live = live_turns(json!([
+            {"id":"msg-1","turn_id":"tok-1","app_install_id":"inst-1","app_context_id":"ctx-1"},
+            {"id":"msg-2","turn_id":"tok-2","app_install_id":"inst-2","app_context_id":"ctx-2"}
+        ]));
+        let error = resolve_assistant_scope(Some(&live), None, None, None, None)
+            .expect_err("two live turns must refuse rather than guess");
+        assert!(error.to_string().contains("--message"), "{error}");
+        let scope = resolve_assistant_scope(
+            Some(&live),
+            Some("inst-x"),
+            Some("ctx-x"),
+            Some("msg-2"),
+            Some("tok-2"),
+        )
+        .unwrap();
+        assert_eq!(scope.install_id, "inst-x");
+        assert_eq!(scope.context_id, "ctx-x");
+        assert_eq!(scope.message, "msg-2");
+    }
+
+    #[test]
+    fn assistant_scope_without_a_turn_needs_every_flag() {
+        let error = resolve_assistant_scope(None, None, None, None, None)
+            .expect_err("no live turn and no flags must refuse");
+        assert!(error.to_string().contains("--message"), "{error}");
+        let scope = resolve_assistant_scope(
+            None,
+            Some("inst-1"),
+            Some("ctx-1"),
+            Some("msg-1"),
+            Some("tok-1"),
+        )
+        .unwrap();
+        assert_eq!(scope.token, "tok-1");
+        // A live turn with no App stamp cannot invent an installation.
+        let live = live_turns(json!([{"id":"msg-1","turn_id":"tok-1"}]));
+        let error = resolve_assistant_scope(Some(&live), None, None, None, None)
+            .expect_err("no stamp must refuse");
+        assert!(error.to_string().contains("install"), "{error}");
+    }
+
+    #[test]
+    fn operation_ids_are_stable_per_turn_action_and_input() {
+        let input = json!({"query": "acme"});
+        let first = derive_operation_id("msg-1", "customers.search", &input);
+        assert_eq!(
+            first,
+            derive_operation_id("msg-1", "customers.search", &input)
+        );
+        assert_ne!(
+            first,
+            derive_operation_id("msg-2", "customers.search", &input)
+        );
+        assert_ne!(
+            first,
+            derive_operation_id("msg-1", "customers.show", &input)
+        );
+        assert_ne!(
+            first,
+            derive_operation_id("msg-1", "customers.search", &json!({"query": "other"}))
+        );
+        assert!(first.starts_with("op-"), "{first}");
+    }
+
+    #[test]
+    fn assistant_input_accepts_inline_and_at_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        assert_eq!(
+            parse_assistant_input(state, r#"{"query":"acme"}"#).unwrap(),
+            json!({"query":"acme"})
+        );
+        let file = dir.path().join("input.json");
+        std::fs::write(&file, r#"{"limit":3}"#).unwrap();
+        let at = format!("@{}", file.display());
+        assert_eq!(
+            parse_assistant_input(state, &at).unwrap(),
+            json!({"limit":3})
+        );
+        assert_eq!(
+            parse_assistant_input(state, file.to_str().unwrap()).unwrap(),
+            json!({"limit":3})
+        );
+        assert!(parse_assistant_input(state, r#"[1,2]"#).is_err());
+        assert!(parse_assistant_input(state, "{not json").is_err());
     }
 }
