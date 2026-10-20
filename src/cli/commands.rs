@@ -2,6 +2,25 @@
 
 use super::*;
 
+/// Where an agent's process runs. Derived from `(provider, endpoint_kind)`
+/// by the registry; this enum only lets a read filter name the value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum PlacementArg {
+    Local,
+    Cloud,
+    Queue,
+}
+
+impl PlacementArg {
+    pub(crate) fn placement(self) -> registry::Placement {
+        match self {
+            Self::Local => registry::Placement::Local,
+            Self::Cloud => registry::Placement::Cloud,
+            Self::Queue => registry::Placement::Queue,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub(crate) enum Commands {
     /// List PM issues assigned to your signed-in hosted identity.
@@ -723,9 +742,15 @@ pub(crate) enum Commands {
         nudge: bool,
         #[command(flatten)]
         steer: SteerArgs,
+        /// Wait for the turn's terminal state, like `message ask`.
+        /// Bare `--wait` uses 120 seconds; `--wait 30` uses 30.
+        #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "120",
+              value_parser = clap::value_parser!(u64).range(1..=600), conflicts_with = "nudge")]
+        wait: Option<u64>,
     },
     /// Hosted coordination for this user's local agent (CAD-1460).
     /// Requires a selected remote org. It does not run in the container.
+    #[command(hide = true)]
     LocalAgent {
         #[command(subcommand)]
         action: local_agent::LocalAgentAction,
@@ -1374,6 +1399,11 @@ pub(crate) enum Commands {
         /// Re-render every <secs> until interrupted.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         watch: Option<u64>,
+        /// Only agents whose process runs there: local (this host),
+        /// cloud (provider-hosted) or queue (a mailbox with no process).
+        /// `--org` picks the board; this picks the agent's host.
+        #[arg(long, value_enum)]
+        placement: Option<PlacementArg>,
     },
     /// Queue a cargo test on the daemon (CAD-129). `submit` returns a
     /// job id; a content-addressed hit returns the earlier job instead

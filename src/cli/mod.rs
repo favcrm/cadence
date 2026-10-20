@@ -128,7 +128,7 @@ use cadence_agent::error::Error;
 use cadence_agent::error::Result;
 use clap::Parser;
 use clap::Subcommand;
-use commands::Commands;
+use commands::{Commands, PlacementArg};
 use connection::ConnectionAction;
 use daemon::DaemonAction;
 use delivery::DeliveryAction;

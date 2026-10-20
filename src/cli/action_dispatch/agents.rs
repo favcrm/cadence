@@ -4,7 +4,15 @@ use super::*;
 
 pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
     match command {
-        Commands::Agent { action } => agent::run(state_dir, action),
+        Commands::Agent { action } => {
+            if action.bridge().is_some() {
+                Err(Error::usage(
+                    "agent connect/watch/assignments/disconnect/reassign coordinate a hosted org with this machine. Select that org, or switch back from `--org local`. Nothing was claimed.",
+                ))
+            } else {
+                agent::run(state_dir, action)
+            }
+        }
         Commands::Message { action } => message::run(state_dir, action),
         Commands::Send {
             alias,
@@ -18,20 +26,31 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             force,
             nudge,
             steer,
-        } => send::run(
-            state_dir,
+            wait,
+        } => {
             // The ArgGroup guarantees exactly one of the two.
-            alias.or(to).expect("clap target group"),
-            text,
-            file,
-            message,
-            reply_to,
-            task,
-            ready,
-            force,
-            nudge,
-            steer,
-        ),
+            let recipient = alias.or(to).expect("clap target group");
+            match wait {
+                Some(secs) => message::run(
+                    state_dir,
+                    MessageAction::Ask {
+                        alias: recipient,
+                        text,
+                        file,
+                        message,
+                        reply_to,
+                        task,
+                        ready,
+                        force,
+                        wait: secs,
+                    },
+                ),
+                None => send::run(
+                    state_dir, recipient, text, file, message, reply_to, task, ready, force,
+                    nudge, steer,
+                ),
+            }
+        }
         Commands::Dispatch {
             issue,
             to,
@@ -212,7 +231,15 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             all,
             json,
             watch,
-        } => status::run(state_dir, group, all, json, watch),
+            placement,
+        } => status::run(
+            state_dir,
+            group,
+            all,
+            json,
+            watch,
+            placement.map(PlacementArg::placement),
+        ),
         Commands::LocalAgent { .. } => Err(Error::usage(
             "local-agent coordinates a hosted org with this machine. Select that org, or switch back from `--org local`. Nothing was claimed.",
         )),

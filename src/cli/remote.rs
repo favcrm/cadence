@@ -31,7 +31,15 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             all,
             json: _,
             watch,
+            placement,
         } => {
+            if placement.is_some() {
+                return Err(unsupported(
+                    "status",
+                    "--placement",
+                    "the remote read model has no placement filter; filter the returned rows locally",
+                ));
+            }
             if watch.is_some() {
                 return Err(unsupported(
                     "status",
@@ -66,9 +74,17 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
                     sort,
                     limit,
                     fields,
+                    placement,
                     json: _,
                 },
         } => {
+            if placement.is_some() {
+                return Err(unsupported(
+                    "agent ls",
+                    "--placement",
+                    "the remote read model has no placement filter; filter the returned rows locally",
+                ));
+            }
             if *all {
                 return Err(unsupported(
                     "agent ls",
@@ -497,7 +513,15 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             force,
             nudge,
             steer,
+            wait,
         } => {
+            if wait.is_some() {
+                return Err(unsupported(
+                    "send",
+                    "--wait",
+                    "a remote send is a durable enqueue; read the outcome with `message read`",
+                ));
+            }
             let recipient = alias.as_deref().or(to.as_deref()).unwrap_or_default();
             return remote_send_args(
                 recipient, text, file, message, reply_to, task, *ready, *force, *nudge, steer,
@@ -1283,6 +1307,11 @@ pub(super) fn run(
     {
         return settings::run_remote(&target, action, grant, wake_timeout, local_state.as_deref());
     }
+    if let Commands::Agent { action } = &command {
+        if let Some(bridge) = action.bridge() {
+            return local_agent::run(&target, &bridge, wake_timeout, local_state);
+        }
+    }
     if let Commands::LocalAgent { action } = &command {
         return local_agent::run(&target, action, wake_timeout, local_state);
     }
@@ -1750,6 +1779,7 @@ mod read_contract_tests {
                 sort: ls.sort,
                 limit: ls.limit,
                 fields: ls.fields,
+                placement: None,
                 json: false,
             },
         }
@@ -1926,18 +1956,21 @@ mod read_contract_tests {
                 all: false,
                 json: false,
                 watch: None,
+                placement: None,
             },
             Commands::Status {
                 group: None,
                 all: true,
                 json: false,
                 watch: None,
+                placement: None,
             },
             Commands::Status {
                 group: None,
                 all: false,
                 json: false,
                 watch: Some(2),
+                placement: None,
             },
         ] {
             assert!(outcome(&command).is_err());
@@ -1947,6 +1980,7 @@ mod read_contract_tests {
             all: false,
             json: false,
             watch: None,
+            placement: None,
         })
         .unwrap();
         assert_eq!(verb, "status");
@@ -2160,9 +2194,22 @@ mod read_contract_tests {
             force: false,
             nudge: false,
             steer: SteerArgs::default(),
+            wait: None,
         };
         f(&mut command);
         command
+    }
+
+    #[test]
+    fn remote_send_refuses_wait() {
+        let with_wait = send_cmd(|c| {
+            let Commands::Send { wait, .. } = c else {
+                unreachable!()
+            };
+            *wait = Some(30);
+        });
+        let err = outcome(&with_wait).unwrap_err();
+        assert!(err.to_string().contains("--wait"), "{err}");
     }
 
     #[test]

@@ -20,6 +20,9 @@ pub(crate) enum MessageAction {
     /// line (a single-line pty body leads with `SUBJECT: <topic> —`)
     /// so the recipient can scan topics; there is no subject field.
     ///
+    /// `cadence send` is the canonical spelling; this stays as a hidden
+    /// alias for one release.
+    #[command(hide = true)]
     Send {
         /// Agent alias or provider-native id.
         alias: String,
@@ -59,7 +62,9 @@ pub(crate) enum MessageAction {
         #[command(flatten)]
         steer: SteerArgs,
     },
-    /// Send and wait for the turn's terminal state.
+    /// Send and wait for the turn's terminal state. `cadence send --wait`
+    /// is the canonical spelling; this stays as a hidden alias.
+    #[command(hide = true)]
     Ask {
         alias: String,
         #[arg(long, conflicts_with = "file")]

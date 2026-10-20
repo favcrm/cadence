@@ -805,6 +805,38 @@ pub fn provider_ids() -> Vec<&'static str> {
     out
 }
 
+/// Where an endpoint's process actually runs, derived from the pair the
+/// caller cannot choose. `Queue` is a durable mailbox with no process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    Local,
+    Cloud,
+    Queue,
+}
+
+impl Placement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Cloud => "cloud",
+            Self::Queue => "queue",
+        }
+    }
+}
+
+/// Placement of one registered endpoint. Total by construction: a pair
+/// without an actor is a queue, an endpoint kind named `cloud` is hosted,
+/// everything else runs on the daemon's own host.
+pub fn placement(provider: &str, endpoint_kind: &str) -> Placement {
+    if !has_actor(provider, endpoint_kind) {
+        Placement::Queue
+    } else if endpoint_kind == "cloud" {
+        Placement::Cloud
+    } else {
+        Placement::Local
+    }
+}
+
 pub fn endpoint_kind_ids() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = SPECS
         .iter()
@@ -1844,6 +1876,21 @@ pub fn capabilities_json(provider: &str, kind: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn placement_is_derived_from_the_pair() {
+        assert_eq!(super::placement("devin", "cloud"), super::Placement::Cloud);
+        assert_eq!(super::placement("pi", "managed"), super::Placement::Local);
+        assert_eq!(
+            super::placement("codex", "managed-ws"),
+            super::Placement::Local
+        );
+        assert_eq!(super::placement("claude", "pty"), super::Placement::Local);
+        assert_eq!(
+            super::placement("inbox", super::INBOX),
+            super::Placement::Queue
+        );
+        assert_eq!(super::placement("fake", "fake"), super::Placement::Local);
+    }
     use super::*;
 
     #[test]

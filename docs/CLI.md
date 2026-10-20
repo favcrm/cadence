@@ -246,6 +246,31 @@ These streams stay raw and are not part of discovery: inbox and events
 NDJSON, logs and content bytes, a bare `build-slot acquire` token, and
 `build-slot run` child stdout.
 
+## Boards and placement
+
+Two selectors, never one:
+
+- `--org <slug>` selects whose board the command acts on — `local` (the
+  default) or a hosted workspace. It never says where an agent runs.
+- `--placement local|cloud|queue` filters `agent list` and `status` by
+  where the agent's process runs: `local` on the daemon's host, `cloud`
+  for a provider-hosted session (`devin · cloud`), `queue` for a mailbox
+  with no process. The value is derived from `(provider, endpoint_kind)`;
+  the flag only selects it.
+
+`--org acme --placement local` is therefore the local-assignment plane:
+the board owns the ticket and this machine runs it. `--org local` alone
+is the standalone board, not "the local agent".
+
+The hosted binding lives under the `agent` noun:
+`agent connect|watch|assignments|disconnect|reassign`, each taking
+`--org <hosted>`. `local-agent` remains a hidden alias for one release;
+`local-agent report` is still the explicit claim reporter.
+
+`cadence send <alias> --wait[=SECS]` waits for the turn's terminal state
+(the same path as the hidden `message ask`). A remote send is a durable
+enqueue only and refuses `--wait`.
+
 ## Settings > Agents management (CAD-1586)
 
 `cadence settings agents` manages the same authoritative document and revision

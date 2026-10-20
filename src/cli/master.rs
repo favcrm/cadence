@@ -44,7 +44,9 @@ pub(crate) enum MasterAction {
     /// The master's dispatch: hand a `ready` ticket of an approved plan,
     /// its blockers done, to the ticket's agent. The daemon composes and
     /// sends the kickoff; `--to` only when the ticket names no agent.
-    /// Master only.
+    /// Master only. `cadence dispatch` is the canonical verb; this stays
+    /// as a hidden alias under the master noun.
+    #[command(hide = true)]
     Dispatch {
         /// The ticket id.
         issue: String,
