@@ -43,6 +43,8 @@ export interface ConversationList {
 }
 
 export const campaignSubject = (campaignId: string) => `campaign:${campaignId}`;
+/** CAD-1636: the assistant chat about one WhatsApp conversation. */
+export const whatsappSubject = (conversationId: string) => `whatsapp:${conversationId}`;
 
 function parseConversation(raw: unknown): Conversation | null {
   if (!raw || typeof raw !== "object") return null;

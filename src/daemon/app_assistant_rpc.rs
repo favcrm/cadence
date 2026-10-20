@@ -197,6 +197,18 @@ impl Shared {
                 required_str(params, "operation_id")?,
                 &scoped.context,
             )?;
+            // CAD-1636: a WhatsApp operation's stored output reads back only
+            // in that conversation's own subject chat; a row without a
+            // stored conversation id refuses.
+            if op["action_id"]
+                .as_str()
+                .is_none_or(|action| action.starts_with("whatsapp."))
+            {
+                let conversation = op["_input"]["conversation_id"].as_str().ok_or_else(|| {
+                    Error::rejected("WhatsApp assistant operation names no conversation")
+                })?;
+                scoped.require_whatsapp(conversation)?;
+            }
             let op = normalize_interrupted_operation(&records, &scoped.context, op)?;
             return Ok(json!({"operation":op}));
         }
@@ -260,6 +272,15 @@ impl Shared {
             "campaigns.show" | "campaigns.create_draft" | "email.draft"
         ) {
             scoped.require_campaign(required_str(input, "campaign_id")?)?;
+        }
+        // CAD-1636: hosted only, and bound to this chat's subject, before
+        // any operation row or draft exists.
+        if matches!(
+            action_id,
+            "whatsapp.conversation.context" | "whatsapp.reply.draft"
+        ) {
+            self.whatsapp_door()?;
+            scoped.require_whatsapp(required_str(input, "conversation_id")?)?;
         }
         let operation_id = required_str(params, "operation_id")?;
         let semantic = crate::store::app_runs::material_digest(
@@ -509,6 +530,14 @@ impl Shared {
                         &scoped.caller,
                         &scoped.message_id,
                     )
+                }
+                "whatsapp.conversation.context" => self.whatsapp_copilot_context(
+                    &scoped.install,
+                    &scoped.context,
+                    required_str(input, "conversation_id")?,
+                ),
+                "whatsapp.reply.draft" => {
+                    self.whatsapp_copilot_draft(&scoped.install, &scoped.context, input)
                 }
                 _ => Err(Error::rejected("unknown assistant action")),
             }?;

@@ -208,8 +208,11 @@ impl Thread {
     }
 }
 
-/// A campaign conversation's subject prefix (v1's only subject kind).
+/// A campaign conversation's subject prefix.
 pub const SUBJECT_CAMPAIGN: &str = "campaign:";
+/// CAD-1636: a WhatsApp conversation's subject prefix
+/// (`whatsapp:<conversation_id>`), bound to one door conversation.
+pub const SUBJECT_WHATSAPP: &str = "whatsapp:";
 /// At most this many conversations per (alias, installation): a
 /// "New conversation" button must not grow the table without bound.
 pub const CONVERSATION_LIMIT: i64 = 200;
@@ -221,7 +224,8 @@ pub enum ConversationKind<'a> {
     General,
     /// "New conversation", `/new`, `/clear`: always a fresh row.
     Fresh,
-    /// `campaign:<id>`: idempotent per (alias, install, subject).
+    /// `campaign:<id>` or `whatsapp:<id>`: idempotent per (alias,
+    /// install, subject).
     Subject(&'a str),
 }
 

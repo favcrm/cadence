@@ -107,7 +107,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
       } else if (c.operation === "screen.preview.clear") {
         if (!exact(c.args, ["preview_id"]) || typeof c.args.preview_id !== "string") throw new Error("Invalid preview clear");
         setPreview(p => p?.id === c.args.preview_id ? null : p);
-      } else if (["smtp.manage", "chat.campaign.open", "chat.campaign.brief"].includes(c.operation)) {
+      } else if (["smtp.manage", "chat.campaign.open", "chat.campaign.brief", "chat.whatsapp.open", "chat.whatsapp.brief"].includes(c.operation)) {
         if (!navigationCallbacks.current.onCommand) throw new Error("Host command unavailable");
         navigationCallbacks.current.onCommand(c);
       } else throw new Error("Unsupported host command");

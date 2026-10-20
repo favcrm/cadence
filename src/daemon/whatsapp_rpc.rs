@@ -269,7 +269,7 @@ fn expired(iso: &Value) -> bool {
         .is_none_or(|at| at.with_timezone(&chrono::Utc) <= chrono::Utc::now())
 }
 
-fn now_secs() -> f64 {
+pub(super) fn now_secs() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -311,7 +311,7 @@ fn reply_from(params: &Value, effect_id: &str) -> Result<Reply> {
 }
 
 impl Shared {
-    fn whatsapp_dir(&self, name: &str) -> Result<std::path::PathBuf> {
+    pub(super) fn whatsapp_dir(&self, name: &str) -> Result<std::path::PathBuf> {
         let dir = self.state_dir.join(name);
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {}
@@ -322,7 +322,7 @@ impl Shared {
     }
 
     /// One record's bytes; `None` when it does not exist.
-    fn whatsapp_record_read(&self, name: &str, id: &str) -> Result<Option<Vec<u8>>> {
+    pub(super) fn whatsapp_record_read(&self, name: &str, id: &str) -> Result<Option<Vec<u8>>> {
         match std::fs::read(self.whatsapp_dir(name)?.join(format!("{id}.json"))) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -331,7 +331,7 @@ impl Shared {
     }
 
     /// Durable, private, atomic replace of one record.
-    fn whatsapp_record_write(&self, name: &str, id: &str, bytes: &[u8]) -> Result<()> {
+    pub(super) fn whatsapp_record_write(&self, name: &str, id: &str, bytes: &[u8]) -> Result<()> {
         let dir = self.whatsapp_dir(name)?;
         let path = dir.join(format!("{id}.json"));
         let tmp = dir.join(format!("{id}.json.tmp"));
@@ -650,7 +650,7 @@ impl Shared {
 
     /// Approval, declaration and live context for one installation. Screen
     /// calls use the screen fence, which proves all of this and more.
-    fn whatsapp_scope<R>(
+    pub(super) fn whatsapp_scope<R>(
         self: &Arc<Self>,
         install: &str,
         context: &str,
@@ -685,7 +685,7 @@ impl Shared {
         action()
     }
 
-    fn whatsapp_door(&self) -> Result<&door::HostedWhatsapp> {
+    pub(super) fn whatsapp_door(&self) -> Result<&door::HostedWhatsapp> {
         self.hosted_whatsapp.as_ref().ok_or_else(|| {
             Error::rejected(
                 "WhatsApp messaging runs only on a hosted AgenticOS workspace; \

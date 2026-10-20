@@ -220,6 +220,18 @@ impl Shared {
         Ok(())
     }
 
+    /// CAD-1636: a subject of a known kind. `campaign:` must exist as the
+    /// installation's own content; `whatsapp:` names a door conversation
+    /// id and exists only on a hosted daemon. Any other kind refuses.
+    pub(super) fn verify_subject(&self, install: &str, context: &str, subject: &str) -> Result<()> {
+        if let Some(id) = subject.strip_prefix(store::SUBJECT_WHATSAPP) {
+            crate::platform::hosted_whatsapp::check_conversation_id(id)?;
+            self.whatsapp_door()?;
+            return Ok(());
+        }
+        self.verify_campaign_subject(install, context, subject)
+    }
+
     /// A campaign subject exists in this installation and the proven
     /// context: the installation's own content row, never a client claim.
     pub(super) fn verify_campaign_subject(
@@ -266,7 +278,7 @@ impl Shared {
                     "this campaign conversation serves only the context it was created in",
                 ));
             };
-            self.verify_campaign_subject(install, context, subject)?;
+            self.verify_subject(install, context, subject)?;
         }
         Ok(())
     }
@@ -689,7 +701,7 @@ impl Shared {
                 let context = context.ok_or_else(|| {
                     Error::rejected("a campaign conversation needs the context it belongs to")
                 })?;
-                self.verify_campaign_subject(install, context, subject)?;
+                self.verify_subject(install, context, subject)?;
                 ConversationKind::Subject(subject)
             }
             (false, None) => ConversationKind::Fresh,

@@ -108,6 +108,8 @@ mod cad1588_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1590_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
+mod cad1636_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
 mod cad225_unattended_acceptance;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
@@ -182,6 +184,7 @@ mod topics_rpc;
 mod unattended;
 mod unattended_landing;
 mod watch;
+mod whatsapp_copilot;
 mod whatsapp_rpc;
 mod wiki_rpc;
 

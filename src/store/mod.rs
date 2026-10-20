@@ -35,7 +35,7 @@ pub use threads::{
     tool_result_summary, tool_summary, ConversationKind, NewEntry, Sender, Thread, ThreadEntry,
     CONVERSATION_LIMIT, KIND_ASSISTANT_TEXT, KIND_MESSAGE, KIND_TOOL_CALL, KIND_TOOL_RESULT,
     KIND_TURN_RESULT, PAGE_MAX as THREAD_PAGE_MAX, ROLE_AGENT, ROLE_OPERATOR, ROLE_SYSTEM,
-    SUBJECT_CAMPAIGN,
+    SUBJECT_CAMPAIGN, SUBJECT_WHATSAPP,
 };
 pub use threads::{CliAuthority, MemberAuthority};
 pub use threads::{COMPACTED_EVENT as THREAD_COMPACTED_EVENT, PACK_EVENT as THREAD_PACK_EVENT};
