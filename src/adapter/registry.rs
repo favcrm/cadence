@@ -436,9 +436,10 @@ pub static SPECS: &[EndpointSpec] = &[
         doctor_caps: &["managed_pi_rpc"],
         probe_bins: &[("omp", &["--version"])],
         session_disposable: true,
-        // Not the install default: `join <pm>` keeps resolving to pi until the
-        // operator moves the default deliberately.
-        launch_default: false,
+        // The endpoint an explicitly named `join <pm> omp` selects. This is not
+        // the installation default provider — `join <pm>` keeps resolving to pi
+        // until the operator moves that default deliberately.
+        launch_default: true,
         internal: false,
     },
     EndpointSpec {
@@ -1578,6 +1579,15 @@ fn validate_devin_cloud(params: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Does this endpoint run the Pi adapter — and therefore its Landlock
+/// confinement, its session handling and its Settings allowlist gate? The
+/// capability decides, never the provider name, so a pi-compatible runtime
+/// (pi, omp, and whatever joins them) inherits all three by construction.
+pub fn pi_family_managed(provider: &str, kind: &str) -> bool {
+    kind == "managed"
+        && spec(provider, kind).is_ok_and(|spec| spec.capabilities.contains(&"managed_pi_rpc"))
+}
+
 /// Register-time validation for enumerated launch params. Params not
 /// named here keep their historical pass-through (claude's modes are
 /// provider-validated — its own CLI rejects bad values on spawn).
@@ -1702,14 +1712,14 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
             }
         }
     }
-    // CAD-556: Landlock confinement exists for `pi/managed` only —
-    // anywhere else the flag would be silently meaningless, so it is
-    // refused instead of dropped.
+    // CAD-556: Landlock confinement is the Pi adapter's policy. Any managed
+    // endpoint that runs that adapter (pi, omp) may ask for it; anywhere else
+    // the flag would be silently meaningless, so it is refused, not dropped.
     if let Some(v) = params.get("confine") {
-        if !(provider == "pi" && kind == "managed") {
+        if !pi_family_managed(provider, kind) {
             return Err(Error::rejected(
-                "'confine' only applies to pi/managed — the pi worker's \
-                 Landlock policy is the only worker confinement today",
+                "'confine' only applies to a managed Pi-family endpoint — \
+                 the Pi adapter's Landlock policy is the only worker confinement today",
             ));
         }
         if !v.is_boolean() {

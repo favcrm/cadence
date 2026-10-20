@@ -853,12 +853,19 @@ pub fn build(
             // CAD-1624: omp is pi-compatible on every flag the adapter uses, so
             // it is the same adapter with its own program — and therefore the
             // same Settings allowlist gate (`PiAdapter::open`), not a bypass.
-            "omp" => Ok(Box::new(pi::PiAdapter::new(
-                hooks,
-                log_path,
-                &env.with_var("CADENCE_PI_COMMAND", "omp"),
-                agent_uid,
-            ))),
+            // Only a default program is replaced: a fixture's sealed command
+            // (`refusing_providers`/`isolate_for_test`) or an operator's
+            // explicit command must win, or a test daemon would spawn the real
+            // binary.
+            "omp" => {
+                let env = match env.var("CADENCE_PI_COMMAND") {
+                    Some(value) if value.trim() != "pi" => env.clone(),
+                    _ => env.with_var("CADENCE_PI_COMMAND", "omp"),
+                };
+                Ok(Box::new(pi::PiAdapter::new(
+                    hooks, log_path, &env, agent_uid,
+                )))
+            }
             other => Err(crate::error::Error::rejected(format!(
                 "No managed adapter for provider '{other}' (implemented: codex, claude, pi, omp)"
             ))),

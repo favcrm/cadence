@@ -1906,8 +1906,17 @@ pub(crate) fn validate_model_harness(
         .iter()
         .find(|provider| provider["id"].as_str() == Some(owner))
         .and_then(|provider| provider["kind"].as_str());
+    // A Pi-extension model rides the Pi adapter, so any managed endpoint that
+    // runs that adapter (pi, omp) owns it — the capability, not the name.
+    if kind == Some("Pi extension") {
+        if !registry::pi_family_managed(harness, "managed") {
+            return Err(Error::rejected(format!(
+                "model '{model}' belongs to the Pi adapter, not harness '{harness}'"
+            )));
+        }
+        return Ok(());
+    }
     let expected = match kind {
-        Some("Pi extension") => "pi",
         Some("native CLI") => owner,
         _ => {
             return Err(Error::rejected(format!(

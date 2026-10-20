@@ -168,16 +168,16 @@ pub(crate) fn provider_launch(
              resumes with `cadence agent resume <alias>`",
         ));
     }
-    if provider == "pi" && resume.is_some() {
+    if registry::pi_family_managed(provider, endpoint_kind) && resume.is_some() {
         return Err(Error::rejected(
             "`--resume` on pi is not supported — a managed pi worker resumes \
              its stored session file with `cadence agent resume <alias>`",
         ));
     }
-    // A pi worker has no permission surface to flag (CAD-544): its
-    // toolset is the fixed dev allowlist, unattended — refuse the
-    // claude-style knobs rather than silently drop them.
-    if provider == "pi" {
+    // A managed Pi-family worker (pi, omp) has no permission surface to flag
+    // (CAD-544): its toolset is the fixed dev allowlist, unattended — refuse
+    // the claude-style knobs rather than silently drop them.
+    if registry::pi_family_managed(provider, endpoint_kind) {
         if claude.permission_mode.is_some() || claude.bypass {
             return Err(Error::rejected(
                 "--permission-mode/--bypass do not apply to pi — a managed pi \
@@ -363,7 +363,8 @@ pub(crate) fn provider_launch(
     // Pi's launch params ride in `params` exactly like claude's — the
     // adapter replays them verbatim on every open: `--model`, then
     // `effort` through `set_thinking_level` (verified via `get_state`).
-    if provider == "pi" {
+    // Any managed Pi-family endpoint (pi, omp) reads the same fields.
+    if registry::pi_family_managed(provider, endpoint_kind) {
         let spec = registry::spec(provider, endpoint_kind)?;
         if let Some(model) = &claude.model {
             params_obj.insert("model".to_string(), json!(model));

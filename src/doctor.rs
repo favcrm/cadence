@@ -102,7 +102,11 @@ pub fn run(state_dir: &Path) -> Result<Value> {
             .iter()
             .all(|(p, _)| checks[p]["present"].as_bool().unwrap_or(false));
         for cap in spec.doctor_caps {
-            caps[*cap] = json!(ok);
+            // Several endpoints share a capability (pi and omp both provide
+            // `managed_pi_rpc`): availability is "any provider with a present
+            // probe", never the last spec's answer.
+            let available = caps[*cap].as_bool().unwrap_or(false);
+            caps[*cap] = json!(available || ok);
         }
     }
     // Empty probe_bins would mark devin_cloud present. The capability is
