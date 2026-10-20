@@ -51,6 +51,13 @@ const IAT_AHEAD_SECS: i64 = 60;
 /// The contract's assertion lifetime: `exp - iat` never exceeds it.
 const MAX_LIFE_SECS: i64 = 60;
 
+/// The last instant [`verify`] accepts an assertion with this `exp`: the
+/// expiry plus the clock-skew allowance. A spent `jti` must be remembered
+/// at least this long, or a replay inside the grace window mints a session.
+pub fn accepted_until(exp: i64) -> i64 {
+    exp + SKEW_SECS
+}
+
 /// The daemon-side trust root for public-name sign-in: this board's
 /// public host (the assertion's `aud`), the platform issuer (`iss` —
 /// also the JWKS origin) and the one company this instance serves.
@@ -138,7 +145,8 @@ pub struct Identity {
     pub email: String,
     pub name: String,
     pub role: Role,
-    /// The single-use token id — the daemon remembers it until `exp`.
+    /// The single-use token id — the daemon remembers it through the
+    /// acceptance deadline.
     pub jti: String,
     pub exp: i64,
 }
@@ -222,7 +230,8 @@ impl Parsed {
     pub fn audience(&self) -> &str {
         &self.claims.aud
     }
-    /// The single-use token id, for the daemon to remember until `exp`.
+    /// The single-use token id, for the daemon to remember through the
+    /// acceptance deadline.
     pub fn jti(&self) -> &str {
         &self.claims.jti
     }
@@ -554,6 +563,11 @@ mod tests {
             kid: "k1".to_string(),
             x,
         }
+    }
+
+    #[test]
+    fn the_acceptance_deadline_includes_the_skew() {
+        assert_eq!(accepted_until(NOW), NOW + SKEW_SECS);
     }
 
     fn config() -> Config {

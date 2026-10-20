@@ -668,9 +668,10 @@ pub struct Opened {
 #[derive(Serialize, Deserialize, Default)]
 struct SessionsFile {
     sessions: Vec<Row>,
-    /// `sha256(jti)` → the assertion's `exp`: platform assertions are
-    /// single-use (CAD-526); persisted so a restart inside the 60 s
-    /// window cannot reopen a replay. Pruned once `exp` passes.
+    /// `sha256(jti)` → the assertion's acceptance deadline
+    /// (`exp + skew`): platform assertions are single-use (CAD-526);
+    /// persisted so a restart inside the window cannot reopen a replay.
+    /// Pruned once the deadline passes.
     #[serde(default)]
     jtis: HashMap<String, i64>,
 }
@@ -690,8 +691,8 @@ pub struct Auth {
     links: HashMap<String, (Origin, i64, Option<String>)>,
     /// spent nonce hash → when it would have expired (pruned after)
     spent: HashMap<String, i64>,
-    /// seen jti hash → its assertion's `exp` — the authoritative
-    /// single-use memory for platform sign-ins (CAD-526).
+    /// seen jti hash → its acceptance deadline (`exp + skew`) — the
+    /// authoritative single-use memory for platform sign-ins (CAD-526).
     jtis: HashMap<String, i64>,
 }
 
@@ -773,8 +774,9 @@ impl Auth {
         self.links
             .retain(|_, (_, exp, _)| now <= *exp + LINK_TTL_SECS);
         self.spent.retain(|_, exp| now <= *exp + LINK_TTL_SECS);
-        // A jti stays until its assertion's own expiry — then a replay
-        // fails "expired" before the single-use check anyway.
+        // A jti stays through its assertion's acceptance deadline — the
+        // same horizon `verify` uses — so a replay inside the grace still
+        // fails the single-use check.
         self.jtis.retain(|_, exp| now <= *exp);
         let before = self.sessions.len();
         self.sessions.retain(|r| r.live(now));
@@ -1043,10 +1045,21 @@ impl Auth {
         now: i64,
         intent: impl FnOnce(&AuditTarget) -> Result<()>,
     ) -> Result<Option<Opened>> {
+        // The verifier may have sampled its clock before a blocking JWKS
+        // fetch. Re-check the acceptance deadline here, under the caller's
+        // Auth lock, so a request that reaches the store after it cannot
+        // open a session even if a concurrent check already pruned the jti.
+        if now > jti_exp {
+            return Err(Error::invalid(
+                "assertion_expired",
+                "the assertion is outside its acceptance window",
+            ));
+        }
         // The authoritative single-use check (contract §4/§9): verified
-        // jtis persist until `exp` — a restart inside the 60 s window
-        // still knows the assertion is spent. Non-mutating: a jti is spent
-        // exactly while its `exp` has not passed, the set `prune` keeps.
+        // jtis persist through the verifier's acceptance deadline — a
+        // restart inside the 60 s window still knows the assertion is
+        // spent. Non-mutating: a jti is spent while its deadline has not
+        // passed, the set `prune` keeps.
         if self.jtis.get(&digest(jti)).is_some_and(|exp| now <= *exp) {
             return Ok(None);
         }
@@ -1898,10 +1911,75 @@ mod tests {
         assert!(auth.mint(Origin::Public, T0).is_err());
     }
 
+    /// CAD-1643: a spent public assertion is remembered through the
+    /// verifier's acceptance grace (`exp + SKEW_SECS`), not only to the raw
+    /// `exp`, so a replay at the edge of the grace cannot mint a session.
+    #[test]
+    fn a_spent_public_jti_survives_the_acceptance_skew() {
+        let s = state();
+        let mut auth = Auth::load(s.path());
+        let exp = T0 + 60;
+        let deadline = crate::board_identity::accepted_until(exp);
+        assert!(auth
+            .open_public(user("u_skew", "operator"), "jti-skew", deadline, "ua", T0)
+            .unwrap()
+            .is_some());
+        // `verify` still accepts the assertion at exp+30; the replay loses.
+        assert!(auth
+            .open_public(
+                user("u_skew", "operator"),
+                "jti-skew",
+                deadline,
+                "ua",
+                exp + 30
+            )
+            .unwrap()
+            .is_none());
+        // Past the deadline the store refuses before the jti lookup; the
+        // verifier is the guard above it.
+        let late = auth
+            .open_public(
+                user("u_skew", "operator"),
+                "jti-skew",
+                deadline,
+                "ua",
+                exp + 31,
+            )
+            .err()
+            .expect("past the acceptance deadline must refuse");
+        assert_eq!(late.code(), Some("assertion_expired"));
+    }
+
+    /// CAD-1643: a jti pruned by a concurrent check must not let a request
+    /// with a stale clock open a session past the acceptance deadline.
+    #[test]
+    fn a_pruned_jti_cannot_open_past_the_acceptance_deadline() {
+        let s = state();
+        let mut auth = Auth::load(s.path());
+        let exp = T0 + 60;
+        let deadline = crate::board_identity::accepted_until(exp);
+        auth.open_public(user("u_late", "operator"), "jti-late", deadline, "ua", T0)
+            .unwrap()
+            .unwrap();
+        // A concurrent request at exp+31 prunes the spent entry.
+        auth.prune(exp + 31);
+        let late = auth
+            .open_public(
+                user("u_late", "operator"),
+                "jti-late",
+                deadline,
+                "ua",
+                exp + 31,
+            )
+            .err()
+            .expect("past the acceptance deadline must refuse");
+        assert_eq!(late.code(), Some("assertion_expired"));
+    }
+
     /// CAD-526 §4: the `jti` is single-use, and the memory is persisted —
     /// a daemon restart inside the assertion's window still refuses the
-    /// replay. Only its sha256 is stored; once `exp` passes it is
-    /// forgotten (the verifier's own expiry bound is the wall).
+    /// replay. Only its sha256 is stored; once the acceptance deadline
+    /// passes it is forgotten (the verifier's own expiry bound is the wall).
     #[test]
     fn a_spent_jti_stays_spent_across_a_reload() {
         let s = state();
@@ -1924,12 +2002,13 @@ mod tests {
             .open_public(user("u_1", "member"), "jti-9", T0 + 60, "ua", T0 + 1)
             .unwrap()
             .is_none());
-        // Past `exp` the entry is gone — the assertion would fail
-        // verification before this check anyway.
-        assert!(reloaded
+        // Past the acceptance deadline the store refuses; the verifier
+        // rejects there too.
+        let late = reloaded
             .open_public(user("u_1", "member"), "jti-9", T0 + 60, "ua", T0 + 61)
-            .unwrap()
-            .is_some());
+            .err()
+            .expect("past the acceptance deadline must refuse");
+        assert_eq!(late.code(), Some("assertion_expired"));
     }
 
     /// CAD-526 §9: one session per `sub` — a fresh sign-in ends the same
