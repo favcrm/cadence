@@ -937,7 +937,8 @@ pub fn has_actor(provider: &str, kind: &str) -> bool {
 /// enrolls for strict build-slot admission (CAD-230). Panes keep their
 /// legacy binding; the fake and mailbox kinds own no provider process.
 pub fn enrolls_build_slots(provider: &str, kind: &str) -> bool {
-    matches!(provider, "claude" | "codex" | "pi") && matches!(kind, "managed" | "managed-ws")
+    (matches!(provider, "claude" | "codex") && matches!(kind, "managed" | "managed-ws"))
+        || pi_family_managed(provider, kind)
 }
 
 /// The endpoint exposes an attachable surface (tmux pane or provider
@@ -1296,7 +1297,7 @@ pub fn validate_next_launch_param(
         (_, Value::Null) => Ok(()),
         ("effort", Value::String(level)) if provider == "claude" => claude_effort(level),
         ("effort", Value::String(level)) if provider == "codex" => codex_effort(level),
-        ("effort", Value::String(level)) if provider == "pi" => pi_effort(level),
+        ("effort", Value::String(level)) if pi_family_managed(provider, kind) => pi_effort(level),
         ("approval_policy", Value::String(policy)) => codex_approval_policy(policy),
         ("confine", Value::Bool(_)) => Ok(()),
         ("model", Value::String(m)) if !m.trim().is_empty() => Ok(()),

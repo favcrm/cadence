@@ -435,7 +435,7 @@ pub fn preview(
                     model = Some((id.to_string(), source.to_string()));
                 }
             }
-            if spec.provider == "pi" {
+            if registry::pi_family_managed(spec.provider, spec.endpoint_kind) {
                 match pi_policy::resolve_model_with_source(
                     policy.as_ref(),
                     "worker",
@@ -475,7 +475,7 @@ pub fn preview(
             policy.as_ref(),
             &profile.role,
         ));
-        if spec.is_some_and(|item| item.provider == "pi") {
+        if spec.is_some_and(|item| registry::pi_family_managed(item.provider, item.endpoint_kind)) {
             let confined = crate::doctor::host::read_host_overrides(pm_dir)
                 .map_err(Error::rejected)?
                 .and_then(|overrides| overrides.confine_pi_workers)

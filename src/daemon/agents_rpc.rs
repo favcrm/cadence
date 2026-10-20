@@ -142,7 +142,12 @@ impl Shared {
         let instructions = profile_job.as_deref().or(caller_instructions);
         let mut defaulted = requested_profile.is_some();
         let pm_dir = self.pm_dir().ok().filter(|d| d.is_dir());
-        if provider == "pi" && endpoint == "managed" && parsed.get("confine").is_none() {
+        // The host default `confine_pi_workers` is the Pi adapter's policy, so
+        // every managed Pi-family worker (pi, omp) obeys it — a family
+        // registration must never launch unconfined by name mismatch.
+        if crate::adapter::registry::pi_family_managed(provider, endpoint)
+            && parsed.get("confine").is_none()
+        {
             if let Some(pm_dir) = &pm_dir {
                 let overrides =
                     crate::doctor::host::read_host_overrides(pm_dir).map_err(Error::rejected)?;
@@ -174,7 +179,7 @@ impl Shared {
         // survives into the stored row.
         let mut pi_params: Option<String> = None;
         let mut pi_selection: Option<Value> = None;
-        let parsed = if provider == "pi" {
+        let parsed = if crate::adapter::registry::pi_family_managed(provider, endpoint) {
             // `provider_default` means "whatever the provider picks" —
             // the exact silent fallback this gate removes, so pi
             // refuses it outright rather than collide downstream.
@@ -495,7 +500,9 @@ impl Shared {
         // it is refused — and it can never be cleared, because a pi
         // launch without `--model` would silently fall back. CAD-575:
         // the role's own list applies when pm.yaml carries one.
-        if agent.provider == "pi" && patch.as_object().unwrap().contains_key("model") {
+        if crate::adapter::registry::pi_family_managed(&agent.provider, &agent.endpoint_kind)
+            && patch.as_object().unwrap().contains_key("model")
+        {
             let policy = self.stored_pi_policy()?;
             let role = if crate::master::is_master(&agent.alias) {
                 "master"
@@ -513,7 +520,7 @@ impl Shared {
                 }
             }
         }
-        if agent.provider == "pi" && agent.endpoint_kind == "managed" {
+        if crate::adapter::registry::pi_family_managed(&agent.provider, &agent.endpoint_kind) {
             let mut effective = agent.params.clone().unwrap_or_else(|| json!({}));
             if let (Some(current), Some(changes)) = (effective.as_object_mut(), patch.as_object()) {
                 current.extend(changes.clone());

@@ -275,17 +275,18 @@ impl Shared {
             seen.push(spec.provider);
             let takes_model = spec.launch_params.contains(&"model");
             let takes_effort = spec.launch_params.contains(&"effort");
-            let models = if spec.provider == "pi" {
-                let empty: &[String] = &[];
-                json!(policy
-                    .as_ref()
-                    .map(|p| p.models.allow_for("worker"))
-                    .unwrap_or(empty))
-            } else if takes_model {
-                Value::Null
-            } else {
-                json!([])
-            };
+            let models =
+                if crate::adapter::registry::pi_family_managed(spec.provider, spec.endpoint_kind) {
+                    let empty: &[String] = &[];
+                    json!(policy
+                        .as_ref()
+                        .map(|p| p.models.allow_for("worker"))
+                        .unwrap_or(empty))
+                } else if takes_model {
+                    Value::Null
+                } else {
+                    json!([])
+                };
             let efforts: &[&str] = if !takes_effort {
                 &[]
             } else {

@@ -1100,8 +1100,7 @@ pub fn refuse_confined_devin(alias: &str, confined: bool, model: &str) -> Result
 }
 
 pub fn refuse_confined_devin_agent(agent: &Agent) -> Result<()> {
-    if agent.provider == "pi"
-        && agent.endpoint_kind == "managed"
+    if crate::adapter::registry::pi_family_managed(&agent.provider, &agent.endpoint_kind)
         && !crate::master::is_master(&agent.alias)
     {
         let params = agent.params.as_ref().unwrap_or(&Value::Null);
