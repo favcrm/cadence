@@ -20,6 +20,9 @@ pub(super) fn run(
     target: &RemoteTarget,
     wake_timeout: u64,
 ) -> Result<i32> {
+    // The daemon renews, but the command still refuses locally when no saved
+    // credential exists — the pre-cutover exit code and message are kept.
+    cadence_agent::remote_cli::web_credential_saved(target)?;
     let value = match action {
         WebAction::Prepare { input, name, spa } => {
             let site = web_publish::freeze(input)?;

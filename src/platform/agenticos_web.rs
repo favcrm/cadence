@@ -211,6 +211,7 @@ impl AgenticosWebAdapter {
             }
         };
         let mut files = Vec::with_capacity(rows.len());
+        let mut seen_paths = std::collections::BTreeSet::new();
         let mut total = 0u64;
         for row in rows {
             let path = row["path"]
@@ -231,6 +232,9 @@ impl AgenticosWebAdapter {
             let row_bytes = row["bytes"]
                 .as_u64()
                 .ok_or_else(|| Error::rejected("prepare_site: a file row has no size"))?;
+            if !seen_paths.insert(path.clone()) {
+                return Err(Error::rejected("prepare_site: the plan repeats a path"));
+            }
             let manifest_row = manifest_by_path.get(path.as_str()).ok_or_else(|| {
                 Error::rejected("prepare_site: the plan names a file outside the manifest")
             })?;

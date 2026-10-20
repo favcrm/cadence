@@ -2609,6 +2609,14 @@ pub struct WebIdentity {
 /// Verify the stored credential for `target` and return its identity. Fails
 /// closed when the credential has no issuer, expired, or was minted for
 /// another workspace or audience.
+/// Read-only local guard for a command whose requests go through the
+/// daemon: the saved credential must exist and be current, but renewal
+/// belongs to the daemon. The refusal text is the pre-cutover web path's.
+pub fn web_credential_saved(target: &RemoteTarget) -> Result<()> {
+    let dir = auth_dir(None)?;
+    load_credential(&dir, target).map(|_| ())
+}
+
 pub fn web_identity(target: &RemoteTarget) -> Result<WebIdentity> {
     let dir = auth_dir(None).map_err(|_| {
         reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
