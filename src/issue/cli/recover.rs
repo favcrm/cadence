@@ -58,7 +58,8 @@ pub enum RecoverAction {
     /// The truthful outcome of an attempt and the blockers that remain.
     /// Read-only; safe to run after a failed or unknown `execute`.
     Status {
-        /// The attempt JSON printed by `recover execute`.
+        /// The recorded attempt FILE the daemon printed: the path named by
+        /// an `execute` error, or the `record` field of its reply.
         #[arg(long)]
         attempt: PathBuf,
     },
@@ -100,26 +101,11 @@ pub fn run_recover(action: &RecoverAction, state_dir: &Path) -> Result<i32> {
                 "paths": path,
             }),
         )?,
-        RecoverAction::Status { attempt } => {
-            // The daemon reads its OWN record: a caller cannot hand in
-            // an attempt that claims success.
-            let recorded = read_json_file(attempt, "--attempt")?
-                .get("record")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    crate::error::Error::rejected(format!(
-                        "{} carries no `record` path — pass the attempt JSON the daemon \
-                         printed after `recover execute`",
-                        attempt.display()
-                    ))
-                })?;
-            client::rpc(
-                state_dir,
-                "tracker_recovery_status",
-                json!({"attempt_path": recorded}),
-            )?
-        }
+        RecoverAction::Status { attempt } => client::rpc(
+            state_dir,
+            "tracker_recovery_status",
+            json!({"attempt_path": attempt.display().to_string()}),
+        )?,
     };
     print_json(&out);
     Ok(0)

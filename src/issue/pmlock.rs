@@ -430,6 +430,9 @@ pub struct InterruptionReport {
     /// complete leftover set. A recovery must not authorize a decision
     /// from a sample (CAD-1601).
     pub sampled: bool,
+    /// The acquisition snapshot was present and trustworthy. Without
+    /// it no path can be attributed to the crash (CAD-1601).
+    pub snapshot_known: bool,
 }
 
 /// CAD-1234: the acquiring call site of every lock this process holds,
@@ -730,8 +733,11 @@ struct Interruption {
     /// state. Kept apart from `named` so a caller can name them
     /// exactly (CAD-1601).
     hazards: Vec<String>,
-    /// The file scan stopped at its cap: the names are a sample.
+    /// The file scan stopped at its cap: the names are a SAMPLE.
     sampled: bool,
+    /// The acquisition snapshot was present and trustworthy. Without
+    /// it, no path can be attributed to the crash (CAD-1601).
+    snapshot_known: bool,
 }
 
 fn open_coordination(path: &Path, create: bool) -> std::io::Result<Option<File>> {
@@ -797,13 +803,19 @@ fn read_snapshot(git_dir: &Path) -> Result<Option<HashSet<String>>> {
     file.take(16 << 20)
         .read_to_end(&mut buf)
         .map_err(|e| io_unknown(&path, "the dirty-path snapshot", e))?;
-    Ok(Some(
-        String::from_utf8_lossy(&buf)
-            .split('\0')
-            .filter(|p| !p.is_empty())
-            .map(str::to_string)
-            .collect(),
-    ))
+    let mut names: Vec<String> = String::from_utf8_lossy(&buf)
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    // The tag proves THIS version wrote the file, including the staged
+    // set. An older build's snapshot has no tag, so its staged set is
+    // unknown and no provenance can be derived from it.
+    if names.first().map(String::as_str) != Some("cadence-snapshot v3") {
+        return Ok(None);
+    }
+    names.remove(0);
+    Ok(Some(names.into_iter().collect()))
 }
 
 /// When the dirty-path snapshot was written: the moment the last
@@ -855,7 +867,7 @@ fn files_since(
 fn write_snapshot(git_dir: &Path, tree: &Tree) -> Result<()> {
     let tmp = git_dir.join(format!("{TMP_PREFIX}dirty-{}", std::process::id()));
     let path = git_dir.join(DIRTY_FILE);
-    let mut content = String::new();
+    let mut content = String::from("cadence-snapshot v3\0");
     for (_, p) in &tree.loose {
         content.push_str(p);
         content.push('\0');
@@ -889,6 +901,25 @@ fn sweep_tmp(git_dir: &Path) {
     }
 }
 
+/// True when the snapshot recorded `p`, or a directory that contains
+/// it. Git lists an untracked directory as one `dir/` entry, so its
+/// children are protected by that entry even when they are not named
+/// individually.
+fn snapshot_protects(snapshot: &HashSet<String>, p: &str) -> bool {
+    if snapshot.contains(p) {
+        return true;
+    }
+    let mut end = 0;
+    while let Some(i) = p[end..].find('/') {
+        end += i;
+        if snapshot.contains(&format!("{}/", &p[..end])) {
+            return true;
+        }
+        end += 1;
+    }
+    false
+}
+
 fn classify(
     tree: &Tree,
     snapshot: Option<&HashSet<String>>,
@@ -909,7 +940,7 @@ fn classify(
         // when the crash took the lock is in the snapshot, so the crash
         // did not create it. Without a snapshot (an older build's
         // crash) nothing is proven, and the path is protected.
-        if snapshot.is_some_and(|s| !s.contains(p)) {
+        if snapshot.is_some_and(|s| !snapshot_protects(s, p)) {
             named.push(format!("staged {p}"));
             paths.push(p.clone());
         } else {
@@ -923,14 +954,22 @@ fn classify(
         }
     }
     for (kind, p) in &tree.loose {
-        if snapshot.is_none() && *kind == "untracked" {
-            // No snapshot in this version's format (an older build's
-            // crash): present untracked paths cannot be told from
-            // leftovers, so none is blamed. Git state, staged entries
-            // and modified tracked files still refuse.
-            foreign.push(format!("{kind} {p}"));
-            foreign_paths.push(p.clone());
-        } else if snapshot.is_some_and(|s| s.contains(p)) {
+        if snapshot.is_none() {
+            if *kind == "untracked" {
+                // CAD-1208: present untracked paths cannot be told from
+                // leftovers, so none is blamed.
+                foreign.push(format!("{kind} {p}"));
+                foreign_paths.push(p.clone());
+            } else {
+                // A modified tracked file: it blocks, but with no
+                // snapshot nothing proves the crash modified it, so it
+                // is protected too.
+                named.push(format!("{kind} {p}"));
+                foreign.push(format!("{kind} {p}"));
+                foreign_paths.push(p.clone());
+                paths.push(p.clone());
+            }
+        } else if snapshot.is_some_and(|s| snapshot_protects(s, p)) {
             foreign.push(format!("{kind} {p}"));
             foreign_paths.push(p.clone());
         } else if p.ends_with('/') && inside.iter().any(|f| f.starts_with(p.as_str())) {
@@ -975,6 +1014,7 @@ fn classify(
             paths,
             hazards: tree.git_state.clone(),
             sampled,
+            snapshot_known: snapshot.is_some(),
         })
     }
 }
@@ -1205,7 +1245,9 @@ impl Pm {
                     sampled = true;
                 }
             } else {
-                let _ = files_since(&self.dir, p, taken, &mut ambiguous);
+                if files_since(&self.dir, p, taken, &mut ambiguous) {
+                    sampled = true;
+                }
                 ambiguous.retain(|f| !snapshot.contains(f));
             }
             whole.push(p.clone());
@@ -1772,6 +1814,7 @@ impl Pm {
                 named: i.named,
                 hazards: i.hazards,
                 sampled: i.sampled,
+                snapshot_known: i.snapshot_known,
             },
             None => InterruptionReport::default(),
         })

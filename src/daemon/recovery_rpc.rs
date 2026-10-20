@@ -14,30 +14,41 @@ const EXECUTE_VERB: &str = "tracker recovery execute";
 /// branches on it (busy is retryable, conflict is not) still branches
 /// correctly.
 fn with_attempt_path(e: Error, path: Option<&std::path::Path>) -> Error {
-    let Some(path) = path else {
-        return e;
-    };
-    let msg = format!("{e} (the attempt was recorded at {})", path.display());
+    match path {
+        Some(path) => with_note(
+            e,
+            &format!("the attempt was recorded at {}", path.display()),
+        ),
+        None => e,
+    }
+}
+
+/// The error, with a note appended. The original structured code is
+/// preserved: the note adds context, it does not change what happened.
+fn with_note(e: Error, note: &str) -> Error {
+    let msg = format!("{e} ({note})");
+    let code = e.code().unwrap_or_default();
     match e.kind() {
-        "conflict" => Error::conflict_coded("recovery_failed", msg),
-        "busy" => Error::busy_coded("resource_busy", msg),
-        "gate" => Error::gate_coded("recovery_gate", msg),
+        "conflict" => Error::conflict_coded(known_code(code, "recovery_failed"), msg),
+        "busy" => Error::busy_coded(known_code(code, "resource_busy"), msg),
+        "gate" => Error::gate_coded(known_code(code, "recovery_gate"), msg),
         "internal" => Error::internal(msg),
         _ => Error::rejected(msg),
     }
 }
 
-/// The error, with a note appended. The kind — and so the exit code —
-/// is preserved: the note adds context, it does not change what
-/// happened.
-fn with_note(e: Error, note: &str) -> Error {
-    let msg = format!("{e} ({note})");
-    match e.kind() {
-        "conflict" => Error::conflict_coded("recovery_failed", msg),
-        "busy" => Error::busy_coded("resource_busy", msg),
-        "gate" => Error::gate_coded("recovery_gate", msg),
-        "internal" => Error::internal(msg),
-        _ => Error::rejected(msg),
+/// The stable codes this flow emits, as the `&'static str` the error
+/// constructors require: a code that reached a caller must survive the
+/// note, not degrade to a generic one.
+fn known_code(code: &str, fallback: &'static str) -> &'static str {
+    match code {
+        "legacy_write_lock" => "legacy_write_lock",
+        "stale_review" => "stale_review",
+        "resource_busy" => "resource_busy",
+        "recovery_gate" => "recovery_gate",
+        "recovery_failed" => "recovery_failed",
+        "recovery_evidence" => "recovery_evidence",
+        _ => fallback,
     }
 }
 

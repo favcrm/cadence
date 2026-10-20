@@ -145,6 +145,13 @@ pub fn review(pm: &Pm, blocked_operation: Option<&str>) -> Result<Value> {
              help.",
         ));
     }
+    if !report.snapshot_known {
+        return Err(Error::rejected(
+            "the tracker's acquisition snapshot is missing, or it is not one this build wrote, \
+             so no path can be proven to be the crashed writer's. A recovery will not guess: \
+             settle this transaction by hand. A retry will not help.",
+        ));
+    }
     let leftovers = report.paths.clone();
     let foreign = report.foreign.clone();
     let foreign_paths = report.foreign_paths.clone();
@@ -309,6 +316,9 @@ fn failure_attempt(
         "outcome": outcome,
         "committed": committed,
         "removed_blobs": landed.map(|o| o.removed.clone()).unwrap_or_default(),
+        "worktree_preimages": landed
+            .map(|o| o.worktree_preimages.clone())
+            .unwrap_or_default(),
         "message": message,
         "error": {
             "kind": error.kind(),
@@ -365,6 +375,38 @@ fn execute_inner(
             report.hazards.join(", ")
         )));
     }
+    let reviewed: Vec<String> = review
+        .get("leftovers")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let gone: Vec<&String> = paths
+        .iter()
+        .filter(|p| {
+            let n = p.trim().trim_start_matches("./").trim_end_matches('/');
+            reviewed.iter().any(|r| r == n) && !leftovers.iter().any(|l| l == n)
+        })
+        .collect();
+    if !gone.is_empty() {
+        return Err(Error::conflict_coded(
+            "stale_review",
+            format!(
+                "{} was reviewed as the crashed writer's leftover but is no longer in the \
+                 tracker's leftover set — the state changed, or another writer settled it. The \
+                 review is stale and nothing was changed by this request: review again. A retry \
+                 unchanged will not help.",
+                gone.iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
     let confirmed = require_str(decision, "confirmation")?;
     let preview_digest = require_str(decision, "preview_digest")?;
     let selected = select_paths(pm, &leftovers, &foreign, paths)?;
@@ -419,6 +461,7 @@ fn execute_inner(
                 committed: None,
                 partial: false,
                 removed: Vec::new(),
+                worktree_preimages: Vec::new(),
                 message: "left unresolved: the crashed writer's work and every blocker stay as \
                           they are. No tracker content was changed and no recovery succeeded."
                     .to_string(),
@@ -429,25 +472,62 @@ fn execute_inner(
                     selected.join(", "),
                     selected.join(", ")
                 );
-                let commit = commit_index_state(pm, &selected, &message)?;
-                Outcome {
-                    resolved: true,
-                    committed: Some(commit),
-                    partial: false,
-                    removed: Vec::new(),
-                    message: "kept the inspected staged content: the committed blobs are the \
-                              ones the crashed writer staged, and any unstaged content in the \
-                              working tree is untouched."
-                        .to_string(),
+                match commit_index_state(pm, &selected, &message) {
+                    Ok(commit) => Outcome {
+                        resolved: true,
+                        committed: Some(commit),
+                        partial: false,
+                        removed: Vec::new(),
+                        worktree_preimages: Vec::new(),
+                        message: "kept the inspected staged content: the committed blobs are the \
+                                  ones the crashed writer staged, and any unstaged content in the \
+                                  working tree is untouched."
+                            .to_string(),
+                    },
+                    Err(e) => {
+                        // A refusal before any commit is not a landing;
+                        // an internal failure can be a commit whose ref
+                        // update went unconfirmed. Only the second is
+                        // recorded as possibly applied.
+                        if e.kind() == "internal" {
+                            *landed = Some(Outcome {
+                                resolved: false,
+                                committed: None,
+                                partial: true,
+                                removed: Vec::new(),
+                                worktree_preimages: Vec::new(),
+                                message: "the keep may have been applied: the commit could not \
+                                          be confirmed. Inspect the tracker before doing anything \
+                                          else."
+                                    .to_string(),
+                            });
+                        }
+                        return Err(e);
+                    }
                 }
             }
             Choice::Discard => {
-                // The preimages: the staged blobs this discard removes.
-                // They stay in the object store, so naming them makes
-                // a partial discard recoverable.
+                // The preimages, captured BEFORE anything is changed:
+                // the staged blobs and the working tree's own bytes.
+                // Both stay in the object store, so a partial discard
+                // is recoverable.
                 let removed: Vec<String> = selected
                     .iter()
                     .filter_map(|p| staged_blob(pm, p).ok().flatten())
+                    .collect();
+                let worktree_preimages: Vec<Value> = selected
+                    .iter()
+                    .filter_map(|p| {
+                        let regular = std::fs::symlink_metadata(pm.dir.join(p))
+                            .map(|m| m.is_file())
+                            .unwrap_or(false);
+                        if !regular {
+                            return None;
+                        }
+                        git(&pm.dir, &["hash-object", "-w", "--", p])
+                            .ok()
+                            .map(|oid| json!({"path": p, "blob": oid.trim()}))
+                    })
                     .collect();
                 match discard_paths(pm, &selected) {
                     Ok(()) => Outcome {
@@ -455,6 +535,7 @@ fn execute_inner(
                         committed: None,
                         partial: false,
                         removed,
+                        worktree_preimages,
                         message: "discarded the selected changes: the index and the working tree \
                                   for those paths are back to their committed state, and every \
                                   other path is untouched."
@@ -468,6 +549,7 @@ fn execute_inner(
                             committed: None,
                             partial: true,
                             removed,
+                            worktree_preimages,
                             message: "the discard PARTLY applied: some selected paths are back \
                                       to their committed state and the rest were not touched."
                                 .to_string(),
@@ -500,6 +582,7 @@ fn execute_inner(
         "recovery_success": recovery_success,
         "committed": outcome.committed,
         "removed_blobs": outcome.removed,
+        "worktree_preimages": outcome.worktree_preimages,
         "message": outcome.message,
         "remaining": remaining,
         "foreign_count": after.foreign.len(),
@@ -640,6 +723,10 @@ struct Outcome {
     /// The staged blobs a discard removed: the preimages that keep a
     /// partial discard recoverable.
     removed: Vec<String>,
+    /// The working tree's own bytes a discard removed, saved as blobs
+    /// in the object store: the index preimage alone does not make an
+    /// unstaged or untracked file recoverable.
+    worktree_preimages: Vec<Value>,
     message: String,
 }
 
@@ -1240,8 +1327,10 @@ fn commit_index_state(pm: &Pm, paths: &[String], message: &str) -> Result<String
         ],
         None,
     )?;
-    // HEAD advances only if it is still the reviewed one.
-    run_git(
+    // HEAD advances only if it is still the reviewed one. A child killed
+    // after committing the ref but before reporting leaves the outcome
+    // UNKNOWN: the ref is re-read rather than trusting the exit status.
+    if let Err(e) = run_git(
         pm,
         &[],
         &[
@@ -1251,7 +1340,19 @@ fn commit_index_state(pm: &Pm, paths: &[String], message: &str) -> Result<String
             Os::new(&head),
         ],
         None,
-    )?;
+    ) {
+        let now = git(&pm.dir, &["rev-parse", "HEAD"]).unwrap_or_default();
+        if now.trim() == commit.trim() {
+            return Ok(commit);
+        }
+        return Err(Error::internal(format!(
+            "the recovery commit {} was created but HEAD could not be advanced ({e}); HEAD is \
+             {}. The outcome is UNKNOWN: the commit may or may not be referenced. Inspect the \
+             tracker before doing anything else; a retry is not safe.",
+            commit.trim(),
+            now.trim()
+        )));
+    }
     let _ = std::fs::remove_file(&tmp_index);
     Ok(commit)
 }
@@ -1434,10 +1535,39 @@ fn unique_suffix() -> u128 {
 /// the tracker.
 fn discard_paths(pm: &Pm, paths: &[String]) -> Result<()> {
     for path in paths {
-        let in_head = git(&pm.dir, &["cat-file", "-e", &format!("HEAD:{path}")]).is_ok();
-        if in_head {
-            // The index entry only: the working tree's copy is written
-            // below, without following links.
+        // Membership in the committed TREE, not object readability: a
+        // tree entry whose blob cannot be read must fail, never fall
+        // through to the "added file" arm that deletes it.
+        let entry = git(&pm.dir, &["ls-tree", "HEAD", "--", path])?
+            .trim()
+            .to_string();
+        if !entry.is_empty() {
+            let mode = entry
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if !mode.starts_with("100") {
+                return Err(Error::rejected(format!(
+                    "{path} is a {mode} entry in the committed tree, not a regular file — a \
+                     discard restores regular files only. Restore it by hand and leave this \
+                     path unresolved. A retry unchanged will not help."
+                )));
+            }
+            // The committed bytes, read BEFORE the index is touched: an
+            // unreadable blob leaves both layers unchanged.
+            let content =
+                git_raw(pm, &["cat-file", "blob", &format!("HEAD:{path}")]).map_err(|e| {
+                    Error::internal(format!(
+                        "the committed content of {path} could not be read ({e}). Nothing was \
+                         changed: repair the object store, then review again."
+                    ))
+                })?;
+            let wanted = if mode.ends_with("755") {
+                0o755u32
+            } else {
+                0o644u32
+            };
             run_git(
                 pm,
                 &[],
@@ -1450,19 +1580,6 @@ fn discard_paths(pm: &Pm, paths: &[String]) -> Result<()> {
                 ],
                 None,
             )?;
-            let content = git_raw(pm, &["cat-file", "blob", &format!("HEAD:{path}")])?;
-            // The committed mode, in BOTH directions. It is set on the
-            // descriptor the replacement write already holds, so no
-            // pathname is resolved again after the no-follow checks.
-            let mode = git(&pm.dir, &["ls-tree", "HEAD", "--", path])
-                .ok()
-                .and_then(|l| l.split_whitespace().next().map(str::to_string))
-                .unwrap_or_default();
-            let wanted = if mode.ends_with("755") {
-                0o755u32
-            } else {
-                0o644u32
-            };
             write_file_no_follow(&pm.dir, path, &content, wanted).map_err(|e| {
                 Error::internal(format!(
                     "the working-tree copy of {path} could not be restored from its committed \

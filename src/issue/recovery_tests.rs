@@ -552,6 +552,7 @@ fn a_partial_discard_is_recorded_as_partially_applied() {
         committed: None,
         partial: true,
         removed: vec!["abc123".to_string()],
+        worktree_preimages: vec![serde_json::json!({"path": "crashed/issue.md", "blob": "def456"})],
         message: "the discard PARTLY applied".to_string(),
     };
     let review = serde_json::json!({ "state": "bound" });
@@ -565,6 +566,7 @@ fn a_partial_discard_is_recorded_as_partially_applied() {
     );
     assert_eq!(attempt["outcome"], "partially_applied");
     assert_eq!(attempt["removed_blobs"][0], "abc123");
+    assert_eq!(attempt["worktree_preimages"][0]["blob"], "def456");
     let message = attempt["message"].as_str().unwrap_or_default();
     assert!(message.contains("PARTLY applied"), "{message}");
     assert!(!message.contains("a retry is safe"), "{message}");
