@@ -858,12 +858,7 @@ pub fn build(
             // explicit command must win, or a test daemon would spawn the real
             // binary.
             "omp" => {
-                // A blank override is the same as an absent one: it would
-                // otherwise reach the adapter and fall back to bare `pi`.
-                let env = match env.var("CADENCE_PI_COMMAND") {
-                    Some(value) if !value.trim().is_empty() && value.trim() != "pi" => env.clone(),
-                    _ => env.with_var("CADENCE_PI_COMMAND", "omp"),
-                };
+                let env = provider_env_for("omp", env);
                 Ok(Box::new(pi::PiAdapter::new(
                     hooks, log_path, &env, agent_uid,
                 )))
@@ -936,6 +931,22 @@ pub fn build(
             "Endpoint kind '{other}' is not implemented \
              (implemented: managed, managed-ws, pty, cloud, fake)"
         ))),
+    }
+}
+
+/// The environment an endpoint actually launches with. The omp arm runs the
+/// Pi adapter on its own program: an absent, blank or default-`pi` command is
+/// replaced on a copy (never the shared map), and every other command —
+/// including a fixture's sealed one — is preserved. Display code that
+/// recomputes launch policy (confinement) must use this, or it reports the
+/// wrong program's grants.
+pub fn provider_env_for(provider: &str, env: &ProviderEnv) -> ProviderEnv {
+    if provider != "omp" {
+        return env.clone();
+    }
+    match env.var("CADENCE_PI_COMMAND") {
+        Some(value) if !value.trim().is_empty() && value.trim() != "pi" => env.clone(),
+        _ => env.with_var("CADENCE_PI_COMMAND", "omp"),
     }
 }
 
@@ -1134,6 +1145,56 @@ mod tests {
         let omp = env.with_var("CADENCE_PI_COMMAND", "omp");
         assert_eq!(env.var("CADENCE_PI_COMMAND").as_deref(), Some("pi"));
         assert_eq!(omp.var("CADENCE_PI_COMMAND").as_deref(), Some("omp"));
+    }
+
+    /// CAD-1624/CAD-1633: the omp endpoint runs its own program only when
+    /// the configured command is absent, blank or the bare default `pi`;
+    /// any explicit command (operator or sealed fixture) wins, and the
+    /// shared map is never mutated. Display code recomputing launch policy
+    /// uses the same rule.
+    #[test]
+    fn provider_env_keeps_explicit_commands_and_defaults_omp() {
+        let absent = ProviderEnv::default();
+        assert_eq!(
+            provider_env_for("omp", &absent)
+                .var("CADENCE_PI_COMMAND")
+                .as_deref(),
+            Some("omp")
+        );
+        for default in ["", "   ", "pi", " pi "] {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_PI_COMMAND", default);
+            assert_eq!(
+                provider_env_for("omp", &env)
+                    .var("CADENCE_PI_COMMAND")
+                    .as_deref(),
+                Some("omp"),
+                "{default:?}"
+            );
+            assert_eq!(
+                env.var("CADENCE_PI_COMMAND").as_deref(),
+                Some(default),
+                "shared env mutated for {default:?}"
+            );
+        }
+        for explicit in ["/bin/false", "/opt/omp/bin/omp --flag"] {
+            let env = ProviderEnv::default();
+            env.set("CADENCE_PI_COMMAND", explicit);
+            assert_eq!(
+                provider_env_for("omp", &env)
+                    .var("CADENCE_PI_COMMAND")
+                    .as_deref(),
+                Some(explicit)
+            );
+        }
+        let env = ProviderEnv::default();
+        env.set("CADENCE_PI_COMMAND", "pi");
+        assert_eq!(
+            provider_env_for("pi", &env)
+                .var("CADENCE_PI_COMMAND")
+                .as_deref(),
+            Some("pi")
+        );
     }
 
     /// CAD-1009: the slot stands for the token wherever the daemon's

@@ -2553,11 +2553,13 @@ impl Shared {
                         let confined = adapter::pi::worker_confined(&agent);
                         agent_json["confined"] = json!(confined);
                         if confined {
-                            let (_exe, policy) = adapter::pi::pi_worker_confinement(
-                                &self.provider_env,
-                                &self.state_dir,
-                                &agent,
-                            );
+                            // The policy must be built with the environment
+                            // the adapter would launch with (omp's own
+                            // program), not the daemon's defaults.
+                            let env =
+                                adapter::provider_env_for(&agent.provider, &self.provider_env);
+                            let (_exe, policy) =
+                                adapter::pi::pi_worker_confinement(&env, &self.state_dir, &agent);
                             agent_json["confinement"] =
                                 json!({"read": policy.read, "write": policy.write});
                         }
