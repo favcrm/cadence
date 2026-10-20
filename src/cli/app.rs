@@ -1445,6 +1445,19 @@ pub(crate) enum AssistantAction {
         #[arg(long)]
         operation_id: String,
     },
+    /// Operator decision on one pending permission request.
+    Decide {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        operation_id: String,
+        /// The operation revision the decision was made against.
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long, value_parser = ["allow_once", "allow_always", "deny"])]
+        decision: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1873,12 +1886,20 @@ fn wait_assistant_operation(
         if status != "running" {
             let mut value = current;
             if status == "pending_permission" {
+                let revision = value
+                    .get("operation")
+                    .and_then(|operation| operation.get("revision"))
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or_default();
                 if let Some(object) = value.as_object_mut() {
                     object.insert(
                         "wait_note".into(),
                         json!(format!(
-                            "operation {operation_id} waits for an operator decision in the app; \
-                             it does not run until then"
+                            "operation {operation_id} waits for an operator decision: \
+                             `cadence app assistant decide {} --context-id {} \
+                             --operation-id {operation_id} --expected-revision {revision} \
+                             --decision allow_once` (or `allow_always` / `deny`)",
+                            scope.install_id, scope.context_id
                         )),
                     );
                 }
@@ -2279,6 +2300,10 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                     input,
                     wait,
                 } => {
+                    // The ticket's refusal order: malformed or oversized
+                    // input never reaches the daemon, not even the read that
+                    // resolves the live turn.
+                    let input = parse_assistant_input(state_dir, input)?;
                     let scope = assistant_scope(
                         state_dir,
                         install_id.as_deref(),
@@ -2286,7 +2311,6 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                         message.as_deref(),
                         token.as_deref(),
                     )?;
-                    let input = parse_assistant_input(state_dir, input)?;
                     let operation_id = match operation_id {
                         Some(id) => id.clone(),
                         None => derive_operation_id(&scope.message, action_id, &input),
@@ -2319,6 +2343,23 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                         None,
                     )
                 }
+                AssistantAction::Decide {
+                    install_id,
+                    context_id,
+                    operation_id,
+                    expected_revision,
+                    decision,
+                } => (
+                    "app_assistant_decision",
+                    json!({
+                        "install_id": install_id,
+                        "context_id": context_id,
+                        "operation_id": operation_id,
+                        "expected_revision": expected_revision,
+                        "decision": decision,
+                    }),
+                    None,
+                ),
             };
             let result = client::rpc(state_dir, method, params)?;
             match wait {
