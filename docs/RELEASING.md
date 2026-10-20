@@ -63,7 +63,11 @@ Report any remaining operator rollout work explicitly.
 
 1. Select a successful **main push** CI run containing the intended merged
    changes and its attested artifact. A manual `ci.yml` dispatch is a benchmark
-   and does not run the main-push artifact/attestation jobs.
+   and does not run the main-push artifact/attestation jobs. Pick the candidate
+   **after** the last merge you depend on lands: a run selected earlier stages
+   a build that lacks it. Re-dispatch on the newer tip rather than approve a
+   superseded candidate — staging only stages, and promotion is always a manual
+   dispatch, so nothing is promoted implicitly.
 2. Identify the installed baseline from operator-provided update/version
    evidence and its approved candidate receipt's `ci_run_id`. Do not assume
    the preceding main commit or the public `latest` release is that baseline.
@@ -85,6 +89,12 @@ Report any remaining operator rollout work explicitly.
    The operator runs the check first and proceeds only if it permits the
    intended target. Installation, drain, backup and health checks remain in
    the supported update flow, not a hand-built restart recipe.
+   `promotion-completion` publishes the operator-host catalogue record only
+   after the promotion run completes, so an update relayed while `promote` is
+   still waiting refuses with `release detail (not_found)`. Confirm the record
+   exists first — the source's `releases/<product>/<profile>/<sha>` path
+   answers 200 — and read that refusal as "not published yet", never as a
+   wrong command.
 
 ### Bundled guidance on native update (CAD-1472)
 
@@ -560,3 +570,55 @@ mode of clean-install.py verifies the anonymous public URLs on the native
 targets and its results are recorded here and in INSTALL-AGENT.md. No agent
 approves release environments; published bytes and release notes are
 immutable.
+
+### Routine delivery: docs-only changes (CAD-1298)
+
+Ordinary `docs/**/*.md`, plus `README.md` and `CONTRIBUTING.md`, is the
+**routine** class when every changed path is a regular `100644` file, added or
+modified with no mode change, and none of them is a `trigger7` path. The
+policy asks for **zero independent verdicts** and no operator approval, but
+`scripts/enqueue-reviewed` still refuses it without a **fresh native readiness
+proof** bound to that exact head and PR:
+
+```
+active routine delivery has no fresh native readiness proof for this exact binding
+```
+
+That proof is a delivery record whose `outcome_report` names one `done` task
+report on the ticket, and the report must bind the same attempt: `agent` equals
+the record's worker, `sha` is the full PR head, `pr` is the PR URL, it was filed
+no earlier than the record's dispatch, and branch protection's required checks
+are green on that head.
+
+The daemon opens the record two ways. A master dispatch does it
+(`cadence dispatch --to <worker> <ID> --reply-to <alias> --note <path>`); or,
+for a lane the master never dispatched, the checkup adopts it from the agent's
+own `done` report (CAD-484) — it visits every non-inbox agent, and an idle,
+enabled lane holding a done report opens the record at the report's own time,
+then routes it. A session that is not itself a registered cadence pane can
+therefore deliver a routine PR without inventing a mechanism:
+
+1. `cadence issue start <ID>` so the ticket owns the worktree and the head.
+2. Make the change, run `scripts/pre-push`, push, open the PR, and let the
+   exact-head `ci.yml` run finish.
+3. Register a worker that can actually run — `cadence agent register <alias>
+   --provider pi --role worker --endpoint managed --sandbox workspace-write`
+   (on a host whose Cadence MCP readiness does not answer, the `codex` driver
+   refuses and `pi` works) — then dispatch the ticket to it with a note saying
+   what to verify and not to push. Add `--take-over "<reason>"` when the
+   session already claimed the ticket. The kickoff template already carries
+   the report command.
+4. Wait for the checkup: `cadence delivery ls --json` shows the record move
+   `working` → `ready` and carry `outcome_report`.
+5. Post the evidence comment the gate reads (one comment carrying every line),
+   then `scripts/enqueue-reviewed <PR> --head <full head>`.
+
+That comment must carry the head, an exact `Base branch: <branch>` line, and
+the lines the policy names: `Delivery class: routine`, `Policy digest:
+sha256:…`, `Green CI run: <url>`, and, once the readiness exists, `Outcome
+report: <path>` and `Native CI run: <id> <url>`. No verdict notes are needed,
+and adding them relaxes nothing for this class.
+
+Retire the worker once the lane has served its purpose (`cadence agent stop`
+then `cadence agent remove`). The proof exists so the merge is bound to a green
+head and a named report — not because the diff is small.
