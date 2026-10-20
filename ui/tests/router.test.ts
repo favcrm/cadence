@@ -90,7 +90,8 @@ equal(showProjectChoices(0, "all"), false, "no projects hides the row");
 equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible");
 
 // Reading a location: the slug is the scope on Projects. ?project= is the
-// in-page filter on Agents, Overview, Apps and Memory. Elsewhere it is ignored.
+// in-page filter on Agents, Team overview and Settings → Memory. Elsewhere
+// it is ignored.
 {
   const loc = readLocation("/projects/cadence", "?view=kanban&tag=ui&issue=CAD-1", "list");
   equal(loc.project, "cadence", "slug scope");
