@@ -77,17 +77,14 @@ every script check is compilation-free.
 
 ## Fixture isolation and test tiers
 
-For ordinary hosted feedback on the retained CAD-663 and CAD-650 cases, dispatch
-the `test-feedback` workflow from `main` with a full lowercase 40-character
-repository commit SHA and the allowlisted case. It runs that exact test once
-using the dispatch main commit's trusted nextest wrapper. A passing assertion
-is green; an assertion failure or invalid feedback is red. The artifact records
-both source SHAs, the actual runner return code, bounded logs and available
-JUnit. Missing or inconsistent reports are invalid feedback, not a diagnosis.
-The pinned profile also retains nonselected skipped cases from the same target;
-only the requested case may execute, and supplied counts must match all entries.
-This route does not retry required CI or replace local build admission; the
-separate mutation workflow still requires a deliberate assertion failure.
+For ordinary hosted feedback on one retained case, run that case through the
+live suite instead: `scripts/cadence-nextest -E 'test(=name)'` locally, or the
+`stress` workflow on ephemeral runners for repeated runs. The former
+`test-feedback` workflow and its CAD-663/CAD-650 allowlist are gone — those two
+cases' cargo test targets were retired with the legacy integration suite, so
+the workflow could not have run. This route does not retry required CI or
+replace local build admission; the separate mutation workflow still requires a
+deliberate assertion failure.
 
 Fixture daemons and boards use a short `/tmp/<lane>` root for HOME, XDG paths
 and TMPDIR: Unix socket paths cannot exceed 107 bytes. Pass through the real
@@ -164,8 +161,8 @@ Choose tests by the changed contract:
 - CI checks the full test inventory and runs the required suite with `test-seam`.
   Default-feature checks retain real caller-identity coverage; the debug-only
   seam must never appear in release builds. The `ui` feature embeds a previously
-  built SPA. Avoid `--all-features`: `e2e` is an opt-in journey tier with its own
-  release/Node/browser prerequisites.
+  built SPA, so avoid `--all-features`; the retired `e2e` journey tier used to
+  add its own release/Node/browser prerequisites.
 
 Retain real timing budgets and operator-lineage proofs. A new or changed
 enforced rule ships with one independent acceptance check proving the bad

@@ -1552,56 +1552,58 @@ fn keep_or(params: &Value, field: &str, default: Option<&str>) -> Value {
     }
 }
 
+/// Every method name in `Shared::dispatch_method`'s match — parsed from
+/// the source so a test sees methods added later (the CAD-339 table
+/// parse). One parser for the whole daemon: the caller-rule table, the
+/// master allowlist and the app-conversation allowlist all read the same
+/// list, so a method missing from one is missing from all.
+#[cfg(test)]
+pub(crate) fn dispatch_methods() -> Vec<String> {
+    let src = include_str!("../daemon.rs");
+    let start = src.find("    fn dispatch_method(\n").expect("dispatch fn");
+    let body = &src[start..];
+    let body = &body[body.find("match method {").expect("match")..];
+    let body = &body[..body
+        .find("other => Err(Error::rejected(format!(\"Unknown method")
+        .expect("end")];
+    // rustfmt splits a long `"a" | "b" | "c" =>` arm across lines,
+    // so join each arm's continuation lines (they start with `|`)
+    // before reading its names — a wrapped arm still counts once.
+    let mut out = Vec::new();
+    let mut arm_text = String::new();
+    let mut in_arm = false;
+    for line in body.lines() {
+        let t = line.trim_start();
+        let indent = line.len() - t.len();
+        if in_arm && t.starts_with('|') {
+            // A wrapped `| "next"` continuation — same 12-space
+            // indent as the arm's first line.
+            arm_text.push_str(t);
+        } else {
+            in_arm = false;
+        }
+        if indent == 12 && t.starts_with('"') {
+            arm_text.clear();
+            arm_text.push_str(t);
+            in_arm = true;
+        }
+        if in_arm && arm_text.contains("=>") {
+            let (arms, _) = arm_text.split_once("=>").unwrap();
+            for arm in arms.split('|') {
+                let name = arm.trim().trim_matches('"');
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    out.push(name.to_string());
+                }
+            }
+            in_arm = false;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Every method name in `Shared::dispatch`'s match — parsed from the
-    /// source so the test sees methods added later (the CAD-339 table
-    /// parse).
-    pub(crate) fn dispatch_methods() -> Vec<String> {
-        let src = include_str!("../daemon.rs");
-        let start = src.find("    fn dispatch_method(\n").expect("dispatch fn");
-        let body = &src[start..];
-        let body = &body[body.find("match method {").expect("match")..];
-        let body = &body[..body
-            .find("other => Err(Error::rejected(format!(\"Unknown method")
-            .expect("end")];
-        // rustfmt splits a long `"a" | "b" | "c" =>` arm across lines,
-        // so join each arm's continuation lines (they start with `|`)
-        // before reading its names — a wrapped arm still counts once.
-        let mut out = Vec::new();
-        let mut arm_text = String::new();
-        let mut in_arm = false;
-        for line in body.lines() {
-            let t = line.trim_start();
-            let indent = line.len() - t.len();
-            if in_arm && t.starts_with('|') {
-                // A wrapped `| "next"` continuation — same 12-space
-                // indent as the arm's first line.
-                arm_text.push_str(t);
-            } else {
-                in_arm = false;
-            }
-            if indent == 12 && t.starts_with('"') {
-                arm_text.clear();
-                arm_text.push_str(t);
-                in_arm = true;
-            }
-            if in_arm && arm_text.contains("=>") {
-                let (arms, _) = arm_text.split_once("=>").unwrap();
-                for arm in arms.split('|') {
-                    let name = arm.trim().trim_matches('"');
-                    if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
-                    {
-                        out.push(name.to_string());
-                    }
-                }
-                in_arm = false;
-            }
-        }
-        out
-    }
 
     fn agent(a: &str) -> Who {
         Who::Agent(a.to_string())
@@ -1630,7 +1632,11 @@ mod tests {
     #[test]
     fn every_dispatch_method_has_a_caller_rule() {
         let table = dispatch_methods();
-        assert!(table.len() > 50, "method table parse: {table:?}");
+        // The weak (pre-consolidation) parser saw 417 of 450 methods
+        // because it skipped rustfmt-wrapped arms. Keep the floor above
+        // that result and below the real count, so the regression fails
+        // here instead of silently shrinking the table.
+        assert!(table.len() > 440, "method table parse: {}", table.len());
         for m in &table {
             assert!(
                 rule_of(m).is_some(),

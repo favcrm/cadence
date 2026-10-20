@@ -451,6 +451,10 @@ fn assess_meta(
 /// The full §5 sequence, ordered. The cut between `accounts` and `fs`
 /// is where the §4 pre-flight lands: the agent uid must resolve
 /// before the negative assertions can test numeric principals.
+///
+/// Every path the plan touches is under `AGENT_HOME`, `OPT_ROOT` or
+/// `VAR_LIB` — the "never under `~`, never sudoers" invariant, held
+/// by construction: the plan has no verb for any other path.
 pub(crate) fn plan(spec: &Spec) -> (Vec<Action>, Vec<Action>) {
     let accounts = vec![
         Action::Group {
@@ -831,15 +835,4 @@ pub fn cli(dry_run: bool, helper: PathBuf, operator: &str) -> Result<i32> {
     };
     let report = run(&mut host, &spec, &mut std::io::stdout())?;
     Ok(if report.refused() { 2 } else { 0 })
-}
-
-/// Every path a plan touches must live in one of these roots — the
-/// "never under `~`, never sudoers" invariant as a testable fact.
-pub const ALLOWED_WRITE_ROOTS: &[&str] = &[AGENT_HOME, OPT_ROOT, VAR_LIB];
-
-/// The plan's declared write set — the boundary test asserts every
-/// entry sits under [`ALLOWED_WRITE_ROOTS`].
-pub fn plan_writes(spec: &Spec) -> Vec<String> {
-    let (a, f) = plan(spec);
-    a.iter().chain(f.iter()).flat_map(Action::targets).collect()
 }

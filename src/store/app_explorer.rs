@@ -269,15 +269,6 @@ impl Store {
         })
     }
 
-    /// Drop rows whose install is gone (on remove/purge, and as a lazy
-    /// sweep inside reads). Returns the number dropped.
-    pub fn app_favorites_drop(&self, install_id: &str) -> Result<usize> {
-        install_id_ok(install_id)?;
-        self.write_tx(|conn| {
-            Ok(conn.execute("DELETE FROM app_favorites WHERE install_id=?", [install_id])?)
-        })
-    }
-
     // ---------- install requests (H7) ----------
 
     /// `POST /api/app-catalog/<id>/request` — idempotent per requester
@@ -470,39 +461,6 @@ impl Store {
         })
     }
 
-    /// The cached check for one install, or `null` — a hint only.
-    pub fn app_update_check(&self, install_id: &str) -> Result<Value> {
-        install_id_ok(install_id)?;
-        self.read_tx(|conn| {
-            let row = conn.query_opt(
-                "SELECT checked_at,has_update,version,access_change_json,digest,proposal_json
-                 FROM app_update_checks WHERE install_id=?",
-                [install_id],
-                |r| Ok((
-                    r.get::<_, f64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                    r.get::<_, String>(5)?,
-                )),
-            )?;
-            Ok(match row {
-                Some((checked_at, has_update, version, access_change_json, digest, proposal)) => {
-                    json!({
-                        "checked_at": checked_at,
-                        "has_update": has_update != 0,
-                        "version": version,
-                        "access_change": access_change_json.and_then(|t| serde_json::from_str::<Value>(&t).ok()),
-                        "digest": digest,
-                        "proposal": serde_json::from_str::<Value>(&proposal).unwrap_or(Value::Null),
-                    })
-                }
-                None => Value::Null,
-            })
-        })
-    }
-
     /// Every install with a cached "update ready" (the home badge).
     pub fn app_updates_pending(&self) -> Result<Vec<String>> {
         self.read_tx(|conn| {
@@ -511,18 +469,6 @@ impl Store {
                 [],
                 |r| r.get::<_, String>(0),
             )?)
-        })
-    }
-
-    /// Clear a check row (on remove/purge, or after an upgrade lands).
-    pub fn app_update_check_clear(&self, install_id: &str) -> Result<()> {
-        install_id_ok(install_id)?;
-        self.write_tx(|conn| {
-            conn.execute(
-                "DELETE FROM app_update_checks WHERE install_id=?",
-                [install_id],
-            )?;
-            Ok(())
         })
     }
 }

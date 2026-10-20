@@ -853,24 +853,6 @@ impl RecordStore {
         .map_err(|e| Error::internal(e.to_string()))?;
         Ok(())
     }
-
-    /// Every token hash minted for one send.
-    pub fn app_unsubscribe_hashes(&self, context: &str, send_id: &str) -> Result<Vec<String>> {
-        let conn = self.conn();
-        let mut stmt = conn
-            .prepare(
-                "SELECT token_hash FROM app_unsubscribe_tokens WHERE context_id=? AND send_id=?",
-            )
-            .map_err(|e| Error::internal(e.to_string()))?;
-        let rows = stmt
-            .query_map(params![context, send_id], |r| r.get::<_, String>(0))
-            .map_err(|e| Error::internal(e.to_string()))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(|e| Error::internal(e.to_string()))?);
-        }
-        Ok(out)
-    }
 }
 
 /// The JSON a show/list emits: the send row plus masked deliveries

@@ -29,11 +29,6 @@ CREATE TABLE IF NOT EXISTS crm_settings(
  by TEXT NOT NULL, updated REAL NOT NULL);
 ";
 
-/// One core send row — the crash-reconciliation unit.
-pub struct CrmSend {
-    pub state: String,
-}
-
 impl Store {
     /// Open the durable intent for an approved send. One row per
     /// `(install, context, send)`; a second approve of the same send

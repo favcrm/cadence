@@ -567,69 +567,15 @@ impl Catalog {
         Ok(())
     }
     pub fn load(root: &Path) -> Result<Self> {
-        Self::load_observed(root, || {})
-    }
-    fn load_observed(root: &Path, observed: impl FnOnce()) -> Result<Self> {
         let root = Root::open(root)?;
         no_pending(&root)?;
         let catalog: Self = decode(&required(&root, Path::new(CATALOG), CATALOG_CAP)?)?;
         catalog.validate()?;
-        observed();
         for id in catalog.installations.keys() {
             catalog.installation(&root, id)?;
         }
         catalog.require_current(&root)?;
         Ok(catalog)
-    }
-    #[cfg(feature = "test-seam")]
-    #[doc(hidden)]
-    pub fn load_with_observer(root: &Path, observed: impl FnOnce()) -> Result<Self> {
-        Self::load_observed(root, observed)
-    }
-    pub fn resolve_id(&self, root: &Path, id: &str) -> Result<Installation> {
-        self.resolve_observed(root, id, || {})
-    }
-    fn resolve_observed(
-        &self,
-        root: &Path,
-        id: &str,
-        observed: impl FnOnce(),
-    ) -> Result<Installation> {
-        let id = InstallationId::parse(id)?;
-        let root = Root::open(root)?;
-        self.require_current(&root)?;
-        observed();
-        let installation = self.installation(&root, &id)?;
-        self.require_current(&root)?;
-        Ok(installation)
-    }
-    #[cfg(feature = "test-seam")]
-    #[doc(hidden)]
-    pub fn resolve_id_with_observer(
-        &self,
-        root: &Path,
-        id: &str,
-        observed: impl FnOnce(),
-    ) -> Result<Installation> {
-        self.resolve_observed(root, id, observed)
-    }
-    pub fn resolve_legacy(&self, root: &Path, project: &str, name: &str) -> Result<Installation> {
-        model::check_key(project)?;
-        if !model::valid_tag(name) {
-            return Err(Error::rejected("invalid legacy app name"));
-        }
-        let id = self
-            .installations
-            .iter()
-            .find_map(|(id, entry)| match &entry.storage {
-                Storage::Legacy {
-                    project: p,
-                    name: n,
-                } if p == project && n == name => Some(id),
-                _ => None,
-            })
-            .ok_or_else(|| Error::rejected("unknown exact legacy installation alias"))?;
-        self.resolve_id(root, id)
     }
 }
 

@@ -474,21 +474,6 @@ impl Store {
         })
     }
 
-    /// The (org, sub) member's stored authority revision for effect-time
-    /// revalidation — `Err`/None refuses when unproven.
-    pub fn assistant_authority_rev(&self, org: &str, sub: &str) -> Result<Option<String>> {
-        let conn = self.conn();
-        match conn.query_row(
-            "SELECT authority_rev FROM assistants WHERE org=? AND sub=? AND state='active'",
-            params![org, sub],
-            |r| r.get(0),
-        ) {
-            Ok(v) => Ok(v),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     // ---- shared-job subscribers ---------------------------------------
 
     /// Subscribe `(org, sub)` to `job` through their assistant — idempotent.
@@ -1064,20 +1049,6 @@ impl Store {
                 params![job, revision, now],
             )?;
             Ok(n > 0)
-        })
-    }
-
-    /// Resolve the open check for (job, revision) — a progress watermark
-    /// or a manual intervention closed it.
-    pub fn assist_stall_resolve(&self, job: &str, revision: i64) -> Result<()> {
-        let now = crate::issue::time::now_epoch() as f64;
-        self.write_tx(|tx| {
-            tx.execute(
-                "UPDATE assist_stall_checks SET state='resolved', resolved=? \
-                 WHERE job=? AND revision=? AND state='open'",
-                params![now, job, revision],
-            )?;
-            Ok(())
         })
     }
 

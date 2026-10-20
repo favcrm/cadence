@@ -2,7 +2,7 @@ name: stress
 
 # CAD-958: run a nextest filterset N times on ephemeral GitHub runners so
 # flake loops leave the shared host. Manual dispatch only: this workflow must
-# never run on pull_request, merge_group or push (tests/scripts/test_ci_stress.py).
+# never run on pull_request, merge_group or push.
 #
 #   gh workflow run stress.yml --ref <branch> -f filter='test(=name)' \
 #     -f count=30 -f copies=4 -f load=true

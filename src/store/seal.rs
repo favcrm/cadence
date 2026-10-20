@@ -71,7 +71,6 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// lineage. v51 (CAD-792) adds `app_run_artifact_fetches`, the worker
 /// dependency-fetch receipt. v52 (CAD-1548) adds `settings_authority`.
 /// None are latch or witness rows, so the bound extends to 52.
-#[allow(dead_code)]
 const PROTECTED_SCHEMA_MAX: i64 = 52;
 
 /// Arm level + transaction-control phase, shared between the `Store` and

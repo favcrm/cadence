@@ -182,16 +182,6 @@ pub fn workspace_dir() -> Result<PathBuf> {
     Ok(layout()?.root.join("workspace"))
 }
 
-/// Bind operational custody to the tracker served by this daemon and refuse
-/// any lexical overlap with tracker or vault authority roots.
-pub fn workspace_for(tracker: &Path) -> Result<PathBuf> {
-    workspace_for_instance(
-        tracker,
-        std::env::var("CADENCE_HOME").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
-    )
-}
-
 /// Resolve an instance's workspace from its captured daemon environment,
 /// never from a request or a later process-global layout switch.
 pub fn workspace_for_instance(

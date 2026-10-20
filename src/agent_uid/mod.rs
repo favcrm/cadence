@@ -16,15 +16,12 @@
 //! principals, and no uid-1000 git config that would carry
 //! `safe.directory`/`include.path` covering `/var/lib/cadence`.
 //!
-//! Every read and write goes through [`View`]/[`Host`], so tests drive
-//! the whole lane against a fixture host in a temp dir — nothing here
-//! ever runs `useradd`, `install` or `setfacl` on the real machine in
-//! a test.
+//! Every read and write goes through [`View`]/[`Host`], so the
+//! privileged lane has a single seam to audit — the real host in
+//! production.
 
 pub mod audit;
 pub mod config;
-#[doc(hidden)]
-pub mod fixture;
 pub mod provision;
 pub mod runbook;
 
@@ -1122,8 +1119,8 @@ pub(crate) fn open_verified_source(
     Ok(f)
 }
 
-/// What a vetted helper source must look like — shared so the fixture
-/// applies the identical rule to its (possibly forged) source meta.
+/// What a vetted helper source must look like — the rule the install
+/// path applies to a source's metadata before it is trusted.
 /// POSIX ACLs are part of the vet: a `u:cadence-agent:rw` entry on a
 /// root-owned 0644 source lets the agent write what installs as the
 /// setuid helper, and the mode bits say nothing about it. Refuse any

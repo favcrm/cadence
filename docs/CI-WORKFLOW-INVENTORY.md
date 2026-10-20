@@ -13,17 +13,30 @@ No branch/ruleset settings are changed by this cleanup.
 | `clean-install.yml` | Filtered PR, dispatch | Installer fixtures retired; native installation dispatch scaffolding remains |
 | `handover.yml` | PR, main push | Shell syntax/shellcheck active; fixture echoes are retirement notices |
 | `obsolete-merge-groups.yml` | Queue ref deletion, filtered PR | Active stale-run janitor; old contract fixture retired |
-| `stress.yml` | Dispatch | Dormant legacy suite consumer; restore its inputs before use |
-| `mutation.yml` | Dispatch | Legacy integration-target mutation scaffold; not proof for a deleted target |
-| `test-feedback.yml` | Dispatch | Dormant legacy feedback/replay consumer |
-| `ci-selection-benchmark.yml` | Dispatch | Dormant full-versus-selected integration benchmark |
-| `nextest-shard-benchmark.yml` | Dispatch | Dormant shard/inventory benchmark |
+| `stress.yml` | Dispatch | Manual flake loop over a nextest filterset; runs against the live suite |
+| `mutation.yml` | Dispatch | Manual guard-removal proof; takes a live cargo test target and test name |
+| `ci-selection-benchmark.yml` | Dispatch | Manual full-versus-selected integration benchmark |
+| `nextest-shard-benchmark.yml` | Dispatch | Manual shard/inventory benchmark |
 
 Dormant dispatch files/scripts are retained as rebuild scaffolding in this
 increment, not deleted or advertised as working checks. Do not dispatch them
 as evidence that the retired suite passes. A separate decision should select
-which to rebuild or archive rather than leaving five misleading manual tools
+which to rebuild or archive rather than leaving misleading manual tools
 indefinitely. `cadence-nextest` itself is still live in the review recipe.
+
+## Archived in the deep test audit
+
+The dormant `test-feedback` workflow and its `scripts/test-feedback.py` were
+archived: both allowlisted cases named cargo test targets (`backup_rollout`,
+`threads`) that CAD-1073 deleted, so the workflow could not have run. The
+`scripts/split-integration-tests` and `scripts/split-board-tests` generators
+were archived for the same reason — their source suites (`tests/integration.rs`,
+`tests/board.rs`) are gone, so neither could regenerate anything. The
+`e2e` Cargo feature and `scripts/e2e/mvp.sh` went with the MVP journey they
+existed for (`tests/e2e_mvp.rs`, `tests/e2e/`). `scripts/split-map-sync` and
+`scripts/shard-weights` stay: they are inert until a reviewed inventory
+restoration supplies their inputs, and `AGENTS.md` still names the split
+manifests as retired rather than deleted.
 
 ## Bounded simplification implemented here
 

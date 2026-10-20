@@ -2493,6 +2493,22 @@ pub fn repoint(link: &Path, target: &Path) -> Result<bool> {
 mod backup_pair_tests {
     use super::*;
 
+    /// The embedded trust anchor is pinned by a recorded digest so a
+    /// reviewer can re-derive its provenance. That pin is only worth
+    /// anything if the embedded bytes still hash to it: an edit to
+    /// `upgrade/trusted_root.jsonl` that does not re-pin the digest
+    /// would otherwise leave the recorded provenance quietly false.
+    #[test]
+    fn the_embedded_trusted_root_snapshot_matches_its_recorded_digest() {
+        let digest = format!("{:x}", Sha256::digest(TRUSTED_ROOT_SNAPSHOT.as_bytes()));
+        assert_eq!(
+            digest, TRUSTED_ROOT_SNAPSHOT_SHA256,
+            "the embedded trusted-root snapshot no longer matches its recorded \
+             sha256 — re-pin TRUSTED_ROOT_SNAPSHOT_SHA256 in review, never \
+             silently"
+        );
+    }
+
     #[test]
     fn cad396_a_missing_pre_update_backup_refuses_the_install() {
         let dir = tempfile::tempdir().unwrap();

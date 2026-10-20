@@ -731,7 +731,7 @@ pub enum SprintAction {
         /// The pick-batch tag to populate.
         tag: String,
         /// Batch size cap [default: 10].
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = sprint::DEFAULT_CAP)]
         cap: usize,
         /// Report without writing.
         #[arg(long)]
