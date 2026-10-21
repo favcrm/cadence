@@ -122,6 +122,7 @@ function IssueWorkspace(props: Props) {
           body={detail.body}
           blocked={kickoffWhy}
           groups={pmGroups(props.agents)}
+          seats={seatOptions(props.agents)}
           planHref={props.planHref}
           onClose={() => setKickoff(false)}
           onWrite={props.onWrite}
@@ -130,6 +131,14 @@ function IssueWorkspace(props: Props) {
       )}
     </>
   );
+}
+
+function seatOptions(
+  agents: AgentsPayload | null,
+): { alias: string; provider: string; state: string }[] {
+  return (agents?.agents ?? [])
+    .filter((a) => a.provider !== "inbox" && !a.dead)
+    .map((a) => ({ alias: a.alias, provider: a.provider, state: a.state }));
 }
 
 function pmGroups(agents: AgentsPayload | null): string[] {

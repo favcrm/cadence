@@ -222,6 +222,8 @@ export interface KickoffBody {
   provider: string;
   model?: string;
   effort?: string;
+  /** Dispatch to an existing seat; the seat keeps its model/effort. */
+  alias?: string;
   note?: string;
 }
 
@@ -233,6 +235,7 @@ export function kickoffRequest(id: string, body: KickoffBody): { path: string; b
     body: {
       group: body.group,
       provider: body.provider,
+      ...(body.alias ? { alias: body.alias } : {}),
       ...(body.model ? { model: body.model } : {}),
       ...(body.effort ? { effort: body.effort } : {}),
       ...(note ? { note } : {}),
