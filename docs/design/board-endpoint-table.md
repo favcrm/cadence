@@ -70,10 +70,21 @@ comments (`src/ui/serve.rs:2073`, "ordered before every
 The question: does replacing first-match-wins with a most-specific-match router
 (such as `matchit`) change any winner? Three constructs decide it.
 
-1. **Suffix-dispatched groups.** `starts_with` plus `ends_with`
-   (`write_path.rs:1462`) has no segment count. As a table it becomes one row per
-   action (`/api/app-installations/{id}/remove`, `…/restore`, …). Every such path
-   has a fixed tail, so a pattern binds exactly the same paths. No flip.
+1. **Suffix-dispatched groups — this one narrows.** `starts_with` plus
+   `ends_with` (`write_path.rs:1462`) constrains only the suffix, not the number
+   of segments. `app_explorer::write` then reads the first two segments and
+   ignores any further ones (`src/ui/app_explorer.rs:170-203`), so today
+   `POST /api/app-installations/inst-1/restore/restore` reaches
+   `app_workspace_restore` exactly like the two-segment path. A table row
+   `/api/app-installations/{id}/restore` binds one id segment and would answer
+   `404` to the extra-segment form.
+
+   That narrowing is correct — the extra segments are malformed and no in-repo
+   caller emits them — but it is a behaviour change, not an equivalence. The
+   migration states it explicitly and pins it with a test: the two-segment path
+   keeps its handler, the three-segment path becomes `404`. Contrast the
+   conversations arm (`write_path.rs:1438`), which already filters the tail to a
+   single segment (`!contains('/')`) and therefore can be expressed exactly.
 2. **Same-stem recursion.** `/api/app-installations/migrations/{id}/recover`
    versus `/api/app-installations/{id}/recover` (`write_path.rs:1488-1504`).
    Today both are computed before one `||` arm and cannot both match: the
@@ -88,8 +99,10 @@ The question: does replacing first-match-wins with a most-specific-match router
    `/api/app-requests/dismiss`. As a table these become seven rows with one
    handler id; no overlap.
 
-**Finding:** no pair in either chain currently depends on first-match *over*
-most-specific. The one pair where order mattered (`migrations/{id}/recover`)
+**Finding:** no pair in either chain depends on first-match *over* most-specific
+for the paths the board actually serves. The one place the rules would disagree
+is the malformed extra-segment form above, where a table is deliberately
+stricter. The one pair where order mattered (`migrations/{id}/recover`)
 resolves the same way under both rules. The audit is static: it compared the arms
 as written, not observed responses.
 
@@ -140,6 +153,8 @@ fn route(method: &str, path: &str) -> Outcome {
    the uniform `Ctx` makes the parameter names part of the handler signature.
 5. `read_admit`'s order (405, then guard, then handler) survives as the
    dispatcher's order for every `Read` class row.
+6. The suffix-group narrowing is recorded: `/{id}/<action>/<anything>` is `404`
+   after the migration, where today it reaches the action handler.
 
 ## 6. Migration order
 
