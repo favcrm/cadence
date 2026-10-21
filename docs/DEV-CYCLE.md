@@ -381,3 +381,55 @@ normal gates return. An agent or PR may not grant that exception to itself.
   checks or the restored mandatory controls must be present before ordinary
   delivery resumes. The exception is evidence for a controlled transition, not
   proof that the removed coverage was safe or equivalent.
+
+## Local AgenticOS provider
+
+A dev sandbox can use the real AgenticOS provider for Social Content source
+reads, image/text generation and device publish. The app needs no fixture
+variant: the host emits the same `agenticos_external` receipts production does.
+The profile is sandbox-only; a production daemon still reads the fixed
+root-owned `/etc/cadence/provider-deployments.json`.
+
+Create the credentials with their exact scopes:
+
+| File | Scopes | Used for |
+| --- | --- | --- |
+| `provider.token` | `provider.read` + `provider.draft` | source, destination list, image and text |
+| `send.token` | `publish.send` | device publish |
+
+Cadence keeps one connection per provider/account, so read and draft share one
+connection. Publish stays a separate credential because AgenticOS does not
+allow `provider.*` and `publish.send` on one token. If the workspace issues
+separate read/draft tokens, provide `read.token` and `draft.token`; the command
+still enrolls one connection using `read.token`, which must carry both scopes
+for image/text work.
+
+```sh
+mkdir -p ~/.config/cadence/dev-tokens
+chmod 0600 ~/.config/cadence/dev-tokens/*.token
+
+cadence dev agenticos setup --name dev \
+  --workspace ws_<company-uuid> \
+  --token-dir ~/.config/cadence/dev-tokens
+
+cadence dev up dev
+cadence dev agenticos bind --name dev --bundle ./dist/bundle --context Default
+```
+
+`setup` writes `provider.json`, a sandbox-scoped `provider-deployments.json`
+with the reviewed `agenticos-external-provider-tools@4` pin, and the credential
+files under the sandbox root. `up` applies the profile to the daemon and its
+children; if the sandbox is already running, `cadence dev reload --name dev`
+applies it. `cadence dev env dev` prints the same exports for CLI use.
+
+`bind` installs the bundle, approves that exact digest in the sandbox, creates
+the context, enrolls the provider connection, binds every declared
+`source`/`image`/`writer` slot, and sets the publication destination from the
+live destination list. A changed bundle needs a fresh sandbox or a catalog
+upgrade before rebinding.
+
+Only the install approval is automatic, and only for the exact digest in a dev
+store. Run, quote and effect approvals remain the normal host calls. The
+device publish sender is configured by the profile’s `CADENCE_PUBLISH_*`
+exports, so local publish does not need a hosted lease. Use a test Instagram
+account: a device publish is a real external side effect.
