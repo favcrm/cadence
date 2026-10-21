@@ -175,8 +175,10 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
         })
         .catch((e: unknown) => {
           if (!active || sent !== latest || generation.current !== started || e instanceof StaleEnableError) return;
-          if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
-            // Signed out or tenancy lost: clear everything and stop. The next auth epoch retries.
+          if (e instanceof ApiError && (e.status === 401 || e.status === 403 || e.status === 404)) {
+            // Signed out, tenancy lost, or this server serves no human
+            // threads at all (CAD-1704): clear everything and stop. The next
+            // auth epoch retries.
             stop();
             if (known.current !== null) releaseDevice();
             known.current = null;
