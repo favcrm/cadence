@@ -1,6 +1,6 @@
 # Cadence app tooling
 
-This archive is a versioned starter toolchain for app-owned React/Vite projects. It contains pinned React 19, Vite 8, and the React Vite plugin, a frozen pnpm lockfile, and the canonical Cadence frame kit. It is tooling only: it is not a Cadence SDK, app runtime, authorization grant, or requirement that apps adopt a particular architecture.
+This archive is a versioned starter toolchain for app-owned React/Vite projects. It contains pinned React 19, Vite 8, and the React Vite plugin, a frozen pnpm lockfile, the canonical Cadence frame kit, and the app-side screen-bridge receiver (`app-kit/`). It is tooling plus that receiver: it is not a Cadence SDK, an authority, an app runtime, or a requirement that apps adopt a particular architecture. Validation, fixtures and previews stay with the matching host CLI.
 
 ## Start a private app project
 
@@ -31,3 +31,21 @@ cadence app frame-kit --out /tmp/my-app-frame \
 ```
 
 The default exported frame is an empty offline reference. For an app smoke test, serve the exported frame and mount your application using the actual `--parent-origin` and `--bundle` values. Do not patch generated renderer bytes, replace the host bridge, or treat the empty reference as a running app integration.
+
+## Screen bridge receiver
+
+`app-kit/` is the receiver an app screen uses for the private MessagePort
+bridge: boot, `ready`, the closed PUSH union, `call`/`slot`/`tool`, assets,
+bounded `state` and teardown. It is vendor-copied verbatim from the Cadence
+UI source and pinned file-by-file in `toolchain.json` (`app_kit.version` and
+`app_kit.files`). Import it from the unpacked archive, or vendor the folder
+into the app:
+
+```js
+import { createScreenReceiver } from "./app-kit/src/index.mjs";
+```
+
+Do not edit the packaged receiver and do not treat it as the protocol's
+source: the wire contract is the Cadence `screenProtocol` document for this
+release. What a PUSH means, the app's closed verb set, and payload validation
+stay app-owned.

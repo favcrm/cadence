@@ -1,6 +1,6 @@
 # Versioned app toolchain
 
-Cadence publishes a platform-neutral `cadence-app-toolchain-<tag>.tar.gz` asset and `.sha256` sidecar on its existing versioned GitHub Releases. It is optional starter tooling for app-owned React/Vite projects, not an SDK or an app runtime. It does not change SOC-3 app adoption or SOC-1/SOC-5 holds.
+Cadence publishes a platform-neutral `cadence-app-toolchain-<tag>.tar.gz` asset and `.sha256` sidecar on its existing versioned GitHub Releases. It is optional starter tooling for app-owned React/Vite projects and ships the app-side screen-bridge receiver (`app-kit/`). It is not an SDK, an authority or an app runtime. It does not change SOC-3 app adoption or SOC-1/SOC-5 holds.
 
 ## Download and verify
 
@@ -15,7 +15,17 @@ sha256sum -c "$asset.sha256"
 
 Before consuming the archive, verify its GitHub build-provenance attestation against the exact release tag and Cadence workflow, as described in [INSTALL-AGENT.md](../INSTALL-AGENT.md). The checksum detects byte changes relative to its sidecar; it does not replace provenance verification. Releases are immutable once published.
 
-Extract into a new app-owned project directory. The archive's `toolchain.json` records schema, release tag, source commit, package manager and source-derived pins. `pnpm-lock.yaml` freezes the dependency graph. The current archive is tested with Node 22 and pnpm 12.2.1; use the exact package-manager version recorded in `toolchain.json` and run `pnpm install --frozen-lockfile`. Do not regenerate the lock during routine installation. See the packaged [`app-toolchain/README.md`](../../app-toolchain/README.md) for the minimal consumer flow.
+Extract into a new app-owned project directory. The archive's `toolchain.json` records schema, release tag, source commit, package manager, source-derived pins and the receiver's version and per-file sha256 (`app_kit`). `pnpm-lock.yaml` freezes the dependency graph. The current archive is tested with Node 22 and pnpm 12.2.1; use the exact package-manager version recorded in `toolchain.json` and run `pnpm install --frozen-lockfile`. Do not regenerate the lock during routine installation. See the packaged [`app-toolchain/README.md`](../../app-toolchain/README.md) for the minimal consumer flow.
+
+## Screen bridge receiver
+
+`app-kit/` is the app side of the screen bridge, vendor-copied from the
+Cadence UI source and pinned in `toolchain.json` under `app_kit`. Import
+`app-kit/src/index.mjs` from the unpacked archive (or vendor the folder into
+the app) instead of writing a private `postMessage` receiver. The receiver is
+transport and lifecycle only: the app still owns its projection, its closed
+verb set and its payload validation. Do not edit the packaged files; a new
+Cadence release ships the next version.
 
 ## Matching frame kit
 
