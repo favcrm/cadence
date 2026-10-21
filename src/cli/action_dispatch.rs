@@ -490,6 +490,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         | Commands::Attach { .. }
         | Commands::Resume { .. }
         | Commands::Stop { .. }
+        | Commands::CloudSandbox { .. }
         | Commands::Interrupt { .. }
         | Commands::SelfInfo
         | Commands::Done { .. }

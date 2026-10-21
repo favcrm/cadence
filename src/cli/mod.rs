@@ -32,6 +32,7 @@ mod daemon;
 mod delivery;
 mod devin;
 mod discovery;
+mod cloud_sandbox;
 mod dispatch;
 mod doctor;
 mod events;
