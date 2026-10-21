@@ -12,9 +12,7 @@ use cadence_agent::adapter::sandbox::{
     UreqSandboxTransport,
 };
 use cadence_agent::error::{Error, Result, Structured};
-use cadence_agent::issue::{
-    board, model::check_ref_value, project, task_report, write, Pm,
-};
+use cadence_agent::issue::{board, model::check_ref_value, project, task_report, write, Pm};
 
 /// Refusal code outside a hosted AgenticOS company context.
 pub const NOT_HOSTED: &str = "cloud_sandbox_not_hosted";
@@ -164,7 +162,10 @@ pub fn project_repo(pm_dir: &Path, project_key: &str) -> Result<String> {
                         "project '{project_key}' declares no repo remote or path; cannot run in a sandbox"
                     ))
                 })?;
-            git(&project::expand_home(path), &["remote", "get-url", "origin"])?
+            git(
+                &project::expand_home(path),
+                &["remote", "get-url", "origin"],
+            )?
         }
     };
     normalize_github_repo(&raw)
@@ -214,7 +215,10 @@ pub fn run(issue: &str, branch: &str, base_sha: &str, spec: Option<&Path>) -> Re
             &pm,
             issue,
             "note",
-            &format!("cloud-sandbox sandbox={} job={}", lane.sandbox_id, lane.job_id),
+            &format!(
+                "cloud-sandbox sandbox={} job={}",
+                lane.sandbox_id, lane.job_id
+            ),
             Some("cloud sandbox lane"),
             None,
             None,
@@ -296,7 +300,10 @@ mod tests {
     impl SandboxClient for Fake {
         fn create_job(&self, request: &CreateJob) -> Result<SandboxJob> {
             self.calls.lock().unwrap().push("create".into());
-            self.created_repos.lock().unwrap().push(request.repo.clone());
+            self.created_repos
+                .lock()
+                .unwrap()
+                .push(request.repo.clone());
             if let Some(err) = self.create.lock().unwrap().take() {
                 return err;
             }
@@ -487,11 +494,19 @@ mod tests {
                 .success());
         };
         git_in(&["init", "-q"]);
-        git_in(&["remote", "add", "origin", "https://github.com/favcrm/cadence.git"]);
+        git_in(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/favcrm/cadence.git",
+        ]);
         write_project(
             tmp.path(),
             "favcrm",
-            &format!("key: favcrm\nprefix: FAV\nrepos:\n  - path: {}\n", checkout.display()),
+            &format!(
+                "key: favcrm\nprefix: FAV\nrepos:\n  - path: {}\n",
+                checkout.display()
+            ),
         );
         assert_eq!(
             project_repo(tmp.path(), "favcrm").unwrap(),

@@ -458,7 +458,6 @@ impl<T: SandboxTransport> SandboxClient for HttpSandboxApi<T> {
     }
 }
 
-
 /// In-memory fake for tests: scripted entitlement, scripted transport
 /// responses, and a call log so tests can assert on wire shape.
 #[cfg(test)]
@@ -494,11 +493,10 @@ pub mod fake {
 
     impl SandboxTransport for FakeTransport {
         fn send(&self, method: &str, url: &str, body: Option<&Value>) -> Result<(u16, Value)> {
-            self.calls.lock().unwrap().push((
-                method.to_string(),
-                url.to_string(),
-                body.cloned(),
-            ));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.to_string(), url.to_string(), body.cloned()));
             self.responses
                 .lock()
                 .unwrap()
@@ -573,8 +571,7 @@ mod tests {
     #[test]
     fn create_posts_contract_body_without_company_field() {
         let api = HttpSandboxApi::new(FakeTransport::with(vec![(201, created("job-1"))]));
-        let (lane, job) =
-            create_remote_lane(&api, &entitled(), "co-1", &req("CAD-1")).unwrap();
+        let (lane, job) = create_remote_lane(&api, &entitled(), "co-1", &req("CAD-1")).unwrap();
         assert_eq!(lane.sandbox_id, "csb_job-1");
         assert_eq!(lane.branch, "cad-1-x");
         assert_eq!(lane.job_id, "job-1");
@@ -707,7 +704,10 @@ mod tests {
         assert_eq!(snap.events[0].seq, 1);
         assert_eq!(snap.result.sha.as_deref(), Some(SHA));
         assert_eq!(snap.result.pr, None);
-        assert_eq!(api.transport.calls.lock().unwrap()[0].1, format!("{JOBS_URL}/job-1"));
+        assert_eq!(
+            api.transport.calls.lock().unwrap()[0].1,
+            format!("{JOBS_URL}/job-1")
+        );
     }
 
     #[test]
@@ -764,9 +764,7 @@ mod tests {
 
     #[test]
     fn no_hardcoded_company_or_sandbox_ids() {
-        let api = HttpSandboxApi::new(FakeTransport::with(vec![
-            (201, created("job-1")),
-        ]));
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![(201, created("job-1"))]));
         assert!(create_remote_lane(&api, &ByCompany, "co-allowed", &req("CAD-1")).is_ok());
         let err = create_remote_lane(&api, &ByCompany, "co-other", &req("CAD-1")).unwrap_err();
         assert_eq!(code_of(&err), Some(ENTITLEMENT_REFUSED));
@@ -789,8 +787,7 @@ mod tests {
     #[test]
     fn enabled_dispatch_records_remote_lane_and_never_touches_host_worktree() {
         let api = HttpSandboxApi::new(FakeTransport::with(vec![(201, created("job-1"))]));
-        let (lane, job) =
-            create_remote_lane(&api, &entitled(), "co-1", &req("CAD-1")).unwrap();
+        let (lane, job) = create_remote_lane(&api, &entitled(), "co-1", &req("CAD-1")).unwrap();
         assert_eq!(lane.branch, "cad-1-x");
         assert_eq!(lane.sandbox_id, "csb_job-1");
         assert_eq!(lane.job_id, "job-1");
@@ -836,8 +833,17 @@ mod tests {
     #[test]
     fn failed_job_is_stopped_and_relays_nothing() {
         let api = HttpSandboxApi::new(FakeTransport::with(vec![
-            (200, job_state("failed", json!({"sha": null, "diff": null, "pr": null, "text": ""}))),
-            (200, json!({"ok": true, "data": {"job_id": "job-1", "state": "stopped"}})),
+            (
+                200,
+                job_state(
+                    "failed",
+                    json!({"sha": null, "diff": null, "pr": null, "text": ""}),
+                ),
+            ),
+            (
+                200,
+                json!({"ok": true, "data": {"job_id": "job-1", "state": "stopped"}}),
+            ),
         ]));
         let job = SandboxJob {
             job_id: "job-1".into(),
@@ -847,7 +853,10 @@ mod tests {
             gateway_token: "t".into(),
         };
         let relay = ResultRelay::default();
-        assert_eq!(drive_job(&api, &relay, &job, false).unwrap(), RunOutcome::Failed);
+        assert_eq!(
+            drive_job(&api, &relay, &job, false).unwrap(),
+            RunOutcome::Failed
+        );
         assert!(relay.recorded("csb_job-1").is_none());
         let calls = api.transport.calls.lock().unwrap();
         assert_eq!(calls.last().unwrap().1, format!("{JOBS_URL}/job-1/stop"));
