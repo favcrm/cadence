@@ -346,6 +346,9 @@ export default function AppShell({
     ) => {
       const [path, search] = href.split("?");
       const q = new URLSearchParams(search ?? "");
+      // Single-context mode: the URL never carries a context. Every internal
+      // navigation strips any `ctx`; nothing in the shell ever adds one.
+      q.delete("ctx");
       if (patch.appview !== undefined) {
         if (patch.appview === null || patch.appview === "list") q.delete("appview");
         else q.set("appview", patch.appview);
