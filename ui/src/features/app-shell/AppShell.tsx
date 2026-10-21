@@ -335,7 +335,6 @@ export default function AppShell({
   const writeQuery = useCallback(
     (
       patch: {
-        ctx?: string | null;
         appview?: OutletView | null;
         record?: string | null;
         conversation?: string | null;
@@ -534,7 +533,7 @@ export default function AppShell({
     setLoadFailure(null);
     setLinkNotice(null);
     setContextId("");
-    writeQuery({ ctx: null, appview: null, record: null, conversation: null, clearContractPreview: true }, { replace: true });
+    writeQuery({ appview: null, record: null, conversation: null, clearContractPreview: true }, { replace: true });
     // The strip marks the emptied query handled: unmark so adoption
     // still runs once the new installation's contexts load.
     handledQuery.current = undefined;
@@ -607,7 +606,6 @@ export default function AppShell({
       }
     }
     const staleCtx = urlCtx !== null && !activeIds.includes(urlCtx);
-    const hasConversationLink = query.getAll("conversation").length > 0;
     // Single-company mode: with exactly one active context a scopeless
     // record link is unambiguous, so it resolves to that context.
     const soleContext = urlCtx === null && urlRecord !== null && !badRecord && activeIds.length === 1;
@@ -645,9 +643,6 @@ export default function AppShell({
     if (badRecord || staleCtx || scopelessRecord || soleContext) {
       writeQuery(
         {
-          // Preserve a stale ctx selector alongside a conversation link so
-          // its target can fail visibly instead of becoming contextless.
-          ctx: soleContext ? activeIds[0] : staleCtx && !hasConversationLink ? null : undefined,
           record: badRecord || staleCtx || scopelessRecord ? null : undefined,
           appview: staleCtx ? null : undefined,
         },
@@ -1117,33 +1112,6 @@ function wantsGeneralContext(installation: Installation | null): installation is
 function contextLabel(contexts: AppContext[], contextId: string): string | null {
   if (!contextId) return null;
   return contexts.find((c) => c.id === contextId)?.config.label ?? null;
-}
-
-/** A scoped-entry link: sets `ctx` and clears any carried record /
- *  new-view / section state so entering a scope never lands on the
- *  prior scope's drawer or draft. Re-entering the already-bound
- *  scope keeps the outlet exactly as it is: the link resolves to the
- *  current URL, so `navigate` no-ops and an open record, the New
- *  view and unsaved drafts survive — the link stays real (copiable,
- *  openable in a new tab), never a dead control. Pure — unit-tested
- *  via the shell. */
-export function scopedEntryHref(href: string, contextId: string, boundId: string): string {
-  const [path, search] = href.split("?");
-  const q = new URLSearchParams(search ?? "");
-  const currentContexts = q.getAll("ctx");
-  if (
-    contextId === boundId &&
-    (currentContexts.length === 0 || (currentContexts.length === 1 && currentContexts[0] === boundId))
-  ) {
-    return href;
-  }
-  q.set("ctx", contextId);
-  q.delete("record");
-  q.delete("appview");
-  // An explicit company switch supersedes a pending conversation deep link.
-  q.delete("conversation");
-  const s = q.toString();
-  return path + (s ? `?${s}` : "");
 }
 
 /** The daemon-stamped App binding on an entry's payload, if verified. */
