@@ -414,6 +414,38 @@ impl Shared {
         })
     }
 
+    /// `issue_kickoff` target decision. `true` registers the alias;
+    /// `false` dispatches to the existing seat unchanged. The seat keeps
+    /// its provider, model and effort — the request only names it.
+    fn kickoff_register(
+        existing: Option<(&str, &str)>,
+        provider: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<bool> {
+        let Some((seat_provider, seat_state)) = existing else {
+            return Ok(true);
+        };
+        if seat_provider != provider {
+            return Err(Error::rejected(format!(
+                "issue kickoff: the seat runs {seat_provider}, not {provider} — \
+                 a seat keeps its provider; change it on the seat"
+            )));
+        }
+        if model.is_some() || effort.is_some() {
+            return Err(Error::rejected(
+                "issue kickoff: an existing seat keeps its model and effort; \
+                 change them on the seat",
+            ));
+        }
+        if seat_state == "attention" {
+            return Err(Error::rejected(
+                "issue kickoff: the seat is fenced — reconcile it before dispatching",
+            ));
+        }
+        Ok(false)
+    }
+
     /// `issue_kickoff` — `{issue, group, provider, model?, effort?, alias?, note?}`.
     pub(super) fn rpc_issue_kickoff(
         self: &Arc<Self>,
@@ -481,19 +513,28 @@ impl Shared {
                 picked
             }
         };
-        if self.store.agent_opt(&alias)?.is_some() {
-            return Err(Error::rejected(format!(
-                "issue kickoff: '{alias}' is already registered"
-            )));
+        // One target decision: an existing row is a seat and is
+        // dispatched to as-is; a free alias is registered.
+        let existing = self.store.agent_opt(&alias)?;
+        let register = Self::kickoff_register(
+            existing
+                .as_ref()
+                .map(|a| (a.provider.as_str(), a.state.as_str())),
+            provider,
+            model,
+            effort,
+        )?;
+        if register {
+            // A minted alias is checked here too — still before `issue
+            // start`, so a reserved name never opens a worktree.
+            crate::master::refuse_reserved_alias(&alias)?;
         }
-        // A minted alias is checked here too — still before `issue start`,
-        // so a reserved name never opens a worktree.
-        crate::master::refuse_reserved_alias(&alias)?;
 
         // `issue start` creates a lane before `rpc_register` runs. Apply
         // the same effective-model gate here so a refused configuration
-        // leaves no worktree or issue side effect behind.
-        if crate::adapter::registry::pi_family_managed(provider, kind) {
+        // leaves no worktree or issue side effect behind. A seat is
+        // already registered and keeps its model.
+        if register && crate::adapter::registry::pi_family_managed(provider, kind) {
             let pm_dir = self.pm_dir()?;
             let confined = crate::doctor::host::read_host_overrides(&pm_dir)
                 .map_err(Error::rejected)?
@@ -529,6 +570,11 @@ impl Shared {
                 crate::adapter::pi::refuse_confined_devin(&alias, true, &effective)?;
             }
         }
+        // A seat is checked before `issue start`, so a bad pane or a
+        // confined worker refuses with no lane or claim left behind.
+        if !register {
+            issue::dispatch::check_seat(&project, &alias, false, &self.state_dir)?;
+        }
         let start_args = issue::start::StartArgs {
             repo: None,
             name: None,
@@ -553,17 +599,19 @@ impl Shared {
             launch.insert("effort".to_string(), json!(effort));
         }
         let launch_text = Value::Object(launch).to_string();
-        self.rpc_register(
-            &json!({
-                "alias": alias,
-                "provider": provider,
-                "endpoint_kind": kind,
-                "role": "worker",
-                "cwd": worktree,
-                "params": launch_text,
-            }),
-            peer_pid,
-        )?;
+        if register {
+            self.rpc_register(
+                &json!({
+                    "alias": alias,
+                    "provider": provider,
+                    "endpoint_kind": kind,
+                    "role": "worker",
+                    "cwd": worktree,
+                    "params": launch_text,
+                }),
+                peer_pid,
+            )?;
+        }
         let args = issue::dispatch::DispatchArgs {
             to: alias.clone(),
             note: None,
@@ -694,5 +742,24 @@ impl Shared {
                 "effort": Value::Null,
             },
         }))
+    }
+}
+
+#[cfg(test)]
+mod kickoff_target_tests {
+    use super::*;
+
+    #[test]
+    fn free_alias_registers_and_seat_dispatches() {
+        assert!(Shared::kickoff_register(None, "pi", None, None).unwrap());
+        assert!(!Shared::kickoff_register(Some(("pi", "idle")), "pi", None, None).unwrap());
+    }
+
+    #[test]
+    fn seat_keeps_provider_model_effort_and_is_refused_when_fenced() {
+        assert!(Shared::kickoff_register(Some(("devin", "idle")), "pi", None, None).is_err());
+        assert!(Shared::kickoff_register(Some(("pi", "idle")), "pi", Some("m"), None).is_err());
+        assert!(Shared::kickoff_register(Some(("pi", "idle")), "pi", None, Some("high")).is_err());
+        assert!(Shared::kickoff_register(Some(("pi", "attention")), "pi", None, None).is_err());
     }
 }
