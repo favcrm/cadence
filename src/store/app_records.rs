@@ -1287,7 +1287,8 @@ impl RecordStore {
     /// Bounded search and pagination over one context's customers.
     /// `query` is a bounded substring matched against the record ID
     /// and body; `limit` is 1..=RECORD_PAGE_MAX; `cursor` pages after
-    /// a record ID. The response carries `records`, `truncated` and
+    /// a record ID. The response carries `records`, `total` (the full
+    /// filtered count, independent of the page), `truncated` and
     /// `next_cursor` (null when complete) alongside each record's show
     /// receipt.
     pub fn app_record_list_paged(
@@ -1323,6 +1324,27 @@ impl RecordStore {
             crate::proto::identifier(after, "record cursor")?;
         }
         let conn = self.conn();
+        // The assistant asks "how many customers" with `customers.search`;
+        // answering from the page alone forced one call per twenty rows
+        // until the provider rejected the accumulated turn. Report the
+        // full filtered count with every page so the count is one call,
+        // while `records` stays bounded.
+        let total: i64 = match like.as_deref() {
+            None => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM app_records WHERE context_id=?",
+                    params![context],
+                    |r| r.get(0),
+                )
+                .map_err(|e| Error::internal(e.to_string()))?,
+            Some(pattern) => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM app_records WHERE context_id=? AND (id LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\')",
+                    params![context, pattern, pattern],
+                    |r| r.get(0),
+                )
+                .map_err(|e| Error::internal(e.to_string()))?,
+        };
         let mut sql = String::from("SELECT id FROM app_records WHERE context_id=?");
         if cursor.is_some() {
             sql.push_str(" AND id > ?");
@@ -1360,7 +1382,9 @@ impl RecordStore {
             .iter()
             .map(|id| self.show_in(&conn, context, id))
             .collect::<Result<Vec<_>>>()?;
-        Ok(json!({"records": records, "truncated": truncated, "next_cursor": next_cursor}))
+        Ok(
+            json!({"records": records, "total": total, "truncated": truncated, "next_cursor": next_cursor}),
+        )
     }
 
     pub fn app_record_update(

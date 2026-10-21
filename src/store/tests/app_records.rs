@@ -851,6 +851,11 @@ fn cad1172_records_are_not_capped_at_the_pilot_hundred() {
         "one page holds the page bound"
     );
     assert_eq!(listed["truncated"], json!(true), "150 rows page");
+    assert_eq!(
+        listed["total"],
+        json!(150),
+        "the page reports the full count"
+    );
     // The context really holds all 150: page past the bound.
     let cursor = listed["next_cursor"].as_str().unwrap().to_string();
     let second = store
@@ -858,6 +863,18 @@ fn cad1172_records_are_not_capped_at_the_pilot_hundred() {
         .unwrap();
     assert_eq!(second["records"].as_array().unwrap().len(), 50);
     assert_eq!(second["truncated"], json!(false));
+    assert_eq!(
+        second["total"],
+        json!(150),
+        "the count is independent of the cursor"
+    );
+    // A filtered search reports the filtered total, not the page size.
+    let filtered = store
+        .app_record_list_paged("ctx-1", Some("c149@example.com"), 20, None)
+        .unwrap();
+    assert_eq!(filtered["records"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["total"], json!(1), "the count follows the filter");
+    assert_eq!(filtered["truncated"], json!(false));
 }
 
 #[test]
