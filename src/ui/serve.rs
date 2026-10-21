@@ -1499,15 +1499,6 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         return;
     }
 
-    // CAD-1696: a table read row answers from its own declaration, so the
-    // board's reads and writes share one route authority. A path the table
-    // does not own falls through to the chain below, unchanged.
-    if let Some(bound) = endpoints::resolve(method.as_str(), &path) {
-        let response = read_dispatch(&mut request, state_dir, opts, bound);
-        send(request, response);
-        return;
-    }
-
     // Every private API read is admitted before dispatch, including future
     // routes and streams. Local bootstrap/static files are public. The
     // screen document instead owns a one-use, live-session-bound capability.
@@ -1531,6 +1522,18 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     } else {
         None
     };
+
+    // CAD-1696: a table read row answers from its own declaration, so the
+    // board's reads and writes share one route authority. It runs after the
+    // generic read gate above — the same place the arms it replaces ran — so
+    // an unsigned caller still sees that gate's 401 (and, on the public host,
+    // its session bounce) before any per-row role guard. A path the table does
+    // not own falls through to the chain below, unchanged.
+    if let Some(bound) = endpoints::resolve(method.as_str(), &path) {
+        let response = read_dispatch(&mut request, state_dir, opts, bound);
+        send(request, response);
+        return;
+    }
 
     // The catalogue proxy is a signed-in read: the container no longer serves
     // an anonymous directory. The browser must not be sent at the catalog

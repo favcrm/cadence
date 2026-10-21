@@ -404,6 +404,15 @@ pub(super) fn resolve<'p>(method: &str, path: &'p str) -> Option<Bound<'p>> {
         .find_map(|endpoint| bind(endpoint, path))
 }
 
+/// [`resolve`], or the first row that owns the path when none names the
+/// method. The write dispatcher uses this to keep a table-owned path
+/// answering `405` (after the request method's own admission) instead of
+/// falling through to the legacy `404`. The returned row's method is *not*
+/// the request's; the caller must check.
+pub(super) fn resolve_or_path<'p>(method: &str, path: &'p str) -> Option<Bound<'p>> {
+    resolve(method, path).or_else(|| ENDPOINTS.iter().find_map(|endpoint| bind(endpoint, path)))
+}
+
 fn bind<'p>(endpoint: &'static Endpoint, path: &'p str) -> Option<Bound<'p>> {
     let mut want = endpoint.pattern.split('/');
     let mut got = path.split('/');
@@ -556,6 +565,17 @@ mod tests {
             assert_eq!(head.endpoint.id, get.endpoint.id, "{path}");
             assert_eq!(head.endpoint.class, get.endpoint.class, "{path}");
         }
+    }
+
+    #[test]
+    fn a_wrong_write_method_still_resolves_the_path() {
+        // A table-owned path with the wrong write method must reach the
+        // dispatcher's mismatch answer, not fall through to a legacy 404.
+        let bound = resolve_or_path("PATCH", "/api/app-installations/inst-1/remove")
+            .expect("the path is owned");
+        assert_eq!(bound.endpoint.method, "POST");
+        assert_eq!(bound.endpoint.id, RouteId::ExplorerRemove);
+        assert!(resolve("PATCH", "/api/app-installations/inst-1/remove").is_none());
     }
 
     #[test]

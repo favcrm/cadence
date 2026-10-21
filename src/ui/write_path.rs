@@ -1025,7 +1025,7 @@ pub(crate) fn write_route(
     // method, admission class and bound parameters in one declaration, so the
     // dispatcher and `route_class` cannot disagree. A path no row owns falls
     // through to the remaining chain below, unchanged.
-    if let Some(bound) = endpoints::resolve(method.as_str(), path) {
+    if let Some(bound) = endpoints::resolve_or_path(method.as_str(), path) {
         let endpoint = bound.endpoint;
         // Admission runs before the method check for every non-Session row:
         // a read-only board or an unauthenticated caller used to refuse these
