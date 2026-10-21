@@ -15,6 +15,7 @@ function RecordConfirmation({ view, card, onTap, onCancel }: {
     "whatsapp.reply.send": "Send this WhatsApp reply?",
     "whatsapp.template.send": "Send this WhatsApp template?", "whatsapp.broadcast.test.send": "Send one WhatsApp test message?",
     "whatsapp.broadcast.send": "Approve this WhatsApp broadcast?", "whatsapp.broadcast.stop": "Stop this WhatsApp broadcast?", "whatsapp.handoff.release": "Hand this conversation back to AI?",
+    "works.review": "Review this Works revision?", "works.export": "Export this approved Works revision?",
   };
   const field = card.input;
   const invalid = field?.choices ? !field.choices.some(c => c.value === input) : field?.field === "to_email" ? !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) : false;

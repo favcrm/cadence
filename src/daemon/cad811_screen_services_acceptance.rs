@@ -752,3 +752,6 @@ fn cad811_sender_empty_read_is_typed_and_access_refusals_stay_refused() {
 
 #[path = "cad811_public_owner_attribution_acceptance.rs"]
 mod independent_public_owner_attribution;
+
+#[path = "cad811_works_acceptance.rs"]
+mod independent_works;

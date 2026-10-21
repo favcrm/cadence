@@ -38,17 +38,36 @@ fn must<T, E>(result: std::result::Result<T, E>, what: &str) -> T {
     }
 }
 
-struct Native {
+pub(super) struct Native {
     // Drop the owned board/socket threads before the temp state or Shared.
-    fx: Fixture,
-    shared: Arc<Shared>,
-    member_live: Arc<AtomicBool>,
+    pub(super) fx: Fixture,
+    pub(super) shared: Arc<Shared>,
+    pub(super) member_live: Arc<AtomicBool>,
     lookups: Arc<AtomicUsize>,
-    issuer: String,
+    pub(super) issuer: String,
 }
 
 impl Native {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
+        Self::new_with_subs(&[OWNER])
+    }
+
+    /// Same fixture, admitting exactly `allowed_subs` through the membership
+    /// lookup. The Works two-human test passes the owner plus one second
+    /// synthetic sub; every other caller stays on `new()`.
+    pub(super) fn new_with_subs(allowed_subs: &[&str]) -> Self {
+        let allowed: Vec<(&str, Role)> = allowed_subs
+            .iter()
+            .map(|sub| (*sub, Role::Operator))
+            .collect();
+        Self::new_with_roles(&allowed)
+    }
+
+    pub(super) fn new_with_roles(allowed: &[(&str, Role)]) -> Self {
+        let allowed: Vec<(String, Role)> = allowed
+            .iter()
+            .map(|(sub, role)| ((*sub).to_owned(), *role))
+            .collect();
         assert!(
             std::env::var_os("CADENCE_SOCKET").is_none(),
             "fixture BLOCKED: inherited socket override; do not clear caller identity"
@@ -125,12 +144,17 @@ impl Native {
             .expect("fresh unique Shared")
             .membership_lookup_for_test = Some(Box::new(move |_hash, sub, company, instance| {
             assert!(
-                sub == OWNER && company == COMPANY && instance == INSTANCE,
+                allowed.iter().any(|(allowed, _)| allowed.as_str() == sub)
+                    && company == COMPANY
+                    && instance == INSTANCE,
                 "fixture BLOCKED: wrong synthetic membership binding"
             );
             seen.fetch_add(1, Ordering::SeqCst);
             Ok(if live.load(Ordering::SeqCst) {
-                Some(Role::Operator)
+                allowed
+                    .iter()
+                    .find(|(allowed, _)| allowed.as_str() == sub)
+                    .map(|(_, role)| *role)
             } else {
                 None
             })
@@ -237,11 +261,11 @@ impl Native {
         }
     }
 
-    fn rpc(&self, method: &str, params: Value) -> crate::Result<Value> {
+    pub(super) fn rpc(&self, method: &str, params: Value) -> crate::Result<Value> {
         self.fx.rpc(Asserted::Operator, method, params)
     }
 
-    fn owner(&self) -> (Session, Value) {
+    pub(super) fn owner(&self) -> (Session, Value) {
         let user = BoardUser {
             sub: OWNER.into(),
             email: "c811-owner@example.test".into(),
@@ -277,7 +301,7 @@ impl Native {
         (session, expected)
     }
 
-    fn local(&self) -> Session {
+    pub(super) fn local(&self) -> Session {
         // Same real Auth constructor used by the existing Native fence
         // fixture, not a public-host bootstrap with a local nonce.
         let now = self.shared.operator_now();
@@ -299,14 +323,20 @@ impl Native {
         }
     }
 
-    fn credentials(&self, session: &Session, origin: &str, mut body: Value) -> Value {
+    pub(super) fn credentials(&self, session: &Session, origin: &str, mut body: Value) -> Value {
         body["token"] = json!(session.token);
         body["key"] = json!(session.key);
         body["origin"] = json!(origin);
         body
     }
 
-    fn mount(&self, session: &Session, origin: &str, scope: &Scope, generation: u64) -> String {
+    pub(super) fn mount(
+        &self,
+        session: &Session,
+        origin: &str,
+        scope: &Scope,
+        generation: u64,
+    ) -> String {
         let mint = must(
             self.rpc(
                 "app_screen_mint",
@@ -342,7 +372,7 @@ impl Native {
         action
     }
 
-    fn service(
+    pub(super) fn service(
         &self,
         session: &Session,
         origin: &str,
@@ -374,7 +404,7 @@ impl Native {
         must(response.into_body().read_json(), "HTTP JSON result")
     }
 
-    fn slot(
+    pub(super) fn slot(
         &self,
         session: &Session,
         origin: &str,
@@ -491,7 +521,7 @@ impl Native {
         )
     }
 
-    fn durable_snapshot(&self, scope: &Scope) -> Value {
+    pub(super) fn durable_snapshot(&self, scope: &Scope) -> Value {
         let db = self.record_db(scope);
         let mut tables = Vec::new();
         for table in [

@@ -16,7 +16,7 @@ function sanitized(value: unknown): unknown {
   if (!object(value)) return value;
   return Object.fromEntries(Object.entries(value).filter(([k]) => !SECRET_FIELDS.has(k)).map(([k, v]) => [k, sanitized(v)]));
 }
-function refusal(error: unknown, operation?: RecordCallVerb): ActionRefusal {
+function refusal(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): ActionRefusal {
   const status = error instanceof ApiError ? error.status : 0;
   if (operation === "smtp.show" && error instanceof ApiError && status === 400 && (error.code === "smtp_sender_unbound" || error.code === "smtp_sender_revoked")) {
     return { code: error.code, text: "No live SMTP sender is bound. Configure a sender before sending." };
@@ -29,7 +29,13 @@ function refusal(error: unknown, operation?: RecordCallVerb): ActionRefusal {
   // Apart from explicit sender-state codes on smtp.show, the child consumes
   // canonical classes (a revision_conflict must still reach the editor as conflict).
   // CAD-1656: the confirm-time recompute refusal keeps its own code.
-  if (status === 409 && error instanceof ApiError && error.code === "facts_changed") return { code: "facts_changed", text: "That changed. Refresh before trying again." };
+  // CAD-1662: Works refusals keep their closed store vocabulary, so the screen
+  // can tell a missing item from one blocked pending review.
+  const WORKS_CODES = ["invalid", "forbidden", "not_found", "conflict", "needs_review", "facts_changed", "rejected", "unauthorized"];
+  if (operation?.startsWith("works.") && error instanceof ApiError && status === 400 && error.code && WORKS_CODES.includes(error.code)) {
+    return { code: error.code, text: "Cadence refused this Works request. Refresh before trying again." };
+  }
+   if (status === 409 && error instanceof ApiError && error.code === "facts_changed") return { code: "facts_changed", text: "That changed. Refresh before trying again." };
   const code = ({ 401: "unauthorized", 403: "forbidden", 404: "not_found", 409: "conflict", 503: "unavailable" } as Record<number, string>)[status] ?? "failed";
   return { code, text: status === 401 || status === 403 ? "This app's access is no longer available." : status === 409 ? "That changed. Refresh before trying again." : "Cadence refused this request. Inspect fresh status before retrying an effect." };
 }
@@ -60,7 +66,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
     if (!response.ok) throw new ApiError("Service refused", response.status, object(value) && typeof value.code === "string" ? { code: value.code } : undefined);
     return value;
   }
-  function failed(error: unknown, operation?: RecordCallVerb): ActionRefusal {
+  function failed(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): ActionRefusal {
     csv.clear();
     if (current() && error instanceof ApiError && [401, 403].includes(error.status)) { retired = true; purgeDisplayCache(); host.refused(); }
     return refusal(error, operation);
@@ -135,9 +141,9 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
               ? { ...result, confirmation_required: result.state === "open" } : result);
             if (!["smtp.manage", "chat.campaign.open", "chat.campaign.brief", "chat.whatsapp.brief", "records.csv.confirm"].includes(operation)) invalidateDisplay(domain);
             return { ok: true, data };
-          } catch (error) { return { ok: false, refusal: failed(error) }; }
+          } catch (error) { return { ok: false, refusal: failed(error, operation) }; }
         } };
-      } catch (error) { return failed(error); }
+      } catch (error) { return failed(error, operation); }
     },
   };
 }
@@ -212,6 +218,13 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionA
     if (live) { show("Status (approximate, as of this card)", live.status); show("Delivery so far (approximate, still changing)", stats); }
     show("Effect", "Stops unsent recipients only. Messages already sent cannot be recalled. A stopped broadcast cannot resume; inside the undo window it returns to a draft instead.");
   }
+  if (operation === "works.review" || operation === "works.export") {
+    // CAD-1662: the card draws the doc's current revision the host re-proved;
+    // the reviewer or exporter confirms that exact revision, nothing else.
+    show("Title", facts.title); show("Kind", facts.kind); show("Revision", facts.revision); show("Author", facts.author); show("Digest", facts.contentDigest);
+    if (operation === "works.review") show("Decision", "Approve this revision, or request changes.");
+    if (operation === "works.export") show("Format", "Export receipt for this approved revision only.");
+  }
   if (operation === "whatsapp.handoff.release") {
     // CAD-1651: the takeover time is the bound fact; the contact is live and unbound.
     const contact = live && object(live.contact) ? live.contact : null;
@@ -222,6 +235,8 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionA
   if (typeof facts.state === "string" && facts.state === "pending" && operation.startsWith("whatsapp.")) show("Approval", "Awaiting the workspace owner's approval; tapping again after approval sends it once.");
   show("Scope", facts.scope); show("Unsubscribe origin", facts.unsubscribe_origin ?? (operation === "origin.manage" ? "Not configured" : undefined));
   const card: RecordCard = { operation, facts: rows };
+  if (operation === "works.review") card.input = { field: "choice", label: "Your decision on this exact revision", choices: [{ value: "approve", label: "Approve this revision" }, { value: "changes", label: "Request changes" }] };
+  if (operation === "works.export") card.input = { field: "choice", label: "Export format for this approved revision", choices: [{ value: "html", label: "HTML" }, { value: "markdown", label: "Markdown" }] };
   if (operation === "smtp.test-send") card.input = { field: "to_email", label: "Test recipient (one email address)" };
   if (operation === "sends.resolve") card.input = { field: "resolution", label: "Resolve uncertain outcome — this does not resend", choices: [{ value: "accepted", label: "Accepted by the server" }, { value: "failed", label: "Failed" }] };
   if (operation === "origin.manage") card.input = { field: "unsubscribe_origin", label: "Daemon-global unsubscribe origin (blank clears it)", value: typeof facts.unsubscribe_origin === "string" ? facts.unsubscribe_origin : "" };

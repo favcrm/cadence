@@ -57,6 +57,7 @@ docs/roles/*
 !docs/guides/
 docs/guides/*
 !docs/guides/connections.md
+!docs/guides/app-works.md
 !docs/guides/app-artifact-release.md
 !docs/guides/wiki-knowledge.md
 !docs/guides/external-agents-social.md
