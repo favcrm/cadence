@@ -84,6 +84,8 @@ export function plainRefusal(error: unknown): ActionRefusal {
   if (text.includes("stale")) return { code: "stale", text: "That changed somewhere else. Reload and try again." };
   // A missing binding is a setup problem the app can name, not a bad input.
   if (text.includes("capability binding is absent")) return { code: "binding_absent", text: "Finish setting this app up in Settings first." };
+  // A zero-context install is a setup state, not a failed action.
+  if (text.includes("mounted active context")) return { code: "context_missing", text: "Set up this app's workspace context first, then try again." };
   if (error.status === 409) return { code: "refused", text: "Cadence couldn't do that. Nothing was started." };
   return { code: "failed", text: "That didn't work. Nothing was started." };
 }

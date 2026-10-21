@@ -107,9 +107,9 @@ await rejected(
   "record path escape refused before the wire",
 );
 
-// Mounted shell: one chat pane, scoped links, switch clearing,
-// single context owner, verified send binding, and (CAD-1519) the one
-// generic unavailable state where an app ships no screen of its own.
+// Mounted shell: one chat pane, one active context owner, verified send
+// binding, and (CAD-1519) the one generic unavailable state where an app
+// ships no screen of its own.
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/app-installations/install-shell" });
 for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLSelectElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
@@ -157,6 +157,10 @@ const generic = {
   storage_kind: "workspace", files: [], capabilities: null, connection_slots: [],
 };
 const social = { ...generic, install_id: "install-social", title: "Social Content", name: "social-content" };
+// A Social install with no contexts at all: the screen mounts, but every
+// social source action needs a mounted active context (CAD-1702).
+const socialZero = { ...generic, install_id: "install-social-zero", title: "Social Content", name: "social-content" };
+const socialZeroContexts: Array<Record<string, unknown>> = [];
 const second = { ...generic, install_id: "install-second", title: "Second", name: "reports" };
 const crm = { ...generic, install_id: "install-crm", title: "CRM", name: "crm" };
 // A CRM install with two active scopes: its scopeless record link is
@@ -165,14 +169,12 @@ const crmMulti = { ...generic, install_id: "install-crm-multi", title: "CRM Mult
 const contextsFor: Record<string, unknown> = {
   "install-shell": { contexts: [
     { id: "ctx-a", install_id: "install-shell", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
-    { id: "ctx-b", install_id: "install-shell", revision: 2, state: "active", digest: "cb", config: { schema: 1, label: "Beta", input_defaults: {} } },
   ] },
   "install-second": { contexts: [
     { id: "ctx-only", install_id: "install-second", revision: 1, state: "active", digest: "co", config: { schema: 1, label: "Only", input_defaults: {} } },
   ] },
   "install-social": { contexts: [
     { id: "ctx-brand", install_id: "install-social", revision: 1, state: "active", digest: "cs", config: { schema: 1, label: "Brand", input_defaults: {} } },
-    { id: "ctx-beta", install_id: "install-social", revision: 1, state: "active", digest: "cb2", config: { schema: 1, label: "Beta brand", input_defaults: {} } },
   ] },
   "install-crm": { contexts: [
     { id: "ctx-a", install_id: "install-crm", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
@@ -201,12 +203,27 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
   }
   if (init?.method === "POST") {
-    posts.push({ path, body: JSON.parse(String(init.body)) });
+    const body = JSON.parse(String(init.body));
+    posts.push({ path, body });
+    if (path === "/api/app-installations/install-social-zero/contexts") {
+      const row = {
+        id: "ctx-general",
+        install_id: "install-social-zero",
+        revision: 1,
+        state: "active",
+        digest: "cg",
+        config: { schema: 1, label: body.label, input_defaults: {} },
+      };
+      socialZeroContexts.push(row);
+      return json({ context: row });
+    }
     return json({ ok: true });
   }
   if (path === "/api/app-installations/install-shell") return json(generic);
   if (path === "/api/app-installations/install-second") return json(second);
   if (path === "/api/app-installations/install-social") return json(social);
+  if (path === "/api/app-installations/install-social-zero") return json(socialZero);
+  if (path === "/api/app-installations/install-social-zero/contexts") return json({ contexts: socialZeroContexts });
   if (path === "/api/app-installations/install-shell/contexts") return json(contextsFor["install-shell"]);
   if (path === "/api/app-installations/install-second/contexts") return json(contextsFor["install-second"]);
   if (path === "/api/app-installations/install-social/contexts") return json(contextsFor["install-social"]);
@@ -264,6 +281,11 @@ async function settle(check: () => void) {
   check();
 }
 
+// The shell's adopted scope is visible on the wire: assistant reads carry it.
+const readScopes = () => reads
+  .filter((p) => p.includes("/assistant/"))
+  .map((p) => new URL(p, "http://localhost").searchParams.get("context_id"));
+
 // A new browser: no stored preference, no scope in the link.
 win.sessionStorage.clear();
 history.pushState(null, "", "/app-installations/install-shell");
@@ -301,7 +323,13 @@ equal(panes(), 1, "switching never mounts a second chat pane");
 // Context is adopted from the URL — no selector needed.
 await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a"); });
 await flush();
-assert(location.search.includes("ctx=ctx-a"), "context is adopted from the URL");
+assert(!location.search.includes("ctx="), "a legacy ctx link is normalized to a scope-free URL");
+// D1: an empty selector is distinct from an absent one and is not
+// swallowed by the handled-query guard.
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=&record=rec-1"); });
+await flush(); await flush();
+assert(!location.search.includes("ctx="), "an empty selector is normalized away");
+assert(text().includes("not active"), "an empty selector is treated as inactive");
 posts.length = 0;
 await fill("#app-shell-chat-box", "scoped question");
 await click(host.querySelector(".app-chat-form button[type=submit]"));
@@ -311,142 +339,34 @@ assert(chatPost, "chat send posted");
 equal(chatPost?.body.app, { install_id: "install-shell", context_id: "ctx-a" }, "send binds the selected scope, never actor claims");
 assert(!("actor" in (chatPost?.body ?? {})) && !("verified" in (chatPost?.body ?? {})), "send carries no authority claim");
 
-// Outlet navigation: a New view in the URL, then a URL context change
-// returns the outlet to the list and clears the selection.
+// Outlet navigation: a New view in the URL; a stale context link returns the
+// outlet to the list and clears the selection.
 await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a&appview=new"); });
 await flush();
 assert(location.search.includes("appview=new"), "New view lands in the URL for direct links");
-await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-b"); });
-await flush();
-assert(!location.search.includes("appview="), "context switch returns the outlet to the list");
-assert(!location.search.includes("record="), "context switch clears the stale selection");
-assert(location.search.includes("ctx=ctx-b"), "context switch binds the new scope in the URL");
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-gone&appview=new&record=rec-1"); });
+await flush(); await flush();
+assert(!location.search.includes("appview="), "a stale context link returns the outlet to the list");
+assert(!location.search.includes("record="), "a stale context link clears the stale selection");
+assert(text().includes("not active"), "a stale context link explains itself");
 
-// Authored cross-context links keep their params verbatim: a URL
-// carrying ctx+record together is a deep link for that ctx — record
-// ids are scoped per-context, so the same id may legitimately exist
-// under a different scope. Adoption must not strip it.
+// Authored ctx+record links keep their params verbatim: a deep link's
+// record is never stripped at adoption.
 await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a&record=rec-1"); });
 await flush(); await flush();
 assert(location.search.includes("record=rec-1"), "deep link lands its record");
-// An authored ctx+record link for a different context keeps its record.
-await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-b&record=rec-2"); });
-await flush(); await flush();
-assert(location.search.includes("ctx=ctx-b") && location.search.includes("record=rec-2"), "cross-context record link is preserved");
-// An authored cross-context New-view link keeps its view too.
+// An authored New-view link keeps its view too.
 await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a&appview=new"); });
 await flush(); await flush();
-assert(location.search.includes("ctx=ctx-a") && location.search.includes("appview=new"), "cross-context New view link is preserved");
-// A context-only transition (the scoped-entry link shape: bare ctx,
-// no record/appview) lands clean — the carry state was cleared at the
-// link origin, not guessed at adoption.
-await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-b"); });
+assert(location.search.includes("appview=new") && !location.search.includes("ctx="), "cross-context New view link keeps the view and loses the selector");
+// A bare ctx link carries no stale record/view from the prior entry.
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a"); });
 await flush(); await flush();
 assert(!location.search.includes("record=") && !location.search.includes("appview="), "a bare ctx link carries no stale record/view");
 // Browser back restores the prior authored entry (ctx-a + New view).
 history.back();
 await flush(); await flush();
-assert(location.search.includes("ctx=ctx-a") && location.search.includes("appview=new"), "browser back restores the authored New-view scope");
-
-// Scoped entry: an unselected multi-context install offers one
-// `?ctx=` link per active context — explicit, never a silent default.
-// Clear the remembered preference so the multi-context install lands
-// genuinely unscoped, like a fresh browser.
-win.sessionStorage.removeItem("cadence.workspace-app.context.install-shell");
-await React.act(async () => { navigate("/app-installations/install-shell"); });
-await flush(); await flush();
-assert(location.search === "" || !location.search.includes("ctx="), "no silent context is picked");
-const scopeLinks = Array.from(host.querySelectorAll<HTMLAnchorElement>("[data-scope-link]"));
-equal(scopeLinks.length, 2, "one scoped-entry link per active context");
-assert(scopeLinks.every((a) => a.getAttribute("href")?.includes("ctx=")), "every entry is a real ?ctx= link");
-const acmeEntry = scopeLinks.find((a) => a.getAttribute("data-scope-link") === "ctx-a");
-assert(acmeEntry, "scoped entry exists for ctx-a");
-await click(acmeEntry);
-assert(location.search.includes("ctx=ctx-a"), "scoped entry lands its context in the URL");
-// The links stay after a scope binds: a compact switch keeps every
-// active context reachable without hand-editing the URL — the
-// regression the removed header picker introduced. The bound context
-// carries aria-current instead of disappearing.
-const switchLinks = Array.from(host.querySelectorAll<HTMLAnchorElement>("[data-scope-link]"));
-equal(switchLinks.length, 2, "context links stay reachable once a scope is bound");
-assert(switchLinks.every((a) => a.getAttribute("href")?.includes("ctx=")), "switch entries stay real ?ctx= links");
-const betaEntry = switchLinks.find((a) => a.getAttribute("data-scope-link") === "ctx-b");
-assert(betaEntry, "the other context stays linkable once a scope is bound");
-equal(
-  host.querySelector('[data-scope-link="ctx-a"]')?.getAttribute("aria-current"),
-  "page",
-  "the bound context carries aria-current",
-);
-assert(
-  !host.querySelector('[data-scope-link="ctx-b"]')?.hasAttribute("aria-current"),
-  "unselected contexts carry no aria-current",
-);
-await click(betaEntry);
-assert(location.search.includes("ctx=ctx-b"), "the switch rebinds the new scope in the URL");
-assert(!location.search.includes("appview=") && !location.search.includes("record="), "the switch clears any stale record/view");
-assert((host.textContent ?? "").includes("Beta · 0.1.0"), "the header label follows the switched context");
-
-// The bound context's own link is a same-URL no-op: re-selecting the
-// already-bound scope is not a context switch, so the URL and the open
-// New view survive the click. The href is still a real link to the
-// current page — never a dead control.
-await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-b&appview=new"); });
-await flush();
-assert(location.search.includes("ctx=ctx-b") && location.search.includes("appview=new"), "New view opens on the bound context");
-equal(
-  host.querySelector('[data-scope-link="ctx-b"]')?.getAttribute("href"),
-  "/app-installations/install-shell?ctx=ctx-b&appview=new",
-  "the bound context's link resolves to the current URL",
-);
-await click(host.querySelector('[data-scope-link="ctx-b"]'));
-assert(
-  location.search.includes("ctx=ctx-b") && location.search.includes("appview=new"),
-  "clicking the bound context keeps the query and the New view",
-);
-assert(
-  host.querySelector('[data-scope-link="ctx-b"]')?.getAttribute("aria-current") === "page",
-  "the bound link keeps aria-current after the no-op click",
-);
-// A different context still switches and clears the view.
-await click(host.querySelector('[data-scope-link="ctx-a"]'));
-assert(location.search.includes("ctx=ctx-a"), "switching to ctx-a rebinds the scope");
-assert(!location.search.includes("appview=") && !location.search.includes("record="), "the different-context switch clears view and record");
-// The same no-op holds with a record open: an authored record link
-// under the bound scope keeps its selection through a self-click.
-await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a&record=rec-7"); });
-await flush(); await flush();
-assert(location.search.includes("record=rec-7"), "record link lands under the bound context");
-equal(
-  host.querySelector('[data-scope-link="ctx-a"]')?.getAttribute("href"),
-  "/app-installations/install-shell?ctx=ctx-a&record=rec-7",
-  "the bound link still resolves to the current URL with a record open",
-);
-await click(host.querySelector('[data-scope-link="ctx-a"]'));
-assert(
-  location.search.includes("ctx=ctx-a") && location.search.includes("record=rec-7"),
-  "same-context click keeps the record selection",
-);
-
-// A remembered context (sessionStorage) no longer traps the operator:
-// the switch stays rendered and clicking through clears stale state.
-win.sessionStorage.setItem("cadence.workspace-app.context.install-shell", "ctx-a");
-await React.act(async () => { navigate("/app-installations/install-shell"); });
-await flush(); await flush();
-assert(location.search === "" || !location.search.includes("ctx="), "a remembered context needs no ?ctx in the URL");
-assert((host.textContent ?? "").includes("Acme · 0.1.0"), "the remembered context binds without a URL param");
-const rememberedLinks = Array.from(host.querySelectorAll<HTMLAnchorElement>("[data-scope-link]"));
-equal(rememberedLinks.length, 2, "the switch still renders under a remembered context");
-const rememberedBeta = rememberedLinks.find((a) => a.getAttribute("data-scope-link") === "ctx-b");
-assert(rememberedBeta, "ctx-b stays linkable while ctx-a is remembered");
-// Stale outlet state on the remembered scope: a carried record and a
-// New view both die on the switch, matching the scoped-entry contract.
-await React.act(async () => { navigate("/app-installations/install-shell?appview=new&record=rec-stale"); });
-await flush(); await flush();
-await click(rememberedBeta);
-assert(location.search.includes("ctx=ctx-b"), "switching under a remembered context binds the new scope");
-assert(!location.search.includes("record=") && !location.search.includes("appview="), "switching clears the stale record and view");
-assert((host.textContent ?? "").includes("Beta · 0.1.0"), "the switched context renders its own label");
-win.sessionStorage.removeItem("cadence.workspace-app.context.install-shell");
+assert(location.search.includes("appview=new") && !location.search.includes("ctx="), "browser back restores the authored New view without a selector");
 
 // A context-bound direct link restores scope; browser back keeps it.
 history.pushState(null, "", "/app-installations/install-shell?ctx=ctx-a&record=rec-9");
@@ -464,13 +384,6 @@ await flush(); await flush();
 assert(!location.search.includes("record="), "stale context link clears the record");
 assert(text().includes("not active"), "stale context link explains itself");
 
-// A record link without scope is ambiguous: refused with a notice.
-history.pushState(null, "", "/app-installations/install-shell?record=rec-9");
-await React.act(async () => { win.dispatchEvent(new win.PopStateEvent("popstate")); });
-await flush(); await flush();
-assert(!location.search.includes("record="), "scopeless record link clears the record");
-assert(text().includes("names no context"), "scopeless record link explains itself");
-
 // Installation switch: outlet query stripped, chat history stays visible.
 history.pushState(null, "", "/app-installations/install-second?ctx=ctx-only&record=rec-1");
 await React.act(async () => {
@@ -479,8 +392,6 @@ await React.act(async () => {
 await flush(); await flush(); await flush();
 assert(!location.search.includes("record=") && !location.search.includes("ctx="), "install switch strips stale outlet query");
 assert(text().includes("Second"), "new installation renders");
-// A single-context install keeps the switch hidden — no link clutter.
-assert(!host.querySelector("[data-scope-link]"), "single-context installs render no switch links");
 equal(panes(), 1, "install switch keeps one chat pane");
 assert(text().includes("Scoped follow-up"), "install switch keeps the live thread");
 
@@ -493,36 +404,15 @@ equal(chatBinding({ installId: "i", wanted: "gone", known: true, activeIds: ["a"
 assert(chatBinding({ installId: "i", wanted: "gone", known: true, activeIds: ["a"] }).error?.includes("not active"), "stale scope explains itself");
 equal(chatBinding({ installId: "i", wanted: "gone", known: false, activeIds: [] }).scope, { install_id: "i", context_id: "gone" }, "unknown receipts defer to the server");
 
-// Social-content uses the same shell-owned scope as every other app:
-// the shell renders one selector and hands the verified context to the
-// workspace. The stub below mimics WorkspaceApp's picker exactly
-// (rememberContext, no parent state): the shell must observe the
-// switch in the same tab and send the new scope immediately.
-const { rememberContext: rememberCtx } = require("../src/features/workspace-apps/contextSelection");
-function StubPicker({ installId }: { installId: string }) {
-  const [value, setValue] = React.useState("");
-  return React.createElement("div", null,
-    React.createElement("label", { htmlFor: "brand" }, "Optional brand context"),
-    React.createElement("select", {
-      id: "brand", value,
-      onChange: (e: any) => { setValue(e.target.value); rememberCtx(installId, e.target.value); },
-    },
-      React.createElement("option", { value: "" }, "No brand context"),
-      React.createElement("option", { value: "ctx-brand" }, "Brand"),
-      React.createElement("option", { value: "ctx-beta" }, "Beta brand")));
-}
-// A stale remembered scope blocks the send before anything posts.
+// Social-content uses the same shell-owned scope as every other app: its
+// one active context. The shell reads no remembered choice, so a stale
+// stored id can neither block nor redirect a send.
 win.sessionStorage.setItem("cadence.workspace-app.context.install-social", "ctx-gone");
+reads.length = 0;
 await React.act(async () => {
-  root.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, {
-    installId: "install-social",
-    viewer: { operator: true, readOnly: false },
-    children: () => React.createElement(StubPicker, { installId: "install-social" }),
-  })));
+  root.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, { installId: "install-social", viewer: { operator: true, readOnly: false } })));
 });
-await flush(); await flush(); await flush();
-assert(!host.querySelector('[aria-label="App context"]'), "no stale selector name");
-assert(host.querySelector("#brand"), "the workspace keeps its own selector");
+await settle(() => assert(readScopes().includes("ctx-brand"), "social adopts its one active context"));
 // The Social private screen renders its own chrome — the shell must NOT
 // emit the technical `installId · version · context` subtitle.
 assert(
@@ -530,59 +420,47 @@ assert(
     !text().includes("install-social · 0.1.0"),
   "shell emitted the removed Social technical subtitle",
 );
+assert(!host.querySelector("select[data-social-context]"), "no in-shell context picker remains");
 posts.length = 0;
-await fill("#app-shell-chat-box", "stale scope question");
-await click(host.querySelector(".app-chat-form button[type=submit]"));
-await flush();
-assert(!posts.some((p) => p.path === "/api/threads/master/messages"), "stale social scope posts nothing");
-assert(text().includes("not active"), "stale social scope explains itself");
-// CAD-1177: a Social screen with 2+ active contexts offers its context choice
-// in the shell's header row (outside the outlet), and choosing one is the
-// genuine remembered selection the workspace follows.
-const pick = host.querySelector<HTMLSelectElement>(".app-shell-crumb select[data-social-context]");
-assert(pick, "a multi-context Social screen offers a selection control in the header row");
-assert(!host.querySelector(".app-shell-outlet select[data-social-context]"), "the control is never inside the screen outlet");
-equal(pick.value, "ctx-gone", "a stale scope stays visibly selected until an explicit recovery");
-equal(Array.from(pick.options).filter((o) => !o.disabled).map((o) => o.value).filter(Boolean), ["ctx-brand", "ctx-beta"], "only active contexts are selectable");
-await React.act(async () => {
-  Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!.set!.call(pick, "ctx-beta");
-  pick.dispatchEvent(new Event("change", { bubbles: true }));
-});
-await flush();
-equal(win.sessionStorage.getItem("cadence.workspace-app.context.install-social"), "ctx-beta", "choosing a context remembers it for the workspace");
-// The workspace picker switches scope; the shell's immediate next
-// send carries the new context ID with no intervening navigation.
-const brand = host.querySelector("#brand") as HTMLSelectElement;
-await React.act(async () => {
-  const proto = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!;
-  proto.set!.call(brand, "ctx-beta");
-  brand.dispatchEvent(new Event("change", { bubbles: true }));
-});
-await flush();
-posts.length = 0;
-await fill("#app-shell-chat-box", "beta scope question");
+await fill("#app-shell-chat-box", "social scope question");
 await click(host.querySelector(".app-chat-form button[type=submit]"));
 await flush();
 const socialPost = posts.find((p) => p.path === "/api/threads/master/messages");
 assert(socialPost, "social chat send posted");
-equal(socialPost?.body.app, { install_id: "install-social", context_id: "ctx-beta" }, "send carries the just-picked scope, never the stale one");
-// Switching installation clears the stale social scope: the next
-// install sends its own scope, never the social one.
+equal(socialPost?.body.app, { install_id: "install-social", context_id: "ctx-brand" }, "send binds the one active context, never a remembered id");
+// CAD-1702: a zero-context Social install gets its General context on open;
+// the mount and the send use it instead of an empty scope. Without the fix
+// no create is posted and the send binds no context.
+socialZeroContexts.length = 0;
+posts.length = 0;
+await React.act(async () => {
+  root.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, { installId: "install-social-zero", viewer: { operator: true, readOnly: false } })));
+});
+await settle(() => assert(socialZeroContexts.length === 1, "zero-context Social creates its General context"));
+const zeroCreate = posts.find((p) => p.path === "/api/app-installations/install-social-zero/contexts");
+assert(zeroCreate, "General context create posted");
+equal(zeroCreate?.body.label, "General", "the created context is General");
+await settle(() => assert(readScopes().includes("ctx-general"), "the created context becomes the scope"));
+posts.length = 0;
+await fill("#app-shell-chat-box", "zero context social");
+await click(host.querySelector(".app-chat-form button[type=submit]"));
+await flush();
+const zeroPost = posts.find((p) => p.path === "/api/threads/master/messages");
+assert(zeroPost, "zero-context social send posted");
+equal(zeroPost?.body.app, { install_id: "install-social-zero", context_id: "ctx-general" }, "send binds the created context, not an empty scope");
+// Installation switch: the next install sends its own sole context.
+reads.length = 0;
 await React.act(async () => {
   root.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, { installId: "install-second", viewer: { operator: true, readOnly: false } })));
 });
-await settle(() => assert(
-  host.textContent?.includes("Only"),
-  "second install adopts its sole active context",
-));
-assert(!host.querySelector("select[data-social-context]"), "a one-context install shows no context control");
+await settle(() => assert(readScopes().includes("ctx-only"), "second install adopts its sole active context"));
 posts.length = 0;
 await fill("#app-shell-chat-box", "second install question");
 await click(host.querySelector(".app-chat-form button[type=submit]"));
 await flush();
 const secondPost = posts.find((p) => p.path === "/api/threads/master/messages");
 assert(secondPost, "second install send posted");
-equal(secondPost?.body.app, { install_id: "install-second", context_id: "ctx-only" }, "install switch clears stale social scope");
+equal(secondPost?.body.app, { install_id: "install-second", context_id: "ctx-only" }, "install switch clears the social scope");
 
 // Cold deep links (CAD-863, browser blocker): a fresh mount of the
 // real URL — no manual selection, no same-key navigation — must adopt
@@ -595,15 +473,19 @@ equal(secondPost?.body.app, { install_id: "install-second", context_id: "ctx-onl
 // switch or remembered-scope residue from the earlier flow.
 await React.act(async () => { root.unmount(); });
 win.sessionStorage.clear();
-async function mountColdCold(url: string, install: string) {
+async function mountColdCold(url: string, install: string, scope: string) {
   const hostEl = document.createElement("div");
   document.body.append(hostEl);
   const cold = createRoot(hostEl);
   history.pushState(null, "", url);
+  reads.length = 0;
   await React.act(async () => {
     cold.render(React.createElement(AppShell, { installId: install, viewer: { operator: true, readOnly: false } }));
   });
-  await settle(() => assert((hostEl.textContent ?? "").includes("Reports"), `cold mount renders: ${url}`));
+  await settle(() => {
+    assert((hostEl.textContent ?? "").includes("Reports"), `cold mount renders: ${url}`);
+    assert(readScopes().includes(scope), `cold mount adopts ${scope}: ${url}`);
+  });
   await flush(); await flush();
   return { hostEl, cold };
 }
@@ -613,13 +495,9 @@ async function mountColdCold(url: string, install: string) {
   const { hostEl, cold } = await mountColdCold(
     "/app-installations/install-shell?ctx=ctx-a&crm=customers&record=rec-1",
     "install-shell",
+    "ctx-a",
   );
-  // The adopted label "<label> · version" distinguishes adoption from
-  // the un-adopted scope picker (which also prints context labels as
-  // link text). Assert the bound label, not the picker's options.
-  assert((hostEl.textContent ?? "").includes("Acme · 0.1.0"), "cold ctx+record link adopts the authored context");
-  assert(!(hostEl.textContent ?? "").includes("No context ·"), "cold ctx+record link does not fall back to the scope picker");
-  assert(location.search.includes("ctx=ctx-a") && location.search.includes("record=rec-1"), "cold link params survive adoption");
+  assert(location.search.includes("record=rec-1") && !location.search.includes("ctx="), "cold link keeps its record and loses the selector");
   await React.act(async () => { cold.unmount(); });
   hostEl.remove();
 }
@@ -630,12 +508,11 @@ async function mountColdCold(url: string, install: string) {
   const { hostEl, cold } = await mountColdCold(
     "/app-installations/install-shell?ctx=ctx-a&crm=bogus&record=rec-2",
     "install-shell",
+    "ctx-a",
   );
   assert(location.search.includes("crm=bogus"), "an app-owned section parameter is left to the app");
-  assert(location.search.includes("ctx=ctx-a"), "the authored ctx is kept");
+  assert(!location.search.includes("ctx="), "the authored ctx is normalized away");
   assert(location.search.includes("record=rec-2"), "the authored record is kept");
-  assert((hostEl.textContent ?? "").includes("Acme · 0.1.0"), "the context still adopts");
-  assert(!(hostEl.textContent ?? "").includes("No context ·"), "no fall back to the scope picker");
   await React.act(async () => { cold.unmount(); });
   hostEl.remove();
 }
@@ -644,13 +521,12 @@ async function mountColdCold(url: string, install: string) {
 // adopts rather than dropping the whole link.
 {
   const { hostEl, cold } = await mountColdCold(
-    "/app-installations/install-shell?ctx=ctx-b&record=../escape",
+  "/app-installations/install-shell?ctx=ctx-a&record=../escape",
     "install-shell",
+    "ctx-a",
   );
   assert(!location.search.includes("record="), "malformed record id is stripped");
-  assert(location.search.includes("ctx=ctx-b"), "malformed record keeps the authored ctx");
-  assert((hostEl.textContent ?? "").includes("Beta · 0.1.0"), "malformed record still adopts the context");
-  assert(!(hostEl.textContent ?? "").includes("No context ·"), "malformed record does not fall back to the scope picker");
+  assert(readScopes().includes("ctx-a") && !location.search.includes("ctx="), "malformed record keeps the scope on the wire, not in the URL");
   await React.act(async () => { cold.unmount(); });
   hostEl.remove();
 }
@@ -660,6 +536,7 @@ async function mountColdCold(url: string, install: string) {
   const { hostEl, cold } = await mountColdCold(
     "/app-installations/install-shell?ctx=ctx-gone&record=rec-9",
     "install-shell",
+    "ctx-a",
   );
   assert(!location.search.includes("ctx=") && !location.search.includes("record="), "stale cold link clears scope and record");
   assert((hostEl.textContent ?? "").includes("not active"), "stale cold link explains itself");
@@ -680,12 +557,12 @@ async function mountColdCold(url: string, install: string) {
   });
   await flush();
   assert((hostEl.textContent ?? "").includes("Sign in as the operator"), "unproven viewer sees the sign-in note, never records");
+  reads.length = 0;
   await React.act(async () => {
     cold.render(React.createElement(AppShell, { installId: "install-shell", viewer: { operator: true, readOnly: false } }));
   });
-  await settle(() => assert((hostEl.textContent ?? "").includes("Acme · 0.1.0"), "operator false→true cold link adopts the context"));
-  assert(!(hostEl.textContent ?? "").includes("No context ·"), "operator transition does not fall back to the scope picker");
-  assert(location.search.includes("ctx=ctx-a") && location.search.includes("record=rec-3"), "operator transition keeps the authored link");
+  await settle(() => assert(readScopes().includes("ctx-a"), "operator false→true cold link adopts the context"));
+  assert(location.search.includes("record=rec-3") && !location.search.includes("ctx="), "operator transition keeps the record without the selector");
   await React.act(async () => { cold.unmount(); });
   hostEl.remove();
 }
@@ -723,8 +600,9 @@ async function mountColdCold(url: string, install: string) {
   await React.act(async () => {
     soleRoot.render(React.createElement(AppShell, { installId: "install-crm", viewer: { operator: true, readOnly: false } }));
   });
-  await settle(() => assert(location.search.includes("ctx=ctx-a"), "a scopeless record link resolves to the sole active context"));
+  await settle(() => assert(readScopes().includes("ctx-a"), "a scopeless record link resolves to the sole active context on the wire"));
   assert(location.search.includes("record=cust-0123456789ab"), "the record survives resolution");
+  assert(!location.search.includes("ctx="), "the URL never carries a context after resolution");
   assert(!(sole.textContent ?? "").includes("names no context"), "single-context mode shows no refusal");
   assert(!sole.querySelector("[data-link-notice]"), "single-context mode shows no notice at all");
   await React.act(async () => { soleRoot.unmount(); });
