@@ -22,12 +22,13 @@ write row.
 | `/api/threads/{alias}[/stream]` | chat read | the generic gate — **not** `admit_operator_read`; a member reads it | `POST` on `/{alias}/messages` and `/{alias}/conversations` only |
 | `/api/app-installations/{id}/screens/{tag}/mount` | — | — | `POST`, `ScreenRead` |
 
-Only three of these are genuinely bidirectional on one path
-(`/api/app-installations`, `/{id}/conversations`, `/api/wiki/*`). The rest are a
-read-only path beside differently shaped write paths. A path-first resolver would
-shadow the read on the bidirectional three, and would invent a bare `POST` on
-`/api/threads/{alias}` if the read path were moved as a write row — so the
-inventory, not the mechanism, is the risk.
+Four of these are genuinely bidirectional on one path —
+`/api/app-installations`, `/{id}/conversations`, `/api/wiki/*` and
+`/api/issues/{id}` (a read plus `PATCH`). The rest are a read-only path beside
+differently shaped write paths. A path-first resolver would shadow the read on
+those four, and would invent a bare `POST` on `/api/threads/{alias}` if the read
+path were moved as a write row — so the inventory, not the mechanism, is the
+risk.
 
 ## 2. Two gates, not one
 
@@ -40,9 +41,25 @@ migration must keep that:
 | Write (`write_route`) | For every non-`Session` table row the current dispatcher calls `operator::admit` **before** comparing the method, so a read-only board answers `403 read_only` and an unauthenticated caller its guard refusal before any 405. |
 
 Consequently a `MethodOnly` outcome must not be an early 405. The resolver
-returns it, and the dispatcher applies the gate for the classes the path
-declares, in the same order the chain uses today, and only then answers 405. The
-`Allow` header is additive; the body stays `{"error": "method not allowed"}`.
+returns it and the dispatcher runs **the admission the request's own method would
+get today**, then answers the mismatch pair.
+
+That admission is not the path's declared classes. A method mismatch has no table
+class today: `class_of` returns `None`, `route_class` then consults the legacy
+method-specific rows and falls back to `OperatorOnly`. So `PATCH
+/api/app-installations/x/screens/y/mount` is `OperatorOnly` today even though the
+path's `POST` row is `ScreenRead`, and on a read-only board it is refused `403
+read_only` before any mismatch answer. `MethodOnly` must keep exactly that:
+
+- a **write** method (`POST`, `PATCH`, `DELETE`, `PUT`) runs `operator::admit`
+  with the legacy classification — the path rows' classes are *not* used, and a
+  migrated `ScreenRead` read row must not make an unmatched `POST` member-capable;
+- a **read** method that reaches `MethodOnly` (a path with only write rows) runs
+  the read gate the read chain would run for it (`admit_read`), then answers the
+  mismatch pair.
+
+The `Allow` header is additive. The body is the matched row's own mismatch pair
+below, never a flattened message.
 
 **Mismatch statuses are per path today, and the table must not flatten them:**
 
@@ -52,7 +69,7 @@ declares, in the same order the chain uses today, and only then answers 405. The
 | `POST /api/threads/{alias}` | `404 no such thread write route` |
 | `POST /api/issues/{id}` | `405 no such write route` (not `method not allowed`) |
 | `POST /api/setup` | `405 setup is read-only here — GET only` |
-| `GET` on a write-only row (e.g. `/api/update`) | `405 method not allowed` after admission |
+| `GET` on a write-only row (e.g. `/api/app-installations/upload`) | `405 method not allowed` after admission |
 
 So a row carries its mismatch pair — status, message — exactly as it carries its
 `invalid` pair, and `MethodOnly` answers the pair of the rows it found. A row
@@ -61,15 +78,16 @@ the code does today.
 
 ## 3. HEAD is a read
 
-`handle` admits `GET` **and** `HEAD` into the read chain, and every
-read arm serves both (`head_only` only strips the body in `send`). A resolver
-that matches `GET` exactly would turn today's `HEAD` into a 405 on every migrated
-read row.
+`handle` admits `GET` **and** `HEAD` into the read chain, and the read arms in
+this migration's scope serve both (`head_only` only strips the body in `send`).
+Not every read arm does: `/api/stream` and `/api/threads/{alias}/stream` refuse
+`HEAD` explicitly.
 
-Rule: `HEAD` resolves to the `GET` row of the same pattern and is admitted and
-handled identically; only the response body is suppressed, as `send` already
-does. Rows are declared `GET`; `HEAD` is never declared. `Allow` for a
-read row therefore lists `GET, HEAD`.
+Rule, scoped to rows whose existing arm serves both: `HEAD` resolves to the
+`GET` row of the same pattern and is admitted and handled identically, with only
+the body suppressed; `Allow` lists `GET, HEAD`. A row whose arm refuses `HEAD`
+today declares `HEAD` refusal on the row (its own mismatch pair) when its slice
+arrives — a global `HEAD`→`GET` rule would erase that restriction.
 
 ## 4. Resolution outcomes
 
@@ -134,9 +152,11 @@ today's boundary:
 Checks: each admitted read answers byte-for-byte what its arm answers today
 (status, body, `ETag`); the same request as a member, as an agent, and
 anonymously answers the same status as today; `HEAD` answers the GET status and
-headers with no body; `POST` on each pattern selects the write row and does not
-change the read result; a wrong method on a write-only sibling keeps its current
-mismatch status. The three arms are deleted from `serve.rs` in the same commit
+headers with no body; `POST` on the list and conversations patterns selects
+their write row and does not change the read result; `POST` on the show pattern
+keeps its current admitted `404 no such write route`, because it has no write
+row and must not gain one; a wrong method on a write-only sibling keeps its
+current mismatch status. The three arms are deleted from `serve.rs` in the same commit
 that adds the rows.
 
 ## 7. What this spike does not settle
