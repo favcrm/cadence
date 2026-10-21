@@ -1307,8 +1307,9 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "platform_call",
         Rule::Handler(
-            "request_caller: the calling agent is connection-derived; the \
-             record's agent is never a request field (CAD-506)",
+            "request_caller: the calling agent is connection-derived; a proven \
+             operator may run read/draft tools, a send still needs an agent \
+             (CAD-506, CAD-1642)",
         ),
     ),
     (

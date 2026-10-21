@@ -1771,3 +1771,196 @@ fn cad1218_platform_owner_is_an_approver_and_member_never() {
         "only the owner's Publish enqueued"
     );
 }
+
+#[test]
+fn cad1642_platform_call_operator_lane_refusals() {
+    use crate::contract_fixture::{ToolTable, Verified};
+    use crate::daemon::{ServeOptions, Shared};
+    use crate::platform::PlatformAdapter;
+    use crate::store::NewAgent;
+    use crate::test_seam::{scoped, Asserted};
+    use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct Probe {
+        table: ToolTable,
+        calls: AtomicUsize,
+    }
+
+    impl PlatformAdapter for Probe {
+        fn table(&self) -> &ToolTable {
+            &self.table
+        }
+
+        fn reported_manifest_version(&self) -> Option<String> {
+            self.table.manifest_version.clone()
+        }
+
+        fn credentialless(&self) -> bool {
+            true
+        }
+
+        fn preview(&self, account: &str, tool: &str, _input: &Value) -> String {
+            format!("{account}/{tool}")
+        }
+
+        fn execute(
+            &self,
+            credential: &[u8],
+            tool: &str,
+            _input: &Value,
+            _idempotency_key: &str,
+            _expected_hash: Option<&str>,
+        ) -> std::result::Result<Value, String> {
+            assert!(credential.is_empty(), "credentialless call loaded custody");
+            assert!(matches!(tool, "peek" | "edit"), "send reached execution");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"tool": tool}))
+        }
+
+        fn read_back(&self, _tool: &str, _input: &Value) -> Verified {
+            Verified::Unknown
+        }
+
+        fn source_hash(&self, _agent: &str, _source: &str) -> Option<String> {
+            None
+        }
+    }
+
+    let root = tempfile::Builder::new()
+        .prefix("cad1642-caller-gate-")
+        .tempdir()
+        .unwrap();
+    let state = root.path().join("state");
+    let pm = root.path().join("pm");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    crate::issue::Pm::init(&pm).unwrap();
+
+    let probe = Arc::new(Probe {
+        table: ToolTable::from_json(&json!({
+            "platform": "gate-probe",
+            "manifest_version": "gate-probe@1",
+            "tools": [
+                {"tool": "peek", "effect": "read", "scopes": ["probe.read"]},
+                {"tool": "edit", "effect": "draft", "scopes": ["probe.write"]},
+                {"tool": "send", "effect": "send", "scopes": ["probe.write"]}
+            ]
+        }))
+        .unwrap(),
+        calls: AtomicUsize::new(0),
+    });
+    let mut opts = ServeOptions {
+        provider_env: crate::adapter::ProviderEnv::refusing_providers(),
+        lease: Some(Default::default()),
+        test_seam: true,
+        ..Default::default()
+    };
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+    opts.provider_env
+        .set("CADENCE_HOME", home.to_str().unwrap());
+    opts.platforms.insert("gate-probe".into(), probe.clone());
+    let shared = Shared::new(&state, &opts).unwrap();
+    shared
+        .store
+        .register_agent(&NewAgent {
+            alias: "gate-agent",
+            provider: "fake",
+            endpoint_kind: "fake",
+            role: "worker",
+            cwd: root.path().to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    let pid = std::process::id();
+    let params = |tool: &str| {
+        json!({
+            "platform": "gate-probe",
+            "account": "account",
+            "tool": tool,
+            "input": {}
+        })
+    };
+
+    // A real registered agent without grants cannot borrow the operator lane.
+    for tool in ["peek", "edit"] {
+        let error = scoped(Asserted::Agent("gate-agent".into()), || {
+            shared.dispatch("platform_call", &params(tool), pid)
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), "rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("holds no grant on gate-probe/account")
+                || error
+                    .to_string()
+                    .contains("no credential is enrolled for gate-probe/account"),
+            "{tool} must fail at the account grant, not reach the adapter: {error}"
+        );
+    }
+
+    // Also exercise the fallback itself for an agent-identified but unnamed lane.
+    scoped(Asserted::Agent(String::new()), || {
+        let request = params("peek");
+        let original = shared
+            .request_caller(&request, pid, "platform call")
+            .unwrap_err();
+        assert!(original.to_string().contains("caller identity underivable"));
+        let actual = shared.dispatch("platform_call", &request, pid).unwrap_err();
+        assert_eq!(actual.kind(), original.kind());
+        assert_eq!(actual.to_string(), original.to_string());
+    });
+
+    // A positively proven operator still cannot stage or execute a send.
+    let error = scoped(Asserted::Operator, || {
+        shared.dispatch("platform_call", &params("send"), pid)
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), "rejected");
+    assert!(
+        error.to_string().contains(
+            "platform call: a send effect needs an agent; the operator releases it with the effect decision"
+        ),
+        "operator send must retain the send-needs-an-agent refusal: {error}"
+    );
+    assert!(shared.store.platform_effects(None).unwrap().is_empty());
+
+    // Neither an agent nor a proven operator: preserve the original refusal.
+    for tool in ["peek", "edit", "send"] {
+        scoped(Asserted::Unproven, || {
+            let request = params(tool);
+            let original = shared
+                .request_caller(&request, pid, "platform call")
+                .unwrap_err();
+            assert!(original
+                .to_string()
+                .contains("this connection derives no agent identity"));
+            let actual = shared.dispatch("platform_call", &request, pid).unwrap_err();
+            assert_eq!(actual.kind(), original.kind());
+            assert_eq!(actual.to_string(), original.to_string());
+        });
+    }
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+
+    // Positive controls: identical read/draft requests can reach this adapter
+    // only after the asserted positive operator proof; no custody is enrolled.
+    for (tool, effect) in [("peek", "read"), ("edit", "draft")] {
+        let value = scoped(Asserted::Operator, || {
+            shared.dispatch("platform_call", &params(tool), pid)
+        })
+        .unwrap();
+        assert_eq!(value["result"], json!("executed"));
+        assert_eq!(value["effect"], json!(effect));
+        assert_eq!(value["platform_result"]["tool"], json!(tool));
+    }
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
+    assert!(shared.store.platform_effects(None).unwrap().is_empty());
+}

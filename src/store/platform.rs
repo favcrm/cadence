@@ -786,7 +786,10 @@ impl Store {
                 params![platform, account],
                 |r| r.get(0),
             )?;
-            if enrolled.is_none() && !crate::platform::is_builtin(platform, account) {
+            if enrolled.is_none()
+                && !crate::platform::is_builtin(platform, account)
+                && !crate::platform::saved_login_account(platform, account)
+            {
                 return Err(Error::rejected(format!(
                     "platform '{platform}' account '{account}' is not enrolled — \
                              `platform enroll` first"
@@ -937,7 +940,10 @@ impl Store {
                 params![platform, account],
                 |r| r.get(0),
             )?;
-            if enrolled.is_none() && !crate::platform::is_builtin(platform, account) {
+            if enrolled.is_none()
+                && !crate::platform::is_builtin(platform, account)
+                && !crate::platform::saved_login_account(platform, account)
+            {
                 return Err(Error::rejected(format!(
                     "platform '{platform}' account '{account}' is not enrolled — \
                              `platform enroll` first"
