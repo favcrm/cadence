@@ -737,7 +737,16 @@
         let (dir, s) = store();
         let cwd = dir.path().join("w");
         let kickoff = seeded_task(&s, &cwd);
-        let _ = run_kickoff(&s, &kickoff);
+        let m = run_kickoff(&s, &kickoff);
+        // Drain the kickoff message so the open-message guard is not what
+        // keeps the row; the task stays non-terminal on its own.
+        s.finish(
+            &m,
+            "completed",
+            &json!({"status": "completed", "text": "done", "sha": SHA40_A}),
+            None,
+        )
+        .unwrap();
         s.fixture_write(|c| (*c).execute(
                 "UPDATE agents SET state='stopped', enabled=0, endpoint=NULL,
                  updated=? WHERE alias='w1'",
