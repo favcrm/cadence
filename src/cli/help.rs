@@ -36,10 +36,6 @@ const CORE: &[(&str, &[(&str, &str)])] = &[
         &[
             ("send", "Enqueue a durable message to an agent"),
             ("dispatch", "Start an issue and send its worker the kickoff"),
-            (
-                "local-agent",
-                "Connect your local agent to hosted issue work",
-            ),
             ("join", "Join a new worker agent to a group"),
             ("agent", "List and manage registered agents"),
         ],
@@ -147,6 +143,7 @@ const ADVANCED: &[&str] = &[
 #[cfg(test)]
 const INTERNAL: &[&str] = &[
     "confine",
+    "local-agent",
     "mcp-agent",
     "mcp-permission",
     "rollout",
@@ -640,7 +637,7 @@ mod tests {
         let hidden = originally_hidden();
         // `skill sync` is the hidden implementation `cadence update` calls.
         // `cadence skill install` stays the visible manual repair.
-        assert_eq!(hidden.len(), 9, "{hidden:?}");
+        assert_eq!(hidden.len(), 13, "{hidden:?}");
         for view in [
             render_root(false),
             render_root(true),

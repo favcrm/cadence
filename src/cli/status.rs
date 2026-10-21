@@ -8,7 +8,12 @@ use super::*;
 /// one root, `--all` to nothing smaller than the install; unset scopes
 /// like `agent list` (the caller's group inside a pane, everything
 /// otherwise) — `scope` in the payload names which applied.
-pub(super) fn status_view(state_dir: &Path, group: Option<&str>, all: bool) -> Result<Value> {
+pub(super) fn status_view(
+    state_dir: &Path,
+    group: Option<&str>,
+    all: bool,
+    placement: Option<registry::Placement>,
+) -> Result<Value> {
     let list = list_agents(state_dir, &[], &[], &[], &[], group.is_some() || all, false)?;
     let mut agents = list["agents"].as_array().cloned().unwrap_or_default();
     let scope = if let Some(root) = group {
@@ -19,6 +24,14 @@ pub(super) fn status_view(state_dir: &Path, group: Option<&str>, all: bool) -> R
     } else {
         list["scope"].clone()
     };
+    if let Some(want) = placement {
+        agents.retain(|a| {
+            registry::placement(
+                a["provider"].as_str().unwrap_or_default(),
+                a["endpoint_kind"].as_str().unwrap_or_default(),
+            ) == want
+        });
+    }
     // Tracker issues per owner — only when a tracker is reachable.
     // `views` gives the derived status the board shows; `load_all`
     // stays a filesystem read, and claim ages come from the tracker's
@@ -464,11 +477,12 @@ pub(super) fn run_status(
     all: bool,
     json_out: bool,
     watch: Option<u64>,
+    placement: Option<registry::Placement>,
 ) -> Result<i32> {
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let json = cadence_agent::output::json_selected(json_out);
     loop {
-        let view = status_view(state_dir, group, all)?;
+        let view = status_view(state_dir, group, all, placement)?;
         if json {
             println!(
                 "{}",
@@ -490,12 +504,14 @@ pub(super) fn run_status(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     state_dir: PathBuf,
     group: Option<String>,
     all: bool,
     json: bool,
     watch: Option<u64>,
+    placement: Option<registry::Placement>,
 ) -> Result<i32> {
-    run_status(&state_dir, group.as_deref(), all, json, watch)
+    run_status(&state_dir, group.as_deref(), all, json, watch, placement)
 }

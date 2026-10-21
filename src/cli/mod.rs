@@ -128,7 +128,7 @@ use cadence_agent::error::Error;
 use cadence_agent::error::Result;
 use clap::Parser;
 use clap::Subcommand;
-use commands::Commands;
+use commands::{Commands, PlacementArg};
 use connection::ConnectionAction;
 use daemon::DaemonAction;
 use delivery::DeliveryAction;
@@ -1732,6 +1732,26 @@ pub(crate) fn list_agents(
     // Keep the advertised capacity in the same scope as the visible rows.
     list["live"] = json!(count_live_agents(&list));
     Ok(list)
+}
+
+/// Keep only rows whose derived placement matches, and recompute the
+/// derived `live` count when the payload carries one, so a filtered read
+/// never reports capacity for rows it no longer shows.
+pub(crate) fn retain_by_placement(view: &mut Value, want: registry::Placement) {
+    if let Some(rows) = view["agents"].as_array_mut() {
+        rows.retain(|r| {
+            registry::placement(
+                r["provider"].as_str().unwrap_or_default(),
+                r["endpoint_kind"].as_str().unwrap_or_default(),
+            ) == want
+        });
+    }
+    if view.get("live").is_some() {
+        view["live"] = json!(count_live_agents(view));
+    }
+    if view.get("footer").is_some() {
+        view["footer"]["live"] = json!(count_live_agents(view));
+    }
 }
 
 fn count_live_agents(list: &Value) -> usize {

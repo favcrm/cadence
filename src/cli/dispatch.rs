@@ -6,7 +6,7 @@ use super::*;
 pub(super) fn run(
     state_dir: PathBuf,
     issue: String,
-    to: String,
+    to: Option<String>,
     note: Option<PathBuf>,
     name: Option<String>,
     base: Option<String>,
@@ -30,6 +30,11 @@ pub(super) fn run(
         print_json(&out);
         return Ok(0);
     }
+    let Some(to) = to else {
+        return Err(Error::usage(
+            "dispatch outside the master requires --to <alias> — the ticket owner is used only for the master",
+        ));
+    };
     let pm = cadence_agent::issue::Pm::open_default()?;
     let args = cadence_agent::issue::dispatch::DispatchArgs {
         to: to.clone(),

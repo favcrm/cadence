@@ -31,6 +31,7 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             all,
             json: _,
             watch,
+            placement: _,
         } => {
             if watch.is_some() {
                 return Err(unsupported(
@@ -66,6 +67,7 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
                     sort,
                     limit,
                     fields,
+                    placement: _,
                     json: _,
                 },
         } => {
@@ -497,7 +499,15 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             force,
             nudge,
             steer,
+            wait,
         } => {
+            if wait.is_some() {
+                return Err(unsupported(
+                    "send",
+                    "--wait",
+                    "a remote send is a durable enqueue; read the outcome with `message read`",
+                ));
+            }
             let recipient = alias.as_deref().or(to.as_deref()).unwrap_or_default();
             return remote_send_args(
                 recipient, text, file, message, reply_to, task, *ready, *force, *nudge, steer,
@@ -1226,6 +1236,17 @@ fn name(command: &Commands) -> &'static str {
     }
 }
 
+/// The placement filter a remote read carries, if any.
+fn placement_of(command: &Commands) -> Option<registry::Placement> {
+    match command {
+        Commands::Status { placement, .. } => placement.map(PlacementArg::placement),
+        Commands::Agent {
+            action: AgentAction::List { placement, .. },
+        } => placement.map(PlacementArg::placement),
+        _ => None,
+    }
+}
+
 /// Entry point for a `Remote` resolution (called by `action_dispatch`
 /// instead of the local `dispatch`). `Org` stays local — it edits the
 /// registry, not a daemon — so `org switch local` still gets you home.
@@ -1283,6 +1304,11 @@ pub(super) fn run(
     {
         return settings::run_remote(&target, action, grant, wake_timeout, local_state.as_deref());
     }
+    if let Commands::Agent { action } = &command {
+        if let Some(bridge) = action.bridge() {
+            return local_agent::run(&target, &bridge, wake_timeout, local_state);
+        }
+    }
     if let Commands::LocalAgent { action } = &command {
         return local_agent::run(&target, action, wake_timeout, local_state);
     }
@@ -1330,6 +1356,9 @@ pub(super) fn run(
                 "hosted dispatch does not open a job. Nothing was sent.",
             ));
         }
+        let Some(to) = to.as_deref() else {
+            return Err(Error::usage("hosted dispatch requires --to <alias>"));
+        };
         return local_agent::dispatch(&target, issue, to);
     }
     if let Commands::Issue {
@@ -1450,7 +1479,13 @@ pub(super) fn run(
         }
     };
     match out {
-        cadence_agent::remote_cli::RemoteAnswer::Ok(body) => {
+        cadence_agent::remote_cli::RemoteAnswer::Ok(mut body) => {
+            // A placement read filter is a client-side projection of the
+            // same derived value, so the hosted read applies it before
+            // printing and recomputes the capacity count it projects.
+            if let Some(want) = placement_of(&command) {
+                retain_by_placement(&mut body, want);
+            }
             match remote_blob_cat(&target, &command, &body, deadline, wake_timeout) {
                 Ok(true) => return Ok(0),
                 Ok(false) => {}
@@ -1750,6 +1785,7 @@ mod read_contract_tests {
                 sort: ls.sort,
                 limit: ls.limit,
                 fields: ls.fields,
+                placement: None,
                 json: false,
             },
         }
@@ -1926,18 +1962,21 @@ mod read_contract_tests {
                 all: false,
                 json: false,
                 watch: None,
+                placement: None,
             },
             Commands::Status {
                 group: None,
                 all: true,
                 json: false,
                 watch: None,
+                placement: None,
             },
             Commands::Status {
                 group: None,
                 all: false,
                 json: false,
                 watch: Some(2),
+                placement: None,
             },
         ] {
             assert!(outcome(&command).is_err());
@@ -1947,6 +1986,7 @@ mod read_contract_tests {
             all: false,
             json: false,
             watch: None,
+            placement: None,
         })
         .unwrap();
         assert_eq!(verb, "status");
@@ -2160,9 +2200,22 @@ mod read_contract_tests {
             force: false,
             nudge: false,
             steer: SteerArgs::default(),
+            wait: None,
         };
         f(&mut command);
         command
+    }
+
+    #[test]
+    fn remote_send_refuses_wait() {
+        let with_wait = send_cmd(|c| {
+            let Commands::Send { wait, .. } = c else {
+                unreachable!()
+            };
+            *wait = Some(30);
+        });
+        let err = outcome(&with_wait).unwrap_err();
+        assert!(err.to_string().contains("--wait"), "{err}");
     }
 
     #[test]

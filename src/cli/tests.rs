@@ -12,6 +12,61 @@ fn scoped_live_count_uses_only_visible_rows() {
 }
 
 #[test]
+fn placement_filter_recomputes_live_and_footer_counts() {
+    let mut view = json!({"agents": [
+        {"alias": "a", "provider": "pi", "endpoint_kind": "managed", "state": "busy", "dead": false},
+        {"alias": "b", "provider": "devin", "endpoint_kind": "cloud", "state": "idle", "dead": false}
+    ], "live": 2, "footer": {"live": 2}});
+    retain_by_placement(&mut view, registry::Placement::Cloud);
+    assert_eq!(view["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(view["agents"][0]["alias"], "b");
+    assert_eq!(view["live"], json!(1));
+    assert_eq!(view["footer"]["live"], json!(1));
+}
+
+#[test]
+fn send_wait_refuses_flags_that_the_ask_path_cannot_carry() {
+    let cases: &[&[&str]] = &[
+        &["cadence", "send", "w", "--wait", "--priority", "urgent"],
+        &["cadence", "send", "w", "--wait", "--supersedes", "m1"],
+        &["cadence", "send", "w", "--wait", "--nudge"],
+    ];
+    for argv in cases {
+        let err = Cli::try_parse_from(argv.iter().copied())
+            .err()
+            .expect("must conflict");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{argv:?}"
+        );
+    }
+    assert!(Cli::try_parse_from(["cadence", "send", "w", "--wait"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "send", "w", "--wait", "30"]).is_ok());
+}
+
+#[test]
+fn send_wait_and_message_ask_accept_the_same_wait_values() {
+    for secs in ["0", "1", "600", "601"] {
+        assert!(
+            Cli::try_parse_from(["cadence", "send", "w", "--wait", secs]).is_ok(),
+            "send --wait {secs}"
+        );
+        assert!(
+            Cli::try_parse_from(["cadence", "message", "ask", "w", "--text", "hi", "--wait", secs])
+                .is_ok(),
+            "message ask --wait {secs}"
+        );
+    }
+}
+
+#[test]
+fn dispatch_parses_without_to_for_the_master_route() {
+    assert!(Cli::try_parse_from(["cadence", "dispatch", "CAD-1"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "dispatch", "CAD-1", "--to", "w"]).is_ok());
+}
+
+#[test]
 fn hosted_enrollment_cli_requires_explicit_trust_and_has_no_secret_argv() {
     let args = [
         "cadence",

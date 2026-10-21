@@ -1,5 +1,6 @@
 //! CAD-535: `cadence agent` — moved verbatim from src/main.rs.
 
+use super::local_agent;
 use super::*;
 
 /// `agent show` lists this many terminal messages by default (CAD-879);
@@ -20,6 +21,59 @@ fn show_params(alias: &str, limit: Option<u64>, since: Option<String>, all: bool
         }
     }
     params
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_bridge_verbs_map_to_the_existing_actions() {
+        assert!(matches!(
+            AgentAction::Connect {
+                alias: Some("w".into()),
+                repo: None,
+                name: None,
+            }
+            .bridge(),
+            Some(local_agent::LocalAgentAction::Connect { .. })
+        ));
+        assert!(matches!(
+            AgentAction::Watch.bridge(),
+            Some(local_agent::LocalAgentAction::Watch)
+        ));
+        assert!(matches!(
+            AgentAction::Assignments.bridge(),
+            Some(local_agent::LocalAgentAction::Status)
+        ));
+        assert!(matches!(
+            AgentAction::Disconnect.bridge(),
+            Some(local_agent::LocalAgentAction::Disconnect)
+        ));
+        assert!(matches!(
+            AgentAction::Reassign {
+                assignment: "a1".into(),
+                to: None,
+                cancel: true,
+            }
+            .bridge(),
+            Some(local_agent::LocalAgentAction::Reassign { .. })
+        ));
+        assert!(AgentAction::List {
+            all: false,
+            state: vec![],
+            provider: vec![],
+            kind: vec![],
+            project: vec![],
+            sort: None,
+            limit: None,
+            fields: vec![],
+            placement: None,
+            json: false,
+        }
+        .bridge()
+        .is_none());
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +206,11 @@ pub(crate) enum AgentAction {
         /// Keep only these keys in each row (comma-joined).
         #[arg(long, value_delimiter = ',')]
         fields: Vec<String>,
+        /// Only agents whose process runs there: local (this host),
+        /// cloud (provider-hosted) or queue (a mailbox). Derived from
+        /// `(provider, endpoint_kind)`, never chosen by the caller.
+        #[arg(long, value_enum)]
+        placement: Option<PlacementArg>,
         /// Output is JSON already — accepted for grammar parity.
         #[arg(long)]
         json: bool,
@@ -393,6 +452,64 @@ pub(crate) enum AgentAction {
         #[arg(long)]
         older_than: Option<String>,
     },
+    /// Bind this machine's local actor to the selected hosted org and
+    /// claim queued work. Local execution by definition; `--org` names
+    /// the board, never the placement.
+    Connect {
+        /// Local daemon alias that will read the issue.
+        #[arg(long)]
+        alias: Option<String>,
+        /// Local git checkout. Without it the alias is only saved.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Lane slug. Defaults to `work`.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Keep picking up later assignments until disconnected or interrupted.
+    Watch,
+    /// Show this machine's alias and the assignments the board returned.
+    Assignments,
+    /// Stop local pickup without stopping actors or cancelling claims.
+    Disconnect,
+    /// Move or cancel a live assignment.
+    Reassign {
+        assignment: String,
+        /// Directory user id that should take the work.
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        cancel: bool,
+    },
+}
+
+impl AgentAction {
+    /// The hosted local-binding verbs, mapped onto the existing
+    /// implementation. `None` for every ordinary agent verb, so routing
+    /// stays a single check instead of a second command family.
+    pub(crate) fn bridge(&self) -> Option<local_agent::LocalAgentAction> {
+        use local_agent::LocalAgentAction as L;
+        Some(match self {
+            Self::Connect { alias, repo, name } => L::Connect {
+                alias: alias.clone(),
+                repo: repo.clone(),
+                name: name.clone(),
+            },
+            Self::Watch => L::Watch,
+            Self::Assignments => L::Status,
+            Self::Disconnect => L::Disconnect,
+            Self::Reassign {
+                assignment,
+                to,
+                cancel,
+            } => L::Reassign {
+                assignment: assignment.clone(),
+                to: to.clone(),
+                cancel: *cancel,
+            },
+            _ => return None,
+        })
+    }
 }
 
 pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
@@ -481,12 +598,16 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
             sort,
             limit,
             fields,
+            placement,
             json: _,
         } => {
             // Stamp rows with their tracker project when the filter or
             // the sort reads it.
             let stamp = !project.is_empty() || sort.as_deref() == Some("project");
             let mut out = list_agents(&state_dir, &state, &provider, &kind, &project, all, stamp)?;
+            if let Some(want) = placement {
+                retain_by_placement(&mut out, want.placement());
+            }
             shape_rows(
                 &mut out,
                 "agents",
@@ -702,6 +823,17 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
         AgentAction::Gc { older_than } => {
             let secs = older_than.as_deref().map(parse_duration).transpose()?;
             client::rpc(&state_dir, "agent_gc", json!({"older_than": secs}))?
+        }
+        // Routed before this function by the caller; refused here so a
+        // future routing bypass cannot claim locally.
+        AgentAction::Connect { .. }
+        | AgentAction::Watch
+        | AgentAction::Assignments
+        | AgentAction::Disconnect
+        | AgentAction::Reassign { .. } => {
+            return Err(Error::usage(
+                "agent connect/watch/assignments/disconnect/reassign coordinate a hosted org with this machine. Select that org, or switch back from `--org local`. Nothing was claimed.",
+            ))
         }
     };
     print_json(&result);
