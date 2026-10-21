@@ -79,7 +79,11 @@ fn check_flags(o: &Options) -> Result<()> {
     }
     if o.activate_disabled || o.activate_preflight {
         // Offline activation never reaches a controller.
-        if o.preflight || o.replace.enabled || o.activate.enabled {
+        if o.preflight
+            || o.replace.enabled
+            || o.activate.enabled
+            || (o.activate_disabled && o.activate_preflight)
+        {
             return Err(Error::usage(
                 "choose one of --preflight, --replace, --activate, --activate-disabled or --activate-preflight",
             ));

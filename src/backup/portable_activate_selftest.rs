@@ -346,6 +346,23 @@ fn cad1705_offline_activate_refuses_non_exact_reconciliation() {
 }
 
 #[test]
+fn cad1705_offline_activate_refuses_a_target_inside_the_package() {
+    let (_root, package) = restored_with_queued_message("offline-overlap");
+    let inside = package.join("inside");
+    let err = restore_activate_disabled(&package, &inside, &[]).expect_err("overlap refused");
+    assert!(
+        err.to_string().contains("inside the source package"),
+        "{err}"
+    );
+    assert!(!inside.exists(), "nothing created inside the package");
+    // A target that contains the package is refused too.
+    let (root, package) = restored_with_queued_message("offline-overlap-parent");
+    let err =
+        restore_activate_disabled(&package, &root, &[]).expect_err("containing target refused");
+    assert!(err.to_string().contains("exists"), "{err}");
+}
+
+#[test]
 fn cad1705_activate_preflight_lists_the_package_inventory_and_writes_nothing() {
     let (root, package) = restored_with_queued_message("offline-preflight");
     let plan_out = activate_preflight(&package).expect("preflight");

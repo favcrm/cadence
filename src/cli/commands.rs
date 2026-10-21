@@ -311,12 +311,12 @@ pub(crate) enum Commands {
         /// (AOS-339). The destination must not exist, so this can only create a
         /// fenced root and never changes an existing one. No controller and no
         /// operator connection; imported actors stay disabled.
-        #[arg(long, requires = "portable")]
+        #[arg(long, requires = "portable", conflicts_with = "activate_preflight")]
         activate_disabled: bool,
         /// With `--portable`: read-only activation plan for the package. Prints
         /// the package digest and the exact required reconciliation list and
         /// writes nothing.
-        #[arg(long, requires = "portable")]
+        #[arg(long, requires = "portable", conflicts_with = "activate_disabled")]
         activate_preflight: bool,
         /// With `--activate` or `--activate-disabled`: JSON reconciliation file.
         /// Its `reconciliation` array lists every non-terminal row as retained

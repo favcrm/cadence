@@ -2424,15 +2424,12 @@ pub fn restore_activate_disabled(
     let manifest = verify_package(source)?;
     let digest = crate::backup::portable_replace::package_digest(source)?;
     refuse_existing_activation(destination)?;
-    let parent = destination
+    // The package and the target must be disjoint: staging beside, inside or
+    // over the package would read and write the same tree.
+    let target = crate::backup::portable_replace::offline_activation_target(source, destination)?;
+    let parent = target
         .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    if !parent.is_dir() {
-        return Err(Error::rejected(
-            "destination parent directory does not exist",
-        ));
-    }
+        .ok_or_else(|| Error::rejected("destination has no parent directory"))?;
     let stage = parent.join(format!(".portable-stage-{}", nonce()));
     fs::DirBuilder::new().mode(0o700).create(&stage)?;
     let outcome = (|| {
@@ -2444,10 +2441,10 @@ pub fn restore_activate_disabled(
             &digest,
             reconciliation,
         )?;
-        publish_stage(&stage, destination)?;
+        publish_stage(&stage, &target)?;
         if let Some(obj) = report.as_object_mut() {
             obj.insert("restored".into(), json!(true));
-            obj.insert("destination".into(), json!(destination));
+            obj.insert("destination".into(), json!(target));
             obj.insert("package_digest".into(), json!(digest));
         }
         Ok(report)
