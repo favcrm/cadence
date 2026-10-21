@@ -35,7 +35,7 @@ export type MyWorkMembership = "checking" | "assigned" | "unassigned";
  * `onPrivateSessionReset`); `draftKey` is `identityKey` + issue id.
  */
 export interface MyWorkPeekProps {
-  /** The verified `MyWorkPayload.owner` — "" while membership is `checking`. */
+  /** The verified `MyWorkMembership.owner` — "" while membership is `checking`. */
   owner: string;
   /** This issue's recorded handoff, or null when provenance is unavailable. */
   assignment: AssignmentContext | null;
@@ -190,7 +190,7 @@ export default function Drawer({ id, detail, readState, onRetry, href, onClose, 
       return;
     }
     const issueRead = resources.issue(id).get();
-    const personalRead = resources.myWork.get();
+    const personalRead = resources.myWorkIssue(id).get();
     if (saving !== null || issueRead.inFlight || personalRead.inFlight) return;
     if (issueRead.status !== "ok" || personalRead.status !== "ok" || personal?.membership === "unassigned") {
       pendingFocus.current = null;
@@ -205,7 +205,7 @@ export default function Drawer({ id, detail, readState, onRetry, href, onClose, 
     if (document.activeElement === target) return;
     const frame = requestAnimationFrame(() => {
       if (pendingFocus.current !== request) return;
-      if (resources.issue(id).get().inFlight || resources.myWork.get().inFlight || target.disabled) return;
+      if (resources.issue(id).get().inFlight || resources.myWorkIssue(id).get().inFlight || target.disabled) return;
       if (mounted.current && privateReadsAllowed() && request.key === ctxRef.current.key &&
           request.generation === privateSessionGeneration() && target.isConnected &&
           dialogRef.current?.open && document.hasFocus()) target.focus({ preventScroll: true });
@@ -230,11 +230,11 @@ export default function Drawer({ id, detail, readState, onRetry, href, onClose, 
     if (!personal || !detail || denied || personal.drafts.get(personal.draftKey)?.pending) return;
     if (personal.membership !== "assigned" || detail.owner !== personal.owner) return;
     const liveRead = resources.issue(id).get();
-    const livePersonal = resources.myWork.get();
+    const livePersonal = resources.myWorkIssue(id).get();
     if (!privateReadsAllowed() || !liveRead.data || liveRead.discarded || liveRead.inFlight ||
         liveRead.status !== "ok" || liveRead.data.id !== id || liveRead.data.rev !== detail.rev ||
         !livePersonal.data || livePersonal.inFlight || livePersonal.status !== "ok" ||
-        livePersonal.data.owner !== personal.owner || !livePersonal.data.issues.some((row) => row.id === id)) return;
+        livePersonal.data.owner !== personal.owner || livePersonal.data.id !== id || !livePersonal.data.assigned) return;
     if (writeWhy(personal, liveRead.data, liveRead, t) !== null) return;
     if (kind === "status" && noDragReason(liveRead.data) !== null) return;
     const body = draft.comment.trim();
@@ -263,6 +263,7 @@ export default function Drawer({ id, detail, readState, onRetry, href, onClose, 
         // A different read won while this request ran. Do not overwrite it
         // with an unorderable content hash; refresh without replaying a write.
         void resource.invalidate();
+        void resources.myWorkIssue(ctx.id).invalidate();
         void resources.myWork.invalidate();
       } else personal.onWrite(resp, `${ctx.id} ${kind}`);
       if (resources.issue(ctx.id).get().discarded) {
@@ -292,6 +293,7 @@ export default function Drawer({ id, detail, readState, onRetry, href, onClose, 
           // Write refusal is not read refusal. Only the resulting current
           // read/identity retirement may purge the private snapshot and draft.
           void resources.issue(ctx.id).invalidate();
+          void resources.myWorkIssue(ctx.id).invalidate();
           void resources.myWork.invalidate();
         }
       }

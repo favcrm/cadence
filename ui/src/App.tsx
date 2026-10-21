@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, type MyWorkPayload, type WriteResp } from "./lib/api";
+import { api, ApiError, type WriteResp } from "./lib/api";
 import { useLocale } from "./lib/locale";
 import Agents from "./features/agents/Agents";
 import Apps from "./features/apps/Apps";
@@ -75,7 +75,7 @@ import { RESOURCE_NAMES } from "./lib/cache";
 import { noteThreadsChanged } from "./features/threads/threadsClient";
 import { LiveUpdates, patchRows } from "./lib/liveUpdates";
 import type { Agent, AgentsPayload } from "./lib/types";
-import { cache, onIssueUnavailable, resources } from "./lib/resources";
+import { cache, onIssueUnavailable, resources, type MyWorkList } from "./lib/resources";
 import { useMaybeResource, useResource } from "./lib/useResource";
 import {
   goTo,
@@ -137,8 +137,8 @@ const SCREEN_LABEL: Record<Screen, string> = {
 /** Screens that read the overview: Home's Needs-you rail and the full overview. */
 const overviewOn = (s: Screen) => s === "home" || s === "overview";
 
-/** Preserve personal order and provenance only while the same assignment still holds. */
-function mergePersonalCard(previous: MyWorkPayload, card: IssueCard, keepProvenance = true): MyWorkPayload {
+/** Patch a loaded queue row in place; an issue that left the caller drops out. */
+function mergePersonalCard(previous: MyWorkList, card: IssueCard): MyWorkList {
   const index = previous.issues.findIndex((row) => row.id === card.id);
   // New/reassigned rows need a fresh scoped projection, never an unrelated
   // board patch or an old write response that could resurrect a removed row.
@@ -147,9 +147,17 @@ function mergePersonalCard(previous: MyWorkPayload, card: IssueCard, keepProvena
     return { ...previous, issues: previous.issues.filter((row) => row.id !== card.id) };
   }
   const old = previous.issues[index];
-  const row = { ...card, assignment: keepProvenance ? old?.assignment ?? null : null };
   const issues = previous.issues.slice();
-  issues[index] = row;
+  issues[index] = {
+    ...old,
+    title: card.title,
+    status: card.status,
+    priority: card.priority,
+    blocked: card.blocked,
+    blocked_reason: card.blocked_reason ?? null,
+    checks: card.checks,
+    counts: { comments: card.counts.comments },
+  };
   return { ...previous, issues };
 }
 
@@ -203,6 +211,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // the last payload while it revalidates.
   const detailState = useMaybeResource(openId ? resources.issue(openId) : null);
   const personalState = useMaybeResource(screen === "myWork" ? resources.myWork : null);
+  // The peek's membership: one issue, asked of the server (the list holds one page).
+  const membershipState = useMaybeResource(screen === "myWork" && openId ? resources.myWorkIssue(openId) : null);
   const personalWanted = useRef(screen === "myWork");
   personalWanted.current = screen === "myWork";
   const [personalDrafts] = useState(() => new Map<string, MyWorkDraft>());
@@ -323,6 +333,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       void resources.issue(id).invalidate();
       void resources.lane(id).invalidate();
     }
+    // The peek's quick actions need a current membership too, so a refresh
+    // recovers a failed membership read without reopening the peek.
+    if (personalWanted.current && openIdRef.current) void resources.myWorkIssue(openIdRef.current).invalidate();
   }, []);
   useEffect(() => {
     if (openId) void resources.issue(openId).revalidate();
@@ -331,7 +344,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const invalidatePersonal = useCallback(() => {
     if (personalWanted.current) void resources.myWork.invalidate();
     else resources.myWork.markInvalid();
+    cache.invalidate("myWorkIssue");
   }, []);
+  useEffect(() => {
+    if (screen === "myWork" && openId) void resources.myWorkIssue(openId).revalidate();
+  }, [screen, openId]);
 
   useEffect(() => {
     if (screen === "myWork" && previousScreen.current !== "myWork") restorePersonal.current = true;
@@ -437,7 +454,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           } else resources.issues.mutate((rows) => patchRows(rows, data.id as string, data.op, data.issue as IssueCard, (row) => row.id));
           resources.myWork.mutate((body) => data.op === "delete"
             ? { ...body, issues: body.issues.filter((row) => row.id !== data.id) }
-            : mergePersonalCard(body, data.issue as IssueCard, false));
+            : mergePersonalCard(body, data.issue as IssueCard));
           invalidatePersonal();
         } else if (event.type === "agent") {
           if (typeof data.id !== "string" || !["upsert", "delete"].includes(String(data.op)) ||
@@ -575,6 +592,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       });
       resources.issue(resp.issue.id).write(() => resp.issue);
       resources.myWork.mutate((body) => mergePersonalCard(body, resp.card));
+      // A status or owner change can move the row to another tab or person.
+      invalidatePersonal();
       const warns = (resp.warnings ?? []).filter(Boolean);
       if (warns.length) {
         say("warn", `${verb} · ${warns.join(" · ")}`);
@@ -970,7 +989,14 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             <ProjectFilter project={project} projects={projects} hrefFor={filterHref} />
           </div>
         )}
-        {screen === "myWork" && <MyWork onOpen={openPersonal} onDetails={rememberPersonal} />}
+        {route.screen === "myWork" && (
+          <MyWork
+            view={route.view ?? {}}
+            onView={(view) => update((c) => ({ ...c, route: { screen: "myWork", view } }), { replace: true })}
+            onOpen={openPersonal}
+            onDetails={rememberPersonal}
+          />
+        )}
 
         {screen === "home" && (
           <Home
@@ -1258,13 +1284,17 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           id={openId}
           detail={detailState?.data?.id === openId ? detailState.data : null}
           readState={detailState}
-          onRetry={() => void resources.issue(openId).refresh()}
+          onRetry={() => {
+            void resources.issue(openId).refresh();
+            if (screen === "myWork") void resources.myWorkIssue(openId).refresh();
+          }}
           myWork={screen === "myWork" ? {
-            owner: personalState?.data?.owner ?? "",
-            assignment: personalState?.data?.issues.find((row) => row.id === openId)?.assignment ?? null,
-            membership: !personalState?.data || personalState.inFlight || personalState.status === "stale" || personalState.status === "failed"
+            owner: membershipState?.data?.owner ?? "",
+            assignment: membershipState?.data?.id === openId ? membershipState.data.assignment : null,
+            membership: !membershipState?.data || membershipState.data.id !== openId || membershipState.inFlight ||
+              membershipState.status === "stale" || membershipState.status === "failed"
               ? "checking"
-              : personalState.data.issues.some((row) => row.id === openId) ? "assigned" : "unassigned",
+              : membershipState.data.assigned ? "assigned" : "unassigned",
             identityKey: personalIdentity,
             drafts: personalDrafts,
             draftKey: `${personalIdentity}:${openId}`,
