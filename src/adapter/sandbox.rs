@@ -90,10 +90,9 @@ pub struct CreateJob {
 /// ports, query/fragment, credentials, extra path segments) is refused.
 pub fn normalize_github_repo(raw: &str) -> Result<String> {
     let refuse = || {
-        Error::rejected(format!(
-            "cloud sandbox repo must be a github.com URL (https://github.com/owner/repo); got '{}'",
-            raw.trim()
-        ))
+        Error::rejected(
+            "cloud sandbox repo must be a github.com URL (https://github.com/owner/repo)",
+        )
     };
     let raw = raw.trim();
     let path = if let Some(rest) = raw.strip_prefix("https://github.com/") {
@@ -622,6 +621,20 @@ mod tests {
             "file:///tmp/repo",
         ] {
             assert!(normalize_github_repo(raw).is_err(), "{raw} must be refused");
+        }
+    }
+
+    #[test]
+    fn refusal_does_not_echo_credentials() {
+        for (raw, secret) in [
+            ("https://user:pass@github.com/favcrm/cadence", "pass"),
+            ("https://tok@github.com/favcrm/cadence", "tok"),
+        ] {
+            let message = normalize_github_repo(raw).unwrap_err().to_string();
+            assert!(
+                !message.contains(secret),
+                "refusal leaked {secret}: {message}"
+            );
         }
     }
 

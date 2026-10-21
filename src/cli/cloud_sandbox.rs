@@ -101,6 +101,25 @@ pub fn drive_remote(
     Ok(outcome)
 }
 
+/// Build the report evidence: the runner's text plus a bounded diff summary.
+fn done_evidence(result: &SandboxResult) -> String {
+    let mut evidence = result.text.replace("\n## ", "\n### ");
+    if let Some(diff) = &result.diff {
+        let diff = diff.trim();
+        if !diff.is_empty() {
+            let shown = diff.lines().take(200).collect::<Vec<_>>().join("\n");
+            let omitted = diff.lines().count().saturating_sub(shown.lines().count());
+            evidence.push_str("\n\n### Diff\n\n```diff\n");
+            evidence.push_str(&shown);
+            if omitted > 0 {
+                evidence.push_str(&format!("\n... ({omitted} more diff lines)"));
+            }
+            evidence.push_str("\n```");
+        }
+    }
+    evidence
+}
+
 /// File the relayed result through the existing report path as a `done`
 /// report on the issue.
 fn file_done_report(
@@ -122,6 +141,7 @@ fn file_done_report(
         task_report::parse_pr_url(pr)?;
         yaml.push_str(&format!("pr: {pr}\n"));
     }
+    let evidence = done_evidence(result);
     let text = format!(
         "---\n{yaml}---\n\n\
          ## Expected\n\nIssue {issue} runs in cloud sandbox {sandbox} on branch {branch}, job {job}.\n\n\
@@ -133,7 +153,6 @@ fn file_done_report(
         sandbox = lane.sandbox_id,
         branch = lane.branch,
         job = lane.job_id,
-        evidence = result.text.replace("\n## ", "\n### "),
     );
     let prepared = task_report::prepare(pm, &text, Some(issue), Some(task_report::Kind::Done))?;
     task_report::store(pm, &prepared, actor)?;
@@ -183,6 +202,7 @@ pub fn run(issue: &str, branch: &str, base_sha: &str, spec: Option<&Path>) -> Re
     }
     let pm = Pm::open_default()?;
     let issue_record = board::find_issue(&pm.dir, issue)?;
+    cadence_agent::issue::plan::gate(&pm.dir, &issue_record.front, &issue_record.body)?;
     let spec = match spec {
         Some(path) => std::fs::read_to_string(path)?,
         None => issue_record.body.clone(),
@@ -266,6 +286,20 @@ mod tests {
     use std::sync::Mutex;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn done_evidence_includes_the_diff() {
+        let result = SandboxResult {
+            sha: None,
+            diff: Some("+added\n-removed".into()),
+            pr: None,
+            text: "done".into(),
+        };
+        let evidence = done_evidence(&result);
+        assert!(evidence.contains("### Diff"), "{evidence}");
+        assert!(evidence.contains("+added"), "{evidence}");
+        assert!(evidence.contains("-removed"), "{evidence}");
+    }
 
     /// Scripted client: queued snapshots for `get_job`, a call log, and an
     /// optional create refusal. No network.
