@@ -23,40 +23,30 @@ fn stopped_worker(s: &Store, alias: &str, cwd: &Path) {
 /// Archive one alias through the real apply path, using its current digest.
 fn archive_one(s: &Store, alias: &str) -> Result<Vec<ArchivePlan>> {
     let plan = s.archive_plan(alias)?;
-    s.archive_agents(
-        &[(alias.to_string(), plan.digest)],
-        "retired",
-        &operator(),
-    )
+    s.archive_agents(&[(alias.to_string(), plan.digest)], "retired", &operator())
 }
 
 fn event_count(s: &Store, kind: &str) -> i64 {
     let conn = s.conn();
-    conn.query_row(
-        "SELECT COUNT(*) FROM events WHERE kind=?1",
-        [kind],
-        |r| r.get(0),
-    )
+    conn.query_row("SELECT COUNT(*) FROM events WHERE kind=?1", [kind], |r| {
+        r.get(0)
+    })
     .unwrap()
 }
 
 fn events_for_alias(s: &Store, alias: &str) -> i64 {
     let conn = s.conn();
-    conn.query_row(
-        "SELECT COUNT(*) FROM events WHERE alias=?1",
-        [alias],
-        |r| r.get(0),
-    )
+    conn.query_row("SELECT COUNT(*) FROM events WHERE alias=?1", [alias], |r| {
+        r.get(0)
+    })
     .unwrap()
 }
 
 fn agent_row_count(s: &Store, alias: &str) -> i64 {
     let conn = s.conn();
-    conn.query_row(
-        "SELECT COUNT(*) FROM agents WHERE alias=?1",
-        [alias],
-        |r| r.get(0),
-    )
+    conn.query_row("SELECT COUNT(*) FROM agents WHERE alias=?1", [alias], |r| {
+        r.get(0)
+    })
     .unwrap()
 }
 
@@ -72,7 +62,11 @@ fn seed_history(s: &Store, alias: &str) {
         )?;
         (*conn).execute(
             "INSERT INTO events(alias,kind,payload,at) VALUES(?1,'submitted',?2,?3)",
-            params![alias, json!({"message": format!("{alias}-m1")}).to_string(), now() - 1.0],
+            params![
+                alias,
+                json!({"message": format!("{alias}-m1")}).to_string(),
+                now() - 1.0
+            ],
         )?;
         Ok(())
     })
@@ -97,7 +91,11 @@ fn archived_row_survives_deletion_manual_remove_without_force() {
     assert!(err.to_string().contains("archived"), "{err}");
 
     assert_eq!(agent_row_count(&s, "keep1"), 1, "row deleted");
-    assert_eq!(events_for_alias(&s, "keep1"), events_before, "history pruned");
+    assert_eq!(
+        events_for_alias(&s, "keep1"),
+        events_before,
+        "history pruned"
+    );
     assert!(s.agent("keep1").unwrap().archived_at.is_some());
 }
 
@@ -245,7 +243,10 @@ fn archive_rev_aba_replay_preview_archive_restore_replay() {
         .unwrap();
     let after_archive = s.agent("aba").unwrap();
     assert!(after_archive.archived_at.is_some());
-    assert!(after_archive.lifecycle_rev > rev_r, "archive did not bump rev");
+    assert!(
+        after_archive.lifecycle_rev > rev_r,
+        "archive did not bump rev"
+    );
     let rev_archived = after_archive.lifecycle_rev;
     assert_eq!(event_count(&s, "agent_archived"), 1);
 
@@ -318,8 +319,7 @@ fn archive_rev_aba_restore_with_stale_revision_refused() {
         .restore_agents(&[("aba3".into(), rev_archived)], &operator())
         .expect_err("stale restore must refuse");
     assert!(
-        err.to_string().contains("stale_revision")
-            || err.to_string().contains("not_archived"),
+        err.to_string().contains("stale_revision") || err.to_string().contains("not_archived"),
         "{err}"
     );
     assert_eq!(s.agent("aba3").unwrap().lifecycle_rev, rev_restored);
@@ -374,7 +374,8 @@ fn archive_mixed_batch_all_or_nothing_stale_alias_refuses_fresh_alias() {
     let stale_digest = s.archive_plan("stale").unwrap().digest;
 
     // Make `stale` change under its own digest (a message is queued).
-    s.enqueue("stale", "late", None, "stale-late", "user").unwrap();
+    s.enqueue("stale", "late", None, "stale-late", "user")
+        .unwrap();
 
     let err = s
         .archive_agents(
@@ -408,14 +409,16 @@ fn rollup_skips_archived_alias_leaves_its_delivery_events_untouched() {
     let add_events = |alias: &str, id: &str| {
         s.enqueue(alias, "work", None, id, "user").unwrap();
         s.fixture_write(|conn| {
-            (*conn).execute(
-                "UPDATE messages SET state='completed' WHERE id=?1",
-                [id],
-            )?;
+            (*conn).execute("UPDATE messages SET state='completed' WHERE id=?1", [id])?;
             for kind in ["submitting", "submitted"] {
                 (*conn).execute(
                     "INSERT INTO events(alias,kind,payload,at) VALUES(?1,?2,?3,?4)",
-                    params![alias, kind, json!({"message": id}).to_string(), now() - 9.0 * DAY],
+                    params![
+                        alias,
+                        kind,
+                        json!({"message": id}).to_string(),
+                        now() - 9.0 * DAY
+                    ],
                 )?;
             }
             Ok(())
@@ -428,7 +431,8 @@ fn rollup_skips_archived_alias_leaves_its_delivery_events_untouched() {
     let arch_before = events_for_alias(&s, "roll-arch");
 
     let cutoff = now() - EVENT_ROLLUP_AGE_SECS;
-    s.roll_up_delivery_events(cutoff, EVENT_ROLLUP_BATCH).unwrap();
+    s.roll_up_delivery_events(cutoff, EVENT_ROLLUP_BATCH)
+        .unwrap();
 
     // The live alias rolls up; the archived alias's rows are unchanged.
     let rollup_count = |alias: &str| -> i64 {
@@ -462,7 +466,8 @@ fn restore_preserves_gc_keep_policy_both_ways() {
     stopped_worker(&s, "gck0", &dir.path().join("w"));
     archive_one(&s, "gck0").unwrap();
     let rev = s.agent("gck0").unwrap().lifecycle_rev;
-    s.restore_agents(&[("gck0".into(), rev)], &operator()).unwrap();
+    s.restore_agents(&[("gck0".into(), rev)], &operator())
+        .unwrap();
     assert!(!s.agent("gck0").unwrap().gc_keep, "restore set gc_keep");
 
     // Keep=0 is required by archive, so a kept row cannot be archived. The
@@ -486,7 +491,10 @@ fn restore_preserves_gc_keep_policy_both_ways() {
         .archive_agents(&[("gck1".into(), plan.digest)], "retired", &operator())
         .expect_err("kept row must not archive");
     assert!(err.to_string().contains("gc_keep"), "{err}");
-    assert!(s2.agent("gck1").unwrap().gc_keep, "refused archive cleared keep");
+    assert!(
+        s2.agent("gck1").unwrap().gc_keep,
+        "refused archive cleared keep"
+    );
     let _ = dir;
 }
 
@@ -531,10 +539,7 @@ fn archived_row_excluded_from_queued_for_stopped() {
     // archive plan accepts while keeping the stopped+queued shape the
     // selection query keys on: archive is the only thing under test.
     s.fixture_write(|conn| {
-        (*conn).execute(
-            "UPDATE messages SET state='queued' WHERE id='qfs-m1'",
-            [],
-        )?;
+        (*conn).execute("UPDATE messages SET state='queued' WHERE id='qfs-m1'", [])?;
         Ok(())
     })
     .unwrap();
@@ -545,10 +550,16 @@ fn archived_row_excluded_from_queued_for_stopped() {
             &operator(),
         )
         .expect_err("archive must refuse a row with an open queued message");
-    assert!(err.to_string().contains("open_message") || err.to_string().contains("stale"), "{err}");
+    assert!(
+        err.to_string().contains("open_message") || err.to_string().contains("stale"),
+        "{err}"
+    );
     // Now the real post-archive shape: archived with no open message.
     s.fixture_write(|conn| {
-        (*conn).execute("UPDATE messages SET state='completed' WHERE id='qfs-m1'", [])?;
+        (*conn).execute(
+            "UPDATE messages SET state='completed' WHERE id='qfs-m1'",
+            [],
+        )?;
         Ok(())
     })
     .unwrap();
@@ -597,8 +608,22 @@ fn archived_assignee_refused_on_create_task_leaves_no_task_or_event() {
 
     let job_id = "arch-job";
     s.create_job(
-        job_id, None, "/s.md", &"0".repeat(64), "pm", None, None, None, 2, None, None, None,
-        None, None, None, None,
+        job_id,
+        None,
+        "/s.md",
+        &"0".repeat(64),
+        "pm",
+        None,
+        None,
+        None,
+        2,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     .unwrap();
     let events_before = event_count(&s, "task_created");
@@ -609,7 +634,17 @@ fn archived_assignee_refused_on_create_task_leaves_no_task_or_event() {
     };
 
     let err = s
-        .create_task(job_id, "arch-t1", None, Some("worker"), None, None, None, None, None)
+        .create_task(
+            job_id,
+            "arch-t1",
+            None,
+            Some("worker"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .expect_err("create_task must refuse an archived assignee");
     assert!(err.to_string().contains("archived"), "{err}");
 
@@ -722,7 +757,11 @@ fn routed_report_to_archived_recipient_records_recipient_archived() {
         .iter()
         .filter(|e| e.kind == "handoff_unresolved")
         .collect();
-    assert_eq!(unresolved.len(), 1, "expected one handoff_unresolved: {unresolved:?}");
+    assert_eq!(
+        unresolved.len(),
+        1,
+        "expected one handoff_unresolved: {unresolved:?}"
+    );
     assert_eq!(unresolved[0].payload["reason"], "recipient_archived");
     assert!(
         s.messages("pm").unwrap().is_empty(),
@@ -758,12 +797,34 @@ fn archived_assignee_refused_on_reopen_leaves_task_and_events_unchanged() {
     s.set_agent_state("worker", "stopped", None).unwrap();
     s.set_enabled("worker", false).unwrap();
     s.create_job(
-        "arch-job", None, "/s.md", &"0".repeat(64), "pm", None, None, None, 2, None, None,
-        None, None, None, None, None,
+        "arch-job",
+        None,
+        "/s.md",
+        &"0".repeat(64),
+        "pm",
+        None,
+        None,
+        None,
+        2,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     .unwrap();
     s.create_task(
-        "arch-job", "arch-t1", None, Some("worker"), None, None, None, None, None,
+        "arch-job",
+        "arch-t1",
+        None,
+        Some("worker"),
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     .unwrap();
     // Archive refuses an open task. `failed` is terminal and not open, and
@@ -785,7 +846,13 @@ fn archived_assignee_refused_on_reopen_leaves_task_and_events_unchanged() {
     assert!(err.to_string().contains("archived"), "{err}");
 
     let after = s.task("arch-t1").unwrap();
-    assert_eq!(after.state, before_state, "refused reopen changed task state");
-    assert_eq!(after.revision, before_rev, "refused reopen changed task revision");
+    assert_eq!(
+        after.state, before_state,
+        "refused reopen changed task state"
+    );
+    assert_eq!(
+        after.revision, before_rev,
+        "refused reopen changed task revision"
+    );
     assert_eq!(event_count(&s, "task_reopened"), before_events);
 }

@@ -56,8 +56,7 @@ impl Fixture {
     /// may run the archive verbs.
     fn as_(&self, who: Asserted, method: &str, params: Value) -> cadence_agent::Result<Value> {
         scoped(who, || {
-            self.shared
-                .dispatch(method, &params, std::process::id())
+            self.shared.dispatch(method, &params, std::process::id())
         })
     }
 }
@@ -106,14 +105,14 @@ fn archive_refuses_non_operator_plan_archive_restore() {
     seed_stopped(&f, "victim");
     let plan_params = json!({"aliases": ["victim"], "reason": "retired"});
 
-    for who in [
-        Asserted::Unproven,
-        Asserted::Agent("victim".into()),
-    ] {
+    for who in [Asserted::Unproven, Asserted::Agent("victim".into())] {
         let label = format!("{who:?}");
         let plan = f.as_(who.clone(), "agent_archive_plan", plan_params.clone());
         let e = plan.expect_err(&format!("{label}: archive plan allowed"));
-        assert!(e.to_string().contains("operator"), "{label}: plan refused for wrong reason: {e}");
+        assert!(
+            e.to_string().contains("operator"),
+            "{label}: plan refused for wrong reason: {e}"
+        );
 
         let archive = f.as_(
             who.clone(),
@@ -125,7 +124,10 @@ fn archive_refuses_non_operator_plan_archive_restore() {
             }),
         );
         let e = archive.expect_err(&format!("{label}: archive allowed"));
-        assert!(e.to_string().contains("operator"), "{label}: archive refused for wrong reason: {e}");
+        assert!(
+            e.to_string().contains("operator"),
+            "{label}: archive refused for wrong reason: {e}"
+        );
 
         let restore = f.as_(
             who.clone(),
@@ -133,7 +135,10 @@ fn archive_refuses_non_operator_plan_archive_restore() {
             json!({"aliases": ["victim"], "expect": [{"alias": "victim", "rev": 0}]}),
         );
         let e = restore.expect_err(&format!("{label}: restore allowed"));
-        assert!(e.to_string().contains("operator"), "{label}: restore refused for wrong reason: {e}");
+        assert!(
+            e.to_string().contains("operator"),
+            "{label}: restore refused for wrong reason: {e}"
+        );
     }
 
     let row = f.store().agent("victim").unwrap();
@@ -237,11 +242,20 @@ fn archived_row_refuses_set_stop_unfence_through_rpc() {
             json!({"alias": "frozen", "status": "completed"}),
         )
         .expect_err("agent_unfence must refuse an archived row");
-    assert!(unfence.to_string().contains("archived"), "unfence: {unfence}");
+    assert!(
+        unfence.to_string().contains("archived"),
+        "unfence: {unfence}"
+    );
 
     let after = f.store().agent("frozen").unwrap();
-    assert_eq!(after.lifecycle_rev, before.lifecycle_rev, "refused RPCs bumped rev");
-    assert_eq!(after.gc_keep, before.gc_keep, "refused agent_set changed gc_keep");
+    assert_eq!(
+        after.lifecycle_rev, before.lifecycle_rev,
+        "refused RPCs bumped rev"
+    );
+    assert_eq!(
+        after.gc_keep, before.gc_keep,
+        "refused agent_set changed gc_keep"
+    );
     assert!(after.archived_at.is_some());
 }
 
@@ -258,14 +272,24 @@ fn archived_row_refuses_resume_through_start_guard() {
     let before = f.store().agent("asleep").unwrap();
 
     let err = f
-        .as_(Asserted::Operator, "agent_resume", json!({"alias": "asleep"}))
+        .as_(
+            Asserted::Operator,
+            "agent_resume",
+            json!({"alias": "asleep"}),
+        )
         .expect_err("agent_resume must refuse an archived row");
     assert!(err.to_string().contains("archived"), "{err}");
 
     let after = f.store().agent("asleep").unwrap();
     assert_eq!(after.state, before.state, "refused resume changed state");
-    assert_eq!(after.enabled, before.enabled, "refused resume changed enabled");
-    assert_eq!(after.lifecycle_rev, before.lifecycle_rev, "refused resume bumped rev");
+    assert_eq!(
+        after.enabled, before.enabled,
+        "refused resume changed enabled"
+    );
+    assert_eq!(
+        after.lifecycle_rev, before.lifecycle_rev,
+        "refused resume bumped rev"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -290,5 +314,8 @@ fn lifecycle_rev_bumps_on_state_write_observed_via_agent_show() {
         .as_i64()
         .or_else(|| shown["agent"]["lifecycle_rev"].as_i64())
         .expect("agent_show exposes lifecycle_rev");
-    assert!(rev_after > rev_before, "rev did not advance: {rev_before} -> {rev_after}");
+    assert!(
+        rev_after > rev_before,
+        "rev did not advance: {rev_before} -> {rev_after}"
+    );
 }
