@@ -69,12 +69,17 @@ below, never a flattened message.
 | `POST /api/threads/{alias}` | `404 no such thread write route` |
 | `POST /api/issues/{id}` | `405 no such write route` (not `method not allowed`) |
 | `POST /api/setup` | `405 setup is read-only here — GET only` |
-| `GET` on a write-only row (`/api/settings/agents`, `/api/reports`) | `405 method not allowed` after admission |
 
 So a row carries its mismatch pair — status, message — exactly as it carries its
 `invalid` pair, and `MethodOnly` answers the pair of the rows it found. A row
 that has no mismatch answer yet keeps the generic pair only where that is what
 the code does today.
+
+A read-method mismatch is rare and the table cannot supply it: many paths with a
+write row also have a read arm (`GET /api/settings/agents` is an operator read
+today). Do not derive a read 405 from a write row — trace the path's read
+consumer, and where it has none an admitted private read ends at `404 no such
+route` (`serve.rs:2535-2537`).
 
 **A literal write row never shadows a wildcard read row.** `GET
 /api/app-installations/upload` is *not* a method mismatch today: the read arm
