@@ -126,6 +126,15 @@ fn diff_summary(diff: &str) -> String {
     format!("Diff summary: {files} file(s), +{added} -{removed}.")
 }
 
+/// Match the report writer's control stripping before scanning for the token.
+/// Otherwise `csj\r1.` bypasses the literal prefix and is reconstructed by
+/// `task_report::prepare` after the redactor has run.
+fn normalize_controls(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect()
+}
+
 /// Remove the sandbox gateway token from untrusted runner text. The token is
 /// AgenticOS-owned and must never reach a durable report; the report secret
 /// guard does not know the `csj1.` format.
@@ -149,7 +158,8 @@ fn redact_sandbox_tokens(text: &str) -> String {
 
 /// Build the report evidence: the runner's text plus a bounded diff summary.
 fn done_evidence(result: &SandboxResult) -> String {
-    let mut evidence = redact_sandbox_tokens(&result.text).replace("\n## ", "\n### ");
+    let mut evidence =
+        redact_sandbox_tokens(&normalize_controls(&result.text)).replace("\n## ", "\n### ");
     if let Some(diff) = &result.diff {
         let diff = diff.trim();
         if !diff.is_empty() {
@@ -361,6 +371,55 @@ mod tests {
         let evidence = done_evidence(&result);
         assert!(!evidence.contains("csj1."), "{evidence}");
         assert!(evidence.contains("<redacted-sandbox-token>"), "{evidence}");
+    }
+
+    #[test]
+    fn done_evidence_redacts_a_split_prefix_token() {
+        let result = SandboxResult {
+            sha: None,
+            diff: None,
+            pr: None,
+            text: "csj\r1.abc.def".into(),
+        };
+        let evidence = done_evidence(&result);
+        assert!(!evidence.contains("csj1."), "{evidence}");
+        assert!(!evidence.contains("csj\r1."), "{evidence}");
+        assert!(evidence.contains("<redacted-sandbox-token>"), "{evidence}");
+    }
+
+    #[test]
+    fn done_evidence_survives_report_preparation_without_a_split_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&tmp.path().join("pm")).unwrap();
+        write_project(&pm.dir, "cad", "key: cad\nprefix: CAD\n");
+        let issue = pm.dir.join("cad/CAD-1");
+        std::fs::create_dir_all(&issue).unwrap();
+        std::fs::write(
+            issue.join("issue.md"),
+            "---\nid: CAD-1\nproject: cad\nstatus: ready\ntitle: test\n---\n",
+        )
+        .unwrap();
+        let result = SandboxResult {
+            sha: None,
+            diff: None,
+            pr: None,
+            text: "csj\r1.abc.def".into(),
+        };
+        let evidence = done_evidence(&result);
+        let text = format!(
+            "---\nkind: done\ntask: CAD-1\n---\n\n## Expected\n\nx\n\n\
+             ## Evidence\n\n{evidence}\n\n## Cause\n\nx\n\n## Correction\n\nx\n\n\
+             ## Lesson\n\nx\n\n## Next\n\nx\n"
+        );
+        let prepared = task_report::prepare(&pm, &text, None, Some(task_report::Kind::Done))
+            .expect("prepared");
+        assert!(!prepared.body().contains("csj1."), "{}", prepared.body());
+        assert!(!prepared.body().contains("csj\r1."), "{}", prepared.body());
+        assert!(
+            prepared.body().contains("<redacted-sandbox-token>"),
+            "{}",
+            prepared.body()
+        );
     }
 
     /// Scripted client: queued snapshots for `get_job`, a call log, and an
