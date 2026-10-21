@@ -225,6 +225,19 @@ impl Verdict {
     }
 }
 
+/// A pre-dispatch plan: the exact revision, kickoff id and body a fresh
+/// `dispatch_task` will use. `duplicate` means a live kickoff already
+/// exists and no new revision will be minted.
+pub struct DispatchPlan {
+    pub task: Task,
+    pub job: Job,
+    pub worker: Agent,
+    pub revision: i64,
+    pub message_id: String,
+    pub body: String,
+    pub duplicate: bool,
+}
+
 impl Store {
     pub(super) fn job_in(&self, conn: &impl super::StoreConn, id: &str) -> Result<Job> {
         conn.query_row("SELECT * FROM jobs WHERE id=?", [id], row_job)
@@ -711,6 +724,107 @@ impl Store {
             )));
         }
         Ok(())
+    }
+
+    /// The read-only half of `job dispatch`, used by the cloud runner to
+    /// obtain the exact revision, kickoff id and body before any local
+    /// write. The caller creates the remote job (AOS enforces the
+    /// entitlement) and passes the same message id into `dispatch_task`;
+    /// a race is caught by comparing the returned revision/message.
+    pub fn plan_task_dispatch(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        requested_message_id: Option<&str>,
+    ) -> Result<DispatchPlan> {
+        let task = self.task(task_id)?;
+        let job = self.job(&task.job_id)?;
+        if job.state != "open" {
+            return Err(Error::rejected(format!(
+                "Job '{}' is '{}' — dispatch needs an open job",
+                job.id, job.state
+            )));
+        }
+        let assignee = to.or(task.assignee.as_deref()).ok_or_else(|| {
+            Error::rejected(format!(
+                "Task '{task_id}' has no assignee — \
+                 `cadence job dispatch {task_id} --to <worker>`"
+            ))
+        })?;
+        let worker = self.agent(assignee)?;
+        self.check_group_member(&job, &worker)?;
+        let mut revision = task.revision;
+        match task.state.as_str() {
+            "draft" | "revising" => revision += 1,
+            "dispatched" | "running" => {
+                let live = task
+                    .dispatch_message
+                    .as_deref()
+                    .and_then(|id| self.message(id).ok().flatten())
+                    .filter(|message| !is_terminal(&message.state));
+                if let Some(live) = live {
+                    if to.is_some() && to != task.assignee.as_deref() {
+                        return Err(Error::rejected(format!(
+                            "Task '{task_id}' has a live kickoff — reassign \
+                             after it finishes or is reconciled"
+                        )));
+                    }
+                    let current_revision = task.revision;
+                    return Ok(DispatchPlan {
+                        task,
+                        job,
+                        worker,
+                        revision: current_revision,
+                        message_id: live.id,
+                        body: String::new(),
+                        duplicate: true,
+                    });
+                }
+                revision += 1;
+            }
+            "blocked" => {
+                if to.is_some() && to != task.assignee.as_deref() {
+                    revision += 1;
+                } else {
+                    return Err(Error::rejected(format!(
+                        "Task '{task_id}' is blocked — `cadence job task reopen \
+                         {task_id}` re-scopes it, or `job dispatch {task_id} \
+                         --to <worker>` reassigns"
+                    )));
+                }
+            }
+            state => {
+                return Err(Error::rejected(format!(
+                    "Task '{task_id}' is '{state}' — dispatch is legal from \
+                     draft, revising, or after the live kickoff ended"
+                )));
+            }
+        }
+        let attempt = self
+            .messages_for_task(task_id)?
+            .iter()
+            .filter(|message| message.source == "job_dispatch")
+            .count() as i64;
+        let message_id = requested_message_id.map(str::to_string).unwrap_or_else(|| {
+            Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!("cadence-dispatch:{task_id}:r{revision}:a{attempt}").as_bytes(),
+            )
+            .simple()
+            .to_string()
+        });
+        let body = kickoff_body(&job, &task, revision, &message_id, &worker)?;
+        let mut planned_task = task;
+        planned_task.revision = revision;
+        Ok(DispatchPlan {
+            task: planned_task,
+            job,
+            worker,
+            revision,
+            message_id,
+            body,
+            duplicate: false,
+        })
     }
 
     /// `job dispatch`: one transaction — task `dispatched` at a new (or

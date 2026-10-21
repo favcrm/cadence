@@ -433,22 +433,70 @@ impl Shared {
         let cloud_dispatch = target
             .as_ref()
             .is_some_and(|agent| agent.endpoint_kind == "sandbox");
-        let (task, message, duplicate, behind_dead) = match &expect {
+        let requested_message = optional_str(params, "message");
+        // Cloud admission is the authoritative entitlement check. It runs
+        // before the dispatch transaction, so a refused company leaves no
+        // task revision, lane, job or kickoff behind. The consumer later
+        // replays this same kickoff-id idempotency key.
+        let plan = if cloud_dispatch {
+            Some(
+                self.store
+                    .plan_task_dispatch(task_id, to.as_deref(), requested_message)?,
+            )
+        } else {
+            None
+        };
+        let admission = match &plan {
+            Some(plan) if !plan.duplicate => Some(crate::issue::cloud::admit_dispatch(
+                &plan.job,
+                &plan.task,
+                &plan.message_id,
+                &plan.body,
+            )?),
+            _ => None,
+        };
+        let planned_message = plan
+            .as_ref()
+            .filter(|plan| !plan.duplicate)
+            .map(|plan| plan.message_id.as_str());
+        let planned_revision = plan
+            .as_ref()
+            .filter(|plan| !plan.duplicate)
+            .map(|plan| plan.revision);
+        let dispatched = match &expect {
             Some(expect) => self.store.dispatch_task_expecting(
                 task_id,
                 to.as_deref(),
-                optional_str(params, "message"),
+                planned_message.or(requested_message),
                 by,
                 expect,
-            )?,
+            ),
             None => self.store.dispatch_task(
                 task_id,
                 to.as_deref(),
-                optional_str(params, "message"),
+                planned_message.or(requested_message),
                 by,
-            )?,
+            ),
         };
-        if cloud_dispatch && !duplicate {
+        let (task, message, duplicate, behind_dead) = match dispatched {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(job) = &admission {
+                    crate::issue::cloud::stop_admission(job);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(job) = &admission {
+            // A race that moved the task to a different revision means no
+            // local kickoff can consume this admission; stop it. A
+            // duplicate at the same revision shares the same key and is
+            // left for the consumer.
+            if Some(task.revision) != planned_revision {
+                crate::issue::cloud::stop_admission(job);
+            }
+        }
+        if cloud_dispatch {
             let shared = Arc::clone(self);
             let task_id = task.id.clone();
             let message_id = message.clone();
@@ -472,7 +520,7 @@ impl Shared {
     /// the remote job and call the same finish/report path. A cancelled or
     /// already-claimed delivery is left alone. `has_actor=false` means no
     /// actor exists.
-    fn run_cloud_dispatch(&self, task_id: &str, message_id: &str) -> Result<()> {
+    pub(super) fn run_cloud_dispatch(&self, task_id: &str, message_id: &str) -> Result<()> {
         fn fail(
             store: &crate::store::Store,
             message: &crate::store::Message,
@@ -484,6 +532,14 @@ impl Shared {
         let message = self.store.message(message_id)?.ok_or_else(|| {
             Error::rejected(format!("cloud dispatch message '{message_id}' is gone"))
         })?;
+        if message.state == "queued" && self.store.cloud_stop_requested(&message.id)? {
+            crate::issue::cloud::interrupt_message(
+                &self.store,
+                &message,
+                &Error::rejected("cloud sandbox dispatch was stopped by the operator"),
+            );
+            return Ok(());
+        }
         if !self
             .store
             .mark_running_queued(&message.id, &format!("cloud:{}", message.id))?
@@ -503,12 +559,32 @@ impl Shared {
             .store
             .agent(alias)
             .map_err(|error| fail(&self.store, &message, error))?;
-        let company = crate::issue::cloud::hosted_company(|key| std::env::var(key).ok())
+        let _ = crate::issue::cloud::hosted_company(|key| std::env::var(key).ok())
             .map_err(|error| fail(&self.store, &message, error))?;
         let pm = self
             .pm()
             .map_err(|error| fail(&self.store, &message, error))?;
-        crate::issue::cloud::run_dispatch(&pm, &self.store, &task, &job, &message, &agent, &company)
+        let outcome = crate::issue::cloud::run_dispatch(
+            &pm,
+            &self.store,
+            &task,
+            &job,
+            &message,
+            &agent,
+            &|| {
+                self.store
+                    .cloud_stop_requested(&message.id)
+                    .unwrap_or(false)
+            },
+        );
+        if let Err(error) = &outcome {
+            if error.code() == Some(crate::issue::cloud::UNCERTAIN) {
+                let _ = self
+                    .store
+                    .requeue_cloud_claim(&message.id, &format!("cloud:{}", message.id));
+            }
+        }
+        outcome
     }
 
     /// `job verdict` — the reviewer is the verified caller (CAD-372),

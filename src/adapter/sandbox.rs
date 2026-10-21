@@ -37,6 +37,11 @@ pub const SANDBOX_UNAVAILABLE: &str = "cloud_sandbox_unavailable";
 /// The entitlement key looked up for the calling company.
 pub const ENTITLEMENT_KEY: &str = "cloud_sandbox";
 
+/// AOS-324 caps the job `spec` at 20,000 characters. The kickoff builder
+/// and the pre-dispatch admission both use this ceiling, so a spec that
+/// would be refused remotely is refused before any local write.
+pub const SANDBOX_SPEC_BYTES: usize = 20_000;
+
 /// Pi config base URL for model calls inside the sandbox. Model traffic
 /// goes through AgenticOS; the sandbox holds no provider key.
 pub const PI_BASE_URL: &str = "http://gateway.internal";

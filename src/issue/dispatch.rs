@@ -617,6 +617,13 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
         provider,
         endpoint_kind,
     } = check_seat(&project, &args.to, args.force, state_dir)?;
+    if args.job_spec.is_none() && endpoint_kind == "sandbox" {
+        return Err(Error::rejected(format!(
+            "Worker '{}' is a cloud sandbox agent — cloud execution is only available \
+             through `dispatch --job` with the job's spec; nothing was created",
+            args.to
+        )));
+    }
     if args.job_spec.is_some() {
         let member = agent["alias"].as_str() == Some(reply_to.as_str())
             || agent["params"]["upstream"].as_str() == Some(reply_to.as_str());
@@ -1228,6 +1235,14 @@ pub fn run(
         lessons_withheld,
         body,
     } = lessons(pm, &project, &dir, &front, args, state_dir, &provider, body);
+
+    // A cloud start reserved the exact kickoff id before its lane/job
+    // writes. Use it for the ref and task dispatch so the daemon's
+    // create replays the same remote job.
+    let mid = started["cloud_message"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or(mid);
 
     // CAD-467: a freshly joined worker's `bootstrap-<alias>` still
     // `queued` would deliver as a bare onboarding turn AHEAD of this

@@ -2086,6 +2086,70 @@ impl Store {
         })
     }
 
+    /// Record an operator stop request for a running cloud kickoff. The
+    /// poller observes it and calls the AOS stop route; the event is the
+    /// durable handoff because the runner is not an AgentCtl.
+    pub fn request_cloud_stop(&self, message_id: &str) -> Result<()> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            Self::event(
+                &tx,
+                &alias,
+                "cloud_stop_requested",
+                json!({"message": message_id}),
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Whether an operator stop was requested for this kickoff.
+    pub fn cloud_stop_requested(&self, message_id: &str) -> Result<bool> {
+        self.read_tx(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='cloud_stop_requested' \
+                 AND json_extract(payload,'$.message')=? \
+                 AND alias=(SELECT alias FROM messages WHERE id=?)",
+                params![message_id, message_id],
+                |r| r.get(0),
+            )?;
+            Ok(count > 0)
+        })
+    }
+
+    /// Return a cloud kickoff to `queued` when its remote job's state could
+    /// not be proven and the stop was not confirmed. The guarded claim
+    /// token means only the consumer that claimed this delivery can release
+    /// it; a retry then re-enters the same task/revision remote job.
+    pub fn requeue_cloud_claim(&self, message_id: &str, turn_id: &str) -> Result<bool> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let changed = tx.execute(
+                "UPDATE messages SET state='queued',turn_id=NULL \
+                 WHERE id=? AND state='running' AND turn_id=?",
+                params![message_id, turn_id],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            Self::event(
+                &tx,
+                &alias,
+                "turn_requeued",
+                json!({"message": message_id, "turn_id": turn_id,
+                       "reason": "cloud sandbox job state unproven"}),
+            )?;
+            Ok(true)
+        })
+    }
+
     /// Return a `submitting` message to `queued` — the submission gate
     /// refused before any paste, so retry is safe.
     pub fn requeue(&self, message_id: &str) -> Result<()> {

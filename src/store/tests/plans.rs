@@ -1,5 +1,49 @@
 
     #[test]
+    fn cloud_stop_request_and_claim_requeue_are_guarded() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task("j1", "t1", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, message, ..) = s.dispatch_task("t1", None, None, "test").unwrap();
+        assert!(!s.cloud_stop_requested(&message).unwrap());
+        s.request_cloud_stop(&message).unwrap();
+        assert!(s.cloud_stop_requested(&message).unwrap());
+        let claim = format!("cloud:{message}");
+        assert!(s.mark_running_queued(&message, &claim).unwrap());
+        assert!(!s.requeue_cloud_claim(&message, "other").unwrap());
+        assert!(s.requeue_cloud_claim(&message, &claim).unwrap());
+        assert_eq!(s.message(&message).unwrap().unwrap().state, "queued");
+    }
+
+    #[test]
+    fn dispatch_plan_is_the_transaction_preimage() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task("j1", "t1", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let plan = s.plan_task_dispatch("t1", None, None).unwrap();
+        assert!(!plan.duplicate);
+        assert_eq!(plan.revision, 1);
+        assert!(!plan.body.is_empty());
+        let (task, message, duplicate, _) = s
+            .dispatch_task("t1", None, Some(&plan.message_id), "test")
+            .unwrap();
+        assert_eq!(message, plan.message_id);
+        assert_eq!(task.revision, plan.revision);
+        assert!(!duplicate);
+        let live = s.plan_task_dispatch("t1", None, None).unwrap();
+        assert!(live.duplicate);
+        assert_eq!(live.message_id, message);
+        assert_eq!(live.revision, plan.revision);
+        assert!(live.body.is_empty());
+    }
+
+    #[test]
     fn current_verdict_follows_the_open_revision() {
         let rows = vec![verdict(1, 2), verdict(3, 2), verdict(2, 1)];
         let current = super::current_verdict(1, &rows).unwrap();

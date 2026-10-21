@@ -713,7 +713,7 @@ pub static SPECS: &[EndpointSpec] = &[
     // CAD-1673: the cloud sandbox runner seam (see `adapter::sandbox`).
     // AOS-324: registered cloud runner. It has no local actor; dispatch
     // selects it by `endpoint_kind` and starts the remote job. The image
-    // profile and monthly budget are operator-owned trust-bearing params.
+    // and budget are AOS-owned; no launch params are accepted.
     EndpointSpec {
         provider: "sandbox",
         endpoint_kind: "sandbox",
@@ -729,7 +729,7 @@ pub static SPECS: &[EndpointSpec] = &[
         resumable: false,
         resume_label: "",
         live_settable_params: &[],
-        launch_params: &["image_profile", "monthly_budget_micros"],
+        launch_params: &[],
         session_id_label: "Sandbox session",
         respond_rejection: None,
         capabilities: &[],
@@ -1290,8 +1290,6 @@ pub const TRUST_BEARING_PARAMS: &[&str] = &[
     "permission_timeout_secs",
     "secret_ids",
     "max_acu_limit",
-    "image_profile",
-    "monthly_budget_micros",
     "repos",
     "devin_mode",
     "playbook_id",

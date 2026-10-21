@@ -1036,6 +1036,47 @@ impl Shared {
                 "Agent '{alias}' is archived — restore it before stopping it"
             )));
         }
+        // A sandbox runner has no host actor, so the inbox refusal below
+        // does not apply. A running kickoff is stopped by the poller on a
+        // durable request; a queued one is settled before any create.
+        if agent.provider == "sandbox" && agent.endpoint_kind == "sandbox" {
+            let mut running = 0;
+            let mut queued = 0;
+            for message in self.store.messages(&alias)? {
+                if message.source != "job_dispatch" {
+                    continue;
+                }
+                match message.state.as_str() {
+                    "running" => {
+                        self.store.request_cloud_stop(&message.id)?;
+                        running += 1;
+                    }
+                    "queued" => {
+                        self.store.request_cloud_stop(&message.id)?;
+                        queued += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if running == 0 && queued == 0 {
+                return Err(Error::rejected(format!(
+                    "Agent '{alias}' has no active cloud dispatch to stop"
+                )));
+            }
+            // A live poller observes the request and calls AOS stop. A
+            // queued kickoff stays enabled so restart recovery or a retry
+            // can consume the request and settle it before any create.
+            if running > 0 {
+                self.store.set_enabled(&alias, false)?;
+            }
+            let _ = self.store.event_public(
+                &alias,
+                "stop_requested",
+                json!({"cloud_jobs": running, "queued_stop_requested": queued}),
+            );
+            return Ok(json!({"alias": alias, "state": "stopping",
+                             "cloud_jobs": running, "queued_stop_requested": queued}));
+        }
         if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
             return Err(Error::rejected(format!(
                 "Agent '{alias}' is an inbox — no actor to stop; \

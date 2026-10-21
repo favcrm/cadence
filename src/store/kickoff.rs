@@ -149,7 +149,12 @@ pub(super) fn cloud_hold_exit(message: &str, alias: &str, session: &str) -> Stri
     )
 }
 
-pub(super) fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> Result<String> {
+pub(super) fn cloud_kickoff_body(
+    job: &Job,
+    task: &Task,
+    revision: i64,
+    ceiling: usize,
+) -> Result<String> {
     let spec = task.spec_path.as_deref().unwrap_or(job.spec_path.as_str());
     let raw = std::fs::read_to_string(spec)
         .unwrap_or_else(|_| "(spec text was not available to inline)".to_string());
@@ -175,7 +180,7 @@ pub(super) fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> Resul
         .map(|id| format!(" This job tracks issue {id}."))
         .unwrap_or_default();
     let head = format!(
-        "Cadence task {} (job {}, revision {}). You are a Devin cloud session and cannot \
+        "Cadence task {} (job {}, revision {}). You are a cloud session and cannot \
          read host paths or invoke the cadence CLI. For company questions, use wiki/guide \
          access only if this session has it; otherwise report knowledge not consulted and \
          ask for authorized source material, inventing no policy. Spec text follows. ",
@@ -186,17 +191,17 @@ pub(super) fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> Resul
     // cut. Criteria that cannot fit whole beside the fixed head refuse
     // the dispatch; everything else (the inlined spec first) gives way.
     let kept = acceptance.len() + SHA_TRAILER.len();
-    if head.len() + kept > ENQUEUE_BYTES {
+    if head.len() + kept > ceiling {
         return Err(criteria_too_long(
             &task.id,
             "kickoff",
             head.len() + kept,
             acceptance.len(),
-            ENQUEUE_BYTES,
+            ceiling,
             spec,
         ));
     }
-    let budget = ENQUEUE_BYTES - kept;
+    let budget = ceiling - kept;
     let fixed = head.len() + bridge.len();
     let spec_text = if fixed + cleaned.len() <= budget {
         cleaned
@@ -205,13 +210,13 @@ pub(super) fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> Resul
         format!("{}{SPEC_NOTE}", take_bytes(&cleaned, room))
     };
     let mut body = format!("{head}{spec_text}{bridge}{acceptance}{SHA_TRAILER}");
-    // Scope and issue text can already exceed the enqueue limit. Drop
+    // Scope and issue text can already exceed the delivery limit. Drop
     // the spec, say so, and keep the criteria and SHA trailer inside
-    // 48_000 bytes.
-    if body.len() > ENQUEUE_BYTES {
+    // the assignee's ceiling.
+    if body.len() > ceiling {
         const OMITTED: &str = "… (spec text omitted; the prompt was cut to fit)";
         let tail = format!("{OMITTED}{acceptance}{SHA_TRAILER}");
-        let room = ENQUEUE_BYTES.saturating_sub(tail.len());
+        let room = ceiling.saturating_sub(tail.len());
         let prefix = take_bytes(&format!("{head}{bridge}"), room);
         body = format!("{prefix}{tail}");
     }
@@ -252,10 +257,13 @@ fn cloud_session(provider: &str, endpoint_kind: &str) -> bool {
 }
 
 /// CAD-160: the size a `job dispatch` kickoff must fit for an assignee
-/// on `provider`/`endpoint_kind` — the enqueue limit for a Devin cloud
-/// session (its kickoff inlines the spec), else the pty ceiling.
+/// on `provider`/`endpoint_kind` — the AOS `spec` cap for a sandbox
+/// runner, the enqueue limit for a Devin cloud session (its kickoff
+/// inlines the spec), else the pty ceiling.
 pub fn kickoff_ceiling(provider: &str, endpoint_kind: &str) -> usize {
-    if cloud_session(provider, endpoint_kind) {
+    if provider == "sandbox" && endpoint_kind == "sandbox" {
+        crate::adapter::sandbox::SANDBOX_SPEC_BYTES
+    } else if cloud_session(provider, endpoint_kind) {
         ENQUEUE_BYTES
     } else {
         pty::MAX_BODY
@@ -309,7 +317,12 @@ pub fn job_kickoff(
     endpoint_kind: &str,
 ) -> Result<String> {
     if cloud_session(provider, endpoint_kind) {
-        return cloud_kickoff_body(job, task, revision);
+        let ceiling = if provider == "sandbox" && endpoint_kind == "sandbox" {
+            crate::adapter::sandbox::SANDBOX_SPEC_BYTES
+        } else {
+            ENQUEUE_BYTES
+        };
+        return cloud_kickoff_body(job, task, revision, ceiling);
     }
     let spec = task.spec_path.as_deref().unwrap_or(&job.spec_path);
     let clean = |s: &str| -> String {
@@ -463,7 +476,10 @@ mod cad1373_kickoff_pointer_tests {
         std::fs::write(&spec, "Do the sandbox task.").unwrap();
         let spec = spec.display().to_string();
         assert!(cloud_session("sandbox", "sandbox"));
-        assert_eq!(kickoff_ceiling("sandbox", "sandbox"), ENQUEUE_BYTES);
+        assert_eq!(
+            kickoff_ceiling("sandbox", "sandbox"),
+            crate::adapter::sandbox::SANDBOX_SPEC_BYTES
+        );
         let body = job_kickoff(
             &job(&spec),
             &task(&spec, "the sandbox task is done"),
@@ -486,7 +502,8 @@ mod cad1373_kickoff_pointer_tests {
         let spec = dir.path().join("spec.md");
         std::fs::write(&spec, "Do the cloud task.").unwrap();
         let spec = spec.display().to_string();
-        let body = cloud_kickoff_body(&job(&spec), &task(&spec, "the task is done"), 1).unwrap();
+        let body =
+            cloud_kickoff_body(&job(&spec), &task(&spec, "the task is done"), 1, 48_000).unwrap();
         assert!(body.len() <= ENQUEUE_BYTES, "{} bytes", body.len());
         assert!(
             body.contains("use wiki/guide access only if this session has it"),

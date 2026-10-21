@@ -7,9 +7,6 @@ import { WriteGate } from "../auth/WriteGate";
 import { useTranslate } from "../../lib/locale";
 import {
   buildBody,
-  EMPTY_CLOUD,
-  IMAGE_PROFILES,
-  type CloudProfile,
   type Location,
 } from "./agentSetup";
 
@@ -38,7 +35,6 @@ export default function NewAgentDialog({
   const [sandbox, setSandbox] = useState("");
   const [instructions, setInstructions] = useState("");
   const [cwd, setCwd] = useState("");
-  const [cloud, setCloud] = useState<CloudProfile>(EMPTY_CLOUD);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -57,11 +53,17 @@ export default function NewAgentDialog({
 
   const save = async () => {
     if (writeBlock !== null || saving) return;
-    const built = buildBody(
-      location,
-      { alias, provider, endpointKind, role, teamRole, modelPolicy, sandbox, instructions, cwd },
-      cloud,
-    );
+    const built = buildBody(location, {
+      alias,
+      provider,
+      endpointKind,
+      role,
+      teamRole,
+      modelPolicy,
+      sandbox,
+      instructions,
+      cwd,
+    });
     if ("error" in built) {
       setErr(built.error);
       return;
@@ -78,18 +80,6 @@ export default function NewAgentDialog({
       setSaving(false);
     }
   };
-
-  const cloudField = (key: keyof CloudProfile, label: string, placeholder?: string) => (
-    <label className="field-control">
-      <span className="slabel">{t(label)}</span>
-      <input
-        className="field"
-        value={cloud[key]}
-        placeholder={placeholder}
-        onChange={(event) => setCloud({ ...cloud, [key]: event.target.value })}
-      />
-    </label>
-  );
 
   return (
     <dialog
@@ -163,28 +153,11 @@ export default function NewAgentDialog({
             </label>
           </>
         ) : (
-          <fieldset className="flex flex-col gap-3">
-            <legend className="slabel mb-1">{t("Cloud profile")}</legend>
-            <p className="text-label text-ink-500">
-              {t("The company is bound by the hosted workspace; the repo follows the project.")}
-            </p>
-            <label className="field-control">
-              <span className="slabel">{t("Image profile")}</span>
-              <select
-                className="field"
-                value={cloud.image_profile}
-                onChange={(event) => setCloud({ ...cloud, image_profile: event.target.value })}
-              >
-                <option value="">{t("Default")}</option>
-                {IMAGE_PROFILES.map((profile) => (
-                  <option key={profile} value={profile}>
-                    {profile}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {cloudField("monthly_budget_micros", "Monthly budget (micros)", "e.g. 25000000")}
-          </fieldset>
+          <p className="text-label text-ink-500">
+            {t(
+              "The company is bound by the hosted workspace; the repo follows the project.",
+            )}
+          </p>
         )}
 
         <label className="field-control">

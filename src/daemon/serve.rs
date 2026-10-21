@@ -1033,9 +1033,34 @@ pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
     // Inbox rows are durable mailboxes — enabled or not, they own no
     // actor and keep their pseudo-endpoint across restarts.
     for agent in shared.store.agents()? {
-        if !agent.enabled || !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+        if !agent.enabled {
             // No actor can prove these recovered panes; release any
             // matching report waiter to fail closed against recovery state.
+            shared.adoptions_settle(&agent.alias);
+            continue;
+        }
+        if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+            // A sandbox runner has no host actor: its queued job kickoffs
+            // are consumed by the daemon itself. Resume each claimable
+            // kickoff after a restart; the same kickoff id re-enters the
+            // original remote job.
+            if agent.provider == "sandbox" && agent.endpoint_kind == "sandbox" {
+                for message in shared.store.messages(&agent.alias)? {
+                    if message.state != "queued" || message.source != "job_dispatch" {
+                        continue;
+                    }
+                    let Some(task_id) = message.task_id.clone() else {
+                        continue;
+                    };
+                    let shared = Arc::clone(shared);
+                    let message_id = message.id.clone();
+                    std::thread::spawn(move || {
+                        if let Err(error) = shared.run_cloud_dispatch(&task_id, &message_id) {
+                            eprintln!("cloud sandbox recovery {task_id} failed: {error}");
+                        }
+                    });
+                }
+            }
             shared.adoptions_settle(&agent.alias);
             continue;
         }
