@@ -429,7 +429,9 @@ impl Store {
             let tx = &mut *conn;
             let mut rows: Vec<(i64, String, String, f64)> = tx.query_vec(
                 &format!(
-                    "SELECT e.seq, e.alias, e.kind, e.at FROM events e WHERE {} \
+                    "SELECT e.seq, e.alias, e.kind, e.at FROM events e WHERE {}
+                             AND e.alias NOT IN (SELECT alias FROM agents
+                               WHERE archived_at IS NOT NULL)
                              ORDER BY e.seq LIMIT ?2",
                     rollable_events_where()
                 ),
@@ -1565,6 +1567,39 @@ impl Store {
             params![alias, kind],
             |row| row.get(0),
         )?)
+    }
+
+    /// CAD-1239: like [`Store::last_events_of_all`], but only for the
+    /// listed operational aliases, so archived rows are never read or
+    /// deserialized while enriching `agent_list`.
+    pub fn last_events_of(
+        &self,
+        aliases: &[String],
+        kinds: &[&str],
+    ) -> Result<std::collections::HashMap<String, Event>> {
+        if aliases.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.conn();
+        let kind_placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let alias_placeholders = aliases.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT e.seq,e.alias,e.kind,e.payload,e.job_id,e.task_id,e.at FROM events e
+             JOIN (SELECT MAX(seq) AS seq FROM events
+                   WHERE kind IN ({kind_placeholders}) AND alias IN ({alias_placeholders})
+                   GROUP BY alias) m ON e.seq = m.seq"
+        );
+        let mut args: Vec<&dyn rusqlite::ToSql> =
+            kinds.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+        args.extend(aliases.iter().map(|a| a as &dyn rusqlite::ToSql));
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(args.as_slice(), row_event)?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let event = row?;
+            out.insert(event.alias.clone(), event);
+        }
+        Ok(out)
     }
 
     /// CAD-96: per alias, the newest event of any of `kinds` — one

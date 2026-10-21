@@ -1136,6 +1136,20 @@ impl Store {
             )?;
             return Ok(false);
         };
+        if recipient.archived_at.is_some() {
+            self.handoff_unresolved(
+                tx,
+                Some(&task.id),
+                &job.pm_alias,
+                &delivery,
+                "job_event",
+                &delivery,
+                "recipient_archived",
+                None,
+                None,
+            )?;
+            return Ok(false);
+        }
         let payload = json!({"job": job.id, "task": task.id,
                              "revision": task.revision, "state": new_state});
         let body = format!("Cadence job {}: {note} {payload}", job.id);

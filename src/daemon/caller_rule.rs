@@ -453,6 +453,18 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("agent_caller + gc_partition (CAD-304 S3)"),
     ),
     ("agent_gc_plan", Rule::Read),
+    (
+        "agent_archive_plan",
+        Rule::Handler("operator_connection (CAD-1239)"),
+    ),
+    (
+        "agent_archive",
+        Rule::Handler("operator_connection (CAD-1239)"),
+    ),
+    (
+        "agent_restore",
+        Rule::Handler("operator_connection (CAD-1239)"),
+    ),
     ("agent_resume", Rule::OnAgent(Target::Alias, SelfService)),
     (
         "slot_acquire",

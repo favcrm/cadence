@@ -14,6 +14,18 @@ use super::messages::{row_message, Message, Priority};
 use super::StoreConn;
 use super::{is_task_terminal, is_terminal, now, take_bytes, Sender, Store};
 
+/// CAD-1239: an archived worker cannot be assigned new work or have a
+/// terminal task reopened onto it. Runs inside the assignment transaction.
+fn refuse_archived_assignee(worker: &Agent) -> Result<()> {
+    if worker.archived_at.is_some() {
+        return Err(Error::rejected(format!(
+            "Agent '{}' is archived — it cannot take an assignment",
+            worker.alias
+        )));
+    }
+    Ok(())
+}
+
 /// The `jobs.state` vocabulary for `job list --state`.
 pub const JOB_STATES: &[&str] = &["draft", "open", "done", "failed", "cancelled"];
 
@@ -583,6 +595,7 @@ impl Store {
                 let job = self.job_in(&tx, id)?;
                 let worker = self.agent_in(&tx, a)?;
                 self.check_group_member(&job, &worker)?;
+                refuse_archived_assignee(&worker)?;
             }
             let task_id = format!("{id}-t1");
             tx.execute(
@@ -649,6 +662,7 @@ impl Store {
             if let Some(w) = assignee {
                 let worker = self.agent_in(&tx, w)?;
                 self.check_group_member(&job, &worker)?;
+                refuse_archived_assignee(&worker)?;
             }
             let t = now();
             tx.execute(
@@ -796,6 +810,7 @@ impl Store {
             })?;
             let worker = self.agent_in(&tx, assignee)?;
             self.check_group_member(&job, &worker)?;
+            refuse_archived_assignee(&worker)?;
 
             // Same-revision retry vs new revision.
             let mut revision = task.revision;
@@ -1144,6 +1159,10 @@ impl Store {
                              blocked, verified or failed",
                     task.state
                 )));
+            }
+            if let Some(assignee) = task.assignee.as_deref() {
+                let worker = self.agent_in(&tx, assignee)?;
+                refuse_archived_assignee(&worker)?;
             }
             tx.execute(
                 "UPDATE tasks SET state='draft',revision=0,head_sha=NULL,

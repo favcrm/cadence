@@ -710,6 +710,13 @@
                 params![now() - 30.0 * 86_400.0],
             )
             ).unwrap();
+        // CAD-1239/D-j: the timer keeps non-terminal assigned work. Make
+        // the task terminal so this test still proves the job history
+        // survives the row removal.
+        s.fixture_write(|c| {
+            (*c).execute("UPDATE tasks SET state='done' WHERE assignee='w1'", [])
+        })
+        .unwrap();
 
         assert!(s.timer_gc_remove("w1", 86_400.0).unwrap().is_some());
         assert!(s.agent_opt("w1").unwrap().is_none());
@@ -721,6 +728,33 @@
             .unwrap()
             .iter()
             .any(|e| e.alias == "w1" && e.kind == "task_running"));
+    }
+
+    /// CAD-1239/D-j: the timer also keeps a row with non-terminal
+    /// assigned work, matching `agent remove`'s task refusal.
+    #[test]
+    fn timer_gc_remove_keeps_a_non_terminal_task() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let kickoff = seeded_task(&s, &cwd);
+        let m = run_kickoff(&s, &kickoff);
+        // Drain the kickoff message so the open-message guard is not what
+        // keeps the row; the task stays non-terminal on its own.
+        s.finish(
+            &m,
+            "completed",
+            &json!({"status": "completed", "text": "done", "sha": SHA40_A}),
+            None,
+        )
+        .unwrap();
+        s.fixture_write(|c| (*c).execute(
+                "UPDATE agents SET state='stopped', enabled=0, endpoint=NULL,
+                 updated=? WHERE alias='w1'",
+                params![now() - 30.0 * 86_400.0],
+            )
+            ).unwrap();
+        assert!(s.timer_gc_remove("w1", 86_400.0).unwrap().is_none());
+        assert!(s.agent_opt("w1").unwrap().is_some());
     }
 
     /// CAD-199: the timer's guarded removal — the manual candidate rule

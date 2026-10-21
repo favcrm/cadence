@@ -305,7 +305,8 @@ impl Store {
         let members: Vec<(String, String)> = tx.query_vec(
             "SELECT s.uid, a.alias FROM topic_subscriptions s
                JOIN agents a ON a.uid = s.uid
-              WHERE s.topic_id=? ORDER BY s.added, s.uid",
+              WHERE s.topic_id=? AND a.archived_at IS NULL
+              ORDER BY s.added, s.uid",
             [topic.as_str()],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -442,7 +443,8 @@ impl Store {
             let members: Vec<(String, String)> = conn.query_vec(
                 "SELECT s.uid, a.alias FROM topic_subscriptions s
                    JOIN agents a ON a.uid = s.uid
-                  WHERE s.topic_id=? ORDER BY s.added, s.uid",
+                  WHERE s.topic_id=? AND a.archived_at IS NULL
+              ORDER BY s.added, s.uid",
                 [topic],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
@@ -530,7 +532,8 @@ impl Store {
             let members: Vec<(String, String)> = conn.query_vec(
                 "SELECT s.uid, a.alias FROM topic_subscriptions s
                    JOIN agents a ON a.uid = s.uid
-                  WHERE s.topic_id=? ORDER BY s.added, s.uid",
+                  WHERE s.topic_id=? AND a.archived_at IS NULL
+              ORDER BY s.added, s.uid",
                 [topic],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;

@@ -57,6 +57,87 @@ mod business_templates_rpc;
 mod cad1184_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1184_revision_acceptance;
+/// CAD-1239: explicit archive aliases, at most 50, no duplicates.
+fn archive_aliases(params: &Value) -> Result<Vec<String>> {
+    let raw = params
+        .get("aliases")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::rejected("aliases must be an explicit array"))?;
+    if raw.is_empty() || raw.len() > 50 {
+        return Err(Error::rejected("archive batch must contain 1-50 aliases"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for value in raw {
+        let alias = value
+            .as_str()
+            .ok_or_else(|| Error::rejected("each archive alias must be a string"))?
+            .to_string();
+        if !seen.insert(alias.clone()) {
+            return Err(Error::rejected(format!("duplicate archive alias: {alias}")));
+        }
+        out.push(alias);
+    }
+    Ok(out)
+}
+
+fn archive_expected_digests(params: &Value) -> Result<Vec<(String, String)>> {
+    let raw = params
+        .get("expected")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::rejected("expected must be an explicit array"))?;
+    if raw.is_empty() || raw.len() > 50 {
+        return Err(Error::rejected("archive batch must contain 1-50 aliases"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for value in raw {
+        let alias = value
+            .get("alias")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::rejected("each expected entry needs alias and digest"))?
+            .to_string();
+        let digest = value
+            .get("digest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::rejected("each expected entry needs alias and digest"))?
+            .to_string();
+        if !seen.insert(alias.clone()) {
+            return Err(Error::rejected(format!("duplicate archive alias: {alias}")));
+        }
+        out.push((alias, digest));
+    }
+    Ok(out)
+}
+
+fn archive_expected_revs(params: &Value) -> Result<Vec<(String, i64)>> {
+    let raw = params
+        .get("expected")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::rejected("expected must be an explicit array"))?;
+    if raw.is_empty() || raw.len() > 50 {
+        return Err(Error::rejected("restore batch must contain 1-50 aliases"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for value in raw {
+        let alias = value
+            .get("alias")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::rejected("each expected entry needs alias and lifecycle_rev"))?
+            .to_string();
+        let rev = value
+            .get("lifecycle_rev")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| Error::rejected("each expected entry needs alias and lifecycle_rev"))?;
+        if !seen.insert(alias.clone()) {
+            return Err(Error::rejected(format!("duplicate restore alias: {alias}")));
+        }
+        out.push((alias, rev));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod cad1210_acceptance;
 #[cfg(test)]
@@ -2332,12 +2413,15 @@ impl Shared {
                 // CAD-1266: one pass over `tasks` for the whole fleet, not
                 // one query per agent.
                 let mut open_tasks = self.store.open_task_ids_by_assignee()?;
-                // CAD-96: one grouped read tells auto-stopped rows apart.
+                let listed_agents = self.store.agents()?;
+                let aliases: Vec<String> = listed_agents.iter().map(|a| a.alias.clone()).collect();
+                // CAD-96/CAD-1239: one grouped read for the operational
+                // aliases only; archived rows are never enriched.
                 let markers = self
                     .store
-                    .last_events_of_all(AUTO_STOP_MARKER_KINDS)
+                    .last_events_of(&aliases, AUTO_STOP_MARKER_KINDS)
                     .unwrap_or_default();
-                for agent in self.store.agents()? {
+                for agent in listed_agents {
                     if !states.is_empty() && !states.contains(&agent.state) {
                         continue;
                     }
@@ -2923,6 +3007,83 @@ impl Shared {
                     "candidates": candidates,
                     "not_permitted": not_permitted,
                     "kept": kept,
+                }))
+            }
+            "agent_archive_plan" => {
+                self.operator_connection("agent archive plan", params, peer_pid)?;
+                reject_identity_fields(params, "agent archive plan")?;
+                let aliases = archive_aliases(params)?;
+                let lc = self.lifecycle.lock().unwrap();
+                let mut rows = Vec::new();
+                for alias in &aliases {
+                    let plan = self.store.archive_plan(alias)?;
+                    let mut reasons = plan.reasons.clone();
+                    if lc.owned(alias) || lc.stopping.contains(alias) {
+                        reasons.push("lifecycle_owned".to_string());
+                    }
+                    if plan.agent.endpoint_kind == "pty"
+                        && adapter::pty::pane_alive(&self.state_dir, alias, &self.provider_env)
+                    {
+                        reasons.push("pane_alive".to_string());
+                    }
+                    rows.push(json!({
+                        "alias": plan.agent.alias,
+                        "eligible": reasons.is_empty(),
+                        "reasons": reasons,
+                        "lifecycle_rev": plan.agent.lifecycle_rev,
+                        "digest": plan.digest,
+                        "state": plan.agent.state,
+                        "enabled": plan.agent.enabled,
+                        "gc_keep": plan.agent.gc_keep,
+                        "archived": plan.agent.archived_at.is_some(),
+                        "open_messages": plan.open_messages,
+                        "open_tasks": plan.open_tasks,
+                    }));
+                }
+                Ok(json!({"aliases": rows}))
+            }
+            "agent_archive" => {
+                self.operator_connection("agent archive", params, peer_pid)?;
+                reject_identity_fields(params, "agent archive")?;
+                let reason = required_str(params, "reason")?.to_string();
+                let expected = archive_expected_digests(params)?;
+                let lc = self.lifecycle.lock().unwrap();
+                for (alias, _) in &expected {
+                    if lc.owned(alias) || lc.stopping.contains(alias) {
+                        return Err(Error::rejected(format!("{alias}: lifecycle_owned")));
+                    }
+                    if let Some(agent) = self.store.agent_opt(alias)? {
+                        if agent.endpoint_kind == "pty"
+                            && adapter::pty::pane_alive(&self.state_dir, alias, &self.provider_env)
+                        {
+                            return Err(Error::rejected(format!("{alias}: pane_alive")));
+                        }
+                    }
+                }
+                let by = json!({"by": "operator", "by_kind": "operator-connection"});
+                let plans = self.store.archive_agents(&expected, &reason, &by)?;
+                drop(lc);
+                self.wake();
+                Ok(json!({
+                    "archived": plans.iter().map(|p| p.agent.alias.clone()).collect::<Vec<_>>(),
+                }))
+            }
+            "agent_restore" => {
+                self.operator_connection("agent restore", params, peer_pid)?;
+                reject_identity_fields(params, "agent restore")?;
+                let expected = archive_expected_revs(params)?;
+                let lc = self.lifecycle.lock().unwrap();
+                for (alias, _) in &expected {
+                    if lc.owned(alias) || lc.stopping.contains(alias) {
+                        return Err(Error::rejected(format!("{alias}: lifecycle_owned")));
+                    }
+                }
+                let by = json!({"by": "operator", "by_kind": "operator-connection"});
+                let agents = self.store.restore_agents(&expected, &by)?;
+                drop(lc);
+                self.wake();
+                Ok(json!({
+                    "restored": agents.iter().map(|a| a.alias.clone()).collect::<Vec<_>>(),
                 }))
             }
             "agent_resume" => {
