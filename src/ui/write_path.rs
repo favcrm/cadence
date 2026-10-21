@@ -1012,12 +1012,9 @@ pub(crate) fn write_route(
     // through to the remaining chain below, unchanged.
     if let Some(bound) = endpoints::resolve(path) {
         let endpoint = bound.endpoint;
-        if endpoint.method != method.as_str() {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        // The class decides whether `admit` runs; `Session` is the one class
-        // that skips it (the nonce or the session is the credential).
+        // Admission runs before the method check for every non-Session row:
+        // a read-only board or an unauthenticated caller used to refuse these
+        // paths before the arm's own 405, and must still.
         let caller = if endpoint.class == RouteClass::Session {
             None
         } else {
@@ -1029,6 +1026,10 @@ pub(crate) fn write_route(
                 }
             }
         };
+        if endpoint.method != method.as_str() {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
         // Validators run after admission, so an unauthenticated caller still
         // sees the same refusal it saw before the migration.
         if let Some(resp) = bound.invalid() {

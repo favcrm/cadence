@@ -329,18 +329,28 @@ fn bind<'p>(endpoint: &'static Endpoint, path: &'p str) -> Option<Bound<'p>> {
     loop {
         match (want.next(), got.next()) {
             (None, None) => break,
-            (Some(literal), Some(segment)) if literal == segment => {}
-            (Some(slot), Some(segment)) if slot.starts_with('{') => {
-                let name = slot.trim_start_matches('{').trim_end_matches('}');
-                let binding = endpoint.binding(name)?;
-                if segment.is_empty() && !binding.allow_empty {
-                    return None;
+            (Some(slot), Some(segment)) => {
+                // A slot is recognised by its own spelling, never by the
+                // request segment: a segment that literally reads `{tag}`
+                // must still bind the parameter and face its validator.
+                match slot
+                    .strip_prefix('{')
+                    .and_then(|slot| slot.strip_suffix('}'))
+                {
+                    Some(name) => {
+                        let binding = endpoint.binding(name)?;
+                        if segment.is_empty() && !binding.allow_empty {
+                            return None;
+                        }
+                        if bound == MAX_PARAMS {
+                            return None;
+                        }
+                        params[bound] = Some((binding.name, segment));
+                        bound += 1;
+                    }
+                    None if slot == segment => {}
+                    None => return None,
                 }
-                if bound == MAX_PARAMS {
-                    return None;
-                }
-                params[bound] = Some((binding.name, segment));
-                bound += 1;
             }
             _ => return None,
         }
@@ -402,6 +412,18 @@ mod tests {
         assert_eq!(bound.endpoint.id, RouteId::ExplorerRemove);
         let response = bound.invalid().expect("an empty id is invalid");
         assert_eq!(response.status_code().0, 400);
+    }
+
+    #[test]
+    fn a_segment_spelling_a_slot_still_binds_and_validates() {
+        // `%7Btag%7D` decodes to this at ingress; the slot must bind it and
+        // the tag validator must refuse it, not skip validation.
+        let bound =
+            resolve("/api/app-installations/i/screens/{tag}/mount").expect("the mount row binds");
+        assert_eq!(bound.get("tag"), Some("{tag}"));
+        assert_eq!(bound.invalid().expect("invalid tag").status_code().0, 404);
+        let bound = resolve("/api/app-installations/{id}/remove").expect("the row binds");
+        assert_eq!(bound.get("id"), Some("{id}"));
     }
 
     #[test]
