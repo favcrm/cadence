@@ -85,6 +85,8 @@ pub mod skill;
 pub mod slots;
 pub mod store;
 pub mod tailnet_proof;
+#[cfg(test)]
+pub(crate) mod test_ports;
 pub mod test_queue;
 pub mod test_seam;
 pub mod ui;

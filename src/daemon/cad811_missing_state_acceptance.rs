@@ -527,14 +527,7 @@ impl Native {
         // racy health check or adoption of a neighbor. Only owned 3110-3199.
         // Build Shared after selecting a disjoint free candidate; the actual
         // board bind still must acknowledge success or this attempt is BLOCKED.
-        let reservation = (3110..3200)
-            .filter(|port| !matches!(*port, 3139 | 3140))
-            .find_map(|port| {
-                std::net::TcpListener::bind(("127.0.0.1", port))
-                    .ok()
-                    .map(|listener| (port, listener))
-            })
-            .expect("fixture BLOCKED: no isolated board port");
+        let reservation = crate::test_ports::reserve_board_port();
         let (port, reservation) = reservation;
         let host = format!("c811-owner.board.localhost:{port}");
         let issuer = format!("http://127.0.0.1:{port}");
