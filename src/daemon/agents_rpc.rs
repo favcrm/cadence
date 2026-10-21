@@ -1074,12 +1074,9 @@ impl Shared {
                     "Agent '{alias}' has no active cloud dispatch to stop"
                 )));
             }
-            // A live poller observes the request and calls AOS stop. A
-            // queued kickoff stays enabled so restart recovery or a retry
-            // can consume the request and settle it before any create.
-            if running > 0 {
-                self.store.set_enabled(&alias, false)?;
-            }
+            // A cloud stop is per-job. The actorless agent stays enabled:
+            // there is no actor/resume path to re-enable it, and a stopped
+            // job must not permanently block later dispatch.
             let _ = self.store.event_public(
                 &alias,
                 "stop_requested",

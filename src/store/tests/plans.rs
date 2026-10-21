@@ -48,9 +48,17 @@
             Some(&"0".repeat(40)),
         )
         .unwrap();
-        s.dispatch_task("t8", None, None, "test").unwrap();
+        let (_, kickoff, ..) = s.dispatch_task("t8", None, None, "test").unwrap();
         let error = s.inbox_drain("sb", 0).unwrap_err().to_string();
         assert!(error.contains("inbox agents"), "{error}");
+        let row = s.message(&kickoff).unwrap().unwrap();
+        s.finish(&row, "unknown", &json!({"text": "unknown"}), None)
+            .unwrap();
+        let error = s
+            .reconcile(&kickoff, "interrupted", None, "test", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cloud sandbox work"), "{error}");
         let error = s.cancel_task("t8", "test").unwrap_err().to_string();
         assert!(error.contains("active cloud dispatch"), "{error}");
         let error = s.fail_task("t8", "no", "test").unwrap_err().to_string();
