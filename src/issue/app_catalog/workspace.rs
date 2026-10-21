@@ -2355,9 +2355,9 @@ pub(crate) fn update_check(pm: &Pm, install_id: &str) -> Result<Value> {
             .ok_or_else(|| Error::rejected("installed version is not readable"))?;
         // Directory I/O must not hold the workspace's mutation lock.
         drop(_lock);
-        let origin = crate::ui::public_directory::catalog_origin()
+        let origin = super::client::catalog_origin()
             .ok_or_else(|| Error::rejected("catalogue metadata is unavailable"))?;
-        let document = crate::ui::public_directory::fetch_versions_at(&origin, &locator.id)?;
+        let document = super::client::fetch_versions_at(&origin, &locator.id)?;
         let mut result = super::catalogue::update_check(
             &document,
             locator,

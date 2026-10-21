@@ -2,6 +2,7 @@
 //! No daemon/HTTP routing, execution or grant translation is enabled here.
 pub mod builtin;
 pub(crate) mod catalogue;
+pub(crate) mod client;
 mod fs;
 pub mod workspace;
 use serde::{Deserialize, Serialize};
