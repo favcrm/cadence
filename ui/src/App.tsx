@@ -12,6 +12,7 @@ import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell
 import { Loading, Notice } from "./features/app-shell/shared/States";
 import type { Viewer } from "./features/projects/work";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
+import { noteAppScreen } from "./features/app-shell/sidebarPrefs";
 import { useInstallations, type InstallationsState } from "./features/workspace-apps/useInstallations";
 import { APPS_CHANGED_EVENT } from "./features/workspace-apps/workspaceApps";
 import { appLoadErrorCopy } from "./features/explorer/appErrors";
@@ -41,7 +42,7 @@ import Context from "./features/projects/Context";
 import { contextNavigationSearch } from "./features/projects/contextRoute";
 import Workflows from "./features/projects/Workflows";
 import Sidebar from "./ui/Sidebar";
-import { NavList, ProjectList } from "./ui/NavList";
+import { NavList, ProjectsSection } from "./ui/NavList";
 import Wiki from "./features/wiki/Wiki";
 import Link from "./ui/Link";
 import ProjectFilter from "./ui/ProjectFilter";
@@ -785,6 +786,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       return next;
     });
   }, [activeId, activeSection]);
+  // CAD-1692: the sidebar unfolds Apps on entering an app, judged from the route.
+  useEffect(() => { noteAppScreen(onAppScreen, activeId); }, [onAppScreen, activeId]);
   const appMenu = {
     ...buildAppNav({
       apps: menuApps,
@@ -936,9 +939,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               label={t("Workspace")}
               onNavigate={() => setMenuOpen(false)}
             />
-            <div className="slabel pt-2">{t("projects")}</div>
-            <nav aria-label={t("Projects")}>
-              <ProjectList
+            <div className="pt-2">
+              <ProjectsSection
                 project={navProject}
                 projectHref={projectHref}
                 projects={projects}
@@ -946,7 +948,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 projectsError={projectsState.status === "failed" ? projectsState.error : null}
                 onNavigate={() => setMenuOpen(false)}
               />
-            </nav>
+            </div>
             {/* The header carries these as icons under lg — here they keep
                 their words, so the meaning is one tap away on touch. */}
             <div className="slabel pt-2">{t("board")}</div>

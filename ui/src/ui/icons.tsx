@@ -24,6 +24,7 @@ import {
   Menu01Icon,
   Moon02Icon,
   MoreHorizontalIcon,
+  PinIcon,
   Pulse01Icon,
   RefreshIcon,
   Robot01Icon,
@@ -115,6 +116,10 @@ export const IconChevron = ({ size = 10, ...rest }: IconProps = {}) => (
 /** Tree disclosure; the row rotates it when the folder is open. */
 export const IconCaret = ({ size = 10, ...rest }: IconProps = {}) => (
   <Glyph icon={ArrowRight01Icon} size={size} {...rest} />
+);
+/** Pin a row to the top of its list. */
+export const IconPin = ({ size = 12, ...rest }: IconProps = {}) => (
+  <Glyph icon={PinIcon} size={size} {...rest} />
 );
 /** Close a drawer or a panel. */
 export const IconClose = ({ size = 12, ...rest }: IconProps = {}) => (

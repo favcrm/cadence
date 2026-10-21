@@ -1316,6 +1316,12 @@ export function useLocale(): LocaleContextValue {
 export { useTranslate } from "./localeText";
 
 Object.assign(zhTW, {
+  "Collapse apps": "收合應用程式",
+  "Expand apps": "展開應用程式",
+  "Collapse": "收合",
+  "Expand": "展開",
+  "Show {count} more": "顯示其餘 {count} 個",
+  "Show pinned only": "只顯示已釘選",
   "Choose favorites": "選擇我的最愛",
   "Use Choose favorites to keep everyday apps here and in the sidebar.": "在「選擇我的最愛」釘選日常使用的應用程式，便會顯示在此處及側邊欄。",
   "Manage installation": "管理安裝",

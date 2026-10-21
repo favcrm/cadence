@@ -4,7 +4,7 @@ import type { AppNav } from "../features/app-shell/appNav";
 import type { Route, Screen } from "../lib/router";
 import type { IssueCard, Project } from "../lib/types";
 import { Logo } from "./Logo";
-import { NavList, ProjectList } from "./NavList";
+import { NavList, ProjectsSection } from "./NavList";
 import { useLocale } from "../lib/locale";
 
 interface Props {
@@ -50,11 +50,7 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
           </span>
         </div>
         <NavList screen={screen} navHref={navHref} appMenu={appMenu} homeCount={homeCount} />
-        <div className="slabel flex justify-between mx-[11px] mt-[18px] mb-[5px]">
-          <span>{t("Projects")}</span>
-          <span className="text-[10px]">~/pm</span>
-        </div>
-        <ProjectList project={project} projectHref={projectHref} projects={projects} issues={issues} projectsError={projectsError} />
+        <ProjectsSection project={project} projectHref={projectHref} projects={projects} issues={issues} projectsError={projectsError} />
       </div>
       <div data-sidebar-footer className="pt-1 border-t border-ink-700 text-label text-ink-500">
         {signedIn === true ? account : (
