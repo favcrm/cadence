@@ -113,6 +113,7 @@ const CATALOG: &[(&str, &[&str])] = &[
             "pid",
             "state",
             "enabled",
+            "gc_keep",
             "error",
             "created",
             "updated",

@@ -445,7 +445,7 @@ impl Shared {
     /// caller and each key's old and new value.
     pub(super) fn rpc_set(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
-        let patch = params
+        let mut patch = params
             .get("patch")
             .filter(|p| p.is_object())
             .cloned()
@@ -475,6 +475,27 @@ impl Shared {
         };
         let caller =
             self.authorize_agent_mutation(params, peer_pid, "agent set", &agent, mutation)?;
+        // CAD-804: `gc_keep` is a registry keep, not an endpoint param.
+        // Take it out before the endpoint-param allowlist runs; every
+        // other key still validates and merges exactly as before.
+        let gc_keep = match patch.as_object_mut().unwrap().remove("gc_keep") {
+            None => None,
+            Some(Value::Bool(keep)) => Some(keep),
+            Some(Value::String(s)) if s.eq_ignore_ascii_case("true") => Some(true),
+            Some(Value::String(s)) if s.eq_ignore_ascii_case("false") => Some(false),
+            Some(Value::Null) => Some(false),
+            Some(_) => {
+                return Err(Error::invalid(
+                    "invalid_gc_keep",
+                    "gc_keep must be true or false",
+                ))
+            }
+        };
+        if next_launch && gc_keep.is_some() {
+            return Err(Error::rejected(
+                "gc_keep is not a launch param; set it without --next-launch",
+            ));
+        }
         for (key, value) in patch.as_object().unwrap() {
             proto::param_key(key)?;
             if matches!(
@@ -538,6 +559,16 @@ impl Shared {
         let mut audit = caller_audit(&caller);
         audit["caller_pid"] = json!(peer_pid);
         audit["next_launch"] = json!(next_launch);
+        if let Some(keep) = gc_keep {
+            self.store.set_gc_keep_by(&alias, keep, &audit)?;
+        }
+        if patch.as_object().unwrap().is_empty() {
+            if gc_keep.is_none() {
+                return Err(Error::rejected("agent set needs at least one key"));
+            }
+            self.wake();
+            return Ok(json!({"alias": alias, "state": "updated", "gc_keep": gc_keep}));
+        }
         self.store.set_params_by(&alias, &patch, &audit)?;
         if next_launch {
             self.wake();

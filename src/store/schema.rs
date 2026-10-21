@@ -301,6 +301,7 @@ impl Store {
                     instructions TEXT, thread_id TEXT, session_id TEXT,
                     model TEXT, effort TEXT, pid INTEGER,
                     state TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+                    gc_keep INTEGER NOT NULL DEFAULT 0,
                     error TEXT, created REAL NOT NULL, updated REAL NOT NULL);
                  CREATE TABLE IF NOT EXISTS messages(
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1377,6 +1378,24 @@ impl Store {
                 tx.execute_batch(super::settings_authority::SCHEMA_V52)?;
                 super::settings_authority::lift_embedded_authority(&tx)?;
                 tx.execute("UPDATE schema_version SET version=52", [])?;
+                tx.commit()?;
+            }
+            if version < 53 {
+                // CAD-804: an explicit keep for the agent-gc paths. Column-
+                // checked like v42/v48 so a half-applied store converges;
+                // existing rows default to sweepable.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(agents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                if !columns.iter().any(|c| c == "gc_keep") {
+                    tx.execute_batch(
+                        "ALTER TABLE agents ADD COLUMN gc_keep INTEGER NOT NULL DEFAULT 0",
+                    )?;
+                }
+                tx.execute("UPDATE schema_version SET version=53", [])?;
                 tx.commit()?;
             }
             if let Some(crossing) = permit.crossing {

@@ -72,6 +72,9 @@ pub struct Agent {
     pub generation: Option<String>,
     pub state: String,
     pub enabled: bool,
+    /// CAD-804: an explicit keep for every agent-gc path. A stopped,
+    /// idle row with this set is never swept, however old it is.
+    pub gc_keep: bool,
     pub error: Option<String>,
     /// Row timestamps — `updated` is the last state write, which
     /// `session end` measures idleness from.
@@ -133,6 +136,7 @@ fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
         generation: row.get("generation")?,
         state: row.get("state")?,
         enabled: row.get::<_, i64>("enabled")? != 0,
+        gc_keep: row.get::<_, i64>("gc_keep")? != 0,
         error: row.get("error")?,
         created: row.get("created")?,
         updated: row.get("updated")?,
@@ -204,7 +208,7 @@ impl Agent {
             },
             "approval_policy": approval_policy,
             "approval_policy_source": approval_policy_source,
-            "enabled": self.enabled, "error": self.error,
+            "enabled": self.enabled, "gc_keep": self.gc_keep, "error": self.error,
             "endpoint": self.endpoint, "params": self.params,
             "quota": self.quota,
             "generation": self.generation,
@@ -214,6 +218,22 @@ impl Agent {
             // attached or submitted to until it opens again.
             "dead": self.endpoint.is_none(),
         })
+    }
+}
+
+/// CAD-804: one dead row the agent-gc paths consider, with the
+/// open-message count that decides eligibility and the age the caller's
+/// window is measured against. `agent_gc_plan` renders these rows.
+#[derive(Debug, Clone)]
+pub struct GcRow {
+    pub agent: Agent,
+    pub open_messages: i64,
+    pub age_secs: f64,
+}
+
+impl GcRow {
+    pub fn eligible(&self) -> bool {
+        Store::gc_eligible(&self.agent, self.open_messages)
     }
 }
 
@@ -1040,6 +1060,34 @@ impl Store {
         })
     }
 
+    /// CAD-804: set or clear the explicit agent-gc keep. Stamped with the
+    /// derived caller like `set_params_by`, in the same transaction as the
+    /// column change, so a plan can say who protected the row.
+    pub fn set_gc_keep_by(&self, alias: &str, gc_keep: bool, audit: &Value) -> Result<()> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let agent = self.agent_in(&tx, alias)?;
+            // A keep is not activity: do not reset the idle age the
+            // sweep measures. Only the keep column changes.
+            tx.execute(
+                "UPDATE agents SET gc_keep=? WHERE alias=?",
+                params![gc_keep as i64, alias],
+            )?;
+            let mut detail = json!({
+                "alias": alias,
+                "gc_keep": gc_keep,
+                "old": agent.gc_keep,
+            });
+            if let Some(extra) = audit.as_object() {
+                for (k, v) in extra {
+                    detail[k.as_str()] = v.clone();
+                }
+            }
+            Self::event(&tx, alias, "gc_keep_updated", detail)?;
+            Ok(())
+        })
+    }
+
     /// Publish a detached runtime state in ONE write: the state, its
     /// error and the cleared runtime fields land together so a reader
     /// can never observe a fenced (`attention`) or terminal agent that
@@ -1297,22 +1345,59 @@ impl Store {
         Ok(())
     }
 
-    /// Agents eligible for an explicit `agent gc` sweep: dead endpoint
-    /// and a terminal lifecycle state, optionally limited to rows not
-    /// updated within `older_than` seconds. `agent gc` sweeps these on
-    /// command; the daemon's agent-gc timer (CAD-199, off unless `[host]
-    /// agent_gc_older_than_secs` is set) narrows them further through
-    /// [`Store::timer_gc_remove`].
-    pub fn gc_candidates(&self, older_than: Option<f64>) -> Result<Vec<Agent>> {
+    /// CAD-804: the one row rule every agent-gc path applies — no live
+    /// endpoint, a terminal lifecycle state, not enabled, not explicitly
+    /// kept, and no open or unknown message. The caller's `older_than`
+    /// window is applied by the query/removal, not here.
+    pub fn gc_eligible(agent: &Agent, open_messages: i64) -> bool {
+        agent.endpoint.is_none()
+            && matches!(agent.state.as_str(), "attention" | "stopped")
+            && !agent.enabled
+            && !agent.gc_keep
+            && open_messages == 0
+    }
+
+    /// CAD-804: every dead row inside the caller's age window, with the
+    /// open-message count and age the shared predicate and the plan need.
+    /// Disabled/enabled and `gc_keep` rows are included; callers classify
+    /// them through [`Store::gc_eligible`] so the manual sweep, the plan
+    /// and the timer can never drift.
+    pub fn gc_rows(&self, older_than: Option<f64>) -> Result<Vec<GcRow>> {
         let cutoff = older_than.map(|age| now() - age).unwrap_or(f64::MAX);
         self.read_tx(|conn| {
-            let stmt_sql = "SELECT * FROM agents WHERE endpoint IS NULL
-                         AND state IN ('attention','stopped') AND updated < ?";
+            let stmt_sql = "SELECT a.*,
+                (SELECT COUNT(*) FROM messages m WHERE m.alias=a.alias
+                   AND m.source != 'topic_notice'
+                   AND m.state NOT IN ('completed','failed','interrupted','cancelled'))
+                  AS open_messages
+                FROM agents a WHERE a.endpoint IS NULL
+                  AND a.state IN ('attention','stopped') AND a.updated < ?";
+            let at = now();
             let rows = conn
-                .query_vec(stmt_sql, params![cutoff], row_agent)
+                .query_vec(stmt_sql, params![cutoff], |row| {
+                    let agent = row_agent(row)?;
+                    Ok(GcRow {
+                        age_secs: at - agent.updated,
+                        open_messages: row.get("open_messages")?,
+                        agent,
+                    })
+                })
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
+    }
+
+    /// Agents eligible for an explicit `agent gc` sweep, through the one
+    /// shared predicate. `agent gc` and the daemon's agent-gc timer
+    /// (CAD-199, off unless `[host] agent_gc_older_than_secs` is set)
+    /// both start here; the timer additionally skips a live pty pane.
+    pub fn gc_candidates(&self, older_than: Option<f64>) -> Result<Vec<Agent>> {
+        Ok(self
+            .gc_rows(older_than)?
+            .into_iter()
+            .filter(GcRow::eligible)
+            .map(|row| row.agent)
+            .collect())
     }
 
     pub(super) fn agent_opt_in(
@@ -1356,11 +1441,7 @@ impl Store {
                 [alias],
                 |r| r.get(0),
             )?;
-            let eligible = agent.endpoint.is_none()
-                && matches!(agent.state.as_str(), "attention" | "stopped")
-                && !agent.enabled
-                && age > older_than
-                && open_messages == 0;
+            let eligible = Self::gc_eligible(&agent, open_messages) && age > older_than;
             if !eligible {
                 return Ok(None);
             }

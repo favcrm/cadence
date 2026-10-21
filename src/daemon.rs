@@ -2892,9 +2892,12 @@ impl Shared {
                 reject_identity_fields(params, "agent gc")?;
                 let caller = self.agent_caller(peer_pid, "agent gc")?;
                 let older_than = params.get("older_than").and_then(Value::as_f64);
-                let (candidates, not_permitted) = self.gc_partition(&caller, older_than)?;
-                let candidates: Vec<String> = candidates.into_iter().map(|a| a.alias).collect();
-                Ok(json!({"candidates": candidates, "not_permitted": not_permitted}))
+                let (candidates, not_permitted, kept) = self.gc_plan(&caller, older_than)?;
+                Ok(json!({
+                    "candidates": candidates,
+                    "not_permitted": not_permitted,
+                    "kept": kept,
+                }))
             }
             "agent_resume" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
@@ -9355,6 +9358,24 @@ mod agent_gc_timer {
         shared.agent_gc_tick();
         assert!(shared.store.agent_opt("later").unwrap().is_none());
         assert_eq!(removed_events(&shared).len(), 2);
+    }
+
+    #[test]
+    fn gc_keep_survives_the_sweep_that_removes_a_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = pinned(dir.path(), AgentGcSetting::older_than(AGENT_GC_FLOOR_SECS));
+        stopped_row(&shared, dir.path(), "keep", 30.0);
+        stopped_row(&shared, dir.path(), "gone", 30.0);
+        shared
+            .store
+            .set_gc_keep_by("keep", true, &Value::Null)
+            .unwrap();
+        shared.agent_gc_tick();
+        assert!(shared.store.agent_opt("keep").unwrap().is_some());
+        assert!(shared.store.agent_opt("gone").unwrap().is_none());
+        let events = removed_events(&shared);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["alias"], "gone");
     }
 }
 

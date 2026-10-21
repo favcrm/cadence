@@ -2138,8 +2138,8 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
             json!({"older_than": 3600}),
         ) {
             Ok(plan) => {
-                let cands = str_list(&plan["candidates"]);
-                let refused = str_list(&plan["not_permitted"]);
+                let cands = plan_aliases(&plan["candidates"]);
+                let refused = plan_aliases(&plan["not_permitted"]);
                 gc_row = gc_not_permitted(
                     gc_row,
                     format!("would sweep {} dead agent(s)", cands.len()),
@@ -2480,6 +2480,23 @@ fn handoff_md(
         md.push_str("- agents live — daemon left running\n");
     }
     md
+}
+
+/// A JSON array of plan rows (objects with `alias`, or bare strings from
+/// an older daemon) as aliases.
+fn plan_aliases(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| {
+                    x.get("alias")
+                        .and_then(Value::as_str)
+                        .or_else(|| x.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A JSON array of strings as a `Vec` (anything else is empty).
