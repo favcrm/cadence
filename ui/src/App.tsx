@@ -41,7 +41,7 @@ import Context from "./features/projects/Context";
 import { contextNavigationSearch } from "./features/projects/contextRoute";
 import Workflows from "./features/projects/Workflows";
 import Sidebar from "./ui/Sidebar";
-import { NavList, ProjectList } from "./ui/NavList";
+import { NavList, ProjectsSection } from "./ui/NavList";
 import Wiki from "./features/wiki/Wiki";
 import Link from "./ui/Link";
 import ProjectFilter from "./ui/ProjectFilter";
@@ -936,9 +936,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               label={t("Workspace")}
               onNavigate={() => setMenuOpen(false)}
             />
-            <div className="slabel pt-2">{t("projects")}</div>
-            <nav aria-label={t("Projects")}>
-              <ProjectList
+            <div className="pt-2">
+              <ProjectsSection
                 project={navProject}
                 projectHref={projectHref}
                 projects={projects}
@@ -946,7 +945,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 projectsError={projectsState.status === "failed" ? projectsState.error : null}
                 onNavigate={() => setMenuOpen(false)}
               />
-            </nav>
+            </div>
             {/* The header carries these as icons under lg — here they keep
                 their words, so the meaning is one tap away on touch. */}
             <div className="slabel pt-2">{t("board")}</div>
