@@ -28,6 +28,12 @@ export interface ScreenReceiverOptions {
   MessageChannel?: typeof MessageChannel;
 }
 
+export interface GenerationScope {
+  draft_id: string;
+  operation: "caption" | "image";
+  revision: number;
+}
+
 export interface SlotState {
   state: "pending" | "done" | "refused";
   receipt?: unknown;
@@ -40,7 +46,7 @@ export interface ScreenReceiver {
   accepted(): boolean;
   call<T = unknown>(verb: string, args?: unknown): Promise<T>;
   slot(verb: string, args?: unknown, anchor?: unknown): Promise<SlotState>;
-  tool<T = unknown>(alias: string, input?: unknown, requestId?: string): Promise<T>;
+  tool<T = unknown>(alias: string, input?: unknown, requestId?: string, generationScope?: GenerationScope): Promise<T>;
   asset(ref: string): Promise<string>;
   state(data: string): boolean;
   teardown(): void;
