@@ -967,6 +967,7 @@ impl Store {
                     )));
                 }
             }
+            refuse_archived_assignee(&worker)?;
             if !worker.enabled {
                 return Err(Error::rejected(format!(
                     "Agent '{}' is disabled — resume it before dispatching",
@@ -974,7 +975,6 @@ impl Store {
                 )));
             }
             self.check_group_member(&job, &worker)?;
-            refuse_archived_assignee(&worker)?;
 
             // Same-revision retry vs new revision.
             let mut revision = task.revision;

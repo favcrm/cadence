@@ -2026,7 +2026,13 @@ mod tests {
     fn model_matrix_keeps_devin_and_drops_test_doubles() {
         let rows = model_provider_matrix();
         let ids: Vec<&str> = rows.iter().map(|row| row.id).collect();
-        assert_eq!(ids, vec!["codex", "claude", "pi", "omp", "devin", "cursor"]);
+        assert_eq!(
+            ids,
+            vec!["codex", "claude", "pi", "omp", "devin", "cursor", "sandbox"]
+        );
+        assert!(rows
+            .iter()
+            .any(|row| { row.id == "sandbox" && !row.eligible && row.limitation.is_some() }));
         assert!(rows.iter().any(|row| row.id == "claude" && row.eligible));
         assert!(rows.iter().any(|row| row.id == "pi" && row.eligible));
         assert!(rows
