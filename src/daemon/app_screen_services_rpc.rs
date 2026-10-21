@@ -354,8 +354,6 @@ fn call_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
         WorksPatch => typed::<WorksPatchArgs>(value),
         WorksTrash | WorksRestore => typed::<WorksTrashArgs>(value),
         WorksRequestReview => typed::<WorksRequestReviewArgs>(value),
-        WorksReview => typed::<WorksReviewArgs>(value),
-        WorksExport => typed::<WorksExportArgs>(value),
         SegmentsList | ExclusionsList | SuppressionsList | ContentList | SenderBindingsList => {
             typed::<Empty>(value)
         }
@@ -838,6 +836,11 @@ impl Shared {
         params["install_id"] = json!(proof.context.install_id);
         params["context_id"] = json!(proof.context.context_id);
         use ScreenOperation::*;
+        if matches!(proof.operation, WorksReview | WorksExport) && proof.confirmed.is_none() {
+            return Err(Error::rejected(
+                "works review and export require host confirmation",
+            ));
+        }
         // Only native attribution consumers receive the verified public bearer;
         // each re-derives the human from its live session, never child fields.
         if matches!(
@@ -978,6 +981,11 @@ impl Shared {
             })?;
         let request: CallRequest = serde_json::from_value(params.clone())
             .map_err(|_| Error::rejected("unsupported screen service request"))?;
+        if request.operation.is_slot() {
+            return Err(Error::rejected(
+                "screen service operation requires confirmation",
+            ));
+        }
         bounded(request.operation, &request.args)?;
         let args = call_args(request.operation, &request.args)?;
         let proof = self.screen_service_proof(

@@ -29,7 +29,13 @@ function refusal(error: unknown, operation?: RecordCallVerb): ActionRefusal {
   // Apart from explicit sender-state codes on smtp.show, the child consumes
   // canonical classes (a revision_conflict must still reach the editor as conflict).
   // CAD-1656: the confirm-time recompute refusal keeps its own code.
-  if (status === 409 && error instanceof ApiError && error.code === "facts_changed") return { code: "facts_changed", text: "That changed. Refresh before trying again." };
+  // CAD-1662: Works refusals keep their closed store vocabulary, so the screen
+  // can tell a missing item from one blocked pending review.
+  const WORKS_CODES = ["invalid", "forbidden", "not_found", "conflict", "needs_review", "facts_changed", "rejected", "unauthorized"];
+  if (operation?.startsWith("works.") && error instanceof ApiError && status === 400 && error.code && WORKS_CODES.includes(error.code)) {
+    return { code: error.code, text: "Cadence refused this Works request. Refresh before trying again." };
+  }
+   if (status === 409 && error instanceof ApiError && error.code === "facts_changed") return { code: "facts_changed", text: "That changed. Refresh before trying again." };
   const code = ({ 401: "unauthorized", 403: "forbidden", 404: "not_found", 409: "conflict", 503: "unavailable" } as Record<number, string>)[status] ?? "failed";
   return { code, text: status === 401 || status === 403 ? "This app's access is no longer available." : status === 409 ? "That changed. Refresh before trying again." : "Cadence refused this request. Inspect fresh status before retrying an effect." };
 }
@@ -215,7 +221,7 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionA
   if (operation === "works.review" || operation === "works.export") {
     // CAD-1662: the card draws the doc's current revision the host re-proved;
     // the reviewer or exporter confirms that exact revision, nothing else.
-    show("Title", facts.title); show("Kind", facts.kind); show("Revision", facts.revision); show("Digest", facts.digest);
+    show("Title", facts.title); show("Kind", facts.kind); show("Revision", facts.revision); show("Author", facts.author); show("Digest", facts.contentDigest);
     if (operation === "works.review") show("Decision", "Approve this revision, or request changes.");
     if (operation === "works.export") show("Format", "Export receipt for this approved revision only.");
   }

@@ -49,13 +49,14 @@ pub(super) struct Native {
 
 impl Native {
     pub(super) fn new() -> Self {
-        Self::new_with_sub(OWNER)
+        Self::new_with_subs(&[OWNER])
     }
 
-    /// Same fixture, admitting exactly `allowed_sub` through the membership
-    /// lookup. Only the Works two-human test passes a second synthetic sub.
-    pub(super) fn new_with_sub(allowed_sub: &str) -> Self {
-        let allowed_sub = allowed_sub.to_owned();
+    /// Same fixture, admitting exactly `allowed_subs` through the membership
+    /// lookup. The Works two-human test passes the owner plus one second
+    /// synthetic sub; every other caller stays on `new()`.
+    pub(super) fn new_with_subs(allowed_subs: &[&str]) -> Self {
+        let allowed_subs: Vec<String> = allowed_subs.iter().map(|sub| (*sub).to_owned()).collect();
         assert!(
             std::env::var_os("CADENCE_SOCKET").is_none(),
             "fixture BLOCKED: inherited socket override; do not clear caller identity"
@@ -132,7 +133,9 @@ impl Native {
             .expect("fresh unique Shared")
             .membership_lookup_for_test = Some(Box::new(move |_hash, sub, company, instance| {
             assert!(
-                sub == allowed_sub.as_str() && company == COMPANY && instance == INSTANCE,
+                allowed_subs.iter().any(|allowed| allowed.as_str() == sub)
+                    && company == COMPANY
+                    && instance == INSTANCE,
                 "fixture BLOCKED: wrong synthetic membership binding"
             );
             seen.fetch_add(1, Ordering::SeqCst);
@@ -387,7 +390,7 @@ impl Native {
         must(response.into_body().read_json(), "HTTP JSON result")
     }
 
-    fn slot(
+    pub(super) fn slot(
         &self,
         session: &Session,
         origin: &str,

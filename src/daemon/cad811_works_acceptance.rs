@@ -516,3 +516,185 @@ fn cad1662_manager_guard_forged_scope_and_identity_fields_refuse_without_write()
         "forged identity/scope must create nothing"
     );
 }
+
+// CAD-1662 two-operator success: a verified author creates and requests
+// review; a distinct verified reviewer approves through the real SLOT
+// prepare/confirm path; the author then exports the approved current revision
+// and receives the receipt. Both humans are admitted by one fixture.
+#[test]
+fn cad811_works_two_verified_operators_approve_and_export() {
+    let native = Native::new_with_subs(&["synthetic-c811-owner", "synthetic-c811-reviewer"]);
+    let scope = native.fx.install("works-two-op", WORKS_OPS);
+    let (author, _) = native.owner();
+    let author_action = native.mount(&author, "public", &scope, 1);
+    let reviewer = public_session(
+        &native,
+        "synthetic-c811-reviewer",
+        "c811-works-reviewer-jti",
+    );
+    let reviewer_action = native.mount(&reviewer, "public", &scope, 2);
+
+    let created = native.service(
+        &author,
+        "public",
+        &author_action,
+        "works.create",
+        json!({"kind": "doc", "title": "two-op", "content": content_for("doc"),
+            "idempotency_key": "two-op-create"}),
+        false,
+    );
+    let id = created["id"].as_str().expect("created id").to_owned();
+    let revision = created["revision"].clone();
+    native.service(
+        &author,
+        "public",
+        &author_action,
+        "works.request_review",
+        json!({"id": id, "revision": revision}),
+        false,
+    );
+
+    let approved = native.slot(
+        &reviewer,
+        "public",
+        &reviewer_action,
+        "works.review",
+        (
+            json!({"id": id, "revision": revision, "decision": "approve"}),
+            json!({"confirmed": true, "choice": "approve"}),
+        ),
+        false,
+    );
+    assert!(
+        approved.is_object(),
+        "distinct verified reviewer approves: {approved}"
+    );
+
+    let receipt = native.slot(
+        &author,
+        "public",
+        &author_action,
+        "works.export",
+        (
+            json!({"id": id, "revision": revision, "format": "html"}),
+            json!({"confirmed": true, "choice": "export"}),
+        ),
+        false,
+    );
+    assert!(
+        receipt.is_object(),
+        "author exports the approved current revision: {receipt}"
+    );
+}
+
+// Prepares a SLOT confirmation over the real prepare RPC and returns the
+// token; the caller decides how (and whether) to confirm it.
+fn prepare_slot(
+    native: &Native,
+    session: &Session,
+    action: &str,
+    operation: &str,
+    args: Value,
+) -> String {
+    let prepared = native.rpc(
+        "app_screen_service_slot_prepare",
+        native.credentials(session, "public", call(action, operation, args)),
+    );
+    prepared.expect("slot prepare must succeed for a declared, authorized request")
+        ["confirmation_token"]
+        .as_str()
+        .expect("confirmation token")
+        .to_owned()
+}
+
+fn confirm_slot(
+    native: &Native,
+    session: &Session,
+    action: &str,
+    token: &str,
+    choice: &str,
+) -> crate::Result<Value> {
+    native.rpc(
+        "app_screen_service_slot_confirm",
+        native.credentials(
+            session,
+            "public",
+            json!({"action_token": action,
+                "confirmation_token": token,
+                "confirmation": {"confirmed": true, "choice": choice}}),
+        ),
+    )
+}
+
+// A confirmation is single-use: the first confirm consumes it; a replay with
+// the same token must refuse as spent before any mutation.
+#[test]
+fn cad811_works_confirmation_reuse_refuses() {
+    let native = Native::new_with_subs(&["synthetic-c811-owner", "synthetic-c811-reviewer"]);
+    let scope = native.fx.install("works-reuse", WORKS_OPS);
+    let (author, _) = native.owner();
+    let author_action = native.mount(&author, "public", &scope, 1);
+    let reviewer = public_session(&native, "synthetic-c811-reviewer", "c811-works-reuse-jti");
+    let reviewer_action = native.mount(&reviewer, "public", &scope, 2);
+    let created = native.service(
+        &author,
+        "public",
+        &author_action,
+        "works.create",
+        json!({"kind": "doc", "title": "reuse", "content": content_for("doc"),
+            "idempotency_key": "reuse-create"}),
+        false,
+    );
+    let id = created["id"].as_str().expect("created id").to_owned();
+    let revision = created["revision"].clone();
+    native.service(
+        &author,
+        "public",
+        &author_action,
+        "works.request_review",
+        json!({"id": id, "revision": revision}),
+        false,
+    );
+    let token = prepare_slot(
+        &native,
+        &reviewer,
+        &reviewer_action,
+        "works.review",
+        json!({"id": id, "revision": revision, "decision": "approve"}),
+    );
+    confirm_slot(&native, &reviewer, &reviewer_action, &token, "approve")
+        .expect("first confirm succeeds");
+    let replay = confirm_slot(&native, &reviewer, &reviewer_action, &token, "approve");
+    let error = replay.expect_err("replayed confirmation must refuse");
+    assert_eq!(error.kind(), "rejected", "replay: wrong refusal kind");
+}
+
+// Export before approval refuses at the store gate, through the real SLOT flow.
+#[test]
+fn cad811_works_export_before_approval_refuses_through_slot() {
+    let native = Native::new_with_subs(&["synthetic-c811-owner", "synthetic-c811-reviewer"]);
+    let scope = native.fx.install("works-export-gate", WORKS_OPS);
+    let (author, _) = native.owner();
+    let author_action = native.mount(&author, "public", &scope, 1);
+    let created = native.service(
+        &author,
+        "public",
+        &author_action,
+        "works.create",
+        json!({"kind": "doc", "title": "gate", "content": content_for("doc"),
+            "idempotency_key": "gate-create"}),
+        false,
+    );
+    let id = created["id"].as_str().expect("created id").to_owned();
+    let revision = created["revision"].clone();
+    let token = prepare_slot(
+        &native,
+        &author,
+        &author_action,
+        "works.export",
+        json!({"id": id, "revision": revision, "format": "html"}),
+    );
+    let error = confirm_slot(&native, &author, &author_action, &token, "export")
+        .expect_err("export before approval must refuse");
+    assert_eq!(error.kind(), "rejected", "export gate: wrong refusal kind");
+}
