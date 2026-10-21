@@ -538,6 +538,8 @@ jobs:
         if: ${{ needs.change-scope.outputs.ui != 'false' }}
       - run: pnpm typecheck
         if: ${{ needs.change-scope.outputs.ui != 'false' }}
+      - run: pnpm lint
+        if: ${{ needs.change-scope.outputs.ui != 'false' }}
       - run: pnpm test:url-state
         if: ${{ needs.change-scope.outputs.ui != 'false' }}
       - name: Verify app development isolation and HMR

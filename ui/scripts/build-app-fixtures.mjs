@@ -86,7 +86,7 @@ function readBaseBaseline() {
   if (typeof base !== "string" || !/^[0-9a-f]{40}$/.test(base)) throw new Error("trusted event base is missing or malformed");
   try {
     git(["cat-file", "-e", `${base}^{commit}`]);
-  } catch (error) {
+  } catch {
     if (process.env.CI !== "true") throw new Error(`trusted base commit ${base} is not available locally (offline checks do not fetch)`);
     fetchMissingCiBase(base);
     git(["cat-file", "-e", `${base}^{commit}`]);
@@ -128,7 +128,7 @@ function contractNumber(value) {
 
 const tmp = await mkdtemp(resolve(tmpdir(), "cad-app-fixtures-"));
 try {
-  execFileSync(resolve(ui, "node_modules/.bin/tsc"), ["--noEmit", "--target", "ES2022", "--module", "ESNext",
+  execFileSync(resolve(ui, "node_modules/.bin/tsrs"), ["--ignoreConfig", "--noEmit", "--target", "ES2022", "--module", "ESNext",
     "--moduleResolution", "bundler", "--lib", "ES2023,DOM,DOM.Iterable", "--strict", "--skipLibCheck",
     "--verbatimModuleSyntax", "scripts/app-fixtures/producer.ts"], { cwd: ui, stdio: "inherit" });
   process.chdir(ui);

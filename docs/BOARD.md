@@ -2017,7 +2017,8 @@ Sans/Mono, teal `#2dd4bf` on interactive elements only.
 cd ui
 npx --yes pnpm@12.2.1 install
 CADENCE_DEV_BOARD_PORT=3117 npx --yes pnpm@12.2.1 dev  # Vite HMR; /api → isolated sandbox board
-npx --yes pnpm@12.2.1 typecheck  # tsc --noEmit
+npx --yes pnpm@12.2.1 typecheck  # tsrs --noEmit (TypeScript 7, Rust checker)
+npx --yes pnpm@12.2.1 lint       # oxlint --deny-warnings (rules: ui/.oxlintrc.json)
 npx --yes pnpm@12.2.1 build      # → local ui/dist (--features ui embeds it)
 ```
 

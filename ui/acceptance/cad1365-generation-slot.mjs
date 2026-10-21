@@ -14,12 +14,10 @@
 // Run (inside a build slot): node ui/acceptance/cad1365-generation-slot.mjs
 
 import { createRequire } from "node:module";
-import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
-import vm from "node:vm";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const UI = path.resolve(HERE, "..");
@@ -45,8 +43,7 @@ function finish(code) { cleanup(); process.exit(code); }
 // screenActions.ts compiles alone and its imports become plain require()s
 // satisfied by the stub files written at the mirrored paths below.
 const require = createRequire(path.join(UI, "package.json"));
-const ts = require("typescript");
-const srcDir = path.join(UI, "src", "features", "workspace-apps", "screen");
+const ts = require("@typescript/typescript6");
 function emit(rel) {
   const source = fs.readFileSync(path.join(UI, "src", rel), "utf8");
   const { outputText } = ts.transpileModule(source, { compilerOptions: {

@@ -48,16 +48,16 @@ function finish(code) { cleanup(); process.exit(code); }
 
 // ---------- compile the real production modules with the pinned toolchain ----
 // The worktree carries no node_modules; the pinned ui install in the main
-// checkout supplies typescript 5.9.3. Only screenProtocol.ts and
+// checkout supplies tsrs (TypeScript 7). Only screenProtocol.ts and
 // screenLifecycle.ts are compiled — both are leaf modules with no imports
 // outside themselves, preserving the real classes.
 const require = createRequire(path.join(UI, "package.json"));
 let tscBin;
-try { tscBin = path.join(path.dirname(require.resolve("typescript/package.json")), "bin", "tsc"); }
-catch { tscBin = "/home/ubuntu/Project/cadence/ui/node_modules/typescript/bin/tsc"; }
+try { tscBin = path.join(path.dirname(require.resolve("tsrs/package.json")), "bin", "tsrs"); }
+catch { tscBin = "/home/ubuntu/Project/cadence/ui/node_modules/tsrs/bin/tsrs"; }
 const srcDir = path.join(UI, "src", "features", "workspace-apps", "screen");
-const tsc = spawnSync(process.execPath, [tscBin,
-  "--target", "ES2022", "--module", "commonjs", "--moduleResolution", "node",
+const tsc = spawnSync(process.execPath, [tscBin, "--ignoreConfig",
+  "--target", "ES2022", "--module", "commonjs", "--moduleResolution", "bundler",
   "--strict", "--skipLibCheck", "--esModuleInterop", "--lib", "ES2023,DOM",
   "--outDir", OUT, "--rootDir", srcDir,
   path.join(srcDir, "screenProtocol.ts"), path.join(srcDir, "screenSlot.ts"),

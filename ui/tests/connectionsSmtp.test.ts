@@ -235,7 +235,7 @@ async function main() {
       headers: { "Content-Type": "application/json" },
     });
   act(() => {
-    consent.checked && consent.click();
+    if (consent.checked) consent.click();
   });
   fill("SMTP password", "s3cret-password");
   await act(async () => addBtn()!.click());

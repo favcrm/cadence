@@ -248,8 +248,8 @@ async function sendJson<T>(method: "PUT" | "POST", url: string, payload: object,
     // and no `error` field, so read it before the generic status check or the
     // reader only ever sees "409 response".
     const conflict = record(body)?.conflict;
-    if (conflict === "if_rev") throw wikiErrorFrom(409, { ...(record(body) ?? {}), error: "This collection changed since you opened it", code: "conflict" });
-    if (conflict === "stale") throw wikiErrorFrom(409, { ...(record(body) ?? {}), error: text(record(body)?.reason) ?? "The cited source changed since this report was made", code: "stale" });
+    if (conflict === "if_rev") throw wikiErrorFrom(409, { ...record(body), error: "This collection changed since you opened it", code: "conflict" });
+    if (conflict === "stale") throw wikiErrorFrom(409, { ...record(body), error: text(record(body)?.reason) ?? "The cited source changed since this report was made", code: "stale" });
     if (!resp.ok) throw wikiErrorFrom(resp.status, body);
     return parse(body);
   });

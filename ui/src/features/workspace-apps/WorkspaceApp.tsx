@@ -1401,7 +1401,7 @@ export default function WorkspaceApp({
                       };
                       void mutate(async () => {
                         const editing = editingContextId === selectedContext?.id ? selectedContext : undefined;
-                        const inputDefaults: Record<string, string> = { ...(editing?.config.input_defaults ?? {}) };
+                        const inputDefaults: Record<string, string> = { ...editing?.config.input_defaults };
                         for (const [key, value] of Object.entries({ brand_voice: brandVoice, protected_terms: protectedTerms, content_prompt: contentPrompt, image_prompt: imagePrompt })) {
                           if (value.trim()) inputDefaults[key] = value.trim();
                           else delete inputDefaults[key];

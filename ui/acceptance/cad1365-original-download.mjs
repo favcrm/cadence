@@ -45,8 +45,7 @@ function finish(code) { cleanup(); process.exit(code); }
 
 // ---------- transpile the real production modules ----------------------------
 const require = createRequire(path.join(UI, "package.json"));
-const ts = require("typescript");
-const srcDir = path.join(UI, "src", "features", "workspace-apps", "screen");
+const ts = require("@typescript/typescript6");
 function emit(rel) {
   const source = fs.readFileSync(path.join(UI, "src", rel), "utf8");
   const { outputText } = ts.transpileModule(source, { compilerOptions: {
@@ -215,7 +214,7 @@ console.log("NEW. media.original.download protected slot");
     await settle();
 
     const post = effects.fetch[0];
-    check(effects.fetch.length === 1 && post && /\/api\/app-media\/original$/.test(post.url) && post.init?.method === "POST", "exactly one POST to /api/app-media/original");
+    check(effects.fetch.length === 1 && post && post.url.endsWith("/api/app-media/original") && post.init?.method === "POST", "exactly one POST to /api/app-media/original");
     if (post) {
       let body = null; try { body = JSON.parse(post.init.body); } catch {}
       check(body && Object.keys(body).sort().join(",") === "action_token,asset_id" && body.asset_id === DL_ARGS.asset_id && body.action_token === "tok-live-1", "POST body is exactly {action_token, asset_id}");
