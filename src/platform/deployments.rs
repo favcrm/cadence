@@ -52,6 +52,9 @@ enum DeploymentTransport {
     /// the fixed `api.internal` document door only; never media, SMTP or a
     /// lifecycle lease.
     HostedBusinessDocuments,
+    /// CAD-1689: the image-owned hosted WhatsApp door admission. Binds the
+    /// fixed `api.internal` door only; never media, SMTP or a lifecycle lease.
+    HostedWhatsappDoor,
 }
 
 /// CAD-1158: the exact image-owned SMTP admission tuple. Only this tuple
@@ -68,6 +71,12 @@ pub(crate) const BUSINESS_DOCUMENTS_PROVIDER: &str = "business_documents";
 pub(crate) const BUSINESS_DOCUMENTS_ORIGIN: &str = "http://api.internal";
 pub(crate) const BUSINESS_DOCUMENTS_MANIFEST_PIN: &str = "business-documents@1";
 
+/// CAD-1689: the exact image-owned WhatsApp door tuple. Only this tuple
+/// opens the hosted WhatsApp door without `hosted.lease`.
+pub(crate) const WHATSAPP_PROVIDER: &str = "whatsapp";
+pub(crate) const WHATSAPP_ORIGIN: &str = "http://api.internal";
+pub(crate) const WHATSAPP_MANIFEST_PIN: &str = "whatsapp-door@1";
+
 fn parse_transport<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<DeploymentTransport>, D::Error>
@@ -78,6 +87,7 @@ where
         "hosted-media-lease@1" => Ok(Some(DeploymentTransport::HostedMediaLease)),
         "hosted-smtp-relay@1" => Ok(Some(DeploymentTransport::HostedSmtpRelay)),
         "hosted-business-documents@1" => Ok(Some(DeploymentTransport::HostedBusinessDocuments)),
+        "hosted-whatsapp-door@1" => Ok(Some(DeploymentTransport::HostedWhatsappDoor)),
         _ => Err(serde::de::Error::custom(
             "unknown provider transport assertion",
         )),
@@ -124,6 +134,14 @@ pub(crate) struct HostedBusinessDocumentsAdmission {
 /// authority, hosted email or a lifecycle lease.
 #[derive(Clone, Debug)]
 pub(crate) struct HostedSmtpAdmission {
+    _private: (),
+}
+
+/// CAD-1689: only validated image metadata carrying the exact WhatsApp door
+/// tuple can produce this proof. It selects the fixed `api.internal` door and
+/// grants no lifecycle lease, media, SMTP or email authority.
+#[derive(Clone, Debug)]
+pub(crate) struct HostedWhatsappAdmission {
     _private: (),
 }
 
@@ -222,6 +240,11 @@ impl DeploymentMetadata {
                                 || entry.origin != BUSINESS_DOCUMENTS_ORIGIN
                                 || entry.manifest_pin != BUSINESS_DOCUMENTS_MANIFEST_PIN
                         }
+                        DeploymentTransport::HostedWhatsappDoor => {
+                            entry.provider != WHATSAPP_PROVIDER
+                                || entry.origin != WHATSAPP_ORIGIN
+                                || entry.manifest_pin != WHATSAPP_MANIFEST_PIN
+                        }
                     }
                 })
                 || entry.manifest_pin.is_empty()
@@ -289,6 +312,23 @@ impl DeploymentMetadata {
                     )
             })
             .map(|_| HostedBusinessDocumentsAdmission { _private: () })
+    }
+
+    /// CAD-1689: `Some` only for the exact WhatsApp door tuple (all four
+    /// fields). No other assertion yields it.
+    pub(crate) fn hosted_whatsapp(&self) -> Option<HostedWhatsappAdmission> {
+        self.providers
+            .iter()
+            .find(|entry| {
+                entry.provider == WHATSAPP_PROVIDER
+                    && entry.origin == WHATSAPP_ORIGIN
+                    && entry.manifest_pin == WHATSAPP_MANIFEST_PIN
+                    && matches!(
+                        entry.transport,
+                        Some(DeploymentTransport::HostedWhatsappDoor)
+                    )
+            })
+            .map(|_| HostedWhatsappAdmission { _private: () })
     }
 
     pub(crate) fn hosted_company_master(&self) -> Option<HostedCompanyMaster> {
