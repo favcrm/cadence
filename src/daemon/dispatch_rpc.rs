@@ -570,6 +570,11 @@ impl Shared {
                 crate::adapter::pi::refuse_confined_devin(&alias, true, &effective)?;
             }
         }
+        // A seat is checked before `issue start`, so a bad pane or a
+        // confined worker refuses with no lane or claim left behind.
+        if !register {
+            issue::dispatch::check_seat(&project, &alias, false, &self.state_dir)?;
+        }
         let start_args = issue::start::StartArgs {
             repo: None,
             name: None,

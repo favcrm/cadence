@@ -513,6 +513,54 @@ pub(crate) fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<
     })
 }
 
+/// The worker-only checks every dispatch runs before it creates a lane:
+/// the agent exists and is not fenced, its pane is inside this project,
+/// and a confined pi worker is not on a Devin model. Split out so a
+/// caller that runs `issue start` itself (the board kickoff) can refuse
+/// before the first mutation.
+pub(crate) struct SeatCheck {
+    pub agent: Value,
+    pub cwd_override: Option<String>,
+    pub provider: String,
+    pub endpoint_kind: String,
+}
+
+pub(crate) fn check_seat(
+    project: &crate::issue::project::Project,
+    alias: &str,
+    force: bool,
+    state_dir: &Path,
+) -> Result<SeatCheck> {
+    let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
+    let agent = show["agent"].clone();
+    if agent["state"].as_str() == Some("attention") {
+        return Err(Error::rejected(format!(
+            "Worker '{alias}' is fenced ({}) — reconcile it before dispatching",
+            agent["error"].as_str().unwrap_or("attention")
+        )));
+    }
+    // CAD-202: the lane's pane must still be inside this project.
+    let cwd_override = check_lane_cwd(project, alias, &agent, force)?;
+    let provider = agent["provider"].as_str().unwrap_or_default().to_string();
+    let endpoint_kind = agent["endpoint_kind"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if crate::adapter::registry::pi_family_managed(&provider, &endpoint_kind) {
+        crate::adapter::pi::refuse_confined_devin(
+            alias,
+            agent["params"]["confine"].as_bool() == Some(true),
+            agent["params"]["model"].as_str().unwrap_or_default(),
+        )?;
+    }
+    Ok(SeatCheck {
+        agent,
+        cwd_override,
+        provider,
+        endpoint_kind,
+    })
+}
+
 fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result<Preflight> {
     let GatedIssue {
         project,
@@ -558,30 +606,14 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
     )?;
 
     // Pre-flight, before ANYTHING is created: the worker exists and is
-    // not fenced; for --job it is the PM itself or a group member.
-    let show = client::rpc(state_dir, "agent_show", json!({"alias": args.to}))?;
-    let agent = &show["agent"];
-    if agent["state"].as_str() == Some("attention") {
-        return Err(Error::rejected(format!(
-            "Worker '{}' is fenced ({}) — reconcile it before dispatching",
-            args.to,
-            agent["error"].as_str().unwrap_or("attention")
-        )));
-    }
-    // CAD-202: the lane's pane must still be inside this project.
-    let cwd_override = check_lane_cwd(&project, &args.to, agent, args.force)?;
-    let provider = agent["provider"].as_str().unwrap_or_default().to_string();
-    let endpoint_kind = agent["endpoint_kind"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    if crate::adapter::registry::pi_family_managed(&provider, &endpoint_kind) {
-        crate::adapter::pi::refuse_confined_devin(
-            args.to.as_str(),
-            agent["params"]["confine"].as_bool() == Some(true),
-            agent["params"]["model"].as_str().unwrap_or_default(),
-        )?;
-    }
+    // not fenced. A caller that starts a lane itself (the board) runs
+    // this same check before `issue start`, so a refusal leaves nothing.
+    let SeatCheck {
+        agent,
+        cwd_override,
+        provider,
+        endpoint_kind,
+    } = check_seat(&project, &args.to, args.force, state_dir)?;
     if args.job_spec.is_some() {
         let member = agent["alias"].as_str() == Some(reply_to.as_str())
             || agent["params"]["upstream"].as_str() == Some(reply_to.as_str());
@@ -635,7 +667,9 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            check_job_kickoff(&front.id, &items, spec, &wt_name, &branch, &base_sha, agent)?;
+            check_job_kickoff(
+                &front.id, &items, spec, &wt_name, &branch, &base_sha, &agent,
+            )?;
         }
         None
     };
@@ -651,7 +685,7 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
         acceptance_warning,
         reply_to,
         note,
-        show,
+        show: json!({"agent": agent}),
         provider,
         endpoint_kind,
         cwd_override,
