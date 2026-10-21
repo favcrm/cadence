@@ -973,6 +973,10 @@ impl Shared {
     /// open never reached `ready`. Names the waiting message from the
     /// resume record so the needs-me row can.
     pub(super) fn auto_resume_failed(&self, alias: &str, reason: &str) {
+        // Hold the lifecycle lock across the archived re-check and the
+        // failure event, so an archive cannot commit between them and
+        // leave an event on an archived row.
+        let _lc = self.lifecycle.lock().unwrap();
         if self
             .store
             .agent(alias)
