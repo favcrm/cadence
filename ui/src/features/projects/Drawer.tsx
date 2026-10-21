@@ -35,7 +35,7 @@ export type MyWorkMembership = "checking" | "assigned" | "unassigned";
  * `onPrivateSessionReset`); `draftKey` is `identityKey` + issue id.
  */
 export interface MyWorkPeekProps {
-  /** The verified `MyWorkPayload.owner` — "" while membership is `checking`. */
+  /** The verified `MyWorkMembership.owner` — "" while membership is `checking`. */
   owner: string;
   /** This issue's recorded handoff, or null when provenance is unavailable. */
   assignment: AssignmentContext | null;

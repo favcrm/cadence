@@ -40,5 +40,5 @@
   .my-work-search input{height:2.75rem}
   .my-work-search kbd{display:none}
   .my-work-tab{min-height:2.75rem}
-  .my-work-footer>.btn:last-of-type{margin-left:0;width:100%}
+  .my-work-footer>.btn:last-of-type{margin-left:0;width:100%;min-height:2.75rem}
 }

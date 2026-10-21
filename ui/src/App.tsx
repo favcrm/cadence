@@ -333,6 +333,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       void resources.issue(id).invalidate();
       void resources.lane(id).invalidate();
     }
+    // The peek's quick actions need a current membership too, so a refresh
+    // recovers a failed membership read without reopening the peek.
+    if (personalWanted.current && openIdRef.current) void resources.myWorkIssue(openIdRef.current).invalidate();
   }, []);
   useEffect(() => {
     if (openId) void resources.issue(openId).revalidate();
@@ -1281,7 +1284,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           id={openId}
           detail={detailState?.data?.id === openId ? detailState.data : null}
           readState={detailState}
-          onRetry={() => void resources.issue(openId).refresh()}
+          onRetry={() => {
+            void resources.issue(openId).refresh();
+            if (screen === "myWork") void resources.myWorkIssue(openId).refresh();
+          }}
           myWork={screen === "myWork" ? {
             owner: membershipState?.data?.owner ?? "",
             assignment: membershipState?.data?.id === openId ? membershipState.data.assignment : null,

@@ -61,8 +61,9 @@ onPrivateSessionReset(abortMyWorkRead);
 
 /**
  * Reads the current view. A refresh of the view already shown re-reads as
- * many rows as are loaded (bounded), so a live update or Refresh never drops
- * the rows "Load more" added.
+ * many rows as are loaded, up to MY_WORK_REFRESH_MAX, so a live update or
+ * Refresh keeps the rows "Load more" added; past that bound it restarts at
+ * one page.
  */
 async function readMyWork(): Promise<MyWorkList> {
   abortMyWorkRead();
