@@ -102,7 +102,10 @@ impl AgenticosWebAdapter {
                 &target,
                 required_str(input, "slug")?,
                 input.get("form").and_then(Value::as_str),
-                input["limit"].as_u64().unwrap_or(50) as u32,
+                input["limit"]
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(50),
                 input.get("cursor").and_then(Value::as_str),
                 wake,
             ),

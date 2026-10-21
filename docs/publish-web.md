@@ -49,6 +49,9 @@ cadence web unpublish <slug> [--org <org>]
 - `submissions` reads a site's form submissions, newest first, as JSON with
   `nextCursor`. `--form` filters one form key, `--limit` is 1 to 100, and
   `--cursor` continues from a previous page. Requires the `web.read` scope.
+  This is the only management route that carries a query: the transport admits
+  `limit`, then `form`, then `cursor`, with the published grammars, and refuses
+  any other parameter or encoding.
 - `rollback` and `unpublish` ask the owner for approval. They do not act
   directly.
 

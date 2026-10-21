@@ -928,27 +928,46 @@ pub fn validate_submission_query(
         return Err(Error::rejected("--limit must be between 1 and 100"));
     }
     if let Some(form) = form {
-        let first = form.as_bytes().first().copied();
-        let shape = matches!(first, Some(b'a'..=b'z' | b'0'..=b'9'))
-            && form
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-        if !(1..=40).contains(&form.len()) || !shape {
+        if !is_form_key(form) {
             return Err(Error::rejected(
                 "--form must match ^[a-z0-9][a-z0-9-]{0,39}$",
             ));
         }
     }
     if let Some(cursor) = cursor {
-        let valid = (1..=200).contains(&cursor.len())
-            && cursor
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-' | b'.'));
-        if !valid {
-            return Err(Error::rejected("--cursor is not a submissions cursor"));
+        if !is_form_cursor(cursor) {
+            return Err(Error::rejected(
+                "--cursor must be a nextCursor value from a previous page",
+            ));
         }
     }
     Ok(())
+}
+
+/// The published form-key grammar: one lowercase letter or digit, then up to 39
+/// more lowercase letters, digits or hyphens.
+pub fn is_form_key(value: &str) -> bool {
+    matches!(value.as_bytes().first(), Some(b'a'..=b'z' | b'0'..=b'9'))
+        && value.len() <= 40
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The published submissions cursor: `<created_at ms>:<wsub id>`.
+pub fn is_form_cursor(value: &str) -> bool {
+    let Some((millis, id)) = value.split_once(':') else {
+        return false;
+    };
+    let Some(suffix) = id.strip_prefix("wsub_") else {
+        return false;
+    };
+    (1..=16).contains(&millis.len())
+        && millis.bytes().all(|b| b.is_ascii_digit())
+        && (8..=80).contains(&suffix.len())
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 #[cfg(test)]
@@ -979,8 +998,19 @@ mod submission_query_tests {
         assert!(validate_submission_query(None, 100, None).is_ok());
         assert!(validate_submission_query(None, 0, None).is_err());
         assert!(validate_submission_query(None, 101, None).is_err());
-        assert!(validate_submission_query(None, 50, Some("1730000000000:wsub_ab-1")).is_ok());
-        assert!(validate_submission_query(None, 50, Some("a b")).is_err());
-        assert!(validate_submission_query(None, 50, Some("")).is_err());
+        assert!(validate_submission_query(None, 50, Some("1730000000000:wsub_abcdefgh")).is_ok());
+        for bad in [
+            "1730000000000:wsub_abc",
+            "1730000000000:abc",
+            "x:wsub_abcdefgh",
+            "1730000000000:wsub_abcdefgh&limit=9",
+            "a b",
+            "",
+        ] {
+            assert!(
+                validate_submission_query(None, 50, Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
     }
 }
