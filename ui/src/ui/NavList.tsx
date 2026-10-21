@@ -10,6 +10,7 @@ import type { IssueCard, Project } from "../lib/types";
 import Link from "./Link";
 import { IconAgents, IconApps, IconCaret, IconHome, IconMyWork, IconOutbox, IconPin, IconProjects, IconSettings, IconWiki, IconThreads } from "./icons";
 import { useLocale } from "../lib/locale";
+import { useAssistantUnread } from "../features/app-shell/chat/assistantUnread";
 
 const NAV_ICONS: Record<string, ReactNode> = {
   home: <IconHome size={16} />,
@@ -63,6 +64,8 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
   const { t } = useLocale();
   const prefs = useSidebarPrefs();
   const foldId = useId();
+  // CAD-1700: a quiet dot where an assistant reply waits unseen.
+  const assistantUnread = useAssistantUnread();
   const apps = appMenu?.apps ?? [];
   const currentApp = apps.find((a) => a.current) ?? null;
   return (
@@ -84,6 +87,9 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                   <span className="navbadge num" title={`${homeCount} ${t("waiting for you")}`}>
                     {homeCount}
                   </span>
+                )}
+                {item.screen === "home" && assistantUnread.has("home") && (
+                  <span className="navdot" role="img" aria-label={t("New assistant reply")} />
                 )}
               </Link>
               {item.screen === "apps" && appMenu?.notice && <AppNotice notice={appMenu.notice} />}
@@ -144,6 +150,9 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                           data-parent-current={here && app.current && app.sections ? "" : undefined}
                         >
                           <span className="truncate">{app.title}</span>
+                          {assistantUnread.has(app.installId) && (
+                            <span className="navdot" role="img" aria-label={t("New assistant reply")} />
+                          )}
                         </Link>
                         {app.sections && (
                           <Disclosure

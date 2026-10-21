@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../../lib/api";
+import { subscribeMasterChanged } from "../../../lib/masterChanged";
 import { useTranslate } from "../../../lib/locale";
 import Button from "../../../ui/Button";
 import Link from "../../../ui/Link";
@@ -447,19 +448,14 @@ function emptyData(scopeKey: string): AssistantData {
 }
 
 /** How a failed read settles. `none`: the app declares no assistant actions
- *  (a valid, permanent state — no panel, no more polling). `consent`: the
- *  descriptor awaits approval (calm notice, polling continues so approval
- *  shows up). `error`: a real failure — the error with Retry. */
+ *  (a valid, permanent state, so no panel). `consent`: the descriptor awaits
+ *  approval (a calm notice). `error`: a real failure, the error with Retry. */
 export type ReadOutcome = "none" | "consent" | "error";
 export function readFailure(e: unknown): ReadOutcome {
   if (e instanceof ApiError && e.status === 404) return "none";
   if (e instanceof ApiError && e.status === 409 && /not consented/i.test(e.message)) return "consent";
   return "error";
 }
-export const keepsPolling = (outcome: ReadOutcome | null): boolean => outcome !== "none";
-
-/** Routine refresh cadence, counted from the end of the previous read. */
-const POLL_MS = 8_000;
 
 /** The one reader of one installation/context, as seen by the component. */
 interface Poller {
@@ -469,12 +465,14 @@ interface Poller {
   refresh: () => Promise<void>;
 }
 
-export default function AssistantOperations({ installId, contextId, canDecide, appPath }: {
+export default function AssistantOperations({ installId, contextId, canDecide, appPath, onPendingChange }: {
   installId: string;
   contextId: string;
   canDecide: boolean;
   /** The verified canonical `/apps/<key>` path; resource links emit it. Null means no links. */
   appPath: string | null;
+  /** CAD-1700: an operation waits on the operator's permission decision (the turn bar's "Needs your approval"). */
+  onPendingChange?: (pending: boolean) => void;
 }) {
   const t = useTranslate();
   const scopeKey = JSON.stringify([installId, contextId]);
@@ -489,6 +487,10 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
   // behind an explicit count-labelled history disclosure, all reachable.
   const activeOperations = visible.operations.filter(isActiveOperation);
   const completedOperations = visible.operations.filter((operation) => !isActiveOperation(operation));
+  const pendingDecision = activeOperations.some((operation) => operation.status === "pending_permission");
+  useEffect(() => {
+    onPendingChange?.(pendingDecision);
+  }, [pendingDecision, onPendingChange]);
 
   useEffect(() => {
     // An unresolved context owns no poller and sends no assistant requests.
@@ -504,13 +506,6 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
     let requeue = false;
     // Bumped by every confirmed write; a read that began earlier is stale.
     let epoch = 0;
-    let timer: number | null = null;
-    // The last read's outcome: `none` ends polling for this scope.
-    let outcome: ReadOutcome | null = null;
-    const stopTimer = () => {
-      if (timer !== null) window.clearTimeout(timer);
-      timer = null;
-    };
 
     const readOnce = async (): Promise<void> => {
       const startedAt = epoch;
@@ -540,11 +535,10 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
           error: null,
           consent: false,
         });
-        outcome = null;
       } catch (e) {
         if (!alive) return;
         if (epoch !== startedAt) { requeue = true; return; }
-        outcome = readFailure(e);
+        const outcome = readFailure(e);
         if (outcome === "none") {
           setData(emptyData(scopeKey));
         } else if (outcome === "consent") {
@@ -558,15 +552,6 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
       }
     };
 
-    const schedule = () => {
-      stopTimer();
-      // Hidden tabs do not poll; the visibility listener resumes the reads.
-      if (document.hidden || !keepsPolling(outcome)) return;
-      timer = window.setTimeout(() => {
-        timer = null;
-        if (alive && !document.hidden) void poll();
-      }, POLL_MS);
-    };
     const run = async (): Promise<void> => {
       do {
         requeue = false;
@@ -574,10 +559,8 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
       } while (requeue && alive);
       // Synchronous from here on: a request made after this starts a new read.
       inFlight = null;
-      if (alive) schedule();
     };
     const start = (): Promise<void> => {
-      stopTimer();
       const pending = run();
       inFlight = pending;
       return pending;
@@ -592,22 +575,22 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
       }
       return start();
     };
-    const onVisibility = () => {
-      if (!alive) return;
-      if (document.hidden) stopTimer();
-      else void poll();
+    // Visibility resumes and `master` frames re-read; a hidden tab reads when shown.
+    const resumeRead = () => {
+      if (alive && !document.hidden) void poll();
     };
 
     const handle: Poller = { alive: () => alive, written, refresh: poll };
     // No context yet: nothing to ask for (an empty context ID is a 400).
     if (contextId === "") return;
     poller.current = handle;
-    document.addEventListener("visibilitychange", onVisibility);
+    document.addEventListener("visibilitychange", resumeRead);
+    const unsubscribeMaster = subscribeMasterChanged(resumeRead);
     void poll();
     return () => {
       alive = false;
-      stopTimer();
-      document.removeEventListener("visibilitychange", onVisibility);
+      document.removeEventListener("visibilitychange", resumeRead);
+      unsubscribeMaster();
       if (poller.current === handle) poller.current = null;
     };
   }, [installId, contextId, scopeKey, contextReady]);

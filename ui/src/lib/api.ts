@@ -1071,11 +1071,13 @@ export const api = {
   masterState: () => get<MasterState>("/api/master/state"),
   /** `POST /api/master/command` — an allowlisted session verb (CAD-551);
    *  operator-only, 400 `unknown_command` outside the board's set. */
-  masterCommand: (command: string, arg?: string, wait?: number) =>
-    post<MasterCommandResult>(
-      "/api/master/command",
-      wait !== undefined ? { command, arg, wait } : arg ? { command, arg } : { command },
-    ),
+  masterCommand: (command: string, arg?: string, wait?: number, message?: string) =>
+    post<MasterCommandResult>("/api/master/command", {
+      command,
+      ...(arg ? { arg } : {}),
+      ...(wait !== undefined ? { wait } : {}),
+      ...(message !== undefined ? { message } : {}),
+    }),
   /** `GET /api/master/models` — the dropdowns' list (CAD-575's route,
    *  operator-gated; the chip shows the refusal until it lands). */
   masterModels: () => get<MasterModels>("/api/master/models"),

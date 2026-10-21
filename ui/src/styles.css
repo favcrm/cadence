@@ -418,6 +418,99 @@ pre {
 .workdot.live {
   background: var(--color-accent);
 }
+/* CAD-1700 turn bar (Home and every app pane, above the composer):
+   neutral surface, the state lives in the dot colour and the words;
+   borderless text actions; dashed while the stream reconnects. */
+.turnbar {
+  --tb: var(--color-ink-500);
+  display: flex;
+  align-items: center;
+  gap: .625rem;
+  min-width: 0;
+  margin-bottom: .375rem;
+  padding: .4375rem .5rem .4375rem .75rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .625rem;
+  background: var(--color-ink-850);
+}
+.turnbar[data-state="working"],
+.turnbar[data-state="writing"] { --tb: var(--color-accent); }
+.turnbar[data-state="queued"],
+.turnbar[data-state="needs_approval"] { --tb: var(--color-warn); }
+.turnbar[data-state="failed"] { --tb: var(--color-fail); }
+.turnbar[data-state="done"] { --tb: var(--color-ok); }
+.turnbar[data-stale] { border-style: dashed; }
+.tb-dot {
+  flex: none;
+  width: .5rem;
+  height: .5rem;
+  border-radius: 9999px;
+  background: var(--tb);
+}
+.turnbar[data-state="working"] .tb-dot,
+.turnbar[data-state="writing"] .tb-dot {
+  animation: work-pulse 1.4s ease-in-out infinite;
+}
+.tb-text {
+  display: flex;
+  flex: 1;
+  align-items: baseline;
+  gap: .5rem;
+  min-width: 0;
+}
+.tb-title {
+  flex: none;
+  color: var(--color-ink-100);
+  font-size: var(--text-label);
+  font-weight: 500;
+}
+.tb-detail {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tb-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: .125rem;
+}
+.tb-btn {
+  height: 1.625rem;
+  padding: 0 .5625rem;
+  border: 0;
+  border-radius: .375rem;
+  background: transparent;
+  color: var(--color-ink-300);
+  font: inherit;
+  font-size: var(--text-micro);
+  font-weight: 500;
+  cursor: pointer;
+}
+.tb-btn:hover { background: var(--color-ink-800); color: var(--color-ink-100); }
+.tb-btn.danger { color: var(--color-fail); }
+.tb-btn.danger:hover { background: color-mix(in srgb, var(--color-fail) 12%, transparent); }
+.tb-btn:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+/* CAD-1700: an assistant reply waits unseen — a dot, not a count. */
+.navlink .navdot {
+  flex: none;
+  width: .4375rem;
+  height: .4375rem;
+  margin-left: auto;
+  border-radius: 9999px;
+  background: var(--color-accent);
+}
+.navlink .navbadge + .navdot { margin-left: .375rem; }
+@media (max-width: 1023.98px) {
+  .tb-btn { height: 2.25rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .turnbar[data-state="working"] .tb-dot,
+  .turnbar[data-state="writing"] .tb-dot { animation: none; }
+}
 .stopbtn {
   padding: .12rem .55rem;
   border: 1px solid var(--color-edge);

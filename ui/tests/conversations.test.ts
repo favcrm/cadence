@@ -56,6 +56,9 @@ const threads: Record<string, any[]> = {
   "s-full": [ent(1, "operator", "message", "earlier question", "m-s")],
 };
 let turn: any = null;
+// CAD-1700: the master queue in delivery order, and the board commands posted.
+let queue: { message: string; conversation: string | null }[] = [];
+const commandPosts: unknown[] = [];
 // Set inside a check to hold one send in flight (pending state "sending").
 let deferSend: ((resolve: (r: Response) => void) => void) | null = null;
 const messagePosts: any[] = [];
@@ -97,7 +100,11 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const id = url.searchParams.get("conversation") ?? "";
     return json({ entries: threads[id] ?? [], more_before: false });
   }
-  if (url.pathname === "/api/master/state") return json({ alias: "master", provider: "p", endpoint_kind: "k", live: true, turn });
+  if (url.pathname === "/api/master/state") return json({ alias: "master", provider: "p", endpoint_kind: "k", live: true, turn, queue });
+  if (url.pathname === "/api/master/command") {
+    commandPosts.push(JSON.parse(String(init!.body)));
+    return json({ command: "x", ok: true, result: {} });
+  }
   if (url.pathname === "/api/crm-send/list") return json({ sends: [] });
   if (url.pathname === "/api/crm-send/origin") return json({ unsubscribe_origin: null, stored: false });
   return json({ records: [], truncated: false, next_cursor: null, segments: [], exclusions: [], suppressions: [], contents: [], proposals: [], bindings: [] });
@@ -113,23 +120,24 @@ async function mount(installId: string, viewer = { operator: true, readOnly: fal
   await React.act(async () => { root.render(React.createElement(AppShell, { installId, viewer })); });
   await settle();
 }
-// CAD-1326: the select is gone; the history button lists conversations and
-// the scope row names the open one (or the unsaved draft).
-const histBtn = () => host.querySelector('[aria-label="Conversation history"]') as HTMLButtonElement;
-const rows = () => Array.from(host.querySelectorAll("[data-chat-history] .app-chat-history-row")) as HTMLButtonElement[];
+// CAD-1700: the header names the open conversation; the Conversations menu
+// (history icon) lists them, the current one checked.
+const histBtn = () => host.querySelector('[aria-label="Conversations"]') as HTMLButtonElement;
+const rows = () => Array.from(host.querySelectorAll('[data-chat-history] [role="menuitemradio"]')) as HTMLButtonElement[];
 async function openHistory() {
   if (!host.querySelector("[data-chat-history]")) {
     await React.act(async () => { histBtn().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
   }
 }
-const optionLabels = async () => { await openHistory(); return rows().map((r) => r.textContent); };
+const rowName = (r: Element) => r.querySelector(".app-chat-history-name")?.textContent ?? null;
+const optionLabels = async () => { await openHistory(); return rows().map(rowName); };
 const openLabel = () => host.querySelector("[data-chat-conv-label]")?.textContent?.replace(/^·\s*/, "") ?? null;
 const pane = () => (host.querySelector("[data-chat-pane]") as HTMLElement).textContent ?? "";
 const box = () => host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement;
 const newButton = () => host.querySelector("[data-chat-new]") as HTMLButtonElement;
 async function pick(label: string) {
   await openHistory();
-  const row = rows().find((r) => r.textContent === label);
+  const row = rows().find((r) => rowName(r) === label);
   assert(row, `history lists ${label}`);
   await React.act(async () => { row!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
   await settle();
@@ -152,7 +160,7 @@ assert(newButton().closest(".app-chat-head-tools") && newButton().nextElementSib
 assert(!host.querySelector('select[aria-label="Conversation"], [data-chat-home-link], [data-chat-conversations]'), "no conversation select, row or Home link");
 equal(openLabel(), "General", "General is the default and the scope row names it");
 await optionLabels();
-equal(rows()[0].getAttribute("aria-current"), "true", "history marks General as the open one");
+equal(rows()[0].getAttribute("aria-checked"), "true", "the Conversations menu checks General as the open one");
 assert(pane().includes("general answer") && !pane().includes("campaign brief"), "General shows only its own thread");
 await pick("Spring launch");
 assert(pane().includes("campaign brief") && !pane().includes("general answer"), "the campaign conversation shows only its own thread");
@@ -168,6 +176,7 @@ await type("/new");
 equal(messagePosts.length, 1, "/new is not sent as a message");
 equal(createPosts, [{ install: "install-crm", body: { context_id: "ctx-a" } }], "/new creates one conversation with no subject");
 assert(openLabel() !== null, "the fresh conversation has an open-conversation label");
+await openHistory(); // CAD-1700: the shareable link lives in the Conversations menu.
 const newConversationLink = host.querySelector("[data-chat-conversation-link]") as HTMLAnchorElement | null;
 assert(newConversationLink, "the fresh conversation has a shareable link");
 equal(new URL(newConversationLink.href).searchParams.get("conversation"), "new-1", "the fresh conversation is the selected conversation");
@@ -196,56 +205,62 @@ equal(createPosts.map((p) => p.body), [{ context_id: "ctx-a" }, { context_id: "c
   equal(messagePosts[messagePosts.length - 1].conversation, `new-${created}`, "sent to the id the create returned");
 }
 
-// Queued notice: the master is on another conversation's message while this one waits.
+// CAD-1700: the turn bar. Another conversation's running turn shows nothing
+// here; this conversation's own queued message reads "Queued after …".
+const bar = () => host.querySelector("[data-turn-bar]") as HTMLElement | null;
+const barButton = (label: string) =>
+  Array.from(bar()?.querySelectorAll("button") ?? []).find((b) => b.textContent === label) ?? null;
 await pick("Spring launch");
-turn = { state: "working", message: "m-gen-elsewhere" };
+turn = { state: "working", message: "m-gen-elsewhere", conversation: "c-gen" };
 await React.act(async () => { await resources.masterState.refresh(); });
 await settle();
-assert(pane().includes("Assistant is finishing another task — your message is queued"), "queued notice shows while the master is busy elsewhere");
-turn = { state: "working", message: "m-camp" };
-await React.act(async () => { await resources.masterState.refresh(); });
-await settle();
-assert(!pane().includes("your message is queued"), "no notice when the running message is this conversation's own");
+assert(bar()?.dataset.state !== "working" && bar()?.dataset.state !== "queued", `another conversation's running turn never shows Working or Queued here (got ${bar()?.dataset.state})`);
 turn = null;
 await React.act(async () => { await resources.masterState.refresh(); });
 await settle();
 
-// CAD-1168 follow-up: the selected conversation's own in-flight turn reads as
-// a compact status — Sending… while its POST is in flight, Queued… when the
-// daemon reports this conversation's message as the queue head. Neither bleeds
-// into another conversation, and only the owned working turn offers Stop.
+// The selected conversation's own turn: Sending while its POST is in flight;
+// Queued (with Cancel, never Stop) once the daemon queues it behind another
+// conversation's turn; Working with Stop carrying this exact message once it
+// runs. Nothing bleeds into another conversation.
 await pick("Spring launch");
 {
   let resolveSend: ((r: Response) => void) | null = null;
   deferSend = (r) => { resolveSend = r; };
   await type("queued brief update");
   assert(resolveSend !== null, "the send is still in flight");
-  assert(host.querySelector('[data-chat-status="sending"]') !== null, "an in-flight send shows Sending…");
+  equal(bar()?.dataset.state, "sending", "an in-flight send shows Sending");
   await React.act(async () => { resolveSend!(json({ message: "x", state: "queued", duplicate: false })); });
   await settle();
   deferSend = null;
-  assert(host.querySelector('[data-chat-status="waiting"]') !== null, "send acknowledgement keeps a status until the daemon turn arrives");
 
   const sentMessage = messagePosts[messagePosts.length - 1].message;
-  turn = { state: "queued", message: sentMessage };
+  turn = { state: "working", message: "m-gen-elsewhere", conversation: "c-gen" };
+  queue = [{ message: sentMessage, conversation: "c-camp" }];
   await React.act(async () => { await resources.masterState.refresh(); });
   await settle();
-  assert(host.querySelector('[data-chat-status="queued"]') !== null, "an owned queued turn shows Queued…");
-  assert(host.querySelector("[data-chat-stop]") === null, "a queued turn offers no Stop");
+  equal(bar()?.dataset.state, "queued", "an owned queued message shows Queued");
+  assert(bar()!.textContent!.includes("after General"), `Queued names what is ahead; got ${bar()?.textContent}`);
+  assert(barButton("Stop") === null, "a queued message offers no Stop");
+  await React.act(async () => { barButton("Cancel")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await settle();
+  equal(commandPosts.at(-1), { command: "cancel", message: sentMessage }, "Cancel names exactly this conversation's queued message");
 
-  // Once SSE/page reconciliation drops the pending row, the owned queue head
-  // must keep polling: thread entries do not refresh the master projection.
   threads["c-camp"].push(ent(3, "operator", "message", "queued brief update", sentMessage));
   await React.act(async () => { await conversationThread("c-camp").refresh(); });
+  turn = { state: "working", message: sentMessage, conversation: "c-camp", summary: "customers.search" };
+  queue = [];
+  // No timer: a `master` stream frame invalidates the state (CAD-1700).
+  await React.act(async () => { await resources.masterState.invalidate(); });
   await settle();
-  turn = { state: "working", message: sentMessage };
-  await React.act(async () => { await new Promise((r) => setTimeout(r, 6_100)); });
+  equal(bar()?.dataset.state, "working", "the owned running turn shows Working after a master frame");
+  assert(bar()!.textContent!.includes("customers.search"), "Working names the live step");
+  await React.act(async () => { barButton("Stop")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
   await settle();
-  assert(host.querySelector("[data-chat-stop]") !== null, "the owned working turn still offers Stop");
-  assert(pane().includes("Working…"), "the working row still shows");
+  equal(commandPosts.at(-1), { command: "stop", message: sentMessage }, "Stop names exactly this conversation's running turn");
 
   await pick("General");
-  assert(host.querySelector("[data-chat-status]") === null, "the status does not bleed into another conversation");
+  assert(bar() === null, "the turn does not bleed into another conversation");
   turn = null;
   await React.act(async () => { await resources.masterState.refresh(); });
   await settle();

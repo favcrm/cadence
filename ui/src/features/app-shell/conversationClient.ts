@@ -1,6 +1,7 @@
 import { useCallback, useLayoutEffect, useRef, useSyncExternalStore } from "react";
 import { api, ApiError } from "../../lib/api";
 import { cache, resources } from "../../lib/resources";
+import { subscribeMasterChanged } from "../../lib/masterChanged";
 import { useQuery } from "../../lib/useResource";
 import type { Resource } from "../../lib/cache";
 import { beginPrivateOperation, onPrivateReadsPaused, onPrivateSessionReset, withPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
@@ -34,6 +35,8 @@ export interface Conversation {
   title: string | null;
   subject: string | null;
   isGeneral: boolean;
+  /** Epoch seconds of the last change (any entry write), from the daemon. */
+  updated: number;
 }
 
 export interface ConversationList {
@@ -55,6 +58,7 @@ function parseConversation(raw: unknown): Conversation | null {
     title: typeof v.title === "string" && v.title !== "" ? v.title : null,
     subject: typeof v.subject === "string" ? v.subject : null,
     isGeneral: v.is_general === true,
+    updated: typeof v.updated === "number" ? v.updated : 0,
   };
 }
 
@@ -110,6 +114,10 @@ const listFamily = cache.family<string, ConversationList>("conversations", async
   }
 });
 export const conversationList = (installId: string): Resource<ConversationList> => listFamily(installId);
+// A `master` frame means a conversation may have changed (a reply, a tool
+// step, a new conversation): refresh the observed lists. A conversation's
+// list in another install is marked and refetches when its screen revalidates.
+subscribeMasterChanged(() => cache.invalidate("conversations"));
 
 interface InflightCreate {
   promise: Promise<Conversation>;

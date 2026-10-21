@@ -3,7 +3,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
-import { streamInto, type SseErrorState } from "../../lib/sse";
+import type { SseErrorState } from "../../lib/sse";
 import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
 import type { MasterAppOrigin, MasterCommandResult, Overview, ThreadRef } from "../../lib/types";
@@ -30,6 +30,11 @@ import NeedsRail from "./NeedsRail";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
 import PlanCard from "./PlanCard";
 import Conversation from "../app-shell/chat/Conversation";
+import { TurnBar } from "../app-shell/chat/TurnBar";
+import { usePendingPermission } from "../app-shell/chat/usePendingApproval";
+import { noteHomeSeen } from "../app-shell/chat/homeUnread";
+import { earlierStep, useThreadStream } from "../app-shell/chat/conversationThread";
+import { turnBarState } from "../app-shell/chat/turnBar";
 import MemberChat from "./MemberChat";
 import { memberScope } from "./memberThread";
 import { time } from "./ThreadView";
@@ -50,11 +55,8 @@ import SinceCard from "./SinceCard";
 import {
   discardPending,
   lastSeq,
-  applyEarlier,
-  fetchEarlier,
   openStep,
   planAnchors,
-  reduceFrame,
   stepSummary,
   threadItems,
   visibleWindow,
@@ -188,13 +190,11 @@ function WorkingRow({
   turn,
   appOrigin,
   step,
-  onStop,
   resolveAppPath,
 }: {
   turn: TurnState;
   appOrigin: MasterAppOrigin | null;
   step: ThreadEntry | null;
-  onStop: () => void;
   /** CAD-1438: resolves an install id to its unique canonical path (or null). */
   resolveAppPath: (installId: string) => string | null;
 }) {
@@ -229,16 +229,6 @@ function WorkingRow({
         <Link href={appHref} className="lnk text-micro shrink-0">
           {t("Open its conversation")} <span aria-hidden>↗</span>
         </Link>
-      )}
-      {turn.kind === "working" && (
-        <button
-          type="button"
-          className="stopbtn shrink-0"
-          onClick={onStop}
-          title={t("Interrupt the running turn (same as /stop)")}
-        >
-          {t("Stop")}
-        </button>
       )}
     </div>
   );
@@ -698,6 +688,26 @@ function MasterHome({
   const masterRow = agents.data?.agents.find((a) => a.alias === MASTER);
   const submitting = (thread.data?.pending ?? []).some((p) => p.state !== "failed");
   const turn = turnState(master.data, masterRow, submitting);
+  // The turn bar (turnBar.ts) is the same derivation Conversation uses, so
+  // the two surfaces cannot disagree: Stop only for the running turn's own
+  // message, Cancel only for this surface's own queued message. Home's
+  // conversation is the Master thread, which the turn reports as `null`.
+  const threadEntries = thread.data?.entries ?? [];
+  const permissionPending = usePendingPermission(threadEntries);
+  // Results older than this Home visit are history, not a live outcome.
+  const liveSince = useMemo(() => Date.now(), []);
+  const turnBar = turnBarState(
+    {
+      master: master.data,
+      entries: threadEntries,
+      pendingMessages: (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message),
+      awaitingApproval: permissionPending,
+      reconnecting: link !== null && link !== "live",
+      liveSince,
+    },
+    null,
+  );
+  const failedSend = (thread.data?.pending ?? []).find((p) => p.state === "failed") ?? null;
   const serverTurn = master.data?.turn;
   // `turnState` retains the message id for working turns. For queued turns
   // it drops that id, so recover it only when its server-derived display
@@ -752,21 +762,7 @@ function MasterHome({
   // resumes after its last seq — never a replay of the history. On a
   // reconnect `streamInto` resumes with `?after=<last id>` and the
   // reducer dedupes by seq: no gaps, no repeats.
-  useEffect(() => {
-    if (!loaded || missing) return;
-    const sub = streamInto(resources.masterThread, reduceFrame, {
-      url: `/api/threads/${MASTER}/stream`,
-      events: ["entry"],
-      lastEventId: String(lastSeq(resources.masterThread.get().data) ?? 0),
-      onError: (state) => {
-        setLink(state);
-        // The alias went away (a 4xx for good): re-read to show why.
-        if (state === "stopped") void resources.masterThread.refresh();
-      },
-    });
-    setLink("live");
-    return () => sub.close();
-  }, [loaded, missing]);
+  useThreadStream(resources.masterThread, `/api/threads/${MASTER}/stream`, loaded && !missing, setLink);
 
   // The seq watermark for the enter animation: items at or below the
   // mount tail are history — they render still; only what lands after
@@ -778,18 +774,13 @@ function MasterHome({
   }, [loaded, thread.data]);
 
   // Keep master_state honest: it follows the agents resource's
-  // invalidations (turn boundaries land there), and polls gently while a
-  // turn works — context use drifts inside a turn without touching the
-  // agents row. A daemon that answered 501 (no master_state) stops the
+  // invalidations (turn boundaries land there) and the `master` stream
+  // frame (CAD-1700: turn, queue, tool steps and permissions in any
+  // conversation). A daemon that answered 501 (no master_state) stops the
   // follow — send/command refreshes still retry it explicitly.
   useEffect(() => {
     if (master.status !== "failed") void resources.masterState.refresh();
   }, [agents.data, master.status]);
-  useEffect(() => {
-    if (turn.kind !== "working") return;
-    const t = setInterval(() => void resources.masterState.refresh(), 12_000);
-    return () => clearInterval(t);
-  }, [turn.kind]);
   // Turn boundaries land on the thread stream before the agents row
   // moves — a `turn_result` or a queued `message` tail revalidates the
   // state immediately so the working row clears with the reply, not a
@@ -800,6 +791,10 @@ function MasterHome({
     if (tail && (tail.kind === "turn_result" || tail.kind === "message")) {
       void resources.masterState.refresh();
     }
+  }, [tailSeq]);
+  // CAD-1700: Home on screen has shown everything up to its tail.
+  useEffect(() => {
+    if (tailSeq > 0) noteHomeSeen(tailSeq);
   }, [tailSeq]);
 
   // Smart scroll (CAD-551, panel-scoped CAD-600) plus send-pin
@@ -1033,24 +1028,29 @@ function MasterHome({
     [],
   );
 
+  const runTurnCommand = useCallback((command: "stop" | "cancel", message: string) => {
+    const id = ++cmdSeq.current;
+    api
+      .masterCommand(command, undefined, undefined, message)
+      .then((r) => {
+        void resources.masterState.refresh();
+        if (!r.ok) setCmds((c) => [...c, { id, name: command, ok: false, text: "The master did not accept the command." }]);
+      })
+      .catch((e: ApiError) => setCmds((c) => [...c, { id, name: command, ok: false, text: e.message }]));
+  }, []);
+
   const onEarlier = useCallback(() => {
-    const data = resources.masterThread.get().data;
-    if (!data) return;
-    const hidden = Math.max(0, threadItems(data).length - limit);
-    if (hidden > 0) {
+    const step = earlierStep(resources.masterThread, threadReader(MASTER), limit);
+    if (step === null || step.kind === "complete") return;
+    if (step.kind === "widen") {
       setLimit((l) => l + WINDOW);
       return;
     }
-    const page = fetchEarlier(threadReader(MASTER), data);
-    if (!page) {
-      resources.masterThread.write((cur) => ({ ...(cur ?? data), moreBefore: false }));
-      return;
-    }
     setLoadingEarlier(true);
-    page
+    step.page
       .then((older) => {
         earlierLanded.current = true;
-        resources.masterThread.write((cur) => applyEarlier(cur, older));
+        step.land(older);
         setLimit((l) => l + WINDOW);
       })
       .catch(() => undefined)
@@ -1185,16 +1185,33 @@ function MasterHome({
           )}
 
           <div className="chatdock" ref={dockRef} data-chat-dock>
-            {/* The turn's truthful status line and its Stop live in the
-                dock, outside the message rows (CAD-1462); the working
-                presentation itself is the subtle name-row indicator. */}
-            <WorkingRow
-              turn={turn}
-              appOrigin={turnOrigin}
-              step={step}
-              onStop={() => runCommand("stop", "")}
-              resolveAppPath={resolveAppPath}
+            {/* The turn bar (CAD-1700) owns the turn's state and its Stop and
+                Cancel; the working presentation itself is the subtle name-row
+                indicator (CAD-1462). */}
+            <TurnBar
+              state={turnBar}
+              reconnecting={link !== null && link !== "live"}
+              since={serverTurn?.since ?? null}
+              actions={{
+                onStop: (message) => runTurnCommand("stop", message),
+                onCancel: (message) => runTurnCommand("cancel", message),
+                onRetry: failedSend ? () => onRetrySend(failedSend.message, failedSend.text) : undefined,
+                onReview: () => {
+                  const card = scrollRef.current?.querySelector<HTMLElement>("[data-permission-thread]");
+                  card?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });
+                },
+              }}
             />
+            {/* Another conversation's turn (an app's), with its link: Home's
+                own turn is the turn bar above. */}
+            {turnBar.kind === "idle" && (
+              <WorkingRow
+                turn={turn}
+                appOrigin={turnOrigin}
+                step={step}
+                resolveAppPath={resolveAppPath}
+              />
+            )}
             <Composer
               block={block}
               seed={seed}

@@ -75,6 +75,8 @@ import type { BoardFilters } from "./lib/filters";
 import type { UpdateBanner } from "./lib/types";
 import { RESOURCE_NAMES } from "./lib/cache";
 import { noteThreadsChanged } from "./features/threads/threadsClient";
+import { noteMasterChanged } from "./lib/masterChanged";
+import { useHomeUnread } from "./features/app-shell/chat/homeUnread";
 import { LiveUpdates, patchRows } from "./lib/liveUpdates";
 import type { Agent, AgentsPayload } from "./lib/types";
 import { cache, onIssueUnavailable, resources, type MyWorkList } from "./lib/resources";
@@ -178,6 +180,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const loc = useMemo(() => currentLocation(), [href]);
   const { route, view, project, openId, filters } = loc;
   const screen = route.screen;
+  useHomeUnread(screen === "home");
   const fullHeight = screen === "home" || screen === "wiki" || screen === "workspaceApp" || screen === "workspaceAppKey" || screen === "threads" ||
     (route.screen === "projects" && route.section === "context" && Boolean(route.slug));
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
@@ -428,6 +431,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     cache.invalidate("lane");
     invalidatePersonal();
     noteThreadsChanged();
+    noteMasterChanged();
     refresh();
   }, [refresh, invalidatePersonal]);
 
@@ -442,6 +446,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         if (laneFollowsStream([key])) cache.invalidate("lane");
         if (key === "issues" || key === "issue" || key === "agents") invalidatePersonal();
         if (key === "threads") noteThreadsChanged();
+        if (key === "master") noteMasterChanged();
         if (key === "overview" && !overviewWantedRef.current) {
           resources.overview.markInvalid();
         } else cache.invalidate(key);
@@ -485,7 +490,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     liveUpdates.current = updates;
     const sub = subscribeSse({
       url: "/api/stream?entities=1",
-      events: ["hello", "heartbeat", "issues", "agents", "jobs", "monitoring", "issue", "agent", "agent_meta", "plan", "aggregates", "threads"],
+      events: ["hello", "heartbeat", "issues", "agents", "jobs", "monitoring", "issue", "agent", "agent_meta", "plan", "aggregates", "threads", "master"],
       onEvent: updates.event,
       onOpen: updates.opened,
       onError: updates.failed,
