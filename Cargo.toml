@@ -1,6 +1,6 @@
 [package]
 name = "cadence-agent"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "MIT"
 description = "Local controller coordinating coding agents across terminals"
