@@ -9,7 +9,6 @@ import { dropWorkspaceAppSnapshot, readWorkspaceAppSnapshot, workspaceApps, type
 import { WorkspaceAppCachedPreview } from "../workspace-apps/WorkspaceApp";
 import { chatScreenFor } from "./chatScreen";
 import { screenTag } from "../workspace-apps/screen/screenProjection";
-import { initialContext, rememberedContext, rememberContext, screenContext, subscribeContext } from "../workspace-apps/contextSelection";
 import ScreenUnavailable from "../workspace-apps/screen/ScreenUnavailable";
 import { isSocialContent } from "../workspace-apps/socialContentSupport";
 import { sectionFromSearch } from "./appNav";
@@ -347,10 +346,6 @@ export default function AppShell({
     ) => {
       const [path, search] = href.split("?");
       const q = new URLSearchParams(search ?? "");
-      if (patch.ctx !== undefined) {
-        if (patch.ctx === null || patch.ctx === "") q.delete("ctx");
-        else q.set("ctx", patch.ctx);
-      }
       if (patch.appview !== undefined) {
         if (patch.appview === null || patch.appview === "list") q.delete("appview");
         else q.set("appview", patch.appview);
@@ -480,7 +475,6 @@ export default function AppShell({
         setGeneralSetup({ key: setupScopeKey, error: "App setup did not return an active context. Retry setup or ask an administrator to review this installation." });
         return;
       }
-      if (query.get("ctx") === null) rememberContext(installId, row.id);
       handledQuery.current = undefined;
       setContexts((previous) => previous.some((context) => context.id === row.id) ? previous : [...previous, row]);
       setGeneralSetup(null);
@@ -522,18 +516,6 @@ export default function AppShell({
   // pick drops a stale conversation/record view that was bound to the
   // previous scope. Host-driven writes (URL adoption, setup) flag out so
   // their emit cannot rewrite the authored URL they came from.
-  useEffect(() => {
-    return subscribeContext((changed, next) => {
-      if (changed !== installId) return;
-      setContextId(next ?? "");
-      if (emitByHost.current) return;
-      if (installation?.install_id !== installId) return;
-      const current = query.get("ctx") ?? "";
-      if (next === current) return;
-      writeQuery({ ctx: next || null, record: null, appview: null, conversation: null });
-    });
-  }, [installId, installation, query, writeQuery]);
-
   // Installation switch: stale outlet state must never follow the
   // operator across the boundary. The first mount keeps direct links.
   useEffect(() => {
@@ -572,22 +554,15 @@ export default function AppShell({
   // view keeps remembered choice. Stale nonempty ids resolve to the
   // stale id itself — the binding refuses, never an auto-retarget.
   // Storage is read here, once, in the owner — resolvers take data only.
-  const fallbackContext = () => {
-    const remembered = rememberedContext(installId);
-    return activeIds.length === 0
-      ? remembered ?? ""
-      : installation !== null && screenTag(installation) !== null
-        ? screenContext(remembered, activeIds)
-        : initialContext(remembered, activeIds);
-  };
-  // Host-driven adoption (the effect below and setup): set the one scope
-  // and persist it, flagging the emission so the subscription does not
-  // rewrite the URL the adoption came from.
+  // Single-company mode: the workspace has exactly one active app context.
+  // It is the scope for every screen, chat and run; nothing remembers or
+  // switches a selection.
+  const fallbackContext = () => activeIds[0] ?? "";
+  // Host-driven adoption (the effect below and setup): set the one scope.
   const adoptScope = (next: string) => {
     emitByHost.current = true;
     try {
       setContextId(next);
-      rememberContext(installId, next);
     } finally {
       emitByHost.current = false;
     }
@@ -890,46 +865,6 @@ export default function AppShell({
         </span>
 
         <span className="flex-1" />
-        {screenOutlet && (activeIds.length > 1 || (contextId !== "" && !activeIds.includes(contextId))) && (
-          // A private screen offers no in-outlet picker (the screen is the
-          // outlet's first child). With 2+ active contexts the choice lives
-          // here; it also appears while a remembered scope is stale — the
-          // operator recovers by picking the sole live context, never by
-          // editing storage. Social's explicit "no context" survives.
-          <select
-            className="app-shell-context-pick"
-            aria-label={t("Context")}
-            data-social-context
-            value={contextId}
-            onChange={(e) => {
-              const next = e.target.value;
-              if (next === contextId) return;
-              if (next !== "" && !activeIds.includes(next)) return;
-              // One mechanism for both cases: persist + emit; the
-              // subscription applies the selection and keeps the URL in
-              // step, so a scoped conversation/record never survives a
-              // deliberate scope pick.
-              rememberContext(installId, next);
-            }}
-          >
-            {contextId !== "" && !activeIds.includes(contextId) && (
-              <option value={contextId} disabled>{t("Unavailable context")}</option>
-            )}
-            {isSocial && <option value="">{t("No context")}</option>}
-            {!isSocial && (
-              <option value="" disabled>
-                {t("Choose a context")}
-              </option>
-            )}
-            {contexts
-              .filter((c) => c.state === "active")
-              .map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.config.label}
-                </option>
-              ))}
-          </select>
-        )}
         {launchableWorkflows.map((flow) => (
           <Button
             key={flow.name}
@@ -1095,66 +1030,7 @@ export default function AppShell({
                 // shell shows no installId/version/context subtitle.
                 null
               ) : (
-                <p className="num text-micro text-ink-500">
-                  {activeContexts.find((c) => c.id === contextId)?.config.label ?? t("No context")} · {installation.version}
-                </p>
-              )}
-              {/* Scoped entry: a multi-context install with no linked
-                  or remembered scope stays unselected rather than
-                  silently picking a client. Each context is an explicit
-                  `?ctx=` link — a real URL write, deep-linkable, never a
-                  hidden default. The removed header picker stays gone.
-                  The same links stay available after a scope is bound
-                  (chosen, linked or remembered): without them the only
-                  way to reach a second context would be hand-editing
-                  the URL — the regression the header picker's removal
-                  introduced. The bound context keeps its link but
-                  carries `aria-current`, so the current scope is still
-                  announced and never a dead control — and its href is
-                  the current URL itself, so following it is a
-                  `navigate` no-op that keeps the open record, the New
-                  view and any unsaved draft instead of resetting the
-                  outlet. Single-context installs keep the entry hidden
-                  — no link clutter. */}
-              {!screenOutlet && activeIds.length > 1 && (
-                <nav
-                  className={
-                    contextId === ""
-                      ? "app-shell-scope card px-4 py-4"
-                      : "app-shell-switch"
-                  }
-                  aria-label={contextId === "" ? t("Choose a context") : t("Switch context")}
-                >
-                  <p
-                    className={
-                      contextId === "" ? "text-label text-ink-300" : "text-label text-ink-500"
-                    }
-                  >
-                    {contextId === ""
-                      ? t("Choose a context to open {title}'s records.").replace("{title}", () => title)
-                      : t("Context:")}
-                  </p>
-                  <ul
-                    className={
-                      contextId === ""
-                        ? "app-shell-scope-list"
-                        : "app-shell-scope-list app-shell-switch-list"
-                    }
-                  >
-                    {activeContexts.map((c) => (
-                        <li key={c.id}>
-                          <Link
-                            href={scopedEntryHref(href, c.id, contextId)}
-                            className="lnk text-label"
-                            data-scope-link={c.id}
-                            aria-current={c.id === contextId ? "page" : undefined}
-                          >
-                            {c.config.label}
-                          </Link>
-                        </li>
-                      ))}
-                  </ul>
-                </nav>
+                <p className="num text-micro text-ink-500">{installation.version}</p>
               )}
               {linkNotice && (
                 <p className="self-start rounded border border-warn/40 px-3 py-1.5 text-label text-warn" role="alert" data-link-notice>
