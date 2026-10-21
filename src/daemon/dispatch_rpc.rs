@@ -453,15 +453,10 @@ impl Shared {
         // One kickoff at a time, so two callers share one lane.
         let _serial = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
         let pm = self.pm()?;
-        let (project, dir) = issue::write::issue_dir(&pm, &id)?;
-        let (front, body) = issue::write::load_front(&dir)?;
-        if issue::parse::acceptance_items(&body).is_empty() {
-            return Err(Error::rejected(format!(
-                "{id} has no acceptance criteria — add them with \
-                 `cadence issue acceptance {id} --from <file>` before kickoff"
-            )));
-        }
-        issue::plan::gate(&pm.dir, &front, &body)?;
+        // One shared pre-dispatch gate (CLI dispatch uses the same
+        // function); the board is the caller that requires acceptance.
+        let gate = issue::dispatch::gate_issue(&pm, &id, true)?;
+        let (project, front) = (gate.project, gate.front);
         if let Some(path) = self.kickoff_existing_lane(&project, &front)? {
             return Ok(self.kickoff_lane_receipt(&front, &path));
         }
