@@ -57,7 +57,9 @@ reference receiver and `screenProtocol.ts`):
   call is outstanding at a time — a second is refused locally with
   `conflict` (the host closes the mount on concurrent tool calls). A local
   timeout does not cancel the host invocation, so the gate stays closed until
-  the host's reply (even a late one) or teardown.
+  the matching `tool-reply` (even a late one) or teardown. A retired id keeps
+  its kind: a replayed or wrong-kind late reply never releases another
+  request's gate and is torn down.
 - A v1-only mount sends the bare `{op:"ready"}` envelope; `screen.v1` is a
   local PUSH filter, never a name on the wire (the host refuses it).
 - A slot's `pending` event arrives through `onSlotState` and leaves the

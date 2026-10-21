@@ -195,7 +195,7 @@ export function createScreenReceiver(options = {}) {
   const channel = new Channel();
   const port = channel.port1;
   const pending = new Map(); // request id -> { resolve, reject, timer }
-  const sent = new Set(); // ids this mount sent, kept for late replies
+  const sent = new Map(); // id -> kind, kept for late/replayed replies
   const assets = new Map(); // ref -> resolve
   const identityKeys = ["v", "install_id", "digest", "context_id"];
   let tornDown = false;
@@ -207,6 +207,7 @@ export function createScreenReceiver(options = {}) {
   // A local timeout does not cancel the host invocation, so busy survives it
   // until the host's reply (even a late one) or teardown.
   let toolBusy = false;
+  let busyToolId = null;
 
   const close = (reason, notify) => {
     if (tornDown) return;
@@ -218,6 +219,8 @@ export function createScreenReceiver(options = {}) {
     } catch {
       // a closed port is already closed
     }
+    toolBusy = false;
+    busyToolId = null;
     for (const entry of pending.values()) {
       clearTimeout(entry.timer);
       entry.reject(new ScreenClosedError(`screen bridge closed: ${reason}`));
@@ -233,7 +236,7 @@ export function createScreenReceiver(options = {}) {
     port.postMessage(message);
   };
 
-  const request = (kind, body) => {
+  const request = (kind, body, onSent) => {
     if (tornDown) return Promise.reject(new ScreenClosedError("screen bridge is closed"));
     if (!liveV2) {
       return Promise.reject(new ScreenClosedError("the action channel opens only after a screen.v2 PUSH"));
@@ -246,7 +249,8 @@ export function createScreenReceiver(options = {}) {
         reject(new ScreenTimeoutError(id, timeoutMs));
       }, timeoutMs);
       pending.set(id, { resolve, reject, timer, kind });
-      sent.add(id);
+      sent.set(id, kind);
+      onSent?.(id);
       try {
         post({ v: 2, op: kind, id, ...body });
       } catch (error) {
@@ -263,14 +267,25 @@ export function createScreenReceiver(options = {}) {
     const entry = pending.get(message.id);
     if (!entry) {
       if (message.v !== 2) throw new Error(`${message.op} must be v2`);
-      if (message.op === "tool-reply") toolBusy = false;
-      return sent.has(message.id); // a late reply is ignored, not fatal
+      const kind = sent.get(message.id);
+      if (!kind) return false;
+      // A retired request still validates its kind; a replayed reply never
+      // releases a different invocation's gate.
+      if (message.op !== expectedOp[kind]) throw new Error(`${kind} answered with ${message.op}`);
+      if (kind === "tool" && message.id === busyToolId) {
+        toolBusy = false;
+        busyToolId = null;
+      }
+      return true; // a late reply is ignored, not fatal
     }
     if (message.v !== 2) throw new Error(`${message.op} must be v2`);
     if (message.op !== expectedOp[entry.kind]) {
       throw new Error(`${entry.kind} answered with ${message.op}`);
     }
-    if (message.op === "tool-reply") toolBusy = false;
+    if (message.op === "tool-reply" && message.id === busyToolId) {
+      toolBusy = false;
+      busyToolId = null;
+    }
     if (message.op === "slot-state") {
       // A slot is a host-drawn control: `pending` is progress, not a result.
       // Keep the request open (and stop its clock) until `done`/`refused` so
@@ -399,7 +414,9 @@ export function createScreenReceiver(options = {}) {
         return Promise.reject(new ScreenRefusalError({ code: "conflict", text: "Another tool call is already running." }));
       }
       toolBusy = true;
-      const pendingTool = request("tool", { alias, input, request_id: requestId });
+      const pendingTool = request("tool", { alias, input, request_id: requestId }, (id) => {
+        busyToolId = id;
+      });
       // A host reply settles busy in `settle`. A local timeout must NOT:
       // the host may still be running the tool. Any other local rejection
       // means nothing was posted, so release the gate.

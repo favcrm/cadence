@@ -413,3 +413,45 @@ test("a timed-out tool keeps the channel busy until the host replies", async () 
   host.postMessage({ v: 2, op: "tool-reply", id: next.id, ok: true, data: {} });
   await third;
 });
+
+test("a replayed tool reply cannot release another tool's gate", async () => {
+  const { host, inbox, pushes, receiver } = connect({ accepts: ["screen.v2", "screen-actions.v1"], timeoutMs: 1000 });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const first = receiver.tool("social.publish", {}, "req-1");
+  const firstRequest = await waitFor(() => inbox.find((m) => m.op === "tool"), "the first tool request");
+  host.postMessage({ v: 2, op: "tool-reply", id: firstRequest.id, ok: true, data: {} });
+  await first;
+
+  const second = receiver.tool("social.publish", {}, "req-2");
+  const secondRequest = await waitFor(
+    () => inbox.filter((m) => m.op === "tool").find((m) => m.id !== firstRequest.id),
+    "the second tool request",
+  );
+  host.postMessage({ v: 2, op: "tool-reply", id: firstRequest.id, ok: true, data: {} });
+  await tick();
+  await assert.rejects(receiver.tool("social.publish", {}, "req-3"), (error) => error.code === "conflict");
+  assert.equal(inbox.filter((m) => m.op === "tool").length, 2);
+  host.postMessage({ v: 2, op: "tool-reply", id: secondRequest.id, ok: true, data: {} });
+  await second;
+});
+
+test("a wrong-kind late reply tears down", async () => {
+  const { host, inbox, pushes, errors, receiver } = connect({ timeoutMs: 20 });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const pending = receiver.call("read.run", {});
+  await assert.rejects(pending, ScreenTimeoutError);
+  const request = await waitFor(() => inbox.find((m) => m.op === "call"), "the call");
+  host.postMessage({ v: 2, op: "tool-reply", id: request.id, ok: true, data: {} });
+  await waitFor(() => errors.length === 1, "the wrong-kind teardown");
+});
+
+test("teardown after a timed-out tool reports closed, not busy", async () => {
+  const { host, pushes, receiver } = connect({ accepts: ["screen.v2", "screen-actions.v1"], timeoutMs: 20 });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  await assert.rejects(receiver.tool("social.publish", {}, "req-1"), ScreenTimeoutError);
+  receiver.teardown();
+  await assert.rejects(receiver.tool("social.publish", {}, "req-2"), ScreenClosedError);
+});
