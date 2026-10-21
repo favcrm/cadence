@@ -301,6 +301,14 @@ impl Shared {
         Ok(json!({"task": task.to_json()}))
     }
 
+    /// Read-only entitlement probe for a cloud start. The CLI has no
+    /// hosted company context; the daemon does, and its refusal carries
+    /// the stable `cloud_sandbox_not_entitled` code.
+    pub(super) fn rpc_cloud_probe(self: &Arc<Self>, _params: &Value) -> Result<Value> {
+        crate::issue::cloud::probe_entitlement()?;
+        Ok(json!({"entitled": true}))
+    }
+
     /// `job dispatch` — bookkeeping plus the kickoff enqueue in one
     /// store transaction. Does not bypass the ready gate: `--ready` is
     /// claimed client-side exactly like `send --ready`.
@@ -433,69 +441,26 @@ impl Shared {
         let cloud_dispatch = target
             .as_ref()
             .is_some_and(|agent| agent.endpoint_kind == "sandbox");
-        let requested_message = optional_str(params, "message");
-        // Cloud admission is the authoritative entitlement check. It runs
-        // before the dispatch transaction, so a refused company leaves no
-        // task revision, lane, job or kickoff behind. The consumer later
-        // replays this same kickoff-id idempotency key.
-        let plan = if cloud_dispatch {
-            Some(
-                self.store
-                    .plan_task_dispatch(task_id, to.as_deref(), requested_message)?,
-            )
-        } else {
-            None
-        };
-        let admission = match &plan {
-            Some(plan) if !plan.duplicate => Some(crate::issue::cloud::admit_dispatch(
-                &plan.job,
-                &plan.task,
-                &plan.message_id,
-                &plan.body,
-            )?),
-            _ => None,
-        };
-        let planned_message = plan
-            .as_ref()
-            .filter(|plan| !plan.duplicate)
-            .map(|plan| plan.message_id.as_str());
-        let planned_revision = plan
-            .as_ref()
-            .filter(|plan| !plan.duplicate)
-            .map(|plan| plan.revision);
-        let dispatched = match &expect {
+        // Read-only AOS probe before the dispatch transaction. A denied
+        // company leaves the task revision, job and kickoff untouched.
+        if cloud_dispatch {
+            crate::issue::cloud::probe_entitlement()?;
+        }
+        let (task, message, duplicate, behind_dead) = match &expect {
             Some(expect) => self.store.dispatch_task_expecting(
                 task_id,
                 to.as_deref(),
-                planned_message.or(requested_message),
+                optional_str(params, "message"),
                 by,
                 expect,
-            ),
+            )?,
             None => self.store.dispatch_task(
                 task_id,
                 to.as_deref(),
-                planned_message.or(requested_message),
+                optional_str(params, "message"),
                 by,
-            ),
+            )?,
         };
-        let (task, message, duplicate, behind_dead) = match dispatched {
-            Ok(value) => value,
-            Err(error) => {
-                if let Some(job) = &admission {
-                    crate::issue::cloud::stop_admission(job);
-                }
-                return Err(error);
-            }
-        };
-        if let Some(job) = &admission {
-            // A race that moved the task to a different revision means no
-            // local kickoff can consume this admission; stop it. A
-            // duplicate at the same revision shares the same key and is
-            // left for the consumer.
-            if Some(task.revision) != planned_revision {
-                crate::issue::cloud::stop_admission(job);
-            }
-        }
         if cloud_dispatch {
             let shared = Arc::clone(self);
             let task_id = task.id.clone();
@@ -532,14 +497,6 @@ impl Shared {
         let message = self.store.message(message_id)?.ok_or_else(|| {
             Error::rejected(format!("cloud dispatch message '{message_id}' is gone"))
         })?;
-        if message.state == "queued" && self.store.cloud_stop_requested(&message.id)? {
-            crate::issue::cloud::interrupt_message(
-                &self.store,
-                &message,
-                &Error::rejected("cloud sandbox dispatch was stopped by the operator"),
-            );
-            return Ok(());
-        }
         if !self
             .store
             .mark_running_queued(&message.id, &format!("cloud:{}", message.id))?

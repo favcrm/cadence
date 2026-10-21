@@ -462,6 +462,34 @@ impl<T: SandboxTransport> SandboxClient for HttpSandboxApi<T> {
     }
 }
 
+impl<T: SandboxTransport> HttpSandboxApi<T> {
+    /// Non-executing entitlement probe: AOS's GET job route checks the
+    /// company's `cloud_sandbox` row before it looks the job up. A fixed
+    /// absent id therefore returns 403 when disabled and 404 when enabled,
+    /// with no remote create or store write. This is the admission gate the
+    /// daemon and the CLI run before any cloud lane/message effect.
+    pub fn entitled(&self) -> Result<bool> {
+        let (status, envelope) = self
+            .transport
+            .send("GET", &format!("{JOBS_URL}/probe"), None)?;
+        let code = envelope
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        match (status, code) {
+            (403, "cloud_sandbox_not_entitled") => Ok(false),
+            (404, _) | (200..=299, _) => Ok(true),
+            _ => Err(map_error(status, code)),
+        }
+    }
+}
+
+impl<T: SandboxTransport> SandboxEntitlement for HttpSandboxApi<T> {
+    fn cloud_sandbox_enabled(&self, _company: &str) -> Result<bool> {
+        self.entitled()
+    }
+}
+
 /// In-memory fake for tests: scripted entitlement, scripted transport
 /// responses, and a call log so tests can assert on wire shape.
 #[cfg(test)]
@@ -846,6 +874,25 @@ mod tests {
         assert!(!again, "second relay must not report again");
         assert_eq!(relay.reported.lock().unwrap().len(), 1);
         assert_eq!(relay.recorded("csb_job-1").unwrap().text, "done");
+    }
+
+    #[test]
+    fn entitlement_probe_uses_get_and_distinguishes_refusal() {
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![
+            (404, json!({"ok": false, "error": {"code": "not_found"}})),
+            (
+                403,
+                json!({"ok": false, "error": {"code": "cloud_sandbox_not_entitled"}}),
+            ),
+        ]));
+        assert!(api.entitled().unwrap());
+        let error = require_entitlement(&api, "co-1").unwrap_err();
+        assert_eq!(error.code(), Some(ENTITLEMENT_REFUSED));
+        let calls = api.transport.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls
+            .iter()
+            .all(|(method, url, _)| method == "GET" && url == &format!("{JOBS_URL}/probe")));
     }
 
     #[test]

@@ -14,36 +14,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use uuid::Uuid;
 
-use crate::adapter::sandbox::SandboxJob;
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::model::{self, Front, Ref};
 use crate::issue::{claim, finish, git, parse, project, write, Pm};
 use crate::worktree::{self, layout};
-
-/// A remote job created before the cloud lane/job effects. It is stopped
-/// on any later local failure unless the start reaches its cloud return.
-struct CloudAdmission {
-    handle: Option<SandboxJob>,
-    job_id: String,
-    message_id: String,
-}
-
-impl CloudAdmission {
-    fn disarm(mut self) {
-        self.handle = None;
-    }
-}
-
-impl Drop for CloudAdmission {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            crate::issue::cloud::stop_admission(&handle);
-        }
-    }
-}
 
 /// Optional M3 job creation: `--job --pm <alias> --spec <file>
 /// [--assignee <alias>]`.
@@ -711,12 +687,18 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     };
     if args.job.is_none() {
         if let Some(owner) = &args.owner {
-            let show = client::rpc(state_dir, "agent_show", json!({"alias": owner}))?;
-            if show["agent"]["endpoint_kind"].as_str() == Some("sandbox") {
-                return Err(Error::rejected(format!(
-                    "Cloud sandbox agent '{owner}' runs only `--job` dispatches — \
-                     nothing was created"
-                )));
+            // `issue_kickoff` may mint the worker after start; only an
+            // already-registered sandbox owner is refused here.
+            match client::rpc(state_dir, "agent_show", json!({"alias": owner})) {
+                Ok(show) if show["agent"]["endpoint_kind"].as_str() == Some("sandbox") => {
+                    return Err(Error::rejected(format!(
+                        "Cloud sandbox agent '{owner}' runs only `--job` dispatches — \
+                         nothing was created"
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) if error.to_string().contains("Unknown agent") => {}
+                Err(error) => return Err(error),
             }
         }
     }
@@ -827,6 +809,12 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         "issue start",
         || claim::since(&pm.dir, &project.key, &front, Duration::from_secs(2)),
     )?;
+    // A cloud start's admission is a read-only AOS probe, before the
+    // take-over commit and before the ordinary new-lane claim. A denied
+    // company leaves the tracker untouched.
+    if cloud {
+        client::rpc(state_dir, "cloud_probe", json!({}))?;
+    }
     if let Some(t) = &checked.take_over {
         let mut taken = front.clone();
         taken.claim = Some(claim::new_claim(&requester, Some(t.reason.clone())));
@@ -916,88 +904,6 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     } else {
         base_sha.clone()
     };
-    // The cloud runner's entitlement is enforced by the AOS create. Do it
-    // before the claim, branch ref or job row, so a disabled company gets
-    // a stable refusal and no durable lane. The chosen job/task/kickoff ids
-    // are the ones this start and its later task dispatch use, so the
-    // consumer's create is an idempotent replay of this reservation.
-    let cloud_admission = if cloud {
-        let job_args = args
-            .job
-            .as_ref()
-            .ok_or_else(|| Error::rejected("cloud sandbox start needs a job definition"))?;
-        let (_, spec, spec_sha) = job_probe
-            .as_ref()
-            .ok_or_else(|| Error::rejected("cloud sandbox start needs a readable job spec"))?;
-        let job_id = format!("job-{}", &Uuid::new_v4().simple().to_string()[..8]);
-        let task_id = format!("{job_id}-t1");
-        let task_acceptance =
-            crate::issue::dispatch::acceptance_listing(&parse::acceptance_items(&body));
-        let admission_job = crate::store::Job {
-            id: job_id.clone(),
-            title: Some(front.title.clone()),
-            spec_path: spec.clone(),
-            spec_sha256: Some(spec_sha.clone()),
-            pm_alias: job_args.pm.clone(),
-            issue_id: Some(front.id.clone()),
-            repo: Some(root.display().to_string()),
-            base_ref: Some(lane_base_sha.clone()),
-            state: "open".to_string(),
-            max_revisions: 2,
-            stall_secs: None,
-            error: None,
-            created: 0.0,
-            updated: 0.0,
-        };
-        let admission_task = crate::store::Task {
-            id: task_id.clone(),
-            job_id: job_id.clone(),
-            title: None,
-            role: "worker".to_string(),
-            assignee: job_args.assignee.clone(),
-            spec_path: None,
-            acceptance: task_acceptance,
-            worktree: Some(root.display().to_string()),
-            branch: Some(branch.clone()),
-            base_sha: Some(lane_base_sha.clone()),
-            head_sha: None,
-            state: "draft".to_string(),
-            revision: 0,
-            dispatch_message: None,
-            error: None,
-            created: 0.0,
-            updated: 0.0,
-        };
-        let message_id = Uuid::new_v5(
-            &Uuid::NAMESPACE_URL,
-            format!("cadence-dispatch:{task_id}:r1:a0").as_bytes(),
-        )
-        .simple()
-        .to_string();
-        let kickoff = crate::store::job_kickoff(
-            &admission_job,
-            &admission_task,
-            1,
-            &message_id,
-            "sandbox",
-            "sandbox",
-        )?;
-        let handle = crate::issue::cloud::admit_dispatch(
-            &admission_job,
-            &admission_task,
-            &message_id,
-            &kickoff,
-        )?;
-        Some(CloudAdmission {
-            handle: Some(handle),
-            job_id,
-            message_id,
-        })
-    } else {
-        None
-    };
-    let cloud_job_id = cloud_admission.as_ref().map(|a| a.job_id.clone());
-    let cloud_message = cloud_admission.as_ref().map(|a| a.message_id.clone());
     let checkout_record = || {
         let mut record = worktree::lifecycle::new_record(worktree::lifecycle::CheckoutSpec {
             repo: &root,
@@ -1101,7 +1007,6 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             "slot_env": null,
             "claim": claim_out,
             "cloud": true,
-            "cloud_message": cloud_message,
         });
         write::add_ref(
             pm,
@@ -1125,7 +1030,6 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 job_state_dir,
                 "job_new",
                 json!({"pm": job.pm, "spec": spec, "spec_sha256": spec_sha256,
-                       "job": cloud_job_id,
                        "title": front.title, "issue": front.id,
                        "repo": root, "base_ref": lane_base_sha,
                        "task_worktree": root.to_string_lossy(),
@@ -1155,9 +1059,6 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             }
         }
         out["leases"] = leases;
-        if let Some(admission) = cloud_admission {
-            admission.disarm();
-        }
         return Ok(out);
     }
 

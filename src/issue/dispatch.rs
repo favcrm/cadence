@@ -1236,14 +1236,6 @@ pub fn run(
         body,
     } = lessons(pm, &project, &dir, &front, args, state_dir, &provider, body);
 
-    // A cloud start reserved the exact kickoff id before its lane/job
-    // writes. Use it for the ref and task dispatch so the daemon's
-    // create replays the same remote job.
-    let mid = started["cloud_message"]
-        .as_str()
-        .map(str::to_string)
-        .unwrap_or(mid);
-
     // CAD-467: a freshly joined worker's `bootstrap-<alias>` still
     // `queued` would deliver as a bare onboarding turn AHEAD of this
     // kickoff — and a worker that treated it as the task would then

@@ -99,25 +99,14 @@ fn create_request(job: &Job, task: &Task, message_id: &str, body: &str) -> Resul
     })
 }
 
-/// Authoritative admission before any durable dispatch write. AOS enforces
-/// the company's `cloud_sandbox` entitlement on create (403
-/// `cloud_sandbox_not_entitled` maps to `ENTITLEMENT_REFUSED`), and the
-/// consumer later replays the same idempotency key. A refusal therefore
-/// leaves tracker, lane, task and message untouched.
-pub fn admit_dispatch(job: &Job, task: &Task, message_id: &str, body: &str) -> Result<SandboxJob> {
-    let _ = hosted_company(|key| std::env::var(key).ok())?;
-    let request = create_request(job, task, message_id, body)?;
-    let client = HttpSandboxApi::new(UreqSandboxTransport::new(None));
-    client.create_job(&request)
-}
-
-/// Stop an admission whose local dispatch did not commit. A stop failure
-/// is deliberately not fatal to the caller: the remote may still run, and
-/// the task/message were never written, so there is no consumer to
-/// duplicate it.
-pub fn stop_admission(job: &SandboxJob) {
-    let client = HttpSandboxApi::new(UreqSandboxTransport::new(None));
-    let _ = client.stop_job(&job.job_id);
+/// Non-executing, authoritative entitlement probe. AOS's GET job route
+/// checks the company's `cloud_sandbox` row before the job lookup; the
+/// fixed absent id returns 403 when disabled and 404 when enabled, with no
+/// remote create. Run this before any cloud lane/job/message write.
+pub fn probe_entitlement() -> Result<()> {
+    let company = hosted_company(|key| std::env::var(key).ok())?;
+    let api = HttpSandboxApi::new(UreqSandboxTransport::new(None));
+    crate::adapter::sandbox::require_entitlement(&api, &company)
 }
 
 /// Consume one dispatched kickoff for a sandbox agent.
@@ -157,6 +146,20 @@ pub fn run_dispatch(
             return Err(error);
         }
     };
+    // The stop request and publication start are serialized in the store.
+    // A stop that won means no tracker done report and no completion.
+    match store.begin_cloud_publication(&message.id) {
+        Ok(true) => {}
+        Ok(false) => {
+            let error = stopped_error("cloud sandbox dispatch was stopped before publication");
+            interrupt_message(store, message, &error);
+            return Err(error);
+        }
+        Err(error) => {
+            fail_message(store, message, &error);
+            return Err(error);
+        }
+    }
     let prepared = match prepare_done_report(pm, issue, &lane, &result, &agent.alias) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -200,25 +203,38 @@ fn execute(
     agent: &Agent,
     stop: &dyn Fn() -> bool,
 ) -> Result<(RemoteLane, SandboxResult)> {
-    if stop() {
-        return Err(Error::Structured(Structured {
-            kind: "rejected",
-            code: STOPPED.to_string(),
-            message: "cloud sandbox dispatch was stopped before create".to_string(),
-            revision: None,
-        }));
-    }
     let request = create_request(job, task, &message.id, &message.body)?;
     let client = HttpSandboxApi::new(UreqSandboxTransport::new(None));
-    let job_handle = client.create_job(&request)?;
+    let job_handle = match client.create_job(&request) {
+        Ok(handle) => handle,
+        Err(error)
+            if matches!(
+                error.code(),
+                Some(crate::adapter::sandbox::ENTITLEMENT_REFUSED)
+                    | Some(crate::adapter::sandbox::SANDBOX_UNAVAILABLE)
+            ) =>
+        {
+            // A definitive refusal/route absence means no remote exists.
+            return Err(error);
+        }
+        Err(error) => {
+            // A transport loss after the request may have created the job.
+            return Err(uncertain(format!(
+                "cloud sandbox create outcome is unknown: {error}"
+            )));
+        }
+    };
     if stop() {
-        let _ = client.stop_job(&job_handle.job_id);
-        return Err(Error::Structured(Structured {
-            kind: "rejected",
-            code: STOPPED.to_string(),
-            message: "cloud sandbox dispatch was stopped after create".to_string(),
-            revision: None,
-        }));
+        return Err(match client.stop_job(&job_handle.job_id) {
+            Ok(_) => stopped_error(&format!(
+                "cloud sandbox job {} was stopped after create",
+                job_handle.job_id
+            )),
+            Err(stop) => uncertain(format!(
+                "cloud sandbox job {} stop was not confirmed ({stop})",
+                job_handle.job_id
+            )),
+        });
     }
     let lane = RemoteLane {
         ticket_id: request.ticket_id.clone(),
@@ -240,11 +256,35 @@ fn execute(
         None,
         &agent.alias,
     ) {
-        let _ = client.stop_job(&job_handle.job_id);
-        return Err(error);
+        return Err(match client.stop_job(&job_handle.job_id) {
+            Ok(_) => error,
+            Err(stop) => uncertain(format!(
+                "cloud sandbox job {} stop was not confirmed after a lane-ref \
+                 failure ({stop}): {error}",
+                job_handle.job_id
+            )),
+        });
     }
     let result = drive_to_result(&client, &job_handle, stop)?;
     Ok((lane, result))
+}
+
+fn uncertain(message: String) -> Error {
+    Error::Structured(Structured {
+        kind: "rejected",
+        code: UNCERTAIN.to_string(),
+        message,
+        revision: None,
+    })
+}
+
+fn stopped_error(message: &str) -> Error {
+    Error::Structured(Structured {
+        kind: "rejected",
+        code: STOPPED.to_string(),
+        message: message.to_string(),
+        revision: None,
+    })
 }
 
 fn polling_failed(client: &dyn SandboxClient, job: &SandboxJob, error: &Error) -> Error {
@@ -267,16 +307,16 @@ fn polling_failed(client: &dyn SandboxClient, job: &SandboxJob, error: &Error) -
 }
 
 fn stopped(client: &dyn SandboxClient, job: &SandboxJob) -> Error {
-    let _ = client.stop_job(&job.job_id);
-    Error::Structured(Structured {
-        kind: "rejected",
-        code: STOPPED.to_string(),
-        message: format!(
+    match client.stop_job(&job.job_id) {
+        Ok(_) => stopped_error(&format!(
             "cloud sandbox job {} was stopped by the operator",
             job.job_id
-        ),
-        revision: None,
-    })
+        )),
+        Err(stop) => uncertain(format!(
+            "cloud sandbox job {} operator stop was not confirmed ({stop})",
+            job.job_id
+        )),
+    }
 }
 
 fn drive_to_result(
@@ -312,11 +352,16 @@ fn drive_to_result(
         }
         polls += 1;
         if polls >= MAX_POLLS {
-            client.stop_job(&job.job_id)?;
-            return Err(Error::rejected(format!(
-                "cloud sandbox job {} did not settle; it was stopped",
-                job.job_id
-            )));
+            return Err(match client.stop_job(&job.job_id) {
+                Ok(_) => Error::rejected(format!(
+                    "cloud sandbox job {} did not settle; it was stopped",
+                    job.job_id
+                )),
+                Err(stop) => uncertain(format!(
+                    "cloud sandbox job {} did not settle and its stop was not confirmed ({stop})",
+                    job.job_id
+                )),
+            });
         }
         std::thread::sleep(POLL_INTERVAL);
     }

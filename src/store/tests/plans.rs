@@ -19,6 +19,20 @@
     }
 
     #[test]
+    fn cloud_publication_blocks_a_late_stop() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task("j1", "t2", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, message, ..) = s.dispatch_task("t2", None, None, "test").unwrap();
+        assert!(s.begin_cloud_publication(&message).unwrap());
+        let error = s.request_cloud_stop(&message).unwrap_err().to_string();
+        assert!(error.contains("already completing"), "{error}");
+    }
+
+    #[test]
     fn dispatch_plan_is_the_transaction_preimage() {
         let (dir, s) = store();
         let cwd = dir.path().join("w");

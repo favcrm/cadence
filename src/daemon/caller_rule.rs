@@ -388,6 +388,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("job_close", Rule::OnJob(Target::Job)),
     ("task_new", Rule::OnJob(Target::Job)),
     ("task_show", Rule::Read),
+    ("cloud_probe", Rule::Read),
     ("task_dispatch", Rule::OnJob(Target::Task)),
     (
         "task_verdict",

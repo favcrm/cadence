@@ -2852,6 +2852,7 @@ impl Shared {
             "task_new" => self.rpc_task_new(params),
             "task_show" => self.rpc_task_show(params),
             "task_dispatch" => self.rpc_task_dispatch(params),
+            "cloud_probe" => self.rpc_cloud_probe(params),
             "task_verdict" => self.rpc_task_verdict(params, peer_pid),
             "task_accept" => self.rpc_task_accept(params),
             "task_sha" => self.rpc_task_sha(params),

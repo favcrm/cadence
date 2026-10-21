@@ -2096,6 +2096,17 @@ impl Store {
                 tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
                     r.get(0)
                 })?;
+            let publishing: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='cloud_publication_started' \
+                 AND json_extract(payload,'$.message')=? AND alias=?",
+                params![message_id, alias],
+                |r| r.get(0),
+            )?;
+            if publishing > 0 {
+                return Err(Error::rejected(
+                    "cloud dispatch is already completing; the stop was refused",
+                ));
+            }
             Self::event(
                 &tx,
                 &alias,
@@ -2103,6 +2114,35 @@ impl Store {
                 json!({"message": message_id}),
             )?;
             Ok(())
+        })
+    }
+
+    /// Serialize the first publication write with a concurrent operator
+    /// stop. A stop that commits first makes this return `false`; once this
+    /// commits, `request_cloud_stop` refuses to cancel the completion.
+    pub fn begin_cloud_publication(&self, message_id: &str) -> Result<bool> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            let stopped: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='cloud_stop_requested' \
+                 AND json_extract(payload,'$.message')=? AND alias=?",
+                params![message_id, alias],
+                |r| r.get(0),
+            )?;
+            if stopped > 0 {
+                return Ok(false);
+            }
+            Self::event(
+                &tx,
+                &alias,
+                "cloud_publication_started",
+                json!({"message": message_id}),
+            )?;
+            Ok(true)
         })
     }
 
