@@ -105,7 +105,6 @@ const fn route(method: &'static str, pattern: &'static str, class: RouteClass) -
 /// that matches no entry is [`RouteClass::OperatorOnly`]
 /// ([`route_class`]) — a new route fails closed until it is listed.
 pub const WRITE_ROUTES: &[WriteRoute] = &[
-    route("POST", "/api/locale", RouteClass::CallerScoped),
     route("POST", "/api/approvals/approve", RouteClass::OperatorOnly),
     // CAD-1393: company document templates and drafts — the approval is
     // the operator's alone; drafting is listed operator-only on the board
@@ -353,7 +352,6 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/issues", RouteClass::AgentAllowed),
     // CAD-140: filing a report or idea is creating a tracker issue —
     // the same class as `POST /api/issues`, through `report::file`.
-    route("POST", "/api/reports", RouteClass::AgentAllowed),
     route("PATCH", "/api/issues/*", RouteClass::AgentAllowed),
     route("POST", "/api/issues/*/links", RouteClass::AgentAllowed),
     route("DELETE", "/api/issues/*/links", RouteClass::AgentAllowed),
@@ -373,27 +371,6 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/plans/*/reject", RouteClass::OperatorOnly),
     route("POST", "/api/delivery/*/merge", RouteClass::OperatorOnly),
     route("POST", "/api/delivery/*/decline", RouteClass::OperatorOnly),
-    route(
-        "POST",
-        "/api/settings/model-defaults",
-        RouteClass::OperatorOnly,
-    ),
-    route("POST", "/api/settings/agents", RouteClass::OperatorOnly),
-    route(
-        "POST",
-        "/api/settings/agents/catalog",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/settings/agents/sync",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/settings/agents/preview",
-        RouteClass::OperatorOnly,
-    ),
     route("POST", "/api/threads/*/messages", RouteClass::OperatorOnly),
     // CAD-810 / CAD-821: every topic write is the operator's. Listed so the
     // classification is reviewed, and unlisted writes fail closed to the same class.
@@ -475,8 +452,6 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/epics/*/stage", RouteClass::OperatorOnly),
     // CAD-561: the board's Update button and its check — operator-only,
     // like every other action that replaces the running build.
-    route("POST", "/api/update", RouteClass::OperatorOnly),
-    route("POST", "/api/update/check", RouteClass::OperatorOnly),
     // CAD-496: the board relays `plan_propose` over its own daemon
     // connection, so the daemon attributes the run to whoever that
     // connection proves — operator-only, like `plan_approve`.
