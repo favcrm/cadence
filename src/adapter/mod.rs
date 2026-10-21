@@ -78,7 +78,8 @@ fn cap_provider_log(path: &std::path::Path, max: u64) -> crate::error::Result<()
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(len - max))?;
     let mut tail = Vec::with_capacity(max as usize);
-    file.read_to_end(&mut tail)?;
+    // Byte-bounded even if another process appends between metadata and read.
+    file.take(max).read_to_end(&mut tail)?;
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .truncate(true)

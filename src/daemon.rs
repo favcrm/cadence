@@ -2844,9 +2844,11 @@ impl Shared {
                         );
                     }
                     self.open_attach.lock().unwrap().remove(&alias);
+                    // The lifecycle lock is still held: a re-registration
+                    // under this alias cannot have opened a replacement log.
+                    self.remove_provider_log(&alias);
                     notify
                 };
-                self.remove_provider_log(&alias);
                 // A forced finish routed notices: wake their actors.
                 for target in &notify {
                     self.notify_agent(target);
