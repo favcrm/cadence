@@ -420,3 +420,6 @@ fn read_fixture(root: &Path, name: &str, owner: u32) -> Result<Option<Deployment
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cad1689_acceptance;
