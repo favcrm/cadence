@@ -345,9 +345,10 @@ export default function AppShell({
     ) => {
       const [path, search] = href.split("?");
       const q = new URLSearchParams(search ?? "");
-      // Single-context mode: the URL never carries a context. Every internal
-      // navigation strips any `ctx`; nothing in the shell ever adds one.
-      q.delete("ctx");
+      // Single-context mode: the URL never carries a context selector for
+      // new work. A conversation link keeps its `ctx` claim only so the
+      // conversation gate can verify or refuse it; the scope itself is
+      // resolved independently of the URL.
       if (patch.appview !== undefined) {
         if (patch.appview === null || patch.appview === "list") q.delete("appview");
         else q.set("appview", patch.appview);
@@ -363,6 +364,7 @@ export default function AppShell({
         if (patch.conversation === null) q.delete("conversation");
         else q.set("conversation", patch.conversation);
       }
+      if (!q.has("conversation")) q.delete("ctx");
       if (patch.screenRoute) {
         const { patch: route, navigation } = patch.screenRoute;
         // Closed app-local selectors only. Native scope, session, conversation
@@ -606,7 +608,6 @@ export default function AppShell({
       }
     }
     const staleCtx = urlCtx !== null && !activeIds.includes(urlCtx);
-    const hasConversationLink = query.getAll("conversation").length > 0;
     // Single-company mode: with exactly one active context a scopeless
     // record link is unambiguous, so it resolves to that context.
     const soleContext = urlCtx === null && urlRecord !== null && !badRecord && activeIds.length === 1;
@@ -638,16 +639,11 @@ export default function AppShell({
     } else {
       adoptScope(fallbackContext());
     }
-    // One normalized write emits every strip at once. Marking the
-    // pre-write URL handled (done above) plus this write's own
-    // handled mark leaves the surviving ctx adoptable on the next
-    // pass — but adoption already ran on it above, so no second
-    // effect turn is needed and the URL settles in a single replace.
-    // A conversation link whose context is no longer active keeps its
-    // `ctx` so the conversation gate can refuse it visibly. Stripping it
-    // here would turn the rejected link into an unscoped request.
+    // One normalized write emits every strip at once. A conversation link
+    // keeps its `ctx` claim (writeQuery preserves it while a conversation
+    // param exists) so the gate can verify or refuse it; everything else
+    // loses its selector here.
     if (badRecord || staleCtx || scopelessRecord || soleContext) {
-      if (staleCtx && hasConversationLink) return;
       writeQuery(
         {
           record: badRecord || staleCtx || scopelessRecord ? null : undefined,
