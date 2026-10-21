@@ -32,6 +32,10 @@ pub(super) struct Options {
     pub preflight: bool,
     pub replace: Replace,
     pub activate: Activation,
+    /// Offline activation (AOS-339): restore into a new dir and activate, or
+    /// plan it. Never touches a live controller.
+    pub activate_disabled: bool,
+    pub activate_preflight: bool,
     /// Remote-only (`--org`) flags; every local form refuses them.
     pub request_id: Option<String>,
     pub status: Option<String>,
@@ -61,12 +65,36 @@ fn check_flags(o: &Options) -> Result<()> {
         if o.preflight
             || o.replace.enabled
             || o.activate.enabled
+            || o.activate_disabled
+            || o.activate_preflight
             || controller
             || digests
             || reconciliation
         {
             return Err(Error::usage(
-                "--preflight, --replace, --activate, --controller-state, --expected-* and --reconciliation need --portable",
+                "--preflight, --replace, --activate, --activate-disabled, --activate-preflight, --controller-state, --expected-* and --reconciliation need --portable",
+            ));
+        }
+        return Ok(());
+    }
+    if o.activate_disabled || o.activate_preflight {
+        // Offline activation never reaches a controller.
+        if o.preflight || o.replace.enabled || o.activate.enabled {
+            return Err(Error::usage(
+                "choose one of --preflight, --replace, --activate, --activate-disabled or --activate-preflight",
+            ));
+        }
+        if o.force || !o.repos.is_empty() {
+            return Err(Error::usage("--portable does not take --repo or --force"));
+        }
+        if controller || digests {
+            return Err(Error::usage(
+                "--activate-disabled and --activate-preflight run offline; they take no --controller-state or --expected-* digests",
+            ));
+        }
+        if o.activate_preflight && reconciliation {
+            return Err(Error::usage(
+                "--activate-preflight takes no --reconciliation; read the required list from its output",
             ));
         }
         return Ok(());
@@ -113,7 +141,9 @@ fn check_flags(o: &Options) -> Result<()> {
         ));
     }
     if reconciliation && !o.activate.enabled {
-        return Err(Error::usage("--reconciliation applies only to --activate"));
+        return Err(Error::usage(
+            "--reconciliation applies only to --activate or --activate-disabled",
+        ));
     }
     Ok(())
 }
@@ -129,6 +159,8 @@ pub(super) fn run(opts: Options) -> Result<i32> {
         preflight,
         replace,
         activate,
+        activate_disabled,
+        activate_preflight,
         request_id: _,
         status: _,
         rollback: _,
@@ -138,6 +170,37 @@ pub(super) fn run(opts: Options) -> Result<i32> {
     if !portable {
         let opts = cadence_agent::backup::RestoreOptions { force, repos };
         print_json(&cadence_agent::backup::restore(&source, &state_dir, &opts)?);
+        return Ok(0);
+    }
+    if activate_preflight {
+        // Read-only plan: the package digest and the exact list of non-terminal
+        // rows the caller must name. Nothing is written anywhere.
+        print_json(&cadence_agent::backup::portable::activate_preflight(
+            &source,
+        )?);
+        return Ok(0);
+    }
+    if activate_disabled {
+        // Offline restore + activation, manual mode, execution disabled. The
+        // destination must not exist; the activation runs on the private stage
+        // before publish, so a refusal leaves nothing behind.
+        let reconciliation = match activate.reconciliation {
+            Some(path) => {
+                let text = std::fs::read_to_string(&path)?;
+                let value: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| Error::usage(format!("reconciliation file: {e}")))?;
+                cadence_agent::backup::portable_activate::parse_reconciliation(
+                    &value["reconciliation"],
+                )
+                .map_err(|e| Error::usage(format!("reconciliation file: {e}")))?
+            }
+            None => Vec::new(),
+        };
+        print_json(&cadence_agent::backup::portable::restore_activate_disabled(
+            &source,
+            &state_dir,
+            &reconciliation,
+        )?);
         return Ok(0);
     }
     if preflight && activate.enabled {

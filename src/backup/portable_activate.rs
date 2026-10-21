@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use super::portable::{verify_package_for_replace, INACTIVE_MARKER};
 use super::portable_fence::{FENCE_FILE, FORMAT, MODE_DISABLED};
 use super::portable_replace::{
-    boundaries, lock_target, package_digest, replace_marker, snapshot_target,
+    boundaries, lock_target, package_digest, replace_marker, snapshot_target, TargetSnapshot,
 };
 use crate::error::{Error, Result};
 
@@ -163,10 +163,27 @@ pub fn activate(source: &Path, req: &ActivateRequest) -> Result<Value> {
             "destination digest or generation does not match the request; a stale or replayed request is refused; nothing was written",
         ));
     }
-    // The supplied plan must equal the live required inventory under the
-    // target lock, before any receipt or marker write.
-    match_plan(&required_inventory(&target)?, &req.reconciliation)?;
-    let marker = read_marker(&target)?;
+    activate_in_place(
+        &target,
+        &before,
+        &req.expected_package_digest,
+        &req.reconciliation,
+    )
+}
+
+/// AOS-339/CAD-1705: the activation itself, on a managed `committed_inactive`
+/// root whose caller holds whatever authority the situation requires. The live
+/// RPC passes a destination the operator named; the offline restore passes the
+/// private stage it just built and has not published yet. The supplied plan
+/// must equal the live required inventory before any receipt or marker write.
+pub(crate) fn activate_in_place(
+    target: &Path,
+    before: &TargetSnapshot,
+    expected_package_digest: &str,
+    reconciliation: &[Reconciliation],
+) -> Result<Value> {
+    match_plan(&required_inventory(target)?, reconciliation)?;
+    let marker = read_marker(target)?;
     // The marker's generation is the fresh, nonce-derived metadata written
     // by replacement. It is a different domain from the request's snapshot
     // generation (sha256 of the inventory digest), so it is checked for
@@ -185,9 +202,9 @@ pub fn activate(source: &Path, req: &ActivateRequest) -> Result<Value> {
             "an execution-mode receipt already exists; nothing was written",
         ));
     }
-    let generation = fresh_generation(&before.generation, &req.expected_package_digest);
+    let generation = fresh_generation(&before.generation, expected_package_digest);
     // 1. Receipt first, fsynced, atomically renamed into place.
-    write_receipt(&target, &generation)?;
+    write_receipt(target, &generation)?;
     // 2. Only then the activated marker. Same generation as the receipt.
     let activated = json!({
         "state": ACTIVATED,
@@ -196,19 +213,19 @@ pub fn activate(source: &Path, req: &ActivateRequest) -> Result<Value> {
         "replaces_generation": before.generation,
         "execution_mode": MODE_DISABLED,
         "bindings": [],
-        "reconciliation": req.reconciliation.iter().map(|r| json!({
+        "reconciliation": reconciliation.iter().map(|r| json!({
             "kind": r.kind, "id": r.id, "status": r.status, "action": "retain_inert"
         })).collect::<Vec<_>>(),
         "actors_enabled": false,
         "activation": "manual, execution disabled",
     });
-    replace_marker(&target, &activated)?;
+    replace_marker(target, &activated)?;
     Ok(json!({
         "activated": true,
         "state": ACTIVATED,
         "execution_mode": MODE_DISABLED,
         "bindings": 0,
-        "reconciliation_retained": req.reconciliation.len(),
+        "reconciliation_retained": reconciliation.len(),
         "generation": generation,
         "replaces_generation": before.generation,
         "destination": target,

@@ -2409,6 +2409,86 @@ pub fn restore_inactive(
     }))
 }
 
+/// AOS-339/CAD-1705: restore a package into a NEW directory and activate it,
+/// manual mode with execution disabled, in one step. The destination must not
+/// exist: this path can never activate, overwrite or touch an existing managed
+/// root or a live state dir, so the terminal-anchored operator gate on
+/// `portable_activate` keeps applying to every root that already exists. The
+/// activation runs on the private stage before the no-replace publish, so a
+/// refusal leaves nothing behind.
+pub fn restore_activate_disabled(
+    source: &Path,
+    destination: &Path,
+    reconciliation: &[crate::backup::portable_activate::Reconciliation],
+) -> Result<Value> {
+    let manifest = verify_package(source)?;
+    let digest = crate::backup::portable_replace::package_digest(source)?;
+    refuse_existing_activation(destination)?;
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !parent.is_dir() {
+        return Err(Error::rejected(
+            "destination parent directory does not exist",
+        ));
+    }
+    let stage = parent.join(format!(".portable-stage-{}", nonce()));
+    fs::DirBuilder::new().mode(0o700).create(&stage)?;
+    let outcome = (|| {
+        stage_and_validate(source, &stage, &manifest)?;
+        let before = crate::backup::portable_replace::snapshot_target_dir(&stage)?;
+        let mut report = crate::backup::portable_activate::activate_in_place(
+            &stage,
+            &before,
+            &digest,
+            reconciliation,
+        )?;
+        publish_stage(&stage, destination)?;
+        if let Some(obj) = report.as_object_mut() {
+            obj.insert("restored".into(), json!(true));
+            obj.insert("destination".into(), json!(destination));
+            obj.insert("package_digest".into(), json!(digest));
+        }
+        Ok(report)
+    })();
+    if outcome.is_err() {
+        let _ = fs::remove_dir_all(&stage);
+    }
+    outcome
+}
+
+/// AOS-339/CAD-1705: the read-only activation plan for a package. Reads the
+/// package's own store and writes nothing persistent.
+pub fn activate_preflight(source: &Path) -> Result<Value> {
+    verify_package(source)?;
+    let digest = crate::backup::portable_replace::package_digest(source)?;
+    let required = crate::backup::portable_activate::required_inventory(source)?;
+    Ok(json!({
+        "package_digest": digest,
+        "execution_mode": "disabled",
+        "bindings": [],
+        "required_reconciliation": required.iter().map(|r| json!({
+            "kind": r.kind, "id": r.id, "status": r.status, "action": "retain_inert"
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// A destination that exists at all is refused here, unlike `restore_inactive`,
+/// which accepts an empty directory.
+fn refuse_existing_activation(destination: &Path) -> Result<()> {
+    match destination.symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::rejected(format!(
+            "cannot inspect {}: {error}",
+            destination.display()
+        ))),
+        Ok(_) => Err(Error::rejected(
+            "destination exists; an offline activation restores into a new directory only",
+        )),
+    }
+}
+
 fn nonce() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }

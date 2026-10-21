@@ -306,10 +306,22 @@ pub(crate) enum Commands {
         /// Local only — refused on a remote org.
         #[arg(long, requires = "portable", conflicts_with = "replace")]
         activate: bool,
-        /// With `--activate`: JSON reconciliation file. Its `reconciliation`
-        /// array lists every non-terminal row as retained inert; the file
-        /// must name each one. Omitted means an empty list.
-        #[arg(long, requires = "activate")]
+        /// With `--portable`: restore the package into a NEW `--state-dir` and
+        /// activate it in one step, manual mode with execution disabled
+        /// (AOS-339). The destination must not exist, so this can only create a
+        /// fenced root and never changes an existing one. No controller and no
+        /// operator connection; imported actors stay disabled.
+        #[arg(long, requires = "portable")]
+        activate_disabled: bool,
+        /// With `--portable`: read-only activation plan for the package. Prints
+        /// the package digest and the exact required reconciliation list and
+        /// writes nothing.
+        #[arg(long, requires = "portable")]
+        activate_preflight: bool,
+        /// With `--activate` or `--activate-disabled`: JSON reconciliation file.
+        /// Its `reconciliation` array lists every non-terminal row as retained
+        /// inert; the file must name each one. Omitted means an empty list.
+        #[arg(long, requires = "portable")]
         reconciliation: Option<PathBuf>,
         /// Remote `--portable` only: the caller-minted stable idempotency id
         /// the migration operation is bound to. Mandatory for import,
