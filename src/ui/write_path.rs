@@ -875,17 +875,32 @@ fn agent_settings_error(err: Error) -> HttpResp {
     settings_rpc_error(err)
 }
 
-pub(crate) fn agent_settings_post(request: &mut Request, state_dir: &Path, path: &str) -> HttpResp {
+/// The daemon method one settings subpath relays. The path is parsed by the
+/// endpoint table; this is the only place the four operations are named.
+fn agent_settings_rpc(op: Option<&str>) -> &'static str {
+    match op {
+        Some("catalog") => "agent_settings_catalog",
+        Some("sync") => "agent_settings_sync",
+        Some("preview") => "agent_settings_preview",
+        _ => "agent_settings_set",
+    }
+}
+
+pub(crate) fn agent_settings_post(
+    request: &mut Request,
+    state_dir: &Path,
+    op: Option<&'static str>,
+) -> HttpResp {
     let body = match agent_settings_body(request) {
         Ok(body) => body,
         Err(resp) => return resp,
     };
-    let (method, params) = if path.ends_with("/catalog") {
+    let (method, params) = if op == Some("catalog") {
         (
             "agent_settings_catalog",
             json!({"provider": body.get("provider").cloned().unwrap_or(Value::Null)}),
         )
-    } else if path.ends_with("/sync") {
+    } else if op == Some("sync") {
         (
             "agent_settings_sync",
             json!({
@@ -893,7 +908,7 @@ pub(crate) fn agent_settings_post(request: &mut Request, state_dir: &Path, path:
                 "profile": body.get("profile").cloned().unwrap_or(Value::Null),
             }),
         )
-    } else if path.ends_with("/preview") {
+    } else if op == Some("preview") {
         (
             "agent_settings_preview",
             json!({
@@ -904,7 +919,7 @@ pub(crate) fn agent_settings_post(request: &mut Request, state_dir: &Path, path:
         )
     } else {
         (
-            "agent_settings_set",
+            agent_settings_rpc(op),
             json!({
                 "expected_revision": body.get("expected_revision").cloned().unwrap_or(Value::Null),
                 "config": body.get("config").cloned().unwrap_or(Value::Null),
@@ -1131,6 +1146,24 @@ pub(crate) fn write_route(
                 bound.get("id").unwrap_or_default(),
                 bound.get("tag").unwrap_or_default(),
             ),
+            RouteId::UpdateStart => updates::start(state_dir, opts),
+            RouteId::UpdateCheck => updates::check_now(state_dir),
+            RouteId::SettingsAgents => agent_settings_post(&mut request, state_dir, None),
+            RouteId::SettingsAgentsCatalog => {
+                agent_settings_post(&mut request, state_dir, Some("catalog"))
+            }
+            RouteId::SettingsAgentsSync => {
+                agent_settings_post(&mut request, state_dir, Some("sync"))
+            }
+            RouteId::SettingsAgentsPreview => {
+                agent_settings_post(&mut request, state_dir, Some("preview"))
+            }
+            RouteId::ModelDefaults => model_defaults_post(&mut request, state_dir),
+            RouteId::Locale => super::locale::post(&mut request, state_dir, opts),
+            RouteId::Reports => match caller.as_ref() {
+                Some(caller) => post_report(&mut request, state_dir, pm_dir, caller.actor()),
+                None => err_response(500, "unadmitted write"),
+            },
             RouteId::CatalogInstall => explorer_write(
                 &mut request,
                 state_dir,
@@ -1226,69 +1259,6 @@ pub(crate) fn write_route(
             return;
         }
     };
-    // CAD-561: the operator's Update button — the same pipeline the CLI
-    // runs, in this process; the card polls `GET /api/update`.
-    if path == "/api/update" || path == "/api/update/check" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let resp = if path == "/api/update" {
-            updates::start(state_dir, opts)
-        } else {
-            updates::check_now(state_dir)
-        };
-        send(request, resp);
-        return;
-    }
-    if path == "/api/settings/agents"
-        || path == "/api/settings/agents/catalog"
-        || path == "/api/settings/agents/sync"
-        || path == "/api/settings/agents/preview"
-    {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let resp = agent_settings_post(&mut request, state_dir, path);
-        send(request, resp);
-        return;
-    }
-    if path == "/api/settings/model-defaults" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let resp = model_defaults_post(&mut request, state_dir);
-        send(request, resp);
-        return;
-    }
-    if path == "/api/locale" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let resp = super::locale::post(&mut request, state_dir, opts);
-        send(request, resp);
-        return;
-    }
-    // CAD-140: filing a report or idea — the same `report::file` path
-    // `cadence report` uses (scrubbing, context, intake shape, PM
-    // heads-up), never a bare issue create. Admitted above, like every
-    // write; the actor below is the admitted caller, never a field.
-    if path == "/api/reports" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let Some(caller) = &caller else {
-            send(request, err_response(500, "unadmitted write"));
-            return;
-        };
-        let resp = post_report(&mut request, state_dir, pm_dir, caller.actor());
-        send(request, resp);
-        return;
-    }
     // Monitor acknowledgement: this is a daemon-owned durable write, kept
     // beside (and behind the same browser write guards as) tracker writes.
     // The UI never mutates the monitor SQLite store directly, which keeps a
@@ -2346,6 +2316,20 @@ mod busy_tests {
         let mut body = String::new();
         resp.into_reader().read_to_string(&mut body).unwrap();
         assert!(body.contains("\"code\": \"resource_busy\""), "{body}");
+    }
+
+    #[test]
+    fn every_settings_subpath_relays_its_own_method() {
+        assert_eq!(agent_settings_rpc(None), "agent_settings_set");
+        assert_eq!(
+            agent_settings_rpc(Some("catalog")),
+            "agent_settings_catalog"
+        );
+        assert_eq!(agent_settings_rpc(Some("sync")), "agent_settings_sync");
+        assert_eq!(
+            agent_settings_rpc(Some("preview")),
+            "agent_settings_preview"
+        );
     }
 
     #[test]

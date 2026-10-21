@@ -41,6 +41,15 @@ pub(super) enum RouteId {
     ExplorerRemove,
     ExplorerRestore,
     Mount,
+    UpdateStart,
+    UpdateCheck,
+    SettingsAgents,
+    SettingsAgentsCatalog,
+    SettingsAgentsSync,
+    SettingsAgentsPreview,
+    ModelDefaults,
+    Locale,
+    Reports,
     CatalogInstall,
     CatalogGitCheck,
     CatalogRequest,
@@ -242,6 +251,35 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
         ScreenRead,
         MOUNT_BINDINGS
     ),
+    row!(UpdateStart, "/api/update", OperatorOnly, &[]),
+    row!(UpdateCheck, "/api/update/check", OperatorOnly, &[]),
+    row!(SettingsAgents, "/api/settings/agents", OperatorOnly, &[]),
+    row!(
+        SettingsAgentsCatalog,
+        "/api/settings/agents/catalog",
+        OperatorOnly,
+        &[]
+    ),
+    row!(
+        SettingsAgentsSync,
+        "/api/settings/agents/sync",
+        OperatorOnly,
+        &[]
+    ),
+    row!(
+        SettingsAgentsPreview,
+        "/api/settings/agents/preview",
+        OperatorOnly,
+        &[]
+    ),
+    row!(
+        ModelDefaults,
+        "/api/settings/model-defaults",
+        OperatorOnly,
+        &[]
+    ),
+    row!(Locale, "/api/locale", CallerScoped, &[]),
+    row!(Reports, "/api/reports", AgentAllowed, &[]),
     row!(
         CatalogInstall,
         "/api/app-catalog/install",
