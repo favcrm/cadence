@@ -476,18 +476,19 @@ export default function AppShell({
         ? created
         : null;
     setGeneralSetup({ key: setupScopeKey, error: null });
-    const freshRequestId = () => `general-${installId}-${crypto.randomUUID()}`;
+    const recoveryRequestId = () => `general-${installId}-replay`;
     const createGeneral = async () => {
       try {
         const row = activeRow(await create(`general-${installId}`));
         if (row !== null) return row;
       } catch (error) {
         // The store rejects a replayed request id whose context was
-        // archived, rather than returning the archived row. Converge with
-        // a fresh identity instead of failing this install forever.
-        if (!/archived/i.test(String((error as Error)?.message ?? error))) throw error;
+        // archived. The HTTP boundary reports that as a generic conflict,
+        // so recover once under a deterministic id: stable across tabs, so
+        // concurrent recoveries still converge on one context.
+        if (!(error instanceof ApiError && error.status === 409)) throw error;
       }
-      return activeRow(await create(freshRequestId()));
+      return activeRow(await create(recoveryRequestId()));
     };
     createGeneral()
       .then((row) => {
