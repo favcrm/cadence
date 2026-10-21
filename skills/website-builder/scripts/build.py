@@ -19,7 +19,11 @@ from urllib.parse import urlsplit
 
 from common import MANIFEST, ORDER, load, refuse, run, emit
 
-EXTENSIONS = {".html", ".css", ".js", ".svg", ".png"}
+EXTENSIONS = {
+    ".html", ".css", ".js", ".mjs", ".svg", ".png",
+    ".jpg", ".jpeg", ".webp", ".avif", ".ico",
+    ".woff", ".woff2", ".ttf", ".otf",
+}
 ATTR = re.compile(r"""\b(href|src|content)\s*=\s*(["'])(.*?)\2""", re.IGNORECASE | re.DOTALL)
 
 
