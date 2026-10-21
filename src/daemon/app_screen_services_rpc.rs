@@ -345,7 +345,7 @@ args!(WorksRequestReviewArgs {
     id: String,
     revision: i64
 });
-args!(WorksReviewArgs { id: String, revision: i64, decision: String, note: Option<String> });
+args!(WorksReviewArgs { id: String, revision: i64, decision: Option<String>, note: Option<String> });
 args!(WorksExportArgs { id: String, revision: i64, format: Option<String> });
 
 fn typed<T: for<'de> Deserialize<'de> + Serialize>(value: &Value) -> Result<Value> {
