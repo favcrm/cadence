@@ -540,6 +540,11 @@ pub(crate) fn check_seat(
             agent["error"].as_str().unwrap_or("attention")
         )));
     }
+    if agent["enabled"].as_bool() == Some(false) {
+        return Err(Error::rejected(format!(
+            "Worker '{alias}' is disabled — resume it before dispatching"
+        )));
+    }
     // CAD-202: the lane's pane must still be inside this project.
     let cwd_override = check_lane_cwd(project, alias, &agent, force)?;
     let provider = agent["provider"].as_str().unwrap_or_default().to_string();

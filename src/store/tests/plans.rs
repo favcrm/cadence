@@ -49,6 +49,8 @@
         )
         .unwrap();
         s.dispatch_task("t8", None, None, "test").unwrap();
+        let error = s.inbox_drain("sb", 0).unwrap_err().to_string();
+        assert!(error.contains("inbox agents"), "{error}");
         let error = s.cancel_task("t8", "test").unwrap_err().to_string();
         assert!(error.contains("active cloud dispatch"), "{error}");
         let error = s.fail_task("t8", "no", "test").unwrap_err().to_string();
@@ -60,6 +62,12 @@
             .unwrap_err()
             .to_string();
         assert!(error.contains("active cloud dispatch"), "{error}");
+
+        s.set_enabled("sb", false).unwrap();
+        s.create_task("j1", "t10", None, Some("sb"), None, None, None, None, None)
+            .unwrap();
+        let error = s.dispatch_task("t10", None, None, "test").unwrap_err().to_string();
+        assert!(error.contains("disabled"), "{error}");
     }
 
     #[test]

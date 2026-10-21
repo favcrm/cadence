@@ -1034,14 +1034,18 @@ pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
     // actor and keep their pseudo-endpoint across restarts.
     for agent in shared.store.agents()? {
         if !agent.enabled {
-            // A disabled sandbox may still own a durable stop request
-            // from before the restart; recover it to stop the remote.
+            // A disabled sandbox must not start new cloud work, but any
+            // claimable delivery left over from before the stop is settled
+            // (replay-and-stop when a create was attempted, interrupt when
+            // it was not). The stop request is durable before the spawn.
             if agent.provider == "sandbox" && agent.endpoint_kind == "sandbox" {
                 for message in shared.store.messages(&agent.alias)? {
                     if !matches!(message.state.as_str(), "queued" | "unknown")
                         || message.source != "job_dispatch"
-                        || !shared.store.cloud_stop_requested(&message.id)?
                     {
+                        continue;
+                    }
+                    if shared.store.request_cloud_stop(&message.id).is_err() {
                         continue;
                     }
                     let Some(task_id) = message.task_id.clone() else {

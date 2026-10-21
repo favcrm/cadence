@@ -437,6 +437,12 @@ impl Shared {
             .transpose()?;
         if let Some(target) = &target {
             crate::adapter::pi::refuse_confined_devin_agent(target)?;
+            if !target.enabled {
+                return Err(Error::rejected(format!(
+                    "Agent '{}' is disabled — resume it before dispatching",
+                    target.alias
+                )));
+            }
         }
         let cloud_dispatch = target
             .as_ref()

@@ -15,6 +15,13 @@ impl Store {
     /// (drain, peek, ack) shares this refusal for process endpoints.
     fn inbox_agent_in(&self, conn: &impl super::StoreConn, alias: &str) -> Result<Agent> {
         let agent = self.agent_in(conn, alias)?;
+        if agent.provider != "inbox" || agent.endpoint_kind != "inbox" {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is endpoint kind '{}' — `cadence inbox` only \
+                 reads inbox agents",
+                agent.endpoint_kind
+            )));
+        }
         if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
             return Err(Error::rejected(format!(
                 "Agent '{alias}' is endpoint kind '{}' — `cadence inbox` only \

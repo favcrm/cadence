@@ -690,6 +690,11 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             // `issue_kickoff` may mint the worker after start; only an
             // already-registered sandbox owner is refused here.
             match client::rpc(state_dir, "agent_show", json!({"alias": owner})) {
+                Ok(show) if show["agent"]["enabled"].as_bool() == Some(false) => {
+                    return Err(Error::rejected(format!(
+                        "Agent '{owner}' is disabled — resume it before starting work"
+                    )));
+                }
                 Ok(show) if show["agent"]["endpoint_kind"].as_str() == Some("sandbox") => {
                     return Err(Error::rejected(format!(
                         "Cloud sandbox agent '{owner}' runs only `--job` dispatches — \
@@ -717,6 +722,11 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             ..
         }) => {
             let show = client::rpc(state_dir, "agent_show", json!({"alias": assignee}))?;
+            if show["agent"]["enabled"].as_bool() == Some(false) {
+                return Err(Error::rejected(format!(
+                    "Agent '{assignee}' is disabled — resume it before starting work"
+                )));
+            }
             cloud = show["agent"]["endpoint_kind"].as_str() == Some("sandbox");
             crate::issue::dispatch::check_lane_cwd(&project, assignee, &show["agent"], *force)?
         }
