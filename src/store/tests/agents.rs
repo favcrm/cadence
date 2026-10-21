@@ -121,6 +121,7 @@
             generation: None,
             state: "idle".into(),
             enabled: true,
+            gc_keep: false,
             error: None,
             created: now(),
             updated: now(),

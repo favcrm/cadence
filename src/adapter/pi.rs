@@ -3563,6 +3563,7 @@ mod cad1553_company_authority_acceptance {
             generation: None,
             state: "starting".into(),
             enabled: true,
+            gc_keep: false,
             error: None,
             created: 0.0,
             updated: 0.0,

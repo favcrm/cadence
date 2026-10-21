@@ -373,6 +373,10 @@ pub(crate) enum AgentAction {
     /// `agent set <alias> auto_ready=verified` opts a live agent into
     /// daemon-verified readiness.
     ///
+    /// `agent set <alias> gc_keep=true` sets the explicit agent-gc keep:
+    /// every gc path skips it, including a stopped row past the age
+    /// window. `gc_keep=false` (or a bare `gc_keep`) clears it.
+    ///
     /// `agent set <alias> auto_stop=off` opts an agent out of the
     /// daemon's idle auto-stop (default ON: an agent with nothing queued,
     /// running, awaiting a report or unknown for 60 minutes is stopped,
@@ -439,18 +443,24 @@ pub(crate) enum AgentAction {
     /// so no orphan outlives its row. A removed agent can no longer be
     /// resumed.
     ///
-    /// The daemon runs the same sweep on a timer ONLY when pm.yaml sets
-    /// `[host] agent_gc_older_than_secs` (off by default; 7-day floor; at
-    /// most hourly). The timer additionally keeps enabled agents, pty
-    /// agents whose pane is up, and any agent with a queued, running or
-    /// unknown message, and records `agent_gc_removed` per row on the
-    /// daemon event stream. The timer kills nothing: it frees no memory
-    /// and no disk. `cadence daemon status` shows the setting.
+    /// Both this command and the daemon timer use the same eligibility
+    /// rule: enabled agents, agents with `gc_keep`, and agents with a
+    /// queued, running or unknown message are kept. The timer
+    /// additionally skips a pty agent whose pane is still up. The timer
+    /// runs ONLY when pm.yaml sets `[host] agent_gc_older_than_secs`
+    /// (off by default; 7-day floor; at most hourly) and records
+    /// `agent_gc_removed` per row on the daemon event stream. The timer
+    /// kills nothing: it frees no memory and no disk. `cadence daemon
+    /// status` shows the setting.
     Gc {
         /// Only remove agents last updated more than this long ago
-        /// (e.g. 30m, 12h, 7d; bare number = seconds).
+        /// (e.g. 30m, 12h, 7d; bare number = seconds). Below the 7-day
+        /// floor requires --force, like the timer's floor.
         #[arg(long)]
         older_than: Option<String>,
+        /// Sweep rows younger than the 7-day floor (explicit override).
+        #[arg(long)]
+        force: bool,
     },
     /// Bind this machine's local actor to the selected hosted org and
     /// claim queued work. Local execution by definition; `--org` names
@@ -820,9 +830,14 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
                                "message": format!("bootstrap-{alias}")}));
             return Ok(0);
         }
-        AgentAction::Gc { older_than } => {
+        AgentAction::Gc { older_than, force } => {
             let secs = older_than.as_deref().map(parse_duration).transpose()?;
-            client::rpc(&state_dir, "agent_gc", json!({"older_than": secs}))?
+            require_gc_floor(secs, force)?;
+            client::rpc(
+                &state_dir,
+                "agent_gc",
+                json!({"older_than": secs, "force": force}),
+            )?
         }
         // Routed before this function by the caller; refused here so a
         // future routing bypass cannot claim locally.
@@ -838,4 +853,33 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
     };
     print_json(&result);
     Ok(0)
+}
+
+/// CAD-804: the manual sweep honours the same 7-day floor as the timer.
+/// A shorter window is refused unless the caller explicitly overrides it;
+/// a mistyped `--older-than 1h` is otherwise unrecoverable.
+fn require_gc_floor(secs: Option<f64>, force: bool) -> Result<()> {
+    if let Some(secs) = secs {
+        if secs < cadence_agent::daemon::AGENT_GC_FLOOR_SECS as f64 && !force {
+            return Err(Error::rejected(format!(
+                "agent gc --older-than {secs}s is below the 7-day floor ({}s) — \
+                 pass --force to sweep younger rows",
+                cadence_agent::daemon::AGENT_GC_FLOOR_SECS
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod gc_floor_tests {
+    use super::*;
+
+    #[test]
+    fn below_the_floor_requires_force() {
+        assert!(require_gc_floor(Some(3600.0), false).is_err());
+        assert!(require_gc_floor(Some(3600.0), true).is_ok());
+        assert!(require_gc_floor(Some(7.0 * 86_400.0), false).is_ok());
+        assert!(require_gc_floor(None, false).is_ok());
+    }
 }

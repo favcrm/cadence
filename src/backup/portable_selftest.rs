@@ -140,6 +140,7 @@ const CAD1441_HISTORICAL_DEFS: &[&str] = &[
     "pid INTEGER",
     "state TEXT NOT NULL",
     "enabled INTEGER NOT NULL DEFAULT 1",
+    "gc_keep INTEGER NOT NULL DEFAULT 0",
     "error TEXT",
     "created REAL NOT NULL",
     "updated REAL NOT NULL",
@@ -168,6 +169,7 @@ const CAD1441_HISTORICAL_NAMES: &[&str] = &[
     "pid",
     "state",
     "enabled",
+    "gc_keep",
     "error",
     "created",
     "updated",
@@ -298,7 +300,11 @@ fn cad1441_known_catalog_accepts_historical_order_and_refuses_unknown_or_missing
         .filter(|d| !d.starts_with("uid "))
         .collect();
     let state = cad1441_fixture(&root, "missing", &defs);
-    assert_eq!(cad1441_names(&db_file(&state)).len(), 24, "uid omitted");
+    assert_eq!(
+        cad1441_names(&db_file(&state)).len(),
+        CAD1441_HISTORICAL_NAMES.len() - 1,
+        "uid omitted"
+    );
     let missing = root.join("package-missing");
     let err = export_portable(&state, &missing, &opts)
         .expect_err("an omitted known agents column must refuse the export");

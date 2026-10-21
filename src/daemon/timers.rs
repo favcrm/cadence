@@ -6,6 +6,22 @@ use super::*;
 /// automatic sweep never reaches an agent idle for less than a week.
 pub const AGENT_GC_FLOOR_SECS: u64 = 7 * 86_400;
 
+/// CAD-804: the daemon-side floor both `agent gc` and `agent_gc_plan`
+/// enforce. The CLI checks it too, but a direct RPC must not bypass it;
+/// `force` is the explicit operator override (and what `session end`
+/// sends for its own 1h cleanup).
+pub(super) fn require_agent_gc_floor(older_than: Option<f64>, force: bool) -> Result<()> {
+    if let Some(secs) = older_than {
+        if secs < AGENT_GC_FLOOR_SECS as f64 && !force {
+            return Err(Error::rejected(format!(
+                "agent gc --older-than {secs}s is below the 7-day floor \
+                 ({AGENT_GC_FLOOR_SECS}s) — pass --force to sweep younger rows"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The timer sweeps at most this often.
 pub(super) const AGENT_GC_EVERY: Duration = Duration::from_secs(3600);
 
@@ -383,6 +399,7 @@ pub(super) const AUTO_STOP_PASSIVE_KINDS: &[&str] = &[
     AUTO_RESUME_FAILED_EVENT,
     "stop_requested",
     "params_updated",
+    "gc_keep_updated",
     "quota_updated",
     "quota_update_ignored",
     "inbox_unconsumed",

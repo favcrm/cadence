@@ -2134,12 +2134,15 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
         // without the plan RPC falls back to the listing.
         match client::rpc(
             &opts.state_dir,
+            // Session end's 1h cleanup is an explicit override of the
+            // manual 7-day floor, like `agent gc --force`; the daemon
+            // refuses a below-floor request without it.
             "agent_gc_plan",
-            json!({"older_than": 3600}),
+            json!({"older_than": 3600, "force": true}),
         ) {
             Ok(plan) => {
-                let cands = str_list(&plan["candidates"]);
-                let refused = str_list(&plan["not_permitted"]);
+                let cands = plan_aliases(&plan["candidates"]);
+                let refused = plan_aliases(&plan["not_permitted"]);
                 gc_row = gc_not_permitted(
                     gc_row,
                     format!("would sweep {} dead agent(s)", cands.len()),
@@ -2163,7 +2166,11 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
             }
         }
     } else {
-        match client::rpc(&opts.state_dir, "agent_gc", json!({"older_than": 3600})) {
+        match client::rpc(
+            &opts.state_dir,
+            "agent_gc",
+            json!({"older_than": 3600, "force": true}),
+        ) {
             Ok(v) => {
                 done.gc_removed = str_list(&v["removed"]);
                 gc_row = gc_not_permitted(
@@ -2480,6 +2487,23 @@ fn handoff_md(
         md.push_str("- agents live — daemon left running\n");
     }
     md
+}
+
+/// A JSON array of plan rows (objects with `alias`, or bare strings from
+/// an older daemon) as aliases.
+fn plan_aliases(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| {
+                    x.get("alias")
+                        .and_then(Value::as_str)
+                        .or_else(|| x.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A JSON array of strings as a `Vec` (anything else is empty).

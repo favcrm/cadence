@@ -1029,7 +1029,8 @@ fn agent_remove_and_gc_parse() {
         cli.command,
         Commands::Agent {
             action: AgentAction::Gc {
-                older_than: Some(d)
+                older_than: Some(d),
+                force: false,
             }
         } if d == "2d"
     ));

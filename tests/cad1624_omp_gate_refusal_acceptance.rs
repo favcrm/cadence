@@ -135,6 +135,7 @@ fn omp_agent(cwd: &str, params: Option<Value>) -> Agent {
         generation: None,
         state: "stopped".into(),
         enabled: true,
+        gc_keep: false,
         error: None,
         created: 0.0,
         updated: 0.0,

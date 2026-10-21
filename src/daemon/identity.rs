@@ -794,6 +794,63 @@ impl Shared {
         Ok((permitted, not_permitted))
     }
 
+    /// CAD-804: the reviewable dry-run. Every dead row inside the age
+    /// window lands in exactly one bucket — `candidates` (the caller may
+    /// sweep it), `not_permitted` (eligible, but the caller rule keeps
+    /// it), or `kept` (the shared predicate keeps it: enabled, gc_keep
+    /// or open messages) — with the fields the decision used.
+    pub(super) fn gc_plan(
+        &self,
+        caller: &AgentCaller,
+        older_than: Option<f64>,
+    ) -> Result<(Vec<Value>, Vec<Value>, Vec<Value>)> {
+        let mut candidates = Vec::new();
+        let mut not_permitted = Vec::new();
+        let mut kept = Vec::new();
+        for row in self.store.gc_rows(older_than)? {
+            let mut detail = json!({
+                "alias": row.agent.alias,
+                "state": row.agent.state,
+                "age_secs": row.age_secs.floor(),
+                "enabled": row.agent.enabled,
+                "gc_keep": row.agent.gc_keep,
+                "open_messages": row.open_messages,
+            });
+            if row.eligible() {
+                let pm = self.effective_pm(&row.agent)?;
+                let allowed = crate::peer::may_mutate_agent(
+                    caller,
+                    &row.agent.alias,
+                    pm.as_deref(),
+                    AgentMutation::Controlled,
+                    "agent gc",
+                )
+                .is_ok();
+                if allowed {
+                    detail["reason"] = json!("eligible: no endpoint, disabled, no open messages");
+                    candidates.push(detail);
+                } else {
+                    detail["reason"] = json!("eligible, but not permitted for this caller");
+                    not_permitted.push(detail);
+                }
+            } else {
+                let mut why = Vec::new();
+                if row.agent.enabled {
+                    why.push("enabled");
+                }
+                if row.agent.gc_keep {
+                    why.push("gc_keep");
+                }
+                if row.open_messages > 0 {
+                    why.push("open messages");
+                }
+                detail["reason"] = json!(format!("kept: {}", why.join(", ")));
+                kept.push(detail);
+            }
+        }
+        Ok((candidates, not_permitted, kept))
+    }
+
     /// Operator authority for the approval-evidence verbs (CAD-217) and
     /// `model_defaults_set` (CAD-337): exactly the connection-bound rule
     /// `slot_reconcile` applies. A
