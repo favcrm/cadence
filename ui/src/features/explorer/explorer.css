@@ -55,7 +55,8 @@
     align-items: center;
   }
   .apps-home .attn-row .txt { min-width: 0; }
-  .apps-home .attn-row .btn {
+  .apps-home .attn-row .btn,
+  .apps-home .attn-row .hint {
     grid-column: 2;
     justify-self: start;
   }
