@@ -4,11 +4,11 @@
 //! No re-implemented guard: every case reaches `serve`'s dispatch and
 //! `my_work::get` / `get_issue`.
 
-#![cfg(all(test, feature = "test-seam"))]
+#![cfg(feature = "test-seam")]
 
-use crate::daemon::ServeOptions;
-use crate::issue::{write as issue_write, Pm};
-use crate::test_seam::Seam;
+use cadence_agent::daemon::ServeOptions;
+use cadence_agent::issue::{write as issue_write, Pm};
+use cadence_agent::test_seam::Seam;
 use serde_json::{json, Value};
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::{Duration, Instant};
@@ -48,8 +48,8 @@ fn http(
         .header("Origin", format!("http://{host}"));
     if let Some((who, token)) = seam {
         req = req
-            .header(crate::test_seam::AS_HEADER, who)
-            .header(crate::test_seam::TOKEN_HEADER, token);
+            .header(cadence_agent::test_seam::AS_HEADER, who)
+            .header(cadence_agent::test_seam::TOKEN_HEADER, token);
     }
     if let Some((token, key)) = session {
         req = req
@@ -121,7 +121,7 @@ fn cad1703_my_work_refuses_foreign_selectors_over_http() {
     let daemon_state = state.clone();
     let mut threads = Threads(stop.clone(), Vec::new());
     threads.1.push(std::thread::spawn(move || {
-        crate::daemon::serve_with(&daemon_state, opts).unwrap()
+        cadence_agent::daemon::serve_with(&daemon_state, opts).unwrap()
     }));
     let deadline = Instant::now() + Duration::from_secs(30);
     while !state.join("cadence.sock").exists() || Seam::token_at(&state).is_none() {
@@ -131,11 +131,11 @@ fn cad1703_my_work_refuses_foreign_selectors_over_http() {
     let seam = Seam::token_at(&state).unwrap();
 
     // Real operator session through the native link mint + open.
-    crate::operator_auth::ensure_secret(&state).unwrap();
-    let secret = crate::operator_auth::read_secret(&state).unwrap();
+    cadence_agent::operator_auth::ensure_secret(&state).unwrap();
+    let secret = cadence_agent::operator_auth::read_secret(&state).unwrap();
     let daemon = |method: &str, params: Value| {
-        crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
-            crate::client::rpc(&state, method, params)
+        cadence_agent::test_seam::scoped(cadence_agent::test_seam::Asserted::Operator, || {
+            cadence_agent::client::rpc(&state, method, params)
         })
         .unwrap_or_else(|e| panic!("{method}: {e}"))
     };
@@ -160,7 +160,7 @@ fn cad1703_my_work_refuses_foreign_selectors_over_http() {
         assert!(Instant::now() < startup_deadline, "board startup deadline");
         let candidate = 3110 + (first + offset) % 80;
         let (startup, ready) = std::sync::mpsc::channel();
-        let board = crate::ui::ServeOpts {
+        let board = cadence_agent::ui::ServeOpts {
             host: "127.0.0.1".into(),
             port: candidate,
             stop: Some(stop.clone()),
@@ -169,7 +169,7 @@ fn cad1703_my_work_refuses_foreign_selectors_over_http() {
             ..Default::default()
         };
         let (s, p) = (state.clone(), pm_dir.clone());
-        let thread = std::thread::spawn(move || drop(crate::ui::serve(&s, &p, &board)));
+        let thread = std::thread::spawn(move || drop(cadence_agent::ui::serve(&s, &p, &board)));
         let remaining = startup_deadline.saturating_duration_since(Instant::now());
         match ready.recv_timeout(remaining) {
             Ok(Ok(())) => {
