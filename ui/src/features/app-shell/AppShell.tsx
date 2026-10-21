@@ -476,13 +476,21 @@ export default function AppShell({
         ? created
         : null;
     setGeneralSetup({ key: setupScopeKey, error: null });
-    create(`general-${installId}`)
-      .then(async (created) => {
-        let row = activeRow(created);
-        // A replayed installation-stable request id can resolve to an
-        // archived context (the earlier setup was retired). Converge on a
-        // fresh active context instead of failing this install forever.
-        if (row === null) row = activeRow(await create(`general-${installId}-${crypto.randomUUID()}`));
+    const freshRequestId = () => `general-${installId}-${crypto.randomUUID()}`;
+    const createGeneral = async () => {
+      try {
+        const row = activeRow(await create(`general-${installId}`));
+        if (row !== null) return row;
+      } catch (error) {
+        // The store rejects a replayed request id whose context was
+        // archived, rather than returning the archived row. Converge with
+        // a fresh identity instead of failing this install forever.
+        if (!/archived/i.test(String((error as Error)?.message ?? error))) throw error;
+      }
+      return activeRow(await create(freshRequestId()));
+    };
+    createGeneral()
+      .then((row) => {
         if (!isCurrent()) return;
         if (row === null) {
           setGeneralSetup({ key: setupScopeKey, error: "App setup did not return an active context. Retry setup or ask an administrator to review this installation." });
