@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::adapter::pty;
 use crate::client;
 use crate::error::{Error, Result};
+use crate::issue::model::Front;
 use crate::issue::parse::AcceptanceItem;
 use crate::issue::{board, claim, parse, start, write, Pm};
 use crate::memory;
@@ -466,15 +467,23 @@ fn lane_head(worktree: &Path) -> Option<String> {
 ///
 /// Native automatic callers preserve their origin through the self-RPC so
 /// live authority is checked after blocking setup, at the final enqueue gate.
-pub fn run(
-    pm: &Pm,
-    id: &str,
-    args: &DispatchArgs,
-    actor: &str,
-    state_dir: &Path,
-    dispatch_pm: Option<&str>,
-    origin: DispatchOrigin,
-) -> Result<Value> {
+struct Preflight {
+    project: crate::issue::project::Project,
+    dir: PathBuf,
+    front: Front,
+    items: Vec<AcceptanceItem>,
+    acceptance: Value,
+    acceptance_warning: Option<String>,
+    reply_to: String,
+    note: PathBuf,
+    show: Value,
+    provider: String,
+    endpoint_kind: String,
+    cwd_override: Option<String>,
+    body: Option<String>,
+}
+
+fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result<Preflight> {
     let (project, dir) = write::issue_dir(pm, id)?;
     let (front, body) = write::load_front(&dir)?;
     // CAD-360: a ticket of a plan dispatches only once the operator
@@ -603,6 +612,458 @@ pub fn run(
 
     // `issue start` — idempotent; --owner <worker>, and for --job the
     // PM is the return address and the worker the assignee.
+    Ok(Preflight {
+        project,
+        dir,
+        front,
+        items,
+        acceptance,
+        acceptance_warning,
+        reply_to,
+        note,
+        show,
+        provider,
+        endpoint_kind,
+        cwd_override,
+        body,
+    })
+}
+
+struct Lessons {
+    mid: String,
+    lessons: Vec<String>,
+    lessons_file: Option<PathBuf>,
+    lessons_error: Option<String>,
+    lessons_withheld: Vec<(String, String)>,
+    body: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lessons(
+    pm: &Pm,
+    project: &crate::issue::project::Project,
+    dir: &Path,
+    front: &Front,
+    args: &DispatchArgs,
+    state_dir: &Path,
+    provider: &str,
+    body: Option<String>,
+) -> Lessons {
+    let mut lessons: Vec<String> = vec![];
+    let mut lessons_file: Option<PathBuf> = None;
+    let mut lessons_error: Option<String> = None;
+    // CAD-203: in-scope lessons withheld for stale evidence, with the
+    // reason — recorded on the dispatch comment and in the output so
+    // "why did I not get this?" is answerable.
+    let mut lessons_withheld: Vec<(String, String)> = vec![];
+    // The message id is minted up front so the `message` ref commits
+    // BEFORE the send: a finish racing the dispatch sees the binding
+    // the moment the ref lands. The old send→add_ref order left the
+    // kickoff live but unbound for a window (CAD-107).
+    let mid = Uuid::new_v4().simple().to_string();
+    let mut body = body;
+    if !args.no_lessons {
+        if let Some(b) = body.as_mut() {
+            let issue_obj = board::Issue {
+                project: project.key.clone(),
+                dir: dir.to_path_buf(),
+                front: front.clone(),
+                body: String::new(),
+                comments: vec![],
+                artifacts: vec![],
+            };
+            match memory::match_for_issue(pm, &issue_obj, Some(provider)) {
+                Err(e) => lessons_error = Some(format!("memory match failed: {e}")),
+                Ok((matched, mem_errors)) => {
+                    // Valid records still reach the worker; every file
+                    // that failed to load is named on the issue.
+                    if let Some(line) = memory::load_errors_line(&mem_errors) {
+                        lessons_error = Some(line);
+                    }
+                    lessons_withheld = matched
+                        .withheld
+                        .iter()
+                        .map(|(m, reason)| (m.front.id.clone(), reason.clone()))
+                        .collect();
+                    // Written whenever it has content: a dispatch whose
+                    // every match was withheld still gets the file with
+                    // only its Withheld section.
+                    let (text, slugs) = memory::render_lessons(&matched);
+                    if !text.is_empty() {
+                        let ddir = state_dir.join("dispatch");
+                        let file = ddir.join(format!("{mid}-lessons.md"));
+                        // tmp + rename: a failed write never leaves a
+                        // partial or empty lessons artifact behind.
+                        let tmp = ddir.join(format!("{mid}-lessons.tmp"));
+                        let prior = b.clone();
+                        *b = format!("{prior} Lessons: {}.", file.display());
+                        if let Err(e) = check_body(b, provider) {
+                            *b = prior;
+                            let why =
+                                format!("lessons path pushed the kickoff over the body limit: {e}");
+                            lessons_error = Some(match lessons_error {
+                                Some(prev) => format!("{prev}; {why}"),
+                                None => why,
+                            });
+                        } else if let Err(e) = std::fs::create_dir_all(&ddir)
+                            .and_then(|_| std::fs::write(&tmp, &text))
+                            .and_then(|_| std::fs::rename(&tmp, &file))
+                        {
+                            let _ = std::fs::remove_file(&tmp);
+                            *b = prior;
+                            let why = format!("lessons file unwritable: {e}");
+                            lessons_error = Some(match lessons_error {
+                                Some(prev) => format!("{prev}; {why}"),
+                                None => why,
+                            });
+                        } else {
+                            lessons = slugs;
+                            lessons_file = Some(file);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Lessons {
+        mid,
+        lessons,
+        lessons_file,
+        lessons_error,
+        lessons_withheld,
+        body,
+    }
+}
+
+struct RecordCtx<'a> {
+    pm: &'a Pm,
+    id: &'a str,
+    args: &'a DispatchArgs,
+    actor: &'a str,
+    state_dir: &'a Path,
+    front: &'a Front,
+    started: &'a Value,
+    message: &'a str,
+    bootstrap_id: &'a str,
+    bootstrap_state: Option<String>,
+    fold: bool,
+    lessons: Vec<String>,
+    lessons_file: Option<PathBuf>,
+    lessons_error: Option<String>,
+    lessons_withheld: Vec<(String, String)>,
+    acceptance_warning: Option<String>,
+    cwd_override: Option<String>,
+    agent: &'a Value,
+    note: &'a Path,
+    dispatch_pm: Option<&'a str>,
+    sent_state: (&'static str, Value),
+    out: Value,
+}
+
+fn record(ctx: RecordCtx<'_>) -> Result<Value> {
+    let RecordCtx {
+        pm,
+        id,
+        args,
+        actor,
+        state_dir,
+        front,
+        started,
+        message,
+        bootstrap_id,
+        bootstrap_state,
+        fold,
+        lessons,
+        lessons_file,
+        lessons_error,
+        lessons_withheld,
+        acceptance_warning,
+        cwd_override,
+        agent,
+        note,
+        dispatch_pm,
+        sent_state,
+        out,
+    } = ctx;
+    let mut out = out;
+    let dispatch_record = match dispatch_pm {
+        // An in-daemon dispatch writes the record itself — its pm is
+        // the master's alias, not whatever a round-trip connection
+        // would derive — and it may replace any prior record (the
+        // daemon's own dispatch is the operator-grade writer).
+        Some(pm_alias) => {
+            let record = json!({
+                "issue": front.id,
+                "pm": pm_alias,
+                "pm_kind": "daemon",
+                "worker": args.to,
+                "worktree": started["worktree"],
+                "branch": started["branch"],
+                "message": message,
+                "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
+            });
+            crate::issue::areas::record_dispatch(state_dir, &front.id, record.clone(), true)
+                .map(|_| record)
+        }
+        None => client::rpc(
+            state_dir,
+            "dispatch_record",
+            json!({
+                "issue": front.id,
+                "message": message,
+            }),
+        ),
+    };
+
+    // The comment rides its own commit through the existing helper. A
+    // second line records which lessons were injected.
+    let mut comment_text = format!("Dispatched to {}: {}", args.to, note.display());
+    if !lessons.is_empty() {
+        comment_text.push_str(&format!("\nLessons injected: {}", lessons.join(", ")));
+    }
+    if !lessons_withheld.is_empty() {
+        let items: Vec<String> = lessons_withheld
+            .iter()
+            .map(|(slug, reason)| format!("{slug} ({reason})"))
+            .collect();
+        comment_text.push_str(&format!("\nLessons withheld: {}", items.join("; ")));
+    }
+    // A `--job` dispatch's override is already recorded by `issue
+    // start`, which re-checks the assignee; the plain path records it
+    // here, with the dispatch it allowed.
+    if let Some(note) = cwd_override.as_ref().filter(|_| args.job_spec.is_none()) {
+        comment_text.push_str(&format!("\n{note}"));
+    }
+    // CAD-159: the empty-acceptance warning is recorded once, on this
+    // dispatch's own comment — a duplicate run returns before here.
+    if let Some(warning) = &acceptance_warning {
+        comment_text.push_str(&format!("\nAcceptance warning: {warning}"));
+    }
+    // CAD-467: the fold's outcome is recorded on the dispatch's own
+    // comment — both ways. A cancelled row's history names this
+    // kickoff; a refused cancel (the bootstrap was claimed first)
+    // means this kickoff still carries the onboarding text while the
+    // bootstrap turn runs too — at worst the worker reads it twice.
+    match bootstrap_state.as_deref() {
+        Some("folded") => comment_text.push_str(&format!(
+            "\nBootstrap {bootstrap_id} folded into this kickoff — the queued \
+             onboarding turn was cancelled; its instructions ride this message."
+        )),
+        Some(state) if fold => comment_text.push_str(&format!(
+            "\nBootstrap {bootstrap_id} was meant to fold into this kickoff but \
+             the cancel was refused (row is now {state}) — this kickoff carries \
+             the onboarding text; the bootstrap turn delivers it again."
+        )),
+        _ => {}
+    }
+    // CAD-378: the advisory lease warnings, recorded with the dispatch
+    // they were raised on — never a refusal.
+    for line in crate::issue::areas::warning_lines(&started["leases"]) {
+        comment_text.push_str(&format!("\nLease warning: {line}"));
+    }
+    let comment = write::add_comment(pm, id, &comment_text, None, Some("dispatch"), None, actor)?;
+
+    // The worker's current probe verdict — pty only; the operator
+    // learns whether delivery happens now or when the pane idles.
+    let probe = if agent["endpoint_kind"].as_str() == Some("pty")
+        && agent["dead"].as_bool() != Some(true)
+    {
+        client::rpc(state_dir, "agent_probe", json!({"alias": args.to})).ok()
+    } else {
+        None
+    };
+
+    out["dispatched"] = json!(true);
+    out["dispatch_record"] = dispatch_record
+        .as_ref()
+        .map(|r| r.clone())
+        .unwrap_or(Value::Null);
+    out["dispatch_record_error"] = dispatch_record
+        .as_ref()
+        .err()
+        .map(|e| json!(e.to_string()))
+        .unwrap_or(Value::Null);
+    out["message"] = json!(message);
+    out[sent_state.0] = sent_state.1;
+    out["lessons"] = json!(lessons);
+    out["lessons_file"] = lessons_file
+        .as_ref()
+        .map(|p| json!(p))
+        .unwrap_or(Value::Null);
+    out["lessons_withheld"] = json!(lessons_withheld
+        .iter()
+        .map(|(slug, reason)| json!({"slug": slug, "reason": reason}))
+        .collect::<Vec<_>>());
+    out["lessons_error"] = lessons_error
+        .as_ref()
+        .map(|e| json!(e))
+        .unwrap_or(Value::Null);
+    out["comment"] = comment["comment"].clone();
+    // CAD-467: `folded` when the queued bootstrap was cancelled into
+    // this kickoff; a live-but-unfolded bootstrap (`queued`/`running`)
+    // means the kickoff delivers after it reports — surfaced so the PM
+    // sees why this kickoff is not the lane's first turn.
+    out["bootstrap"] = bootstrap_state.map(|s| json!(s)).unwrap_or(Value::Null);
+    out["job"] = started["job"].clone();
+    out["task"] = started["task"].clone();
+    out["probe"] = probe.unwrap_or(Value::Null);
+    out["cwd_override"] = cwd_override.map(Value::from).unwrap_or(Value::Null);
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn duplicate(
+    pm: &Pm,
+    id: &str,
+    args: &DispatchArgs,
+    actor: &str,
+    state_dir: &Path,
+    front: &Front,
+    started: &Value,
+    show_now: &Value,
+    items: &[AcceptanceItem],
+    out: &mut Value,
+) -> Result<bool> {
+    let mut live: Option<Value> = None;
+    let mut reported: Option<Value> = None;
+    for r in front
+        .refs
+        .iter()
+        .filter(|r| r.kind == "message" && r.closed != Some(true))
+    {
+        let Some(mid) = r.path.as_deref() else {
+            continue;
+        };
+        let owner = r
+            .agent
+            .as_deref()
+            .or_else(|| {
+                r.label
+                    .as_deref()
+                    .and_then(|l| l.strip_prefix("dispatch → "))
+            })
+            .unwrap_or(&args.to);
+        let messages = if owner == args.to {
+            Some(show_now.clone())
+        } else {
+            client::rpc(state_dir, "agent_show", json!({"alias": owner})).ok()
+        };
+        let Some(found) = messages.and_then(|s| {
+            s["messages"]
+                .as_array()
+                .and_then(|ms| ms.iter().find(|m| m["id"].as_str() == Some(mid)).cloned())
+        }) else {
+            continue;
+        };
+        let state = found["state"].as_str().unwrap_or_default();
+        if LIVE_MESSAGE_STATES.contains(&state) {
+            live = Some(found);
+            break;
+        }
+        // The proof is the daemon-recorded row: this issue's kickoff,
+        // delivered to THIS worker (the row's `alias` is the send's
+        // target — a kickoff reported by another worker is their
+        // history, not this dispatch's), on THIS lane's worktree.
+        let reported_here = state == "completed"
+            && found["alias"].as_str() == Some(args.to.as_str())
+            && found["issue"].as_str() == Some(front.id.as_str())
+            && match (found["worktree"].as_str(), started["worktree"].as_str()) {
+                (Some(m), Some(lane)) => m == lane,
+                _ => false,
+            };
+        if reported_here {
+            reported = Some(found);
+        }
+    }
+    if let Some(msg) = live {
+        out["dispatched"] = json!(false);
+        out["duplicate"] = json!(true);
+        out["duplicate_kind"] = json!("live");
+        // CAD-300 (QA R4): a duplicate sends nothing, so its warning
+        // must not say it dispatched.
+        if items.is_empty() {
+            out["acceptance"]["warning"] = json!(self::acceptance_warning(&front.id, false));
+        }
+        out["message"] = msg["id"].clone();
+        out["message_state"] = msg["state"].clone();
+        return Ok(true);
+    }
+    if let Some(msg) = reported {
+        // The kickoff's own report sha against the lane's head now —
+        // equal is the cleanest late duplicate; either way the issue
+        // was reported by this worker in this lane, so nothing
+        // re-sends. Both sides are recorded so the PM can judge.
+        let mid = msg["id"].as_str().unwrap_or_default();
+        let reported_sha = msg["result"]["sha"].as_str();
+        let via = msg["result"]["via"].as_str().unwrap_or("report");
+        let lane_head = started["worktree"]
+            .as_str()
+            .and_then(|wt| lane_head(Path::new(wt)));
+        let same_head = match (reported_sha, lane_head.as_deref()) {
+            (Some(s), Some(h)) => Some(s == h),
+            _ => None,
+        };
+        out["dispatched"] = json!(false);
+        out["duplicate"] = json!(true);
+        out["duplicate_kind"] = json!("reported");
+        if items.is_empty() {
+            out["acceptance"]["warning"] = json!(self::acceptance_warning(&front.id, false));
+        }
+        out["message"] = msg["id"].clone();
+        out["message_state"] = msg["state"].clone();
+        out["reported"] = json!({
+            "sha": reported_sha,
+            "via": via,
+            "lane_head": lane_head,
+            "same_head": same_head,
+        });
+        let _ = write::add_comment(
+            pm,
+            id,
+            &format!(
+                "Late duplicate dispatch suppressed: {} already reported \
+                 kickoff {} (via {}, sha {}, lane head {}) — nothing re-sent.",
+                args.to,
+                mid,
+                via,
+                reported_sha.unwrap_or("none recorded"),
+                lane_head.as_deref().unwrap_or("unreadable"),
+            ),
+            None,
+            Some("dispatch"),
+            None,
+            actor,
+        );
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub fn run(
+    pm: &Pm,
+    id: &str,
+    args: &DispatchArgs,
+    actor: &str,
+    state_dir: &Path,
+    dispatch_pm: Option<&str>,
+    origin: DispatchOrigin,
+) -> Result<Value> {
+    let Preflight {
+        project,
+        dir,
+        front,
+        items,
+        acceptance,
+        acceptance_warning,
+        reply_to,
+        note,
+        show,
+        provider,
+        endpoint_kind,
+        cwd_override,
+        body,
+    } = preflight(pm, id, args, state_dir)?;
+    let agent = &show["agent"];
     let start_args = start::StartArgs {
         repo: args.repo.clone(),
         name: args.name.clone(),
@@ -658,61 +1119,6 @@ pub fn run(
     // or any unrelated completed message a ref was pointed at) never
     // matches. A kickoff whose recorded worktree is a different lane is
     // that lane's history, not this dispatch's.
-    let mut live: Option<Value> = None;
-    let mut reported: Option<Value> = None;
-    // A fresh read on the target — `show` predates `issue start`, and
-    // a launch finishing mid-dispatch can have enqueued a bootstrap.
-    let show_now = client::rpc(state_dir, "agent_show", json!({"alias": args.to}))
-        .unwrap_or_else(|_| show.clone());
-    for r in front
-        .refs
-        .iter()
-        .filter(|r| r.kind == "message" && r.closed != Some(true))
-    {
-        let Some(mid) = r.path.as_deref() else {
-            continue;
-        };
-        let owner = r
-            .agent
-            .as_deref()
-            .or_else(|| {
-                r.label
-                    .as_deref()
-                    .and_then(|l| l.strip_prefix("dispatch → "))
-            })
-            .unwrap_or(&args.to);
-        let messages = if owner == args.to {
-            Some(show_now.clone())
-        } else {
-            client::rpc(state_dir, "agent_show", json!({"alias": owner})).ok()
-        };
-        let Some(found) = messages.and_then(|s| {
-            s["messages"]
-                .as_array()
-                .and_then(|ms| ms.iter().find(|m| m["id"].as_str() == Some(mid)).cloned())
-        }) else {
-            continue;
-        };
-        let state = found["state"].as_str().unwrap_or_default();
-        if LIVE_MESSAGE_STATES.contains(&state) {
-            live = Some(found);
-            break;
-        }
-        // The proof is the daemon-recorded row: this issue's kickoff,
-        // delivered to THIS worker (the row's `alias` is the send's
-        // target — a kickoff reported by another worker is their
-        // history, not this dispatch's), on THIS lane's worktree.
-        let reported_here = state == "completed"
-            && found["alias"].as_str() == Some(args.to.as_str())
-            && found["issue"].as_str() == Some(front.id.as_str())
-            && match (found["worktree"].as_str(), started["worktree"].as_str()) {
-                (Some(m), Some(lane)) => m == lane,
-                _ => false,
-            };
-        if reported_here {
-            reported = Some(found);
-        }
-    }
     let mut out = json!({
         "issue": front.id,
         "worker": args.to,
@@ -728,65 +1134,13 @@ pub fn run(
         "claim": started["claim"],
         "leases": started["leases"],
     });
-    if let Some(msg) = live {
-        out["dispatched"] = json!(false);
-        out["duplicate"] = json!(true);
-        out["duplicate_kind"] = json!("live");
-        // CAD-300 (QA R4): a duplicate sends nothing, so its warning
-        // must not say it dispatched.
-        if items.is_empty() {
-            out["acceptance"]["warning"] = json!(self::acceptance_warning(&front.id, false));
-        }
-        out["message"] = msg["id"].clone();
-        out["message_state"] = msg["state"].clone();
-        return Ok(out);
-    }
-    if let Some(msg) = reported {
-        // The kickoff's own report sha against the lane's head now —
-        // equal is the cleanest late duplicate; either way the issue
-        // was reported by this worker in this lane, so nothing
-        // re-sends. Both sides are recorded so the PM can judge.
-        let mid = msg["id"].as_str().unwrap_or_default();
-        let reported_sha = msg["result"]["sha"].as_str();
-        let via = msg["result"]["via"].as_str().unwrap_or("report");
-        let lane_head = started["worktree"]
-            .as_str()
-            .and_then(|wt| lane_head(Path::new(wt)));
-        let same_head = match (reported_sha, lane_head.as_deref()) {
-            (Some(s), Some(h)) => Some(s == h),
-            _ => None,
-        };
-        out["dispatched"] = json!(false);
-        out["duplicate"] = json!(true);
-        out["duplicate_kind"] = json!("reported");
-        if items.is_empty() {
-            out["acceptance"]["warning"] = json!(self::acceptance_warning(&front.id, false));
-        }
-        out["message"] = msg["id"].clone();
-        out["message_state"] = msg["state"].clone();
-        out["reported"] = json!({
-            "sha": reported_sha,
-            "via": via,
-            "lane_head": lane_head,
-            "same_head": same_head,
-        });
-        let _ = write::add_comment(
-            pm,
-            id,
-            &format!(
-                "Late duplicate dispatch suppressed: {} already reported \
-                 kickoff {} (via {}, sha {}, lane head {}) — nothing re-sent.",
-                args.to,
-                mid,
-                via,
-                reported_sha.unwrap_or("none recorded"),
-                lane_head.as_deref().unwrap_or("unreadable"),
-            ),
-            None,
-            Some("dispatch"),
-            None,
-            actor,
-        );
+    // A fresh read on the target — `show` predates `issue start`, and
+    // a launch finishing mid-dispatch can have enqueued a bootstrap.
+    let show_now = client::rpc(state_dir, "agent_show", json!({"alias": args.to}))
+        .unwrap_or_else(|_| show.clone());
+    if duplicate(
+        pm, id, args, actor, state_dir, &front, &started, &show_now, &items, &mut out,
+    )? {
         return Ok(out);
     }
 
@@ -799,82 +1153,14 @@ pub fn run(
     // exists by now. A malformed file, an unwritable lessons file or a
     // suffix that pushes the body over the cap degrades to no lessons
     // with `lessons_error` naming the reason.
-    let mut lessons: Vec<String> = vec![];
-    let mut lessons_file: Option<PathBuf> = None;
-    let mut lessons_error: Option<String> = None;
-    // CAD-203: in-scope lessons withheld for stale evidence, with the
-    // reason — recorded on the dispatch comment and in the output so
-    // "why did I not get this?" is answerable.
-    let mut lessons_withheld: Vec<(String, String)> = vec![];
-    // The message id is minted up front so the `message` ref commits
-    // BEFORE the send: a finish racing the dispatch sees the binding
-    // the moment the ref lands. The old send→add_ref order left the
-    // kickoff live but unbound for a window (CAD-107).
-    let mid = Uuid::new_v4().simple().to_string();
-    let mut body = body;
-    if !args.no_lessons {
-        if let Some(b) = body.as_mut() {
-            let issue_obj = board::Issue {
-                project: project.key.clone(),
-                dir: dir.clone(),
-                front: front.clone(),
-                body: String::new(),
-                comments: vec![],
-                artifacts: vec![],
-            };
-            match memory::match_for_issue(pm, &issue_obj, Some(&provider)) {
-                Err(e) => lessons_error = Some(format!("memory match failed: {e}")),
-                Ok((matched, mem_errors)) => {
-                    // Valid records still reach the worker; every file
-                    // that failed to load is named on the issue.
-                    if let Some(line) = memory::load_errors_line(&mem_errors) {
-                        lessons_error = Some(line);
-                    }
-                    lessons_withheld = matched
-                        .withheld
-                        .iter()
-                        .map(|(m, reason)| (m.front.id.clone(), reason.clone()))
-                        .collect();
-                    // Written whenever it has content: a dispatch whose
-                    // every match was withheld still gets the file with
-                    // only its Withheld section.
-                    let (text, slugs) = memory::render_lessons(&matched);
-                    if !text.is_empty() {
-                        let ddir = state_dir.join("dispatch");
-                        let file = ddir.join(format!("{mid}-lessons.md"));
-                        // tmp + rename: a failed write never leaves a
-                        // partial or empty lessons artifact behind.
-                        let tmp = ddir.join(format!("{mid}-lessons.tmp"));
-                        let prior = b.clone();
-                        *b = format!("{prior} Lessons: {}.", file.display());
-                        if let Err(e) = check_body(b, &provider) {
-                            *b = prior;
-                            let why =
-                                format!("lessons path pushed the kickoff over the body limit: {e}");
-                            lessons_error = Some(match lessons_error {
-                                Some(prev) => format!("{prev}; {why}"),
-                                None => why,
-                            });
-                        } else if let Err(e) = std::fs::create_dir_all(&ddir)
-                            .and_then(|_| std::fs::write(&tmp, &text))
-                            .and_then(|_| std::fs::rename(&tmp, &file))
-                        {
-                            let _ = std::fs::remove_file(&tmp);
-                            *b = prior;
-                            let why = format!("lessons file unwritable: {e}");
-                            lessons_error = Some(match lessons_error {
-                                Some(prev) => format!("{prev}; {why}"),
-                                None => why,
-                            });
-                        } else {
-                            lessons = slugs;
-                            lessons_file = Some(file);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let Lessons {
+        mid,
+        lessons,
+        lessons_file,
+        lessons_error,
+        lessons_withheld,
+        body,
+    } = lessons(pm, &project, &dir, &front, args, state_dir, &provider, body);
 
     // CAD-467: a freshly joined worker's `bootstrap-<alias>` still
     // `queued` would deliver as a bare onboarding turn AHEAD of this
@@ -1075,129 +1361,30 @@ pub fn run(
     // That record, not anything the tracker carries, binds the lane's
     // area-owner rows. A failure is reported, never silent: the kickoff
     // already went out, and an unbound lane's rows stay up (fail loud).
-    let dispatch_record = match dispatch_pm {
-        // An in-daemon dispatch writes the record itself — its pm is
-        // the master's alias, not whatever a round-trip connection
-        // would derive — and it may replace any prior record (the
-        // daemon's own dispatch is the operator-grade writer).
-        Some(pm_alias) => {
-            let record = json!({
-                "issue": front.id,
-                "pm": pm_alias,
-                "pm_kind": "daemon",
-                "worker": args.to,
-                "worktree": started["worktree"],
-                "branch": started["branch"],
-                "message": message,
-                "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
-            });
-            crate::issue::areas::record_dispatch(state_dir, &front.id, record.clone(), true)
-                .map(|_| record)
-        }
-        None => client::rpc(
-            state_dir,
-            "dispatch_record",
-            json!({
-                "issue": front.id,
-                "message": message,
-            }),
-        ),
-    };
-
-    // The comment rides its own commit through the existing helper. A
-    // second line records which lessons were injected.
-    let mut comment_text = format!("Dispatched to {}: {}", args.to, note.display());
-    if !lessons.is_empty() {
-        comment_text.push_str(&format!("\nLessons injected: {}", lessons.join(", ")));
-    }
-    if !lessons_withheld.is_empty() {
-        let items: Vec<String> = lessons_withheld
-            .iter()
-            .map(|(slug, reason)| format!("{slug} ({reason})"))
-            .collect();
-        comment_text.push_str(&format!("\nLessons withheld: {}", items.join("; ")));
-    }
-    // A `--job` dispatch's override is already recorded by `issue
-    // start`, which re-checks the assignee; the plain path records it
-    // here, with the dispatch it allowed.
-    if let Some(note) = cwd_override.as_ref().filter(|_| args.job_spec.is_none()) {
-        comment_text.push_str(&format!("\n{note}"));
-    }
-    // CAD-159: the empty-acceptance warning is recorded once, on this
-    // dispatch's own comment — a duplicate run returns before here.
-    if let Some(warning) = &acceptance_warning {
-        comment_text.push_str(&format!("\nAcceptance warning: {warning}"));
-    }
-    // CAD-467: the fold's outcome is recorded on the dispatch's own
-    // comment — both ways. A cancelled row's history names this
-    // kickoff; a refused cancel (the bootstrap was claimed first)
-    // means this kickoff still carries the onboarding text while the
-    // bootstrap turn runs too — at worst the worker reads it twice.
-    match bootstrap_state.as_deref() {
-        Some("folded") => comment_text.push_str(&format!(
-            "\nBootstrap {bootstrap_id} folded into this kickoff — the queued \
-             onboarding turn was cancelled; its instructions ride this message."
-        )),
-        Some(state) if fold => comment_text.push_str(&format!(
-            "\nBootstrap {bootstrap_id} was meant to fold into this kickoff but \
-             the cancel was refused (row is now {state}) — this kickoff carries \
-             the onboarding text; the bootstrap turn delivers it again."
-        )),
-        _ => {}
-    }
-    // CAD-378: the advisory lease warnings, recorded with the dispatch
-    // they were raised on — never a refusal.
-    for line in crate::issue::areas::warning_lines(&started["leases"]) {
-        comment_text.push_str(&format!("\nLease warning: {line}"));
-    }
-    let comment = write::add_comment(pm, id, &comment_text, None, Some("dispatch"), None, actor)?;
-
-    // The worker's current probe verdict — pty only; the operator
-    // learns whether delivery happens now or when the pane idles.
-    let probe = if agent["endpoint_kind"].as_str() == Some("pty")
-        && agent["dead"].as_bool() != Some(true)
-    {
-        client::rpc(state_dir, "agent_probe", json!({"alias": args.to})).ok()
-    } else {
-        None
-    };
-
-    out["dispatched"] = json!(true);
-    out["dispatch_record"] = dispatch_record
-        .as_ref()
-        .map(|r| r.clone())
-        .unwrap_or(Value::Null);
-    out["dispatch_record_error"] = dispatch_record
-        .as_ref()
-        .err()
-        .map(|e| json!(e.to_string()))
-        .unwrap_or(Value::Null);
-    out["message"] = json!(message);
-    out[sent_state.0] = sent_state.1;
-    out["lessons"] = json!(lessons);
-    out["lessons_file"] = lessons_file
-        .as_ref()
-        .map(|p| json!(p))
-        .unwrap_or(Value::Null);
-    out["lessons_withheld"] = json!(lessons_withheld
-        .iter()
-        .map(|(slug, reason)| json!({"slug": slug, "reason": reason}))
-        .collect::<Vec<_>>());
-    out["lessons_error"] = lessons_error
-        .as_ref()
-        .map(|e| json!(e))
-        .unwrap_or(Value::Null);
-    out["comment"] = comment["comment"].clone();
-    // CAD-467: `folded` when the queued bootstrap was cancelled into
-    // this kickoff; a live-but-unfolded bootstrap (`queued`/`running`)
-    // means the kickoff delivers after it reports — surfaced so the PM
-    // sees why this kickoff is not the lane's first turn.
-    out["bootstrap"] = bootstrap_state.map(|s| json!(s)).unwrap_or(Value::Null);
-    out["job"] = started["job"].clone();
-    out["task"] = started["task"].clone();
-    out["probe"] = probe.unwrap_or(Value::Null);
-    out["cwd_override"] = cwd_override.map(Value::from).unwrap_or(Value::Null);
-    Ok(out)
+    record(RecordCtx {
+        pm,
+        id,
+        args,
+        actor,
+        state_dir,
+        front: &front,
+        started: &started,
+        message: &message,
+        bootstrap_id: &bootstrap_id,
+        bootstrap_state,
+        fold,
+        lessons,
+        lessons_file,
+        lessons_error,
+        lessons_withheld,
+        acceptance_warning,
+        cwd_override,
+        agent,
+        note: &note,
+        dispatch_pm,
+        sent_state,
+        out,
+    })
 }
 
 #[cfg(test)]
