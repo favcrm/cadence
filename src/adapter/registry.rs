@@ -710,6 +710,34 @@ pub static SPECS: &[EndpointSpec] = &[
         launch_default: true,
         internal: false,
     },
+    // CAD-1673: the cloud sandbox runner seam (see `adapter::sandbox`).
+    // Internal and factory-less until AOS-324 lands the real transport:
+    // not selectable, never a working production endpoint.
+    EndpointSpec {
+        provider: "sandbox",
+        endpoint_kind: "sandbox",
+        display: "Cloud sandbox (internal seam)",
+        has_actor: false,
+        attach: Attach::None,
+        ready_gate: false,
+        screen_probe: false,
+        reports: Reporting::TurnResult,
+        report_hint: Reporting::TurnResult,
+        turn_token: None,
+        brokers_requests: false,
+        resumable: false,
+        resume_label: "",
+        live_settable_params: &[],
+        launch_params: &[],
+        session_id_label: "Sandbox session",
+        respond_rejection: None,
+        capabilities: &[],
+        doctor_caps: &[],
+        probe_bins: &[],
+        session_disposable: false,
+        launch_default: false,
+        internal: true,
+    },
 ];
 
 /// `health.capabilities` entry for daemon-wide model defaults.

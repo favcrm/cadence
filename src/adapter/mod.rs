@@ -113,6 +113,7 @@ pub(crate) mod pi_guest {
 }
 pub mod pty;
 pub mod registry;
+pub mod sandbox;
 pub mod stdio;
 pub mod ws;
 
