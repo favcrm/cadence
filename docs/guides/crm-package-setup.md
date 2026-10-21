@@ -6,12 +6,13 @@ repository, under `app/`. Use a trusted, pinned checkout of that repository,
 not the historical embedded `workspace-apps/crm` snapshot or
 `tests/fixtures/apps/crm` (host-contract test data only). Installing it
 creates a workspace installation whose app is named `crm` — the name the
-host-compiled CRM screens (Customers, Segments, Campaigns, content review,
-bounded send controls) key on. The package is metadata plus one local-only
-`email-brief` workflow; the CRM UI, customer records domain, authorization
-checks and sending are **host-compiled features of the daemon and board**,
-not contents of this bundle. Installing it grants no additional authority —
-it makes the already host-compiled UI discoverable to an authorized operator
+packaged CRM screens (Customers, Segments, Campaigns, content review, bounded
+send controls) key on. Since CAD-1519 the package ships those screens itself
+and core mounts them through the generic app shell; the bundle is screens,
+metadata and one local-only `email-brief` workflow. The customer records
+domain, authorization checks and sending remain **host-compiled features of
+the daemon and board**, not contents of this bundle. Installing it grants no additional authority —
+it makes the packaged UI discoverable to an authorized operator
 under the name `crm`; it does not itself confer UI access, records, SMTP
 custody, send authority, or a sandbox over what workers may do.
 
@@ -183,15 +184,19 @@ digest.
 ## Production boundary
 
 Everything above describes package installation and local, package-tested
-behaviour on a disposable workspace. The host-compiled CRM UI and send path
-are verified separately; installing or approving this package is **not**
+behaviour on a disposable workspace. The packaged CRM screens and the host
+send path are verified separately; installing or approving this package is **not**
 proof of the production send path, and a host binary rollout is a separate
 operator-owned action.
 
 ## MVP acceptance matrix (CAD-865)
 
 One row per promised MVP flow, mapped to its source and existing evidence,
-at lane source `d379ae54` (this work's parent). Historical CAD-786 browser
+at lane source `d379ae54` (this work's parent). This is a historical
+acceptance snapshot, not a map of the current checkout: CAD-1073 retired the
+`tests/crm_*.rs` Rust suites, and CAD-1519 removed the CRM app UI from core
+along with the `crmCustomers`/`crmSegments`/`crmCampaigns` UI tests. The
+verdict column records the CAD-865 run only. Historical CAD-786 browser
 evidence under `/home/ubuntu/.cache/fb597/e2e` is retained at its own SHA
 and does not validate this head. `browser-pending` means the flow is proven
 in daemon tests and mounted UI tests but awaits the real-browser run; the

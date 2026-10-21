@@ -136,14 +136,15 @@ let that code poison the cache or exfiltrate the key. Therefore:
 - Every other job, including all gate jobs on `pull_request` and
   `merge_group` and on main pushes, gets only the read-only pair and no
   `environment:`.
-- The guard evaluator in `tests/scripts/test_ci_sccache.py` (retired under CAD-1073) compares
-  strings case-insensitively like GitHub and supports `==` and `!=`; any
-  other expression form (functions, `!`) is rejected. The test also rejects
-  `secrets[...]`, `toJSON(secrets)` and any computed `environment:`.
-- `tests/scripts/test_ci_sccache.py` (retired under CAD-1073) (run in `fmt`) fails if an RW secret
-  appears anywhere but `cache-warm`, if its `if` admits any event but push
-  to main, if the writer environment is attached to another job, or if
-  any job waits on it.
+- The guard evaluator in `tests/scripts/test_ci_sccache.py` (retired under
+  CAD-1073) compared strings case-insensitively like GitHub and supported
+  `==` and `!=`; any other expression form (functions, `!`) was rejected.
+  The test also rejected `secrets[...]`, `toJSON(secrets)` and any computed
+  `environment:`.
+- `tests/scripts/test_ci_sccache.py` (retired under CAD-1073, formerly run
+  in `fmt`) failed if an RW secret appeared anywhere but `cache-warm`, if
+  its `if` admitted any event but push to main, if the writer environment
+  was attached to another job, or if any job waited on it.
 
 How it works:
 
@@ -288,7 +289,7 @@ one line per step (`[ OK ]`, `[FAIL] name: exit N`, `[SKIP] name: why`):
 "Changed" is the union of commits since `origin/main`, working-tree edits
 and untracked files; use `--base REF` to override and `--list` to print the
 plan without running it. It sets `CARGO_BUILD_JOBS=4` unless already set and
-does not run the full suite. During CAD-1073 the merge queue runs the same
+does not run the full suite. During CAD-1073 the merge queue ran the same
 reduced floor, not a hidden full integration suite.
 
 The legacy `tests/split-map*.toml` and `split_map_inventory` contract were
@@ -301,8 +302,9 @@ The required `fmt` job runs the shared scope/runner, shard-coverage,
 nextest-cost, delivery/staging/review-observation contracts and doctor/host
 split-map check once. Their failures still block the required gate and
 release evidence. They no longer repeat in every Rust test shard.
-`tests/scripts/test_ci_shared_checks.py` (retired under CAD-1073) checks that each command remains
-once-only and blocking, including early failures in multi-command steps.
+`tests/scripts/test_ci_shared_checks.py` (retired under CAD-1073) checked
+that each command remained once-only and blocking, including early failures
+in multi-command steps.
 
 The enqueue consumer checks run through
 `python3 scripts/test_enqueue_requirements.py` in `fmt`. Its
@@ -431,7 +433,7 @@ from that file and runs `rustup toolchain install <channel>` with the
 profile and components the job passes. `--export` also sets
 `RUSTUP_TOOLCHAIN` for jobs that build another checkout (staging's
 `candidate-source`). Local `cargo` follows the file too, so a local
-`cargo clippy` matches CI. `tests/scripts/test_ci_toolchain_pin.py` (retired under CAD-1073) fails
+`cargo clippy` matches CI. `tests/scripts/test_ci_toolchain_pin.py` (retired under CAD-1073) failed
 if a workflow installs a literal or floating channel.
 
 A new stable release can no longer turn the queue red: lints and

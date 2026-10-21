@@ -40,11 +40,11 @@ listing:
 
 # CRM — reviewed email briefs
 
-This bundle installs the `crm` app the host-compiled CRM screens key on:
+This fixture installs the `crm` app that the packaged CRM screens key on:
 Customers, Segments, Campaigns, content review and bounded send controls
-are daemon/UI features for an installation whose app is named `crm`.
-They are not implemented by this bundle — this package is metadata plus
-one local-only workflow, not the CRM UI or domain code. The bundle's only
+ship with the canonical `cadence-app-crm` package for an installation whose
+app is named `crm`. This fixture carries only host-contract test data —
+metadata plus one local-only workflow, not the screens or domain code. The bundle's only
 runnable workflow is `email-brief`, which turns pasted facts into a single
 reviewed email brief text artifact. The separate `app-assistant.json`
 declares data-only `app-assistant/v1` action IDs for the host's generic

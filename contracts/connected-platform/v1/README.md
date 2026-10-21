@@ -1,7 +1,8 @@
 # Connected-platform contract fixture — v1
 
-The machine-readable copy of [ADR 0006](../../../docs/adr/0006-connected-platform-contract.md)
-§5.2/§5.4 — the contract two codebases implement: **Cadence** (CAD-366
+The machine-readable copy of ADR 0006 §5.2/§5.4 (the decision record is
+local working material and is not shipped in this repository) — the contract
+two codebases implement: **Cadence** (CAD-366
 credential proxy, CAD-506 effect gate) and **AgenticOS v2** (AOS-49
 credential exchange, AOS-52 tool manifest). This directory supplies shared
 test inputs (§5.6); current Cadence coverage is described below.
