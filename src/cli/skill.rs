@@ -13,6 +13,15 @@ pub(crate) enum SkillAction {
     /// Inspect every bundled guidance file and each provider's discovery link.
     /// This does not write, and it does not claim a live session reloaded.
     Status,
+    /// Read a bundled skill without writing anything: a JSON manifest of
+    /// its files and byte counts, or with `--file` that file's exact bytes.
+    Show {
+        #[arg(value_parser = cadence_agent::skill::SKILL_NAMES)]
+        name: String,
+        /// A bundled file path, for example `scripts/next.py`.
+        #[arg(long)]
+        file: Option<String>,
+    },
     /// Non-force refresh used by native `cadence update` so the activated
     /// binary writes its own embedded bytes. Not a second installer:
     /// `cadence skill install` remains the manual repair. Matching files
@@ -29,6 +38,14 @@ pub(super) fn run(_state_dir: PathBuf, action: SkillAction) -> Result<i32> {
             print_json(&report);
         }
         SkillAction::Status => print_json(&cadence_agent::skill::status(&home)),
+        SkillAction::Show { name, file } => {
+            match cadence_agent::skill::show(&name, file.as_deref())? {
+                cadence_agent::skill::ShowOutput::Manifest(manifest) => {
+                    print_json(&manifest);
+                }
+                cadence_agent::skill::ShowOutput::File(text) => print!("{text}"),
+            }
+        }
         SkillAction::Sync => {
             if cadence_agent::sandbox::profile().is_some() {
                 print_json(&json!({
