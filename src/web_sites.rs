@@ -1,7 +1,8 @@
 //! CAD-1429/CAD-1642: the Publish Web workflow over the AgenticOS
 //! `/v1/web-sites` contract (`packages/contracts/src/web-sites.ts`, version
-//! "1"), shared by the daemon `agenticos-web` adapter and the acceptance
-//! harness. The CLI is a thin staging client in `cli/web.rs`.
+//! "1"). The daemon `agenticos-web` adapter calls the per-action functions
+//! below from its account-bound entry; the acceptance harness uses [`run`].
+//! The CLI is a thin staging client in `cli/web.rs`.
 //!
 //! Every action runs against one explicitly selected workspace. The credential
 //! is the saved `hct_` grant verified by `remote_cli`; this module never reads a
@@ -128,8 +129,9 @@ struct ReleaseRef {
     manifest_digest: String,
 }
 
-/// Run one action and return its result without printing. The daemon adapter
-/// uses this; the acceptance harness uses [`run`] for its print/exit wrapper.
+/// Run one action and return its result without printing. The `agenticos-web`
+/// adapter calls the per-action functions from `execute_for_account`; the
+/// acceptance harness uses [`run`] for its print/exit wrapper.
 pub fn execute(action: &WebAction, target: &RemoteTarget, wake_timeout: u64) -> Result<Value> {
     match action {
         WebAction::Prepare { input, name, spa } => {
