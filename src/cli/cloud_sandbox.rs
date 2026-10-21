@@ -5,12 +5,16 @@
 use std::path::Path;
 use std::time::Duration;
 
+use super::util::git;
 use cadence_agent::adapter::sandbox::{
-    create_remote_lane, drive_job, is_settled, CreateJob, HttpSandboxApi, RemoteLane, ResultRelay,
-    RunOutcome, SandboxClient, SandboxEntitlement, SandboxResult, UreqSandboxTransport,
+    create_remote_lane, drive_job, is_settled, normalize_github_repo, CreateJob, HttpSandboxApi,
+    RemoteLane, ResultRelay, RunOutcome, SandboxClient, SandboxEntitlement, SandboxResult,
+    UreqSandboxTransport,
 };
 use cadence_agent::error::{Error, Result, Structured};
-use cadence_agent::issue::{board, model::check_ref_value, task_report, write, Pm};
+use cadence_agent::issue::{
+    board, model::check_ref_value, project, task_report, write, Pm,
+};
 
 /// Refusal code outside a hosted AgenticOS company context.
 pub const NOT_HOSTED: &str = "cloud_sandbox_not_hosted";
@@ -138,6 +142,34 @@ fn file_done_report(
     Ok(())
 }
 
+/// Pick the project's GitHub remote: the first declared `repos[].remote`,
+/// else the checkout's `origin` (`git -C <path> remote get-url origin`).
+/// The result is normalised to `https://github.com/owner/repo`; anything
+/// else (non-github, credentials, no remote) is refused before any request.
+pub fn project_repo(pm_dir: &Path, project_key: &str) -> Result<String> {
+    let project = project::list(pm_dir)?
+        .into_iter()
+        .find(|p| p.key == project_key)
+        .ok_or_else(|| Error::rejected(format!("project '{project_key}' not found")))?;
+    let declared = project.repos.iter().find_map(|r| r.remote.clone());
+    let raw = match declared {
+        Some(remote) => remote,
+        None => {
+            let path = project
+                .repos
+                .iter()
+                .find_map(|r| r.path.as_deref())
+                .ok_or_else(|| {
+                    Error::rejected(format!(
+                        "project '{project_key}' declares no repo remote or path; cannot run in a sandbox"
+                    ))
+                })?;
+            git(&project::expand_home(path), &["remote", "get-url", "origin"])?
+        }
+    };
+    normalize_github_repo(&raw)
+}
+
 /// `cadence cloud-sandbox <ISSUE> --branch <b> --base-sha <sha> [--spec f]`.
 pub fn run(issue: &str, branch: &str, base_sha: &str, spec: Option<&Path>) -> Result<i32> {
     let company = hosted_company(|k| std::env::var(k).ok())?;
@@ -155,8 +187,10 @@ pub fn run(issue: &str, branch: &str, base_sha: &str, spec: Option<&Path>) -> Re
         None => issue_record.body.clone(),
     };
     let base_sha = base_sha.to_ascii_lowercase();
+    let repo = project_repo(&pm.dir, &issue_record.project)?;
     let req = CreateJob {
         ticket_id: issue.to_string(),
+        repo,
         branch: branch.to_string(),
         idempotency_key: format!("cloud-sandbox:{issue}:{branch}:{base_sha}"),
         base_sha,
@@ -235,6 +269,7 @@ mod tests {
         create: Mutex<Option<Result<SandboxJob>>>,
         snapshots: Mutex<Vec<JobSnapshot>>,
         calls: Mutex<Vec<String>>,
+        created_repos: Mutex<Vec<String>>,
     }
 
     impl Fake {
@@ -243,6 +278,7 @@ mod tests {
                 create: Mutex::new(None),
                 snapshots: Mutex::new(snapshots.into_iter().rev().collect()),
                 calls: Mutex::new(Vec::new()),
+                created_repos: Mutex::new(Vec::new()),
             }
         }
         fn refusing(code: &str) -> Self {
@@ -258,8 +294,9 @@ mod tests {
     }
 
     impl SandboxClient for Fake {
-        fn create_job(&self, _: &CreateJob) -> Result<SandboxJob> {
+        fn create_job(&self, request: &CreateJob) -> Result<SandboxJob> {
             self.calls.lock().unwrap().push("create".into());
+            self.created_repos.lock().unwrap().push(request.repo.clone());
             if let Some(err) = self.create.lock().unwrap().take() {
                 return err;
             }
@@ -311,6 +348,7 @@ mod tests {
     fn req() -> CreateJob {
         CreateJob {
             ticket_id: "CAD-1673".into(),
+            repo: "https://github.com/favcrm/cadence".into(),
             branch: "cad-1673".into(),
             base_sha: SHA.into(),
             spec: "spec".into(),
@@ -411,5 +449,109 @@ mod tests {
         .unwrap();
         assert!(matches!(out, RunOutcome::Failed));
         assert_eq!(client.calls.lock().unwrap().last().unwrap(), "stop");
+    }
+
+    /// Write `<pm>/<key>/project.yaml` with the given body.
+    fn write_project(pm: &Path, key: &str, yaml: &str) {
+        let dir = pm.join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("project.yaml"), yaml).unwrap();
+    }
+
+    #[test]
+    fn project_repo_uses_declared_remote_and_normalizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_project(
+            tmp.path(),
+            "favcrm",
+            "key: favcrm\nprefix: FAV\nrepos:\n  - remote: git@github.com:favcrm/cadence.git\n",
+        );
+        assert_eq!(
+            project_repo(tmp.path(), "favcrm").unwrap(),
+            "https://github.com/favcrm/cadence"
+        );
+    }
+
+    #[test]
+    fn project_repo_falls_back_to_checkout_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let git_in = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        };
+        git_in(&["init", "-q"]);
+        git_in(&["remote", "add", "origin", "https://github.com/favcrm/cadence.git"]);
+        write_project(
+            tmp.path(),
+            "favcrm",
+            &format!("key: favcrm\nprefix: FAV\nrepos:\n  - path: {}\n", checkout.display()),
+        );
+        assert_eq!(
+            project_repo(tmp.path(), "favcrm").unwrap(),
+            "https://github.com/favcrm/cadence"
+        );
+    }
+
+    #[test]
+    fn project_repo_refuses_non_github_and_credential_remotes() {
+        for remote in [
+            "https://gitlab.com/favcrm/cadence.git",
+            "https://user:pass@github.com/favcrm/cadence",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_project(
+                tmp.path(),
+                "favcrm",
+                &format!("key: favcrm\nprefix: FAV\nrepos:\n  - remote: {remote}\n"),
+            );
+            let err = project_repo(tmp.path(), "favcrm").unwrap_err();
+            assert!(matches!(err, Error::Rejected(_)), "{remote}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn project_repo_refuses_project_without_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_project(tmp.path(), "favcrm", "key: favcrm\nprefix: FAV\n");
+        assert!(matches!(
+            project_repo(tmp.path(), "favcrm").unwrap_err(),
+            Error::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn create_body_carries_repo_and_no_host_worktree() {
+        let client = Fake::new(vec![snap("completed")]);
+        let mut req = req();
+        req.repo = "https://github.com/favcrm/cadence".into();
+        let out = drive_remote(
+            &client,
+            &Entitled(true),
+            "co-1",
+            &req,
+            Duration::ZERO,
+            5,
+            Sinks {
+                record: &mut |_| Ok(()),
+                report: &mut |_, _| Ok(()),
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, RunOutcome::Relayed(_)));
+        assert_eq!(
+            *client.created_repos.lock().unwrap(),
+            vec!["https://github.com/favcrm/cadence".to_string()]
+        );
+        // No host worktree: the remote lane records only sandbox identity.
+        let calls = client.calls.lock().unwrap();
+        assert_eq!(calls[0], "create");
+        assert!(!calls.iter().any(|c| c.contains("worktree")));
     }
 }

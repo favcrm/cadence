@@ -76,10 +76,51 @@ impl std::fmt::Debug for SandboxJob {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateJob {
     pub ticket_id: String,
+    /// `https://github.com/owner/repo`, normalised by [`normalize_github_repo`].
+    pub repo: String,
     pub branch: String,
     pub base_sha: String,
     pub spec: String,
     pub idempotency_key: String,
+}
+
+/// Normalise a GitHub remote to `https://github.com/owner/repo`. Accepts
+/// `https://github.com/owner/repo(.git)`, `git@github.com:owner/repo(.git)`
+/// and `ssh://git@github.com/owner/repo(.git)`. Anything else (other hosts,
+/// ports, query/fragment, credentials, extra path segments) is refused.
+pub fn normalize_github_repo(raw: &str) -> Result<String> {
+    let refuse = || {
+        Error::rejected(format!(
+            "cloud sandbox repo must be a github.com URL (https://github.com/owner/repo); got '{}'",
+            raw.trim()
+        ))
+    };
+    let raw = raw.trim();
+    let path = if let Some(rest) = raw.strip_prefix("https://github.com/") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("git@github.com:") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("ssh://git@github.com/") {
+        rest
+    } else {
+        return Err(refuse());
+    };
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(refuse());
+    };
+    let segment_ok = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    if !segment_ok(owner) || !segment_ok(repo) {
+        return Err(refuse());
+    }
+    Ok(format!("https://github.com/{owner}/{repo}"))
 }
 
 /// One event streamed from a running sandbox job.
@@ -384,8 +425,10 @@ fn str_field<'a>(data: &'a Value, key: &str) -> Result<&'a str> {
 
 impl<T: SandboxTransport> SandboxClient for HttpSandboxApi<T> {
     fn create_job(&self, request: &CreateJob) -> Result<SandboxJob> {
+        let repo = normalize_github_repo(&request.repo)?;
         let body = json!({
             "ticket_id": request.ticket_id,
+            "repo": repo,
             "branch": request.branch,
             "base_sha": request.base_sha,
             "spec": request.spec,
@@ -479,6 +522,7 @@ mod tests {
     fn req(ticket: &str) -> CreateJob {
         CreateJob {
             ticket_id: ticket.to_string(),
+            repo: "https://github.com/favcrm/cadence".to_string(),
             branch: "cad-1-x".to_string(),
             base_sha: SHA.to_string(),
             spec: "spec".to_string(),
@@ -541,8 +585,56 @@ mod tests {
         assert_eq!(url, JOBS_URL);
         let body = body.as_ref().unwrap();
         assert_eq!(body["idempotency_key"], "idem-key-0001");
+        assert_eq!(body["repo"], "https://github.com/favcrm/cadence");
         assert_eq!(body["base_sha"], SHA);
         assert!(body.get("company").is_none() && body.get("company_id").is_none());
+    }
+
+    #[test]
+    fn normalizes_github_remote_forms() {
+        for raw in [
+            "https://github.com/favcrm/cadence",
+            "https://github.com/favcrm/cadence.git",
+            "git@github.com:favcrm/cadence.git",
+            "ssh://git@github.com/favcrm/cadence",
+            "  https://github.com/favcrm/cadence  ",
+        ] {
+            assert_eq!(
+                normalize_github_repo(raw).unwrap(),
+                "https://github.com/favcrm/cadence",
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_non_github_and_credential_bearing_remotes() {
+        for raw in [
+            "",
+            "https://gitlab.com/favcrm/cadence",
+            "https://github.com.evil.test/favcrm/cadence",
+            "https://github.com:443/favcrm/cadence",
+            "https://user:pass@github.com/favcrm/cadence",
+            "https://tok@github.com/favcrm/cadence",
+            "https://github.com/favcrm/cadence?x=1",
+            "https://github.com/favcrm/cadence#frag",
+            "https://github.com/favcrm",
+            "https://github.com/favcrm/cadence/tree/main",
+            "https://github.com/../cadence",
+            "git@gitlab.com:favcrm/cadence.git",
+            "file:///tmp/repo",
+        ] {
+            assert!(normalize_github_repo(raw).is_err(), "{raw} must be refused");
+        }
+    }
+
+    #[test]
+    fn create_refuses_bad_repo_before_any_wire_call() {
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![]));
+        let mut bad = req("CAD-1");
+        bad.repo = "https://user:pass@github.com/favcrm/cadence".into();
+        assert!(create_remote_lane(&api, &entitled(), "co-1", &bad).is_err());
+        assert!(api.transport.calls.lock().unwrap().is_empty());
     }
 
     #[test]
