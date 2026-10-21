@@ -224,16 +224,37 @@ pair is per row, so `mount` keeps `404 no such write route` and the explorer id
 keeps `400 missing installation id`; a single global "404 on invalid" would
 change an observable status.
 
-**Precedence.** Rows are tried in declaration order, so `/migrations/{id}/recover`
-must precede `/{id}/recover` (the id validator accepts `migrations`). A test pins
-that pair, because first-match order is the only thing that distinguishes them.
+**Precedence.** One row pair really does overlap:
+`POST /api/app-installations/migrations/upgrade/recover` satisfies both
+`/migrations/{id}/recover` (id `upgrade`) and `/{id}/upgrade/recover` (id
+`migrations`) — the two parses are computed before one `||` arm and the current
+code takes catalog recovery first (`write_path.rs:1476-1511`), relaying
+`app_workspace_migration_recover` with id `upgrade`. The table must declare
+`/migrations/{id}/recover` first and a test must pin that exact path, the chosen
+operation and the bound id. `/migrations/{id}/recover` versus `/{id}/recover` has
+a different segment count and cannot overlap; the two are ordinary matching
+cases, not an overlap test.
 
 **Dispatch is broader than classification today.** The suffix family dispatches
-`/{id}/<verb>/<anything>` (handler reads two segments) while its `WRITE_ROUTES`
-pattern `/{id}/<verb>` binds one segment, so such a request is already classified
-`OperatorOnly` by the fail-closed default. The table adopts the narrow shape for
-both, which is invariant 6's narrowing and is why the malformed form becomes a
-clean `404` instead of an admitted handler that answers `404` itself.
+`/{id}/<verb>/<anything>` (the handler reads two segments and ignores the rest)
+while its `WRITE_ROUTES` pattern `/{id}/<verb>` binds one segment, so such a
+request is already classified `OperatorOnly` by the fail-closed default. When
+the second segment is a supported verb the request still reaches the relay —
+`POST /api/app-installations/inst-1/update-check/update-check` performs an
+update check today. The table adopts the narrow shape for both, which is
+invariant 6's narrowing: those spellings become pre-admission `404`s. That is an
+intentional behaviour change, not an equivalence; the implementation tests it as
+such. No caller gains authority (the wide spelling is operator-only today), but
+an admitted operator loses a spelling that worked.
+
+**Empty segments are a binding question, not a matcher detail.** Today
+`POST /api/app-installations//remove` reaches `app_explorer::write` and answers
+`400 missing installation id`, because the arm matches on suffix alone. A
+`{id}` binding that rejects an empty segment would turn that into `404`, and a
+binding that accepts it lets the row's validator answer `400`. The explorer row
+must accept the empty segment and answer `400`; the mount row rejects it with
+`404 no such write route`, as `mount_route` does today. The pattern language
+therefore needs an explicit empty-segment rule per binding, not a global one.
 
 **Router.** Still no dependency. After this slice the table holds roughly 30 rows
 and a linear scan is free; precedence is explicit and tested. Buy a router only
