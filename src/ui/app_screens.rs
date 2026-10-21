@@ -35,27 +35,6 @@ use crate::operator_auth::Origin;
 
 const BODY_CAP: u64 = 4 * 1024;
 
-/// `POST /api/app-installations/<id>/screens/<tag>/mount` → `(id, tag)`.
-pub(super) fn mount_route(path: &str) -> Option<(&str, &str)> {
-    let rest = path.strip_prefix("/api/app-installations/")?;
-    let (install, rest) = rest.split_once("/screens/")?;
-    let (tag, verb) = rest.split_once('/')?;
-    if verb != "mount" || install.is_empty() || install.contains('/') {
-        return None;
-    }
-    if !crate::issue::app_screen_pkg::valid_tag(tag) {
-        return None;
-    }
-    if install.len() > 128
-        || !install
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-    {
-        return None;
-    }
-    Some((install, tag))
-}
-
 /// `GET /api/app-screen/<nonce>` → `Some(nonce)` for exactly that shape.
 pub(super) fn frame_route(path: &str) -> Option<&str> {
     let nonce = path.strip_prefix("/api/app-screen/")?;

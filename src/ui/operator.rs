@@ -262,84 +262,20 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-installations/*/revoke",
         RouteClass::OperatorOnly,
     ),
-    route("POST", "/api/app-installations", RouteClass::OperatorOnly),
     // CAD-1194: the install-check — read-only, but it fetches and
     // validates a source on the host, so it is the operator's like install.
-    route(
-        "POST",
-        "/api/app-installations/check",
-        RouteClass::OperatorOnly,
-    ),
     // CAD-1129: the apps Explorer. The catalog install/git-check and
     // the per-install update-check/remove/restore are the operator's,
     // like every install write; favorites, the workspace default and
     // an install request are the member verbs (`AgentAllowed` admits a
     // named member's session, which the daemon re-proves).
-    route("POST", "/api/app-catalog/install", RouteClass::OperatorOnly),
-    route(
-        "POST",
-        "/api/app-catalog/git-check",
-        RouteClass::OperatorOnly,
-    ),
-    route("POST", "/api/app-catalog/request", RouteClass::AgentAllowed),
-    route("POST", "/api/app-favorites", RouteClass::AgentAllowed),
-    route(
-        "POST",
-        "/api/app-favorites/default",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/app-favorites/opened",
-        RouteClass::AgentAllowed,
-    ),
-    route(
-        "POST",
-        "/api/app-requests/dismiss",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/app-installations/*/update-check",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/app-installations/*/remove-preview",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/app-installations/*/remove",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/app-installations/*/restore",
-        RouteClass::OperatorOnly,
-    ),
     // CAD-996: bounded manual `{files}` bundle upload — operator-only like the
     // sibling install route it stages into.
-    route(
-        "POST",
-        "/api/app-installations/upload",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/app-installations/upload/check",
-        RouteClass::OperatorOnly,
-    ),
     // CAD-1006: the screen mint. Authority is the proven session
     // credential relayed to the daemon, never a caller field; the minted
     // nonce is the frame GET's one-use cap. CAD-1537: a member or a
     // `--read-only` board mounts read-only (`ScreenRead`); the SLOT and
     // tool routes below stay the operator's.
-    route(
-        "POST",
-        "/api/app-installations/*/screens/*/mount",
-        RouteClass::ScreenRead,
-    ),
     route(
         "POST",
         "/api/app-screen-services/call",
@@ -414,21 +350,6 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-social-drafts/effect-stage",
         RouteClass::OperatorOnly,
     ),
-    route(
-        "POST",
-        "/api/app-installations/migrate",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/app-installations/*/recover",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/app-installations/migrations/*/recover",
-        RouteClass::OperatorOnly,
-    ),
     route("POST", "/api/issues", RouteClass::AgentAllowed),
     // CAD-140: filing a report or idea is creating a tracker issue —
     // the same class as `POST /api/issues`, through `report::file`.
@@ -493,11 +414,6 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route(
         "POST",
         "/api/threads/*/conversations",
-        RouteClass::OperatorOnly,
-    ),
-    route(
-        "POST",
-        "/api/app-installations/*/conversations",
         RouteClass::OperatorOnly,
     ),
     // CAD-551: the composer's slash commands and Stop — the daemon's
@@ -2852,10 +2768,14 @@ mod tests {
                 RouteClass::OperatorOnly,
                 "{path}"
             );
+            // Listed in one of the two declarations: the endpoint table for
+            // migrated paths (CAD-1682), otherwise `WRITE_ROUTES`.
             assert!(
                 WRITE_ROUTES.iter().any(|r| r.method == "POST"
                     && r.class == RouteClass::OperatorOnly
-                    && matches(r.pattern, path)),
+                    && matches(r.pattern, path))
+                    || crate::ui::endpoints::class_of("POST", path)
+                        == Some(RouteClass::OperatorOnly),
                 "{path} must be listed, not left to the fail-closed default"
             );
         }

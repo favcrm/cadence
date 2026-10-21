@@ -11,7 +11,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
 
-use super::endpoints::SessionRoute;
+use super::endpoints::RouteId;
+use super::operator::RouteClass;
 use super::serve::{add_security_headers, err_response, json_response};
 use super::ServeOpts;
 use super::{
@@ -682,6 +683,21 @@ pub(crate) fn coded_response(
     resp
 }
 
+/// One explorer write: the row's action and bound id, relayed with the
+/// board's public proof — the same call the chain made after parsing the
+/// path (CAD-1682).
+fn explorer_write(
+    request: &mut Request,
+    state_dir: &Path,
+    opts: &ServeOpts,
+    caller: Option<&operator::Caller>,
+    action: app_explorer::WriteAction,
+    install: Option<&str>,
+) -> HttpResp {
+    let relay = operator::public_relay(request, opts);
+    app_explorer::write(request, action, install, caller, relay, state_dir)
+}
+
 /// Seconds a client should wait before retrying a busy daemon.
 pub(crate) const BUSY_RETRY_AFTER_SECS: u32 = 2;
 
@@ -990,21 +1006,187 @@ pub(crate) fn write_route(
     opts: &ServeOpts,
     send: &dyn Fn(Request, HttpResp),
 ) {
-    // CAD-313 / CAD-777: the session paths — the nonce, or the session
-    // itself, is the credential, and the device pair is the same login
-    // class (unconfigured boards answer 404 inside the handlers). Their
-    // method, path and class are one row in `endpoints::ENDPOINTS`
-    // (CAD-1670), so this dispatch cannot drift from `route_class`.
-    if let Some(endpoint) = endpoints::lookup(path) {
+    // CAD-1664: every route the endpoint table owns dispatches from its row —
+    // method, admission class and bound parameters in one declaration, so the
+    // dispatcher and `route_class` cannot disagree. A path no row owns falls
+    // through to the remaining chain below, unchanged.
+    if let Some(bound) = endpoints::resolve(path) {
+        let endpoint = bound.endpoint;
+        // Admission runs before the method check for every non-Session row:
+        // a read-only board or an unauthenticated caller used to refuse these
+        // paths before the arm's own 405, and must still.
+        let caller = if endpoint.class == RouteClass::Session {
+            None
+        } else {
+            match operator::admit(&request, method.as_str(), path, state_dir, opts) {
+                Ok(caller) => caller,
+                Err(resp) => {
+                    send(request, resp);
+                    return;
+                }
+            }
+        };
         if endpoint.method != method.as_str() {
             send(request, err_response(405, "method not allowed"));
             return;
         }
+        // Validators run after admission, so an unauthenticated caller still
+        // sees the same refusal it saw before the migration.
+        if let Some(resp) = bound.invalid() {
+            send(request, resp);
+            return;
+        }
         let resp = match endpoint.id {
-            SessionRoute::Open => operator::open(&mut request, state_dir, opts),
-            SessionRoute::Logout => operator::logout(&request, state_dir, opts),
-            SessionRoute::DeviceCode => operator::device_code(&mut request, state_dir, opts),
-            SessionRoute::DevicePoll => operator::device_poll(&mut request, state_dir, opts),
+            RouteId::SessionOpen => operator::open(&mut request, state_dir, opts),
+            RouteId::SessionLogout => operator::logout(&request, state_dir, opts),
+            RouteId::SessionDeviceCode => operator::device_code(&mut request, state_dir, opts),
+            RouteId::SessionDevicePoll => operator::device_poll(&mut request, state_dir, opts),
+            RouteId::WorkspaceInstall => {
+                apps::workspace(&mut request, state_dir, "app_workspace_install", None)
+            }
+            RouteId::WorkspaceCheck => {
+                apps::workspace(&mut request, state_dir, "app_workspace_install_check", None)
+            }
+            RouteId::WorkspaceUpload => apps::workspace_upload(&mut request, state_dir),
+            RouteId::WorkspaceUploadCheck => apps::workspace_upload_check(&mut request, state_dir),
+            RouteId::WorkspaceMigrate => {
+                apps::workspace(&mut request, state_dir, "app_workspace_migrate", None)
+            }
+            RouteId::CatalogRecover => apps::workspace(
+                &mut request,
+                state_dir,
+                "app_workspace_migration_recover",
+                bound.get("id"),
+            ),
+            RouteId::WorkspaceRecover => apps::workspace(
+                &mut request,
+                state_dir,
+                "app_workspace_recover",
+                bound.get("id"),
+            ),
+            RouteId::WorkspaceUpgrade => apps::workspace(
+                &mut request,
+                state_dir,
+                "app_workspace_upgrade",
+                bound.get("id"),
+            ),
+            RouteId::WorkspaceUpgradeCheck => apps::workspace(
+                &mut request,
+                state_dir,
+                "app_workspace_upgrade_check",
+                bound.get("id"),
+            ),
+            RouteId::WorkspaceUpgradeRecover => apps::workspace(
+                &mut request,
+                state_dir,
+                "app_workspace_upgrade_recover",
+                bound.get("id"),
+            ),
+            RouteId::Conversations => {
+                let relay = operator::public_relay(&request, opts);
+                threads::post_conversation(
+                    &mut request,
+                    state_dir,
+                    crate::master::ALIAS,
+                    bound.get("id"),
+                    relay,
+                )
+            }
+            RouteId::ExplorerUpdateCheck => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::UpdateCheck,
+                bound.get("id"),
+            ),
+            RouteId::ExplorerRemovePreview => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::RemovePreview,
+                bound.get("id"),
+            ),
+            RouteId::ExplorerRemove => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::Remove,
+                bound.get("id"),
+            ),
+            RouteId::ExplorerRestore => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::Restore,
+                bound.get("id"),
+            ),
+            RouteId::Mount => app_screens::mount(
+                &mut request,
+                state_dir,
+                opts,
+                bound.get("id").unwrap_or_default(),
+                bound.get("tag").unwrap_or_default(),
+            ),
+            RouteId::CatalogInstall => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::CatalogInstall,
+                None,
+            ),
+            RouteId::CatalogGitCheck => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::CatalogGitCheck,
+                None,
+            ),
+            RouteId::CatalogRequest => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::CatalogRequest,
+                None,
+            ),
+            RouteId::FavoriteSet => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::FavoriteSet,
+                None,
+            ),
+            RouteId::FavoriteDefault => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::FavoriteDefault,
+                None,
+            ),
+            RouteId::FavoriteOpened => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::FavoriteOpened,
+                None,
+            ),
+            RouteId::RequestDismiss => explorer_write(
+                &mut request,
+                state_dir,
+                opts,
+                caller.as_ref(),
+                app_explorer::WriteAction::RequestDismiss,
+                None,
+            ),
         };
         send(request, resp);
         return;
@@ -1421,137 +1603,6 @@ pub(crate) fn write_route(
         send(request, response);
         return;
     }
-    // CAD-1098: the app panel's conversations — the master's, scoped to
-    // the installation in the path. Same operator-only class and daemon
-    // proof as `/api/threads/master/conversations`.
-    if let Some(install) = path
-        .strip_prefix("/api/app-installations/")
-        .and_then(|tail| tail.strip_suffix("/conversations"))
-        .filter(|id| !id.is_empty() && !id.contains('/'))
-    {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let relay = operator::public_relay(&request, opts);
-        let resp = threads::post_conversation(
-            &mut request,
-            state_dir,
-            crate::master::ALIAS,
-            Some(install),
-            relay,
-        );
-        send(request, resp);
-        return;
-    }
-    // CAD-1129: the apps Explorer's writes — catalog install/git-check,
-    // per-install update-check/remove/restore, and the member verbs
-    // (favorites, request). Classified in `WRITE_ROUTES`; the daemon's
-    // own caller rule is the second, strict layer.
-    if path == "/api/app-catalog/install"
-        || path == "/api/app-catalog/git-check"
-        || path == "/api/app-catalog/request"
-        || path == "/api/app-favorites"
-        || path == "/api/app-favorites/default"
-        || path == "/api/app-favorites/opened"
-        || path == "/api/app-requests/dismiss"
-        || path.starts_with("/api/app-installations/")
-            && (path.ends_with("/update-check")
-                || path.ends_with("/remove-preview")
-                || path.ends_with("/remove")
-                || path.ends_with("/restore"))
-    {
-        let relay = operator::public_relay(&request, opts);
-        let response = app_explorer::write(
-            &mut request,
-            method,
-            path,
-            caller.as_ref(),
-            relay,
-            state_dir,
-        );
-        send(request, response);
-        return;
-    }
-    let catalog_recovery = path
-        .strip_prefix("/api/app-installations/migrations/")
-        .and_then(|tail| tail.strip_suffix("/recover"))
-        .filter(|id| !id.is_empty() && !id.contains('/'));
-    let install_upgrade_recovery = path
-        .strip_prefix("/api/app-installations/")
-        .and_then(|tail| tail.strip_suffix("/upgrade/recover"))
-        .filter(|id| !id.is_empty() && !id.contains('/'));
-    let install_upgrade_check = path
-        .strip_prefix("/api/app-installations/")
-        .and_then(|tail| tail.strip_suffix("/upgrade/check"))
-        .filter(|id| !id.is_empty() && !id.contains('/'));
-    let install_upgrade = path
-        .strip_prefix("/api/app-installations/")
-        .and_then(|tail| tail.strip_suffix("/upgrade"))
-        .filter(|id| !id.is_empty() && !id.contains('/'));
-    let install_recovery = path
-        .strip_prefix("/api/app-installations/")
-        .and_then(|tail| tail.strip_suffix("/recover"))
-        .filter(|id| !id.is_empty() && !id.contains('/'));
-    if path == "/api/app-installations/migrate"
-        || catalog_recovery.is_some()
-        || install_recovery.is_some()
-        || install_upgrade.is_some()
-        || install_upgrade_check.is_some()
-        || install_upgrade_recovery.is_some()
-    {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let (operation, id) = if let Some(id) = catalog_recovery {
-            ("app_workspace_migration_recover", Some(id))
-        } else if let Some(id) = install_upgrade_recovery {
-            ("app_workspace_upgrade_recover", Some(id))
-        } else if let Some(id) = install_upgrade_check {
-            ("app_workspace_upgrade_check", Some(id))
-        } else if let Some(id) = install_upgrade {
-            ("app_workspace_upgrade", Some(id))
-        } else if let Some(id) = install_recovery {
-            ("app_workspace_recover", Some(id))
-        } else {
-            ("app_workspace_migrate", None)
-        };
-        let response = apps::workspace(&mut request, state_dir, operation, id);
-        send(request, response);
-        return;
-    }
-    // CAD-1194: the read-only install-check — operator-only in
-    // `WRITE_ROUTES`, relays `app_workspace_install_check`.
-    if path == "/api/app-installations/check" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let response =
-            apps::workspace(&mut request, state_dir, "app_workspace_install_check", None);
-        send(request, response);
-        return;
-    }
-    if path == "/api/app-installations" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let response = apps::workspace(&mut request, state_dir, "app_workspace_install", None);
-        send(request, response);
-        return;
-    }
-    // CAD-1006: the private screen mount mint — OperatorOnly, `{}` body.
-    if let Some((install_id, tag)) = app_screens::mount_route(path) {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let response = app_screens::mount(&mut request, state_dir, opts, install_id, tag);
-        send(request, response);
-        return;
-    }
     // CAD-1177: the standalone tool invoke — OperatorOnly write route,
     // relays the live session + mount action context to `app_tool_invoke`.
     if app_screens::tool_route(path) {
@@ -1633,19 +1684,6 @@ pub(crate) fn write_route(
     // staged to a server-derived external temp dir (NOT under pm.dir, which
     // the installer refuses as a source), then installed via the unchanged
     // source-path installer. OperatorOnly in WRITE_ROUTES.
-    if path == "/api/app-installations/upload" || path == "/api/app-installations/upload/check" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let response = if path.ends_with("/check") {
-            apps::workspace_upload_check(&mut request, state_dir)
-        } else {
-            apps::workspace_upload(&mut request, state_dir)
-        };
-        send(request, response);
-        return;
-    }
     // An app approval (CAD-557) — relayed to the daemon's
     // `app_approve`, operator-only on the board (see `apps`).
     if let Some((key, name)) = apps::approve_route(path) {
