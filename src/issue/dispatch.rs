@@ -483,16 +483,46 @@ struct Preflight {
     body: Option<String>,
 }
 
-fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result<Preflight> {
+/// The one pre-dispatch gate every caller shares: resolve the issue, read
+/// it, require acceptance when the caller does, and apply the plan gate.
+/// Authority, claim and target checks stay with the caller — this only
+/// removes the duplicated load/acceptance/plan sequence.
+pub(crate) struct GatedIssue {
+    pub project: crate::issue::project::Project,
+    pub dir: PathBuf,
+    pub front: Front,
+    pub items: Vec<AcceptanceItem>,
+}
+
+pub(crate) fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<GatedIssue> {
     let (project, dir) = write::issue_dir(pm, id)?;
     let (front, body) = write::load_front(&dir)?;
-    // CAD-360: a ticket of a plan dispatches only once the operator
-    // approved the plan, and only with acceptance. Issues in no plan
-    // pass unchanged.
+    let items = parse::acceptance_items(&body);
+    if require_acceptance && items.is_empty() {
+        return Err(Error::rejected(format!(
+            "{id} has no acceptance criteria — add them with \
+             `cadence issue acceptance {id} --from <file>` before kickoff"
+        )));
+    }
     crate::issue::plan::gate(&pm.dir, &front, &body)?;
+    Ok(GatedIssue {
+        project,
+        dir,
+        front,
+        items,
+    })
+}
+
+fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result<Preflight> {
+    let GatedIssue {
+        project,
+        dir,
+        front,
+        items,
+        ..
+    } = gate_issue(pm, id, false)?;
     // CAD-159: the CAD-238 section-scoped readback. No items warns;
     // it never refuses (PM decision, ADR-0002 §8.3).
-    let items = parse::acceptance_items(&body);
     let acceptance_warning = items
         .is_empty()
         .then(|| acceptance_warning(&front.id, true));
