@@ -96,7 +96,10 @@ impl Fx {
 }
 
 fn fx() -> Fx {
-    let dir = tempfile::Builder::new().prefix("cad1700").tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("cad1700")
+        .tempdir()
+        .unwrap();
     let pm = dir.path().join("pm");
     crate::issue::Pm::init(&pm).unwrap();
     let opts = ServeOptions {
@@ -148,18 +151,12 @@ fn fx() -> Fx {
             None,
         )
         .unwrap();
-    Fx {
-        _dir: dir,
-        shared,
-    }
+    Fx { _dir: dir, shared }
 }
 
 fn refusal(r: Result<Value>) -> (String, String) {
     let e = r.expect_err("expected a refusal");
-    (
-        e.code().unwrap_or_default().to_string(),
-        e.to_string(),
-    )
+    (e.code().unwrap_or_default().to_string(), e.to_string())
 }
 
 #[test]
@@ -192,8 +189,16 @@ fn cad1700_an_agent_caller_cannot_stop_or_cancel_a_master_turn() {
             "cancel from an agent is refused by the operator gate: {text}"
         );
     }
-    assert_eq!(fx.state("m-run"), "running", "the running turn is untouched");
-    assert_eq!(fx.state("m-queued"), "queued", "the queued message is untouched");
+    assert_eq!(
+        fx.state("m-run"),
+        "running",
+        "the running turn is untouched"
+    );
+    assert_eq!(
+        fx.state("m-queued"),
+        "queued",
+        "the queued message is untouched"
+    );
 }
 
 #[test]
@@ -208,11 +213,17 @@ fn cad1700_stop_refuses_anything_but_the_current_running_turn() {
 
     for message in ["m-queued", "m-old", "m-missing"] {
         let (code, text) = refusal(fx.command("stop", Some(message)));
-        assert_eq!(code, "turn_not_running", "stop {message} is refused: {text}");
+        assert_eq!(
+            code, "turn_not_running",
+            "stop {message} is refused: {text}"
+        );
     }
     // A stale click: `m-old` was the running turn once, `m-new` runs now.
     let (code, _) = refusal(fx.command("stop", Some("m-old")));
-    assert_eq!(code, "turn_not_running", "a stale id never reaches the newer turn");
+    assert_eq!(
+        code, "turn_not_running",
+        "a stale id never reaches the newer turn"
+    );
     assert_eq!(fx.state("m-new"), "running", "the newer turn still runs");
 
     // Positive control: the running id passes the guard (the fixture
@@ -270,12 +281,28 @@ fn cad1700_cancel_refuses_everything_but_the_operators_own_queued_message() {
             "{message} is not an operator message queued to the master"
         );
     }
-    assert_eq!(fx.state("m-w1"), "queued", "another agent's queue is untouched");
-    assert_eq!(fx.state("m-daemon"), "queued", "a daemon message is untouched");
+    assert_eq!(
+        fx.state("m-w1"),
+        "queued",
+        "another agent's queue is untouched"
+    );
+    assert_eq!(
+        fx.state("m-daemon"),
+        "queued",
+        "a daemon message is untouched"
+    );
 
     // Positive control: the operator's own queued message is cancelled,
     // and its neighbour is not.
     fx.command("cancel", Some("m-mine")).unwrap();
-    assert_eq!(fx.state("m-mine"), "cancelled", "the operator's own queued message is cancelled");
-    assert_eq!(fx.state("m-other"), "queued", "the message behind it is untouched");
+    assert_eq!(
+        fx.state("m-mine"),
+        "cancelled",
+        "the operator's own queued message is cancelled"
+    );
+    assert_eq!(
+        fx.state("m-other"),
+        "queued",
+        "the message behind it is untouched"
+    );
 }

@@ -296,7 +296,13 @@ impl Store {
                 [alias],
                 |r| r.get(0),
             )?;
-            Ok((live.0, live.1, live.2, entries, (transition * 1000.0) as i64))
+            Ok((
+                live.0,
+                live.1,
+                live.2,
+                entries,
+                (transition * 1000.0) as i64,
+            ))
         })
     }
 

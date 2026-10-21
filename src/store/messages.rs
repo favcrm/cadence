@@ -3257,7 +3257,11 @@ mod master_stamp_tests {
     fn master_stamp_moves_on_enqueue_run_finish_and_thread_entry() {
         let (_dir, store) = open();
         let quiet = store.master_stamp("master").unwrap();
-        assert_eq!(store.master_stamp("master").unwrap(), quiet, "an idle master is stable");
+        assert_eq!(
+            store.master_stamp("master").unwrap(),
+            quiet,
+            "an idle master is stable"
+        );
 
         store
             .enqueue("master", "one", None, "m-1", "operator")
@@ -3284,7 +3288,10 @@ mod master_stamp_tests {
             )
             .unwrap();
         let entry = store.master_stamp("master").unwrap();
-        assert!(entry.3 > running.3, "a thread entry moves the newest entry seq");
+        assert!(
+            entry.3 > running.3,
+            "a thread entry moves the newest entry seq"
+        );
 
         store
             .finish_running("m-1", "completed", &json!({"text": "done"}), None)
