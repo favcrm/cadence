@@ -13,7 +13,7 @@ import {
 const boot = {
   tag: "tag-1",
   bridge_nonce: "a".repeat(64),
-  generation: "gen-1",
+  generation: 1,
   parent_origin: "https://board.example",
 };
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -66,12 +66,21 @@ const push = (overrides = {}) => ({
   ...overrides,
 });
 
-test("boot validation pins origin, nonce and keys", () => {
+test("boot validation pins origin, nonce, tag and numeric generation", () => {
   assert.equal(validateBoot(boot).parent_origin, "https://board.example");
-  assert.equal(validateBoot({ ...boot, parent_origin: "http://localhost:5173" }).parent_origin, "http://localhost:5173");
-  assert.throws(() => validateBoot({ ...boot, parent_origin: "http://board.example" }), /https or loopback/);
+  assert.equal(validateBoot({ ...boot, generation: 0 }).generation, 0);
+  assert.equal(
+    validateBoot({ ...boot, parent_origin: "http://cadence-1234.localhost:1234" }).parent_origin,
+    "http://cadence-1234.localhost:1234",
+  );
+  assert.throws(() => validateBoot({ ...boot, parent_origin: "http://127.0.0.1:3000" }), /loopback/);
+  assert.throws(() => validateBoot({ ...boot, parent_origin: "http://board.example" }), /loopback/);
   assert.throws(() => validateBoot({ ...boot, parent_origin: "https://board.example/path" }), /origin/);
   assert.throws(() => validateBoot({ ...boot, bridge_nonce: "a".repeat(63) }), /64 lowercase hex/);
+  assert.throws(() => validateBoot({ ...boot, generation: "1" }), /safe integer/);
+  assert.throws(() => validateBoot({ ...boot, generation: -1 }), /safe integer/);
+  assert.throws(() => validateBoot({ ...boot, tag: "Tag-1" }), /lowercase/);
+  assert.throws(() => validateBoot({ ...boot, tag: "a.b" }), /lowercase/);
   assert.throws(() => validateBoot({ ...boot, extra: true }), /exactly/);
 });
 
@@ -149,7 +158,7 @@ test("call resolves on a reply and maps a refusal to its status", async () => {
 });
 
 test("a tool request carries alias, input and request_id without a verb", async () => {
-  const { host, inbox, pushes, receiver } = connect();
+  const { host, inbox, pushes, receiver } = connect({ accepts: ["screen.v2", "screen-actions.v1"] });
   host.postMessage(push());
   await waitFor(() => pushes.length === 1, "the first push");
   const pending = receiver.tool("social.publish", { draft: 1 }, "req-1");
@@ -220,7 +229,7 @@ test("a v1-only receiver refuses the v2 action channel", async () => {
 });
 
 test("request shapes are bounded at send time", async () => {
-  const { host, inbox, pushes, receiver } = connect();
+  const { host, inbox, pushes, receiver } = connect({ accepts: ["screen.v2", "screen-actions.v1"] });
   host.postMessage(push());
   await waitFor(() => pushes.length === 1, "the first push");
   await assert.rejects(receiver.call("read.run", "not-an-object"), /plain object/);
@@ -250,4 +259,79 @@ test("a slot resolves the host's event, not just its state", async () => {
     state: "done",
     receipt: { run_id: "r1", request_id: "req-1", state: "done" },
   });
+});
+
+test("the tool channel requires the screen-actions.v1 negotiation", async () => {
+  const { receiver } = connect();
+  await assert.rejects(receiver.tool("social.publish", {}, "req-1"), (error) => {
+    assert.ok(error instanceof ScreenClosedError);
+    assert.match(error.message, /screen-actions\.v1/);
+    return true;
+  });
+});
+
+test("a reply with the wrong version or request kind tears down", async () => {
+  const { host, inbox, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const pending = receiver.call("read.run", {});
+  const rejected = assert.rejects(pending, ScreenClosedError);
+  const request = await waitFor(() => inbox.find((m) => m.op === "call"), "the call");
+  host.postMessage({ v: 2, op: "tool-reply", id: request.id, ok: true, data: {} });
+  await waitFor(() => errors.length === 1, "the kind teardown");
+  await rejected;
+
+  const second = connect();
+  second.host.postMessage(push());
+  await waitFor(() => second.pushes.length === 1, "the second push");
+  const waiting = second.receiver.call("read.run", {});
+  const waitingRejected = assert.rejects(waiting, ScreenClosedError);
+  const req = await waitFor(() => second.inbox.find((m) => m.op === "call"), "the second call");
+  second.host.postMessage({ v: 1, op: "reply", id: req.id, ok: true, data: {} });
+  await waitFor(() => second.errors.length === 1, "the version teardown");
+  await waitingRejected;
+});
+
+test("a slot stays open through pending and resolves on done", async () => {
+  const events = [];
+  const { host, inbox, pushes, receiver } = connect({ onSlotState: (event) => events.push(event) });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const pending = receiver.slot("publish.cancel", {}, "footer");
+  const request = await waitFor(() => inbox.find((m) => m.op === "slot"), "the slot request");
+  host.postMessage({ v: 2, op: "slot-state", id: request.id, state: "pending" });
+  await tick();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].state, "pending");
+  assert.equal(await Promise.race([pending.then(() => "resolved"), tick().then(() => "open")]), "open");
+  const receipt = { run_id: "run-" + "c".repeat(32), request_id: "req-1", state: "done" };
+  host.postMessage({ v: 2, op: "slot-state", id: request.id, state: "done", receipt });
+  assert.deepEqual(await pending, { state: "done", receipt });
+});
+
+test("an asset reply outside the image contract tears down", async () => {
+  const { host, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const pending = receiver.asset("media:1");
+  const rejected = assert.rejects(pending, ScreenClosedError);
+  await tick();
+  host.postMessage({ v: 2, op: "asset", ref: "media:1", data_url: "https://evil.example/x.png" });
+  await waitFor(() => errors.length === 1, "the asset teardown");
+  await rejected;
+});
+
+test("a refused boot returns an inert receiver whose calls also report closed", async () => {
+  const errors = [];
+  const receiver = createScreenReceiver({
+    boot: { ...boot, generation: "1" },
+    parent: { postMessage() {} },
+    onPush() {},
+    onError: (reason) => errors.push(reason),
+  });
+  assert.equal(receiver.boot, null);
+  assert.equal(errors.length, 1);
+  await assert.rejects(receiver.call("read.run", {}), ScreenClosedError);
+  await assert.rejects(receiver.asset("media:1"), ScreenClosedError);
+  assert.equal(receiver.state("x"), false);
 });

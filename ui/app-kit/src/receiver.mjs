@@ -20,8 +20,9 @@ export const DEFAULT_TIMEOUT_MS = 15_000;
 
 const BOOT_ID = "cadence-screen-boot";
 const BOOT_KEYS = ["bridge_nonce", "generation", "parent_origin", "tag"];
-const TAG = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const TAG = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const NONCE = /^[0-9a-f]{64}$/;
+const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 // Wire bounds from `screenProtocol.ts`: ACTION_ID, TOOL_ALIAS,
 // TOOL_REQUEST_ID, ACTION_ARGS_BYTES and COORD_MAX. The receiver enforces the
 // shape; which verbs an app may send stays the app's closed set.
@@ -29,11 +30,20 @@ const ACTION_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const TOOL_ALIAS = /^[a-z][a-z0-9]{0,31}(\.[a-z][a-z0-9]{0,31}){0,3}$/;
 const TOOL_REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const ACTION_ARGS_BYTES = 16 * 1024;
+const ASSET_DATA_URL = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+=*$/;
 const COORD_MAX = 16384;
-const LOOPBACK = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
 function fail(message) {
   throw new TypeError(message);
+}
+
+/** The one http parent the host serves: `http://<name>.localhost:<port>`.
+ *  No IP literals, no bare host without a port, no credentials (checked by
+ *  the caller), and the origin must round-trip exactly. */
+function loopbackHttp(origin) {
+  if (origin.protocol !== "http:" || origin.port === "" || Number(origin.port) < 1) return false;
+  const labels = origin.hostname.split(".");
+  return labels.at(-1) === "localhost" && labels.every((label) => DNS_LABEL.test(label)) && origin.hostname.length <= 253;
 }
 
 export function validateBoot(value) {
@@ -42,10 +52,10 @@ export function validateBoot(value) {
   if (keys.length !== BOOT_KEYS.length || keys.some((key) => !BOOT_KEYS.includes(key))) {
     fail("boot keys must be exactly bridge_nonce, generation, parent_origin, tag");
   }
-  if (!TAG.test(value.tag ?? "")) fail("boot tag is malformed");
+  if (!TAG.test(value.tag ?? "")) fail("boot tag must be 1-32 lowercase letters, digits or dashes, not leading with a dash");
   if (!NONCE.test(value.bridge_nonce ?? "")) fail("boot bridge_nonce must be 64 lowercase hex");
-  if (typeof value.generation !== "string" || value.generation.length === 0 || value.generation.length > 128) {
-    fail("boot generation must be a non-empty string of at most 128 characters");
+  if (typeof value.generation !== "number" || !Number.isSafeInteger(value.generation) || value.generation < 0) {
+    fail("boot generation must be a non-negative safe integer");
   }
   let origin;
   try {
@@ -53,11 +63,11 @@ export function validateBoot(value) {
   } catch {
     fail("boot parent_origin must be an absolute origin");
   }
-  const loopback = LOOPBACK.has(origin.hostname) || origin.hostname.endsWith(".localhost");
-  if (!(origin.protocol === "https:" || (origin.protocol === "http:" && loopback))) {
-    fail("boot parent_origin must be https or loopback http");
-  }
+  if (origin.username || origin.password) fail("boot parent_origin must not carry credentials");
   if (origin.origin !== value.parent_origin) fail("boot parent_origin must be an origin, not a path");
+  if (!(origin.protocol === "https:" || loopbackHttp(origin))) {
+    fail("boot parent_origin must be https or the host's loopback http origin");
+  }
   return Object.freeze({
     tag: value.tag,
     bridge_nonce: value.bridge_nonce,
@@ -111,7 +121,7 @@ function byteLength(value) {
 }
 
 function inert(reason) {
-  const refuse = () => Promise.reject(new Error(`screen bridge is closed: ${reason}`));
+  const refuse = () => Promise.reject(new ScreenClosedError(`screen bridge is closed: ${reason}`));
   return Object.freeze({
     boot: null,
     accepted: () => false,
@@ -142,15 +152,23 @@ export function createScreenReceiver(options = {}) {
     onError,
     accepts = ["screen.v2"],
     timeoutMs = DEFAULT_TIMEOUT_MS,
+    onSlotState,
     document: documentRef = globalThis.document,
     parent = globalThis.parent,
     window: windowRef = globalThis.window,
     MessageChannel: Channel = globalThis.MessageChannel,
   } = options;
   if (typeof onPush !== "function") throw new TypeError("onPush is required");
-  if (!Array.isArray(accepts) || accepts.length === 0 || accepts.some((v) => !/^screen\.v[12]$/.test(v))) {
-    throw new TypeError("accepts must name screen.v1 and/or screen.v2");
+  const ACCEPTED = new Set(["screen.v1", "screen.v2", "screen-actions.v1"]);
+  if (
+    !Array.isArray(accepts) ||
+    accepts.length === 0 ||
+    accepts.some((value) => !ACCEPTED.has(value)) ||
+    !accepts.some((value) => value === "screen.v1" || value === "screen.v2")
+  ) {
+    throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1");
   }
+  const actionsAccepted = accepts.includes("screen-actions.v1");
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new TypeError("timeoutMs must be positive");
   if (!parent || typeof parent.postMessage !== "function") throw new TypeError("a parent window is required");
   if (typeof Channel !== "function") throw new TypeError("MessageChannel is unavailable");
@@ -191,7 +209,7 @@ export function createScreenReceiver(options = {}) {
       entry.reject(new ScreenClosedError(`screen bridge closed: ${reason}`));
     }
     pending.clear();
-    for (const resolve of assets.values()) resolve.fail?.(new Error(`screen bridge closed: ${reason}`));
+    for (const entry of assets.values()) entry.fail?.(new ScreenClosedError(`screen bridge closed: ${reason}`));
     assets.clear();
     if (notify) onError?.(reason);
   };
@@ -213,7 +231,7 @@ export function createScreenReceiver(options = {}) {
         pending.delete(id);
         reject(new ScreenTimeoutError(id, timeoutMs));
       }, timeoutMs);
-      pending.set(id, { resolve, reject, timer });
+      pending.set(id, { resolve, reject, timer, kind });
       sent.add(id);
       try {
         post({ v: 2, op: kind, id, ...body });
@@ -225,30 +243,43 @@ export function createScreenReceiver(options = {}) {
     });
   };
 
+  const expectedOp = { call: "reply", slot: "slot-state", tool: "tool-reply" };
+
   const settle = (message) => {
     const entry = pending.get(message.id);
     if (!entry) return sent.has(message.id); // a late reply is ignored, not fatal
-    pending.delete(message.id);
-    clearTimeout(entry.timer);
+    if (message.v !== 2) throw new Error(`${message.op} must be v2`);
+    if (message.op !== expectedOp[entry.kind]) {
+      throw new Error(`${entry.kind} answered with ${message.op}`);
+    }
     if (message.op === "slot-state") {
-      // A slot is a host-drawn control: `done` may carry a receipt or data,
-      // and `refused` carries a refusal. The child resolves the event as-is
-      // (minus `id`/`op`/`v`) so the app maps its own outcome.
+      // A slot is a host-drawn control: `pending` is progress, not a result.
+      // Keep the request open (and stop its clock) until `done`/`refused` so
+      // a later receipt is never discarded.
+      if (!["pending", "done", "refused"].includes(message.state)) throw new Error("malformed slot-state");
       if (message.refusal !== undefined && !readRefusal(message.refusal)) {
-        entry.reject(new Error("malformed slot-state refusal"));
-        return true;
+        throw new Error("malformed slot-state refusal");
       }
       const { id: _id, op: _op, v: _v, ...event } = message;
+      if (message.state === "pending") {
+        clearTimeout(entry.timer);
+        onSlotState?.(event);
+        return true;
+      }
+      pending.delete(message.id);
+      clearTimeout(entry.timer);
       entry.resolve(event);
       return true;
     }
+    pending.delete(message.id);
+    clearTimeout(entry.timer);
     if (message.ok === true) {
       entry.resolve(message.data);
       return true;
     }
     const refusal = readRefusal(message.refusal);
     if (message.ok === false && refusal) entry.reject(new ScreenRefusalError(refusal));
-    else entry.reject(new Error(`malformed ${message.op} reply`));
+    else throw new Error(`malformed ${message.op} reply`);
     return true;
   };
 
@@ -260,11 +291,13 @@ export function createScreenReceiver(options = {}) {
       if (!message || typeof message !== "object" || Array.isArray(message)) fail("non-object message");
       if (message.op === "asset") {
         if (message.v !== 2) fail("asset reply must be v2");
+        if (Object.keys(message).sort().join() !== "data_url,op,ref,v") fail("asset reply has extra or missing keys");
         const entry = assets.get(message.ref);
         if (!entry) fail("unsolicited asset reply");
         if (typeof message.data_url !== "string" || byteLength(message.data_url) > MAX_ASSET_BYTES) {
-          fail("asset reply is malformed or over the bound");
+          fail("asset reply is over the bound");
         }
+        if (!ASSET_DATA_URL.test(message.data_url)) fail("asset reply is not an image data URL");
         assets.delete(message.ref);
         entry.resolve(message.data_url);
         return;
@@ -329,6 +362,9 @@ export function createScreenReceiver(options = {}) {
       return request("slot", { verb, args, anchor });
     },
     tool(alias, input = {}, requestId) {
+      if (!actionsAccepted) {
+        return Promise.reject(new ScreenClosedError('the tool channel needs accepts to include "screen-actions.v1"'));
+      }
       if (typeof alias !== "string" || !TOOL_ALIAS.test(alias)) {
         return Promise.reject(new TypeError("tool alias is malformed"));
       }

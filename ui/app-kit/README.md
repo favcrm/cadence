@@ -52,9 +52,19 @@ reference receiver and `screenProtocol.ts`):
 - `call`/`slot`/`tool` and `asset` open only after a `screen.v2` PUSH; before
   that, and on a v1-only mount, they reject with `ScreenClosedError`
   (`code: "gone"`) instead of posting a request the host cannot answer.
+- `tool` additionally requires `accepts` to include `screen-actions.v1`; the
+  host closes a port that sends a tool call without the negotiation.
+- A slot's `pending` event arrives through `onSlotState` and leaves the
+  promise open; only `done`/`refused` settle it, so the receipt is never lost.
+- Host replies must be `v:2` and answer the request's own kind (`call`→`reply`,
+  `slot`→`slot-state`, `tool`→`tool-reply`); anything else tears the port down.
+- Asset replies carry `data:image/(jpeg|png|webp);base64,…` within the bound.
 - `args`/`input` are plain objects within 16 KiB; `anchor` is exactly
   `{x,y,w,h}` in frame coordinates (or `"footer"`); ids follow
   `ACTION_ID`, tool aliases `TOOL_ALIAS`, `request_id` `TOOL_REQUEST_ID`.
+- Boot `generation` is a non-negative safe integer; `tag` is 1–32 lowercase
+  letters/digits/dashes, and an `http` parent is only the host's
+  `*.localhost:<port>` origin.
 - The first accepted PUSH pins `v`/`install_id`/`digest`/`context_id`; any
   later disagreement tears the port down.
 - Teardown rejects every outstanding request with `ScreenClosedError`, so no

@@ -1,7 +1,7 @@
 export interface ScreenBoot {
   tag: string;
   bridge_nonce: string;
-  generation: string;
+  generation: number;
   parent_origin: string;
 }
 
@@ -19,7 +19,8 @@ export interface ScreenReceiverOptions {
   boot?: ScreenBoot;
   onPush(push: ScreenPush): void;
   onError?(reason: string): void;
-  accepts?: readonly ("screen.v1" | "screen.v2")[];
+  onSlotState?(event: SlotState): void;
+  accepts?: readonly ("screen.v1" | "screen.v2" | "screen-actions.v1")[];
   timeoutMs?: number;
   document?: { getElementById(id: string): { textContent: string | null } | null };
   parent?: { postMessage(message: unknown, origin: string, transfer?: unknown[]): void };
@@ -28,7 +29,7 @@ export interface ScreenReceiverOptions {
 }
 
 export interface SlotState {
-  state?: "pending" | "done" | "refused";
+  state: "pending" | "done" | "refused";
   receipt?: unknown;
   data?: unknown;
   refusal?: { code: string; text: string };
