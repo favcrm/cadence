@@ -176,11 +176,78 @@ groups.
 
 ## 7. What this spike does not settle
 
-- Whether `matchit`'s segment rules cover every existing pattern. The inventory
-  above suggests they do; slice 1 must prove it with a test that builds the
-  router from the table and asserts each row matches a synthesized concrete path.
+- Router mechanics: §8 decides against a router for now, so there is nothing to
+  prove there until a catch-all row or ~100 rows arrive.
 - Whether `Ctx` can stay borrow-friendly for handlers that mutate the request
   (uploads read the body) — slice 1 answers it on the smallest handler.
 - The TypeScript side. Codegen from Rust is not currently possible — 3 of the UI's
   102 interfaces have a Rust `Serialize` counterpart; the rest are `json!`
   literals. That is a separate prerequisite, not part of this migration.
+
+## 8. Parameterised rows: per-segment validation (CAD-1677)
+
+Slice 2 cannot move on segment patterns alone: some shapes validate the values
+they bind, and a plain `{id}` row would drop that check. The `/api/app-installations/`
+write stem, as it stands:
+
+| Arm (`src/ui/write_path.rs`) | Shape today | Validation | Failure today |
+|---|---|---|---|
+| 1438 | `POST /{id}/conversations` | id non-empty, no `/` | falls through → `404 no such write route` |
+| 1462 | `POST /{id}/{update-check,remove-preview,remove,restore}`, **any** middle segments | id non-empty | empty id → `400 missing installation id` inside `app_explorer::write`; extra segments dispatch when the second segment is a verb |
+| 1488-1531 | `/migrate`, `/{id}/recover`, `/{id}/upgrade`, `/{id}/upgrade/check`, `/{id}/upgrade/recover`, `/migrations/{id}/recover` | id non-empty, no `/` | falls through → `404 no such write route` |
+| 1537, 1547 | `/check`, exact `/api/app-installations` | none | — |
+| 1647 | `/upload`, `/upload/check` | none | — |
+| `app_screens::mount_route` | `POST /{id}/screens/{tag}/mount` | id: non-empty, ≤128, `[A-Za-z0-9_-]`; tag: `valid_tag` | falls through → `404 no such write route` |
+
+**Row shape.** A row binds named parameters and may validate them; the failure
+status and message are part of the row because they differ today.
+
+```rust
+struct Endpoint {
+    id: RouteId,
+    method: &'static str,
+    pattern: &'static str,            // "/api/app-installations/{id}/remove"
+    class: RouteClass,
+    bindings: &'static [Binding],
+}
+
+struct Binding {
+    name: &'static str,
+    validate: fn(&str) -> bool,
+    invalid: (u16, &'static str),     // what that arm answers today
+}
+```
+
+`lookup` returns the row and its validated bindings. A validator that fails
+answers the row's `invalid` pair and never reaches admission or a handler. The
+pair is per row, so `mount` keeps `404 no such write route` and the explorer id
+keeps `400 missing installation id`; a single global "404 on invalid" would
+change an observable status.
+
+**Precedence.** Rows are tried in declaration order, so `/migrations/{id}/recover`
+must precede `/{id}/recover` (the id validator accepts `migrations`). A test pins
+that pair, because first-match order is the only thing that distinguishes them.
+
+**Dispatch is broader than classification today.** The suffix family dispatches
+`/{id}/<verb>/<anything>` (handler reads two segments) while its `WRITE_ROUTES`
+pattern `/{id}/<verb>` binds one segment, so such a request is already classified
+`OperatorOnly` by the fail-closed default. The table adopts the narrow shape for
+both, which is invariant 6's narrowing and is why the malformed form becomes a
+clean `404` instead of an admitted handler that answers `404` itself.
+
+**Router.** Still no dependency. After this slice the table holds roughly 30 rows
+and a linear scan is free; precedence is explicit and tested. Buy a router only
+when a catch-all row appears or the table passes ~100 rows.
+
+**Complete slice-2 row list** (all `POST`): the six rows of the recovery/migrate
+family, `check`, the exact install path, `upload`, `upload/check`, the explorer
+exact paths (`/api/app-catalog/{install,git-check,request}`,
+`/api/app-favorites`, `/api/app-favorites/{default,opened}`,
+`/api/app-requests/dismiss`), the four `/{id}/{update-check,remove-preview,remove,restore}`
+rows, `/{id}/conversations`, and `/{id}/screens/{tag}/mount`. The read half of
+the same stem is slice 3; `serialized_write` is untouched.
+
+**Checks the implementation runs for each moved row:** the row answers the same
+status and body for a valid path, the same `invalid` pair for its failing
+validator, `405` for a wrong method, and `404` for the malformed extra-segment
+form (invariant 6). The precedence pair gets its own test.
