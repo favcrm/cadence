@@ -410,7 +410,12 @@ pub(super) fn resolve<'p>(method: &str, path: &'p str) -> Option<Bound<'p>> {
 /// falling through to the legacy `404`. The returned row's method is *not*
 /// the request's; the caller must check.
 pub(super) fn resolve_or_path<'p>(method: &str, path: &'p str) -> Option<Bound<'p>> {
-    resolve(method, path).or_else(|| ENDPOINTS.iter().find_map(|endpoint| bind(endpoint, path)))
+    resolve(method, path).or_else(|| {
+        ENDPOINTS
+            .iter()
+            .filter(|endpoint| endpoint.method != "GET")
+            .find_map(|endpoint| bind(endpoint, path))
+    })
 }
 
 fn bind<'p>(endpoint: &'static Endpoint, path: &'p str) -> Option<Bound<'p>> {
@@ -576,6 +581,10 @@ mod tests {
         assert_eq!(bound.endpoint.method, "POST");
         assert_eq!(bound.endpoint.id, RouteId::ExplorerRemove);
         assert!(resolve("PATCH", "/api/app-installations/inst-1/remove").is_none());
+        // A read-only pattern has no write row: the fallback must not borrow
+        // the GET row, or a bare POST would answer 405 instead of the
+        // admitted `404 no such write route`.
+        assert!(resolve_or_path("POST", "/api/app-installations/inst-1").is_none());
     }
 
     #[test]
