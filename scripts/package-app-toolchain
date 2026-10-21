@@ -83,6 +83,14 @@ def main():
         shutil.copyfile(ROOT / "app-toolchain/README.md", stage / "README.md")
         shutil.copyfile(ROOT / "LICENSE", stage / "LICENSE")
         app_kit = ROOT / "ui/app-kit"
+        unlisted = sorted(
+            str(path.relative_to(app_kit))
+            for base in ("src", "types")
+            for path in (app_kit / base).rglob("*")
+            if path.is_file() and str(path.relative_to(app_kit)) not in APP_KIT_FILES
+        )
+        if unlisted:
+            fail("app-kit source files are not in APP_KIT_FILES: " + ", ".join(unlisted))
         app_kit_version = json.loads((app_kit / "package.json").read_text())["version"]
         app_kit_files = {}
         for relative in APP_KIT_FILES:
