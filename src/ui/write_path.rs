@@ -1054,9 +1054,10 @@ pub(crate) fn write_route(
         let resp = match endpoint.id {
             // The read rows never reach this dispatcher: `read_dispatch`
             // answers them from `handle` before a write is considered.
-            RouteId::WorkspaceList | RouteId::WorkspaceShow | RouteId::ConversationsRead => {
-                err_response(500, "a read row reached the write dispatcher")
-            }
+            RouteId::WorkspaceList
+            | RouteId::WorkspaceShow
+            | RouteId::ConversationsRead
+            | RouteId::AgentDetail => err_response(500, "a read row reached the write dispatcher"),
             RouteId::SessionOpen => operator::open(&mut request, state_dir, opts),
             RouteId::SessionLogout => operator::logout(&request, state_dir, opts),
             RouteId::SessionDeviceCode => operator::device_code(&mut request, state_dir, opts),

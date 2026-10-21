@@ -39,6 +39,7 @@ pub(super) enum RouteId {
     WorkspaceList,
     WorkspaceShow,
     ConversationsRead,
+    AgentDetail,
     ExplorerUpdateCheck,
     ExplorerRemovePreview,
     ExplorerRemove,
@@ -128,6 +129,23 @@ const SHOW_ID: &[Binding] = &[Binding {
     validate: non_empty,
     invalid: (404, "not found"),
 }];
+
+/// The agent-detail alias: the arm's own grammar, with its own 400.
+const ALIAS_BINDING: &[Binding] = &[Binding {
+    name: "alias",
+    allow_empty: true,
+    validate: valid_alias,
+    invalid: (400, "bad agent alias"),
+}];
+
+/// `[A-Za-z0-9._-]{1,80}`, as the read arm enforced before the table.
+fn valid_alias(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 80
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
 
 const MOUNT_BINDINGS: &[Binding] = &[
     Binding {
@@ -257,6 +275,12 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
         "/api/app-installations/{id}/conversations",
         OperatorOnly,
         INSTALL_ID
+    ),
+    get!(
+        AgentDetail,
+        "/api/agents/{alias}",
+        CallerScoped,
+        ALIAS_BINDING
     ),
     row!(
         ExplorerUpdateCheck,
@@ -485,7 +509,8 @@ mod tests {
             let probe = row
                 .pattern
                 .replace("{id}", "inst-1")
-                .replace("{tag}", "screen");
+                .replace("{tag}", "screen")
+                .replace("{alias}", "swe-1");
             let bound = resolve(row.method, &probe).expect("a declared pattern resolves");
             if bound.endpoint.id != row.id {
                 // `GET /api/app-installations/{id}` and the POST rows share a
@@ -585,6 +610,39 @@ mod tests {
         // the GET row, or a bare POST would answer 405 instead of the
         // admitted `404 no such write route`.
         assert!(resolve_or_path("POST", "/api/app-installations/inst-1").is_none());
+    }
+
+    #[test]
+    fn the_agent_detail_keeps_its_alias_grammar() {
+        let bound = resolve("GET", "/api/agents/swe-1.high").expect("a valid alias binds");
+        assert_eq!(bound.endpoint.id, RouteId::AgentDetail);
+        assert_eq!(bound.get("alias"), Some("swe-1.high"));
+        assert!(bound.invalid().is_none());
+
+        // Empty and illegal aliases bind and answer the arm's own 400.
+        for path in [
+            "/api/agents/",
+            "/api/agents/bad alias",
+            "/api/agents/with%20space",
+        ] {
+            let Some(bound) = resolve("GET", path) else {
+                continue; // `%20` decodes to a space before this point.
+            };
+            let response = bound.invalid().expect("the alias is invalid");
+            assert_eq!(response.status_code().0, 400, "{path}");
+        }
+        let bound = resolve("GET", "/api/agents/").expect("an empty alias binds");
+        assert_eq!(bound.invalid().expect("invalid").status_code().0, 400);
+        let long = format!("/api/agents/{}", "a".repeat(81));
+        assert_eq!(
+            resolve("GET", &long)
+                .expect("binds")
+                .invalid()
+                .expect("invalid")
+                .status_code()
+                .0,
+            400
+        );
     }
 
     #[test]
