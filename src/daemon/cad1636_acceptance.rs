@@ -253,13 +253,7 @@ impl Fx {
         let state = root.path().to_path_buf();
         let pm = state.join("pm");
         crate::issue::Pm::init(&pm).unwrap();
-        let (port, reservation) = (3110..3200)
-            .find_map(|port| {
-                std::net::TcpListener::bind(("127.0.0.1", port))
-                    .ok()
-                    .map(|listener| (port, listener))
-            })
-            .expect("fixture BLOCKED: no isolated board port in 3110-3199");
+        let (port, reservation) = crate::test_ports::reserve_board_port();
         let host = format!("c1636.board.localhost:{port}");
         let issuer = format!("http://127.0.0.1:{port}");
         crate::board_identity::write_config(
