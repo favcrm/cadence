@@ -462,6 +462,30 @@ pub(crate) enum AgentAction {
         #[arg(long)]
         force: bool,
     },
+    /// Archive a stopped, idle, unkept agent (operator-only). Preview with
+    /// `--plan`, then apply with `--reason` and one `--expect alias=digest`.
+    Archive {
+        /// Explicit aliases (1-50, no duplicates).
+        aliases: Vec<String>,
+        /// Recorded in the agent_archived event; required to apply.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Print the reviewable preview; writes nothing.
+        #[arg(long)]
+        plan: bool,
+        /// alias=digest from the preview; repeat for every alias.
+        #[arg(long = "expect")]
+        expected: Vec<String>,
+    },
+    /// Restore an archived agent (operator-only). Requires one
+    /// `--expect-rev alias=<lifecycle_rev>` per alias.
+    Restore {
+        /// Explicit aliases (1-50, no duplicates).
+        aliases: Vec<String>,
+        /// alias=lifecycle_rev from `agent show`; repeat for every alias.
+        #[arg(long = "expect-rev")]
+        expected: Vec<String>,
+    },
     /// Bind this machine's local actor to the selected hosted org and
     /// claim queued work. Local execution by definition; `--org` names
     /// the board, never the placement.
@@ -839,6 +863,44 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
                 json!({"older_than": secs, "force": force}),
             )?
         }
+        AgentAction::Archive {
+            aliases,
+            reason,
+            plan,
+            expected,
+        } => {
+            if plan {
+                client::rpc(
+                    &state_dir,
+                    "agent_archive_plan",
+                    json!({"aliases": aliases}),
+                )?
+            } else {
+                let reason = reason.ok_or_else(|| {
+                    Error::usage("agent archive needs --reason (or --plan for a preview)")
+                })?;
+                let pairs = parse_expected(&expected)?;
+                require_same_aliases(&aliases, &pairs)?;
+                let entries: Vec<Value> = pairs
+                    .iter()
+                    .map(|(alias, digest)| json!({"alias": alias, "digest": digest}))
+                    .collect();
+                client::rpc(
+                    &state_dir,
+                    "agent_archive",
+                    json!({"expected": entries, "reason": reason}),
+                )?
+            }
+        }
+        AgentAction::Restore { aliases, expected } => {
+            let pairs = parse_expected_revs(&expected)?;
+            require_same_aliases(&aliases, &pairs)?;
+            let entries: Vec<Value> = pairs
+                .iter()
+                .map(|(alias, rev)| json!({"alias": alias, "lifecycle_rev": rev}))
+                .collect();
+            client::rpc(&state_dir, "agent_restore", json!({"expected": entries}))?
+        }
         // Routed before this function by the caller; refused here so a
         // future routing bypass cannot claim locally.
         AgentAction::Connect { .. }
@@ -853,6 +915,58 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
     };
     print_json(&result);
     Ok(0)
+}
+
+fn parse_expected(pairs: &[String]) -> Result<Vec<(String, String)>> {
+    if pairs.is_empty() {
+        return Err(Error::usage(
+            "agent archive needs --expect alias=digest for every alias",
+        ));
+    }
+    pairs
+        .iter()
+        .map(|pair| {
+            pair.split_once('=')
+                .filter(|(alias, digest)| !alias.is_empty() && !digest.is_empty())
+                .map(|(alias, digest)| (alias.to_string(), digest.to_string()))
+                .ok_or_else(|| Error::usage("--expect must be alias=digest"))
+        })
+        .collect()
+}
+
+fn parse_expected_revs(pairs: &[String]) -> Result<Vec<(String, i64)>> {
+    if pairs.is_empty() {
+        return Err(Error::usage(
+            "agent restore needs --expect-rev alias=lifecycle_rev for every alias",
+        ));
+    }
+    pairs
+        .iter()
+        .map(|pair| {
+            let (alias, rev) = pair
+                .split_once('=')
+                .ok_or_else(|| Error::usage("--expect-rev must be alias=lifecycle_rev"))?;
+            let rev = rev
+                .parse::<i64>()
+                .map_err(|_| Error::usage("--expect-rev lifecycle_rev must be an integer"))?;
+            if alias.is_empty() {
+                return Err(Error::usage("--expect-rev needs an alias"));
+            }
+            Ok((alias.to_string(), rev))
+        })
+        .collect()
+}
+
+fn require_same_aliases<T>(aliases: &[String], pairs: &[(String, T)]) -> Result<()> {
+    let positional: std::collections::HashSet<&str> = aliases.iter().map(String::as_str).collect();
+    let expected: std::collections::HashSet<&str> =
+        pairs.iter().map(|(alias, _)| alias.as_str()).collect();
+    if positional != expected {
+        return Err(Error::usage(
+            "positional aliases and --expect/--expect-rev must name the same set",
+        ));
+    }
+    Ok(())
 }
 
 /// CAD-804: the manual sweep honours the same 7-day floor as the timer.

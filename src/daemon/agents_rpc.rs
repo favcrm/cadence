@@ -454,6 +454,11 @@ impl Shared {
         // like `upstream` or `session` would silently rewire routing and
         // session binding, so they are rejected rather than merged.
         let agent = self.store.agent(&alias)?;
+        if agent.archived_at.is_some() {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is archived — restore it before changing it"
+            )));
+        }
         // `next_launch`: launch params (model, effort) stored for the
         // next open only — the live process is left exactly as it is.
         let next_launch = params
@@ -932,6 +937,11 @@ impl Shared {
         // Resolve the agent before any reconcile so a bad alias fails
         // without side effects.
         let agent = self.store.agent(&alias)?;
+        if agent.archived_at.is_some() {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is archived — restore it before unfencing it"
+            )));
+        }
         let ids = self.store.unknown_messages(&alias)?;
         if ids.is_empty() {
             return Err(Error::rejected(format!(
@@ -1021,6 +1031,11 @@ impl Shared {
             )));
         }
         let agent = self.store.agent(&alias)?;
+        if agent.archived_at.is_some() {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is archived — restore it before stopping it"
+            )));
+        }
         if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
             return Err(Error::rejected(format!(
                 "Agent '{alias}' is an inbox — no actor to stop; \

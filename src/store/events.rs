@@ -429,7 +429,9 @@ impl Store {
             let tx = &mut *conn;
             let mut rows: Vec<(i64, String, String, f64)> = tx.query_vec(
                 &format!(
-                    "SELECT e.seq, e.alias, e.kind, e.at FROM events e WHERE {} \
+                    "SELECT e.seq, e.alias, e.kind, e.at FROM events e WHERE {}
+                             AND e.alias NOT IN (SELECT alias FROM agents
+                               WHERE archived_at IS NOT NULL)
                              ORDER BY e.seq LIMIT ?2",
                     rollable_events_where()
                 ),

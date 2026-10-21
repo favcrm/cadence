@@ -302,6 +302,8 @@ impl Store {
                     model TEXT, effort TEXT, pid INTEGER,
                     state TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
                     gc_keep INTEGER NOT NULL DEFAULT 0,
+                    archived_at REAL, archived_by TEXT, archive_reason TEXT,
+                    lifecycle_rev INTEGER NOT NULL DEFAULT 0,
                     error TEXT, created REAL NOT NULL, updated REAL NOT NULL);
                  CREATE TABLE IF NOT EXISTS messages(
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1396,6 +1398,40 @@ impl Store {
                     )?;
                 }
                 tx.execute("UPDATE schema_version SET version=53", [])?;
+                tx.commit()?;
+            }
+            if version < 54 {
+                // CAD-1239: the archive marker, its writer, a monotonic
+                // revision for compare-and-set, and the retention triggers.
+                // Column-checked so a half-applied store converges; existing
+                // rows are unarchived and start at revision 0.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(agents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                for (column, definition) in [
+                    ("archived_at", "archived_at REAL"),
+                    ("archived_by", "archived_by TEXT"),
+                    ("archive_reason", "archive_reason TEXT"),
+                    ("lifecycle_rev", "lifecycle_rev INTEGER NOT NULL DEFAULT 0"),
+                ] {
+                    if !columns.iter().any(|c| c == column) {
+                        tx.execute_batch(&format!("ALTER TABLE agents ADD COLUMN {definition}"))?;
+                    }
+                }
+                tx.execute_batch(
+                    "CREATE TRIGGER IF NOT EXISTS agents_lifecycle_rev
+                       AFTER UPDATE OF state,enabled,endpoint,archived_at,gc_keep ON agents
+                       FOR EACH ROW BEGIN
+                         UPDATE agents SET lifecycle_rev=lifecycle_rev+1 WHERE alias=OLD.alias;
+                       END;
+                     CREATE TRIGGER IF NOT EXISTS agents_archived_no_delete
+                       BEFORE DELETE ON agents WHEN OLD.archived_at IS NOT NULL
+                       BEGIN SELECT RAISE(ABORT,'archived'); END;",
+                )?;
+                tx.execute("UPDATE schema_version SET version=54", [])?;
                 tx.commit()?;
             }
             if let Some(crossing) = permit.crossing {

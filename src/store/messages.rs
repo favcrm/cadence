@@ -1417,7 +1417,12 @@ impl Store {
             return Err(Error::rejected("Prompt must contain 1-48000 characters"));
         }
         identifier(id, "Message id")?;
-        self.agent_in(tx, alias)?;
+        let target = self.agent_in(tx, alias)?;
+        if target.archived_at.is_some() {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is archived — its alias is reserved"
+            )));
+        }
         let reply_recipient = if let Some(target) = reply_to {
             let recipient = self.agent_in(tx, target)?;
             if target == alias {
@@ -1695,6 +1700,7 @@ impl Store {
         let current = self.agent_opt_in(tx, recipient)?;
         let reason = match current.as_ref() {
             None => Some("recipient_missing"),
+            Some(agent) if agent.archived_at.is_some() => Some("recipient_archived"),
             Some(_) if expected.is_none() => Some("recipient_identity_unavailable"),
             Some(agent) if !Self::identity_matches(expected.as_ref().unwrap(), agent) => {
                 Some("recipient_identity_changed")
@@ -2778,7 +2784,8 @@ impl Store {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT m.alias, m.id FROM messages m JOIN agents a ON a.alias = m.alias
-             WHERE a.state = 'stopped' AND m.state = 'queued' AND m.source NOT IN (?, ?)
+             WHERE a.state = 'stopped' AND a.archived_at IS NULL
+               AND m.state = 'queued' AND m.source NOT IN (?, ?)
              ORDER BY m.alias, m.seq",
         )?;
         let rows = stmt.query_map([NUDGE_SOURCE, crate::proto::TOPIC_NOTICE_SOURCE], |r| {

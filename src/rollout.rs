@@ -70,7 +70,9 @@ use crate::store::{self, Store};
 /// v52 (CAD-1548) adds `settings_authority` beside `model_defaults`.
 /// v53 (CAD-804) adds `agents.gc_keep`, the explicit keep every agent-gc
 /// path honours.
-pub const SCHEMA_VERSION: i64 = 53;
+/// v54 (CAD-1239) adds the retired-agent archive marker, lifecycle revision
+/// and retention triggers.
+pub const SCHEMA_VERSION: i64 = 54;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

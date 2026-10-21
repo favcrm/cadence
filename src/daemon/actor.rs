@@ -48,6 +48,11 @@ impl Shared {
         self.assistant_start_guard(alias)?;
         // A mailbox never gets an actor — regardless of who asked.
         let a = self.store.agent(alias)?;
+        if a.archived_at.is_some() {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is archived — restore it before starting"
+            )));
+        }
         if !registry::has_actor(&a.provider, &a.endpoint_kind) {
             return Err(Error::rejected(format!(
                 "Agent '{alias}' is an inbox — it has no actor to start"

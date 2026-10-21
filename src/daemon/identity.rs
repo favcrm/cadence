@@ -835,6 +835,9 @@ impl Shared {
                 }
             } else {
                 let mut why = Vec::new();
+                if row.agent.archived_at.is_some() {
+                    why.push("archived");
+                }
                 if row.agent.enabled {
                     why.push("enabled");
                 }
