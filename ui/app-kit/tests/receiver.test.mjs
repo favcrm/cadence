@@ -455,3 +455,14 @@ test("teardown after a timed-out tool reports closed, not busy", async () => {
   receiver.teardown();
   await assert.rejects(receiver.tool("social.publish", {}, "req-2"), ScreenClosedError);
 });
+
+test("a malformed matching late reply tears down instead of releasing the gate", async () => {
+  const { host, inbox, pushes, errors, receiver } = connect({ accepts: ["screen.v2", "screen-actions.v1"], timeoutMs: 20 });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  await assert.rejects(receiver.tool("social.publish", {}, "req-1"), ScreenTimeoutError);
+  const request = await waitFor(() => inbox.find((m) => m.op === "tool"), "the tool request");
+  host.postMessage({ v: 2, op: "tool-reply", id: request.id });
+  await waitFor(() => errors.length === 1, "the malformed late teardown");
+  await assert.rejects(receiver.tool("social.publish", {}, "req-2"), ScreenClosedError);
+});

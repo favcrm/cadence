@@ -263,6 +263,16 @@ export function createScreenReceiver(options = {}) {
 
   const expectedOp = { call: "reply", slot: "slot-state", tool: "tool-reply" };
 
+  /** A reply whose outcome is well-formed for its op. A late/replayed reply
+   *  is validated exactly like a waiting one before it can release a gate. */
+  const validOutcome = (message) => {
+    if (message.op === "slot-state") {
+      return ["pending", "done", "refused"].includes(message.state) &&
+        (message.refusal === undefined || readRefusal(message.refusal) !== null);
+    }
+    return message.ok === true || (message.ok === false && readRefusal(message.refusal) !== null);
+  };
+
   const settle = (message) => {
     const entry = pending.get(message.id);
     if (!entry) {
@@ -272,6 +282,7 @@ export function createScreenReceiver(options = {}) {
       // A retired request still validates its kind; a replayed reply never
       // releases a different invocation's gate.
       if (message.op !== expectedOp[kind]) throw new Error(`${kind} answered with ${message.op}`);
+      if (!validOutcome(message)) throw new Error(`malformed ${message.op} reply`);
       if (kind === "tool" && message.id === busyToolId) {
         toolBusy = false;
         busyToolId = null;
