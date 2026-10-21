@@ -1531,7 +1531,7 @@ fn frozen_charge_ceiling(authority: &Value) -> std::result::Result<u64, String> 
     Ok(amount)
 }
 
-fn valid_base(base: &str) -> Result<String> {
+pub(crate) fn valid_base(base: &str) -> Result<String> {
     let base = base.trim_end_matches('/');
     let uri: ureq::http::Uri = base
         .parse()

@@ -33,6 +33,8 @@ use serde_json::{json, Value};
 use crate::client;
 use crate::error::{Error, Result};
 
+mod provider;
+
 /// The file that makes a directory a sandbox root. `reset` deletes
 /// nothing that lacks it.
 const MARKER: &str = ".cadence-sandbox";
@@ -100,6 +102,59 @@ pub enum DevAction {
     /// List the sandboxes under the base with running status.
     #[command(visible_alias = "list")]
     Ls,
+    /// Point this sandbox at real AgenticOS and wire one app.
+    Agenticos {
+        #[command(subcommand)]
+        action: AgenticosAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AgenticosAction {
+    /// Write the sandbox provider profile and 0600 credentials.
+    ///
+    /// `--token-dir` must contain `send.token` (`publish.send`) and either
+    /// `provider.token` (`provider.read` + `provider.draft`) or
+    /// `read.token`; `draft.token` is optional and defaults to the read
+    /// credential.
+    Setup {
+        /// The dev Cadence [default: `CADENCE_PROFILE`, else `dev`].
+        #[arg(long)]
+        name: Option<String>,
+        /// AgenticOS API origin (no path).
+        #[arg(long, default_value = "https://api-v2.agenticos.hk")]
+        origin: String,
+        /// Exact company workspace account, `ws_<uuid>`.
+        #[arg(long)]
+        workspace: String,
+        /// Reviewed external-provider manifest pin.
+        #[arg(long, default_value = "agenticos-external-provider-tools@4")]
+        pin: String,
+        /// Directory holding provider.token (or read.token) and send.token.
+        #[arg(long)]
+        token_dir: PathBuf,
+    },
+    /// Install one app and bind its source/image/writer/publication slots.
+    Bind {
+        /// The dev Cadence [default: `CADENCE_PROFILE`, else `dev`].
+        #[arg(long)]
+        name: Option<String>,
+        /// App bundle root (`app.md` at the top level).
+        #[arg(long, default_value = "app")]
+        bundle: PathBuf,
+        /// Context label to create (or reuse).
+        #[arg(long, default_value = "Default")]
+        context: String,
+        /// Connected Instagram destination; the first live row when omitted.
+        #[arg(long)]
+        destination_id: Option<String>,
+        /// IANA timezone recorded on the publication binding.
+        #[arg(long, default_value = "UTC")]
+        timezone: String,
+        /// Do not set the publication destination or sender.
+        #[arg(long)]
+        no_publish: bool,
+    },
 }
 
 /// `cadence dev …`. `state_dir` is the store this shell points at; it
@@ -145,9 +200,263 @@ pub fn run_cli(state_dir: &Path, action: &DevAction) -> Result<i32> {
         }
         DevAction::Reset { name } => reset(&Sandbox::open(name)?)?,
         DevAction::Ls => ls()?,
+        DevAction::Agenticos { action } => run_agenticos(state_dir, action)?,
     };
     println!("{}", crate::output::json_text(&out).unwrap_or_default());
     Ok(0)
+}
+
+// ---------- real AgenticOS provider profile ----------
+
+fn run_agenticos(_state_dir: &Path, action: &AgenticosAction) -> Result<Value> {
+    match action {
+        AgenticosAction::Setup {
+            name,
+            origin,
+            workspace,
+            pin,
+            token_dir,
+        } => {
+            let sb = agenticos_sandbox(name.as_deref())?;
+            refuse_production(&sb)?;
+            let existing = read_marker(&sb)?;
+            refuse_unmarked_nonempty(&sb, existing.as_ref())?;
+            std::fs::create_dir_all(&sb.root)?;
+            // `up` refuses a non-empty root without a marker. Setup may run
+            // before `up`, so leave the minimal marker `up` would accept.
+            if existing.is_none() {
+                std::fs::write(
+                    sb.marker(),
+                    json!({
+                        "name": sb.name,
+                        "created_at": crate::issue::time::iso(crate::issue::time::now_epoch()),
+                    })
+                    .to_string(),
+                )?;
+            }
+            provider::setup(&sb.root, origin, workspace, pin, token_dir)
+        }
+        AgenticosAction::Bind {
+            name,
+            bundle,
+            context,
+            destination_id,
+            timezone,
+            no_publish,
+        } => bind_agenticos(
+            name.as_deref(),
+            bundle,
+            context,
+            destination_id.as_deref(),
+            timezone,
+            !*no_publish,
+        ),
+    }
+}
+
+/// The sandbox a dev-agenticos verb acts on: the named one, else the
+/// profile this shell points at, else `dev`.
+fn agenticos_sandbox(name: Option<&str>) -> Result<Sandbox> {
+    let name = name
+        .map(str::to_owned)
+        .or_else(profile)
+        .unwrap_or_else(|| DEFAULT_NAME.to_owned());
+    if let Some(profile) = profile() {
+        if name != profile {
+            return Err(Error::rejected(format!(
+                "this shell points at sandbox '{profile}', not '{name}' — pass --name {name} \
+                 from a shell without CADENCE_PROFILE"
+            )));
+        }
+    }
+    let sb = Sandbox::open(&name)?;
+    refuse_production(&sb)?;
+    Ok(sb)
+}
+
+fn bind_agenticos(
+    name: Option<&str>,
+    bundle: &Path,
+    context: &str,
+    destination_id: Option<&str>,
+    timezone: &str,
+    publish: bool,
+) -> Result<Value> {
+    let sb = agenticos_sandbox(name)?;
+    require_marker(&sb)?;
+    let profile = provider::load(&sb.root)?
+        .ok_or_else(|| Error::rejected("run `cadence dev agenticos setup` first"))?;
+    let bundle = std::fs::canonicalize(bundle)
+        .map_err(|_| Error::rejected("app bundle path does not exist"))?;
+    if !bundle.join("app.md").is_file() {
+        return Err(Error::rejected("app bundle has no app.md at its root"));
+    }
+    let manifest = crate::issue::app::parse_manifest(
+        &std::fs::read_to_string(bundle.join("app.md"))
+            .map_err(|_| Error::rejected("app.md is unreadable"))?,
+    )?;
+
+    let installed = match client::rpc(
+        &sb.state_dir(),
+        "app_workspace_install",
+        json!({"source": bundle}),
+    ) {
+        Ok(installed) => installed,
+        Err(error)
+            if error
+                .to_string()
+                .contains("already has workspace installation") =>
+        {
+            return Err(Error::rejected(format!(
+                "{error}; reset the sandbox (`cadence dev reset {}`) or upgrade the \
+                 existing installation before rebinding",
+                sb.name
+            )))
+        }
+        Err(error) => return Err(error),
+    };
+    let install_id = installed["install_id"]
+        .as_str()
+        .ok_or_else(|| Error::internal("install returned no install_id"))?
+        .to_owned();
+    let digest = installed["digest"]
+        .as_str()
+        .ok_or_else(|| Error::internal("install returned no digest"))?
+        .to_owned();
+    // Sandbox auto-approval: the exact installed digest only.
+    let approved = client::rpc(
+        &sb.state_dir(),
+        "app_local_install_approve",
+        json!({"install_id": install_id, "digest": digest}),
+    )?;
+
+    let created_context = client::rpc(
+        &sb.state_dir(),
+        "app_context_create",
+        json!({
+            "install_id": install_id,
+            "label": context,
+            "input_defaults": {},
+            "request_id": "dev-context",
+        }),
+    )?;
+    let context_id = created_context["context"]["id"]
+        .as_str()
+        .ok_or_else(|| Error::internal("context create returned no id"))?
+        .to_owned();
+
+    // The host keeps one connection per provider/account, so a combined
+    // `provider.token` (read + draft) is the default. A read-only fallback
+    // still binds source; image/writer then fail at the provider with the
+    // missing scope rather than refusing the second enrollment here.
+    let token = profile
+        .credentials
+        .provider
+        .as_deref()
+        .unwrap_or(&profile.credentials.read);
+    let provider = enroll(&sb, &profile, &["provider.read", "provider.draft"], token)?;
+
+    let mut bindings = serde_json::Map::new();
+    for slot in ["source", "image", "writer"] {
+        if !manifest.capabilities.contains_key(slot) {
+            continue;
+        }
+        let binding = client::rpc(
+            &sb.state_dir(),
+            "app_binding_create",
+            json!({
+                "install_id": install_id,
+                "context_id": context_id,
+                "slot": slot,
+                "connection_id": provider,
+                "request_id": format!("dev-{slot}"),
+            }),
+        )?;
+        bindings.insert(slot.to_owned(), binding);
+    }
+
+    let mut publication = Value::Null;
+    let mut warnings = Vec::new();
+    if publish {
+        let destinations = client::rpc(&sb.state_dir(), "social_destinations", json!({}))?;
+        let selected = destination_id.map(str::to_owned).or_else(|| {
+            destinations["destinations"]
+                .as_array()
+                .and_then(|rows| rows.first())
+                .and_then(|row| row["destination_id"].as_str())
+                .map(str::to_owned)
+        });
+        match selected {
+            Some(destination_id) => {
+                let existing = client::rpc(
+                    &sb.state_dir(),
+                    "app_binding_list",
+                    json!({"install_id": install_id, "context_id": context_id}),
+                )?;
+                let revision = existing["bindings"]
+                    .as_array()
+                    .and_then(|rows| {
+                        rows.iter()
+                            .find(|row| row["slot"].as_str() == Some("publication"))
+                    })
+                    .and_then(|row| row["revision"].as_u64());
+                let mut params = json!({
+                    "install_id": install_id,
+                    "context_id": context_id,
+                    "destination_id": destination_id,
+                    "request_id": "dev-publication",
+                    "timezone": timezone,
+                });
+                if let Some(revision) = revision {
+                    params["expected_revision"] = json!(revision);
+                }
+                let binding = client::rpc(&sb.state_dir(), "app_binding_use_destination", params)?;
+                bindings.insert("publication".to_owned(), binding.clone());
+                publication = binding;
+            }
+            None => warnings
+                .push("no connected Instagram destination; publication binding not set".to_owned()),
+        }
+    }
+
+    Ok(json!({
+        "schema": 1,
+        "sandbox": sb.name,
+        "install_id": install_id,
+        "digest": digest,
+        "approval": approved,
+        "context_id": context_id,
+        "connections": {"provider": provider},
+        "bindings": bindings,
+        "publication": publication,
+        "warnings": warnings,
+    }))
+}
+
+fn enroll(
+    sb: &Sandbox,
+    profile: &provider::Profile,
+    scopes: &[&str],
+    path: &Path,
+) -> Result<String> {
+    let token = std::fs::read_to_string(path)
+        .map_err(|_| Error::rejected("provider credential is unreadable"))?;
+    let enrolled = client::rpc(
+        &sb.state_dir(),
+        "connection_create",
+        json!({
+            "provider": "agenticos_external",
+            "account": profile.workspace,
+            "shape": "token",
+            "token": token.trim(),
+            "scopes": scopes,
+            "accept_same_uid_risk": true,
+        }),
+    )?;
+    enrolled["connection"]["id"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| Error::internal("connection create returned no id"))
 }
 
 // ---------- profile gating ----------
@@ -468,6 +777,30 @@ fn read_marker(sb: &Sandbox) -> Result<Option<Value>> {
         )));
     }
     Ok(Some(marker))
+}
+
+/// A root without a marker must be empty; otherwise `up` or `setup` would
+/// treat unrelated contents as a sandbox (and `reset` could delete them).
+fn refuse_unmarked_nonempty(sb: &Sandbox, existing: Option<&Value>) -> Result<()> {
+    if existing.is_some() {
+        return Ok(());
+    }
+    match std::fs::read_dir(&sb.root) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Err(Error::rejected(format!(
+                    "{} exists and holds no sandbox marker — pick another name",
+                    sb.root.display()
+                )));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::rejected(format!(
+            "cannot read {} ({e}) — refusing; pick another name",
+            sb.root.display()
+        ))),
+    }
 }
 
 /// `<root>/.cadence-sandbox` when `state_dir` is `<root>/state` beside a
@@ -876,6 +1209,9 @@ fn env_lines(sb: &Sandbox, port: Option<u16>, allow_global: bool) -> String {
         pm = sh_quote(&sb.pm_dir().to_string_lossy()),
         profile = sh_quote(&sb.profile()),
     );
+    if let Ok(Some(profile)) = provider::load(&sb.root) {
+        text.push_str(&profile.env_exports(&sb.root));
+    }
     if allow_global {
         text.push_str(&format!("export {ALLOW_GLOBAL_ENV}=1\n"));
     }
@@ -980,6 +1316,13 @@ fn run_child_output(
     env: &[(String, String)],
 ) -> Result<Vec<u8>> {
     let mut cmd = child(sb, exe, args, grant);
+    match provider::load(&sb.root) {
+        Ok(Some(profile)) => profile.apply_env(&mut cmd, &sb.root),
+        Ok(None) => {}
+        // A broken profile must not make `down` or `reload` unable to reach
+        // the sandbox. Startup (`up`) validates it before any child starts.
+        Err(error) => eprintln!("dev provider profile ignored: {error}"),
+    }
     for (key, value) in env {
         cmd.env(key, value);
     }
@@ -1059,6 +1402,9 @@ fn persisted_share(sb: &Sandbox) -> Result<bool> {
 
 fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
     refuse_production(sb)?;
+    // Refuse a malformed profile before any child starts; `down`/`reload`
+    // stay reachable even if the profile later breaks.
+    provider::load(&sb.root)?;
     let socket = client::socket_path(&sb.state_dir());
     let len = socket.as_os_str().len();
     if len > SOCKET_PATH_MAX {
@@ -1070,23 +1416,7 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
     }
     let _up_lock = up_lock(sb)?;
     let existing = read_marker(sb)?;
-    match std::fs::read_dir(&sb.root) {
-        Ok(mut entries) => {
-            if existing.is_none() && entries.next().is_some() {
-                return Err(Error::rejected(format!(
-                    "{} exists and holds no sandbox marker — pick another name",
-                    sb.root.display()
-                )));
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(Error::rejected(format!(
-                "cannot read {} ({e}) — refusing; pick another name",
-                sb.root.display()
-            )))
-        }
-    }
+    refuse_unmarked_nonempty(sb, existing.as_ref())?;
     // CAD-1283: eligibility for a bind-collision retry is captured
     // BEFORE the first `ui start` writes `ui.json` — after it,
     // `persisted_port` would always find the port `choose_port` picked

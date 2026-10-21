@@ -4970,6 +4970,13 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // consumed and before the store opens — a daemon that cannot hold
     // it refuses here having written nothing but the singleton lock.
     let hosted = hosted_config(&opts)?;
+    // CAD-1713: a dev store may carry its own sandbox-scoped provider
+    // deployment pin instead of the fixed root-owned `/etc` file.
+    if opts.provider_deployments.is_none() {
+        if let Some(metadata) = crate::platform::deployments::load_dev(state_dir)? {
+            opts.provider_deployments = Some(metadata);
+        }
+    }
     // CAD-501: a hosted daemon (or one with CADENCE_AGENTICOS_URL)
     // registers the AgenticOS adapter before the store opens. An
     // unconfigured daemon leaves it unregistered and fails closed.

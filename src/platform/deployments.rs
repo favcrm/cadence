@@ -408,6 +408,63 @@ pub fn load() -> Result<Option<DeploymentMetadata>> {
     read_components(root, &["etc", "cadence", "provider-deployments.json"], 0)
 }
 
+/// CAD-1713: sandbox-only provider deployment metadata.
+///
+/// `cadence dev up` sets `CADENCE_DEV_PROVIDER_DEPLOYMENTS` to a 0600 file
+/// under the sandbox root. It is accepted only when the store is a dev
+/// store; a production daemon keeps the fixed root-owned file above.
+pub fn load_dev(state_dir: &Path) -> Result<Option<DeploymentMetadata>> {
+    let Some(path) = std::env::var_os("CADENCE_DEV_PROVIDER_DEPLOYMENTS") else {
+        return Ok(None);
+    };
+    let dev = crate::sandbox::dev_owner(state_dir)?.is_some();
+    load_dev_at(state_dir, Path::new(&path), dev)
+}
+
+fn load_dev_at(state_dir: &Path, path: &Path, dev: bool) -> Result<Option<DeploymentMetadata>> {
+    if path.as_os_str().is_empty() || !dev {
+        return Err(Error::rejected(
+            "CADENCE_DEV_PROVIDER_DEPLOYMENTS is only accepted in a dev store",
+        ));
+    }
+    if !path.is_absolute() {
+        return Err(Error::rejected(
+            "dev provider deployment metadata path must be absolute",
+        ));
+    }
+    let root = state_dir.parent().ok_or_else(refused)?;
+    let root = std::fs::canonicalize(root).map_err(|_| refused())?;
+    let link = std::fs::symlink_metadata(path).map_err(|_| refused())?;
+    if link.file_type().is_symlink() || !link.file_type().is_file() {
+        return Err(Error::rejected(
+            "dev provider deployment metadata must be a regular file, not a symlink",
+        ));
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| refused())?;
+    if canonical.as_path() != path || !canonical.starts_with(&root) {
+        return Err(Error::rejected(
+            "dev provider deployment metadata must live under the sandbox root \
+             without symlink traversal",
+        ));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&canonical)
+        .map_err(|_| refused())?;
+    let meta = file.metadata().map_err(|_| refused())?;
+    if !meta.file_type().is_file() || meta.len() > CAP || meta.mode() & 0o077 != 0 {
+        return Err(Error::rejected(
+            "dev provider deployment metadata must be a 0600 regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(CAP + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| refused())?;
+    DeploymentMetadata::parse(&bytes).map(Some)
+}
+
 #[cfg(test)]
 fn read_fixture(root: &Path, name: &str, owner: u32) -> Result<Option<DeploymentMetadata>> {
     let root = std::fs::OpenOptions::new()
