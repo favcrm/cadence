@@ -203,3 +203,92 @@ fn archived_register_duplicate_is_not_unique_recovery() {
 // `archived_row_excluded_from_queued_for_stopped`; the RPC resume path is not
 // exercised here. See the gap report.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Gap 4: rpc_set / rpc_stop / rpc_unfence refuse an archived row through the
+// real dispatch gate, as the operator, and leave the row unchanged.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn archived_row_refuses_set_stop_unfence_through_rpc() {
+    let f = fixture();
+    seed_stopped(&f, "frozen");
+    archive_via_store(&f, "frozen");
+    let before = f.store().agent("frozen").unwrap();
+
+    let set = f
+        .as_(
+            Asserted::Operator,
+            "agent_set",
+            json!({"alias": "frozen", "patch": {"gc_keep": true}}),
+        )
+        .expect_err("agent_set must refuse an archived row");
+    assert!(set.to_string().contains("archived"), "set: {set}");
+
+    let stop = f
+        .as_(Asserted::Operator, "agent_stop", json!({"alias": "frozen"}))
+        .expect_err("agent_stop must refuse an archived row");
+    assert!(stop.to_string().contains("archived"), "stop: {stop}");
+
+    let unfence = f
+        .as_(
+            Asserted::Operator,
+            "agent_unfence",
+            json!({"alias": "frozen", "status": "completed"}),
+        )
+        .expect_err("agent_unfence must refuse an archived row");
+    assert!(unfence.to_string().contains("archived"), "unfence: {unfence}");
+
+    let after = f.store().agent("frozen").unwrap();
+    assert_eq!(after.lifecycle_rev, before.lifecycle_rev, "refused RPCs bumped rev");
+    assert_eq!(after.gc_keep, before.gc_keep, "refused agent_set changed gc_keep");
+    assert!(after.archived_at.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Gap 5: resume refuses an archived row through the real start guard
+// (try_resume -> start_actor_locked), as the operator.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn archived_row_refuses_resume_through_start_guard() {
+    let f = fixture();
+    seed_stopped(&f, "asleep");
+    archive_via_store(&f, "asleep");
+    let before = f.store().agent("asleep").unwrap();
+
+    let err = f
+        .as_(Asserted::Operator, "agent_resume", json!({"alias": "asleep"}))
+        .expect_err("agent_resume must refuse an archived row");
+    assert!(err.to_string().contains("archived"), "{err}");
+
+    let after = f.store().agent("asleep").unwrap();
+    assert_eq!(after.state, before.state, "refused resume changed state");
+    assert_eq!(after.enabled, before.enabled, "refused resume changed enabled");
+    assert_eq!(after.lifecycle_rev, before.lifecycle_rev, "refused resume bumped rev");
+}
+
+// ---------------------------------------------------------------------------
+// Gap 6: the lifecycle revision is the CAS input. A direct store state write
+// must bump lifecycle_rev, observable through the agent_show RPC.
+// The stop refusal path is covered above; this check uses a live-shaped
+// unarchived row so the RPC is not refused by the archive guard.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lifecycle_rev_bumps_on_state_write_observed_via_agent_show() {
+    let f = fixture();
+    seed_stopped(&f, "bumper");
+    let rev_before = f.store().agent("bumper").unwrap().lifecycle_rev;
+    // Force a real, non-trigger state write through the store, which is the
+    // path rpc_stop/start take into the same row; the trigger must bump it.
+    f.store().set_agent_state("bumper", "idle", None).unwrap();
+    let shown = f
+        .as_(Asserted::Operator, "agent_show", json!({"alias": "bumper"}))
+        .expect("agent_show as operator");
+    let rev_after = shown["lifecycle_rev"]
+        .as_i64()
+        .or_else(|| shown["agent"]["lifecycle_rev"].as_i64())
+        .expect("agent_show exposes lifecycle_rev");
+    assert!(rev_after > rev_before, "rev did not advance: {rev_before} -> {rev_after}");
+}

@@ -645,3 +645,147 @@ fn archived_rows_excluded_before_enrichment_from_operational_list() {
     );
     let _ = dir;
 }
+
+// ---------------------------------------------------------------------------
+// Gap 1: queued_for_stopped SQL filter, proven without completing the message.
+// The archived row carries a queued message the whole time; only the archived
+// filter can exclude it. A non-archived stopped control with a queued message
+// must still be selected, so the empty result is not a broken query.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn queued_for_stopped_filter_excludes_archived_keeps_live_stopped() {
+    let (dir, s) = store();
+    let cwd = dir.path().join("w");
+    // Live control: stopped, not archived, with a queued message.
+    stopped_worker(&s, "live", &cwd);
+    s.enqueue("live", "x", None, "live-m1", "user").unwrap();
+    // Archived row: stopped and archived, then a queued message is written
+    // directly so the row is queued and stopped and archived at once.
+    stopped_worker(&s, "gone", &cwd);
+    archive_one(&s, "gone").unwrap();
+    s.fixture_write(|conn| {
+        (*conn).execute(
+            "INSERT INTO messages(id,alias,body,source,state,created)
+             VALUES('gone-q1','gone','x','user','queued',?1)",
+            [now()],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let rows = s.queued_for_stopped().unwrap();
+    assert!(
+        rows.iter().any(|(alias, _, _)| alias == "live"),
+        "control: live stopped row with queued message not selected: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|(alias, _, _)| alias != "gone"),
+        "filter selected the archived row with a queued message: {rows:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Gap 2: routed report to an archived recipient. The worker result routes to
+// the archived pm; recipient_binding must record `recipient_archived` through
+// the handoff_unresolved path and deliver nothing to the archived row.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn routed_report_to_archived_recipient_records_recipient_archived() {
+    let (dir, s) = store();
+    let cwd = dir.path().join("w");
+    for alias in ["pm", "w1"] {
+        reg(&s, alias, &cwd);
+    }
+    s.enqueue("w1", "do it", Some("pm"), "m1", "user").unwrap();
+    let m = match s.take_queued("w1").unwrap() {
+        Take::Message(m) => m,
+        _ => panic!("expected queued message"),
+    };
+    s.mark_running("m1", "turn-1").unwrap();
+    // Archive the recipient while the worker is still in flight.
+    s.set_agent_state("pm", "stopped", None).unwrap();
+    s.set_enabled("pm", false).unwrap();
+    archive_one(&s, "pm").unwrap();
+
+    s.finish(
+        &m,
+        "completed",
+        &json!({"status": "completed", "text": "done"}),
+        None,
+    )
+    .unwrap();
+
+    let events = s.events(Store::DAEMON_STREAM, 0, 100).unwrap();
+    let unresolved: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "handoff_unresolved")
+        .collect();
+    assert_eq!(unresolved.len(), 1, "expected one handoff_unresolved: {unresolved:?}");
+    assert_eq!(unresolved[0].payload["reason"], "recipient_archived");
+    assert!(
+        s.messages("pm").unwrap().is_empty(),
+        "result was delivered to an archived recipient"
+    );
+    assert!(s.agent("pm").unwrap().archived_at.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Gap 3: reopen_task refuses an archived assignee, and changes nothing.
+// reopen is legal only from blocked|verified|failed, so the task is put in
+// `blocked` directly to reach the assignee guard.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn archived_assignee_refused_on_reopen_leaves_task_and_events_unchanged() {
+    let (dir, s) = store();
+    let cwd = dir.path().join("w");
+    stopped_worker(&s, "pm", &cwd);
+    s.register_agent(&NewAgent {
+        alias: "worker",
+        provider: "fake",
+        endpoint_kind: "managed",
+        role: "worker",
+        cwd: cwd.to_str().unwrap(),
+        sandbox: "read-only",
+        instructions: None,
+        params: Some(r#"{"upstream":"pm"}"#),
+        team_role: None,
+        model_policy: None,
+    })
+    .unwrap();
+    s.set_agent_state("worker", "stopped", None).unwrap();
+    s.set_enabled("worker", false).unwrap();
+    s.create_job(
+        "arch-job", None, "/s.md", &"0".repeat(64), "pm", None, None, None, 2, None, None,
+        None, None, None, None, None,
+    )
+    .unwrap();
+    s.create_task(
+        "arch-job", "arch-t1", None, Some("worker"), None, None, None, None, None,
+    )
+    .unwrap();
+    // Archive refuses an open task. `failed` is terminal and not open, and
+    // reopen is legal from `failed`, so the task moves there before archive.
+    s.fixture_write(|conn| {
+        (*conn).execute("UPDATE tasks SET state='failed' WHERE id='arch-t1'", [])?;
+        Ok(())
+    })
+    .unwrap();
+    archive_one(&s, "worker").unwrap();
+
+    let before_state = s.task("arch-t1").unwrap().state;
+    let before_rev = s.task("arch-t1").unwrap().revision;
+    let before_events = event_count(&s, "task_reopened");
+
+    let err = s
+        .reopen_task("arch-t1", "operator")
+        .expect_err("reopen must refuse an archived assignee");
+    assert!(err.to_string().contains("archived"), "{err}");
+
+    let after = s.task("arch-t1").unwrap();
+    assert_eq!(after.state, before_state, "refused reopen changed task state");
+    assert_eq!(after.revision, before_rev, "refused reopen changed task revision");
+    assert_eq!(event_count(&s, "task_reopened"), before_events);
+}
