@@ -1,7 +1,8 @@
 //! CAD-1429 independent TLS acceptance driver (acceptance author, not the
-//! implementer). Included as a sibling `tls_acceptance` module of `web` by
-//! `web_cli_test_harness.rs`, so `web_sites::run` is the SAME production
-//! command function the binary runs. Compiled only under `cfg(test)`.
+//! implementer). Included by `web_cli_test_harness.rs`, so `web_sites::run`
+//! is the same workflow the daemon `agenticos-web` adapter invokes; the
+//! `cadence` binary itself now uses the staging client in `cli/web.rs`.
+//! Compiled only under `cfg(test)`.
 //!
 //! What it exercises, against the NodeHTTPS bridge owned by
 //! `apps/api/src/web-sites/integration.acceptance.test.ts`:

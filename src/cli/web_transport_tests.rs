@@ -15,7 +15,9 @@
 //! process restart remains unproven.
 //!
 //! Compiled into the library unit-test binary through `web_cli_test_harness`,
-//! so the production `web.rs` functions run unchanged.
+//! so the production `web_sites` workflow runs unchanged. The daemon adapter
+//! and this suite share that workflow; the `cadence` binary is a thin staging
+//! client in `cli/web.rs`.
 
 use crate::remote_cli::{web_envelope, RemoteTarget, WebResponse};
 use crate::web_publish;
