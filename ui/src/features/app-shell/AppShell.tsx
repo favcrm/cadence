@@ -667,7 +667,7 @@ export default function AppShell({
     // keeps its `ctx` claim (writeQuery preserves it while a conversation
     // param exists) so the gate can verify or refuse it; everything else
     // loses its selector here.
-    if (badRecord || staleCtx || scopelessRecord || soleContext || legacyMismatch) {
+    if (badRecord || staleCtx || scopelessRecord || soleContext || legacyMismatch || urlCtx !== null) {
       writeQuery(
         {
           record: badRecord || staleCtx || scopelessRecord || legacyMismatch ? null : undefined,

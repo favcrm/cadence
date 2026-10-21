@@ -323,7 +323,7 @@ equal(panes(), 1, "switching never mounts a second chat pane");
 // Context is adopted from the URL — no selector needed.
 await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a"); });
 await flush();
-assert(location.search.includes("ctx=ctx-a"), "context is adopted from the URL");
+assert(!location.search.includes("ctx="), "a legacy ctx link is normalized to a scope-free URL");
 posts.length = 0;
 await fill("#app-shell-chat-box", "scoped question");
 await click(host.querySelector(".app-chat-form button[type=submit]"));
@@ -352,7 +352,7 @@ assert(location.search.includes("record=rec-1"), "deep link lands its record");
 // An authored New-view link keeps its view too.
 await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a&appview=new"); });
 await flush(); await flush();
-assert(location.search.includes("ctx=ctx-a") && location.search.includes("appview=new"), "cross-context New view link is preserved");
+assert(location.search.includes("appview=new") && !location.search.includes("ctx="), "cross-context New view link keeps the view and loses the selector");
 // A bare ctx link carries no stale record/view from the prior entry.
 await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a"); });
 await flush(); await flush();
@@ -360,7 +360,7 @@ assert(!location.search.includes("record=") && !location.search.includes("appvie
 // Browser back restores the prior authored entry (ctx-a + New view).
 history.back();
 await flush(); await flush();
-assert(location.search.includes("ctx=ctx-a") && location.search.includes("appview=new"), "browser back restores the authored New-view scope");
+assert(location.search.includes("appview=new") && !location.search.includes("ctx="), "browser back restores the authored New view without a selector");
 
 // A context-bound direct link restores scope; browser back keeps it.
 history.pushState(null, "", "/app-installations/install-shell?ctx=ctx-a&record=rec-9");
@@ -491,7 +491,7 @@ async function mountColdCold(url: string, install: string, scope: string) {
     "install-shell",
     "ctx-a",
   );
-  assert(location.search.includes("ctx=ctx-a") && location.search.includes("record=rec-1"), "cold link params survive adoption");
+  assert(location.search.includes("record=rec-1") && !location.search.includes("ctx="), "cold link keeps its record and loses the selector");
   await React.act(async () => { cold.unmount(); });
   hostEl.remove();
 }
@@ -505,7 +505,7 @@ async function mountColdCold(url: string, install: string, scope: string) {
     "ctx-a",
   );
   assert(location.search.includes("crm=bogus"), "an app-owned section parameter is left to the app");
-  assert(location.search.includes("ctx=ctx-a"), "the authored ctx is kept");
+  assert(!location.search.includes("ctx="), "the authored ctx is normalized away");
   assert(location.search.includes("record=rec-2"), "the authored record is kept");
   await React.act(async () => { cold.unmount(); });
   hostEl.remove();
@@ -520,7 +520,7 @@ async function mountColdCold(url: string, install: string, scope: string) {
     "ctx-a",
   );
   assert(!location.search.includes("record="), "malformed record id is stripped");
-  assert(readScopes().includes("ctx-a"), "malformed record keeps the authored ctx on the wire");
+  assert(readScopes().includes("ctx-a") && !location.search.includes("ctx="), "malformed record keeps the scope on the wire, not in the URL");
   await React.act(async () => { cold.unmount(); });
   hostEl.remove();
 }
@@ -556,7 +556,7 @@ async function mountColdCold(url: string, install: string, scope: string) {
     cold.render(React.createElement(AppShell, { installId: "install-shell", viewer: { operator: true, readOnly: false } }));
   });
   await settle(() => assert(readScopes().includes("ctx-a"), "operator false→true cold link adopts the context"));
-  assert(location.search.includes("ctx=ctx-a") && location.search.includes("record=rec-3"), "operator transition keeps the authored link");
+  assert(location.search.includes("record=rec-3") && !location.search.includes("ctx="), "operator transition keeps the record without the selector");
   await React.act(async () => { cold.unmount(); });
   hostEl.remove();
 }
