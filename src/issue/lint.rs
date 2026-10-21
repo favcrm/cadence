@@ -46,6 +46,8 @@ pub fn run_with(
 /// Issue folders a scoped lint covers: `(project key, folder name)`.
 type Scope = Vec<(String, String)>;
 
+type Fronts = HashMap<String, (String, model::Front, String)>;
+
 /// CAD-1256: lint only what the index stages (the commit hook's mode).
 ///
 /// Per-issue checks (schema, id/folder, grammar, status/kind, refs,
@@ -142,6 +144,38 @@ fn run_inner(
         errors: vec![],
         warnings: vec![],
     };
+    let (projects, work_configs) = collect_projects(pm, approvals, delivery_approvals, &mut lint)?;
+    let mut fronts: Fronts = scan_folders(pm, &projects, only_project, &scope, &mut lint);
+    // CAD-1256: ids whose own checks run. Everything else in `fronts`
+    // (scoped lint only) is context loaded to resolve links and chains.
+    let checked: HashSet<String> = fronts.keys().cloned().collect();
+    if scope.is_some() {
+        load_link_context(pm, &projects, &mut fronts, &mut lint);
+    }
+
+    check_issues(pm, &projects, &fronts, &work_configs, &checked, &mut lint);
+    check_contradictions(&fronts, &checked, &mut lint);
+    check_types(&fronts, &checked, &mut lint);
+    check_cycles(&fronts, &checked, &mut lint);
+    Ok(json!({
+        "ok": lint.errors.is_empty(),
+        "errors": lint.errors,
+        "warnings": lint.warnings,
+        "projects": projects.len(),
+        "issues": checked.len(),
+        "scope": if scope.is_some() { "staged" } else { "all" },
+    }))
+}
+
+fn collect_projects(
+    pm: &Pm,
+    approvals: Option<&crate::issue::work::Approvals>,
+    delivery_approvals: Option<&crate::issue::delivery_policy::DeliveryApprovals>,
+    lint: &mut Lint,
+) -> Result<(
+    Vec<project::Project>,
+    HashMap<String, crate::issue::work::WorkConfig>,
+)> {
     let projects = project::list(&pm.dir)?;
     // project::list skips symlinked dirs — flag them here instead of
     // letting them disappear silently.
@@ -238,8 +272,18 @@ fn run_inner(
              (<pm>/agents/<slug>/) — rename the project",
         );
     }
-    let mut fronts: HashMap<String, (String, model::Front, String)> = HashMap::new();
-    for project in &projects {
+    Ok((projects, work_configs))
+}
+
+fn scan_folders(
+    pm: &Pm,
+    projects: &[project::Project],
+    only_project: Option<&str>,
+    scope: &Option<Scope>,
+    lint: &mut Lint,
+) -> Fronts {
+    let mut fronts: Fronts = HashMap::new();
+    for project in projects {
         if let Some(only) = only_project {
             if project.key != only {
                 continue;
@@ -249,7 +293,7 @@ fn run_inner(
         // (name, path, is_symlink, is_dir). A scoped lint stats only its
         // staged folders; the full lint lists the whole project dir.
         let mut candidates: Vec<(String, std::path::PathBuf, bool, bool)> = Vec::new();
-        match &scope {
+        match scope {
             Some(scope) => {
                 for (_, name) in scope.iter().filter(|(p, _)| *p == project.key) {
                     let path = dir.join(name);
@@ -407,13 +451,17 @@ fn run_inner(
         }
     }
 
-    // CAD-1256: ids whose own checks run. Everything else in `fronts`
-    // (scoped lint only) is context loaded to resolve links and chains.
-    let checked: HashSet<String> = fronts.keys().cloned().collect();
-    if scope.is_some() {
-        load_link_context(pm, &projects, &mut fronts, &mut lint);
-    }
+    fronts
+}
 
+fn check_issues(
+    pm: &Pm,
+    projects: &[project::Project],
+    fronts: &Fronts,
+    work_configs: &HashMap<String, crate::issue::work::WorkConfig>,
+    checked: &HashSet<String>,
+    lint: &mut Lint,
+) {
     // Per-issue field checks + link targets.
     for (project_key, front, folder) in fronts.values().filter(|(_, f, _)| checked.contains(&f.id))
     {
@@ -560,7 +608,9 @@ fn run_inner(
             }
         }
     }
+}
 
+fn check_contradictions(fronts: &Fronts, checked: &HashSet<String>, lint: &mut Lint) {
     // Contradiction warning: status claims progress while a blocker is
     // still open. File status is what lint audits — derivation is a
     // runtime concern.
@@ -597,7 +647,9 @@ fn run_inner(
             }
         }
     }
+}
 
+fn check_types(fronts: &Fronts, checked: &HashSet<String>, lint: &mut Lint) {
     // CAD-405: a stage belongs to an epic; an explicit non-epic type on
     // an issue with children contradicts the tree.
     let parents: HashSet<&str> = fronts
@@ -617,7 +669,9 @@ fn run_inner(
             ));
         }
     }
+}
 
+fn check_cycles(fronts: &Fronts, checked: &HashSet<String>, lint: &mut Lint) {
     // Depth ≤ 2 and parent acyclicity.
     for (id, (_, front, _)) in fronts.iter().filter(|(id, _)| checked.contains(*id)) {
         let mut depth = 1;
@@ -661,15 +715,6 @@ fn run_inner(
             lint.err(format!("{id}: blocked_by cycle back to itself"));
         }
     }
-
-    Ok(json!({
-        "ok": lint.errors.is_empty(),
-        "errors": lint.errors,
-        "warnings": lint.warnings,
-        "projects": projects.len(),
-        "issues": checked.len(),
-        "scope": if scope.is_some() { "staged" } else { "all" },
-    }))
 }
 
 /// Scoped lint: load the issues the checked ones point at, so dangling
