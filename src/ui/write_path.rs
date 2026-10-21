@@ -1025,7 +1025,7 @@ pub(crate) fn write_route(
     // method, admission class and bound parameters in one declaration, so the
     // dispatcher and `route_class` cannot disagree. A path no row owns falls
     // through to the remaining chain below, unchanged.
-    if let Some(bound) = endpoints::resolve(path) {
+    if let Some(bound) = endpoints::resolve_or_path(method.as_str(), path) {
         let endpoint = bound.endpoint;
         // Admission runs before the method check for every non-Session row:
         // a read-only board or an unauthenticated caller used to refuse these
@@ -1052,6 +1052,11 @@ pub(crate) fn write_route(
             return;
         }
         let resp = match endpoint.id {
+            // The read rows never reach this dispatcher: `read_dispatch`
+            // answers them from `handle` before a write is considered.
+            RouteId::WorkspaceList | RouteId::WorkspaceShow | RouteId::ConversationsRead => {
+                err_response(500, "a read row reached the write dispatcher")
+            }
             RouteId::SessionOpen => operator::open(&mut request, state_dir, opts),
             RouteId::SessionLogout => operator::logout(&request, state_dir, opts),
             RouteId::SessionDeviceCode => operator::device_code(&mut request, state_dir, opts),
