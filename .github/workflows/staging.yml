@@ -227,8 +227,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: candidate-source/ui/pnpm-lock.yaml
       - run: control/scripts/ci-rust-toolchain --export --profile minimal
       # CAD-1073: tests/e2e_mvp.rs was retired with the suite. The stage
       # job's residual release gate is the migration/backup rehearsal below
