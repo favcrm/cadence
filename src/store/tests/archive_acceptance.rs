@@ -1053,7 +1053,7 @@ fn topic_fanout_skips_archived_subscriber_and_keeps_membership() {
     );
     let gone_deliveries = count_rows(
         &s,
-        &format!("SELECT COUNT(*) FROM topic_deliveries WHERE alias='gone'"),
+        "SELECT COUNT(*) FROM topic_deliveries WHERE alias='gone'",
     );
     assert_eq!(gone_deliveries, 0, "archived subscriber got a delivery row");
     // Membership row is kept; archive does not unsubscribe.
