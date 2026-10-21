@@ -143,7 +143,6 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     "Bash(cadence overview *)",
     "Bash(cadence plan propose *)",
     "Bash(cadence project new *)",
-    "Bash(cadence dispatch *)",
     "Bash(cadence master dispatch *)",
     "Bash(cadence master escalate *)",
     "Bash(cadence master summary)",
@@ -269,7 +268,7 @@ pub fn help_paths(profile: Profile) -> Vec<String> {
         .filter_map(|t| t.strip_prefix("Bash(cadence "))
         .filter_map(|t| t.strip_suffix(')'))
         .map(|t| t.strip_suffix(" *").unwrap_or(t).to_string())
-        .filter(|s| s != "help" && s != "master dispatch")
+        .filter(|s| s != "help")
         .collect();
     let mut paths = stems.clone();
     for stem in &stems {
@@ -1857,8 +1856,6 @@ mod tests {
         assert!(home.contains(&"wiki put".to_string()));
         assert!(home.contains(&"app audience segment-assistant-ls".to_string()));
         assert!(home.contains(&"app".to_string()));
-        assert!(home.contains(&"dispatch".to_string()));
-        assert!(!home.contains(&"master dispatch".to_string()));
         assert!(!home.iter().any(|p| p == "help" || p.starts_with("help ")));
         // Every stem contributes its path; a parent of nothing is absent.
         assert!(!home.contains(&"nonexistent".to_string()));
