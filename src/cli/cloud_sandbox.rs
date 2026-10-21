@@ -101,20 +101,60 @@ pub fn drive_remote(
     Ok(outcome)
 }
 
+/// A short, fence-free summary of a unified diff. Raw diff text is never
+/// embedded in a report: a context line can contain the report scanner's
+/// fence, and a single long line can exceed the report byte cap.
+fn diff_summary(diff: &str) -> String {
+    let mut files = 0usize;
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut in_hunk = false;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            files += 1;
+            in_hunk = false;
+        } else if line.starts_with("@@") {
+            in_hunk = true;
+        } else if in_hunk {
+            if line.starts_with('+') {
+                added += 1;
+            } else if line.starts_with('-') {
+                removed += 1;
+            }
+        }
+    }
+    format!("Diff summary: {files} file(s), +{added} -{removed}.")
+}
+
+/// Remove the sandbox gateway token from untrusted runner text. The token is
+/// AgenticOS-owned and must never reach a durable report; the report secret
+/// guard does not know the `csj1.` format.
+fn redact_sandbox_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("csj1.") {
+        out.push_str(&rest[..pos]);
+        out.push_str("<redacted-sandbox-token>");
+        let after = &rest[pos + 5..];
+        let end = after
+            .find(|c: char| {
+                !(c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == '=')
+            })
+            .unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Build the report evidence: the runner's text plus a bounded diff summary.
 fn done_evidence(result: &SandboxResult) -> String {
-    let mut evidence = result.text.replace("\n## ", "\n### ");
+    let mut evidence = redact_sandbox_tokens(&result.text).replace("\n## ", "\n### ");
     if let Some(diff) = &result.diff {
         let diff = diff.trim();
         if !diff.is_empty() {
-            let shown = diff.lines().take(200).collect::<Vec<_>>().join("\n");
-            let omitted = diff.lines().count().saturating_sub(shown.lines().count());
-            evidence.push_str("\n\n### Diff\n\n```diff\n");
-            evidence.push_str(&shown);
-            if omitted > 0 {
-                evidence.push_str(&format!("\n... ({omitted} more diff lines)"));
-            }
-            evidence.push_str("\n```");
+            evidence.push_str("\n\n### Diff summary\n\n");
+            evidence.push_str(&diff_summary(diff));
         }
     }
     evidence
@@ -288,17 +328,39 @@ mod tests {
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
     #[test]
-    fn done_evidence_includes_the_diff() {
+    fn done_evidence_includes_a_bounded_diff_summary() {
+        let long = "x".repeat(40_000);
         let result = SandboxResult {
             sha: None,
-            diff: Some("+added\n-removed".into()),
+            diff: Some(format!(
+                "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-```\n+{long}\n"
+            )),
             pr: None,
             text: "done".into(),
         };
         let evidence = done_evidence(&result);
-        assert!(evidence.contains("### Diff"), "{evidence}");
-        assert!(evidence.contains("+added"), "{evidence}");
-        assert!(evidence.contains("-removed"), "{evidence}");
+        assert!(evidence.contains("### Diff summary"), "{evidence}");
+        assert!(evidence.contains("1 file(s), +1 -1"), "{evidence}");
+        assert!(!evidence.contains("```"), "{evidence}");
+        assert!(!evidence.contains(&long), "raw diff line was embedded");
+        assert!(
+            evidence.len() < 1024,
+            "evidence must stay small: {}",
+            evidence.len()
+        );
+    }
+
+    #[test]
+    fn done_evidence_redacts_sandbox_tokens() {
+        let result = SandboxResult {
+            sha: None,
+            diff: None,
+            pr: None,
+            text: "token csj1.abc.def done".into(),
+        };
+        let evidence = done_evidence(&result);
+        assert!(!evidence.contains("csj1."), "{evidence}");
+        assert!(evidence.contains("<redacted-sandbox-token>"), "{evidence}");
     }
 
     /// Scripted client: queued snapshots for `get_job`, a call log, and an
