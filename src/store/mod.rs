@@ -42,11 +42,14 @@ pub use threads::{COMPACTED_EVENT as THREAD_COMPACTED_EVENT, PACK_EVENT as THREA
 
 mod agents;
 mod cloud_dispatch_outbox;
+pub(crate) use agents::AGENT_GC_RECORDS_ONLY;
 pub use agents::{Agent, ModelDefaultsSnapshot, NewAgent, AGENT_STATES};
 
 pub const MAX_INSTRUCTIONS_BYTES: usize = 32_000;
 pub mod activity;
 mod delivery;
+pub(crate) use delivery::UNKNOWN_GENERIC_REASON;
+pub use delivery::{unknown_inspect_lead, unknown_recovery_note};
 mod events;
 pub use events::{
     board_revocable, default_approval_id, Event, NewApproval, NewDelegated,

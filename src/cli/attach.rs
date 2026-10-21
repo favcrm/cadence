@@ -73,8 +73,8 @@ pub(crate) fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i
             Error::rejected(format!(
                 "Agent '{alias}' is fenced by an unreconciled unknown message — \
                  resume refused. {} {}",
-                cadence_agent::daemon::unknown_inspect_lead(),
-                cadence_agent::daemon::unknown_recovery_note()
+                cadence_agent::store::unknown_inspect_lead(),
+                cadence_agent::store::unknown_recovery_note()
             ))
         } else {
             Error::rejected(format!(

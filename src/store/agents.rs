@@ -13,6 +13,10 @@ use super::schema::AdoptEntry;
 use super::StoreConn;
 use super::{now, Store};
 
+/// What every agent-gc timer output says, verbatim.
+pub(crate) const AGENT_GC_RECORDS_ONLY: &str = "records only: frees no memory and no disk; \
+     a removed agent can no longer be resumed";
+
 /// The agent-state vocabulary — the `agents.state` column values —
 /// for `agent list --state` (CAD-437). `attention` is a fence, `error`
 /// is recorded on the row but never stored as a state.
@@ -1382,7 +1386,7 @@ impl Store {
                     "thread_id": agent.thread_id,
                     "session_id": agent.session_id,
                     "records_only": true,
-                    "note": crate::daemon::AGENT_GC_RECORDS_ONLY,
+                    "note": AGENT_GC_RECORDS_ONLY,
                 }),
             )?;
             Ok(Some(agent))
