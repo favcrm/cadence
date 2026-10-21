@@ -62,12 +62,14 @@ export default function MyWork({ view, onView, onOpen, onDetails }: {
   useEffect(() => {
     const text = draft.trim();
     if (text === (view.search ?? "")) return;
+    // Restarted on every view change, so a tab or filter picked while typing
+    // is merged into, never overwritten by, the search that applies.
     const timer = window.setTimeout(() => {
       applied.current = text;
       onView({ ...view, search: text || undefined });
     }, SEARCH_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [draft]);
+  }, [draft, viewKey]);
   const searchRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
