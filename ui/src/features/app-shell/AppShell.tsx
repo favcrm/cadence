@@ -476,7 +476,11 @@ export default function AppShell({
         ? created
         : null;
     setGeneralSetup({ key: setupScopeKey, error: null });
-    const recoveryRequestId = () => `general-${installId}-replay`;
+    // Recovery identity is derived from the installation's context history,
+    // so it advances past every archived generation: a second recovery after
+    // another archive uses a new id, while concurrent tabs reading the same
+    // history converge on the same one.
+    const recoveryRequestId = () => `general-${installId}-${contexts.length}`;
     const createGeneral = async () => {
       try {
         const row = activeRow(await create(`general-${installId}`));
