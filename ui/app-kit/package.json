@@ -1,0 +1,23 @@
+{
+  "name": "@cadence/app-kit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The app side of the Cadence screen bridge and app-bundle checks, once.",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "import": "./src/index.mjs"
+    }
+  },
+  "bin": {
+    "cadence-app-check": "./bin/check-bundle.mjs"
+  },
+  "files": ["src", "types", "bin", "README.md"],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -542,6 +542,9 @@ jobs:
         if: ${{ needs.change-scope.outputs.ui != 'false' }}
       - run: pnpm test:url-state
         if: ${{ needs.change-scope.outputs.ui != 'false' }}
+      - name: App-kit receiver and bundle-check tests
+        if: ${{ needs.change-scope.outputs.ui != 'false' }}
+        run: pnpm test:app-kit
       - name: Verify app development isolation and HMR
         if: ${{ needs.change-scope.outputs.ui != 'false' }}
         run: node --test ../scripts/app-dev/*.test.mjs
