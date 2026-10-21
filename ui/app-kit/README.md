@@ -1,23 +1,32 @@
 # `@cadence/app-kit`
 
-The app side of the Cadence screen bridge, and the bundle checks every app
-repo keeps re-implementing — once, dependency-free.
+The app side of the Cadence screen bridge, implemented once. Transport and
+lifecycle only: boot, `init`, `ready`, the closed PUSH union,
+`call`/`slot`/`tool`, assets, bounded `state`, teardown. What a PUSH *means*
+stays in the app.
 
-The wire protocol itself is owned by
-`ui/src/features/workspace-apps/screen/screenProtocol.ts`. This package
-implements the child side of that document (boot, `init`, `ready`, the closed
-PUSH union, `call`/`slot`/`tool`, assets, `state`, teardown) and nothing
-beyond it. What a PUSH *means* stays in the app.
+The wire protocol is owned by
+`ui/src/features/workspace-apps/screen/screenProtocol.ts`; this package
+follows that document and does not extend it.
 
-## Why
+## Not a toolchain
 
-`social-content` (`src/screens/receiver.mjs` + `bridge.mjs`),
-`meeting-minutes` (`src/screens/receiver.mjs`) and `waba5`
-(`src/bridge/*`) each implement the same handshake, request bookkeeping,
-refusal mapping and teardown. The bundle checks are copied per repo as well
-(`check_app_views.mjs`, `build_screen.mjs`, `build-ui-package.mjs`).
+Cadence already owns the developer surface, and this package deliberately
+does not duplicate it:
 
-## Receiver
+| Need | Use |
+| --- | --- |
+| offline bundle validation | `cadence app check <dir>` (host-owned; caps, entry grammar, descriptors, workflows, `requires`) |
+| fixtures | `cadence app fixtures --bundle <dir>` |
+| offline frame / kit CSS | `cadence app frame-kit --out <dir> [--bundle <dir>]` |
+| preview | `cadence app dev --source <checkout> <name>` |
+| starter project + pinned deps | the `cadence-app-toolchain-<tag>.tar.gz` release asset |
+
+This package is the one piece those do not provide: a receiver an app screen
+runs in the browser. It ships inside the toolchain rather than as a parallel
+CLI.
+
+## Usage
 
 ```js
 import { createScreenReceiver } from "@cadence/app-kit";
@@ -41,43 +50,17 @@ Defaults: `accepts: ["screen.v2"]`, `timeoutMs: 15000`, boot read from
 `#cadence-screen-boot`. A reply that is neither `ok` nor a well-formed
 `{code, text}` refusal rejects with `ScreenRefusalError` (status from
 `REFUSAL_STATUS`); no reply rejects with `ScreenTimeoutError` (504). Every
-protocol violation calls `onError` and closes the port — the kit never
-guesses.
-
-## Bundle check
-
-```sh
-npx cadence-app-check .     # or: node bin/check-bundle.mjs <app-repo>
-```
-
-Checks `app/app.md` frontmatter (`app`, `title`, `version`, `summary`), the
-`listing` assets, every `app/views/*.json` (`app-views/v1`, unique ids,
-manifest match), at least one workflow with `title`/`goal` and a body, and
-non-empty rubrics. Each finding carries a stable code from `BUNDLE_CODES`.
+protocol violation calls `onError` and closes the port.
 
 ## Migrating a repo
 
-1. `npm i @cadence/app-kit` (or the pinned tarball) next to `@cadence/screen-ui`.
-2. Replace the hand-written receiver/bridge with `createScreenReceiver`; keep
-   the app's projection and its payload validation in `onPush`, and port the
-   per-app refusal status overrides only where they differ from the default.
-3. Replace `scripts/check_app_views.mjs` with `cadence-app-check .` in CI.
-4. Keep the app's build: this kit does not bundle screens or ship UI.
-
-## Packaging
-
-Local-only, source-pinned, like `@cadence/screen-ui`:
-
-```sh
-node ui/scripts/package-app-kit.mjs --source-tree <checkout> \
-  --source-sha <40-hex> --out <dir>
-```
-
-Prints `{name, version, source_sha, file, sha256}`. Publishing is a separate
-operator step.
+1. Replace the hand-written receiver/bridge with `createScreenReceiver`; keep
+   the app's projection and payload validation in `onPush`.
+2. Keep `cadence app check` (not a local copy) in CI.
+3. Keep the app's build and bundler: this package does not build screens.
 
 ## Tests
 
 ```sh
-node --test ui/app-kit/tests/*.test.mjs
+pnpm test:app-kit
 ```

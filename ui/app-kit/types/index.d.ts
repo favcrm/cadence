@@ -62,27 +62,8 @@ export declare const REFUSAL_STATUS: Readonly<Record<string, number>>;
 export declare const MAX_STATE_BYTES: number;
 export declare const MAX_ASSET_BYTES: number;
 export declare const DEFAULT_TIMEOUT_MS: number;
-export declare const VIEW_CONTRACT: "app-views/v1";
 
 export declare function readRefusal(value: unknown): { code: string; text: string } | null;
 export declare function validateBoot(value: unknown): ScreenBoot;
 export declare function readBoot(documentRef?: unknown): ScreenBoot;
 export declare function createScreenReceiver(options: ScreenReceiverOptions): ScreenReceiver;
-
-export interface BundleError {
-  code: string;
-  path: string;
-  message: string;
-}
-
-export interface Frontmatter {
-  values: Record<string, string>;
-  listing: Record<string, string | string[]>;
-  body: string;
-}
-
-export declare function parseFrontmatter(text: string): Frontmatter | null;
-export declare function validateBundle(
-  files: Map<string, string> | Record<string, string>,
-): { ok: boolean; errors: BundleError[] };
-export declare const BUNDLE_CODES: readonly string[];
