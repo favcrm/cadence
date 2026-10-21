@@ -5,9 +5,9 @@
 //! exact paths today; the table grows group by group, and a group moves whole
 //! (never half a stem) so no path is ever owned by two mechanisms.
 //!
-//! A row is not a claim that the handler is registered: `write_route` matches
-//! on [`Endpoint::id`], so a row with no arm compiles but dispatches nothing.
-//! Add the arm with the row.
+//! A row without a dispatch arm does not compile: `write_route` matches on
+//! [`Endpoint::id`] with an exhaustive `match`, so the compiler demands the arm
+//! with the row.
 
 use super::operator::RouteClass;
 
@@ -64,37 +64,57 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
 ];
 
 /// The row that owns `path`, if any. Exact match only: a row never claims a
-/// path it did not declare.
+/// path it did not declare. Dispatch uses this before the method check, so a
+/// wrong method still answers the route's own 405 instead of falling through.
 pub(super) fn lookup(path: &str) -> Option<&'static Endpoint> {
     ENDPOINTS.iter().find(|endpoint| endpoint.pattern == path)
+}
+
+/// The class of `(method, path)`, or `None` when the method does not match the
+/// row. `route_class` falls through to the older table on `None`, so a
+/// migrated path keeps the class it had before the migration for every method
+/// the row does not declare.
+pub(super) fn class_of(method: &str, path: &str) -> Option<RouteClass> {
+    lookup(path)
+        .filter(|endpoint| endpoint.method == method)
+        .map(|endpoint| endpoint.class)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Listed literally, not derived from `ENDPOINTS`: deleting or misclassing
+    /// a row must fail this test, which iterating the table cannot do.
+    const EXPECTED: &[(SessionRoute, &str, &str)] = &[
+        (SessionRoute::Open, "POST", "/api/session"),
+        (SessionRoute::Logout, "POST", "/api/session/logout"),
+        (SessionRoute::DeviceCode, "POST", "/api/session/device/code"),
+        (SessionRoute::DevicePoll, "POST", "/api/session/device/poll"),
+    ];
+
     #[test]
-    fn every_row_resolves_and_no_pattern_repeats() {
-        for endpoint in ENDPOINTS {
-            let found = lookup(endpoint.pattern).expect("a declared row resolves");
-            assert_eq!(found.id, endpoint.id);
-            assert_eq!(
-                ENDPOINTS
-                    .iter()
-                    .filter(|other| other.pattern == endpoint.pattern)
-                    .count(),
-                1,
-                "{} is declared once",
-                endpoint.pattern
-            );
+    fn the_table_is_exactly_the_session_rows() {
+        assert_eq!(ENDPOINTS.len(), EXPECTED.len(), "no row was added or lost");
+        for (id, method, pattern) in EXPECTED {
+            let endpoint = lookup(pattern).unwrap_or_else(|| panic!("{pattern} is declared"));
+            assert_eq!(endpoint.id, *id, "{pattern}");
+            assert_eq!(endpoint.method, *method, "{pattern}");
+            assert_eq!(endpoint.class, RouteClass::Session, "{pattern}");
         }
     }
 
     #[test]
-    fn the_session_rows_are_post_and_session_classed() {
-        for endpoint in ENDPOINTS {
-            assert_eq!(endpoint.method, "POST", "{}", endpoint.pattern);
-            assert_eq!(endpoint.class, RouteClass::Session, "{}", endpoint.pattern);
+    fn the_class_is_method_sensitive() {
+        for (_, method, pattern) in EXPECTED {
+            assert_eq!(
+                class_of(method, pattern),
+                Some(RouteClass::Session),
+                "{pattern}"
+            );
+            for other in ["PUT", "PATCH", "DELETE", "GET"] {
+                assert_eq!(class_of(other, pattern), None, "{other} {pattern}");
+            }
         }
     }
 
