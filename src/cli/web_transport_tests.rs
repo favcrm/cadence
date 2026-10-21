@@ -1862,3 +1862,80 @@ fn the_daemon_adapter_uploads_a_staged_site_through_the_gate() {
         "finalize missing"
     );
 }
+
+#[test]
+fn submissions_reads_a_page_above_the_management_default() {
+    let big = "x".repeat(70 * 1024);
+    let handler: Handler =
+        Arc::new(
+            move |seen: &Seen| match (seen.method.as_str(), seen.path.as_str()) {
+                ("GET", "/v1/web-sites/sites/by-slug/acc-site") => {
+                    (200, json!({"ok": true, "data": {"siteId": SITE}}))
+                }
+                ("GET", path)
+                    if path.starts_with(&format!("/v1/web-sites/sites/{SITE}/submissions")) =>
+                {
+                    (
+                        200,
+                        json!({"ok": true, "data": {
+                            "submissions": [{"fields": big.clone()}],
+                            "nextCursor": null
+                        }}),
+                    )
+                }
+                _ => (
+                    404,
+                    json!({"ok": false, "error": {"code": "not_found", "message": "no"}}),
+                ),
+            },
+        );
+    let (addr, _seen) = serve(handler);
+    let config = credential_dir(&addr);
+    let value = with_config(config.path(), || {
+        crate::web_sites::submissions(&target(&addr), "acc-site", None, 50, None, 60)
+    })
+    .expect("a 70 KiB submissions page must be read");
+    assert_eq!(
+        value["submissions"][0]["fields"].as_str().unwrap().len(),
+        70 * 1024
+    );
+    assert!(value["nextCursor"].is_null());
+}
+
+#[test]
+fn submissions_refuses_a_page_above_the_larger_bound() {
+    let big = "x".repeat((4 * 1024 * 1024) + 1);
+    let handler: Handler =
+        Arc::new(
+            move |seen: &Seen| match (seen.method.as_str(), seen.path.as_str()) {
+                ("GET", "/v1/web-sites/sites/by-slug/acc-site") => {
+                    (200, json!({"ok": true, "data": {"siteId": SITE}}))
+                }
+                ("GET", path)
+                    if path.starts_with(&format!("/v1/web-sites/sites/{SITE}/submissions")) =>
+                {
+                    (
+                        200,
+                        json!({"ok": true, "data": {
+                            "submissions": [{"fields": big.clone()}],
+                            "nextCursor": null
+                        }}),
+                    )
+                }
+                _ => (
+                    404,
+                    json!({"ok": false, "error": {"code": "not_found", "message": "no"}}),
+                ),
+            },
+        );
+    let (addr, _seen) = serve(handler);
+    let config = credential_dir(&addr);
+    let error = with_config(config.path(), || {
+        crate::web_sites::submissions(&target(&addr), "acc-site", None, 50, None, 60)
+    })
+    .expect_err("a page above the submissions bound must be refused");
+    assert!(
+        format!("{error}").contains("too large"),
+        "unexpected error: {error}"
+    );
+}
