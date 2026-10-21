@@ -1059,6 +1059,13 @@ impl Shared {
             lifecycle: &self.lifecycle,
             alias: &alias,
         };
+        // The archive holds the same lifecycle lock. Re-read after the
+        // reservation so an archive that won the lock first refuses here.
+        if self.store.agent(&alias)?.archived_at.is_some() {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is archived — restore it before stopping it"
+            )));
+        }
         self.store.set_enabled(&alias, false)?;
         let _ = self.store.event_public(&alias, "stop_requested", json!({}));
         // A fenced agent keeps its attention state and reason; the stop

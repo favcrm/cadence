@@ -936,8 +936,10 @@ impl Shared {
             .store
             .last_event_of(alias, AUTO_STOP_MARKER_KINDS)
             .is_ok_and(|m| m.is_some_and(|m| m.seq == seen.seq));
-        let still_stopped = self.store.agent(alias).is_ok_and(|a| a.state == "stopped");
-        if !still_seen || !still_stopped {
+        let current = self.store.agent(alias).ok();
+        let still_stopped = current.as_ref().is_some_and(|a| a.state == "stopped");
+        let still_archived = current.as_ref().is_some_and(|a| a.archived_at.is_some());
+        if !still_seen || !still_stopped || still_archived {
             return;
         }
         let recorded = self.store.event_public(
@@ -971,6 +973,13 @@ impl Shared {
     /// open never reached `ready`. Names the waiting message from the
     /// resume record so the needs-me row can.
     pub(super) fn auto_resume_failed(&self, alias: &str, reason: &str) {
+        if self
+            .store
+            .agent(alias)
+            .is_ok_and(|a| a.archived_at.is_some())
+        {
+            return;
+        }
         let resumed = self
             .store
             .last_event_of(alias, &[AUTO_RESUME_EVENT])

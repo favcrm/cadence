@@ -814,6 +814,11 @@ impl Store {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let agent = self.agent_in(&tx, alias)?;
+            if agent.archived_at.is_some() {
+                return Err(Error::rejected(format!(
+                    "Agent '{alias}' is archived — restore it before changing it"
+                )));
+            }
             let mut merged = agent.params.clone().unwrap_or_else(|| json!({}));
             let target = merged
                 .as_object_mut()
@@ -1127,6 +1132,11 @@ impl Store {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let agent = self.agent_in(&tx, alias)?;
+            if agent.archived_at.is_some() {
+                return Err(Error::rejected(format!(
+                    "Agent '{alias}' is archived — restore it before changing it"
+                )));
+            }
             // A keep is not activity: do not reset the idle age the
             // sweep measures. Only the keep column changes.
             tx.execute(

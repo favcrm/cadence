@@ -2413,12 +2413,15 @@ impl Shared {
                 // CAD-1266: one pass over `tasks` for the whole fleet, not
                 // one query per agent.
                 let mut open_tasks = self.store.open_task_ids_by_assignee()?;
-                // CAD-96: one grouped read tells auto-stopped rows apart.
+                let listed_agents = self.store.agents()?;
+                let aliases: Vec<String> = listed_agents.iter().map(|a| a.alias.clone()).collect();
+                // CAD-96/CAD-1239: one grouped read for the operational
+                // aliases only; archived rows are never enriched.
                 let markers = self
                     .store
-                    .last_events_of_all(AUTO_STOP_MARKER_KINDS)
+                    .last_events_of(&aliases, AUTO_STOP_MARKER_KINDS)
                     .unwrap_or_default();
-                for agent in self.store.agents()? {
+                for agent in listed_agents {
                     if !states.is_empty() && !states.contains(&agent.state) {
                         continue;
                     }
@@ -3015,7 +3018,7 @@ impl Shared {
                 for alias in &aliases {
                     let plan = self.store.archive_plan(alias)?;
                     let mut reasons = plan.reasons.clone();
-                    if lc.owned(alias) {
+                    if lc.owned(alias) || lc.stopping.contains(alias) {
                         reasons.push("lifecycle_owned".to_string());
                     }
                     if plan.agent.endpoint_kind == "pty"
@@ -3046,7 +3049,7 @@ impl Shared {
                 let expected = archive_expected_digests(params)?;
                 let lc = self.lifecycle.lock().unwrap();
                 for (alias, _) in &expected {
-                    if lc.owned(alias) {
+                    if lc.owned(alias) || lc.stopping.contains(alias) {
                         return Err(Error::rejected(format!("{alias}: lifecycle_owned")));
                     }
                     if let Some(agent) = self.store.agent_opt(alias)? {
@@ -3071,7 +3074,7 @@ impl Shared {
                 let expected = archive_expected_revs(params)?;
                 let lc = self.lifecycle.lock().unwrap();
                 for (alias, _) in &expected {
-                    if lc.owned(alias) {
+                    if lc.owned(alias) || lc.stopping.contains(alias) {
                         return Err(Error::rejected(format!("{alias}: lifecycle_owned")));
                     }
                 }
