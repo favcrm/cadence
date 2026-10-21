@@ -17,7 +17,7 @@
 //! same route with `member_as` absent.
 
 use serde_json::{json, Value};
-use tiny_http::{Method, Request};
+use tiny_http::Request;
 
 use super::{err_response, json_response, operator, read_body, HttpResp, ServeOpts};
 use crate::client;
@@ -126,29 +126,45 @@ pub(super) fn read(
     err_response(404, "no such app explorer route")
 }
 
-/// POST writes admitted by `RouteClass`. `caller` is the admitted
-/// board caller (only `AgentAllowed` routes reach member verbs).
+/// One explorer write, chosen by the endpoint table's row id (CAD-1682):
+/// the path is parsed once, by `endpoints::resolve`, so this handler never
+/// re-derives its action from the URL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WriteAction {
+    CatalogInstall,
+    CatalogGitCheck,
+    CatalogRequest,
+    FavoriteSet,
+    FavoriteDefault,
+    FavoriteOpened,
+    RequestDismiss,
+    UpdateCheck,
+    RemovePreview,
+    Remove,
+    Restore,
+}
+
+/// POST writes admitted by `RouteClass`. `caller` is the admitted board
+/// caller (only `AgentAllowed` routes reach member verbs); `install` is the
+/// row's bound `{id}` for the per-installation verbs.
 pub(super) fn write(
     request: &mut Request,
-    method: &Method,
-    path: &str,
+    action: WriteAction,
+    install: Option<&str>,
     caller: Option<&operator::Caller>,
     proof_relay: operator::PublicRelay,
     state_dir: &Path,
 ) -> HttpResp {
-    if *method != Method::Post {
-        return err_response(405, "method not allowed");
-    }
-    // No admitted caller, or an agent, never reaches a relay: the
-    // member verbs below would otherwise run as the operator.
+    // No admitted caller, or an agent, never reaches a relay: the member
+    // verbs below would otherwise run as the operator.
     let member = match caller.map(principal) {
         Some(Ok(m)) => m,
         Some(Err(resp)) => return resp,
         None => return err_response(401, "an operator or member session is required"),
     };
-    match path {
-        // The operator-only writes relay over the board's own connection.
-        "/api/app-catalog/install" => match public_proof(proof_relay) {
+    let install = install.unwrap_or_default();
+    match action {
+        WriteAction::CatalogInstall => match public_proof(proof_relay) {
             Ok(proof) => relay_body(
                 request,
                 state_dir,
@@ -160,61 +176,46 @@ pub(super) fn write(
             ),
             Err(resp) => resp,
         },
-        "/api/app-catalog/git-check" => body_rpc(
+        WriteAction::CatalogGitCheck => body_rpc(
             request,
             state_dir,
             "app_catalog_git_check",
             &["url", "git_ref", "dir"],
             None,
         ),
-        p if p.starts_with("/api/app-installations/") => {
-            let tail = &p["/api/app-installations/".len()..];
-            let mut segs = tail.split('/');
-            let (id, verb) = (
-                segs.next().unwrap_or_default(),
-                segs.next().unwrap_or_default(),
-            );
-            if id.is_empty() {
-                return err_response(400, "missing installation id");
-            }
-            match verb {
-                "update-check" => relay(
-                    state_dir,
-                    "app_workspace_update_check",
-                    json!({"install_id": id}),
-                    None,
-                ),
-                "remove-preview" => relay(
-                    state_dir,
-                    "app_workspace_remove_preview",
-                    json!({"install_id": id}),
-                    None,
-                ),
-                "remove" => match public_proof(proof_relay) {
-                    Ok(proof) => body_rpc_install(
-                        request,
-                        state_dir,
-                        "app_workspace_remove",
-                        id,
-                        &["expected_generation", "expected_digest", "request_id"],
-                        proof.as_deref(),
-                    ),
-                    Err(resp) => resp,
-                },
-                "restore" => match public_proof(proof_relay) {
-                    Ok(proof) => relay_session(
-                        state_dir,
-                        "app_workspace_restore",
-                        json!({"install_id": id}),
-                        proof.as_deref(),
-                    ),
-                    Err(resp) => resp,
-                },
-                _ => err_response(404, "no such app-installation route"),
-            }
-        }
-        // Member verbs: favorites + requests (AgentAllowed).
-        "/api/app-favorites" => match public_proof(proof_relay) {
+        WriteAction::UpdateCheck => relay(
+            state_dir,
+            "app_workspace_update_check",
+            json!({"install_id": install}),
+            None,
+        ),
+        WriteAction::RemovePreview => relay(
+            state_dir,
+            "app_workspace_remove_preview",
+            json!({"install_id": install}),
+            None,
+        ),
+        WriteAction::Remove => match public_proof(proof_relay) {
+            Ok(proof) => body_rpc_install(
+                request,
+                state_dir,
+                "app_workspace_remove",
+                install,
+                &["expected_generation", "expected_digest", "request_id"],
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
+        WriteAction::Restore => match public_proof(proof_relay) {
+            Ok(proof) => relay_session(
+                state_dir,
+                "app_workspace_restore",
+                json!({"install_id": install}),
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
+        WriteAction::FavoriteSet => match public_proof(proof_relay) {
             Ok(proof) => relay_body(
                 request,
                 state_dir,
@@ -226,7 +227,7 @@ pub(super) fn write(
             ),
             Err(resp) => resp,
         },
-        "/api/app-favorites/default" => match public_proof(proof_relay) {
+        WriteAction::FavoriteDefault => match public_proof(proof_relay) {
             Ok(proof) => relay_body(
                 request,
                 state_dir,
@@ -238,14 +239,14 @@ pub(super) fn write(
             ),
             Err(resp) => resp,
         },
-        "/api/app-favorites/opened" => body_rpc(
+        WriteAction::FavoriteOpened => body_rpc(
             request,
             state_dir,
             "app_favorites_opened",
             &["install_id"],
             member.as_deref(),
         ),
-        "/api/app-catalog/request" => match public_proof(proof_relay) {
+        WriteAction::CatalogRequest => match public_proof(proof_relay) {
             Ok(proof) => relay_body(
                 request,
                 state_dir,
@@ -257,7 +258,7 @@ pub(super) fn write(
             ),
             Err(resp) => resp,
         },
-        "/api/app-requests/dismiss" => match public_proof(proof_relay) {
+        WriteAction::RequestDismiss => match public_proof(proof_relay) {
             Ok(proof) => relay_body(
                 request,
                 state_dir,
@@ -269,7 +270,6 @@ pub(super) fn write(
             ),
             Err(resp) => resp,
         },
-        _ => err_response(404, "no such app explorer write"),
     }
 }
 
