@@ -51,11 +51,46 @@
         s.dispatch_task("t8", None, None, "test").unwrap();
         let error = s.cancel_task("t8", "test").unwrap_err().to_string();
         assert!(error.contains("active cloud dispatch"), "{error}");
+        let error = s.fail_task("t8", "no", "test").unwrap_err().to_string();
+        assert!(error.contains("active cloud dispatch"), "{error}");
+        let error = s.cancel_job("j1", "test").unwrap_err().to_string();
+        assert!(error.contains("active cloud dispatch"), "{error}");
         let error = s
             .remove_agent("sb", true, &json!({"by": "test"}))
             .unwrap_err()
             .to_string();
         assert!(error.contains("active cloud dispatch"), "{error}");
+    }
+
+    #[test]
+    fn same_alias_replacement_cannot_reuse_a_stale_backend_choice() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w3", &cwd);
+        s.create_task("j1", "t9", None, Some("w3"), None, None, None, None, None)
+            .unwrap();
+        let old = s.agent("w3").unwrap();
+        s.set_agent_state("w3", "stopped", None).unwrap();
+        s.remove_agent("w3", true, &json!({"by": "test"})).unwrap();
+        s.register_agent(&NewAgent {
+            alias: "w3",
+            provider: "devin",
+            endpoint_kind: "pty",
+            role: "worker",
+            cwd: cwd.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(&json!({"upstream": "pm"}).to_string()),
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+        let error = s
+            .dispatch_task_for("t9", Some("w3"), None, "test", Some(&old))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("worker identity changed"), "{error}");
     }
 
     #[test]
@@ -67,11 +102,12 @@
         reg_pty(&s, "w2", &cwd);
         s.create_task("j1", "t6", None, Some("w1"), None, None, None, None, None)
             .unwrap();
+        let replacement = s.agent("w2").unwrap();
         let error = s
-            .dispatch_task_for("t6", None, None, "test", Some("w2"))
+            .dispatch_task_for("t6", None, None, "test", Some(&replacement))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("assignee changed"), "{error}");
+        assert!(error.contains("worker identity changed"), "{error}");
 
         s.create_task("j1", "t7", None, Some("w1"), None, None, None, None, None)
             .unwrap();

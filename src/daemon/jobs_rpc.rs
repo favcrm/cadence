@@ -453,14 +453,14 @@ impl Shared {
                 optional_str(params, "message"),
                 by,
                 expect,
-                target_alias,
+                target.as_ref(),
             )?,
             None => self.store.dispatch_task_for(
                 task_id,
                 to.as_deref(),
                 optional_str(params, "message"),
                 by,
-                target_alias,
+                target.as_ref(),
             )?,
         };
         if cloud_dispatch {
@@ -533,6 +533,12 @@ impl Shared {
             .store
             .agent(alias)
             .map_err(|error| fail(&self.store, &message, error))?;
+        if agent.provider != "sandbox" || agent.endpoint_kind != "sandbox" {
+            let error = Error::rejected(format!(
+                "cloud kickoff recipient '{alias}' is no longer a sandbox agent"
+            ));
+            return Err(fail(&self.store, &message, error));
+        }
         let _ = crate::issue::cloud::hosted_company(|key| std::env::var(key).ok())
             .map_err(|error| fail(&self.store, &message, error))?;
         let pm = self

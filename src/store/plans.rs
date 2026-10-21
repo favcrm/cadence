@@ -860,9 +860,9 @@ impl Store {
         to: Option<&str>,
         message_id: Option<&str>,
         by: &str,
-        expected_assignee: Option<&str>,
+        expected_worker: Option<&Agent>,
     ) -> Result<(Task, String, bool, bool)> {
-        self.dispatch_task_inner(task_id, to, message_id, by, Some(expected_assignee), None)
+        self.dispatch_task_inner(task_id, to, message_id, by, expected_worker, None)
     }
 
     /// `dispatch_task` for an assist-bound job: the fenced transaction first
@@ -889,16 +889,9 @@ impl Store {
         message_id: Option<&str>,
         by: &str,
         expect: &AssistDispatchExpect,
-        expected_assignee: Option<&str>,
+        expected_worker: Option<&Agent>,
     ) -> Result<(Task, String, bool, bool)> {
-        self.dispatch_task_inner(
-            task_id,
-            to,
-            message_id,
-            by,
-            Some(expected_assignee),
-            Some(expect),
-        )
+        self.dispatch_task_inner(task_id, to, message_id, by, expected_worker, Some(expect))
     }
 
     fn dispatch_task_inner(
@@ -907,7 +900,7 @@ impl Store {
         to: Option<&str>,
         message_id: Option<&str>,
         by: &str,
-        expected_assignee: Option<Option<&str>>,
+        expected_worker: Option<&Agent>,
         expect: Option<&AssistDispatchExpect>,
     ) -> Result<(Task, String, bool, bool)> {
         self.write_tx(|conn| {
@@ -959,16 +952,21 @@ impl Store {
                              `cadence job dispatch {task_id} --to <worker>`"
                 ))
             })?;
-            if let Some(expected) = expected_assignee {
-                if Some(assignee) != expected {
+            let worker = self.agent_in(&tx, assignee)?;
+            if let Some(expected) = expected_worker {
+                if worker.alias != expected.alias
+                    || worker.uid != expected.uid
+                    || worker.provider != expected.provider
+                    || worker.endpoint_kind != expected.endpoint_kind
+                {
                     return Err(Error::rejected(format!(
-                        "Task '{task_id}' assignee changed to '{assignee}' while \
+                        "Task '{task_id}' worker identity changed to '{}' while \
                          dispatching — retry so the local/cloud choice follows the \
-                         final worker"
+                         final registered agent",
+                        worker.alias
                     )));
                 }
             }
-            let worker = self.agent_in(&tx, assignee)?;
             self.check_group_member(&job, &worker)?;
             refuse_archived_assignee(&worker)?;
 
@@ -1323,6 +1321,7 @@ impl Store {
                     task.state
                 )));
             }
+            self.refuse_active_cloud(tx, &task, "reopening the task")?;
             if let Some(assignee) = task.assignee.as_deref() {
                 let worker = self.agent_in(&tx, assignee)?;
                 refuse_archived_assignee(&worker)?;
@@ -1356,6 +1355,7 @@ impl Store {
                     task.state
                 )));
             }
+            self.refuse_active_cloud(tx, &task, "failing the task")?;
             tx.execute(
                 "UPDATE tasks SET state='failed',error=?,updated=? WHERE id=?",
                 params![reason, now(), task_id],
@@ -1392,24 +1392,48 @@ impl Store {
         })
     }
 
+    /// The sandbox alias holding an active cloud kickoff for this task.
+    fn active_cloud_alias(
+        &self,
+        tx: &impl super::StoreConn,
+        task: &Task,
+    ) -> Result<Option<String>> {
+        let Some(kickoff) = &task.dispatch_message else {
+            return Ok(None);
+        };
+        let Some(alias) = tx.query_opt(
+            "SELECT alias FROM messages WHERE id=? AND source='job_dispatch' \
+             AND state IN ('queued','running','unknown')",
+            [kickoff.as_str()],
+            |r| r.get::<_, String>(0),
+        )?
+        else {
+            return Ok(None);
+        };
+        let agent = self.agent_in(tx, &alias)?;
+        Ok((agent.provider == "sandbox" && agent.endpoint_kind == "sandbox").then_some(alias))
+    }
+
+    fn refuse_active_cloud(
+        &self,
+        tx: &impl super::StoreConn,
+        task: &Task,
+        verb: &str,
+    ) -> Result<()> {
+        if let Some(alias) = self.active_cloud_alias(tx, task)? {
+            return Err(Error::rejected(format!(
+                "Task '{}' has an active cloud dispatch on '{alias}' — \
+                 run `cadence agent stop {alias}` and reconcile the remote \
+                 before {verb}",
+                task.id
+            )));
+        }
+        Ok(())
+    }
+
     fn cancel_task_tx(&self, tx: &impl super::StoreConn, task: &Task, by: &str) -> Result<()> {
+        self.refuse_active_cloud(tx, task, "cancelling the task")?;
         if let Some(kickoff) = &task.dispatch_message {
-            if let Some((alias, _)) = tx.query_opt(
-                "SELECT alias,state FROM messages WHERE id=? AND source='job_dispatch' \
-                 AND state IN ('queued','running','unknown')",
-                [kickoff.as_str()],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )? {
-                let agent = self.agent_in(tx, &alias)?;
-                if agent.provider == "sandbox" && agent.endpoint_kind == "sandbox" {
-                    return Err(Error::rejected(format!(
-                        "Task '{}' has an active cloud dispatch on '{alias}' — \
-                         run `cadence agent stop {alias}` and reconcile the remote \
-                         before cancelling the task",
-                        task.id
-                    )));
-                }
-            }
             tx.execute(
                 "UPDATE messages SET state='cancelled',completed=?
                  WHERE id=? AND state IN ('queued','submitting')",

@@ -386,6 +386,19 @@ impl Store {
                 }
                 return Err(Self::duplicate_alias());
             }
+            let active_cloud: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM messages WHERE alias=? AND source='job_dispatch' \
+                 AND state IN ('queued','running','unknown')",
+                [new.alias],
+                |r| r.get(0),
+            )?;
+            if active_cloud > 0 {
+                return Err(Error::rejected(format!(
+                    "Agent '{}' has an active cloud dispatch — stop and reconcile \
+                     the remote before registering this alias again",
+                    new.alias
+                )));
+            }
             let defaults = Self::read_model_defaults_tx(&*tx)?;
             let resolved =
                 match crate::model_defaults::resolve(crate::model_defaults::ResolveRequest {
