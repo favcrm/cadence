@@ -625,14 +625,16 @@ export default function AppShell({
       adoptScope(fallbackContext());
       setLinkNotice("The record link names no context — the selection was cleared.");
     } else if (urlCtx !== null) {
-      // The URL's ctx+record/appview are adopted verbatim: they were
-      // authored together — a deep link, a scoped-entry link, or a
-      // history entry — never split or cleared here. Stale scope is
-      // prevented at the transition origin (the scoped-entry links
-      // emit a bare `?ctx=` and the section links drop record/appview),
-      // not by guessing which arriving params are intentional.
-      adoptScope(urlCtx);
-      setLinkNotice(null);
+      // A legacy `?ctx=` selector is validation evidence, never an
+      // alternate scope: the workspace's single active context is the
+      // authority, so a link cannot bind new work to a different one.
+      const resolved = fallbackContext();
+      adoptScope(resolved);
+      setLinkNotice(
+        urlCtx === resolved
+          ? null
+          : "The linked context is not this workspace's active scope — the workspace context was used.",
+      );
     } else {
       adoptScope(fallbackContext());
     }
