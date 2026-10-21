@@ -1752,3 +1752,111 @@ fn auth_and_server_errors_remain_unknown_and_retry_the_same_body() {
         );
     }
 }
+
+/// CAD-1665: the CLI's staging shape, written directly so the daemon adapter
+/// can be exercised without the binary.
+#[cfg(feature = "test-seam")]
+fn stage_for_test(state: &Path, site: &web_publish::FrozenSite, slug: &str, spa: bool) -> String {
+    let token = format!("stage-{}", "ab".repeat(12));
+    let dir = state.join("web-staging").join(&token);
+    std::fs::create_dir_all(dir.join("files")).unwrap();
+    let files: Vec<Value> = site
+        .files
+        .iter()
+        .map(|file| {
+            json!({
+                "path": file.path,
+                "sha256": file.sha256,
+                "mime": file.mime,
+                "bytes": file.bytes.len(),
+            })
+        })
+        .collect();
+    let plan = json!({
+        "version": "1",
+        "slug": slug,
+        "spa": spa,
+        "digest": site.digest,
+        "canonical": site.canonical,
+        "files": files,
+    });
+    write_private(&dir.join("plan.json"), &serde_json::to_vec(&plan).unwrap());
+    for file in &site.files {
+        write_private(
+            &dir.join("files")
+                .join(web_publish::encode_artifact_path(&file.path)),
+            &file.bytes,
+        );
+    }
+    token
+}
+
+/// CAD-1665: the daemon seam — an operator `platform_call` reaches the
+/// `agenticos-web` adapter, which resolves the saved login and uploads the
+/// staged bundle over the real transport.
+#[cfg(feature = "test-seam")]
+#[test]
+fn the_daemon_adapter_uploads_a_staged_site_through_the_gate() {
+    use crate::daemon::{ServeOptions, Shared};
+    use crate::test_seam::{scoped, Asserted};
+
+    let (addr, seen) = serve(prepare_handler(vec!["index.html"]));
+    let config = credential_dir(&addr);
+    let registry = json!({"connections": [{
+        "selection": {"org": ORG},
+        "destination": {"mode": "remote", "endpoint": BOARD_AUDIENCE, "org_id": ORG_ID}
+    }]});
+    write_private(
+        &config.path().join("cadence/orgs.json"),
+        &serde_json::to_vec(&registry).unwrap(),
+    );
+
+    let state = tempfile::tempdir().unwrap();
+    let pm = tempfile::tempdir().unwrap();
+    crate::issue::Pm::init(pm.path()).unwrap();
+    let mut opts = ServeOptions {
+        provider_env: crate::adapter::ProviderEnv::refusing_providers(),
+        lease: Some(Default::default()),
+        test_seam: true,
+        ..Default::default()
+    };
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm.path().to_str().unwrap());
+    crate::platform::agenticos_web::attach(&mut opts, state.path()).unwrap();
+    let shared = Shared::new(state.path(), &opts).unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let site = web_publish::freeze(&tiny_site(root.path())).unwrap();
+    let token = stage_for_test(state.path(), &site, "my-site", false);
+    let params = json!({
+        "platform": "agenticos-web",
+        "account": ORG,
+        "tool": "prepare_site",
+        "input": {"org": ORG, "staging": token},
+    });
+    let value = with_config(config.path(), || {
+        scoped(Asserted::Operator, || {
+            shared.dispatch("platform_call", &params, std::process::id())
+        })
+    })
+    .expect("the operator call must execute the adapter");
+
+    assert_eq!(value["result"], json!("executed"));
+    assert_eq!(value["platform_result"]["releaseId"], json!(RELEASE));
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|request| request.method == "POST" && request.path == "/v1/web-sites/uploads"),
+        "create missing"
+    );
+    assert!(
+        seen.iter()
+            .any(|request| request.method == "PUT" && request.path.contains("/files/index.html")),
+        "artifact missing"
+    );
+    assert!(
+        seen.iter()
+            .any(|request| request.method == "POST" && request.path.ends_with("/finalize")),
+        "finalize missing"
+    );
+}
