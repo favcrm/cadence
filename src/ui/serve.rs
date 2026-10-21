@@ -1112,9 +1112,12 @@ fn table_read_guard(
         operator::RouteClass::ScreenRead => {
             operator::admit_screen_read(request, state_dir, opts).map(|_| ())
         }
-        operator::RouteClass::AgentAllowed | operator::RouteClass::CallerScoped => {
+        operator::RouteClass::AgentAllowed => {
             operator::admit_read(request, state_dir, opts).map(|_| ())
         }
+        // The generic read gate already admitted this request; a second
+        // `admit_read` would only repeat it.
+        operator::RouteClass::CallerScoped => Ok(()),
         operator::RouteClass::Session
         | operator::RouteClass::RecipientToken
         | operator::RouteClass::Refused => Err(err_response(
@@ -1142,6 +1145,13 @@ fn read_dispatch(
         }
         endpoints::RouteId::WorkspaceShow => {
             apps::workspace(request, state_dir, "app_workspace_show", bound.get("id"))
+        }
+        endpoints::RouteId::AgentDetail => {
+            let alias = bound.get("alias").unwrap_or_default();
+            match agent_detail(state_dir, alias) {
+                Ok(detail) => json_response(detail),
+                Err(error) => err_response(404, &error),
+            }
         }
         endpoints::RouteId::ConversationsRead => {
             let install = bound.get("id").unwrap_or_default();
@@ -2422,23 +2432,6 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                         read_admission.expect("private stream admission"),
                     ),
                     Some(_) => send(request, err_response(404, "no such thread route")),
-                }
-                return;
-            }
-            // `/api/agents/<alias>` — the drawer detail endpoint.
-            if let Some(alias) = path.strip_prefix("/api/agents/") {
-                if alias.is_empty()
-                    || alias.len() > 80
-                    || !alias
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-                {
-                    send(request, err_response(400, "bad agent alias"));
-                    return;
-                }
-                match agent_detail(state_dir, alias) {
-                    Ok(detail) => send(request, json_response(detail)),
-                    Err(e) => send(request, err_response(404, &e)),
                 }
                 return;
             }
