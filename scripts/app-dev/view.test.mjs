@@ -15,7 +15,7 @@ test("actual studio mounts source grid, batch run, editor, revision guard and lo
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
   const React = tools("react"),
     { createRoot } = tools("react-dom/client"),
-    ts = tools("typescript");
+    ts = tools("@typescript/typescript6");
   const icons = new Map();
   for (const name of [
     "CubeIcon",
@@ -46,6 +46,7 @@ test("actual studio mounts source grid, batch run, editor, revision guard and lo
           jsx: ts.JsxEmit.ReactJSX,
           module: ts.ModuleKind.CommonJS,
           target: ts.ScriptTarget.ES2022,
+          esModuleInterop: false,
         },
       },
     ).outputText;

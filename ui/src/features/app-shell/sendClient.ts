@@ -637,10 +637,10 @@ export const sendClient = {
       const ok =
         trimmed.length > 0 &&
         trimmed.length <= 200 &&
-        (/^https:\/\//.test(trimmed) || /^http:\/\//.test(trimmed)) &&
+        (trimmed.startsWith("https://") || trimmed.startsWith("http://")) &&
         !/[?#@]/.test(rest) &&
         (slashAt === -1 || rest.slice(slashAt) === "/") &&
-        (/^https:\/\//.test(trimmed)
+        (trimmed.startsWith("https://")
           ? rest.replace(/\/$/, "").length > 0
           : /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?\/?$/.test(trimmed));
       if (!ok) {

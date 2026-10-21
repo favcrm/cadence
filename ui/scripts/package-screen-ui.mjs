@@ -29,7 +29,7 @@ const git = (...argv) => execFileSync("git", ["-C", source, ...argv]);
 git("cat-file", "-e", `${sourceSha}^{commit}`);
 if (git("rev-parse", "HEAD").toString().trim() !== sourceSha) throw new Error("Checkout HEAD differs from --source-sha");
 
-const names = ["react", "react-dom", "@types/react", "@types/react-dom", "@hugeicons/react", "@hugeicons/core-free-icons", "typescript", "vite", "@vitejs/plugin-react", "tailwindcss", "@tailwindcss/vite"];
+const names = ["react", "react-dom", "@types/react", "@types/react-dom", "@hugeicons/react", "@hugeicons/core-free-icons", "@typescript/typescript6", "vite", "@vitejs/plugin-react", "tailwindcss", "@tailwindcss/vite"];
 const versions = {};
 for (const name of names) {
   const expected = hostPackage.dependencies?.[name] ?? hostPackage.devDependencies?.[name];
@@ -42,7 +42,8 @@ for (const [name, version] of Object.entries({ ...kitPackage.dependencies, ...ki
 }
 const pnpm = execFileSync("pnpm", ["--version"], { cwd: ui, env: { ...process.env, COREPACK_ENABLE_NETWORK: "0" } }).toString().trim();
 if (hostPackage.packageManager !== `pnpm@${pnpm}`) throw new Error("pnpm differs from source pin");
-const ts = requireTool("typescript");
+// TypeScript 7 ships no JS compiler API; @typescript/typescript6 is its official API companion.
+const ts = requireTool("@typescript/typescript6");
 const { build } = await import(pathToFileURL(requireTool.resolve("vite")));
 const { default: react } = await import(pathToFileURL(requireTool.resolve("@vitejs/plugin-react")));
 const { default: tailwind } = await import(pathToFileURL(requireTool.resolve("@tailwindcss/vite")));

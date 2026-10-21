@@ -60,11 +60,11 @@ process.on("unhandledRejection", e => { console.error(`DRIVER ERROR: ${e?.stack 
 // ---------- transpile the real production modules with the pinned toolchain --
 const require = createRequire(path.join(UI, "package.json"));
 let tscBin;
-try { tscBin = path.join(path.dirname(require.resolve("typescript/package.json")), "bin", "tsc"); }
-catch (e) { console.error(`DRIVER ERROR — pinned ui typescript not resolvable: ${e.message}`); finish(2); }
+try { tscBin = path.join(path.dirname(require.resolve("tsrs/package.json")), "bin", "tsrs"); }
+catch (e) { console.error(`DRIVER ERROR — pinned ui tsrs not resolvable: ${e.message}`); finish(2); }
 const srcDir = path.join(UI, "src", "features", "workspace-apps", "screen");
-const tsc = spawnSync(process.execPath, [tscBin,
-  "--target", "ES2022", "--module", "commonjs", "--moduleResolution", "node",
+const tsc = spawnSync(process.execPath, [tscBin, "--ignoreConfig",
+  "--target", "ES2022", "--module", "commonjs", "--moduleResolution", "bundler",
   "--strict", "--skipLibCheck", "--esModuleInterop", "--lib", "ES2023,DOM",
   "--outDir", OUT, "--rootDir", srcDir,
   path.join(srcDir, "screenProtocol.ts"), path.join(srcDir, "screenSlot.ts"),
@@ -119,7 +119,7 @@ if (!protocol.shapeFor(PUSH, "v2")) throw new Error("invalid acceptance PUSH fix
 function makeActions() {
   return {
     calls: [],
-    call: async (verb, args, ui) => { return { ok: true, data: { echo: verb } }; },
+    call: async (verb) => { return { ok: true, data: { echo: verb } }; },
     planner: async () => ({ code: "unplanned", text: "not planned" }),
     onSlot: () => {}, onLink: () => {},
   };

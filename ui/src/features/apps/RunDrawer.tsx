@@ -51,7 +51,7 @@ export default function RunDrawer({
   const slugInput = inputs.some((i) => i.name === "slug") ? "slug" : null;
   // The saved default team wins; the last run fills any role it left
   // unset (CAD-577).
-  const team = { ...teamFromLastRun(row, runs), ...(app.team ?? {}) };
+  const team = { ...teamFromLastRun(row, runs), ...app.team };
   // The run's plain name — the workflow's own `label:` ("New post"),
   // never the engine's "new run" (CAD-571).
   const title = row.label?.trim() || "New run";

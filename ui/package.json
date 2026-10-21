@@ -8,9 +8,10 @@
     "dev": "vite",
     "build": "node scripts/check-module-names.mjs && vite build && node scripts/build-app-fixtures.mjs",
     "test:url-state": "pnpm test",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsrs --noEmit",
+    "lint": "oxlint --deny-warnings src tests scripts screen-ui acceptance vite.config.ts",
     "preview": "vite preview",
-    "test": "node --test scripts/check-module-names.test.mjs && tmp_dir=$(mktemp -d \"${TMPDIR:-/tmp}/cadence-ui-tests.XXXXXX\") && trap 'rm -rf \"$tmp_dir\"' EXIT && tsc -p tsconfig.tests.json --outDir \"$tmp_dir\" && for t in \"$tmp_dir\"/tests/*.test.js; do NODE_PATH=\"$PWD/node_modules\" node \"$t\" || exit 1; done && node scripts/build-app-fixtures.mjs && for check in drift-acceptance tag-base-acceptance; do status=0; bash \"scripts/app-fixtures/$check.sh\" || status=$?; if [ \"$status\" -eq 77 ] && [ -z \"${CI:-}\" ]; then printf '%s\\n' \"SKIP $check: source or prerequisites are not in acceptance-ready state (local non-CI run)\"; elif [ \"$status\" -ne 0 ]; then exit \"$status\"; fi; done"
+    "test": "node --test scripts/check-module-names.test.mjs && tmp_dir=$(mktemp -d \"${TMPDIR:-/tmp}/cadence-ui-tests.XXXXXX\") && trap 'rm -rf \"$tmp_dir\"' EXIT && tsrs -p tsconfig.tests.json --outDir \"$tmp_dir\" && for t in \"$tmp_dir\"/tests/*.test.js; do NODE_PATH=\"$PWD/node_modules\" node \"$t\" || exit 1; done && node scripts/build-app-fixtures.mjs && for check in drift-acceptance tag-base-acceptance; do status=0; bash \"scripts/app-fixtures/$check.sh\" || status=$?; if [ \"$status\" -eq 77 ] && [ -z \"${CI:-}\" ]; then printf '%s\\n' \"SKIP $check: source or prerequisites are not in acceptance-ready state (local non-CI run)\"; elif [ \"$status\" -ne 0 ]; then exit \"$status\"; fi; done"
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "5.3.0",
@@ -26,10 +27,13 @@
     "@tailwindcss/vite": "4.3.3",
     "@types/react": "19.2.9",
     "@types/react-dom": "19.2.7",
+    "@typescript/typescript6": "6.0.2",
     "@vitejs/plugin-react": "6.1.1",
     "happy-dom": "17.4.4",
+    "oxlint": "1.89.0",
     "tailwindcss": "4.3.3",
-    "typescript": "5.9.3",
+    "tsrs": "0.18.0-ts7.1.0-dev.20260929",
+    "typescript": "7.0.2",
     "vite": "8.2.2"
   }
 }

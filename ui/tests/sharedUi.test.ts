@@ -10,7 +10,6 @@ export {};
  * form-preview control that must stay inert.
  */
 declare function require(name: string): any;
-declare const process: { cwd(): string };
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);

@@ -15,7 +15,7 @@ for command in git node python3 sha256sum; do
   command -v "$command" >/dev/null || { echo "SKIP: required tool unavailable: $command"; exit 77; }
 done
 nodes="$source_repo/ui/node_modules"
-[[ -x "$nodes/.bin/tsc" && -d "$nodes/vite" ]] || { echo 'SKIP: existing UI TypeScript/Vite dependencies unavailable'; exit 77; }
+[[ -x "$nodes/.bin/tsrs" && -d "$nodes/vite" ]] || { echo 'SKIP: existing UI TypeScript/Vite dependencies unavailable'; exit 77; }
 
 root=$(mktemp -d "${TMPDIR:-/tmp}/cad1271-tag-base.XXXXXX")
 mkdir -p "$root/logs" "$root/home" "$root/xdg-cache" "$root/xdg-config" "$root/tmp" "$root/bin"
