@@ -355,13 +355,41 @@ export interface AssignmentContext {
   self_assigned: boolean;
 }
 
-export interface MyWorkIssue extends IssueCard {
-  assignment: AssignmentContext | null;
+/** One My work queue row (CAD-1703): what a card renders, not the full board card. */
+export interface MyWorkIssue {
+  id: string;
+  project: string;
+  title: string;
+  status: string;
+  priority: string;
+  blocked: boolean;
+  blocked_reason: string | null;
+  container: boolean;
+  checks: { done: number; total: number };
+  counts: { comments: number };
+  created: string;
+  /** Last recorded activity (status/owner change, comment or creation). */
+  updated: string | null;
 }
 
+/** One page of `GET /api/my-work`. `counts` cover every filter except the tab. */
 export interface MyWorkPayload {
   owner: string;
   issues: MyWorkIssue[];
+  total: number;
+  next_cursor: string | null;
+  counts: { active: number; done: number; dropped: number; all: number };
+  status_counts: Record<string, number>;
+  /** Projects the caller has any issue in — the project filter's options. */
+  projects: string[];
+}
+
+/** `GET /api/my-work/issues/<ID>` — whether the issue is still the caller's. */
+export interface MyWorkMembership {
+  owner: string;
+  id: string;
+  assigned: boolean;
+  assignment: AssignmentContext | null;
 }
 
 
@@ -373,7 +401,8 @@ export const api = {
   meta: (withOperator = false, signal?: AbortSignal) =>
     get<Meta>(withOperator ? "/api/meta?operator=1" : "/api/meta", signal),
   overview: () => get<Overview>("/api/overview"),
-  myWork: (signal?: AbortSignal) => get<MyWorkPayload>("/api/my-work", signal),
+  myWork: (query: string, signal?: AbortSignal) => get<MyWorkPayload>(`/api/my-work?${query}`, signal),
+  myWorkIssue: (id: string) => get<MyWorkMembership>(`/api/my-work/issues/${encodeURIComponent(id)}`),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
   projectContext: (project: string, role: ContextRole = "pm", expectedRevision?: string) => {
     const query = new URLSearchParams({ role });

@@ -47,6 +47,24 @@ Refresh retains keyboard focus while its read is pending and announces the busy
 state on the page. Refreshing again cancels the previous read; a late response
 cannot replace the newer result.
 
+The queue reads one page at a time (CAD-1703). Tabs split Active (doing, review,
+ready and backlog, grouped in that order), Done, Dropped and All, each with its
+count. Search matches an issue's id or title; Project, Priority and Blocked only
+narrow the results, and Sort orders by last update, priority or creation. The
+server applies all of them, so a search finds done issues that were never loaded.
+The view lives in the URL (`/my-work?tab=done&search=smtp&project=cadence`), so
+reloading or sharing the link restores it. Load more appends the next 50 rows;
+its cursor names the last row shown, not an offset, so a row that changed tabs
+in between is neither repeated nor skipped among the rest. A refresh or live
+update re-reads the rows already loaded (up to 500) rather than dropping them.
+
+`GET /api/my-work` accepts exactly `tab`, `q`, `project`, `priority`, `blocked`,
+`sort`, `cursor` and `limit` (1-100, default 50); any other parameter, a repeat
+or a malformed value is a 400. The response adds `total` for the tab, `counts`
+per tab and per status (every filter except the tab), `next_cursor`, and the
+`projects` the caller holds issues in. Rows are a queue projection (status,
+priority, blocked, checks, comment count, `updated`), not the full board card.
+
 Each compact card has an Inspect button and a separate Details link. Inspect
 opens a native modal snapshot; full details, history, evidence and execution
 remain on the existing Issue page. Returning from Details restores the queue's
@@ -67,8 +85,12 @@ the drawer has already closed. A write refusal instead triggers fresh reads
 and permission verification: it does not itself prove the issue is unreadable.
 Older projection responses cannot restore a retired row.
 
-Assignment context is optional. A bounded, shared first-parent Git history
-walk proves the current ownership transition against a pinned history head;
+Assignment context is optional and is read for one issue at a time:
+`GET /api/my-work/issues/<ID>` answers whether that issue is still the caller's
+and, when it is, its recorded handoff. The peek uses it both for its
+Assignment row and for the membership its writes require, because the queue
+holds only the loaded page. A bounded, shared first-parent Git history walk
+proves the current ownership transition against a pinned history head;
 unresolved history, actors, corrupt objects or changed snapshots return
 unavailable context. Git authors and later no-op edits are not assigners.
 Self-assignment requires the exact verified human receipt, never the shared
@@ -78,11 +100,11 @@ check and is limited by a shared deadline and object-read budget.
 My work remains an assigned-task queue, not a personal read-receipt or follow-up
 list. Status represents shared task progress; opening Inspect changes neither
 status nor attention state. Comment counts are totals, not unread indicators.
-Owned terminal-status issues remain included; no Active/Completed filter or
-personal tracking fields are introduced.
+Done and dropped issues stay reachable under their tabs; no personal tracking
+fields are introduced.
 
 The board derives the owner from its live session and rechecks the caller after
-the read. Query selectors are refused. Local board sessions use the existing
+the read. No query parameter names an owner, subject or role. Local board sessions use the existing
 `operator` attribution; named hosted Owners and Members retain their own user handles.
 Existing project access is applied before deriving cards, relationships and epic
 roll-ups; being assigned an issue never grants access to its project. Owner

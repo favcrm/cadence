@@ -1,4 +1,5 @@
-import { api, ApiError, type MyWorkPayload } from "./api";
+import { api, ApiError, type MyWorkMembership, type MyWorkPayload } from "./api";
+import { myWorkApiQuery, myWorkViewKey, type MyWorkView } from "./myWorkQuery";
 import { QueryCache, type Resource } from "./cache";
 import { loadThread, type PageReader, type ThreadState } from "../features/home/thread";
 import { onPrivateReadsPaused, onPrivateSessionReset } from "./privateSession";
@@ -38,6 +39,19 @@ const unavailablePrivateRecord = (error: unknown) => error instanceof ApiError &
 let myWorkController: AbortController | null = null;
 const unavailableIssueListeners = new Set<(id: string) => void>();
 
+/** Rows per page, and the most one request may ask for. */
+export const MY_WORK_PAGE = 50;
+const MY_WORK_PAGE_MAX = 100;
+/** A refresh re-reads at most this many rows; past it the list restarts at one page. */
+const MY_WORK_REFRESH_MAX = 500;
+
+/** The list as loaded: the server's pages, joined, and the view they answer. */
+export interface MyWorkList extends MyWorkPayload {
+  viewKey: string;
+}
+
+let myWorkView: MyWorkView = {};
+
 function abortMyWorkRead(): void {
   myWorkController?.abort();
 }
@@ -45,15 +59,41 @@ function abortMyWorkRead(): void {
 onPrivateReadsPaused(abortMyWorkRead);
 onPrivateSessionReset(abortMyWorkRead);
 
-async function readMyWork(): Promise<MyWorkPayload> {
+/**
+ * Reads the current view. A refresh of the view already shown re-reads as
+ * many rows as are loaded (bounded), so a live update or Refresh never drops
+ * the rows "Load more" added.
+ */
+async function readMyWork(): Promise<MyWorkList> {
   abortMyWorkRead();
   const controller = new AbortController();
   myWorkController = controller;
+  const view = myWorkView;
+  const viewKey = myWorkViewKey(view);
+  const shown = resources.myWork.get().data;
+  const loaded = shown?.viewKey === viewKey ? shown.issues.length : 0;
+  const want = Math.max(MY_WORK_PAGE, loaded > MY_WORK_REFRESH_MAX ? 0 : loaded);
   try {
-    return await api.myWork(controller.signal);
+    let body = await api.myWork(myWorkApiQuery(view, { limit: Math.min(want, MY_WORK_PAGE_MAX) }), controller.signal);
+    while (body.next_cursor && body.issues.length < want) {
+      const limit = Math.min(want - body.issues.length, MY_WORK_PAGE_MAX);
+      const next = await api.myWork(myWorkApiQuery(view, { cursor: body.next_cursor, limit }), controller.signal);
+      body = { ...next, issues: [...body.issues, ...next.issues] };
+    }
+    return { ...body, viewKey };
   } finally {
     if (myWorkController === controller) myWorkController = null;
   }
+}
+
+/** Point the list at `view`. A different view replaces the pending read. */
+export function showMyWorkView(view: MyWorkView): void {
+  if (myWorkViewKey(view) === myWorkViewKey(myWorkView)) {
+    void resources.myWork.revalidate();
+    return;
+  }
+  myWorkView = view;
+  void refreshMyWork();
 }
 
 /** Explicit refresh replaces the pending read without dropping same-session rows. */
@@ -61,6 +101,31 @@ export function refreshMyWork(): Promise<void> {
   abortMyWorkRead();
   resources.myWork.pause();
   return resources.myWork.refresh();
+}
+
+let loadingMore: Promise<void> | null = null;
+
+/**
+ * Append the next page of the view on screen. A refresh or a view change
+ * in the meantime wins: the page is dropped unless it continues the list
+ * it was asked for.
+ */
+export function loadMoreMyWork(): Promise<void> {
+  const shown = resources.myWork.get();
+  const list = shown.data;
+  if (loadingMore || shown.inFlight || !list?.next_cursor || list.viewKey !== myWorkViewKey(myWorkView)) {
+    return loadingMore ?? Promise.resolve();
+  }
+  const cursor = list.next_cursor;
+  const view = myWorkView;
+  loadingMore = api.myWork(myWorkApiQuery(view, { cursor, limit: MY_WORK_PAGE }))
+    .then((next) => {
+      resources.myWork.mutate((current) => current.viewKey !== list.viewKey || current.next_cursor !== cursor
+        ? current
+        : { ...next, viewKey: current.viewKey, issues: [...current.issues, ...next.issues] });
+    })
+    .finally(() => { loadingMore = null; });
+  return loadingMore;
 }
 
 export function onIssueUnavailable(listener: (id: string) => void): () => void {
@@ -96,9 +161,17 @@ export const resources = {
   issues: cache.resource<IssueCard[]>("issues", () => api.issues().then((r) => r.issues), {
     isEmpty: (rows) => rows.length === 0,
   }),
-  /** Caller-scoped personal projection; private-cache reset retires it with the session. */
-  myWork: cache.resource<MyWorkPayload>("myWork", readMyWork, {
+  /** Caller-scoped personal projection, one view at a time; private-cache reset retires it with the session. */
+  myWork: cache.resource<MyWorkList>("myWork", readMyWork, {
     isEmpty: (body) => body.issues.length === 0,
+    discardOnError: unavailablePrivateRecord,
+  }),
+  /**
+   * `GET /api/my-work/issues/<id>` — whether the peeked issue is still the
+   * caller's, and its recorded handoff. The list holds one page, so the
+   * peek's write guard asks the server instead of searching the page.
+   */
+  myWorkIssue: cache.family<string, MyWorkMembership>("myWorkIssue", (id) => api.myWorkIssue(id), {
     discardOnError: unavailablePrivateRecord,
   }),
   /** `GET /api/projects` — project config (key, prefix, repos). */

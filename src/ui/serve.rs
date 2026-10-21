@@ -1482,6 +1482,11 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             let response = my_work::get(&request, state_dir, pm_dir, opts, raw_query);
             send(request, response);
         }
+        p if p.starts_with("/api/my-work/issues/") => {
+            let id = &p["/api/my-work/issues/".len()..];
+            let response = my_work::get_issue(&request, state_dir, pm_dir, opts, id, raw_query);
+            send(request, response);
+        }
         "/api/locale" => {
             let response = locale::get(&request, state_dir, opts);
             send(request, response);

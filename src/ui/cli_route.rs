@@ -419,21 +419,17 @@ fn dispatch(
                 return cli_fail(403, "human_session_required", "my_work requires a user");
             }
             let policy_actor = actor.policy_spelling();
-            match super::my_work::Snapshot::load(
-                state_dir,
-                pm_dir,
-                &actor.handle,
-                Some(&actor.sub),
-                &policy_actor,
-            ) {
-                Ok(snapshot) => match snapshot.payload(&actor.handle, &policy_actor) {
-                    Some(body) => json_ok(body),
-                    None => cli_fail(
-                        403,
-                        "project_access_changed",
-                        "My work project access changed; refresh",
-                    ),
-                },
+            match super::my_work::Snapshot::load(state_dir, pm_dir, &policy_actor) {
+                Ok(snapshot) => {
+                    match snapshot.payload(pm_dir, &actor.handle, Some(&actor.sub), &policy_actor) {
+                        Some(body) => json_ok(body),
+                        None => cli_fail(
+                            403,
+                            "project_access_changed",
+                            "My work project access changed; refresh",
+                        ),
+                    }
+                }
                 Err(error) => write_err(&error),
             }
         }

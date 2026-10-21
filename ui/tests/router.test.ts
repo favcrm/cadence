@@ -71,6 +71,22 @@ for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/
 }
 equal(matchRoute("/my-work/extra").screen, "notFound", "My work has no nested routes");
 
+// CAD-1703: My work's tab, search and filters live in its URL and round-trip;
+// they never follow a navigation to another screen.
+{
+  const search = "?tab=done&search=smtp+relay&project=agenticos-v2&priority=P1&blocked=1&sort=priority";
+  const loc = readLocation("/my-work", search);
+  equal(loc.route, {
+    screen: "myWork",
+    view: { tab: "done", search: "smtp relay", project: "agenticos-v2", priority: "P1", blocked: true, sort: "priority" },
+  }, "My work reads its view");
+  equal(locationHref(loc, search), "/my-work?tab=done&search=smtp+relay&project=agenticos-v2&priority=P1&blocked=1&sort=priority", "My work view round-trips");
+  equal(scopeRedirect("/my-work", search), null, "My work keeps its project filter");
+  equal(readLocation("/my-work", "?tab=bogus&priority=P9&project=..%2Fx&sort=owner").route, { screen: "myWork" }, "malformed view values fall back to defaults");
+  equal(locationHref(goTo(loc, { screen: "threads" }), search), "/threads", "My work view stays on My work");
+  equal(locationHref({ ...loc, route: { screen: "myWork", view: {} } }, search), "/my-work", "the default view has a bare URL");
+}
+
 
 // Which screens keep a project. One table.
 equal(projectScope({ screen: "projects", slug: "cadence", section: "issues" }), "slug", "projects are the slug");

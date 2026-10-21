@@ -1,6 +1,7 @@
 import { parseIssueTab, type IssueTab } from "../features/issues/model";
 import { readFilters, writeFilters, NO_FILTERS, type BoardFilters } from "./filters";
 import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
+import { MY_WORK_URL_KEYS, readMyWorkView, writeMyWorkView, type MyWorkView } from "./myWorkQuery";
 
 /**
  * The app's routes — real paths with browser history, so every screen has
@@ -68,7 +69,8 @@ export type Route =
   | { screen: "workspaceAppKey"; appKey: string }
   | { screen: "agents"; alias: string | null }
   | { screen: "threads" }
-  | { screen: "myWork" }
+  /** CAD-1703: the tab, search and filters, from the query (`?tab=done&search=…`). */
+  | { screen: "myWork"; view?: MyWorkView }
   | { screen: "wiki"; mode: WikiMode; path: string | null; query: string | null; at?: string; section?: string; page?: number }
   | { screen: "outbox" }
   | { screen: "setup" }
@@ -391,6 +393,10 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
   if (route.screen === "projects" && route.section === "overview" && q.has("view")) {
     route = { ...route, section: "issues" };
   }
+  if (route.screen === "myWork") {
+    const view = readMyWorkView(q);
+    route = Object.keys(view).length ? { screen: "myWork", view } : { screen: "myWork" };
+  }
   const onProjects = route.screen === "projects";
   const queried = q.get("project");
   return {
@@ -438,6 +444,8 @@ export function locationHref(loc: AppLocation, search = ""): string {
   // controls instead of the mounted app screen); it never carries over to
   // another installation.
   for (const key of ["tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page"]) q.delete(key);
+  // CAD-1703: My work's view belongs to its own route.
+  for (const key of MY_WORK_URL_KEYS) q.delete(key);
   writeFilters(q, NO_FILTERS);
   const route = scopedRoute(loc.route, loc.project);
   // CAD-1068: the mounted app routes (`workspaceAppKey`, and the retired
@@ -458,6 +466,7 @@ export function locationHref(loc: AppLocation, search = ""): string {
     q.set("project", loc.project);
   }
   if (loc.openId) q.set("issue", loc.openId);
+  if (route.screen === "myWork" && route.view) writeMyWorkView(q, route.view);
   if (route.screen === "wiki") {
     if (route.at !== undefined) q.set("at", route.at);
     if (route.section) q.set("section", route.section);
@@ -573,7 +582,8 @@ export function scopeRedirect(
   if (legacy) return legacy;
   if (!new URLSearchParams(search).has("project")) return null;
   const loc = readLocation(pathname, search, storedView);
-  if (projectFilter(loc.route) || loc.route.screen === "projects") return null;
+  // My work's `?project=` is its own filter (CAD-1703), not a screen scope.
+  if (projectFilter(loc.route) || loc.route.screen === "projects" || loc.route.screen === "myWork") return null;
   const next = locationHref(loc, search);
   const current = pathname + (search ? (search.startsWith("?") ? search : `?${search}`) : "");
   return next === current ? null : next;
