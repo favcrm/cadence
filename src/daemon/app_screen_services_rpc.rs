@@ -80,6 +80,25 @@ impl ScreenServiceConfirmation {
     }
 }
 
+#[cfg(test)]
+impl Shared {
+    /// Test-only clock seam: age every held confirmation past
+    /// [`CONFIRM_TTL`] so the expiry refusal runs without sleeping.
+    pub(crate) fn age_screen_confirmations_for_test(&self) {
+        let aged = Instant::now()
+            .checked_sub(CONFIRM_TTL)
+            .expect("monotonic clock covers the TTL");
+        for item in self
+            .screen_service_confirmations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values_mut()
+        {
+            item.issued = aged;
+        }
+    }
+}
+
 struct CsvInFlight<'a> {
     key: String,
     live: &'a std::sync::Mutex<std::collections::HashSet<String>>,

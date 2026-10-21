@@ -698,3 +698,192 @@ fn cad811_works_export_before_approval_refuses_through_slot() {
         .expect_err("export before approval must refuse");
     assert_eq!(error.kind(), "rejected", "export gate: wrong refusal kind");
 }
+
+// Changed facts: a revision moved after prepare must refuse the confirm,
+// and the approval must not land on the new revision.
+#[test]
+fn cad1662_changed_facts_after_prepare_refuse_through_slot_confirm() {
+    let native = Native::new_with_subs(&["synthetic-c811-owner", "synthetic-c811-reviewer"]);
+    let scope = native.fx.install("works-facts", WORKS_OPS);
+    let (author, _) = native.owner();
+    let author_action = native.mount(&author, "public", &scope, 1);
+    let reviewer = public_session(&native, "synthetic-c811-reviewer", "c811-works-facts-jti");
+    let reviewer_action = native.mount(&reviewer, "public", &scope, 2);
+    let created = native.service(
+        &author,
+        "public",
+        &author_action,
+        "works.create",
+        json!({"kind": "doc", "title": "facts", "content": content_for("doc"),
+            "idempotency_key": "facts-create"}),
+        false,
+    );
+    let id = created["id"].as_str().expect("created id").to_owned();
+    let revision = created["revision"].clone();
+    native.service(
+        &author,
+        "public",
+        &author_action,
+        "works.request_review",
+        json!({"id": id, "revision": revision}),
+        false,
+    );
+    let token = prepare_slot(
+        &native,
+        &reviewer,
+        &reviewer_action,
+        "works.review",
+        json!({"id": id, "revision": revision, "decision": "approve"}),
+    );
+    // The author edits after the reviewer's card was drawn: revision moves.
+    native.service(
+        &author,
+        "public",
+        &author_action,
+        "works.patch",
+        json!({"id": id, "if_revision": revision,
+            "operations": [{"type": "set_title", "title": "facts v2"}],
+            "idempotency_key": "facts-patch"}),
+        false,
+    );
+    let error = confirm_slot(&native, &reviewer, &reviewer_action, &token, "approve")
+        .expect_err("changed facts must refuse the confirm");
+    assert_eq!(
+        error.kind(),
+        "rejected",
+        "changed facts: wrong refusal kind"
+    );
+    let shown = native.service(
+        &author,
+        "public",
+        &author_action,
+        "works.get",
+        json!({"id": id}),
+        false,
+    );
+    assert_eq!(
+        shown["reviewState"], "draft",
+        "approval must not land on the moved revision"
+    );
+}
+
+// Expiry: a confirmation older than CONFIRM_TTL refuses at confirm, through
+// the test-only clock seam; no production clock or visibility changes.
+#[test]
+fn cad1662_expired_confirmation_refuses_through_slot_confirm() {
+    let native = Native::new_with_subs(&["synthetic-c811-owner", "synthetic-c811-reviewer"]);
+    let scope = native.fx.install("works-expiry", WORKS_OPS);
+    let (author, _) = native.owner();
+    let author_action = native.mount(&author, "public", &scope, 1);
+    let reviewer = public_session(&native, "synthetic-c811-reviewer", "c811-works-expiry-jti");
+    let reviewer_action = native.mount(&reviewer, "public", &scope, 2);
+    let created = native.service(
+        &author,
+        "public",
+        &author_action,
+        "works.create",
+        json!({"kind": "doc", "title": "expiry", "content": content_for("doc"),
+            "idempotency_key": "expiry-create"}),
+        false,
+    );
+    let id = created["id"].as_str().expect("created id").to_owned();
+    let revision = created["revision"].clone();
+    native.service(
+        &author,
+        "public",
+        &author_action,
+        "works.request_review",
+        json!({"id": id, "revision": revision}),
+        false,
+    );
+    let token = prepare_slot(
+        &native,
+        &reviewer,
+        &reviewer_action,
+        "works.review",
+        json!({"id": id, "revision": revision, "decision": "approve"}),
+    );
+    native.shared.age_screen_confirmations_for_test();
+    let error = confirm_slot(&native, &reviewer, &reviewer_action, &token, "approve")
+        .expect_err("expired confirmation must refuse");
+    assert_eq!(error.kind(), "rejected", "expiry: wrong refusal kind");
+    let shown = native.service(
+        &author,
+        "public",
+        &author_action,
+        "works.get",
+        json!({"id": id}),
+        false,
+    );
+    assert_eq!(
+        shown["reviewState"], "draft",
+        "expired approval must not land"
+    );
+}
+
+// Revocation: once the reviewer's membership is withdrawn, the old mount
+// and approval authority must refuse; the doc stays unapproved.
+#[test]
+fn cad1662_retired_reviewer_authority_refuses_after_membership_withdrawal() {
+    let native = Native::new_with_subs(&["synthetic-c811-owner", "synthetic-c811-reviewer"]);
+    let scope = native.fx.install("works-revoke", WORKS_OPS);
+    let (author, _) = native.owner();
+    let author_action = native.mount(&author, "public", &scope, 1);
+    let reviewer = public_session(&native, "synthetic-c811-reviewer", "c811-works-revoke-jti");
+    let reviewer_action = native.mount(&reviewer, "public", &scope, 2);
+    let created = native.service(
+        &author,
+        "public",
+        &author_action,
+        "works.create",
+        json!({"kind": "doc", "title": "revoke", "content": content_for("doc"),
+            "idempotency_key": "revoke-create"}),
+        false,
+    );
+    let id = created["id"].as_str().expect("created id").to_owned();
+    let revision = created["revision"].clone();
+    native.service(
+        &author,
+        "public",
+        &author_action,
+        "works.request_review",
+        json!({"id": id, "revision": revision}),
+        false,
+    );
+    native
+        .member_live
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let token = native.rpc(
+        "app_screen_service_slot_prepare",
+        native.credentials(
+            &reviewer,
+            "public",
+            call(
+                &reviewer_action,
+                "works.review",
+                json!({"id": id, "revision": revision, "decision": "approve"}),
+            ),
+        ),
+    );
+    assert!(
+        token.is_err(),
+        "retired reviewer mount must refuse to prepare"
+    );
+    // Membership withdrawal is global to the fixture; restore it only to read
+    // the item back and prove the refused approval left the review state put.
+    native
+        .member_live
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let shown = native.service(
+        &author,
+        "public",
+        &author_action,
+        "works.get",
+        json!({"id": id}),
+        false,
+    );
+    assert_eq!(
+        shown["reviewState"], "draft",
+        "retired reviewer must not approve"
+    );
+}

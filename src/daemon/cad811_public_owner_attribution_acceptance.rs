@@ -42,7 +42,7 @@ pub(super) struct Native {
     // Drop the owned board/socket threads before the temp state or Shared.
     pub(super) fx: Fixture,
     pub(super) shared: Arc<Shared>,
-    member_live: Arc<AtomicBool>,
+    pub(super) member_live: Arc<AtomicBool>,
     lookups: Arc<AtomicUsize>,
     pub(super) issuer: String,
 }

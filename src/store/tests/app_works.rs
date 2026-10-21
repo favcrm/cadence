@@ -321,3 +321,47 @@ fn cad1649_audit_rows_are_written() {
     assert!(actions.contains("create"));
     assert!(actions.contains("patch"));
 }
+
+// CAD-1662 audit transaction: a Works mutation whose audit row cannot be
+// written must roll back entirely - no item/revision change and no
+// idempotency replay row. Fail-injection is a SQLite trigger on the real
+// audit table, so the production write path is unchanged.
+#[test]
+fn cad1662_audit_failure_rolls_back_item_revision_and_replay() {
+    let (_dir, store) = open();
+    store
+        .app_works_create("ctx-1", &doc("Rollback"), "alice", "create-rb", None)
+        .unwrap();
+    store
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER cad1662_fail_audit BEFORE INSERT ON app_works_audit
+             BEGIN SELECT RAISE(ABORT, 'synthetic audit failure'); END;",
+        )
+        .unwrap();
+    let before_rev = store.app_works_get("ctx-1", "rollback").unwrap()["revision"].clone();
+
+    let patch = store.app_works_patch(
+        "ctx-1",
+        "rollback",
+        1,
+        &[json!({"type": "set_title", "title": "Rollback v2"})],
+        "alice",
+        "patch-rb",
+        None,
+    );
+    assert!(patch.is_err(), "patch must fail when its audit row fails");
+
+    let after = store.app_works_get("ctx-1", "rollback").unwrap();
+    assert_eq!(after["revision"], before_rev, "revision must not advance");
+    assert_eq!(after["title"], "Rollback", "title must not change");
+    let replays: i64 = store
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM app_works_idempotency WHERE context_id='ctx-1' AND key='patch-rb'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(replays, 0, "no replay row may persist after audit failure");
+}
