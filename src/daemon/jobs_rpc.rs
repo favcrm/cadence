@@ -452,6 +452,10 @@ impl Shared {
         if cloud_dispatch {
             crate::issue::cloud::probe_entitlement()?;
         }
+        let stall_secs = optional_i64(params, "stall_secs");
+        if stall_secs.is_some_and(|s| s < 0) {
+            return Err(Error::rejected("stall_secs must be non-negative"));
+        }
         let (task, message, duplicate, behind_dead) = match &expect {
             Some(expect) => self.store.dispatch_task_expecting_for(
                 task_id,
@@ -482,8 +486,18 @@ impl Shared {
         if let Some(assignee) = &task.assignee {
             self.notify_agent(assignee);
         }
+        // CAD-1353: the budget is chosen per dispatch and recorded on
+        // the job. A duplicate dispatch re-delivers an existing kickoff,
+        // so it must not rewrite the budget that kickoff was sent with.
+        if !duplicate {
+            if let Some(secs) = stall_secs {
+                self.store.set_job_stall_secs(&task.job_id, secs)?;
+            }
+        }
+        let message_state = self.store.message(&message)?.map(|m| m.state);
         self.wake();
         Ok(json!({"task": task.to_json(), "message": message,
+                  "message_state": message_state,
                   "duplicate": duplicate, "queued_behind_dead": behind_dead}))
     }
 

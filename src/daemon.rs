@@ -154,6 +154,8 @@ mod cad1327_acceptance;
 mod cad1337_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1337_migration_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1353_delivery_status_acceptance;
 mod cad1365_generation_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1365_media_publish_acceptance;
@@ -2413,6 +2415,7 @@ impl Shared {
                 // CAD-1266: one pass over `tasks` for the whole fleet, not
                 // one query per agent.
                 let mut open_tasks = self.store.open_task_ids_by_assignee()?;
+                let deliveries = self.store.open_delivery_summary()?;
                 let listed_agents = self.store.agents()?;
                 let aliases: Vec<String> = listed_agents.iter().map(|a| a.alias.clone()).collect();
                 // CAD-96/CAD-1239: one grouped read for the operational
@@ -2469,6 +2472,9 @@ impl Shared {
                         view.apply(&mut j);
                     }
                     apply_auto_stop_view(&mut j, &agent, markers.get(&agent.alias));
+                    let (queued, oldest) =
+                        deliveries.get(&agent.alias).copied().unwrap_or((0, None));
+                    apply_delivery_view(&mut j, &agent, queued, oldest);
                     if let Some(awaiting) = self.awaiting_report_view(&agent) {
                         j["awaiting_report"] = awaiting;
                     }
@@ -2625,6 +2631,14 @@ impl Shared {
                 }
                 let marker = self.store.last_event_of(&alias, AUTO_STOP_MARKER_KINDS)?;
                 apply_auto_stop_view(&mut agent_json, &agent, marker.as_ref());
+                let active = self.store.active_messages(&alias)?;
+                let waiting: Vec<_> = active
+                    .into_iter()
+                    .filter(|message| message.state != "running")
+                    .collect();
+                let queued = waiting.len() as i64;
+                let oldest = waiting.iter().map(|m| m.created).reduce(f64::min);
+                apply_delivery_view(&mut agent_json, &agent, queued, oldest);
                 if let Some(awaiting) = self.awaiting_report_view(&agent) {
                     agent_json["awaiting_report"] = awaiting;
                 }
@@ -5498,8 +5512,9 @@ use serve::{
 pub use serve::{INSTANCE_FILE, LAST_RECOVERY_FILE};
 #[allow(unused_imports)]
 use timers::{
-    apply_auto_stop_view, auto_stop_view, AgentGcState, AgentGcTimer, AutoStopState, AutoStopTimer,
-    AutoStopVerdict, AGENT_GC_EVERY, AUTO_STOP_MARKER_KINDS, AUTO_STOP_PASSIVE_KINDS,
+    apply_auto_stop_view, apply_delivery_view, auto_stop_view, delivery_view, AgentGcState,
+    AgentGcTimer, AutoStopState, AutoStopTimer, AutoStopVerdict, AGENT_GC_EVERY,
+    AUTO_STOP_MARKER_KINDS, AUTO_STOP_PASSIVE_KINDS,
 };
 pub use timers::{
     auto_stop_label, AgentGcSetting, AutoStopSetting, AGENT_GC_FLOOR_SECS, AUTO_RESUME_EVENT,

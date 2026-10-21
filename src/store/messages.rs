@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::proto::identifier;
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::agents::Agent;
 use super::schema::Take;
@@ -2604,6 +2604,31 @@ impl Store {
         )?;
         let rows = stmt.query_map([alias], row_message)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// CAD-1353: one grouped read for the fleet status view — how many
+    /// deliveries each alias is waiting to start and how long the oldest
+    /// has waited. A running turn is already delivering, so it is not
+    /// counted as queued; the stall view reports it separately.
+    pub fn open_delivery_summary(&self) -> Result<HashMap<String, (i64, Option<f64>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT alias, COUNT(*), MIN(created) FROM messages
+             WHERE alias != '' AND state IN ('queued','submitting','unknown')
+             AND source != 'topic_notice' GROUP BY alias",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, i64>(1)?, row.get::<_, Option<f64>>(2)?),
+            ))
+        })?;
+        let mut summary = HashMap::new();
+        for row in rows {
+            let (alias, counts) = row?;
+            summary.insert(alias, counts);
+        }
+        Ok(summary)
     }
 
     /// Running rows only, via the queue index: recurring summaries must

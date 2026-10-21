@@ -453,6 +453,93 @@ pub(super) fn auto_stop_view(agent: &Agent, marker: Option<&store::Event>) -> Op
     }))
 }
 
+/// CAD-1353: what a non-empty delivery queue is waiting for. The live
+/// idle case is the one the operator cannot see from `state` alone: an
+/// actor with no turn running has no provider event to show and looks
+/// idle while the delivery has not started.
+pub(super) fn delivery_view(agent: &Agent, queued: i64, oldest: Option<f64>) -> Value {
+    if queued <= 0 {
+        return json!({"queued": 0, "state": "clear"});
+    }
+    let age = oldest.map(|at| (crate::store::now() - at).max(0.0).round() as u64);
+    let (state, owner, reason) = if agent.state == "stopped" {
+        (
+            "stopped",
+            "operator",
+            "the agent is stopped — `cadence agent resume <alias>` drains the queue",
+        )
+    } else if !agent.enabled {
+        (
+            "disabled",
+            "operator",
+            "the agent is disabled — enable or resume it to drain the queue",
+        )
+    } else if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+        (
+            "inbox",
+            "operator",
+            "the inbox has no actor — drain it with `cadence inbox <alias>`",
+        )
+    } else if agent.endpoint.is_none() {
+        (
+            "no-endpoint",
+            "operator",
+            "the agent has no live endpoint — resume it to start an actor",
+        )
+    } else if matches!(agent.state.as_str(), "starting" | "stopping") {
+        (
+            "lifecycle",
+            "daemon",
+            "the actor is starting or stopping — the queue drains once it is live",
+        )
+    } else if agent.state == "attention" {
+        (
+            "attention",
+            "operator",
+            "the agent needs attention — resolve the fence or approval before the queue can run",
+        )
+    } else if agent.state == "idle" {
+        (
+            "idle-no-turn",
+            "daemon",
+            "the live actor is idle and no turn has started for the queued delivery (daemon delivery loop)",
+        )
+    } else if matches!(agent.state.as_str(), "running" | "busy") {
+        (
+            "turn-in-progress",
+            "agent",
+            "a turn is in progress — the queued delivery waits for it to end",
+        )
+    } else {
+        (
+            "queued",
+            "daemon",
+            "the delivery is queued and the daemon has not started it",
+        )
+    };
+    json!({
+        "queued": queued,
+        "oldest_secs": age,
+        "state": state,
+        "blocker": {"owner": owner, "reason": reason},
+    })
+}
+
+/// Stamp the delivery view and make the queue visible in the row's
+/// label, so a caller reading `state_label` cannot see a plain idle
+/// agent while work waits.
+pub(super) fn apply_delivery_view(j: &mut Value, agent: &Agent, queued: i64, oldest: Option<f64>) {
+    j["delivery"] = delivery_view(agent, queued, oldest);
+    if queued > 0 {
+        let label = j
+            .get("state_label")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| agent.state.clone());
+        j["state_label"] = json!(format!("{label} · {queued} queued"));
+    }
+}
+
 /// CAD-413: the `auto_resume_failed` view of an agent whose newest
 /// marker is a failed auto-resume and that is still not live — what the
 /// needs-me row names: the agent, the message left waiting, and why.

@@ -269,6 +269,23 @@ impl Store {
         self.task_in(&conn, id)
     }
 
+    /// CAD-1353: record the stall budget chosen by `job dispatch
+    /// --stall-secs` on the task's job. The dispatch itself already
+    /// validated the caller; this only refuses a missing job and a
+    /// negative budget.
+    pub fn set_job_stall_secs(&self, job_id: &str, secs: i64) -> Result<()> {
+        if secs < 0 {
+            return Err(Error::rejected("stall_secs must be non-negative"));
+        }
+        self.job(job_id)?;
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE jobs SET stall_secs=?,updated=? WHERE id=?",
+            params![secs, now(), job_id],
+        )?;
+        Ok(())
+    }
+
     /// CAD-160 (ADR-0002 phase 1): the body a task-bound message (`send
     /// --task`, `ask --task`) is delivered as. For an open task it is
     /// the sender's text, then the task's objective, then every

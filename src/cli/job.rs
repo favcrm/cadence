@@ -118,6 +118,11 @@ pub(crate) enum JobAction {
         /// cadence-dispatch:<task>:r<n>).
         #[arg(long)]
         message: Option<String>,
+        /// Per-dispatch no-provider-event budget in seconds, recorded
+        /// on the job (0 disables). Overrides `job new --stall-secs`
+        /// for this dispatch; a duplicate dispatch records nothing.
+        #[arg(long)]
+        stall_secs: Option<u64>,
     },
     /// Record a QA verdict bound to the task's reported commit.
     /// The reviewer is the verified caller (CAD-372): the agent whose
@@ -318,6 +323,7 @@ pub(super) fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
             ready,
             force,
             message,
+            stall_secs,
         } => {
             // --ready is the same operator claim as `send --ready`:
             // resolve the assignee (explicit --to or the stored one),
@@ -345,11 +351,20 @@ pub(super) fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
                     }
                 }
             }
-            print_json(&rpc(
+            let out = rpc(
                 "task_dispatch",
                 json!({"task": task, "to": to, "message": message,
-                       "by": by}),
-            )?);
+                       "by": by, "stall_secs": stall_secs}),
+            )?;
+            // CAD-1353: a duplicate dispatch is an acknowledged retry,
+            // not a silent success. Say which message already carries
+            // the work and what state it is in, and exit 4 so a script
+            // sees the two outcomes differently.
+            if let Some(line) = duplicate_dispatch_line(&out) {
+                println!("{line}");
+                return Ok(4);
+            }
+            print_json(&out);
         }
         JobAction::Verdict {
             task,
@@ -852,6 +867,21 @@ pub(super) fn verdict_status_post(
         Ok(_) => json!({"posted": true, "pr": number, "sha": sha}),
         Err(e) => reason(format!("gh post failed: {e}")),
     }
+}
+
+/// CAD-1353: the explicit retry line for a duplicate dispatch, or `None`
+/// for a fresh one. The caller prints it and exits 4, so a script cannot
+/// mistake the retry for a new kickoff.
+pub(super) fn duplicate_dispatch_line(out: &Value) -> Option<String> {
+    (out.get("duplicate").and_then(Value::as_bool) == Some(true)).then(|| {
+        format!(
+            "duplicate of {} (state {})",
+            out.get("message").and_then(Value::as_str).unwrap_or("?"),
+            out.get("message_state")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        )
+    })
 }
 
 pub(super) fn run(state_dir: PathBuf, action: JobAction) -> Result<i32> {

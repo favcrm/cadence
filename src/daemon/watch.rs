@@ -856,9 +856,10 @@ impl Shared {
                 running.as_ref().unwrap(),
                 self.stall_now().saturating_duration_since(at),
                 episode,
+                budget,
             ),
             StallTransition::Stall(episode, silent) => {
-                self.stall_fired(&agent, running.as_ref().unwrap(), silent, episode)
+                self.stall_fired(&agent, running.as_ref().unwrap(), silent, episode, budget)
             }
             StallTransition::Emit => {}
         }
@@ -934,12 +935,20 @@ impl Shared {
 
     /// `turn_stalled`: record the event and send the one notice this
     /// episode gets. Fires once per silence episode.
-    fn stall_fired(&self, agent: &Agent, message: &Message, silent: Duration, episode: u64) {
+    fn stall_fired(
+        &self,
+        agent: &Agent,
+        message: &Message,
+        silent: Duration,
+        episode: u64,
+        budget: u64,
+    ) {
         let silent_secs = silent.as_secs();
         let (job_id, task_id) = self.message_scope(message);
         let mut payload = json!({
             "message": message.id,
             "silent_secs": silent_secs,
+            "budget_secs": budget,
             "last_activity": epoch_secs() - silent_secs as f64,
         });
         if let Some(t) = task_id {
@@ -953,15 +962,26 @@ impl Shared {
             task_id,
         );
         self.wake();
-        self.stall_notice(agent, message, episode, true, silent_secs);
+        self.stall_notice(agent, message, episode, true, silent_secs, budget);
     }
 
     /// `turn_resumed`: the first activity after a stall closes the
     /// episode — same event/notice pair to the same recipients.
-    fn stall_resumed(&self, agent: &Agent, message: &Message, silent: Duration, episode: u64) {
+    fn stall_resumed(
+        &self,
+        agent: &Agent,
+        message: &Message,
+        silent: Duration,
+        episode: u64,
+        budget: u64,
+    ) {
         let silent_secs = silent.as_secs();
         let (job_id, task_id) = self.message_scope(message);
-        let mut payload = json!({"message": message.id, "silent_secs": silent_secs});
+        let mut payload = json!({
+            "message": message.id,
+            "silent_secs": silent_secs,
+            "budget_secs": budget,
+        });
         if let Some(t) = task_id {
             payload["task"] = json!(t);
         }
@@ -973,7 +993,7 @@ impl Shared {
             task_id,
         );
         self.wake();
-        self.stall_notice(agent, message, episode, false, silent_secs);
+        self.stall_notice(agent, message, episode, false, silent_secs, budget);
     }
 
     /// `approval_menu`: the sampled pane just showed an approval menu
@@ -1143,17 +1163,19 @@ impl Shared {
         episode: u64,
         stalled: bool,
         silent_secs: u64,
+        budget: u64,
     ) {
         let what = message.task_id.as_deref().unwrap_or(&message.id);
         let body = if stalled {
             let cursor = self.store.event_cursor(&agent.alias).unwrap_or(0);
             format!(
-                "Worker {} has shown no activity for {} on {} — this is \
-                 informational; nothing was changed or interrupted. \
+                "Worker {} has shown no activity for {} (stall budget {}) on {} — \
+                 this is informational; nothing was changed or interrupted. \
                  Look with: `cadence agent capture {}`, \
                  `cadence agent probe {}`, `cadence events {} --after {}`.",
                 agent.alias,
                 fmt_duration(silent_secs),
+                fmt_duration(budget),
                 what,
                 agent.alias,
                 agent.alias,
@@ -1162,11 +1184,13 @@ impl Shared {
             )
         } else {
             format!(
-                "Worker {} is active again on {} after {} of silence — \
-                 the earlier stall notice is resolved; nothing was changed.",
+                "Worker {} is active again on {} after {} of silence \
+                 (stall budget {}) — the earlier stall notice is resolved; \
+                 nothing was changed.",
                 agent.alias,
                 what,
-                fmt_duration(silent_secs)
+                fmt_duration(silent_secs),
+                fmt_duration(budget)
             )
         };
         let kind = if stalled { "stalled" } else { "resumed" };
