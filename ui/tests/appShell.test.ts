@@ -324,6 +324,12 @@ equal(panes(), 1, "switching never mounts a second chat pane");
 await React.act(async () => { navigate("/app-installations/install-shell?ctx=ctx-a"); });
 await flush();
 assert(!location.search.includes("ctx="), "a legacy ctx link is normalized to a scope-free URL");
+// D1: an empty selector is distinct from an absent one and is not
+// swallowed by the handled-query guard.
+await React.act(async () => { navigate("/app-installations/install-shell?ctx=&record=rec-1"); });
+await flush(); await flush();
+assert(!location.search.includes("ctx="), "an empty selector is normalized away");
+assert(text().includes("not active"), "an empty selector is treated as inactive");
 posts.length = 0;
 await fill("#app-shell-chat-box", "scoped question");
 await click(host.querySelector(".app-chat-form button[type=submit]"));

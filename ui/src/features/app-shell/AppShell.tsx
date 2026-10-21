@@ -331,7 +331,7 @@ export default function AppShell({
     ctx: string | null,
     record: string | null,
     appview: string | null,
-  ) => `${installId}|${ctx ?? ""}|${record ?? ""}|${appview ?? ""}`;
+  ) => JSON.stringify([installId, ctx, record, appview]);
   const writeQuery = useCallback(
     (
       patch: {
