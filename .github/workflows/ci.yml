@@ -1300,11 +1300,15 @@ jobs:
           asset="cadence-app-toolchain-$TAG.tar.gz"
           sha256sum -c "$asset.sha256"
           python3 - "$asset" "$TAG" "$SOURCE_SHA" ../src/ui/package.json <<'PY'
-          import json, re, sys, tarfile
+          import hashlib, json, re, sys, tarfile
+          from pathlib import Path
           archive, tag, source_sha, ui_manifest_path = sys.argv[1:]
+          app_kit_files = ("README.md", "package.json", "src/index.mjs", "src/receiver.mjs",
+                           "src/refusal.mjs", "types/index.d.ts")
           expected = {
               "LICENSE", "README.md", "frame-kit/frame.html", "frame-kit/kit.css",
               "frame-kit/metadata.json", "package.json", "pnpm-lock.yaml", "toolchain.json",
+              *(f"app-kit/{relative}" for relative in app_kit_files),
           }
           if not re.fullmatch(r"v[0-9][0-9A-Za-z.+_-]*", tag) or not re.fullmatch(r"[0-9a-f]{40}", source_sha):
               raise SystemExit("invalid release tag or source commit")
@@ -1319,16 +1323,30 @@ jobs:
                   return json.load(tar.extractfile(name))
               metadata = read_json("toolchain.json")
               package = read_json("package.json")
+              archived_app_kit = {
+                  relative: tar.extractfile(f"app-kit/{relative}").read()
+                  for relative in app_kit_files
+              }
           ui = json.load(open(ui_manifest_path, encoding="utf-8"))
           ui_pins = {**ui["dependencies"], **ui["devDependencies"]}
           pin_names = ("react", "react-dom", "vite", "@vitejs/plugin-react")
           pins = {name: ui_pins.get(name) for name in pin_names}
+          app_kit_dir = Path(ui_manifest_path).parent / "app-kit"
+          app_kit_hashes = {
+              relative: hashlib.sha256((app_kit_dir / relative).read_bytes()).hexdigest()
+              for relative in app_kit_files
+          }
+          for relative in app_kit_files:
+              if archived_app_kit[relative] != (app_kit_dir / relative).read_bytes():
+                  raise SystemExit(f"app-kit archive bytes differ from source: {relative}")
+          app_kit_version = json.loads((app_kit_dir / "package.json").read_text())["version"]
           manager = ui.get("packageManager")
           if not isinstance(manager, str) or not re.fullmatch(r"pnpm@[0-9]+(?:\.[0-9]+){2}", manager):
               raise SystemExit("UI package manager must be an exact pnpm major.minor.patch version")
           if metadata != {"schema": "cadence-app-toolchain/1", "tag": tag,
-                          "source_sha": source_sha, "package_manager": manager, "pins": pins}:
-              raise SystemExit("app-toolchain version, source, schema, package manager, or pins do not match")
+                          "source_sha": source_sha, "package_manager": manager, "pins": pins,
+                          "app_kit": {"version": app_kit_version, "files": app_kit_hashes}}:
+              raise SystemExit("app-toolchain version, source, schema, package manager, pins or app-kit do not match")
           expected_package = {
               "name": "cadence-app-toolchain", "private": True,
               "version": tag[1:], "type": "module", "packageManager": manager,

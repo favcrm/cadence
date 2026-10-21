@@ -15,6 +15,16 @@ import tempfile
 ROOT = Path(__file__).resolve().parent.parent
 SCHEMA = "cadence-app-toolchain/1"
 PIN_NAMES = ("react", "react-dom", "vite", "@vitejs/plugin-react")
+# The app-side screen receiver, vendored byte-for-byte from ui/app-kit. The
+# archive pins every file so a consumer can prove what it unpacked.
+APP_KIT_FILES = (
+    "README.md",
+    "package.json",
+    "src/index.mjs",
+    "src/receiver.mjs",
+    "src/refusal.mjs",
+    "types/index.d.ts",
+)
 
 
 def fail(message):
@@ -72,12 +82,24 @@ def main():
         shutil.copyfile(ROOT / "app-toolchain/pnpm-lock.yaml", stage / "pnpm-lock.yaml")
         shutil.copyfile(ROOT / "app-toolchain/README.md", stage / "README.md")
         shutil.copyfile(ROOT / "LICENSE", stage / "LICENSE")
+        app_kit = ROOT / "ui/app-kit"
+        app_kit_version = json.loads((app_kit / "package.json").read_text())["version"]
+        app_kit_files = {}
+        for relative in APP_KIT_FILES:
+            source = app_kit / relative
+            if not source.is_file():
+                fail(f"app-kit source is missing: {relative}")
+            target = stage / "app-kit" / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            app_kit_files[relative] = hashlib.sha256(source.read_bytes()).hexdigest()
         (stage / "toolchain.json").write_text(json.dumps({
             "schema": SCHEMA,
             "tag": args.tag,
             "source_sha": args.source_sha,
             "package_manager": manager,
             "pins": pins,
+            "app_kit": {"version": app_kit_version, "files": app_kit_files},
         }, indent=2) + "\n")
         frame = stage / "frame-kit"
         subprocess.run(
@@ -88,6 +110,7 @@ def main():
         members = [
             "LICENSE", "README.md", "frame-kit/frame.html", "frame-kit/kit.css",
             "frame-kit/metadata.json", "package.json", "pnpm-lock.yaml", "toolchain.json",
+            *(f"app-kit/{relative}" for relative in APP_KIT_FILES),
         ]
         for member in members:
             if not (stage / member).is_file():
