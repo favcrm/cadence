@@ -134,6 +134,12 @@ export function lifecycleBadge(
   return { label: t(status), tone: "ink" };
 }
 
+/** Where an agent runs, derived from its endpoint kind - no stored column.
+ * `sandbox` is a cloud sandbox agent; every other kind is local. */
+export function agentLocation(a: Agent): "cloud" | "local" {
+  return a.endpoint_kind === "sandbox" ? "cloud" : "local";
+}
+
 export function agentStatus(a: Agent): string {
   if (a.fenced) return "attention";
   if (a.inbox || a.provider === "inbox") return "inbox";

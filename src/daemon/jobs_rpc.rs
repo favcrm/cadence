@@ -423,10 +423,16 @@ impl Shared {
             }
             None => {}
         }
-        if let Some(alias) = to.as_deref().or(pending.assignee.as_deref()) {
-            let target = self.store.agent(alias)?;
-            crate::adapter::pi::refuse_confined_devin_agent(&target)?;
+        let target_alias = to.as_deref().or(pending.assignee.as_deref());
+        let target = target_alias
+            .map(|alias| self.store.agent(alias))
+            .transpose()?;
+        if let Some(target) = &target {
+            crate::adapter::pi::refuse_confined_devin_agent(target)?;
         }
+        let cloud_dispatch = target
+            .as_ref()
+            .is_some_and(|agent| agent.endpoint_kind == "sandbox");
         let (task, message, duplicate, behind_dead) = match &expect {
             Some(expect) => self.store.dispatch_task_expecting(
                 task_id,
@@ -442,12 +448,39 @@ impl Shared {
                 by,
             )?,
         };
+        if cloud_dispatch && !duplicate {
+            let shared = Arc::clone(self);
+            let task_id = task.id.clone();
+            let message_id = message.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = shared.run_cloud_dispatch(&task_id, &message_id) {
+                    eprintln!("cloud sandbox dispatch {task_id} failed: {error}");
+                }
+            });
+        }
         if let Some(assignee) = &task.assignee {
             self.notify_agent(assignee);
         }
         self.wake();
         Ok(json!({"task": task.to_json(), "message": message,
                   "duplicate": duplicate, "queued_behind_dead": behind_dead}))
+    }
+
+    /// Consume a sandbox agent's dispatched kickoff. The normal dispatch
+    /// transaction already set the task `dispatched` and queued `message`;
+    /// the cloud backend marks it running, drives the remote job, and calls
+    /// the same finish/report path. `has_actor=false` means no actor exists.
+    fn run_cloud_dispatch(&self, task_id: &str, message_id: &str) -> Result<()> {
+        let task = self.store.task(task_id)?;
+        let job = self.store.job(&task.job_id)?;
+        let message = self.store.message(message_id)?.ok_or_else(|| {
+            Error::rejected(format!("cloud dispatch message '{message_id}' is gone"))
+        })?;
+        let alias = task.assignee.as_deref().unwrap_or(message.alias.as_str());
+        let agent = self.store.agent(alias)?;
+        let company = crate::issue::cloud::hosted_company(|key| std::env::var(key).ok())?;
+        let pm = self.pm()?;
+        crate::issue::cloud::run_dispatch(&pm, &self.store, &task, &job, &message, &agent, &company)
     }
 
     /// `job verdict` — the reviewer is the verified caller (CAD-372),

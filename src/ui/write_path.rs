@@ -380,6 +380,90 @@ pub(crate) fn post_report(
     }
 }
 
+/// Body for `POST /api/agents`. Every field is one `rpc_register` reads;
+/// `deny_unknown_fields` refuses identity-shaped keys (`by`, `actor`,
+/// `operator`, …) and anything else the daemon has no say in. Location is
+/// not a daemon field: `cloud` pins provider and endpoint kind to `sandbox`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentRegisterReq {
+    alias: String,
+    location: String,
+    provider: Option<String>,
+    endpoint_kind: Option<String>,
+    role: Option<String>,
+    team_role: Option<String>,
+    model_policy: Option<String>,
+    cwd: Option<String>,
+    sandbox: Option<String>,
+    instructions: Option<String>,
+    params: Option<String>,
+}
+
+/// Maps a setup location to the `(provider, endpoint_kind)` pair the daemon
+/// registers. `cloud` pins both to `sandbox`; `local` needs the explicit
+/// pair and refuses `sandbox`, which only Cloud may set.
+fn resolve_location(req: &AgentRegisterReq) -> std::result::Result<(String, String), String> {
+    match req.location.trim() {
+        "local" => {
+            let provider = req.provider.as_deref().map(str::trim).unwrap_or_default();
+            let endpoint = req
+                .endpoint_kind
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default();
+            if provider.is_empty() || endpoint.is_empty() {
+                return Err("a local agent needs a provider and endpoint kind".into());
+            }
+            if provider == "sandbox" || endpoint == "sandbox" {
+                return Err("sandbox is a cloud location - choose Cloud".into());
+            }
+            Ok((provider.to_string(), endpoint.to_string()))
+        }
+        "cloud" => {
+            if req.provider.is_some() || req.endpoint_kind.is_some() {
+                return Err("cloud sets provider and endpoint kind itself".into());
+            }
+            Ok(("sandbox".to_string(), "sandbox".to_string()))
+        }
+        other => Err(format!("location is local or cloud - not '{other}'")),
+    }
+}
+
+/// `POST /api/agents`: register one agent through the daemon's
+/// `agent_register` (`rpc_register`). The operator gate ran in `admit`;
+/// the daemon applies the same validation a CLI registration does.
+pub(crate) fn post_agent(request: &mut Request, state_dir: &Path) -> HttpResp {
+    let bytes = match read_body(request, JSON_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let req: AgentRegisterReq = match parse_json(&bytes) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let (provider, endpoint_kind) = match resolve_location(&req) {
+        Ok(pair) => pair,
+        Err(message) => return err_response(400, &message),
+    };
+    let params = json!({
+        "alias": req.alias.trim(),
+        "provider": provider,
+        "endpoint_kind": endpoint_kind,
+        "role": req.role,
+        "team_role": req.team_role,
+        "model_policy": req.model_policy,
+        "cwd": req.cwd,
+        "sandbox": req.sandbox,
+        "instructions": req.instructions,
+        "params": req.params,
+    });
+    match client::rpc(state_dir, "agent_register", params) {
+        Ok(out) => json_response(out),
+        Err(err) => super::home::rpc_err(&err, "agent_register"),
+    }
+}
+
 /// Fresh card + detail payloads for one id after a write.
 pub(crate) fn issue_payloads(pm: &Pm, state_dir: &Path, id: &str) -> Result<(Value, Value)> {
     let read = read_model::get(state_dir, &pm.dir).board(pm, None);
@@ -1264,6 +1348,80 @@ pub(crate) fn write_route(
             return;
         }
     };
+    // CAD-561: the operator's Update button — the same pipeline the CLI
+    // runs, in this process; the card polls `GET /api/update`.
+    if path == "/api/update" || path == "/api/update/check" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = if path == "/api/update" {
+            updates::start(state_dir, opts)
+        } else {
+            updates::check_now(state_dir)
+        };
+        send(request, resp);
+        return;
+    }
+    if path == "/api/settings/agents"
+        || path == "/api/settings/agents/catalog"
+        || path == "/api/settings/agents/sync"
+        || path == "/api/settings/agents/preview"
+    {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = agent_settings_post(&mut request, state_dir, path);
+        send(request, resp);
+        return;
+    }
+    if path == "/api/settings/model-defaults" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = model_defaults_post(&mut request, state_dir);
+        send(request, resp);
+        return;
+    }
+    if path == "/api/locale" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = super::locale::post(&mut request, state_dir, opts);
+        send(request, resp);
+        return;
+    }
+    // CAD-140: filing a report or idea — the same `report::file` path
+    // `cadence report` uses (scrubbing, context, intake shape, PM
+    // heads-up), never a bare issue create. Admitted above, like every
+    // write; the actor below is the admitted caller, never a field.
+    if path == "/api/reports" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let Some(caller) = &caller else {
+            send(request, err_response(500, "unadmitted write"));
+            return;
+        };
+        let resp = post_report(&mut request, state_dir, pm_dir, caller.actor());
+        send(request, resp);
+        return;
+    }
+    // Setup: one agent row through the daemon's `agent_register` (the same
+    // `rpc_register` the CLI uses). Operator-only by `WRITE_ROUTES`.
+    if path == "/api/agents" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = post_agent(&mut request, state_dir);
+        send(request, resp);
+        return;
+    }
     // Monitor acknowledgement: this is a daemon-owned durable write, kept
     // beside (and behind the same browser write guards as) tracker writes.
     // The UI never mutates the monitor SQLite store directly, which keeps a
@@ -2341,5 +2499,57 @@ mod busy_tests {
     fn other_errors_are_not_busy() {
         assert!(busy_response(&Error::Rejected("no".into())).is_none());
         assert!(busy_response(&Error::gate_coded("x", "standing")).is_none());
+    }
+}
+
+#[cfg(test)]
+mod agent_setup_tests {
+    use super::*;
+
+    fn req(location: &str, provider: Option<&str>, endpoint: Option<&str>) -> AgentRegisterReq {
+        AgentRegisterReq {
+            alias: "scout".into(),
+            location: location.into(),
+            provider: provider.map(Into::into),
+            endpoint_kind: endpoint.map(Into::into),
+            role: None,
+            team_role: None,
+            model_policy: None,
+            cwd: None,
+            sandbox: None,
+            instructions: None,
+            params: None,
+        }
+    }
+
+    #[test]
+    fn cloud_pins_provider_and_endpoint_to_sandbox() {
+        let pair = resolve_location(&req("cloud", None, None)).unwrap();
+        assert_eq!(pair, ("sandbox".to_string(), "sandbox".to_string()));
+    }
+
+    #[test]
+    fn cloud_refuses_a_caller_chosen_provider_or_endpoint() {
+        assert!(resolve_location(&req("cloud", Some("claude"), None)).is_err());
+        assert!(resolve_location(&req("cloud", None, Some("local"))).is_err());
+    }
+
+    #[test]
+    fn local_needs_an_explicit_pair() {
+        let pair = resolve_location(&req("local", Some("claude"), Some("pty"))).unwrap();
+        assert_eq!(pair, ("claude".to_string(), "pty".to_string()));
+        assert!(resolve_location(&req("local", Some("claude"), None)).is_err());
+        assert!(resolve_location(&req("local", None, Some("pty"))).is_err());
+    }
+
+    #[test]
+    fn local_refuses_sandbox_so_cloud_stays_the_only_sandbox_path() {
+        assert!(resolve_location(&req("local", Some("sandbox"), Some("pty"))).is_err());
+        assert!(resolve_location(&req("local", Some("claude"), Some("sandbox"))).is_err());
+    }
+
+    #[test]
+    fn unknown_location_is_refused() {
+        assert!(resolve_location(&req("remote", Some("claude"), Some("pty"))).is_err());
     }
 }

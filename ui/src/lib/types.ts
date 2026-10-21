@@ -632,6 +632,26 @@ export interface UsageLimit {
   } | null;
 }
 
+/**
+ * `POST /api/agents` body. `location` is the only setup choice: `cloud`
+ * sends no provider or endpoint kind (the daemon sets `sandbox`/`sandbox`);
+ * `local` sends the existing provider and endpoint kind plus cwd. No
+ * per-issue location exists.
+ */
+export interface AgentRegisterBody {
+  alias: string;
+  location: "local" | "cloud";
+  provider?: string;
+  endpoint_kind?: string;
+  role?: string;
+  team_role?: string;
+  model_policy?: string;
+  cwd?: string;
+  sandbox?: string;
+  instructions?: string;
+  params?: string;
+}
+
 export interface Agent {
   alias: string;
   provider: string;

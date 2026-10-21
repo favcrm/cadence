@@ -138,12 +138,6 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         Commands::Attach { name, print } => attach::run(state_dir, name, print),
         Commands::Resume { group, all, detach } => resume::run(state_dir, group, all, detach),
         Commands::Stop { group } => stop::run(state_dir, group),
-        Commands::CloudSandbox {
-            issue,
-            branch,
-            base_sha,
-            spec,
-        } => cloud_sandbox::run(&issue, &branch, &base_sha, spec.as_deref()),
         Commands::Interrupt { alias, wait } => interrupt::run(state_dir, alias, wait),
         Commands::SelfInfo => {
             let alias = std::env::var("CADENCE_ALIAS").map_err(|_| {

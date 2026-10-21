@@ -23,7 +23,6 @@ mod business_templates;
 mod cad1586_managed_settings_acceptance;
 mod claude;
 mod client_update;
-mod cloud_sandbox;
 mod codex;
 mod commands;
 mod confine;

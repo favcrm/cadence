@@ -1019,22 +1019,6 @@ pub(crate) enum Commands {
         /// Group handle — the PM agent's alias or provider-native id.
         group: String,
     },
-    /// Run one issue in an AgenticOS cloud sandbox (CAD-1673). Hosted
-    /// only: refuses outside an AgenticOS company context before any
-    /// request. The default host dispatch is unchanged.
-    CloudSandbox {
-        /// Issue id (e.g. CAD-1673).
-        issue: String,
-        /// Branch the sandbox lane pushes to.
-        #[arg(long)]
-        branch: String,
-        /// Full base commit sha the lane is cut from.
-        #[arg(long, value_name = "SHA")]
-        base_sha: String,
-        /// Spec file for the job [default: the issue body].
-        #[arg(long, value_name = "FILE")]
-        spec: Option<PathBuf>,
-    },
     /// Stop an agent's running turn with the provider's own interrupt —
     /// Claude's stream-json interrupt request, Codex `turn/interrupt`, a
     /// pane's interrupt key — never a kill. The message finishes

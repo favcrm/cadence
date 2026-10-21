@@ -105,7 +105,6 @@ const ADVANCED: &[&str] = &[
     "attachment",
     "auth",
     "claude",
-    "cloud-sandbox",
     "codex",
     "commands",
     "cursor",

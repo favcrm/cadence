@@ -16,11 +16,13 @@ import { WriteGate } from "../auth/WriteGate";
 import { activeTasks, AgentActivity, WorkBlock } from "./AgentBlocks";
 import AgentAvatar, { lookFor } from "./AgentAvatar";
 import AgentDrawer from "./AgentDrawer";
+import NewAgentDialog from "./NewAgentDialog";
 import {
   AGENT_FILTERS,
   agentHoldsWorkButDead,
   agentMatchesFilter,
   agentMatchesSearch,
+  agentLocation,
   agentOrder,
   LIFECYCLE_SECTIONS,
   lifecycleBadge,
@@ -171,6 +173,9 @@ function AgentCard({
           >
             {a.alias}
           </button>
+          <span className="ml-2 text-micro text-ink-500">
+            {agentLocation(a) === "cloud" ? t("Cloud") : t("Local")}
+          </span>
           <p className="meta break-words">
             {a.role ?? t("Agent")} · {a.provider} ·{" "}
             {a.group_root ? t("root") : a.group}
@@ -272,6 +277,8 @@ export default function Agents({
   const t = useTranslate();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<AgentFilter>("current");
+  const [creating, setCreating] = useState(false);
+  const writeBlock = useContext(WriteGate);
   const payload = state.data;
   const scopeUnavailable = project !== "all" && issuesState.data === null;
   const issueProjects = issueIndex(issuesState.data ?? []);
@@ -344,6 +351,15 @@ export default function Agents({
         <h1 className="text-section font-semibold text-ink-100">{t("Agents")}</h1>
         <span className="text-label text-ink-500">{summary}</span>
         <StaleChip state={state} />
+        <Button
+          size="sm"
+          className="ml-auto"
+          disabled={writeBlock !== null}
+          title={writeBlock ?? t("Create a local or cloud agent")}
+          onClick={() => setCreating(true)}
+        >
+          {t("New agent")}
+        </Button>
       </div>
       <p className="text-label text-ink-400 mb-5">
         {t("Current work, agent status, and recent activity.")}
@@ -508,6 +524,12 @@ export default function Agents({
               </details>
             )}
         </>
+      )}
+      {creating && (
+        <NewAgentDialog
+          onClose={() => setCreating(false)}
+          onCreated={() => onRetry()}
+        />
       )}
       {open && (
         <AgentDrawer
