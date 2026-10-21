@@ -367,6 +367,29 @@ fn canonical_dir(path: &Path, what: &str) -> Result<PathBuf> {
     Ok(canon)
 }
 
+/// CAD-1705: canonicalise an offline activation target against its source
+/// package and refuse any overlap, so the restore can never stage into, or
+/// publish over, the package it reads.
+pub(crate) fn offline_activation_target(source: &Path, target: &Path) -> Result<PathBuf> {
+    let source = canonical_dir(source, "source package")?;
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent = canonical_dir(parent, "destination parent")?;
+    let name = target
+        .file_name()
+        .ok_or_else(|| Error::rejected("destination has no name"))?;
+    let target = parent.join(name);
+    let overlaps = |a: &Path, b: &Path| a == b || a.starts_with(b) || b.starts_with(a);
+    if overlaps(&target, &source) {
+        return Err(Error::rejected(
+            "destination equals, contains or lies inside the source package; refusing",
+        ));
+    }
+    Ok(target)
+}
+
 /// Full inventory of a managed root: every directory and file. Refuses any
 /// symlink, hardlink, foreign owner, non-0700 directory, or unknown entry.
 /// The managed top layout is fixed (see [`managed_top`]); nothing else is

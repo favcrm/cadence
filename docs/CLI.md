@@ -556,6 +556,32 @@ must carry its terminal receipt. Pending, failed and unknown outcomes exit
 nonzero; a successful status query can report any recorded phase without
 claiming that the migration completed.
 
+### Offline activation (AOS-339)
+
+A hosted workspace whose root is replaced stays inactive: the imported snapshot
+carries the native `committed_inactive` marker, and the daemon refuses to start
+on it. An applier container cannot reach the live controller's operator
+connection, so the activation runs offline, on a destination that does not yet
+exist:
+
+- `restore --portable <package> --activate-preflight` is read-only. It prints
+  the package digest and the exact `required_reconciliation` list (every
+  non-terminal message, job, task and monitor with its current status). Nothing
+  is written.
+- `restore --portable <package> --state-dir <new-dir> --activate-disabled
+  --reconciliation <file>` restores the package into `<new-dir>` and activates
+  it in one step, manual mode with execution disabled. `<new-dir>` must not
+  exist; an existing empty directory, a managed root or a live state dir is
+  refused before any write, and a refusal leaves no destination behind. The
+  reconciliation file names every row from the preflight, each `retain_inert`;
+  a missing, extra, duplicate or wrong-status entry refuses.
+
+The output starts fenced: the daemon admits the root, opens the store without a
+restart sweep, starts no actor and refuses every RPC outside the read-only
+allowlist. The live `--activate` form (a controller operator connection, on an
+existing root) is unchanged and remains the only path for a root that already
+exists.
+
 ## Exit codes
 
 A failure prints one JSON object on stderr (`{"error", "kind"}`) and exits
