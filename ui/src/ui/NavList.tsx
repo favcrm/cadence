@@ -1,8 +1,8 @@
-import { Fragment, useEffect, useId, type ReactNode } from "react";
+import { Fragment, useId, useLayoutEffect, useRef, type ReactNode } from "react";
 import { countLabel, issueCounts } from "../lib/counts";
 import type { ResourceState } from "../lib/cache";
 import type { AppNav } from "../features/app-shell/appNav";
-import { noteCurrentApp, updateSidebarPrefs, useSidebarPrefs } from "../features/app-shell/sidebarPrefs";
+import { updateSidebarPrefs, useSidebarPrefs } from "../features/app-shell/sidebarPrefs";
 import { prefetchWorkspaceApp } from "../features/workspace-apps/workspaceApps";
 import { navMatches } from "../features/issues/model";
 import { NAV, type Route, type Screen } from "../lib/router";
@@ -65,11 +65,6 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
   const foldId = useId();
   const apps = appMenu?.apps ?? [];
   const currentApp = apps.find((a) => a.current) ?? null;
-  // An empty menu means the installed-app list has not answered yet: not a sighting.
-  const currentInstall = apps.length === 0 ? undefined : currentApp?.installId ?? null;
-  useEffect(() => {
-    if (currentInstall !== undefined) noteCurrentApp(currentInstall);
-  }, [currentInstall]);
   return (
     <nav className="grid gap-[2px]" aria-label={t(label)}>
       {NAV.map((item) => {
@@ -269,6 +264,19 @@ export function ProjectList({ project, projectHref, projects, issues, projectsEr
   const rest = projects.filter((p) => !prefs.pinned.includes(p.key));
   const limited = pinned.length > 0 && !prefs.showAll;
   const shown = limited ? rest.filter((p) => p.key === project) : rest;
+  // Keyboard focus follows a pin toggle: the row moves, it does not
+  // remount; if unpinning hides it, focus lands on the list's toggle.
+  const listRef = useRef<HTMLDivElement>(null);
+  const refocus = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    const key = refocus.current;
+    if (key === null) return;
+    refocus.current = null;
+    const list = listRef.current;
+    const target = list?.querySelector<HTMLButtonElement>(`button.projpin[data-key="${CSS.escape(key)}"]`)
+      ?? list?.querySelector<HTMLButtonElement>("button.projmore");
+    target?.focus();
+  });
   const row = (p: Project, isPinned: boolean) => {
     const c = count(p.key);
     return (
@@ -286,21 +294,31 @@ export function ProjectList({ project, projectHref, projects, issues, projectsEr
         <button
           type="button"
           className="projpin"
+          data-key={p.key}
           aria-pressed={isPinned}
           aria-label={`${t(isPinned ? "Unpin" : "Pin")} ${p.key}`}
           title={t(isPinned ? "Unpin" : "Pin")}
-          onClick={() => updateSidebarPrefs((s) => ({
-            ...s,
-            pinned: s.pinned.includes(p.key) ? s.pinned.filter((k) => k !== p.key) : [...s.pinned, p.key],
-          }))}
+          onClick={(e) => {
+            if (e.currentTarget === document.activeElement) refocus.current = p.key;
+            updateSidebarPrefs((s) => ({
+              ...s,
+              pinned: s.pinned.includes(p.key) ? s.pinned.filter((k) => k !== p.key) : [...s.pinned, p.key],
+            }));
+          }}
         >
           <IconPin size={12} />
         </button>
       </div>
     );
   };
+  // One keyed sibling list, so a row that changes group keeps its DOM node.
+  const rows = [
+    ...pinned.map((p) => row(p, true)),
+    ...(pinned.length > 0 && shown.length > 0 ? [<div key=" sep" className="projsep" role="separator" />] : []),
+    ...shown.map((p) => row(p, false)),
+  ];
   return (
-    <div className="grid gap-[2px]">
+    <div ref={listRef} className="grid gap-[2px]">
       {projects.length === 0 && !projectsError ? (
         <span className="mx-[10px] py-1 text-micro text-ink-500">{t("No projects yet")}</span>
       ) : (
@@ -310,9 +328,7 @@ export function ProjectList({ project, projectHref, projects, issues, projectsEr
           <span className="proj-count num" title={all.title}>{all.n}</span>
         </Link>
       )}
-      {pinned.map((p) => row(p, true))}
-      {pinned.length > 0 && shown.length > 0 && <div className="projsep" role="separator" />}
-      {shown.map((p) => row(p, false))}
+      {rows}
       {pinned.length > 0 && (prefs.showAll ? rest.length > 0 : rest.length > shown.length) && (
         <button type="button" className="projmore" onClick={() => updateSidebarPrefs((s) => ({ ...s, showAll: !s.showAll }))}>
           {prefs.showAll ? t("Show pinned only") : t("Show {count} more").replace("{count}", String(rest.length - shown.length))}

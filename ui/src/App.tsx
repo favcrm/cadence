@@ -12,6 +12,7 @@ import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell
 import { Loading, Notice } from "./features/app-shell/shared/States";
 import type { Viewer } from "./features/projects/work";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
+import { noteAppScreen } from "./features/app-shell/sidebarPrefs";
 import { useInstallations, type InstallationsState } from "./features/workspace-apps/useInstallations";
 import { APPS_CHANGED_EVENT } from "./features/workspace-apps/workspaceApps";
 import { appLoadErrorCopy } from "./features/explorer/appErrors";
@@ -785,6 +786,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       return next;
     });
   }, [activeId, activeSection]);
+  // CAD-1692: the sidebar unfolds Apps on entering an app, judged from the route.
+  useEffect(() => { noteAppScreen(onAppScreen, activeId); }, [onAppScreen, activeId]);
   const appMenu = {
     ...buildAppNav({
       apps: menuApps,

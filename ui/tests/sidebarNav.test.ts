@@ -98,7 +98,7 @@ equal(hrefs(several), ["/p/all", "/p/alpha", "/p/beta"], "one row per project");
 // CAD-1692: per-browser fold and pin state. The store is shared by the
 // desktop sidebar and the phone menu; static markup reads its snapshot.
 const prefsMod = require("../src/features/app-shell/sidebarPrefs") as typeof import("../src/features/app-shell/sidebarPrefs");
-const { readSidebarPrefs, updateSidebarPrefs, noteCurrentApp, DEFAULT_SIDEBAR_PREFS, SIDEBAR_PREFS_KEY } = prefsMod;
+const { readSidebarPrefs, updateSidebarPrefs, noteAppScreen, DEFAULT_SIDEBAR_PREFS, SIDEBAR_PREFS_KEY } = prefsMod;
 const mem = (raw: string | null) => ({ getItem: (k: string) => (k === SIDEBAR_PREFS_KEY ? raw : null) });
 equal(readSidebarPrefs(null), DEFAULT_SIDEBAR_PREFS, "no storage means the defaults");
 equal(readSidebarPrefs({ getItem: () => { throw new Error("blocked"); } }), DEFAULT_SIDEBAR_PREFS, "throwing storage means the defaults");
@@ -131,19 +131,34 @@ const crmClosed = nav("apps", appMenu);
 assert(/<button[^>]*aria-expanded="false"[^>]*aria-label="Expand CRM sections"/.test(crmClosed), "a closed app's sections say so");
 assert(/<div [^>]*class="navfold"[^>]*aria-hidden="true"[^>]*><div class="navfold-in"><nav aria-label="CRM sections"/.test(crmClosed), "a closed app's sections are folded");
 
-// Entering an app reopens Apps and that app; leaving or the first sighting never folds.
+// Entering an app reopens Apps and that app. Loading straight onto an app
+// page (even before its installation resolves), staying, and leaving never do.
+const { resetPrivateSession: resetSession, allowPrivateReads: allowReads } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
+const expanded = () => /aria-label="Collapse apps"/.test(nav("apps", appMenu));
+const crmOpen = () => /aria-label="Collapse CRM sections"/.test(nav("apps", appMenu));
+// (a) Reload onto an app page: unresolved first, then resolved — a load, not an entry.
+resetSession(); allowReads();
 set({ appsOpen: false, closedApps: ["install-crm"] });
-noteCurrentApp("install-soc"); // first sighting (a reload onto an app page): no change
-assert(/aria-label="Expand apps"/.test(nav("apps", appMenu)), "the first app seen (a reload onto an app page) keeps the fold");
-noteCurrentApp("install-soc"); // same app again: still no change
-assert(/aria-label="Expand apps"/.test(nav("apps", appMenu)), "staying on one app keeps the fold");
-noteCurrentApp("install-crm");
-const entered = nav("apps", appMenu);
-assert(/aria-expanded="true"[^>]*aria-label="Collapse apps"/.test(entered), "entering an app unfolds Apps");
-assert(/aria-expanded="true"[^>]*aria-label="Collapse CRM sections"/.test(entered), "entering an app unfolds its sections");
-updateSidebarPrefs((p) => ({ ...p, appsOpen: false }));
-noteCurrentApp(null);
-assert(/aria-label="Expand apps"/.test(nav("home", appMenu)), "leaving an app keeps a fold");
+noteAppScreen(true, null);
+noteAppScreen(true, "install-crm");
+assert(!expanded() && !crmOpen(), "loading onto an app page keeps the folds");
+noteAppScreen(true, "install-crm");
+assert(!expanded(), "staying on one app keeps the fold");
+noteAppScreen(true, "install-soc");
+assert(expanded(), "switching to another app unfolds Apps");
+set({ appsOpen: false, closedApps: ["install-crm"] });
+noteAppScreen(false, null);
+assert(!expanded(), "leaving an app keeps a fold");
+noteAppScreen(true, "install-crm");
+assert(expanded() && crmOpen(), "entering an app unfolds Apps and its sections");
+// (b) Reload onto Home, then enter an app before the installed-app list answers.
+resetSession(); allowReads();
+set({ appsOpen: false, closedApps: ["install-crm"] });
+noteAppScreen(false, null);
+noteAppScreen(true, null);
+assert(!expanded(), "an unresolved app screen decides nothing yet");
+noteAppScreen(true, "install-crm");
+assert(expanded() && crmOpen(), "entry from Home counts once the app resolves, even if the list was still loading");
 
 // Projects: pins lead, the rest wait behind Show N more, the current project stays.
 const five = ["alpha", "beta", "gamma", "delta", "eps"].map((key) => ({ key, prefix: key.slice(0, 3).toUpperCase() }));
@@ -182,10 +197,9 @@ assert(/<div [^>]*class="navfold"[^>]*aria-hidden="true"/.test(closed), "folded 
 set({});
 
 // A confirmed identity change drops the previous session's layout and pins.
-const { resetPrivateSession, allowPrivateReads } = require("../src/lib/privateSession") as typeof import("../src/lib/privateSession");
 set({ pinned: ["alpha"], appsOpen: false });
-resetPrivateSession();
-allowPrivateReads();
+resetSession();
+allowReads();
 equal(nameTexts(projectList(five)), ["All projects", ...five.map((p) => p.key)], "a session reset unpins everything");
 assert(/aria-label="Collapse apps"/.test(nav("apps", appMenu)), "a session reset unfolds Apps");
 

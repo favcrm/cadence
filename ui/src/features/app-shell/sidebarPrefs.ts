@@ -85,20 +85,33 @@ export function useSidebarPrefs(): SidebarPrefs {
   return useSyncExternalStore(subscribe, snapshot, snapshot);
 }
 
-// The app on screen, as last seen. `undefined` until the installed-app
-// menu first answers, so a reload onto an app page is not an "entry".
-let seenApp: string | null | undefined;
+// The app on screen as last seen: `undefined` before the first report,
+// `null` off app screens, `LOADING` for the app page the board was loaded
+// onto while its installation is still unresolved.
+const LOADING = Symbol("loading");
+let seenApp: string | null | typeof LOADING | undefined;
 
-/** Entering an app unfolds Apps and that app's sections; leaving one
- *  never folds anything. Call with the current installation (or null)
- *  once the app menu is known. */
-export function noteCurrentApp(installId: string | null): void {
-  if (seenApp === undefined || installId === seenApp) {
+/** Entering an app unfolds Apps and that app's sections; loading the
+ *  board straight onto an app page, staying on one app, and leaving an
+ *  app never change a fold. `onAppScreen` comes from the route (known at
+ *  once); `installId` is the resolved current installation, or null while
+ *  the installed-app list or the app's receipt is still loading. */
+export function noteAppScreen(onAppScreen: boolean, installId: string | null): void {
+  if (!onAppScreen) {
+    seenApp = null;
+    return;
+  }
+  if (seenApp === undefined) {
+    seenApp = installId ?? LOADING;
+    return;
+  }
+  if (installId === null) return; // still resolving: decide when it lands
+  if (seenApp === LOADING) {
     seenApp = installId;
     return;
   }
+  if (installId === seenApp) return;
   seenApp = installId;
-  if (installId === null) return;
   updateSidebarPrefs((p) =>
     p.appsOpen && !p.closedApps.includes(installId)
       ? p
