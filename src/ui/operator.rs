@@ -641,8 +641,8 @@ fn matches(pattern: &str, path: &str) -> bool {
 pub fn route_class(method: &str, path: &str) -> RouteClass {
     // The endpoint table answers first: a migrated path is declared in
     // exactly one place (CAD-1670).
-    if let Some(endpoint) = super::endpoints::lookup(path) {
-        return endpoint.class;
+    if let Some(class) = super::endpoints::class_of(method, path) {
+        return class;
     }
     WRITE_ROUTES
         .iter()
