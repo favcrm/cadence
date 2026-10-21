@@ -11,13 +11,14 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
 
+use super::endpoints::SessionRoute;
 use super::serve::{add_security_headers, err_response, json_response};
 use super::ServeOpts;
 use super::{
     app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_media, app_records,
     app_release, app_runs, app_screens, app_social_drafts, approvals, apps, business_templates,
-    connections, crm_send, crm_smtp, home, lane, operator, read_model, social_publish, stages,
-    threads, updates, whatsapp, wiki, workflows,
+    connections, crm_send, crm_smtp, endpoints, home, lane, operator, read_model, social_publish,
+    stages, threads, updates, whatsapp, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -989,33 +990,21 @@ pub(crate) fn write_route(
     opts: &ServeOpts,
     send: &dyn Fn(Request, HttpResp),
 ) {
-    // CAD-313: signing in and out — the nonce, or the session itself,
-    // is the credential (`operator`).
-    if path == "/api/session" || path == "/api/session/logout" {
-        if *method != Method::Post {
+    // CAD-313 / CAD-777: the session paths — the nonce, or the session
+    // itself, is the credential, and the device pair is the same login
+    // class (unconfigured boards answer 404 inside the handlers). Their
+    // method, path and class are one row in `endpoints::ENDPOINTS`
+    // (CAD-1670), so this dispatch cannot drift from `route_class`.
+    if let Some(endpoint) = endpoints::lookup(path) {
+        if endpoint.method != method.as_str() {
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let resp = if path == "/api/session" {
-            operator::open(&mut request, state_dir, opts)
-        } else {
-            operator::logout(&request, state_dir, opts)
-        };
-        send(request, resp);
-        return;
-    }
-    // CAD-777: device-grant sign-in — same login class as `/api/session`.
-    // Unconfigured boards answer 404 inside the handlers, like an
-    // unknown shape.
-    if path == "/api/session/device/code" || path == "/api/session/device/poll" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let resp = if path == "/api/session/device/code" {
-            operator::device_code(&mut request, state_dir, opts)
-        } else {
-            operator::device_poll(&mut request, state_dir, opts)
+        let resp = match endpoint.id {
+            SessionRoute::Open => operator::open(&mut request, state_dir, opts),
+            SessionRoute::Logout => operator::logout(&request, state_dir, opts),
+            SessionRoute::DeviceCode => operator::device_code(&mut request, state_dir, opts),
+            SessionRoute::DevicePoll => operator::device_poll(&mut request, state_dir, opts),
         };
         send(request, resp);
         return;

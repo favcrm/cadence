@@ -53,6 +53,7 @@ mod connections;
 mod crm_send;
 mod crm_smtp;
 pub mod delivery_sync;
+mod endpoints;
 mod home;
 mod human_threads;
 mod lane;

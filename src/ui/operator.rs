@@ -610,13 +610,12 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/apps/*/*/worker", RouteClass::OperatorOnly),
     route("POST", "/api/memories/*/*/accept", RouteClass::Refused),
     route("POST", "/api/memories/*/*/reject", RouteClass::Refused),
-    route("POST", "/api/session", RouteClass::Session),
-    route("POST", "/api/session/logout", RouteClass::Session),
+    // The session paths are declared in `endpoints::ENDPOINTS`; their
+    // class is answered there, so no row is repeated here.
     // CAD-777: the device-grant sign-in exchange — the pending id (code)
     // or the issuer-approved grant (poll) is the credential, never a
     // session. Agent peers are refused without side effects.
-    route("POST", "/api/session/device/code", RouteClass::Session),
-    route("POST", "/api/session/device/poll", RouteClass::Session),
+
     // CAD-786: the unsubscribe origin write is operator-only like
     // every other /api/crm-send write (the class default).
     route("POST", "/api/crm-send/origin", RouteClass::OperatorOnly),
@@ -640,6 +639,11 @@ fn matches(pattern: &str, path: &str) -> bool {
 
 /// The class of a write — [`RouteClass::OperatorOnly`] when unlisted.
 pub fn route_class(method: &str, path: &str) -> RouteClass {
+    // The endpoint table answers first: a migrated path is declared in
+    // exactly one place (CAD-1670).
+    if let Some(endpoint) = super::endpoints::lookup(path) {
+        return endpoint.class;
+    }
     WRITE_ROUTES
         .iter()
         .find(|r| r.method == method && matches(r.pattern, path))
