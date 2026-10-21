@@ -36,6 +36,9 @@ pub(super) enum RouteId {
     WorkspaceUpgradeCheck,
     WorkspaceUpgradeRecover,
     Conversations,
+    WorkspaceList,
+    WorkspaceShow,
+    ConversationsRead,
     ExplorerUpdateCheck,
     ExplorerRemovePreview,
     ExplorerRemove,
@@ -117,6 +120,15 @@ const EXPLORER_ID: &[Binding] = &[Binding {
     invalid: (400, "missing installation id"),
 }];
 
+/// The show row's id keeps the arm's own predicate: a non-empty segment
+/// without a slash (an empty id 404s in the chain today).
+const SHOW_ID: &[Binding] = &[Binding {
+    name: "id",
+    allow_empty: false,
+    validate: non_empty,
+    invalid: (404, "not found"),
+}];
+
 const MOUNT_BINDINGS: &[Binding] = &[
     Binding {
         name: "id",
@@ -137,6 +149,18 @@ macro_rules! row {
         Endpoint {
             id: RouteId::$id,
             method: "POST",
+            pattern: $pattern,
+            class: RouteClass::$class,
+            bindings: $bindings,
+        }
+    };
+}
+
+macro_rules! get {
+    ($id:ident, $pattern:literal, $class:ident, $bindings:expr) => {
+        Endpoint {
+            id: RouteId::$id,
+            method: "GET",
             pattern: $pattern,
             class: RouteClass::$class,
             bindings: $bindings,
@@ -217,6 +241,19 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
     ),
     row!(
         Conversations,
+        "/api/app-installations/{id}/conversations",
+        OperatorOnly,
+        INSTALL_ID
+    ),
+    get!(WorkspaceList, "/api/app-installations", OperatorOnly, &[]),
+    get!(
+        WorkspaceShow,
+        "/api/app-installations/{id}",
+        ScreenRead,
+        SHOW_ID
+    ),
+    get!(
+        ConversationsRead,
         "/api/app-installations/{id}/conversations",
         OperatorOnly,
         INSTALL_ID
@@ -352,11 +389,19 @@ impl<'p> Bound<'p> {
     }
 }
 
-/// The row that owns `path`, with its bound parameters. Method is not
-/// considered here: a matched row with the wrong method answers 405, and a
-/// path no row owns falls through to the remaining chain.
-pub(super) fn resolve(path: &str) -> Option<Bound<'_>> {
-    ENDPOINTS.iter().find_map(|endpoint| bind(endpoint, path))
+/// The row that owns `(method, path)`, with its bound parameters.
+///
+/// The method is part of the match, never a filter applied afterwards: a
+/// literal write row must not shadow a wildcard read row, so `GET
+/// /api/app-installations/upload` finds the show row with id `upload` even
+/// though a `POST /api/app-installations/upload` row exists. `HEAD` resolves
+/// to the `GET` row: the read arms serve both and `send` strips the body.
+pub(super) fn resolve<'p>(method: &str, path: &'p str) -> Option<Bound<'p>> {
+    let wanted = if method == "HEAD" { "GET" } else { method };
+    ENDPOINTS
+        .iter()
+        .filter(|endpoint| endpoint.method == wanted)
+        .find_map(|endpoint| bind(endpoint, path))
 }
 
 fn bind<'p>(endpoint: &'static Endpoint, path: &'p str) -> Option<Bound<'p>> {
@@ -400,9 +445,7 @@ fn bind<'p>(endpoint: &'static Endpoint, path: &'p str) -> Option<Bound<'p>> {
 /// for the path. `route_class` falls through to the older table on `None`, so a
 /// migrated path keeps the class it had for every method the row does not name.
 pub(super) fn class_of(method: &str, path: &str) -> Option<RouteClass> {
-    resolve(path)
-        .filter(|bound| bound.endpoint.method == method)
-        .map(|bound| bound.endpoint.class)
+    resolve(method, path).map(|bound| bound.endpoint.class)
 }
 
 #[cfg(test)]
@@ -429,8 +472,12 @@ mod tests {
                 .pattern
                 .replace("{id}", "inst-1")
                 .replace("{tag}", "screen");
-            let bound = resolve(&probe).expect("a declared pattern resolves");
-            assert_eq!(bound.endpoint.id, row.id, "{probe}");
+            let bound = resolve(row.method, &probe).expect("a declared pattern resolves");
+            if bound.endpoint.id != row.id {
+                // `GET /api/app-installations/{id}` and the POST rows share a
+                // prefix; the probe must resolve to the row that declares it.
+                panic!("{probe} resolved to {:?}", bound.endpoint.id);
+            }
             assert!(bound.invalid().is_none(), "{probe}");
         }
     }
@@ -438,7 +485,7 @@ mod tests {
     #[test]
     fn catalog_recovery_wins_the_real_overlap() {
         // The one pair where declaration order decides.
-        let bound = resolve("/api/app-installations/migrations/upgrade/recover")
+        let bound = resolve("POST", "/api/app-installations/migrations/upgrade/recover")
             .expect("the overlap resolves");
         assert_eq!(bound.endpoint.id, RouteId::CatalogRecover);
         assert_eq!(bound.get("id"), Some("upgrade"));
@@ -446,7 +493,7 @@ mod tests {
 
     #[test]
     fn the_explorer_keeps_its_empty_id_refusal() {
-        let bound = resolve("/api/app-installations//remove").expect("an empty id binds");
+        let bound = resolve("POST", "/api/app-installations//remove").expect("an empty id binds");
         assert_eq!(bound.endpoint.id, RouteId::ExplorerRemove);
         let response = bound.invalid().expect("an empty id is invalid");
         assert_eq!(response.status_code().0, 400);
@@ -456,11 +503,11 @@ mod tests {
     fn a_segment_spelling_a_slot_still_binds_and_validates() {
         // `%7Btag%7D` decodes to this at ingress; the slot must bind it and
         // the tag validator must refuse it, not skip validation.
-        let bound =
-            resolve("/api/app-installations/i/screens/{tag}/mount").expect("the mount row binds");
+        let bound = resolve("POST", "/api/app-installations/i/screens/{tag}/mount")
+            .expect("the mount row binds");
         assert_eq!(bound.get("tag"), Some("{tag}"));
         assert_eq!(bound.invalid().expect("invalid tag").status_code().0, 404);
-        let bound = resolve("/api/app-installations/{id}/remove").expect("the row binds");
+        let bound = resolve("POST", "/api/app-installations/{id}/remove").expect("the row binds");
         assert_eq!(bound.get("id"), Some("{id}"));
     }
 
@@ -470,7 +517,7 @@ mod tests {
             "/api/app-installations/bad.id/screens/screen/mount",
             "/api/app-installations/inst-1/screens/Bad_Tag/mount",
         ] {
-            let bound = resolve(path).expect("the mount row binds");
+            let bound = resolve("POST", path).expect("the mount row binds");
             let response = bound.invalid().expect("the value is invalid");
             assert_eq!(response.status_code().0, 404, "{path}");
         }
@@ -478,8 +525,55 @@ mod tests {
 
     #[test]
     fn an_extra_segment_is_no_row_at_all() {
-        assert!(resolve("/api/app-installations/inst-1/update-check/update-check").is_none());
-        assert!(resolve("/api/app-installations/inst-1/restore/restore").is_none());
+        assert!(resolve(
+            "POST",
+            "/api/app-installations/inst-1/update-check/update-check"
+        )
+        .is_none());
+        assert!(resolve("POST", "/api/app-installations/inst-1/restore/restore").is_none());
+    }
+
+    #[test]
+    fn a_literal_write_row_never_shadows_the_show_read() {
+        // `GET /api/app-installations/upload` is the show row with id
+        // `upload` today; the POST upload row must not take it.
+        let bound = resolve("GET", "/api/app-installations/upload").expect("a read row");
+        assert_eq!(bound.endpoint.id, RouteId::WorkspaceShow);
+        assert_eq!(bound.get("id"), Some("upload"));
+        let bound = resolve("POST", "/api/app-installations/upload").expect("a write row");
+        assert_eq!(bound.endpoint.id, RouteId::WorkspaceUpload);
+    }
+
+    #[test]
+    fn head_resolves_to_the_get_row() {
+        for path in [
+            "/api/app-installations",
+            "/api/app-installations/inst-1",
+            "/api/app-installations/inst-1/conversations",
+        ] {
+            let get = resolve("GET", path).expect("a read row");
+            let head = resolve("HEAD", path).expect("HEAD follows GET");
+            assert_eq!(head.endpoint.id, get.endpoint.id, "{path}");
+            assert_eq!(head.endpoint.class, get.endpoint.class, "{path}");
+        }
+    }
+
+    #[test]
+    fn the_read_rows_keep_their_classes() {
+        assert_eq!(
+            resolve("GET", "/api/app-installations").map(|b| b.endpoint.class),
+            Some(RouteClass::OperatorOnly)
+        );
+        assert_eq!(
+            resolve("GET", "/api/app-installations/i").map(|b| b.endpoint.class),
+            Some(RouteClass::ScreenRead)
+        );
+        assert_eq!(
+            resolve("GET", "/api/app-installations/i/conversations").map(|b| b.endpoint.class),
+            Some(RouteClass::OperatorOnly)
+        );
+        // The show pattern has no write row: a bare POST is not a row.
+        assert!(resolve("POST", "/api/app-installations/i").is_none());
     }
 
     #[test]

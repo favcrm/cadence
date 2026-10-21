@@ -21,9 +21,9 @@ use super::write_path::{
 use super::{
     app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
     app_release, app_runs, app_screens, approvals, apps, assist_route, business_templates,
-    cli_route, connections, crm_send, delivery_sync, home, lane, locale, member_assist, my_work,
-    operator, platform_account, read_model, social_publish, stages, threads, topics, updates, wiki,
-    wiki_envelope, work_conversations, workflows,
+    cli_route, connections, crm_send, delivery_sync, endpoints, home, lane, locale, member_assist,
+    my_work, operator, platform_account, read_model, social_publish, stages, threads, topics,
+    updates, wiki, wiki_envelope, work_conversations, workflows,
 };
 use super::{
     push_device_login_config, ready_file, startup_failed_file, tailnet_url, ServeOpts,
@@ -1093,6 +1093,66 @@ fn read_admit<R: ReadRoute>(
     Some(handle(request, route))
 }
 
+/// A table read row's admission, chosen by its class (CAD-1696).
+///
+/// The read and write guards differ beyond the class name: a read never runs
+/// the browser write guard, and `ScreenRead` admits a member where
+/// `OperatorOnly` refuses one. A class with no read rule is refused rather
+/// than admitted, so a read row cannot be declared with a write-only class.
+fn table_read_guard(
+    class: operator::RouteClass,
+    request: &Request,
+    state_dir: &Path,
+    opts: &ServeOpts,
+) -> std::result::Result<(), HttpResp> {
+    match class {
+        operator::RouteClass::OperatorOnly => {
+            operator::admit_operator_read(request, state_dir, opts)
+        }
+        operator::RouteClass::ScreenRead => {
+            operator::admit_screen_read(request, state_dir, opts).map(|_| ())
+        }
+        operator::RouteClass::AgentAllowed | operator::RouteClass::CallerScoped => {
+            operator::admit_read(request, state_dir, opts).map(|_| ())
+        }
+        operator::RouteClass::Session
+        | operator::RouteClass::RecipientToken
+        | operator::RouteClass::Refused => Err(err_response(
+            500,
+            "this endpoint table row cannot be served as a read",
+        )),
+    }
+}
+
+/// Run one table read row: guard by class, then the row's handler
+/// (CAD-1696). `None` means no read row matched and the chain continues.
+fn read_dispatch(
+    request: &mut Request,
+    state_dir: &Path,
+    opts: &ServeOpts,
+    bound: endpoints::Bound<'_>,
+) -> HttpResp {
+    let row = bound.endpoint;
+    if let Err(response) = table_read_guard(row.class, request, state_dir, opts) {
+        return response;
+    }
+    match row.id {
+        endpoints::RouteId::WorkspaceList => {
+            apps::workspace(request, state_dir, "app_workspace_list", None)
+        }
+        endpoints::RouteId::WorkspaceShow => {
+            apps::workspace(request, state_dir, "app_workspace_show", bound.get("id"))
+        }
+        endpoints::RouteId::ConversationsRead => {
+            let install = bound.get("id").unwrap_or_default();
+            threads::conversations(state_dir, crate::master::ALIAS, &|key: &str| {
+                (key == "install").then(|| install.to_string())
+            })
+        }
+        _ => err_response(500, "a write row reached the read dispatcher"),
+    }
+}
+
 /// A board write waits this long for the one writer before answering
 /// `resource_busy`: long enough for an ordinary write queued behind
 /// another, short enough that a stuck request never queues the board.
@@ -1436,6 +1496,15 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             opts,
             &send_write,
         );
+        return;
+    }
+
+    // CAD-1696: a table read row answers from its own declaration, so the
+    // board's reads and writes share one route authority. A path the table
+    // does not own falls through to the chain below, unchanged.
+    if let Some(bound) = endpoints::resolve(method.as_str(), &path) {
+        let response = read_dispatch(&mut request, state_dir, opts, bound);
+        send(request, response);
         return;
     }
 
@@ -2233,50 +2302,6 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 operator::admit_operator_read,
                 |req, route| social_publish::handle(req, state_dir, route, false),
             ) {
-                send(request, response);
-                return;
-            }
-            // CAD-1098: `/api/app-installations/<id>/conversations` — the
-            // master's conversations for that installation.
-            if let Some(install) = path
-                .strip_prefix("/api/app-installations/")
-                .and_then(|tail| tail.strip_suffix("/conversations"))
-                .filter(|id| !id.is_empty() && !id.contains('/'))
-            {
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
-                    send(request, response);
-                    return;
-                }
-                let response =
-                    threads::conversations(state_dir, crate::master::ALIAS, &|key: &str| {
-                        (key == "install").then(|| install.to_string())
-                    });
-                send(request, response);
-                return;
-            }
-            if path == "/api/app-installations"
-                || path
-                    .strip_prefix("/api/app-installations/")
-                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
-            {
-                let id = path.strip_prefix("/api/app-installations/");
-                // CAD-1537: one installation's receipt is a screen read a
-                // member may make; the list stays the operator's.
-                let admitted = if id.is_some() {
-                    operator::admit_screen_read(&request, state_dir, opts).map(|_| ())
-                } else {
-                    operator::admit_operator_read(&request, state_dir, opts)
-                };
-                if let Err(response) = admitted {
-                    send(request, response);
-                    return;
-                }
-                let method = if id.is_some() {
-                    "app_workspace_show"
-                } else {
-                    "app_workspace_list"
-                };
-                let response = apps::workspace(&mut request, state_dir, method, id);
                 send(request, response);
                 return;
             }
