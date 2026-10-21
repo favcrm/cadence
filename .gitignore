@@ -47,6 +47,7 @@ docs/roles/*
 !docs/design/hosted-migration.md
 !docs/design/CONTRACT-TEMPLATE.md
 !docs/design/remote-cli.md
+!docs/design/board-endpoint-table.md
 !docs/design/team-knowledge.md
 !docs/roles/risk-classes.md
 !docs/roles/one-review-paths.toml
