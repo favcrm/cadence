@@ -49,8 +49,6 @@ mod cad1337_acceptance;
 mod cli_route;
 #[cfg(all(test, feature = "cli-runtime-test"))]
 pub(crate) use cli_route::prime_jwks_for_test as prime_cli_jwks_for_test;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1703_my_work_acceptance;
 mod connections;
 mod crm_send;
 mod crm_smtp;

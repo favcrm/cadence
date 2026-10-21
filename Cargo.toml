@@ -49,6 +49,11 @@ test-seam = []
 # against real AOS test handlers; never part of ordinary `cargo test`.
 cli-runtime-test = ["test-seam"]
 
+[[test]]
+name = "cad1703_my_work_acceptance"
+path = "tests/cad1703_my_work_acceptance.rs"
+required-features = ["test-seam"]
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
