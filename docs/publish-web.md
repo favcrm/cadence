@@ -77,8 +77,8 @@ with an owner cookie.
   and the page shows "This approval no longer matches".
 - Re-running the command while the action is open resumes that action and the
   same link. It does not approve anything.
-- Once the action has expired, a new action must be created; the CLI keeps one
-  durable intent per release and does not mint a second one on its own.
+- Once the action has expired the CLI treats it as terminal, so the next run
+  creates a fresh action with a new request key; the old link stays dead.
 
 ## Local state and retries
 

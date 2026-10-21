@@ -852,31 +852,7 @@ pub fn submissions(
     cursor: Option<&str>,
     wake_timeout: u64,
 ) -> Result<Value> {
-    if !(1..=100).contains(&limit) {
-        return Err(Error::rejected("--limit must be between 1 and 100"));
-    }
-    if let Some(form) = form {
-        let valid = (1..=40).contains(&form.len())
-            && form
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            && !form.starts_with('-')
-            && !form.ends_with('-');
-        if !valid {
-            return Err(Error::rejected(
-                "--form must be 1-40 lowercase letters, digits or hyphens",
-            ));
-        }
-    }
-    if let Some(cursor) = cursor {
-        let valid = (1..=200).contains(&cursor.len())
-            && cursor
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-' | b'.'));
-        if !valid {
-            return Err(Error::rejected("--cursor is not a submissions cursor"));
-        }
-    }
+    validate_submission_query(form, limit, cursor)?;
     let found = remote_cli::web_request(
         target,
         "web.read",
@@ -938,4 +914,73 @@ pub fn releases(target: &RemoteTarget, slug: &str, wake_timeout: u64) -> Result<
     )?;
     let listing = remote_cli::web_envelope(response)?;
     Ok(json!({"org": target.org, "site": slug, "releases": listing["releases"]}))
+}
+
+/// Local pre-flight for `submissions`. The server owns the query grammar; this
+/// refuses the obviously invalid before any request is built, using the same
+/// form-key grammar as the published endpoint (`^[a-z0-9][a-z0-9-]{0,39}$`).
+pub fn validate_submission_query(
+    form: Option<&str>,
+    limit: u32,
+    cursor: Option<&str>,
+) -> Result<()> {
+    if !(1..=100).contains(&limit) {
+        return Err(Error::rejected("--limit must be between 1 and 100"));
+    }
+    if let Some(form) = form {
+        let first = form.as_bytes().first().copied();
+        let shape = matches!(first, Some(b'a'..=b'z' | b'0'..=b'9'))
+            && form
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !(1..=40).contains(&form.len()) || !shape {
+            return Err(Error::rejected(
+                "--form must match ^[a-z0-9][a-z0-9-]{0,39}$",
+            ));
+        }
+    }
+    if let Some(cursor) = cursor {
+        let valid = (1..=200).contains(&cursor.len())
+            && cursor
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-' | b'.'));
+        if !valid {
+            return Err(Error::rejected("--cursor is not a submissions cursor"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod submission_query_tests {
+    use super::validate_submission_query;
+
+    #[test]
+    fn form_keys_follow_the_published_grammar() {
+        let longest = "x".repeat(40);
+        for good in ["contact", "a", "contact-", "a1-2", longest.as_str()] {
+            assert!(
+                validate_submission_query(Some(good), 50, None).is_ok(),
+                "{good} must be accepted"
+            );
+        }
+        let too_long = "x".repeat(41);
+        for bad in ["", "-lead", "Contact", "con tact", too_long.as_str()] {
+            assert!(
+                validate_submission_query(Some(bad), 50, None).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn limit_and_cursor_are_refused_before_any_request() {
+        assert!(validate_submission_query(None, 1, None).is_ok());
+        assert!(validate_submission_query(None, 100, None).is_ok());
+        assert!(validate_submission_query(None, 0, None).is_err());
+        assert!(validate_submission_query(None, 101, None).is_err());
+        assert!(validate_submission_query(None, 50, Some("1730000000000:wsub_ab-1")).is_ok());
+        assert!(validate_submission_query(None, 50, Some("a b")).is_err());
+        assert!(validate_submission_query(None, 50, Some("")).is_err());
+    }
 }
