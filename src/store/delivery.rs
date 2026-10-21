@@ -11,6 +11,24 @@ use super::plans::{Job, Task};
 use super::StoreConn;
 use super::{now, Store};
 
+/// Fallback detail when an unknown fence has no provider account.
+pub(crate) const UNKNOWN_GENERIC_REASON: &str = "Uncertain provider outcome requires review";
+
+/// First sentence of an unknown-outcome hint: look before reconciling.
+pub fn unknown_inspect_lead() -> &'static str {
+    "Inspect the uncertain message and its side effects before reconciling. \
+     A missed render observation does not prove the delivery did not happen."
+}
+
+/// What reconciliation is, and how CLI unfence behaves. No command chain:
+/// CLI unfence already resumes, and dispatch is not authorized here.
+pub fn unknown_recovery_note() -> &'static str {
+    "Reconciliation is an explicit operator decision, not an automatic \
+     interrupted or completed result. The CLI unfence command resumes by \
+     default; do not follow it with a second resume. Pass --no-resume to \
+     reconcile without resuming."
+}
+
 /// CAD-1380 R4: the constant next-action instruction carried by an assist
 /// intent. No member text; the drain delivers it verbatim.
 const ASSIST_NEXT_ACTION: &str =
@@ -39,7 +57,7 @@ pub(super) fn unknown_event_reason(error: Option<&str>, result: &Value) -> Strin
                 .and_then(Value::as_str)
                 .filter(|value| !value.trim().is_empty())
         })
-        .unwrap_or(crate::daemon::UNKNOWN_GENERIC_REASON);
+        .unwrap_or(UNKNOWN_GENERIC_REASON);
     let flat: String = reason
         .chars()
         .map(|character| {
@@ -52,7 +70,7 @@ pub(super) fn unknown_event_reason(error: Option<&str>, result: &Value) -> Strin
         .collect();
     let words: Vec<&str> = flat.split_whitespace().collect();
     if words.is_empty() {
-        return crate::daemon::UNKNOWN_GENERIC_REASON.to_string();
+        return UNKNOWN_GENERIC_REASON.to_string();
     }
     let redacted = crate::doctor::host::redact_argv(&words);
     if redacted.chars().count() <= UNKNOWN_EVENT_REASON_CHARS {
@@ -66,8 +84,8 @@ pub(super) fn unknown_event_reason(error: Option<&str>, result: &Value) -> Strin
 fn unknown_event_action(message_id: &str) -> String {
     format!(
         "{} {} Review message {message_id} before choosing an explicit reconcile status.",
-        crate::daemon::unknown_inspect_lead(),
-        crate::daemon::unknown_recovery_note(),
+        unknown_inspect_lead(),
+        unknown_recovery_note(),
     )
 }
 

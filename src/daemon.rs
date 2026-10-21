@@ -213,6 +213,9 @@ use crate::store::Agent;
 use crate::store::Message;
 use crate::store::Store;
 use crate::store::Take;
+use crate::store::{
+    unknown_inspect_lead, unknown_recovery_note, AGENT_GC_RECORDS_ONLY, UNKNOWN_GENERIC_REASON,
+};
 use serde_json::json;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -4459,10 +4462,6 @@ fn optional_i64(params: &Value, field: &str) -> Option<i64> {
 // deletes registry rows (and their message/event history) and nothing
 // else, so it frees no memory and no disk.
 
-/// What every agent-gc timer output says, verbatim.
-pub const AGENT_GC_RECORDS_ONLY: &str = "records only: frees no memory and no disk; \
-     a removed agent can no longer be resumed";
-
 /// Every alias some agent names as its upstream — a group root even
 /// when it was registered as a worker.
 fn upstream_roots(agents: &[Agent]) -> HashSet<String> {
@@ -5496,30 +5495,12 @@ fn release_lease_tail(
     drop(shared_socket);
 }
 
-/// Fallback detail when an unknown fence has no provider account.
-pub const UNKNOWN_GENERIC_REASON: &str = "Uncertain provider outcome requires review";
-
 /// Separates a preserved unknown reason from the operator hint. Older
 /// rows used ` — reconcile:`; both markers are stripped on restamp.
 const UNKNOWN_FENCE_MARK: &str = " — inspect:";
 
 /// Same character cap `current_message_summary` uses for operator-facing text.
 const UNKNOWN_DETAIL_CHARS: usize = 512;
-
-/// First sentence of an unknown-outcome hint: look before reconciling.
-pub fn unknown_inspect_lead() -> &'static str {
-    "Inspect the uncertain message and its side effects before reconciling. \
-     A missed render observation does not prove the delivery did not happen."
-}
-
-/// What reconciliation is, and how CLI unfence behaves. No command chain:
-/// CLI unfence already resumes, and dispatch is not authorized here.
-pub fn unknown_recovery_note() -> &'static str {
-    "Reconciliation is an explicit operator decision, not an automatic \
-     interrupted or completed result. The CLI unfence command resumes by \
-     default; do not follow it with a second resume. Pass --no-resume to \
-     reconcile without resuming."
-}
 
 /// `job show` attention while the kickoff is still `unknown`. Dispatch is
 /// described as a later paste, not as the next command.

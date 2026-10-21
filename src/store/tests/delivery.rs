@@ -550,11 +550,11 @@
 
         assert_eq!(
             unknown_event_reason(Some("   "), &json!({"error": "  "})),
-            crate::daemon::UNKNOWN_GENERIC_REASON
+            crate::store::UNKNOWN_GENERIC_REASON
         );
         assert_eq!(
             unknown_event_reason(None, &json!({})),
-            crate::daemon::UNKNOWN_GENERIC_REASON
+            crate::store::UNKNOWN_GENERIC_REASON
         );
         let from_result =
             unknown_event_reason(None, &json!({"error": format!("see --token={secret}")}));
