@@ -1,36 +1,38 @@
 //! Cloud sandbox runner seam (CAD-1673).
 //!
 //! The daemon-side boundary for a remote Cadence runner that executes a
-//! ticket inside an AgenticOS-hosted sandbox. This module owns three
-//! things and nothing else:
+//! ticket inside an AgenticOS-hosted sandbox. Shapes follow the AOS-324
+//! contract (`packages/contracts/src/cloud-sandbox-jobs.ts`):
 //!
-//! - [`SandboxClient`]: the job lifecycle (create, collect events, fetch
-//!   result, stop) as seen from the daemon. The transport is injected.
-//! - [`SandboxEntitlement`]: the per-company `cloud_sandbox` check. There
-//!   is no environment flag and no hardcoded company id; the company is
-//!   whatever the AgenticOS API answers for the caller.
-//! - [`ResultRelay`]: the idempotent report of a remote result (sha,
-//!   diff, PR, result text) back to the daemon through the client
-//!   boundary. A local unix socket inside the sandbox is never assumed.
+//! - [`SandboxClient`]: the job lifecycle over `api.internal`
+//!   `/v1/runtime/cloud-sandbox/jobs` (create, get, stop). The company is
+//!   never a request field; AgenticOS binds it from the caller's context.
+//! - [`SandboxEntitlement`]: the per-company `cloud_sandbox` check. A 403
+//!   `cloud_sandbox_not_entitled` maps to [`ENTITLEMENT_REFUSED`].
+//! - [`ResultRelay`]: the idempotent relay of a remote result back to the
+//!   daemon. A local unix socket inside the sandbox is never assumed.
 //!
-//! TODO(CAD-1673 / AOS-324): no real transport is wired. Before this
-//! kind can run, wire these AOS-324 contract artifacts: the sandbox
-//! route names (create, events, result, stop) and the entitlement route
-//! for `cloud_sandbox`; their request and response schemas; and the auth
-//! header the daemon presents. Until then only the test fakes implement
-//! [`SandboxClient`] and [`SandboxEntitlement`].
+//! `gateway_token` is AgenticOS-owned. It is held only in memory for the
+//! lifetime of a [`SandboxJob`] and is never logged or persisted.
 //!
 //! The `sandbox` endpoint kind is registered `internal`, so it is not
 //! selectable as a working production endpoint and has no factory arm.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::time::Duration;
+
+use serde::Deserialize;
+use serde_json::{json, Value};
 
 use crate::error::{Error, Result, Structured};
 
 /// Stable refusal code when the company lacks the `cloud_sandbox`
 /// entitlement, or the entitlement cannot be read.
 pub const ENTITLEMENT_REFUSED: &str = "cloud_sandbox_not_entitled";
+
+/// Stable refusal code when the AgenticOS sandbox route is not served.
+pub const SANDBOX_UNAVAILABLE: &str = "cloud_sandbox_unavailable";
 
 /// The entitlement key looked up for the calling company.
 pub const ENTITLEMENT_KEY: &str = "cloud_sandbox";
@@ -43,25 +45,54 @@ pub const PI_BASE_URL: &str = "http://gateway.internal";
 /// credential; the gateway authenticates the sandbox job.
 pub const PI_PLACEHOLDER_TOKEN: &str = "cadence-sandbox-placeholder";
 
+/// AOS-324 `api.internal` job route. Company is bound server-side.
+pub const JOBS_URL: &str = "http://api.internal/v1/runtime/cloud-sandbox/jobs";
+
 /// A remote job handle. `sandbox_id` is what the daemon records on the
 /// agent row; `branch` is the Git ref the remote runner pushes to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `gateway_token` is AgenticOS-owned: never logged, never persisted.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SandboxJob {
+    pub job_id: String,
     pub sandbox_id: String,
     pub branch: String,
+    pub expires_at: String,
+    pub gateway_token: String,
+}
+
+impl std::fmt::Debug for SandboxJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxJob")
+            .field("job_id", &self.job_id)
+            .field("sandbox_id", &self.sandbox_id)
+            .field("branch", &self.branch)
+            .field("expires_at", &self.expires_at)
+            .field("gateway_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The create request body, matching the AOS-324 contract strictly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateJob {
+    pub ticket_id: String,
+    pub branch: String,
+    pub base_sha: String,
+    pub spec: String,
+    pub idempotency_key: String,
 }
 
 /// One event streamed from a running sandbox job.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SandboxEvent {
     pub seq: u64,
     pub kind: String,
     pub text: String,
 }
 
-/// The result a remote runner reports. Every field is optional except
-/// `text`; the daemon records what the runner provided.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The result a remote runner reports. `text` is always present; the
+/// other fields are optional and recorded as the runner provided them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct SandboxResult {
     pub sha: Option<String>,
     pub diff: Option<String>,
@@ -69,22 +100,24 @@ pub struct SandboxResult {
     pub text: String,
 }
 
+/// The `get` response: state, events, and the result snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct JobSnapshot {
+    pub job_id: String,
+    pub state: String,
+    pub events: Vec<SandboxEvent>,
+    pub result: SandboxResult,
+}
+
 /// Job lifecycle over the AgenticOS sandbox API, from the daemon's view.
-///
-/// TODO(CAD-1673 / AOS-324): wire the real transport once AOS-324 lands
-/// its contract artifacts: the sandbox route names for create, events,
-/// result, and stop; their request and response schemas; and the auth
-/// header the daemon presents. Until then only [`FakeSandboxClient`]
-/// implements this trait.
 pub trait SandboxClient: Send + Sync {
-    /// Create a job for `ticket_id` on `branch` with the inlined `spec`.
-    fn create_job(&self, ticket_id: &str, branch: &str, spec: &str) -> Result<SandboxJob>;
-    /// Events recorded for the job after `after_seq`, in order.
-    fn collect_events(&self, job: &SandboxJob, after_seq: u64) -> Result<Vec<SandboxEvent>>;
-    /// The job's result, once it has settled.
-    fn fetch_result(&self, job: &SandboxJob) -> Result<SandboxResult>;
+    /// Create a job. Replaying the same `idempotency_key` returns the
+    /// existing job rather than starting a second sandbox.
+    fn create_job(&self, request: &CreateJob) -> Result<SandboxJob>;
+    /// The job's state, events, and result.
+    fn get_job(&self, job_id: &str) -> Result<JobSnapshot>;
     /// Stop the job. Stopping an already-stopped job is not an error.
-    fn stop_job(&self, job: &SandboxJob) -> Result<()>;
+    fn stop_job(&self, job_id: &str) -> Result<String>;
 }
 
 /// Per-company entitlement check (`cloud_sandbox`).
@@ -120,6 +153,7 @@ pub struct RemoteLane {
     pub ticket_id: String,
     pub branch: String,
     pub sandbox_id: String,
+    pub job_id: String,
 }
 
 /// Create a remote lane for `ticket_id` after the entitlement passes. The
@@ -128,17 +162,17 @@ pub fn create_remote_lane(
     client: &dyn SandboxClient,
     entitlement: &dyn SandboxEntitlement,
     company: &str,
-    ticket_id: &str,
-    branch: &str,
-    spec: &str,
-) -> Result<RemoteLane> {
+    request: &CreateJob,
+) -> Result<(RemoteLane, SandboxJob)> {
     require_entitlement(entitlement, company)?;
-    let job = client.create_job(ticket_id, branch, spec)?;
-    Ok(RemoteLane {
-        ticket_id: ticket_id.to_string(),
-        branch: job.branch,
-        sandbox_id: job.sandbox_id,
-    })
+    let job = client.create_job(request)?;
+    let lane = RemoteLane {
+        ticket_id: request.ticket_id.clone(),
+        branch: job.branch.clone(),
+        sandbox_id: job.sandbox_id.clone(),
+        job_id: job.job_id.clone(),
+    };
+    Ok((lane, job))
 }
 
 /// Idempotency ledger for relayed results, keyed by sandbox id. A repeat
@@ -151,14 +185,18 @@ pub struct ResultRelay {
 
 impl ResultRelay {
     /// Relay the result for `job` once. Returns `Ok(true)` when this call
-    /// recorded it, `Ok(false)` when it was already reported.
+    /// recorded it, `Ok(false)` when it was already reported. The result
+    /// is taken from a settled `get`; an unsettled job is not relayed.
     pub fn relay(&self, client: &dyn SandboxClient, job: &SandboxJob) -> Result<bool> {
         let mut reported = self.reported.lock().unwrap();
         if reported.contains_key(&job.sandbox_id) {
             return Ok(false);
         }
-        let result = client.fetch_result(job)?;
-        reported.insert(job.sandbox_id.clone(), result);
+        let snapshot = client.get_job(&job.job_id)?;
+        if !is_settled(&snapshot.state) {
+            return Ok(false);
+        }
+        reported.insert(job.sandbox_id.clone(), snapshot.result);
         Ok(true)
     }
 
@@ -168,8 +206,176 @@ impl ResultRelay {
     }
 }
 
-/// In-memory fake for tests: scripted entitlement, scripted job results,
-/// and a call log for asserting that no host worktree was requested.
+/// A job is settled once it can no longer produce a result.
+pub fn is_settled(state: &str) -> bool {
+    matches!(state, "stopped" | "completed" | "failed")
+}
+
+/// Transport seam for `api.internal`: one JSON request, one JSON envelope
+/// back. The HTTP implementation is [`UreqSandboxTransport`]; tests use a
+/// scripted fake so no network is touched.
+pub trait SandboxTransport: Send + Sync {
+    /// Send `method` to `url` with an optional JSON body and return the
+    /// HTTP status and the raw parsed envelope.
+    fn send(&self, method: &str, url: &str, body: Option<&Value>) -> Result<(u16, Value)>;
+}
+
+/// The real `api.internal` transport over `ureq`.
+pub struct UreqSandboxTransport {
+    agent: ureq::Agent,
+    bearer: Option<String>,
+}
+
+impl UreqSandboxTransport {
+    pub fn new(bearer: Option<String>) -> Self {
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(20)))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build();
+        Self {
+            agent: ureq::Agent::new_with_config(config),
+            bearer,
+        }
+    }
+}
+
+const RESPONSE_CAP: u64 = 4 * 1024 * 1024;
+
+impl SandboxTransport for UreqSandboxTransport {
+    fn send(&self, method: &str, url: &str, body: Option<&Value>) -> Result<(u16, Value)> {
+        let unreachable = || Error::internal("cloud sandbox API unreachable");
+        let mut response = match (method, body) {
+            ("POST", Some(body)) => {
+                let req = self.agent.post(url);
+                let req = match &self.bearer {
+                    Some(t) => req.header("authorization", &format!("Bearer {t}")),
+                    None => req,
+                };
+                req.send_json(body).map_err(|_| unreachable())?
+            }
+            ("POST", None) => {
+                let req = self.agent.post(url);
+                let req = match &self.bearer {
+                    Some(t) => req.header("authorization", &format!("Bearer {t}")),
+                    None => req,
+                };
+                req.send_empty().map_err(|_| unreachable())?
+            }
+            _ => {
+                let req = self.agent.get(url);
+                let req = match &self.bearer {
+                    Some(t) => req.header("authorization", &format!("Bearer {t}")),
+                    None => req,
+                };
+                req.call().map_err(|_| unreachable())?
+            }
+        };
+        let status = response.status().as_u16();
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(RESPONSE_CAP)
+            .read_to_vec()
+            .map_err(|_| unreachable())?;
+        let envelope: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| Error::internal("cloud sandbox API returned a non-JSON body"))?;
+        Ok((status, envelope))
+    }
+}
+
+/// HTTP-backed [`SandboxClient`] and [`SandboxEntitlement`] over
+/// `api.internal`, parsing the `{ok, data | error}` envelope.
+pub struct HttpSandboxApi<T: SandboxTransport> {
+    transport: T,
+}
+
+impl<T: SandboxTransport> HttpSandboxApi<T> {
+    pub fn new(transport: T) -> Self {
+        Self { transport }
+    }
+
+    fn data(&self, method: &str, url: &str, body: Option<&Value>) -> Result<Value> {
+        let (status, envelope) = self.transport.send(method, url, body)?;
+        let ok = envelope.get("ok").and_then(Value::as_bool) == Some(true);
+        if ok && (200..300).contains(&status) {
+            return envelope
+                .get("data")
+                .cloned()
+                .ok_or_else(|| Error::internal("cloud sandbox envelope had no data"));
+        }
+        let code = envelope
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        Err(map_error(status, code))
+    }
+}
+
+/// Map an AgenticOS sandbox error to a stable Cadence error. A 403
+/// `cloud_sandbox_not_entitled` is [`ENTITLEMENT_REFUSED`]; a missing
+/// route is [`SANDBOX_UNAVAILABLE`]; anything else is a generic rejection
+/// carrying only the AgenticOS code, never the message body.
+fn map_error(status: u16, code: &str) -> Error {
+    match (status, code) {
+        (403, "cloud_sandbox_not_entitled") => Error::Structured(Structured {
+            kind: "rejected",
+            code: ENTITLEMENT_REFUSED.to_string(),
+            message: format!("company is not entitled for {ENTITLEMENT_KEY}"),
+            revision: None,
+        }),
+        (404, _) | (405, _) => Error::Structured(Structured {
+            kind: "rejected",
+            code: SANDBOX_UNAVAILABLE.to_string(),
+            message: "cloud sandbox route is not available".to_string(),
+            revision: None,
+        }),
+        _ => Error::rejected(format!("cloud sandbox API refused ({status} {code})")),
+    }
+}
+
+fn str_field<'a>(data: &'a Value, key: &str) -> Result<&'a str> {
+    data.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::internal(format!("cloud sandbox response missing {key}")))
+}
+
+impl<T: SandboxTransport> SandboxClient for HttpSandboxApi<T> {
+    fn create_job(&self, request: &CreateJob) -> Result<SandboxJob> {
+        let body = json!({
+            "ticket_id": request.ticket_id,
+            "branch": request.branch,
+            "base_sha": request.base_sha,
+            "spec": request.spec,
+            "idempotency_key": request.idempotency_key,
+        });
+        let data = self.data("POST", JOBS_URL, Some(&body))?;
+        Ok(SandboxJob {
+            job_id: str_field(&data, "job_id")?.to_string(),
+            sandbox_id: str_field(&data, "sandbox_id")?.to_string(),
+            branch: str_field(&data, "branch")?.to_string(),
+            expires_at: str_field(&data, "expires_at")?.to_string(),
+            gateway_token: str_field(&data, "gateway_token")?.to_string(),
+        })
+    }
+
+    fn get_job(&self, job_id: &str) -> Result<JobSnapshot> {
+        let url = format!("{JOBS_URL}/{job_id}");
+        let data = self.data("GET", &url, None)?;
+        serde_json::from_value(data)
+            .map_err(|_| Error::internal("cloud sandbox job response was malformed"))
+    }
+
+    fn stop_job(&self, job_id: &str) -> Result<String> {
+        let url = format!("{JOBS_URL}/{job_id}/stop");
+        let data = self.data("POST", &url, None)?;
+        Ok(str_field(&data, "state")?.to_string())
+    }
+}
+
+
+/// In-memory fake for tests: scripted entitlement, scripted transport
+/// responses, and a call log so tests can assert on wire shape.
 #[cfg(test)]
 pub mod fake {
     use super::*;
@@ -184,50 +390,82 @@ pub mod fake {
         }
     }
 
+    /// Scripted transport: returns queued `(status, envelope)` pairs and
+    /// records every request as `(method, url, body)`.
     #[derive(Default)]
-    pub struct FakeSandboxClient {
-        pub created: Mutex<Vec<(String, String, String)>>,
-        pub fetches: Mutex<usize>,
-        pub stops: Mutex<usize>,
-        pub result: SandboxResult,
+    pub struct FakeTransport {
+        pub responses: Mutex<Vec<(u16, Value)>>,
+        pub calls: Mutex<Vec<(String, String, Option<Value>)>>,
     }
 
-    impl SandboxClient for FakeSandboxClient {
-        fn create_job(&self, ticket_id: &str, branch: &str, spec: &str) -> Result<SandboxJob> {
-            self.created.lock().unwrap().push((
-                ticket_id.to_string(),
-                branch.to_string(),
-                spec.to_string(),
+    impl FakeTransport {
+        pub fn with(responses: Vec<(u16, Value)>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().rev().collect()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SandboxTransport for FakeTransport {
+        fn send(&self, method: &str, url: &str, body: Option<&Value>) -> Result<(u16, Value)> {
+            self.calls.lock().unwrap().push((
+                method.to_string(),
+                url.to_string(),
+                body.cloned(),
             ));
-            Ok(SandboxJob {
-                sandbox_id: format!("sbx-{}", self.created.lock().unwrap().len()),
-                branch: branch.to_string(),
-            })
-        }
-
-        fn collect_events(&self, _job: &SandboxJob, _after: u64) -> Result<Vec<SandboxEvent>> {
-            Ok(Vec::new())
-        }
-
-        fn fetch_result(&self, _job: &SandboxJob) -> Result<SandboxResult> {
-            *self.fetches.lock().unwrap() += 1;
-            Ok(self.result.clone())
-        }
-
-        fn stop_job(&self, _job: &SandboxJob) -> Result<()> {
-            *self.stops.lock().unwrap() += 1;
-            Ok(())
+            self.responses
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or_else(|| Error::internal("fake transport has no scripted response"))
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fake::{FakeEntitlement, FakeSandboxClient};
+    use super::fake::{FakeEntitlement, FakeTransport};
     use super::*;
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
     fn entitled() -> FakeEntitlement {
         FakeEntitlement { enabled: Ok(true) }
+    }
+
+    fn req(ticket: &str) -> CreateJob {
+        CreateJob {
+            ticket_id: ticket.to_string(),
+            branch: "cad-1-x".to_string(),
+            base_sha: SHA.to_string(),
+            spec: "spec".to_string(),
+            idempotency_key: "idem-key-0001".to_string(),
+        }
+    }
+
+    fn created(job_id: &str) -> Value {
+        json!({
+            "ok": true,
+            "data": {
+                "job_id": job_id,
+                "sandbox_id": format!("csb_{job_id}"),
+                "branch": "cad-1-x",
+                "gateway_token": "tok-secret-value",
+                "expires_at": "2026-10-21T05:00:00.000Z"
+            }
+        })
+    }
+
+    fn forbidden() -> Value {
+        json!({"ok": false, "error": {"code": "cloud_sandbox_not_entitled", "message": "x"}})
+    }
+
+    struct ByCompany;
+    impl SandboxEntitlement for ByCompany {
+        fn cloud_sandbox_enabled(&self, company: &str) -> Result<bool> {
+            Ok(company == "co-allowed")
+        }
     }
 
     fn code_of(err: &Error) -> Option<&str> {
@@ -236,79 +474,169 @@ mod tests {
 
     #[test]
     fn entitlement_refusal_has_stable_code_and_creates_nothing() {
-        let client = FakeSandboxClient::default();
+        let transport = FakeTransport::with(vec![]);
+        let api = HttpSandboxApi::new(transport);
         for enabled in [Ok(false), Err("boom".to_string())] {
             let ent = FakeEntitlement { enabled };
-            let err =
-                create_remote_lane(&client, &ent, "co-1", "CAD-1", "b", "spec").unwrap_err();
+            let err = create_remote_lane(&api, &ent, "co-1", &req("CAD-1")).unwrap_err();
             assert_eq!(code_of(&err), Some(ENTITLEMENT_REFUSED), "{err:?}");
         }
-        assert!(client.created.lock().unwrap().is_empty());
+        assert!(api.transport.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_posts_contract_body_without_company_field() {
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![(201, created("job-1"))]));
+        let (lane, job) =
+            create_remote_lane(&api, &entitled(), "co-1", &req("CAD-1")).unwrap();
+        assert_eq!(lane.sandbox_id, "csb_job-1");
+        assert_eq!(lane.branch, "cad-1-x");
+        assert_eq!(lane.job_id, "job-1");
+        assert_eq!(job.gateway_token, "tok-secret-value");
+        let calls = api.transport.calls.lock().unwrap();
+        let (method, url, body) = &calls[0];
+        assert_eq!(method, "POST");
+        assert_eq!(url, JOBS_URL);
+        let body = body.as_ref().unwrap();
+        assert_eq!(body["idempotency_key"], "idem-key-0001");
+        assert_eq!(body["base_sha"], SHA);
+        assert!(body.get("company").is_none() && body.get("company_id").is_none());
+    }
+
+    #[test]
+    fn idempotent_replay_returns_the_same_job_identity() {
+        // AOS answers a replay with 200 and the same job id.
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![
+            (201, created("job-1")),
+            (200, created("job-1")),
+        ]));
+        let first = api.create_job(&req("CAD-1")).unwrap();
+        let second = api.create_job(&req("CAD-1")).unwrap();
+        assert_eq!(first.job_id, second.job_id);
+        assert_eq!(first.sandbox_id, second.sandbox_id);
+    }
+
+    #[test]
+    fn entitlement_403_maps_to_stable_refusal() {
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![(403, forbidden())]));
+        let err = api.create_job(&req("CAD-1")).unwrap_err();
+        assert_eq!(code_of(&err), Some(ENTITLEMENT_REFUSED), "{err:?}");
+    }
+
+    #[test]
+    fn missing_route_maps_to_unavailable() {
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![(
+            404,
+            json!({"ok": false, "error": {"code": "not_found"}}),
+        )]));
+        let err = api.create_job(&req("CAD-1")).unwrap_err();
+        assert_eq!(code_of(&err), Some(SANDBOX_UNAVAILABLE), "{err:?}");
     }
 
     #[test]
     fn remote_lane_is_created_with_branch_and_sandbox_id() {
-        let client = FakeSandboxClient::default();
-        let lane = create_remote_lane(&client, &entitled(), "co-1", "CAD-1", "cad-1-x", "spec")
-            .unwrap();
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![(201, created("job-1"))]));
+        let (lane, _) = create_remote_lane(&api, &entitled(), "co-1", &req("CAD-1")).unwrap();
         assert_eq!(lane.branch, "cad-1-x");
-        assert_eq!(lane.sandbox_id, "sbx-1");
-        // The spec is inlined into the create call, not fetched later.
-        assert_eq!(client.created.lock().unwrap()[0].2, "spec");
+        assert_eq!(lane.sandbox_id, "csb_job-1");
     }
 
     #[test]
     fn remote_lane_never_touches_a_host_worktree() {
-        // The client surface has no worktree method; the lane record holds
-        // only ticket, branch, and sandbox id. Nothing here names a path.
-        let client = FakeSandboxClient::default();
-        let lane =
-            create_remote_lane(&client, &entitled(), "co-1", "CAD-1", "b", "spec").unwrap();
-        let debug = format!("{lane:?}");
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![(201, created("job-1"))]));
+        let (lane, job) = create_remote_lane(&api, &entitled(), "co-1", &req("CAD-1")).unwrap();
+        let debug = format!("{lane:?}{job:?}");
         assert!(!debug.contains("worktree"), "{debug}");
         assert!(!debug.contains('/'), "{debug}");
     }
 
     #[test]
+    fn gateway_token_is_redacted_from_debug() {
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![(201, created("job-1"))]));
+        let job = api.create_job(&req("CAD-1")).unwrap();
+        let debug = format!("{job:?}");
+        assert!(!debug.contains("tok-secret-value"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    #[test]
+    fn get_parses_events_and_result() {
+        let body = json!({"ok": true, "data": {
+            "job_id": "job-1",
+            "state": "completed",
+            "events": [{"seq": 1, "kind": "tool", "text": "ran"}],
+            "result": {"sha": SHA, "diff": "+x", "pr": null, "text": "done"}
+        }});
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![(200, body)]));
+        let snap = api.get_job("job-1").unwrap();
+        assert_eq!(snap.state, "completed");
+        assert_eq!(snap.events[0].seq, 1);
+        assert_eq!(snap.result.sha.as_deref(), Some(SHA));
+        assert_eq!(snap.result.pr, None);
+        assert_eq!(api.transport.calls.lock().unwrap()[0].1, format!("{JOBS_URL}/job-1"));
+    }
+
+    #[test]
+    fn stop_posts_to_stop_route_and_returns_state() {
+        let body = json!({"ok": true, "data": {"job_id": "job-1", "state": "stopped"}});
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![(200, body)]));
+        assert_eq!(api.stop_job("job-1").unwrap(), "stopped");
+        let calls = api.transport.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "POST");
+        assert_eq!(calls[0].1, format!("{JOBS_URL}/job-1/stop"));
+    }
+
+    #[test]
     fn result_relay_is_idempotent_and_reports_once() {
-        let client = FakeSandboxClient {
-            result: SandboxResult {
-                sha: Some("a".repeat(40)),
-                diff: Some("+x".to_string()),
-                pr: Some("https://example.invalid/pr/1".to_string()),
-                text: "done".to_string(),
-            },
-            ..Default::default()
-        };
+        let body = json!({"ok": true, "data": {
+            "job_id": "job-1", "state": "completed", "events": [],
+            "result": {"sha": SHA, "diff": "+x", "pr": "https://example.invalid/pr/1", "text": "done"}
+        }});
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![(200, body)]));
         let job = SandboxJob {
-            sandbox_id: "sbx-1".to_string(),
-            branch: "b".to_string(),
+            job_id: "job-1".into(),
+            sandbox_id: "csb_job-1".into(),
+            branch: "b".into(),
+            expires_at: "x".into(),
+            gateway_token: "t".into(),
         };
         let relay = ResultRelay::default();
-        assert!(relay.relay(&client, &job).unwrap());
-        assert!(!relay.relay(&client, &job).unwrap());
-        assert!(!relay.relay(&client, &job).unwrap());
+        assert!(relay.relay(&api, &job).unwrap());
+        assert!(!relay.relay(&api, &job).unwrap());
+        assert!(!relay.relay(&api, &job).unwrap());
         // Fetched exactly once across three relays: no double report.
-        assert_eq!(*client.fetches.lock().unwrap(), 1);
-        assert_eq!(relay.recorded("sbx-1").unwrap().text, "done");
+        assert_eq!(api.transport.calls.lock().unwrap().len(), 1);
+        assert_eq!(relay.recorded("csb_job-1").unwrap().text, "done");
+    }
+
+    #[test]
+    fn unsettled_job_is_not_relayed() {
+        let body = json!({"ok": true, "data": {
+            "job_id": "job-1", "state": "running", "events": [],
+            "result": {"sha": null, "diff": null, "pr": null, "text": ""}
+        }});
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![(200, body)]));
+        let job = SandboxJob {
+            job_id: "job-1".into(),
+            sandbox_id: "csb_job-1".into(),
+            branch: "b".into(),
+            expires_at: "x".into(),
+            gateway_token: "t".into(),
+        };
+        let relay = ResultRelay::default();
+        assert!(!relay.relay(&api, &job).unwrap());
+        assert!(relay.recorded("csb_job-1").is_none());
     }
 
     #[test]
     fn no_hardcoded_company_or_sandbox_ids() {
-        // The entitlement is looked up for whichever company the caller
-        // passes; a different company must not reuse another's answer.
-        struct ByCompany;
-        impl SandboxEntitlement for ByCompany {
-            fn cloud_sandbox_enabled(&self, company: &str) -> Result<bool> {
-                Ok(company == "co-allowed")
-            }
-        }
-        let client = FakeSandboxClient::default();
-        assert!(create_remote_lane(&client, &ByCompany, "co-allowed", "CAD-1", "b", "s").is_ok());
-        let err = create_remote_lane(&client, &ByCompany, "co-other", "CAD-1", "b", "s")
-            .unwrap_err();
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![
+            (201, created("job-1")),
+        ]));
+        assert!(create_remote_lane(&api, &ByCompany, "co-allowed", &req("CAD-1")).is_ok());
+        let err = create_remote_lane(&api, &ByCompany, "co-other", &req("CAD-1")).unwrap_err();
         assert_eq!(code_of(&err), Some(ENTITLEMENT_REFUSED));
-        assert_eq!(client.created.lock().unwrap().len(), 1);
+        assert_eq!(api.transport.calls.lock().unwrap().len(), 1);
     }
 
     #[test]
