@@ -468,18 +468,46 @@ impl Shared {
 
     /// Consume a sandbox agent's dispatched kickoff. The normal dispatch
     /// transaction already set the task `dispatched` and queued `message`;
-    /// the cloud backend marks it running, drives the remote job, and calls
-    /// the same finish/report path. `has_actor=false` means no actor exists.
+    /// claim the queued delivery before any external side effect, then drive
+    /// the remote job and call the same finish/report path. A cancelled or
+    /// already-claimed delivery is left alone. `has_actor=false` means no
+    /// actor exists.
     fn run_cloud_dispatch(&self, task_id: &str, message_id: &str) -> Result<()> {
-        let task = self.store.task(task_id)?;
-        let job = self.store.job(&task.job_id)?;
+        fn fail(
+            store: &crate::store::Store,
+            message: &crate::store::Message,
+            error: Error,
+        ) -> Error {
+            crate::issue::cloud::fail_message(store, message, &error);
+            error
+        }
         let message = self.store.message(message_id)?.ok_or_else(|| {
             Error::rejected(format!("cloud dispatch message '{message_id}' is gone"))
         })?;
+        if !self
+            .store
+            .mark_running_queued(&message.id, &format!("cloud:{}", message.id))?
+        {
+            return Ok(());
+        }
+        let task = self
+            .store
+            .task(task_id)
+            .map_err(|error| fail(&self.store, &message, error))?;
+        let job = self
+            .store
+            .job(&task.job_id)
+            .map_err(|error| fail(&self.store, &message, error))?;
         let alias = task.assignee.as_deref().unwrap_or(message.alias.as_str());
-        let agent = self.store.agent(alias)?;
-        let company = crate::issue::cloud::hosted_company(|key| std::env::var(key).ok())?;
-        let pm = self.pm()?;
+        let agent = self
+            .store
+            .agent(alias)
+            .map_err(|error| fail(&self.store, &message, error))?;
+        let company = crate::issue::cloud::hosted_company(|key| std::env::var(key).ok())
+            .map_err(|error| fail(&self.store, &message, error))?;
+        let pm = self
+            .pm()
+            .map_err(|error| fail(&self.store, &message, error))?;
         crate::issue::cloud::run_dispatch(&pm, &self.store, &task, &job, &message, &agent, &company)
     }
 

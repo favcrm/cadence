@@ -539,6 +539,32 @@ impl Prepared {
 /// schema, headings, the caller's identity (`CADENCE_ALIAS`), and for
 /// an `answer` that its question exists on the same ticket.
 pub fn prepare(pm: &Pm, text: &str, task: Option<&str>, kind: Option<Kind>) -> Result<Prepared> {
+    let default = default_agent();
+    let claim = std::env::var("CADENCE_ALIAS").ok();
+    prepare_with(pm, text, task, kind, &default, claim.as_deref())
+}
+
+/// Prepare a report for an internal worker whose caller identity is already
+/// known (the daemon's cloud backend). The explicit agent fills and, when the
+/// frontmatter names one, must match it — never the process environment.
+pub fn prepare_as(
+    pm: &Pm,
+    text: &str,
+    task: Option<&str>,
+    kind: Option<Kind>,
+    agent: &str,
+) -> Result<Prepared> {
+    prepare_with(pm, text, task, kind, agent, Some(agent))
+}
+
+fn prepare_with(
+    pm: &Pm,
+    text: &str,
+    task: Option<&str>,
+    kind: Option<Kind>,
+    default_agent: &str,
+    claim: Option<&str>,
+) -> Result<Prepared> {
     if text.len() > BODY_MAX {
         return Err(Error::rejected(format!(
             "Report exceeds the {} KB cap — trim it",
@@ -547,8 +573,8 @@ pub fn prepare(pm: &Pm, text: &str, task: Option<&str>, kind: Option<Kind>) -> R
     }
     let text = strip_controls(text);
     let (front, body) = parse_text(&text)?;
-    check_claim(&front, std::env::var("CADENCE_ALIAS").ok().as_deref())?;
-    let front = validate(front, &body, task, kind, &default_agent())?;
+    check_claim(&front, claim)?;
+    let front = validate(front, &body, task, kind, default_agent)?;
     if front.kind == Some(Kind::Verdict) {
         return Err(Error::rejected(
             "a verdict is filed through the daemon, which checks you are the ticket's \

@@ -1253,6 +1253,7 @@ pub(crate) fn write_route(
                 Some(caller) => post_report(&mut request, state_dir, pm_dir, caller.actor()),
                 None => err_response(500, "unadmitted write"),
             },
+            RouteId::AgentRegister => post_agent(&mut request, state_dir),
             RouteId::CatalogInstall => explorer_write(
                 &mut request,
                 state_dir,
@@ -1348,80 +1349,6 @@ pub(crate) fn write_route(
             return;
         }
     };
-    // CAD-561: the operator's Update button — the same pipeline the CLI
-    // runs, in this process; the card polls `GET /api/update`.
-    if path == "/api/update" || path == "/api/update/check" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let resp = if path == "/api/update" {
-            updates::start(state_dir, opts)
-        } else {
-            updates::check_now(state_dir)
-        };
-        send(request, resp);
-        return;
-    }
-    if path == "/api/settings/agents"
-        || path == "/api/settings/agents/catalog"
-        || path == "/api/settings/agents/sync"
-        || path == "/api/settings/agents/preview"
-    {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let resp = agent_settings_post(&mut request, state_dir, path);
-        send(request, resp);
-        return;
-    }
-    if path == "/api/settings/model-defaults" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let resp = model_defaults_post(&mut request, state_dir);
-        send(request, resp);
-        return;
-    }
-    if path == "/api/locale" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let resp = super::locale::post(&mut request, state_dir, opts);
-        send(request, resp);
-        return;
-    }
-    // CAD-140: filing a report or idea — the same `report::file` path
-    // `cadence report` uses (scrubbing, context, intake shape, PM
-    // heads-up), never a bare issue create. Admitted above, like every
-    // write; the actor below is the admitted caller, never a field.
-    if path == "/api/reports" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let Some(caller) = &caller else {
-            send(request, err_response(500, "unadmitted write"));
-            return;
-        };
-        let resp = post_report(&mut request, state_dir, pm_dir, caller.actor());
-        send(request, resp);
-        return;
-    }
-    // Setup: one agent row through the daemon's `agent_register` (the same
-    // `rpc_register` the CLI uses). Operator-only by `WRITE_ROUTES`.
-    if path == "/api/agents" {
-        if *method != Method::Post {
-            send(request, err_response(405, "method not allowed"));
-            return;
-        }
-        let resp = post_agent(&mut request, state_dir);
-        send(request, resp);
-        return;
-    }
     // Monitor acknowledgement: this is a daemon-owned durable write, kept
     // beside (and behind the same browser write guards as) tracker writes.
     // The UI never mutates the monitor SQLite store directly, which keeps a

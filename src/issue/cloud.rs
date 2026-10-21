@@ -78,34 +78,47 @@ pub fn run_dispatch(
     let issue = job.issue_id.as_deref().ok_or_else(|| {
         Error::rejected("cloud sandbox dispatch needs a job bound to a tracker issue")
     })?;
-    let result = match execute(pm, store, task, job, message, agent, company) {
-        Ok((lane, result)) => (lane, result),
+    let (lane, result) = match execute(pm, task, job, message, agent, company) {
+        Ok(value) => value,
         Err(error) => {
-            let error_text = error.to_string();
-            let result = json!({
-                "status": "failed",
-                "text": error_text.clone(),
-                "error": error_text.clone(),
-            });
-            let _ = store.finish(message, "failed", &result, Some(error_text.as_str()));
+            fail_message(store, message, &error);
             return Err(error);
         }
     };
-    let (lane, result) = result;
+    let prepared = match prepare_done_report(pm, issue, &lane, &result, &agent.alias) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            fail_message(store, message, &error);
+            return Err(error);
+        }
+    };
+    if let Err(error) = task_report::store(pm, &prepared, &agent.alias) {
+        fail_message(store, message, &error);
+        return Err(error);
+    }
     store.finish(message, "completed", &result_json(&result), None)?;
-    file_done_report(pm, issue, &lane, &result, &agent.alias)?;
     Ok(())
+}
+
+pub(crate) fn fail_message(store: &Store, message: &Message, error: &Error) {
+    let error_text = error.to_string();
+    let result = json!({
+        "status": "failed",
+        "text": error_text.clone(),
+        "error": error_text.clone(),
+    });
+    let _ = store.finish(message, "failed", &result, Some(error_text.as_str()));
 }
 
 fn execute(
     pm: &Pm,
-    store: &Store,
     task: &Task,
     job: &Job,
     message: &Message,
     agent: &Agent,
     company: &str,
 ) -> Result<(RemoteLane, SandboxResult)> {
+    validate_cloud_profile(agent)?;
     let issue = job.issue_id.as_deref().ok_or_else(|| {
         Error::rejected("cloud sandbox dispatch needs a job bound to a tracker issue")
     })?;
@@ -131,15 +144,11 @@ fn execute(
         branch: branch.to_string(),
         base_sha: base_sha.to_string(),
         spec,
-        idempotency_key: format!("cloud-sandbox:{}:r{}", task.id, task.revision),
+        idempotency_key: format!("cloud-sandbox:{}:{}", task.id, message.id),
     };
     let client = HttpSandboxApi::new(UreqSandboxTransport::new(None));
     let (lane, job_handle) =
         create_remote_lane(&client, &CreateEnforcesEntitlement, company, &request)?;
-    if let Err(error) = store.mark_running(&message.id, &job_handle.job_id) {
-        let _ = client.stop_job(&job_handle.job_id);
-        return Err(error);
-    }
     if let Err(error) = write::add_ref(
         pm,
         issue,
@@ -159,6 +168,27 @@ fn execute(
     }
     let result = drive_to_result(&client, &job_handle)?;
     Ok((lane, result))
+}
+
+fn validate_cloud_profile(agent: &Agent) -> Result<()> {
+    let Some(params) = agent.params.as_ref() else {
+        return Ok(());
+    };
+    if let Some(profile) = params.get("image_profile") {
+        if !matches!(profile.as_str(), Some("node24-pi" | "rust-lite")) {
+            return Err(Error::rejected(
+                "cloud sandbox image_profile must be node24-pi or rust-lite",
+            ));
+        }
+    }
+    if let Some(budget) = params.get("monthly_budget_micros") {
+        if !budget.as_u64().is_some_and(|value| value > 0) {
+            return Err(Error::rejected(
+                "cloud sandbox monthly_budget_micros must be a positive integer",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn drive_to_result(
@@ -292,15 +322,16 @@ fn done_evidence(result: &SandboxResult) -> String {
     evidence
 }
 
-/// File the relayed result through the existing report path as a `done`
-/// report on the issue.
-fn file_done_report(
+/// Prepare the relayed result through the existing report path as a `done`
+/// report on the issue, attributed to the cloud agent rather than the daemon
+/// process's environment.
+fn prepare_done_report(
     pm: &Pm,
     issue: &str,
     lane: &RemoteLane,
     result: &SandboxResult,
     actor: &str,
-) -> Result<()> {
+) -> Result<task_report::Prepared> {
     let mut yaml = format!("task: {issue}\nkind: done\n");
     if let Some(sha) = &result.sha {
         let hex = matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit());
@@ -326,9 +357,7 @@ fn file_done_report(
         branch = lane.branch,
         job = lane.job_id,
     );
-    let prepared = task_report::prepare(pm, &text, Some(issue), Some(task_report::Kind::Done))?;
-    task_report::store(pm, &prepared, actor)?;
-    Ok(())
+    task_report::prepare_as(pm, &text, Some(issue), Some(task_report::Kind::Done), actor)
 }
 
 #[cfg(test)]

@@ -2057,6 +2057,35 @@ impl Store {
         })
     }
 
+    /// Claim a queued kickoff for a non-actor backend. Returns `false` when
+    /// the message was cancelled or already claimed, so the caller must not
+    /// start an external job or resurrect a terminal delivery.
+    pub fn mark_running_queued(&self, message_id: &str, turn_id: &str) -> Result<bool> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let changed = tx.execute(
+                "UPDATE messages SET state='running',turn_id=? \
+                 WHERE id=? AND state='queued'",
+                params![turn_id, message_id],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            Self::event(
+                &tx,
+                &alias,
+                "turn_started",
+                json!({"message": message_id, "turn_id": turn_id}),
+            )?;
+            self.task_on_running(&tx, message_id, &alias)?;
+            Ok(true)
+        })
+    }
+
     /// Return a `submitting` message to `queued` — the submission gate
     /// refused before any paste, so retry is safe.
     pub fn requeue(&self, message_id: &str) -> Result<()> {

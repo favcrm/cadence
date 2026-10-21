@@ -247,7 +247,8 @@ pub(super) fn criteria_too_long(
 /// A Devin cloud session: it cannot read host paths, so its kickoff
 /// inlines the spec text ([`cloud_kickoff_body`]).
 fn cloud_session(provider: &str, endpoint_kind: &str) -> bool {
-    provider == "devin" && endpoint_kind == "cloud"
+    (provider == "devin" && endpoint_kind == "cloud")
+        || (provider == "sandbox" && endpoint_kind == "sandbox")
 }
 
 /// CAD-160: the size a `job dispatch` kickoff must fit for an assignee
@@ -453,6 +454,27 @@ mod cad1373_kickoff_pointer_tests {
             created: 0.0,
             updated: 0.0,
         }
+    }
+
+    #[test]
+    fn sandbox_uses_an_inlined_cloud_kickoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.md");
+        std::fs::write(&spec, "Do the sandbox task.").unwrap();
+        let spec = spec.display().to_string();
+        assert!(cloud_session("sandbox", "sandbox"));
+        assert_eq!(kickoff_ceiling("sandbox", "sandbox"), ENQUEUE_BYTES);
+        let body = job_kickoff(
+            &job(&spec),
+            &task(&spec, "the sandbox task is done"),
+            1,
+            "m1",
+            "sandbox",
+            "sandbox",
+        )
+        .unwrap();
+        assert!(body.contains("Do the sandbox task."), "{body}");
+        assert!(body.len() <= ENQUEUE_BYTES, "{} bytes", body.len());
     }
 
     /// CAD-1373: the cloud kickoff carries the business-knowledge
