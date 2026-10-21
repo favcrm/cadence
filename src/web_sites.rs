@@ -964,6 +964,9 @@ pub fn is_form_cursor(value: &str) -> bool {
     };
     (1..=16).contains(&millis.len())
         && millis.bytes().all(|b| b.is_ascii_digit())
+        && millis
+            .parse::<u64>()
+            .is_ok_and(|value| value <= 9_007_199_254_740_991)
         && (8..=80).contains(&suffix.len())
         && suffix
             .bytes()
@@ -998,8 +1001,13 @@ mod submission_query_tests {
         assert!(validate_submission_query(None, 100, None).is_ok());
         assert!(validate_submission_query(None, 0, None).is_err());
         assert!(validate_submission_query(None, 101, None).is_err());
+        assert!(
+            validate_submission_query(None, 50, Some("9007199254740991:wsub_abcdefgh")).is_ok()
+        );
         assert!(validate_submission_query(None, 50, Some("1730000000000:wsub_abcdefgh")).is_ok());
         for bad in [
+            "9007199254740992:wsub_abcdefgh",
+            "9999999999999999:wsub_abcdefgh",
             "1730000000000:wsub_abc",
             "1730000000000:abc",
             "x:wsub_abcdefgh",

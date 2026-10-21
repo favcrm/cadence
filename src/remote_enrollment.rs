@@ -21,6 +21,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const VERSION: &str = "hosted-cadence-auth.v1";
 const MAX_RESPONSE: u64 = 64 * 1024;
+/// A submissions page is the one management response that can legitimately
+/// exceed the default bound: the endpoint admits up to 100 entries with 16 KiB
+/// field bodies, so the read allowance mirrors the published page limits plus
+/// envelope overhead. Every other route keeps [`MAX_RESPONSE`].
+const MAX_SUBMISSIONS_RESPONSE: u64 = 4 * 1024 * 1024;
 const MAX_SERVICE_TOKEN: usize = 128;
 const RECORD: &str = "enrollment.json";
 const TRUSTED_ISSUER: &str = "trusted-issuer";
@@ -1236,12 +1241,13 @@ pub fn web_issuer_request(
         return Err(reject("Hosted issuer redirect refused"));
     }
     let mut bytes = Vec::new();
+    let limit = web_response_limit(path);
     response
         .into_body()
         .as_reader()
-        .take(MAX_RESPONSE + 1)
+        .take(limit + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_RESPONSE {
+    if bytes.len() as u64 > limit {
         return Err(reject("Hosted issuer response too large"));
     }
     confirm_login_access_ingress(dir, &issuer, &access)?;
@@ -1314,6 +1320,17 @@ fn web_submissions_route(base: &str) -> bool {
         && suffix
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The read bound for one management path. A submissions page is the only
+/// response allowed to exceed the default; every other route keeps it.
+fn web_response_limit(path: &str) -> u64 {
+    let base = path.split_once('?').map_or(path, |(base, _)| base);
+    if web_submissions_route(base) {
+        MAX_SUBMISSIONS_RESPONSE
+    } else {
+        MAX_RESPONSE
+    }
 }
 
 /// `limit=<1..100>` then optionally `form=` and/or `cursor=`, in that order.
@@ -2926,6 +2943,22 @@ fn enroll_child_locked(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn submissions_responses_get_the_larger_read_bound() {
+        assert_eq!(
+            super::web_response_limit("/v1/web-wites/sites/by-slug/acc-site"),
+            super::MAX_RESPONSE
+        );
+        assert_eq!(
+            super::web_response_limit("/v1/web-sites/sites/site_abcd1234/submissions?limit=50"),
+            super::MAX_SUBMISSIONS_RESPONSE
+        );
+        assert_eq!(
+            super::web_response_limit("/v1/web-wites/sites/site_abcd1234/submissions?limit=50"),
+            super::MAX_RESPONSE
+        );
+    }
+
     /// The production header validator: exact `issuer` hop, bounded UUID id,
     /// header names matched case-insensitively. Anything else yields no id.
     #[test]
