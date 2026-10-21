@@ -170,4 +170,31 @@ if ! grep -F -- "$asset: FAILED" "$work/tamper.out" >/dev/null; then
   cat "$work/tamper.out" >&2
   exit 1
 fi
-printf '%s\n' 'CAD-1272 app-toolchain acceptance passed: package, clean consumer, and production guard refusal.'
+# A recomputed sidecar must not hide modified receiver bytes: the guard has to
+# reach its source comparison and refuse, not stop at the checksum.
+repacked="$work/repacked"
+mkdir "$repacked"
+tar -xzf "$archive" -C "$repacked"
+printf '\n// tampered\n' >> "$repacked/app-kit/src/receiver.mjs"
+tar -czf "$fixture/dist/$asset" -C "$repacked" \
+  LICENSE README.md frame-kit/frame.html frame-kit/kit.css frame-kit/metadata.json \
+  package.json pnpm-lock.yaml toolchain.json \
+  app-kit/README.md app-kit/package.json app-kit/src/index.mjs app-kit/src/receiver.mjs \
+  app-kit/src/refusal.mjs app-kit/types/index.d.ts
+(
+  cd "$fixture/dist"
+  sha256sum "$asset" > "$asset.sha256"
+)
+if (
+  cd "$fixture/dist"
+  TAG="$tag" SOURCE_SHA="$source_sha" bash "$work/publisher-guard.sh"
+) >"$work/receiver-tamper.out" 2>&1; then
+  echo 'production publisher guard accepted modified receiver bytes with a valid sidecar' >&2
+  exit 1
+fi
+if ! grep -F 'app-kit archive bytes differ from source: src/receiver.mjs' "$work/receiver-tamper.out" >/dev/null; then
+  echo 'publisher guard failed for a reason other than the receiver source mismatch:' >&2
+  cat "$work/receiver-tamper.out" >&2
+  exit 1
+fi
+printf '%s\n' 'CAD-1272 app-toolchain acceptance passed: package, clean consumer, checksum and receiver-byte guard refusals.'
