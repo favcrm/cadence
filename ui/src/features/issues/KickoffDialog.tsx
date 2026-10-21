@@ -17,6 +17,7 @@ interface Props {
   title: string;
   body: string;
   groups: string[];
+  seats: { alias: string; provider: string; state: string }[];
   blocked: string | null;
   onClose: () => void;
   onWrite: (resp: WriteResp, verb: string) => void;
@@ -24,13 +25,15 @@ interface Props {
   planHref: string;
 }
 
-export default function KickoffDialog({ id, title, body, groups, blocked, onClose, onWrite, onDone, planHref }: Props) {
+export default function KickoffDialog({ id, title, body, groups, seats, blocked, onClose, onWrite, onDone, planHref }: Props) {
   const t = useTranslate();
   const [step, setStep] = useState<"edit" | "confirm">("edit");
   const [provider, setProvider] = useState(KICKOFF_CHOICES[0].id);
   const [model, setModel] = useState(KICKOFF_CHOICES[0].models[0].id);
   const [effort, setEffort] = useState(KICKOFF_CHOICES[0].effort);
   const [group, setGroup] = useState(groups[0] ?? "master");
+  const [target, setTarget] = useState<"new" | "seat">("new");
+  const [seat, setSeat] = useState(seats[0]?.alias ?? "");
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -69,9 +72,11 @@ export default function KickoffDialog({ id, title, body, groups, blocked, onClos
     return [{ id: model, cost: "unknown" }, ...choice.models];
   }, [choice, model]);
   const cost = models.find((m) => m.id === model)?.cost ?? choice.models[0].cost;
-  const paid = cost === "Paid";
+  const seatMode = target === "seat";
+  const chosen = seats.find((s) => s.alias === seat) ?? null;
+  const paid = !seatMode && cost === "Paid";
   const preview = briefPreview(id, title, body, note);
-  const who = `${choice.label} · ${model} · ${effort}`;
+  const who = seatMode && chosen ? `${chosen.alias} · ${chosen.provider}` : `${choice.label} · ${model} · ${effort}`;
 
   const pickProvider = (next: KickoffChoice) => {
     setProvider(next.id);
@@ -80,8 +85,11 @@ export default function KickoffDialog({ id, title, body, groups, blocked, onClos
   };
 
   const send = () => {
-    if (blocked || busy || !group.trim()) return;
-    const req = kickoffRequest(id, { group, provider, model, effort, note });
+    if (blocked || busy || !group.trim() || (seatMode && !chosen)) return;
+    const req =
+      seatMode && chosen
+        ? kickoffRequest(id, { group, provider: chosen.provider, alias: chosen.alias, note })
+        : kickoffRequest(id, { group, provider, model, effort, note });
     setBusy(true);
     setError(null);
     api
@@ -128,47 +136,84 @@ export default function KickoffDialog({ id, title, body, groups, blocked, onClos
                 One operator-gated click runs issue start, then dispatch.
               </p>
               <div className="grid gap-1.5">
-                <span className="slabel">Provider</span>
-                <div className="flex gap-1" role="group" aria-label="Provider">
-                  {KICKOFF_CHOICES.map((c) => (
-                    <Button
-                      key={c.id}
-                      className="flex-1"
-                      variant={c.id === provider ? "primary" : "secondary"}
-                      aria-label={c.label}
-                      onClick={() => pickProvider(c)}
-                    >
-                      {c.label}
-                    </Button>
-                  ))}
+                <span className="slabel">Target</span>
+                <div className="flex gap-1" role="group" aria-label="Target">
+                  <Button className="flex-1" variant={!seatMode ? "primary" : "secondary"} onClick={() => setTarget("new")}>
+                    New agent
+                  </Button>
+                  <Button className="flex-1" variant={seatMode ? "primary" : "secondary"} onClick={() => setTarget("seat")}>
+                    Existing seat
+                  </Button>
                 </div>
               </div>
-              <div className="grid sm:grid-cols-2 gap-2.5">
-                <label className="grid gap-1.5">
-                  <span className="slabel">Model</span>
-                  <Select
-                    full
-                    value={model}
-                    aria-label="Model"
-                    options={models.map((m) => ({ value: m.id, label: m.id, badge: m.cost }))}
-                    onChange={setModel}
-                  />
-                </label>
-                <label className="grid gap-1.5">
-                  <span className="slabel">Effort</span>
-                  <Select
-                    full
-                    value={effort}
-                    aria-label="Effort"
-                    options={(EFFORTS.includes(effort) ? EFFORTS : [effort, ...EFFORTS]).map((e) => ({ value: e, label: e }))}
-                    onChange={setEffort}
-                  />
-                </label>
-              </div>
-              <div className="flex items-center justify-between gap-2">
-                <span className="slabel">Cost</span>
-                <span className={`chip ${paid ? "bg-warn/15 text-warn" : "bg-info/15 text-info"}`}>{cost}</span>
-              </div>
+              {seatMode ? (
+                <div className="grid gap-1.5">
+                  <span className="slabel">Seat</span>
+                  {seats.length === 0 ? (
+                    <p className="text-secondary text-ink-400 m-0">
+                      No registered seat is available. Use New agent, or register one first.
+                    </p>
+                  ) : (
+                    <Select
+                      full
+                      value={seat}
+                      aria-label="Seat"
+                      options={seats.map((s) => ({
+                        value: s.alias,
+                        label: s.alias,
+                        badge: `${s.provider} · ${s.state}`,
+                      }))}
+                      onChange={setSeat}
+                    />
+                  )}
+                  <span className="text-micro text-ink-500">The seat keeps its provider, model and effort.</span>
+                </div>
+              ) : (
+                <>
+                  <div className="grid gap-1.5">
+                    <span className="slabel">Provider</span>
+                    <div className="flex gap-1" role="group" aria-label="Provider">
+                      {KICKOFF_CHOICES.map((c) => (
+                        <Button
+                          key={c.id}
+                          className="flex-1"
+                          variant={c.id === provider ? "primary" : "secondary"}
+                          aria-label={c.label}
+                          onClick={() => pickProvider(c)}
+                        >
+                          {c.label}
+                        </Button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="grid sm:grid-cols-2 gap-2.5">
+                    <label className="grid gap-1.5">
+                      <span className="slabel">Model</span>
+                      <Select
+                        full
+                        value={model}
+                        aria-label="Model"
+                        options={models.map((m) => ({ value: m.id, label: m.id, badge: m.cost }))}
+                        onChange={setModel}
+                      />
+                    </label>
+                    <label className="grid gap-1.5">
+                      <span className="slabel">Effort</span>
+                      <Select
+                        full
+                        value={effort}
+                        aria-label="Effort"
+                        options={(EFFORTS.includes(effort) ? EFFORTS : [effort, ...EFFORTS]).map((e) => ({ value: e, label: e }))}
+                        onChange={setEffort}
+                      />
+                    </label>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="slabel">Cost</span>
+                    <span className={`chip ${paid ? "bg-warn/15 text-warn" : "bg-info/15 text-info"}`}>{cost}</span>
+                  </div>
+                </>
+              )}
               <label className="grid gap-1.5">
                 <span className="slabel">PM group</span>
                 <input className="field w-full" list="kickoff-groups" value={group} onChange={(e) => setGroup(e.target.value)} aria-label="PM group" />
@@ -198,7 +243,7 @@ export default function KickoffDialog({ id, title, body, groups, blocked, onClos
                 <dt className="slabel">Issue</dt><dd className="num text-secondary text-ink-200">{id}</dd>
                 <dt className="slabel">Runs</dt><dd className="text-secondary text-ink-200">issue start, then dispatch</dd>
                 <dt className="slabel">Worker</dt><dd className="text-secondary text-ink-200">{who}</dd>
-                <dt className="slabel">Cost</dt><dd><span className={`chip ${paid ? "bg-warn/15 text-warn" : "bg-info/15 text-info"}`}>{cost}</span></dd>
+                <dt className="slabel">Cost</dt><dd><span className={`chip ${paid ? "bg-warn/15 text-warn" : "bg-info/15 text-info"}`}>{seatMode ? "seat" : cost}</span></dd>
                 <dt className="slabel">PM</dt><dd className="text-secondary text-ink-200">{group}</dd>
               </dl>
               {paid && (
@@ -219,7 +264,15 @@ export default function KickoffDialog({ id, title, body, groups, blocked, onClos
           {step === "edit" ? (
             <>
               <Button onClick={onClose}>Cancel</Button>
-              <Button variant="primary" disabled={!!blocked || busy || !group.trim()} onClick={() => { if (!blocked && !busy && group.trim()) setStep("confirm"); }}>Continue</Button>
+              <Button
+                variant="primary"
+                disabled={!!blocked || busy || !group.trim() || (seatMode && !chosen)}
+                onClick={() => {
+                  if (!blocked && !busy && group.trim() && (!seatMode || chosen)) setStep("confirm");
+                }}
+              >
+                Continue
+              </Button>
             </>
           ) : (
             <>
