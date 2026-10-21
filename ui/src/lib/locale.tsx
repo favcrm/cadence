@@ -357,6 +357,7 @@ Object.assign(zhTW, {
   "Loading your apps…": "正在載入你的應用程式…",
   "Favorites": "我的最愛",
   "Installed": "已安裝",
+  "Version": "版本",
   "Recently removed": "最近移除",
   "Project apps": "專案應用程式",
   "Needs attention": "需要處理",

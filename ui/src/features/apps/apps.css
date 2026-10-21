@@ -128,26 +128,53 @@
   min-height: calc(100dvh - 2.25rem);
 }
 
-/* The Installed gallery (CAD catalogue directory): whole-card links —
-   no nested buttons. Artwork comes from the shared AppCover, text from
-   the real app_home row. The card's own border motion is the shared
-   `.card` transition; nothing here adds animation, so reduced-motion
-   needs no extra rule. */
+/* The Installed gallery (CAD catalogue directory): the card opens the
+   app; the operator's settings action sits in the card's top-right
+   corner. Artwork comes from the shared AppCover, text from the real
+   app_home row. The card's own border motion is the shared `.card`
+   transition; nothing here adds animation, so reduced-motion needs no
+   extra rule. */
 .apps-home .apps-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(min(290px, 100%), 1fr));
   gap: 1.25rem;
 }
 .apps-home .app-card {
+  position: relative;
   min-width: 0;
   overflow: hidden;
 }
 .apps-home .app-card:has(> a):hover {
   border-color: var(--color-ink-500);
 }
-.apps-home .app-card:has(a:focus-visible) {
+.apps-home .app-card:has(> .app-card-link:focus-visible) {
   outline: 2px solid var(--color-accent);
   outline-offset: 3px;
+}
+.apps-home .app-card-settings {
+  position: absolute;
+  top: 0.625rem;
+  right: 0.625rem;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--color-ink-500) 45%, transparent);
+  background: color-mix(in srgb, var(--color-ink-950) 62%, transparent);
+  color: var(--color-ink-200);
+  backdrop-filter: blur(6px);
+  transition: background-color .15s ease, border-color .15s ease, color .15s ease;
+}
+.apps-home .app-card-settings:hover {
+  border-color: var(--color-ink-300);
+  background: var(--color-ink-850);
+  color: var(--color-ink-100);
+}
+.apps-home .app-card-settings:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }
 .apps-home .app-card-link,
 .apps-home .app-card-link:hover {

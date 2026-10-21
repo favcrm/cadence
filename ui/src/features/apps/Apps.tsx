@@ -17,14 +17,14 @@ import type { Viewer } from "../projects/work";
 import { AppGlyph } from "../explorer/shared";
 import AppCover from "../explorer/AppCover";
 import PageState from "../../ui/PageState";
-import { IconApps, IconLock } from "../../ui/icons";
+import { IconApps, IconLock, IconSettings } from "../../ui/icons";
 import "../explorer/explorer.css";
 
 /**
  * The Apps home (CAD-1129, `/apps`): the OS-style landing — a Needs-
  * attention rail, the operator's/member's favorites row, the installed
- * grid and (operator) Recently removed. Cards open app details; Favorites
- * keep the canonical app page as the quick-open route.
+ * grid and (operator) Recently removed. Cards open the app itself;
+ * an operator's small settings action opens its Manage page.
  *
  * The legacy project-scoped list and the per-project catalog live
  * behind `/apps/<project>/<name>` (unchanged); this screen is the
@@ -147,19 +147,14 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
   };
 
   /**
-   * An installed card's one destination. A catalogue-backed install
-   * links to its catalogue detail (`/apps/catalog/<catalogue.id>`, the
-   * recorded locator, never a key guessed from the app name) pinned to
-   * this installation. An operator's non-catalogue install goes to the
-   * Manage detail, where access/update/remove and pin live. Everyone
-   * else keeps the canonical `/apps/<key>` open route — `null` means
-   * the card stays a readable tile instead of guessing a page.
+   * An installed card opens the app itself, not its store page: the
+   * canonical `/apps/<key>` route is the one destination for everyone.
+   * The operator's settings action — access, updates, remove — lives
+   * beside it on `/apps/manage/<install_id>`; members have no manage
+   * page, so they get no icon.
    */
-  const cardHref = (h: HomeInstallation): string | null => {
-    if (h.catalogue?.id) return `/apps/catalog/${encodeURIComponent(h.catalogue.id)}?installation=${encodeURIComponent(h.install_id)}`;
-    if (isOp) return `/apps/manage/${encodeURIComponent(h.install_id)}`;
-    return openHref(h);
-  };
+  const settingsHref = (h: HomeInstallation): string | null =>
+    isOp ? `/apps/manage/${encodeURIComponent(h.install_id)}` : null;
 
   const attentionRow = (h: HomeInstallation) => {
     const s = h.attention.state;
@@ -324,12 +319,14 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
                 <h2>{t("Installed")}</h2>
                 <span className="chip">{live.length}</span>
                 <span className="grow" />
-                <input className="field search" placeholder={t("Search your apps")} value={q} onChange={(e) => setQ(e.target.value)} aria-label={t("Search installed apps")} />
-                <select className="field sort" value={sort} onChange={(e) => setSort(e.target.value as typeof sort)} aria-label={t("Sort")}>
-                  <option value="recent">{t("Recently used")}</option>
-                  <option value="name">{t("Name")}</option>
-                  <option value="attention">{t("Needs attention first")}</option>
-                </select>
+                <div className="sec-tools">
+                  <input className="field search" placeholder={t("Search your apps")} value={q} onChange={(e) => setQ(e.target.value)} aria-label={t("Search installed apps")} />
+                  <select className="field sort" value={sort} onChange={(e) => setSort(e.target.value as typeof sort)} aria-label={t("Sort")}>
+                    <option value="recent">{t("Recently used")}</option>
+                    <option value="name">{t("Name")}</option>
+                    <option value="attention">{t("Needs attention first")}</option>
+                  </select>
+                </div>
               </div>
               {items.length === 0 ? (
                 <div className="card px-4 py-5 text-secondary text-ink-400">
@@ -339,7 +336,8 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
                 <div className="apps-grid">
                   {items.map((h) => (
                     <InstalledCard key={h.install_id} h={h}
-                      href={cardHref(h)}
+                      href={openHref(h)}
+                      settingsHref={settingsHref(h)}
                       onOpen={() => opened(h.install_id)} />
                   ))}
                 </div>
@@ -373,44 +371,50 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
           )}
         </>
       )}
-      <section className="sec" aria-label={t("Project apps")}>
-        <div className="sechead"><h2>{t("Project apps")}</h2>{projectApps.data && <span className="chip">{projectRows.length}</span>}</div>
-        <ResourceGate
-          state={projectApps}
-          loading={t("loading apps…")}
-          failed={t("could not load apps")}
-          onRetry={() => void resources.apps.invalidate()}
-        />
-        {projectApps.data && projectRows.length === 0 && (
-          <div className="apps-substate text-label text-ink-500">
-            <p>{t("No project apps installed")}.</p>
-            <details className="apps-substate-install">
-              <summary>{t("Install a project app")}</summary>
-              <code className="num text-ink-300">
-                cadence app install &lt;path|git-url&gt; --project &lt;key&gt;
-              </code>
-            </details>
-          </div>
-        )}
-        <ul className="space-y-2.5">
-          {projectRows.map((row, i) => (
-            <AppCard key={`${row.project}/${row.name ?? i}`} row={row} installs={installs} needs={needs} />
-          ))}
-        </ul>
-      </section>
+      {(projectApps.data === null || projectApps.error !== null || projectRows.length > 0 || isOp) && (
+        <section className="sec" aria-label={t("Project apps")}>
+          <div className="sechead"><h2>{t("Project apps")}</h2>{projectApps.data && <span className="chip">{projectRows.length}</span>}</div>
+          <ResourceGate
+            state={projectApps}
+            loading={t("loading apps…")}
+            failed={t("could not load apps")}
+            onRetry={() => void resources.apps.invalidate()}
+          />
+          {projectApps.data && projectRows.length === 0 && (
+            <div className="apps-substate text-label text-ink-500">
+              <p>{t("No project apps installed")}.</p>
+              <details className="apps-substate-install">
+                <summary>{t("Install a project app")}</summary>
+                <code className="num text-ink-300">
+                  cadence app install &lt;path|git-url&gt; --project &lt;key&gt;
+                </code>
+              </details>
+            </div>
+          )}
+          <ul className="space-y-2.5">
+            {projectRows.map((row, i) => (
+              <AppCard key={`${row.project}/${row.name ?? i}`} row={row} installs={installs} needs={needs} />
+            ))}
+          </ul>
+        </section>
+      )}
         </>
       )}
     </main>
   );
 }
 /**
- * One installed app's gallery card: the whole card is a single link
- * (no nested buttons or action links), named by its title and
- * described by its status. Catalogue/listing fields come from the
- * real `app_home` row — absent fields leave clean slots, never
- * fixture text.
+ * One installed app's gallery card: the card opens the app, and the
+ * operator's small settings action opens its Manage page. Catalogue/
+ * listing fields come from the real `app_home` row — absent fields
+ * leave clean slots, never fixture text.
  */
-function InstalledCard({ h, href, onOpen }: { h: HomeInstallation; href: string | null; onOpen: () => void }) {
+function InstalledCard({ h, href, settingsHref, onOpen }: {
+  h: HomeInstallation;
+  href: string | null;
+  settingsHref: string | null;
+  onOpen: () => void;
+}) {
   const t = useTranslate();
   const state = h.attention.state;
   const statusKey =
@@ -436,7 +440,7 @@ function InstalledCard({ h, href, onOpen }: { h: HomeInstallation; href: string 
         {publisher && <span className="card-publisher">{publisher}</span>}
         {h.project && <span className="card-publisher">{t("Project")}: {h.project}</span>}
         <div className="card-footer">
-          <span>{t("Installed")}{h.version ? <> <b>{h.version}</b></> : null}</span>
+          <span>{h.version ? <>{t("Version")} <b>{h.version}</b></> : t("Installed")}</span>
           <span className="app-status" id={statusId} data-state={tone}>{t(statusKey)}</span>
         </div>
       </div>
@@ -454,6 +458,12 @@ function InstalledCard({ h, href, onOpen }: { h: HomeInstallation; href: string 
           aria-labelledby={nameId} aria-describedby={statusId}
           onClick={onOpen}>
           {body}
+        </Link>
+      )}
+      {settingsHref !== null && (
+        <Link className="app-card-settings" href={settingsHref}
+          aria-label={`${t("Settings")} — ${h.title}`} title={t("Settings")}>
+          <IconSettings size={15} />
         </Link>
       )}
     </article>

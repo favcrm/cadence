@@ -330,14 +330,17 @@ under "Recently removed" for 30 days. Within that window
 consent for the same bytes. After the window it refuses: the install can only
 stay removed, and the page no longer offers Restore. Restore remains available
 in **Recently removed** on the Apps page and in historical Explorer details.
-Directory and installed-gallery cards are whole links without nested actions.
+Directory cards are whole links without nested actions. The installed
+gallery's cards open the app itself (`/apps/<key>`); an operator's small
+settings action on each card opens `/apps/manage/<id>`.
 
 ## Explorer routes
 
 In the board, `/apps` is the installed-app home, including Favorites and project
-apps. **Explore apps** opens the native directory at `/apps/explore`. Each whole
-card opens `/apps/catalog/<id>` with its overview, features, releases and workspace
-panel; installed cards carry the exact installation ID.
+apps. **Explore apps** opens the native directory at `/apps/explore`. Each
+directory card opens `/apps/catalog/<id>` with its overview, features, releases
+and workspace panel; installed-gallery cards open the app at `/apps/<key>`, with
+a small operator settings action to `/apps/manage/<id>`.
 
 A verified operator selects an immutable published release, chooses **Review
 installation** or **Review update**, reviews the checked package and access
