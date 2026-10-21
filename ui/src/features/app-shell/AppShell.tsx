@@ -612,6 +612,7 @@ export default function AppShell({
     // record link is unambiguous, so it resolves to that context.
     const soleContext = urlCtx === null && urlRecord !== null && !badRecord && activeIds.length === 1;
     const scopelessRecord = urlCtx === null && urlRecord !== null && !badRecord && !soleContext;
+    let legacyMismatch = false;
     if (staleCtx) {
       // The linked context died since the link was authored: adopt the
       // fallback (like returning to the app) and say so.
@@ -631,6 +632,7 @@ export default function AppShell({
       // authority, so a link cannot bind new work to a different one.
       const resolved = fallbackContext();
       adoptScope(resolved);
+      legacyMismatch = urlCtx !== resolved;
       setLinkNotice(
         urlCtx === resolved
           ? null
@@ -643,11 +645,11 @@ export default function AppShell({
     // keeps its `ctx` claim (writeQuery preserves it while a conversation
     // param exists) so the gate can verify or refuse it; everything else
     // loses its selector here.
-    if (badRecord || staleCtx || scopelessRecord || soleContext) {
+    if (badRecord || staleCtx || scopelessRecord || soleContext || legacyMismatch) {
       writeQuery(
         {
-          record: badRecord || staleCtx || scopelessRecord ? null : undefined,
-          appview: staleCtx ? null : undefined,
+          record: badRecord || staleCtx || scopelessRecord || legacyMismatch ? null : undefined,
+          appview: staleCtx || legacyMismatch ? null : undefined,
         },
         { replace: true },
       );
