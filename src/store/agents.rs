@@ -1131,9 +1131,41 @@ impl Store {
     /// reaching here). Returns the `reply_to` aliases a forced finish
     /// notified — the caller wakes them.
     pub fn remove_agent(&self, alias: &str, force: bool, by: &Value) -> Result<Vec<String>> {
+        self.remove_agent_with(alias, force, by, false)
+    }
+
+    /// CAD-804: a gc sweep's removal. Same row/history removal and caller
+    /// audit as [`Store::remove_agent`], but the shared gc predicate is
+    /// re-checked inside the same transaction, so an agent resumed, kept
+    /// or given work after the candidate snapshot is never deleted.
+    pub fn gc_remove_agent(&self, alias: &str, by: &Value) -> Result<Vec<String>> {
+        self.remove_agent_with(alias, false, by, true)
+    }
+
+    fn remove_agent_with(
+        &self,
+        alias: &str,
+        force: bool,
+        by: &Value,
+        gc: bool,
+    ) -> Result<Vec<String>> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let agent = self.agent_in(&tx, alias)?;
+            if gc {
+                let open_messages: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE alias=? AND source != 'topic_notice'
+                         AND state NOT IN ('completed','failed','interrupted','cancelled')",
+                    [alias],
+                    |r| r.get(0),
+                )?;
+                if !Self::gc_eligible(&agent, open_messages) {
+                    return Err(Error::rejected(format!(
+                        "Agent '{alias}' is no longer a gc candidate — it was resumed, \
+                         kept or given work"
+                    )));
+                }
+            }
             // Inbox rows own no process or pane — their pseudo-endpoint is
             // permanent, so neither gate applies to them.
             if registry::has_actor(&agent.provider, &agent.endpoint_kind) {

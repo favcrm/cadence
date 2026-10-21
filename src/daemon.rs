@@ -2850,6 +2850,11 @@ impl Shared {
                 let caller = self.agent_caller(peer_pid, "agent gc")?;
                 let audit = caller_audit(&caller);
                 let older_than = params.get("older_than").and_then(Value::as_f64);
+                let force = params
+                    .get("force")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                timers::require_agent_gc_floor(older_than, force)?;
                 let (candidates, not_permitted) = self.gc_partition(&caller, older_than)?;
                 let mut removed = Vec::new();
                 {
@@ -2861,7 +2866,7 @@ impl Shared {
                             continue;
                         }
                         // Open work refuses (CAD-284): skip, never force.
-                        if self.store.remove_agent(&agent.alias, false, &audit).is_ok() {
+                        if self.store.gc_remove_agent(&agent.alias, &audit).is_ok() {
                             // A fenced pty pane may still be alive — gc is
                             // the explicit kill; no orphan sessions behind
                             // dropped rows.
@@ -2892,6 +2897,11 @@ impl Shared {
                 reject_identity_fields(params, "agent gc")?;
                 let caller = self.agent_caller(peer_pid, "agent gc")?;
                 let older_than = params.get("older_than").and_then(Value::as_f64);
+                let force = params
+                    .get("force")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                timers::require_agent_gc_floor(older_than, force)?;
                 let (candidates, not_permitted, kept) = self.gc_plan(&caller, older_than)?;
                 Ok(json!({
                     "candidates": candidates,
@@ -9377,6 +9387,37 @@ mod agent_gc_timer {
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["alias"], "gone");
     }
+
+    #[test]
+    fn gc_floor_refuses_below_seven_days_without_force() {
+        assert!(super::timers::require_agent_gc_floor(Some(3600.0), false).is_err());
+        assert!(super::timers::require_agent_gc_floor(Some(3600.0), true).is_ok());
+        assert!(
+            super::timers::require_agent_gc_floor(Some(AGENT_GC_FLOOR_SECS as f64), false).is_ok()
+        );
+        assert!(super::timers::require_agent_gc_floor(None, false).is_ok());
+    }
+
+    #[test]
+    fn gc_keep_set_after_candidate_snapshot_blocks_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = pinned(dir.path(), AgentGcSetting::default());
+        stopped_row(&shared, dir.path(), "kept", 30.0);
+        let _ = shared.store.gc_candidates(Some(0.0)).unwrap();
+        shared
+            .store
+            .set_gc_keep_by("kept", true, &Value::Null)
+            .unwrap();
+        let err = shared
+            .store
+            .gc_remove_agent("kept", &Value::Null)
+            .expect_err("a keep set after the snapshot must block the delete");
+        assert!(
+            err.to_string().contains("no longer a gc candidate"),
+            "{err}"
+        );
+        assert!(shared.store.agent_opt("kept").unwrap().is_some());
+    }
 }
 
 #[cfg(test)]
@@ -9604,7 +9645,12 @@ mod auto_stop_timer {
             other => panic!("expected stop, got {other:?}"),
         }
         // Bookkeeping events never reset the idle clock; turn work does.
-        for passive in ["quota_updated", "params_updated", "stop_requested"] {
+        for passive in [
+            "quota_updated",
+            "params_updated",
+            "stop_requested",
+            "gc_keep_updated",
+        ] {
             shared.store.event_public("w1", passive, json!({})).unwrap();
         }
         assert!(matches!(

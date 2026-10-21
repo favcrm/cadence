@@ -70,8 +70,9 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// v49 (CAD-914) adds wiki transfer job tables. v50 (CAD-1482) adds image
 /// lineage. v51 (CAD-792) adds `app_run_artifact_fetches`, the worker
 /// dependency-fetch receipt. v52 (CAD-1548) adds `settings_authority`.
-/// None are latch or witness rows, so the bound extends to 52.
-const PROTECTED_SCHEMA_MAX: i64 = 52;
+/// v53 (CAD-804) adds `agents.gc_keep`; no latch or witness row changes, so
+/// the bound extends to 53.
+const PROTECTED_SCHEMA_MAX: i64 = 53;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must

@@ -2134,8 +2134,11 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
         // without the plan RPC falls back to the listing.
         match client::rpc(
             &opts.state_dir,
+            // Session end's 1h cleanup is an explicit override of the
+            // manual 7-day floor, like `agent gc --force`; the daemon
+            // refuses a below-floor request without it.
             "agent_gc_plan",
-            json!({"older_than": 3600}),
+            json!({"older_than": 3600, "force": true}),
         ) {
             Ok(plan) => {
                 let cands = plan_aliases(&plan["candidates"]);
@@ -2163,7 +2166,11 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
             }
         }
     } else {
-        match client::rpc(&opts.state_dir, "agent_gc", json!({"older_than": 3600})) {
+        match client::rpc(
+            &opts.state_dir,
+            "agent_gc",
+            json!({"older_than": 3600, "force": true}),
+        ) {
             Ok(v) => {
                 done.gc_removed = str_list(&v["removed"]);
                 gc_row = gc_not_permitted(
