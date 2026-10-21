@@ -702,7 +702,13 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                     )));
                 }
                 Ok(_) => {}
-                Err(error) if error.to_string().contains("Unknown managed agent") => {}
+                Err(error)
+                    if error.to_string().contains("Unknown managed agent")
+                        || error.to_string().contains("Daemon is not reachable") =>
+                {
+                    // No job and no live daemon: the ordinary dispatch path
+                    // will report the daemon failure at its own gate.
+                }
                 Err(error) => return Err(error),
             }
         }
