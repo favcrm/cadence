@@ -46,6 +46,24 @@ const asset = await receiver.asset("draft-image:d1:0");
 receiver.state(JSON.stringify(localDraft)); // ≤ 32 KiB
 ```
 
+Wire guarantees the receiver enforces (mirroring the Social Content
+reference receiver and `screenProtocol.ts`):
+
+- `call`/`slot`/`tool` and `asset` open only after a `screen.v2` PUSH; before
+  that, and on a v1-only mount, they reject with `ScreenClosedError`
+  (`code: "gone"`) instead of posting a request the host cannot answer.
+- `args`/`input` are plain objects within 16 KiB; `anchor` is exactly
+  `{x,y,w,h}` in frame coordinates (or `"footer"`); ids follow
+  `ACTION_ID`, tool aliases `TOOL_ALIAS`, `request_id` `TOOL_REQUEST_ID`.
+- The first accepted PUSH pins `v`/`install_id`/`digest`/`context_id`; any
+  later disagreement tears the port down.
+- Teardown rejects every outstanding request with `ScreenClosedError`, so no
+  caller is left pending on a dead mount.
+
+What stays app-owned: the closed verb set and per-verb arg shapes (the PUSH
+`actions` advertisement), payload validation in `onPush`, and which asset refs
+are legitimate.
+
 Defaults: `accepts: ["screen.v2"]`, `timeoutMs: 15000`, boot read from
 `#cadence-screen-boot`. A reply that is neither `ok` nor a well-formed
 `{code, text}` refusal rejects with `ScreenRefusalError` (status from

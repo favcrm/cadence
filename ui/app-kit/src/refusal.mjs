@@ -31,6 +31,18 @@ export class ScreenRefusalError extends Error {
   }
 }
 
+/** The port is closed: a refused mount, a torn-down identity, or a closed
+ *  action channel. `code: "gone"` is the child-side counterpart of the host's
+ *  refusal vocabulary; the app maps it to "reload the app", never to a retry. */
+export class ScreenClosedError extends Error {
+  constructor(message = "the screen bridge is closed") {
+    super(message);
+    this.name = "ScreenClosedError";
+    this.code = "gone";
+    this.status = 410;
+  }
+}
+
 export class ScreenTimeoutError extends Error {
   constructor(id, timeoutMs) {
     super(`no reply for ${id} within ${timeoutMs}ms`);

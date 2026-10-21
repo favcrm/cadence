@@ -2,6 +2,7 @@ import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import {
   MAX_STATE_BYTES,
+  ScreenClosedError,
   ScreenRefusalError,
   ScreenTimeoutError,
   createScreenReceiver,
@@ -124,7 +125,9 @@ test("an identity change on an accepted port tears down", async () => {
 });
 
 test("call resolves on a reply and maps a refusal to its status", async () => {
-  const { host, inbox, receiver } = connect();
+  const { host, inbox, pushes, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
   const ok = receiver.call("social.drafts.discard", { draft_id: "d1" });
   const request = await waitFor(() => inbox.find((m) => m.op === "call"), "the call");
   assert.deepEqual(
@@ -146,7 +149,9 @@ test("call resolves on a reply and maps a refusal to its status", async () => {
 });
 
 test("a tool request carries alias, input and request_id without a verb", async () => {
-  const { host, inbox, receiver } = connect();
+  const { host, inbox, pushes, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
   const pending = receiver.tool("social.publish", { draft: 1 }, "req-1");
   const request = await waitFor(() => inbox.find((m) => m.op === "tool"), "the tool request");
   assert.deepEqual(
@@ -158,7 +163,9 @@ test("a tool request carries alias, input and request_id without a verb", async 
 });
 
 test("a missing reply times out and rejects", async () => {
-  const { receiver } = connect({ timeoutMs: 20 });
+  const { host, pushes, receiver } = connect({ timeoutMs: 20 });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
   const pending = receiver.call("slow");
   await assert.rejects(pending, (error) => error instanceof ScreenTimeoutError && error.status === 504);
 });
@@ -186,8 +193,41 @@ test("an unknown op tears the port down", async () => {
 });
 
 test("teardown rejects pending work", async () => {
-  const { receiver } = connect({ timeoutMs: 1000 });
+  const { host, pushes, receiver } = connect({ timeoutMs: 1000 });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
   const pending = receiver.call("x");
   receiver.teardown();
   await assert.rejects(pending, /closed/);
+});
+
+test("the action channel is closed until a screen.v2 PUSH", async () => {
+  const { receiver } = connect();
+  await assert.rejects(receiver.call("read.run", {}), (error) => {
+    assert.ok(error instanceof ScreenClosedError);
+    assert.equal(error.code, "gone");
+    assert.match(error.message, /screen\.v2 PUSH/);
+    return true;
+  });
+  await assert.rejects(receiver.asset("media:1"), (error) => error instanceof ScreenClosedError);
+});
+
+test("a v1-only receiver refuses the v2 action channel", async () => {
+  const { host, pushes, receiver } = connect({ accepts: ["screen.v1"] });
+  host.postMessage(push({ v: 1 }));
+  await waitFor(() => pushes.length === 1, "the v1 push");
+  await assert.rejects(receiver.call("read.run", {}), (error) => error.code === "gone");
+});
+
+test("request shapes are bounded at send time", async () => {
+  const { host, inbox, pushes, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  await assert.rejects(receiver.call("read.run", "not-an-object"), /plain object/);
+  await assert.rejects(receiver.call("read.run", { blob: "x".repeat(16 * 1024) }), /16 KiB/);
+  await assert.rejects(receiver.slot("publish.cancel", {}, { x: 0, y: 0, w: 12 }), /anchor/);
+  await assert.rejects(receiver.slot("publish.cancel", {}, { x: -1, y: 0, w: 12, h: 4 }), /anchor/);
+  await assert.rejects(receiver.tool("Social.Publish", {}, "req-1"), /alias/);
+  await assert.rejects(receiver.tool("social.publish", {}, "bad id"), /request_id/);
+  assert.equal(inbox.filter((m) => m.op === "call" || m.op === "slot" || m.op === "tool").length, 0);
 });

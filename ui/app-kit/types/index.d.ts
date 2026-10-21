@@ -50,6 +50,13 @@ export declare class ScreenRefusalError extends Error {
   constructor(refusal: { code?: string; text?: string }, statuses?: Record<string, number>);
 }
 
+export declare class ScreenClosedError extends Error {
+  name: "ScreenClosedError";
+  code: "gone";
+  status: 410;
+  constructor(message?: string);
+}
+
 export declare class ScreenTimeoutError extends Error {
   name: "ScreenTimeoutError";
   code: "timeout";

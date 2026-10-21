@@ -12,7 +12,7 @@
  * `ui/src/features/workspace-apps/screen/screenProtocol.ts`; this module
  * follows that document, it does not extend it.
  */
-import { ScreenRefusalError, ScreenTimeoutError, readRefusal } from "./refusal.mjs";
+import { ScreenClosedError, ScreenRefusalError, ScreenTimeoutError, readRefusal } from "./refusal.mjs";
 
 export const MAX_STATE_BYTES = 32 * 1024;
 export const MAX_ASSET_BYTES = 2 * 1024 * 1024;
@@ -22,7 +22,14 @@ const BOOT_ID = "cadence-screen-boot";
 const BOOT_KEYS = ["bridge_nonce", "generation", "parent_origin", "tag"];
 const TAG = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const NONCE = /^[0-9a-f]{64}$/;
-const NAME = /^[A-Za-z0-9._:-]{1,128}$/;
+// Wire bounds from `screenProtocol.ts`: ACTION_ID, TOOL_ALIAS,
+// TOOL_REQUEST_ID, ACTION_ARGS_BYTES and COORD_MAX. The receiver enforces the
+// shape; which verbs an app may send stays the app's closed set.
+const ACTION_ID = /^[A-Za-z0-9_-]{1,64}$/;
+const TOOL_ALIAS = /^[a-z][a-z0-9]{0,31}(\.[a-z][a-z0-9]{0,31}){0,3}$/;
+const TOOL_REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+const ACTION_ARGS_BYTES = 16 * 1024;
+const COORD_MAX = 16384;
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
 function fail(message) {
@@ -69,6 +76,30 @@ export function readBoot(documentRef = globalThis.document) {
     fail(`#${BOOT_ID} is not JSON`);
   }
   return validateBoot(parsed);
+}
+
+const isPlain = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+
+/** A plain-object args bag within the host's byte bound, or `null`. */
+function validArgs(args) {
+  if (!isPlain(args)) return null;
+  let text;
+  try {
+    text = JSON.stringify(args);
+  } catch {
+    return null;
+  }
+  return text !== undefined && byteLength(text) <= ACTION_ARGS_BYTES ? args : null;
+}
+
+/** `"footer"` or an exact `{x,y,w,h}` rect inside the frame coordinates. */
+function validAnchor(anchor) {
+  if (anchor === "footer") return anchor;
+  if (!isPlain(anchor) || Object.keys(anchor).sort().join() !== "h,w,x,y") return null;
+  const ok = [anchor.x, anchor.y, anchor.w, anchor.h].every(
+    (n) => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= COORD_MAX,
+  );
+  return ok && anchor.w > 0 && anchor.h > 0 ? anchor : null;
 }
 
 function byteLength(value) {
@@ -142,6 +173,7 @@ export function createScreenReceiver(options = {}) {
   let tornDown = false;
   let accepted = false;
   let locked = null;
+  let liveV2 = false;
   let seq = 0;
 
   const close = (reason, notify) => {
@@ -156,7 +188,7 @@ export function createScreenReceiver(options = {}) {
     }
     for (const entry of pending.values()) {
       clearTimeout(entry.timer);
-      entry.reject(new Error(`screen bridge closed: ${reason}`));
+      entry.reject(new ScreenClosedError(`screen bridge closed: ${reason}`));
     }
     pending.clear();
     for (const resolve of assets.values()) resolve.fail?.(new Error(`screen bridge closed: ${reason}`));
@@ -170,8 +202,12 @@ export function createScreenReceiver(options = {}) {
   };
 
   const request = (kind, body) => {
-    if (tornDown) return Promise.reject(new Error("screen bridge is closed"));
+    if (tornDown) return Promise.reject(new ScreenClosedError("screen bridge is closed"));
+    if (!liveV2) {
+      return Promise.reject(new ScreenClosedError("the action channel opens only after a screen.v2 PUSH"));
+    }
     const id = `${kind}-${++seq}`;
+    if (!ACTION_ID.test(id)) return Promise.reject(new TypeError("request id exceeds the wire bound"));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pending.delete(id);
@@ -236,6 +272,7 @@ export function createScreenReceiver(options = {}) {
       if (message.tag !== boot.tag) fail("PUSH tag mismatch");
       if (message.v !== 1 && message.v !== 2) fail("unsupported PUSH version");
       if (!accepts.includes(`screen.v${message.v}`)) fail(`PUSH v${message.v} is not accepted`);
+      liveV2 = message.v === 2;
       const identity = Object.fromEntries(identityKeys.map((key) => [key, message[key]]));
       if (locked && identityKeys.some((key) => identity[key] !== locked[key])) {
         fail("identity/scope mismatch on an accepted port");
@@ -265,11 +302,36 @@ export function createScreenReceiver(options = {}) {
   return Object.freeze({
     boot,
     accepted: () => accepted,
-    call: (verb, args = {}) => request("call", { verb, args }),
-    slot: (verb, args = {}, anchor = {}) => request("slot", { verb, args, anchor }),
-    tool: (alias, input = {}, requestId) => {
-      if (typeof requestId !== "string" || !NAME.test(requestId)) {
-        return Promise.reject(new TypeError("tool request_id is required"));
+    call(verb, args = {}) {
+      if (typeof verb !== "string" || verb.length === 0 || verb.length > 128) {
+        return Promise.reject(new TypeError("verb must be a non-empty string of at most 128 characters"));
+      }
+      if (validArgs(args) === null) {
+        return Promise.reject(new TypeError("args must be a plain object within 16 KiB"));
+      }
+      return request("call", { verb, args });
+    },
+    slot(verb, args = {}, anchor = {}) {
+      if (typeof verb !== "string" || verb.length === 0 || verb.length > 128) {
+        return Promise.reject(new TypeError("verb must be a non-empty string of at most 128 characters"));
+      }
+      if (validArgs(args) === null) {
+        return Promise.reject(new TypeError("args must be a plain object within 16 KiB"));
+      }
+      if (validAnchor(anchor) === null) {
+        return Promise.reject(new TypeError('anchor must be "footer" or exactly {x,y,w,h}'));
+      }
+      return request("slot", { verb, args, anchor });
+    },
+    tool(alias, input = {}, requestId) {
+      if (typeof alias !== "string" || !TOOL_ALIAS.test(alias)) {
+        return Promise.reject(new TypeError("tool alias is malformed"));
+      }
+      if (validArgs(input) === null) {
+        return Promise.reject(new TypeError("input must be a plain object within 16 KiB"));
+      }
+      if (typeof requestId !== "string" || !TOOL_REQUEST_ID.test(requestId)) {
+        return Promise.reject(new TypeError("tool request_id is required and bounded"));
       }
       return request("tool", { alias, input, request_id: requestId });
     },
@@ -277,7 +339,8 @@ export function createScreenReceiver(options = {}) {
       if (typeof ref !== "string" || ref.length === 0 || ref.length > 512) {
         return Promise.reject(new TypeError("asset ref must be a non-empty string"));
       }
-      if (tornDown) return Promise.reject(new Error("screen bridge is closed"));
+      if (tornDown) return Promise.reject(new ScreenClosedError("screen bridge is closed"));
+      if (!liveV2) return Promise.reject(new ScreenClosedError("assets require a screen.v2 PUSH"));
       if (assets.has(ref)) return Promise.reject(new Error(`asset ${ref} is already pending`));
       return new Promise((resolve, reject) => {
         assets.set(ref, { resolve, fail: reject });

@@ -6,4 +6,4 @@ export {
   MAX_ASSET_BYTES,
   MAX_STATE_BYTES,
 } from "./receiver.mjs";
-export { REFUSAL_STATUS, ScreenRefusalError, ScreenTimeoutError, readRefusal } from "./refusal.mjs";
+export { REFUSAL_STATUS, ScreenClosedError, ScreenRefusalError, ScreenTimeoutError, readRefusal } from "./refusal.mjs";
