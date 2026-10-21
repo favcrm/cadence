@@ -606,6 +606,7 @@ export default function AppShell({
       }
     }
     const staleCtx = urlCtx !== null && !activeIds.includes(urlCtx);
+    const hasConversationLink = query.getAll("conversation").length > 0;
     // Single-company mode: with exactly one active context a scopeless
     // record link is unambiguous, so it resolves to that context.
     const soleContext = urlCtx === null && urlRecord !== null && !badRecord && activeIds.length === 1;
@@ -640,7 +641,11 @@ export default function AppShell({
     // handled mark leaves the surviving ctx adoptable on the next
     // pass — but adoption already ran on it above, so no second
     // effect turn is needed and the URL settles in a single replace.
+    // A conversation link whose context is no longer active keeps its
+    // `ctx` so the conversation gate can refuse it visibly. Stripping it
+    // here would turn the rejected link into an unscoped request.
     if (badRecord || staleCtx || scopelessRecord || soleContext) {
+      if (staleCtx && hasConversationLink) return;
       writeQuery(
         {
           record: badRecord || staleCtx || scopelessRecord ? null : undefined,
