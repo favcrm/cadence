@@ -203,7 +203,10 @@ export function createScreenReceiver(options = {}) {
   let locked = null;
   let liveV2 = false;
   let seq = 0;
-  let toolsInFlight = 0;
+  // The host closes a mount that starts a second tool while one is running.
+  // A local timeout does not cancel the host invocation, so busy survives it
+  // until the host's reply (even a late one) or teardown.
+  let toolBusy = false;
 
   const close = (reason, notify) => {
     if (tornDown) return;
@@ -258,11 +261,16 @@ export function createScreenReceiver(options = {}) {
 
   const settle = (message) => {
     const entry = pending.get(message.id);
-    if (!entry) return sent.has(message.id); // a late reply is ignored, not fatal
+    if (!entry) {
+      if (message.v !== 2) throw new Error(`${message.op} must be v2`);
+      if (message.op === "tool-reply") toolBusy = false;
+      return sent.has(message.id); // a late reply is ignored, not fatal
+    }
     if (message.v !== 2) throw new Error(`${message.op} must be v2`);
     if (message.op !== expectedOp[entry.kind]) {
       throw new Error(`${entry.kind} answered with ${message.op}`);
     }
+    if (message.op === "tool-reply") toolBusy = false;
     if (message.op === "slot-state") {
       // A slot is a host-drawn control: `pending` is progress, not a result.
       // Keep the request open (and stop its clock) until `done`/`refused` so
@@ -387,13 +395,18 @@ export function createScreenReceiver(options = {}) {
       }
       // The host closes the mount on a second concurrent tool call; refuse
       // locally instead of destroying the channel.
-      if (toolsInFlight > 0) {
+      if (toolBusy) {
         return Promise.reject(new ScreenRefusalError({ code: "conflict", text: "Another tool call is already running." }));
       }
-      toolsInFlight += 1;
-      return request("tool", { alias, input, request_id: requestId }).finally(() => {
-        toolsInFlight -= 1;
+      toolBusy = true;
+      const pendingTool = request("tool", { alias, input, request_id: requestId });
+      // A host reply settles busy in `settle`. A local timeout must NOT:
+      // the host may still be running the tool. Any other local rejection
+      // means nothing was posted, so release the gate.
+      pendingTool.catch((error) => {
+        if (!(error instanceof ScreenTimeoutError)) toolBusy = false;
       });
+      return pendingTool;
     },
     asset(ref) {
       if (typeof ref !== "string" || ref.length === 0 || ref.length > 512) {

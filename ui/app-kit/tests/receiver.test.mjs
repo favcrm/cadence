@@ -392,3 +392,24 @@ test("an oversized asset data URL tears down", async () => {
   await waitFor(() => errors.length === 1, "the bound teardown");
   await rejected;
 });
+
+test("a timed-out tool keeps the channel busy until the host replies", async () => {
+  const { host, inbox, pushes, receiver } = connect({ accepts: ["screen.v2", "screen-actions.v1"], timeoutMs: 20 });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const first = receiver.tool("social.publish", {}, "req-1");
+  const request = await waitFor(() => inbox.find((m) => m.op === "tool"), "the first tool request");
+  await assert.rejects(first, ScreenTimeoutError);
+  await assert.rejects(receiver.tool("social.publish", {}, "req-2"), (error) => {
+    assert.ok(error instanceof ScreenRefusalError);
+    assert.equal(error.code, "conflict");
+    return true;
+  });
+  assert.equal(inbox.filter((m) => m.op === "tool").length, 1);
+  host.postMessage({ v: 2, op: "tool-reply", id: request.id, ok: true, data: { accepted: true } });
+  await tick();
+  const third = receiver.tool("social.publish", {}, "req-3");
+  const next = await waitFor(() => inbox.filter((m) => m.op === "tool").at(-1) !== request ? inbox.filter((m) => m.op === "tool").at(-1) : null, "the third tool request");
+  host.postMessage({ v: 2, op: "tool-reply", id: next.id, ok: true, data: {} });
+  await third;
+});

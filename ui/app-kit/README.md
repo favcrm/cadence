@@ -55,7 +55,9 @@ reference receiver and `screenProtocol.ts`):
 - `tool` additionally requires `accepts` to include `screen-actions.v1`; the
   host closes a port that sends a tool call without the negotiation. One tool
   call is outstanding at a time — a second is refused locally with
-  `conflict` (the host closes the mount on concurrent tool calls).
+  `conflict` (the host closes the mount on concurrent tool calls). A local
+  timeout does not cancel the host invocation, so the gate stays closed until
+  the host's reply (even a late one) or teardown.
 - A v1-only mount sends the bare `{op:"ready"}` envelope; `screen.v1` is a
   local PUSH filter, never a name on the wire (the host refuses it).
 - A slot's `pending` event arrives through `onSlotState` and leaves the
