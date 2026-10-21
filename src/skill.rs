@@ -74,7 +74,58 @@ const COMPANY_OUTPUTS: BundledSkill = BundledSkill {
     ],
 };
 
-pub const SKILL_NAMES: [&str; 3] = [CADENCE.name, BUSINESS_DOCUMENTS.name, COMPANY_OUTPUTS.name];
+const WEBSITE_BUILDER: BundledSkill = BundledSkill {
+    name: "website-builder",
+    files: &[
+        (
+            "playbook.md",
+            include_str!("../skills/website-builder/playbook.md"),
+        ),
+        (
+            "state.schema.json",
+            include_str!("../skills/website-builder/state.schema.json"),
+        ),
+        (
+            "references/site-spec.md",
+            include_str!("../skills/website-builder/references/site-spec.md"),
+        ),
+        (
+            "scripts/build.py",
+            include_str!("../skills/website-builder/scripts/build.py"),
+        ),
+        (
+            "scripts/check.py",
+            include_str!("../skills/website-builder/scripts/check.py"),
+        ),
+        (
+            "scripts/common.py",
+            include_str!("../skills/website-builder/scripts/common.py"),
+        ),
+        (
+            "scripts/next.py",
+            include_str!("../skills/website-builder/scripts/next.py"),
+        ),
+        (
+            "scripts/selftest.py",
+            include_str!("../skills/website-builder/scripts/selftest.py"),
+        ),
+        (
+            "scripts/submit.py",
+            include_str!("../skills/website-builder/scripts/submit.py"),
+        ),
+        (
+            "SKILL.md",
+            include_str!("../skills/website-builder/SKILL.md"),
+        ),
+    ],
+};
+
+pub const SKILL_NAMES: [&str; 4] = [
+    CADENCE.name,
+    BUSINESS_DOCUMENTS.name,
+    COMPANY_OUTPUTS.name,
+    WEBSITE_BUILDER.name,
+];
 
 /// Provider skill directories that receive links to each selected bundle.
 const LINK_PARENTS: [&str; 3] = [".claude/skills", ".cursor/skills", ".copilot/skills"];
@@ -98,10 +149,16 @@ fn link_state(link: &Path, target: &Path) -> &'static str {
 
 fn selected(target: Option<&str>) -> Result<&'static [BundledSkill]> {
     match target {
-        None => Ok(&[CADENCE, BUSINESS_DOCUMENTS, COMPANY_OUTPUTS]),
+        None => Ok(&[
+            CADENCE,
+            BUSINESS_DOCUMENTS,
+            COMPANY_OUTPUTS,
+            WEBSITE_BUILDER,
+        ]),
         Some("cadence") => Ok(&[CADENCE]),
         Some("business-documents") => Ok(&[BUSINESS_DOCUMENTS]),
         Some("company-outputs") => Ok(&[BUSINESS_DOCUMENTS, COMPANY_OUTPUTS]),
+        Some("website-builder") => Ok(&[WEBSITE_BUILDER]),
         Some(name) => Err(Error::rejected(format!(
             "unknown bundled skill {name:?}; expected {}",
             SKILL_NAMES.join(", ")
@@ -198,6 +255,40 @@ where
         }),
         wrote,
     ))
+}
+
+/// Read-only view of one bundled skill. Without `file`, the JSON manifest
+/// lists every bundled file with its byte count. With `file`, that file's
+/// exact embedded text. Nothing is written; an unknown skill or file is
+/// refused.
+pub enum ShowOutput {
+    Manifest(Value),
+    File(&'static str),
+}
+
+pub fn show(name: &str, file: Option<&str>) -> Result<ShowOutput> {
+    let skill = selected(Some(name))?
+        .first()
+        .ok_or_else(|| Error::rejected(format!("unknown bundled skill {name:?}")))?;
+    match file {
+        None => Ok(ShowOutput::Manifest(json!({
+            "name": skill.name,
+            "path": format!("skills/{}", skill.name),
+            "files": skill
+                .files
+                .iter()
+                .map(|(path, content)| json!({"path": path, "bytes": content.len()}))
+                .collect::<Vec<_>>(),
+        }))),
+        Some(file) => skill
+            .files
+            .iter()
+            .find(|(path, _)| *path == file)
+            .map(|(_, content)| ShowOutput::File(content))
+            .ok_or_else(|| {
+                Error::rejected(format!("unknown file {file:?} in bundled skill {name:?}"))
+            }),
+    }
 }
 
 /// Inspect every expected file and provider link without changing anything.
@@ -627,5 +718,52 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("foreign"));
+    }
+
+    #[test]
+    fn website_builder_selects_only_its_own_bundle() {
+        let only = selected(Some("website-builder")).unwrap();
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].name, "website-builder");
+        assert!(SKILL_NAMES.contains(&"website-builder"));
+    }
+
+    #[test]
+    fn website_builder_install_writes_all_ten_files_then_second_sync_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = sync(dir.path(), true, Some("website-builder")).unwrap();
+        assert_eq!(first["wrote"], true);
+        let root = canonical_root(dir.path()).join("website-builder");
+        for (path, _) in WEBSITE_BUILDER.files {
+            assert!(root.join(path).is_file(), "missing {path}");
+        }
+        assert_eq!(WEBSITE_BUILDER.files.len(), 10);
+
+        let second = sync(dir.path(), false, Some("website-builder")).unwrap();
+        assert_eq!(second["wrote"], false);
+    }
+
+    #[test]
+    fn skill_show_lists_manifest_with_byte_counts_and_refuses_unknown_file() {
+        let manifest = match show("website-builder", None).unwrap() {
+            ShowOutput::Manifest(value) => value,
+            ShowOutput::File(_) => panic!("manifest expected"),
+        };
+        assert_eq!(manifest["name"], "website-builder");
+        let files = manifest["files"].as_array().unwrap();
+        assert_eq!(files.len(), 10);
+        for row in files {
+            assert!(row["bytes"].as_u64().unwrap() > 0);
+        }
+        match show("website-builder", Some("scripts/next.py")).unwrap() {
+            ShowOutput::File(text) => assert_eq!(
+                text,
+                include_str!("../skills/website-builder/scripts/next.py")
+            ),
+            ShowOutput::Manifest(_) => panic!("file expected"),
+        }
+        let refused = show("website-builder", Some("../../etc/passwd"));
+        assert!(refused.is_err());
+        assert!(show("no-such-skill", None).is_err());
     }
 }
