@@ -1269,13 +1269,15 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      # install.sh is published as a release asset; ui/package.json is read
-      # only as pin data. No repository code runs in this privileged job.
+      # install.sh is published as a release asset; ui/package.json and
+      # ui/app-kit are read only as pin data. No repository code runs in this
+      # privileged job; the guard hashes the vendored receiver bytes.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           sparse-checkout: |
             scripts/install.sh
             ui/package.json
+            ui/app-kit/
           sparse-checkout-cone-mode: false
           path: src
           persist-credentials: false
