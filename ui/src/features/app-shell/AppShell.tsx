@@ -450,11 +450,11 @@ export default function AppShell({
     };
   }, [installId, receiptKey, screenViewer]);
 
-  // CAD-1519: an app with a mountable screen and no active context gets its
-  // General context on the operator's first open (Social Content owns its
-  // own contexts). The setup is retriable in place; the request identity
-  // is installation-stable and its result is adopted only while this
-  // verified receipt is still current.
+  // CAD-1519/CAD-1702: an app that mounts a screen (including Social's
+  // native workspace) and has no active context gets its General context on
+  // the operator's first open. The setup is retriable in place; the request
+  // identity is installation-stable and its result is adopted only while
+  // this verified receipt is still current.
   useEffect(() => {
     if (
       !receiptReady ||
@@ -465,24 +465,33 @@ export default function AppShell({
     ) return;
     let current = true;
     const isCurrent = () => current && currentReceiptKeyRef.current === receiptKey;
-    setGeneralSetup({ key: setupScopeKey, error: null });
-    workspaceApps.createContext(installId, {
-      label: "General",
-      input_defaults: {},
-      request_id: `general-${installId}`,
-    }).then((created) => {
-      const row = created && created.install_id === installId && typeof created.id === "string" && created.state === "active"
+    const create = (requestId: string) =>
+      workspaceApps.createContext(installId, {
+        label: "General",
+        input_defaults: {},
+        request_id: requestId,
+      });
+    const activeRow = (created: AppContext | null | undefined) =>
+      created && created.install_id === installId && typeof created.id === "string" && created.state === "active"
         ? created
         : null;
-      if (!isCurrent()) return;
-      if (row === null) {
-        setGeneralSetup({ key: setupScopeKey, error: "App setup did not return an active context. Retry setup or ask an administrator to review this installation." });
-        return;
-      }
-      handledQuery.current = undefined;
-      setContexts((previous) => previous.some((context) => context.id === row.id) ? previous : [...previous, row]);
-      setGeneralSetup(null);
-    }).catch((error: unknown) => {
+    setGeneralSetup({ key: setupScopeKey, error: null });
+    create(`general-${installId}`)
+      .then(async (created) => {
+        let row = activeRow(created);
+        // A replayed installation-stable request id can resolve to an
+        // archived context (the earlier setup was retired). Converge on a
+        // fresh active context instead of failing this install forever.
+        if (row === null) row = activeRow(await create(`general-${installId}-${crypto.randomUUID()}`));
+        if (!isCurrent()) return;
+        if (row === null) {
+          setGeneralSetup({ key: setupScopeKey, error: "App setup did not return an active context. Retry setup or ask an administrator to review this installation." });
+          return;
+        }
+        handledQuery.current = undefined;
+        setContexts((previous) => previous.some((context) => context.id === row.id) ? previous : [...previous, row]);
+        setGeneralSetup(null);
+      }).catch((error: unknown) => {
       if (!isCurrent()) return;
       setGeneralSetup({
         key: setupScopeKey,
@@ -1108,10 +1117,14 @@ export function chatBinding({ installId, wanted, known, activeIds }: {
   return { scope: { install_id: installId, context_id: wanted }, error: null };
 }
 
-/** The apps the shell sets up a General context for: an approved,
- *  executable, installed screen it can mount (Social Content owns its own). */
+/** The apps the shell sets up a General context for: an installation that
+ *  mounts a screen (portable or Social's native workspace) and has none. */
 function wantsGeneralContext(installation: Installation | null): installation is Installation {
-  return installation !== null && installation.removed == null && !isSocialContent(installation) && screenTag(installation) !== null;
+  return (
+    installation !== null &&
+    installation.removed == null &&
+    (isSocialContent(installation) || screenTag(installation) !== null)
+  );
 }
 
 function contextLabel(contexts: AppContext[], contextId: string): string | null {

@@ -157,6 +157,10 @@ const generic = {
   storage_kind: "workspace", files: [], capabilities: null, connection_slots: [],
 };
 const social = { ...generic, install_id: "install-social", title: "Social Content", name: "social-content" };
+// A Social install with no contexts at all: the screen mounts, but every
+// social source action needs a mounted active context (CAD-1702).
+const socialZero = { ...generic, install_id: "install-social-zero", title: "Social Content", name: "social-content" };
+const socialZeroContexts: Array<Record<string, unknown>> = [];
 const second = { ...generic, install_id: "install-second", title: "Second", name: "reports" };
 const crm = { ...generic, install_id: "install-crm", title: "CRM", name: "crm" };
 // A CRM install with two active scopes: its scopeless record link is
@@ -199,12 +203,27 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
   }
   if (init?.method === "POST") {
-    posts.push({ path, body: JSON.parse(String(init.body)) });
+    const body = JSON.parse(String(init.body));
+    posts.push({ path, body });
+    if (path === "/api/app-installations/install-social-zero/contexts") {
+      const row = {
+        id: "ctx-general",
+        install_id: "install-social-zero",
+        revision: 1,
+        state: "active",
+        digest: "cg",
+        config: { schema: 1, label: body.label, input_defaults: {} },
+      };
+      socialZeroContexts.push(row);
+      return json({ context: row });
+    }
     return json({ ok: true });
   }
   if (path === "/api/app-installations/install-shell") return json(generic);
   if (path === "/api/app-installations/install-second") return json(second);
   if (path === "/api/app-installations/install-social") return json(social);
+  if (path === "/api/app-installations/install-social-zero") return json(socialZero);
+  if (path === "/api/app-installations/install-social-zero/contexts") return json({ contexts: socialZeroContexts });
   if (path === "/api/app-installations/install-shell/contexts") return json(contextsFor["install-shell"]);
   if (path === "/api/app-installations/install-second/contexts") return json(contextsFor["install-second"]);
   if (path === "/api/app-installations/install-social/contexts") return json(contextsFor["install-social"]);
@@ -403,6 +422,26 @@ await flush();
 const socialPost = posts.find((p) => p.path === "/api/threads/master/messages");
 assert(socialPost, "social chat send posted");
 equal(socialPost?.body.app, { install_id: "install-social", context_id: "ctx-brand" }, "send binds the one active context, never a remembered id");
+// CAD-1702: a zero-context Social install gets its General context on open;
+// the mount and the send use it instead of an empty scope. Without the fix
+// no create is posted and the send binds no context.
+socialZeroContexts.length = 0;
+posts.length = 0;
+await React.act(async () => {
+  root.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, { installId: "install-social-zero", viewer: { operator: true, readOnly: false } })));
+});
+await settle(() => assert(socialZeroContexts.length === 1, "zero-context Social creates its General context"));
+const zeroCreate = posts.find((p) => p.path === "/api/app-installations/install-social-zero/contexts");
+assert(zeroCreate, "General context create posted");
+equal(zeroCreate?.body.label, "General", "the created context is General");
+await settle(() => assert(readScopes().includes("ctx-general"), "the created context becomes the scope"));
+posts.length = 0;
+await fill("#app-shell-chat-box", "zero context social");
+await click(host.querySelector(".app-chat-form button[type=submit]"));
+await flush();
+const zeroPost = posts.find((p) => p.path === "/api/threads/master/messages");
+assert(zeroPost, "zero-context social send posted");
+equal(zeroPost?.body.app, { install_id: "install-social-zero", context_id: "ctx-general" }, "send binds the created context, not an empty scope");
 // Installation switch: the next install sends its own sole context.
 reads.length = 0;
 await React.act(async () => {

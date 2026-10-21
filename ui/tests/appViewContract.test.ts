@@ -337,7 +337,9 @@ globalThis.fetch = (async (input: unknown) => {
   const url = String(input);
   if (new URL(url, "http://localhost").pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
   if (url.endsWith("/conversations")) return new Response("{}", { status: 404 });
-  const receipt = url.endsWith("/contexts") ? { contexts: [] }
+  const receipt = url === "/api/app-installations/install-b/contexts"
+    ? { contexts: [{ id: "ctx-b", install_id: "install-b", revision: 1, state: "active", digest: "cb", config: { schema: 1, label: "General", input_defaults: {} } }] }
+    : url.endsWith("/contexts") ? { contexts: [] }
     : url.startsWith("/api/threads/master") ? { entries: [], more_before: false }
     : url === "/api/app-installations/install-a" ? { ...shellBase, install_id: "install-a" }
     : url === "/api/app-installations/install-b" ? { ...shellBase, install_id: "install-b", name: "social-content", title: "Social Content" }
