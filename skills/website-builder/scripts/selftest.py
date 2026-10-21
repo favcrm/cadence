@@ -116,11 +116,16 @@ def build_and_check(root, run):
     return out_a
 
 
-class FormlessHandler(SimpleHTTPRequestHandler):
-    """Serves files; answers POST with 405 as a host with no form route does."""
+class FormHandler(SimpleHTTPRequestHandler):
+    """Serves files; answers POST with the configured form status."""
+
+    form_status = 405
+    posted = []
 
     def do_POST(self):
-        self.send_response(405)
+        length = int(self.headers.get("content-length") or 0)
+        FormHandler.posted.append(self.rfile.read(length))
+        self.send_response(FormHandler.form_status)
         self.send_header("content-length", "0")
         self.end_headers()
 
@@ -131,7 +136,9 @@ class FormlessHandler(SimpleHTTPRequestHandler):
 
 
 def check_fixture(root, dist):
-    handler = partial(FormlessHandler, directory=dist)
+    FormHandler.form_status = 405
+    FormHandler.posted = []
+    handler = partial(FormHandler, directory=dist)
     server = HTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -142,6 +149,8 @@ def check_fixture(root, dist):
         body = parse(result)
         expect("check reports 200 and matching bytes", body["status"] == 200 and body["bytes_match"] is True)
         expect("check maps 405 form probe to not_available", body["form"] == "not_available")
+        probe = FormHandler.posted[-1] if FormHandler.posted else b""
+        expect("form probe carries the honeypot", b'"_hp"' in probe)
         expect("check reads the CSP header", body["csp"] == "default-src 'self'")
         expect("check reads nosniff", body["nosniff"] is True)
         expect("check exits 0 when served and matching", result.returncode == 0)
@@ -153,6 +162,11 @@ def check_fixture(root, dist):
         expect("check exits 1 when bytes differ", off.returncode == 1 and parse(off)["bytes_match"] is False)
         bad = script("check.py", "--run", run, "--url", "http://127.0.0.1:1", "--dist", dist)
         expect("check exits 1 when unreachable", bad.returncode == 1)
+        FormHandler.form_status = 201
+        live = script("check.py", "--run", run, "--url", url, "--dist", dist)
+        expect("check maps 201 form probe to available", parse(live)["form"] == "available")
+        expect("check accepts an explicit form key", script(
+            "check.py", "--run", run, "--url", url, "--dist", dist, "--form", "contact").returncode == 0)
     finally:
         server.shutdown()
         server.server_close()
