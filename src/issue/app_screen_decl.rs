@@ -267,6 +267,26 @@ pub enum ScreenOperation {
     WhatsappDraftShow,
     #[serde(rename = "whatsapp.draft.discard")]
     WhatsappDraftDiscard,
+    // CAD-1662: Works content. A closed CALL set plus two host-confirmed
+    // SLOT operations (review decision and export receipt).
+    #[serde(rename = "works.query")]
+    WorksQuery,
+    #[serde(rename = "works.get")]
+    WorksGet,
+    #[serde(rename = "works.create")]
+    WorksCreate,
+    #[serde(rename = "works.patch")]
+    WorksPatch,
+    #[serde(rename = "works.trash")]
+    WorksTrash,
+    #[serde(rename = "works.restore")]
+    WorksRestore,
+    #[serde(rename = "works.request_review")]
+    WorksRequestReview,
+    #[serde(rename = "works.review")]
+    WorksReview,
+    #[serde(rename = "works.export")]
+    WorksExport,
 }
 
 impl ScreenOperation {
@@ -293,6 +313,8 @@ impl ScreenOperation {
                 | Self::WhatsappBroadcastStop
                 | Self::WhatsappHandoffRelease
                 | Self::ChatWhatsappBrief
+                | Self::WorksReview
+                | Self::WorksExport
         )
     }
     /// CAD-1562: an operation of the hosted WhatsApp door.
@@ -386,6 +408,9 @@ impl ScreenOperation {
             | Self::WhatsappReplySend
             | Self::WhatsappTemplatePrepare
             | Self::WhatsappTemplateSend => 49_152,
+            // CAD-1662: a Works revision holds up to 64 KiB of content plus
+            // title, tags, operations and key overhead; not widened for others.
+            Self::WorksCreate | Self::WorksPatch => 81_920,
             // CAD-1590: an individual audience holds up to 1000 ids.
             Self::WhatsappBroadcastDraft => 196_608,
             _ => 16_384,

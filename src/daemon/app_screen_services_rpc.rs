@@ -127,6 +127,7 @@ enum Confirmation {
     GlobalOrigin(GlobalOrigin),
     Csv(CsvConfirmation),
     Brief(BriefConfirmation),
+    WorksChoice(WorksChoice),
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -156,6 +157,13 @@ struct Connection {
 struct Resolution {
     confirmed: bool,
     resolution: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorksChoice {
+    confirmed: bool,
+    choice: String,
+    note: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -302,6 +310,23 @@ args!(WaBrief {
     guidance: String
 });
 args!(RoutePatch { section: Option<String>, view: Option<String>, record_id: Option<String>, segment_id: Option<String>, replace: Option<bool> });
+// CAD-1662: Works content. Bounds follow the store's grammar; the daemon
+// re-validates every field, these structs only close the shape.
+args!(WorksId { id: String });
+args!(WorksQueryArgs { text: Option<String>, kind: Option<String>, review: Option<String>, export: Option<String>, tag: Option<String>, owner: Option<String>, sort: Option<String> });
+args!(WorksCreateArgs { kind: String, title: String, content: Value, tags: Option<Value>, idempotency_key: String });
+args!(WorksPatchArgs { id: String, if_revision: i64, operations: Vec<Value>, idempotency_key: String });
+args!(WorksTrashArgs {
+    id: String,
+    if_revision: i64,
+    idempotency_key: String
+});
+args!(WorksRequestReviewArgs {
+    id: String,
+    revision: i64
+});
+args!(WorksReviewArgs { id: String, revision: i64, decision: String, note: Option<String> });
+args!(WorksExportArgs { id: String, revision: i64, format: Option<String> });
 
 fn typed<T: for<'de> Deserialize<'de> + Serialize>(value: &Value) -> Result<Value> {
     let body: T = serde_json::from_value(value.clone())
@@ -323,6 +348,14 @@ fn call_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
         RecordsCreate => typed::<RecordCreate>(value),
         RecordsUpdate => typed::<RecordUpdate>(value),
         RecordsCsvPreview => typed::<CsvPreview>(value),
+        WorksQuery => typed::<WorksQueryArgs>(value),
+        WorksGet => typed::<WorksId>(value),
+        WorksCreate => typed::<WorksCreateArgs>(value),
+        WorksPatch => typed::<WorksPatchArgs>(value),
+        WorksTrash | WorksRestore => typed::<WorksTrashArgs>(value),
+        WorksRequestReview => typed::<WorksRequestReviewArgs>(value),
+        WorksReview => typed::<WorksReviewArgs>(value),
+        WorksExport => typed::<WorksExportArgs>(value),
         SegmentsList | ExclusionsList | SuppressionsList | ContentList | SenderBindingsList => {
             typed::<Empty>(value)
         }
@@ -410,6 +443,10 @@ fn slot_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
         ScreenOperation::WhatsappBroadcastStop => typed::<WaBroadcast>(value),
         ScreenOperation::WhatsappHandoffRelease => typed::<WaConversation>(value),
         ScreenOperation::ChatWhatsappBrief => typed::<WaBrief>(value),
+        // CAD-1662: review and export are host-confirmed SLOT operations; the
+        // decode mirrors their CALL shape so slot-prepare can fix the facts.
+        ScreenOperation::WorksReview => typed::<WorksReviewArgs>(value),
+        ScreenOperation::WorksExport => typed::<WorksExportArgs>(value),
         _ => Err(Error::rejected("screen SLOT operation is not implemented")),
     }
 }
@@ -488,6 +525,15 @@ fn native_method(operation: ScreenOperation) -> Result<&'static str> {
         WhatsappBroadcastStop => "whatsapp_broadcast_stop",
         WhatsappHandoffSet => "whatsapp_handoff_set",
         WhatsappHandoffRelease => "whatsapp_handoff_release",
+        WorksQuery => "app_works_query",
+        WorksGet => "app_works_get",
+        WorksCreate => "app_works_create",
+        WorksPatch => "app_works_patch",
+        WorksTrash => "app_works_trash",
+        WorksRestore => "app_works_restore",
+        WorksRequestReview => "app_works_request_review",
+        WorksReview => "app_works_review",
+        WorksExport => "app_works_export",
         _ => {
             return Err(Error::rejected(
                 "screen operation has no implemented executor",
@@ -796,7 +842,17 @@ impl Shared {
         // each re-derives the human from its live session, never child fields.
         if matches!(
             proof.operation,
-            RecordsCreate | RecordsUpdate | RecordsCsvImport | ContentSave
+            RecordsCreate
+                | RecordsUpdate
+                | RecordsCsvImport
+                | ContentSave
+                | WorksCreate
+                | WorksPatch
+                | WorksTrash
+                | WorksRestore
+                | WorksRequestReview
+                | WorksReview
+                | WorksExport
         ) {
             if let Some(public_session) = &proof.public_session {
                 params["public_session"] = json!(public_session);
@@ -903,6 +959,10 @@ impl Shared {
             op if op.is_whatsapp() => {
                 self.rpc_whatsapp_with_proof(method, &params, peer_pid, Some(proof))
             }
+            WorksQuery | WorksGet | WorksCreate | WorksPatch | WorksTrash | WorksRestore
+            | WorksRequestReview | WorksReview | WorksExport => {
+                self.rpc_app_works(method, &params, peer_pid, Some(proof))
+            }
             _ => self.rpc_app_content_with_proof(method, &params, peer_pid, Some(proof)),
         }
     }
@@ -970,6 +1030,18 @@ impl Shared {
                 }
                 super::app_records_rpc::csv_decisions(args)?;
                 Ok(preview)
+            }
+            ScreenOperation::WorksReview | ScreenOperation::WorksExport => {
+                // CAD-1662: the confirmation facts are the doc's current
+                // revision and state, re-read here under the scope lock.
+                let id = required_str(args, "id")?;
+                let shown = records.app_works_get(context, id)?;
+                if shown["revision"] != args["revision"] {
+                    return Err(Error::rejected(
+                        "works revision changed before confirmation",
+                    ));
+                }
+                Ok(shown)
             }
             ScreenOperation::SendsApprove | ScreenOperation::SendsResolve => {
                 let id = required_str(args, "send_id")?;
@@ -1127,6 +1199,33 @@ impl Shared {
                     .ok_or_else(|| Error::rejected("confirmation missing"))?
                     .1;
                 *args = json!({"conversation_id": facts["conversation_id"]});
+            }
+            // CAD-1662: a review or export tap confirms the facts re-read at
+            // execution (doc id and revision); the frame supplies neither.
+            (WorksReview, Confirmation::WorksChoice(input))
+                if input.confirmed && matches!(input.choice.as_str(), "approve" | "changes") =>
+            {
+                // CAD-1662: the reviewer's decision is bound to the doc
+                // revision the host re-proved; the frame never supplies it.
+                let facts = &proof
+                    .confirmed
+                    .as_ref()
+                    .ok_or_else(|| Error::rejected("confirmation missing"))?
+                    .1;
+                *args = json!({"id": facts["id"], "revision": facts["revision"],
+                    "decision": input.choice, "note": input.note});
+            }
+            (WorksExport, Confirmation::WorksChoice(input))
+                if input.confirmed
+                    && !input.choice.trim().is_empty()
+                    && input.choice.len() <= 40 =>
+            {
+                let facts = &proof
+                    .confirmed
+                    .as_ref()
+                    .ok_or_else(|| Error::rejected("confirmation missing"))?
+                    .1;
+                *args = json!({"id": facts["id"], "revision": facts["revision"], "format": input.choice});
             }
             (ChatCampaignBrief, Confirmation::Brief(input))
                 if input.confirmed && args["brief"].as_str() == Some(input.brief.as_str()) => {}

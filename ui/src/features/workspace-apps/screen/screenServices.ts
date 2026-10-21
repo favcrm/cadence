@@ -212,6 +212,13 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionA
     if (live) { show("Status (approximate, as of this card)", live.status); show("Delivery so far (approximate, still changing)", stats); }
     show("Effect", "Stops unsent recipients only. Messages already sent cannot be recalled. A stopped broadcast cannot resume; inside the undo window it returns to a draft instead.");
   }
+  if (operation === "works.review" || operation === "works.export") {
+    // CAD-1662: the card draws the doc's current revision the host re-proved;
+    // the reviewer or exporter confirms that exact revision, nothing else.
+    show("Title", facts.title); show("Kind", facts.kind); show("Revision", facts.revision); show("Digest", facts.digest);
+    if (operation === "works.review") show("Decision", "Approve this revision, or request changes.");
+    if (operation === "works.export") show("Format", "Export receipt for this approved revision only.");
+  }
   if (operation === "whatsapp.handoff.release") {
     // CAD-1651: the takeover time is the bound fact; the contact is live and unbound.
     const contact = live && object(live.contact) ? live.contact : null;
@@ -222,6 +229,8 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs, live?: ActionA
   if (typeof facts.state === "string" && facts.state === "pending" && operation.startsWith("whatsapp.")) show("Approval", "Awaiting the workspace owner's approval; tapping again after approval sends it once.");
   show("Scope", facts.scope); show("Unsubscribe origin", facts.unsubscribe_origin ?? (operation === "origin.manage" ? "Not configured" : undefined));
   const card: RecordCard = { operation, facts: rows };
+  if (operation === "works.review") card.input = { field: "choice", label: "Your decision on this exact revision", choices: [{ value: "approve", label: "Approve this revision" }, { value: "changes", label: "Request changes" }] };
+  if (operation === "works.export") card.input = { field: "choice", label: "Export format for this approved revision", choices: [{ value: "html", label: "HTML" }, { value: "markdown", label: "Markdown" }] };
   if (operation === "smtp.test-send") card.input = { field: "to_email", label: "Test recipient (one email address)" };
   if (operation === "sends.resolve") card.input = { field: "resolution", label: "Resolve uncertain outcome — this does not resend", choices: [{ value: "accepted", label: "Accepted by the server" }, { value: "failed", label: "Failed" }] };
   if (operation === "origin.manage") card.input = { field: "unsubscribe_origin", label: "Daemon-global unsubscribe origin (blank clears it)", value: typeof facts.unsubscribe_origin === "string" ? facts.unsubscribe_origin : "" };

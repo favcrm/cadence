@@ -25,7 +25,7 @@ export interface SlotCard { target: string; caption: string; image: string | nul
 export interface RecordCard {
   operation: string;
   facts: { label: string; value: string }[];
-  input?: { field: "to_email" | "connection_id" | "resolution" | "unsubscribe_origin" | "brief"; label: string; value?: string; choices?: { value: string; label: string }[] };
+  input?: { field: "to_email" | "connection_id" | "resolution" | "unsubscribe_origin" | "brief" | "choice"; label: string; value?: string; choices?: { value: string; label: string }[] };
 }
 /** Records consume trusted text; generic browser effects receive only a liveness callback. */
 export type SlotPlan =

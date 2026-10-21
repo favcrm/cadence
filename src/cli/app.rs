@@ -59,6 +59,13 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: ContentAction,
     },
+    /// Works content (CAD-1662): native operator docs, decks and sheets over
+    /// the durable store. Explicit install and context; no actor flags. Review
+    /// needs two verified humans, and the daemon derives the actor.
+    Works {
+        #[command(subcommand)]
+        action: WorksAction,
+    },
     /// CRM app assistant discovery, consented action invocation, and durable receipt reads.
     Assistant {
         #[command(subcommand)]
@@ -471,6 +478,130 @@ pub(crate) enum ContentAction {
         message: String,
         #[arg(long, requires = "message")]
         token: String,
+    },
+}
+
+/// CAD-1662 native Works verbs. Each takes an explicit install and
+/// context; the daemon derives the actor from the operator connection,
+/// so no actor flag exists. Content and audit-bearing writes carry a
+/// caller idempotency key and an `if_revision`/`revision` pin.
+#[derive(Subcommand)]
+pub(crate) enum WorksAction {
+    /// List the context's Works items (optional filters).
+    Query {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        review: Option<String>,
+        #[arg(long)]
+        export: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        sort: Option<String>,
+    },
+    /// Show one Works item.
+    Get {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        id: String,
+    },
+    /// Create a doc, deck or sheet from a JSON file.
+    Create {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        /// JSON file holding `{kind, title, content, tags?}`.
+        #[arg(long)]
+        body: PathBuf,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Apply a JSON patch document pinned to `if_revision`.
+    Patch {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        if_revision: i64,
+        /// JSON file holding `{operations: [...]}`.
+        #[arg(long)]
+        body: PathBuf,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Move one item to trash at `if_revision`.
+    Trash {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        if_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Restore one trashed item at `if_revision`.
+    Restore {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        if_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Request independent review of one revision.
+    #[command(name = "request-review")]
+    RequestReview {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        revision: i64,
+    },
+    /// Record a reviewer decision on a pending revision.
+    Review {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        revision: i64,
+        /// `approve` or `changes`.
+        #[arg(long)]
+        decision: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Export an approved, current revision (receipt only; content stays in the store).
+    Export {
+        install_id: String,
+        #[arg(long)]
+        context_id: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        revision: i64,
+        #[arg(long)]
+        format: Option<String>,
     },
 }
 
@@ -1028,19 +1159,148 @@ fn record_params(action: &RecordAction) -> Result<(&'static str, serde_json::Val
     })
 }
 
+/// CAD-1662: map each native Works verb to its `app_works_*` RPC. JSON
+/// files are bounded by `read_audience_json` (64 KiB) and forwarded as-is;
+/// the daemon's typed grammar validates every field. No actor is sent.
+fn works_params(action: &WorksAction) -> Result<(&'static str, serde_json::Value)> {
+    Ok(match action {
+        WorksAction::Query {
+            install_id,
+            context_id,
+            text,
+            kind,
+            review,
+            export,
+            tag,
+            owner,
+            sort,
+        } => (
+            "app_works_query",
+            json!({"install_id": install_id, "context_id": context_id, "text": text, "kind": kind, "review": review, "export": export, "tag": tag, "owner": owner, "sort": sort}),
+        ),
+        WorksAction::Get {
+            install_id,
+            context_id,
+            id,
+        } => (
+            "app_works_get",
+            json!({"install_id": install_id, "context_id": context_id, "id": id}),
+        ),
+        WorksAction::Create {
+            install_id,
+            context_id,
+            body,
+            idempotency_key,
+        } => {
+            let mut params = read_works_json(body, "works body")?;
+            let obj = params
+                .as_object_mut()
+                .ok_or_else(|| Error::invalid("app_works", "works body must be an object"))?;
+            obj.insert("install_id".into(), json!(install_id));
+            obj.insert("context_id".into(), json!(context_id));
+            obj.insert("idempotency_key".into(), json!(idempotency_key));
+            ("app_works_create", params)
+        }
+        WorksAction::Patch {
+            install_id,
+            context_id,
+            id,
+            if_revision,
+            body,
+            idempotency_key,
+        } => {
+            let mut params = read_works_json(body, "works patch")?;
+            let obj = params
+                .as_object_mut()
+                .ok_or_else(|| Error::invalid("app_works", "works patch must be an object"))?;
+            obj.insert("install_id".into(), json!(install_id));
+            obj.insert("context_id".into(), json!(context_id));
+            obj.insert("id".into(), json!(id));
+            obj.insert("if_revision".into(), json!(if_revision));
+            obj.insert("idempotency_key".into(), json!(idempotency_key));
+            ("app_works_patch", params)
+        }
+        WorksAction::Trash {
+            install_id,
+            context_id,
+            id,
+            if_revision,
+            idempotency_key,
+        } => (
+            "app_works_trash",
+            json!({"install_id": install_id, "context_id": context_id, "id": id, "if_revision": if_revision, "idempotency_key": idempotency_key}),
+        ),
+        WorksAction::Restore {
+            install_id,
+            context_id,
+            id,
+            if_revision,
+            idempotency_key,
+        } => (
+            "app_works_restore",
+            json!({"install_id": install_id, "context_id": context_id, "id": id, "if_revision": if_revision, "idempotency_key": idempotency_key}),
+        ),
+        WorksAction::RequestReview {
+            install_id,
+            context_id,
+            id,
+            revision,
+        } => (
+            "app_works_request_review",
+            json!({"install_id": install_id, "context_id": context_id, "id": id, "revision": revision}),
+        ),
+        WorksAction::Review {
+            install_id,
+            context_id,
+            id,
+            revision,
+            decision,
+            note,
+        } => (
+            "app_works_review",
+            json!({"install_id": install_id, "context_id": context_id, "id": id, "revision": revision, "decision": decision, "note": note}),
+        ),
+        WorksAction::Export {
+            install_id,
+            context_id,
+            id,
+            revision,
+            format,
+        } => {
+            let mut params = json!({"install_id": install_id, "context_id": context_id, "id": id, "revision": revision});
+            // Omit `format` when absent so the daemon applies its html default
+            // instead of receiving an explicit null (refused as invalid).
+            if let Some(format) = format {
+                params["format"] = json!(format);
+            }
+            ("app_works_export", params)
+        }
+    })
+}
+
+/// Works create/patch bodies: a near-64 KiB revision plus kind, title,
+/// tags or operations exceeds the 64 KiB audience bound, so Works verbs get
+/// their own 80 KiB reader. Other commands keep `read_audience_json`.
+fn read_works_json(path: &Path, kind: &str) -> Result<serde_json::Value> {
+    read_bounded_json(path, kind, 80 * 1024)
+}
+
 fn read_audience_json(path: &Path, kind: &str) -> Result<serde_json::Value> {
+    read_bounded_json(path, kind, 64 * 1024)
+}
+
+fn read_bounded_json(path: &Path, kind: &str, limit: usize) -> Result<serde_json::Value> {
     use std::io::Read;
-    const MAX_AUDIENCE_BYTES: usize = 64 * 1024;
     let file = std::fs::File::open(path)
         .map_err(|e| Error::invalid("app_audience", format!("cannot open {kind}: {e}")))?;
     let mut bytes = Vec::new();
-    file.take((MAX_AUDIENCE_BYTES + 1) as u64)
+    file.take((limit + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|e| Error::invalid("app_audience", format!("cannot read {kind}: {e}")))?;
-    if bytes.len() > MAX_AUDIENCE_BYTES {
+    if bytes.len() > limit {
         return Err(Error::invalid(
             "app_audience",
-            format!("{kind} JSON exceeds 64KiB"),
+            format!("{kind} JSON exceeds {}KiB", limit / 1024),
         ));
     }
     serde_json::from_slice(&bytes)
@@ -2269,6 +2529,10 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
             let (method, params) = content_params(action)?;
             client::rpc(state_dir, method, params)?
         }
+        AppAction::Works { action } => {
+            let (method, params) = works_params(action)?;
+            client::rpc(state_dir, method, params)?
+        }
         AppAction::Assistant { action } => {
             let (method, params, wait): (
                 &'static str,
@@ -2548,6 +2812,70 @@ mod tests {
             read_run_inputs(&path).unwrap(),
             json!({"source":"source text","writer":"op-writer"})
         );
+    }
+
+    /// CAD-1662: native Works verbs reach the native `app_works_*` methods
+    /// with explicit install/context and no actor, reviewer or on-behalf-of
+    /// field. Export omits `format` when absent so the daemon default applies.
+    #[test]
+    fn works_verbs_map_to_native_methods_without_actor_fields() {
+        let (method, params) = works_params(&WorksAction::Export {
+            install_id: "inst-1".into(),
+            context_id: "ctx-1".into(),
+            id: "doc-1".into(),
+            revision: 3,
+            format: None,
+        })
+        .unwrap();
+        assert_eq!(method, "app_works_export");
+        assert_eq!(
+            params,
+            json!({"install_id": "inst-1", "context_id": "ctx-1", "id": "doc-1", "revision": 3})
+        );
+        assert!(params.get("format").is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let body = dir.path().join("body.json");
+        std::fs::write(
+            &body,
+            r#"{"kind":"doc","title":"t","content":{"blocks":[]}}"#,
+        )
+        .unwrap();
+        let (method, params) = works_params(&WorksAction::Create {
+            install_id: "inst-1".into(),
+            context_id: "ctx-1".into(),
+            body,
+            idempotency_key: "k-1".into(),
+        })
+        .unwrap();
+        assert_eq!(method, "app_works_create");
+        for forbidden in ["actor", "reviewer", "on_behalf_of", "session", "role"] {
+            assert!(
+                params.get(forbidden).is_none(),
+                "{forbidden} must not be a CLI field"
+            );
+        }
+        assert_eq!(params["install_id"], "inst-1");
+        assert_eq!(params["idempotency_key"], "k-1");
+    }
+
+    /// CAD-1662: Works create/patch bodies are bounded by the 80 KiB Works
+    /// reader, and an oversized body is refused before any daemon call.
+    #[test]
+    fn works_bodies_refuse_over_80kib_before_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = dir.path().join("body.json");
+        let text = json!({"kind":"doc","title":"t","content":{"blocks":[{"type":"p","text":"界".repeat(30_000)}]}}).to_string();
+        std::fs::write(&body, text).unwrap();
+        let error = works_params(&WorksAction::Create {
+            install_id: "inst-1".into(),
+            context_id: "ctx-1".into(),
+            body,
+            idempotency_key: "k-1".into(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("exceeds 80KiB"), "{error}");
     }
 
     #[test]

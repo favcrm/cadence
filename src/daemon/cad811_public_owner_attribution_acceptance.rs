@@ -38,17 +38,24 @@ fn must<T, E>(result: std::result::Result<T, E>, what: &str) -> T {
     }
 }
 
-struct Native {
+pub(super) struct Native {
     // Drop the owned board/socket threads before the temp state or Shared.
-    fx: Fixture,
-    shared: Arc<Shared>,
+    pub(super) fx: Fixture,
+    pub(super) shared: Arc<Shared>,
     member_live: Arc<AtomicBool>,
     lookups: Arc<AtomicUsize>,
-    issuer: String,
+    pub(super) issuer: String,
 }
 
 impl Native {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
+        Self::new_with_sub(OWNER)
+    }
+
+    /// Same fixture, admitting exactly `allowed_sub` through the membership
+    /// lookup. Only the Works two-human test passes a second synthetic sub.
+    pub(super) fn new_with_sub(allowed_sub: &str) -> Self {
+        let allowed_sub = allowed_sub.to_owned();
         assert!(
             std::env::var_os("CADENCE_SOCKET").is_none(),
             "fixture BLOCKED: inherited socket override; do not clear caller identity"
@@ -125,7 +132,7 @@ impl Native {
             .expect("fresh unique Shared")
             .membership_lookup_for_test = Some(Box::new(move |_hash, sub, company, instance| {
             assert!(
-                sub == OWNER && company == COMPANY && instance == INSTANCE,
+                sub == allowed_sub.as_str() && company == COMPANY && instance == INSTANCE,
                 "fixture BLOCKED: wrong synthetic membership binding"
             );
             seen.fetch_add(1, Ordering::SeqCst);
@@ -237,11 +244,11 @@ impl Native {
         }
     }
 
-    fn rpc(&self, method: &str, params: Value) -> crate::Result<Value> {
+    pub(super) fn rpc(&self, method: &str, params: Value) -> crate::Result<Value> {
         self.fx.rpc(Asserted::Operator, method, params)
     }
 
-    fn owner(&self) -> (Session, Value) {
+    pub(super) fn owner(&self) -> (Session, Value) {
         let user = BoardUser {
             sub: OWNER.into(),
             email: "c811-owner@example.test".into(),
@@ -277,7 +284,7 @@ impl Native {
         (session, expected)
     }
 
-    fn local(&self) -> Session {
+    pub(super) fn local(&self) -> Session {
         // Same real Auth constructor used by the existing Native fence
         // fixture, not a public-host bootstrap with a local nonce.
         let now = self.shared.operator_now();
@@ -299,14 +306,20 @@ impl Native {
         }
     }
 
-    fn credentials(&self, session: &Session, origin: &str, mut body: Value) -> Value {
+    pub(super) fn credentials(&self, session: &Session, origin: &str, mut body: Value) -> Value {
         body["token"] = json!(session.token);
         body["key"] = json!(session.key);
         body["origin"] = json!(origin);
         body
     }
 
-    fn mount(&self, session: &Session, origin: &str, scope: &Scope, generation: u64) -> String {
+    pub(super) fn mount(
+        &self,
+        session: &Session,
+        origin: &str,
+        scope: &Scope,
+        generation: u64,
+    ) -> String {
         let mint = must(
             self.rpc(
                 "app_screen_mint",
@@ -342,7 +355,7 @@ impl Native {
         action
     }
 
-    fn service(
+    pub(super) fn service(
         &self,
         session: &Session,
         origin: &str,
@@ -491,7 +504,7 @@ impl Native {
         )
     }
 
-    fn durable_snapshot(&self, scope: &Scope) -> Value {
+    pub(super) fn durable_snapshot(&self, scope: &Scope) -> Value {
         let db = self.record_db(scope);
         let mut tables = Vec::new();
         for table in [

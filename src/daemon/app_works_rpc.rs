@@ -10,6 +10,7 @@
 //! before any file opens.
 
 use super::*;
+use crate::daemon::app_screen_services_rpc::ScreenServiceProof;
 use crate::store::app_records::RecordStore;
 use crate::store::app_works::WorksDraft;
 use serde_json::Value;
@@ -55,7 +56,9 @@ impl Shared {
         method: &str,
         params: &Value,
         peer_pid: u32,
+        proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
+        Self::screen_service_method(proof, method)?;
         self.operator_connection("works content management", params, peer_pid)?;
         let allowed: &[&str] = match method {
             "app_works_create" => &[
@@ -135,8 +138,16 @@ impl Shared {
                 ));
             }
         }
-        let install = required_str(params, "install_id")?.to_string();
-        let context = required_str(params, "context_id")?.to_string();
+        // A screen call derives install/context from the private proof, never
+        // from frame fields; a native call takes them from the operator caller.
+        let install = match proof {
+            Some(proof) => proof.install().to_string(),
+            None => required_str(params, "install_id")?.to_string(),
+        };
+        let context = match proof {
+            Some(proof) => proof.context()?.to_string(),
+            None => required_str(params, "context_id")?.to_string(),
+        };
         let human = self.verified_owner_human(params)?;
         // A review needs a proven reviewer identity; the unverified local
         // operator fallback must not approve or be approved. Refuse before
@@ -148,7 +159,7 @@ impl Shared {
             ));
         }
         let actor = works_actor(human.as_ref())?;
-        let result = self.screen_service_scope(&install, &context, true, None, || {
+        let result = self.screen_service_scope(&install, &context, true, proof, || {
             let records = RecordStore::open(&self.state_dir, &install)?;
             match method {
                 "app_works_create" => {
