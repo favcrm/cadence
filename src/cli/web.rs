@@ -71,6 +71,24 @@ pub(super) fn run(
             target,
             json!({"org": target.org, "slug": slug, "wake_timeout": wake_timeout}),
         )?,
+        WebAction::Submissions {
+            slug,
+            form,
+            limit,
+            cursor,
+        } => platform_call(
+            state_dir,
+            "site_submissions",
+            target,
+            json!({
+                "org": target.org,
+                "slug": slug,
+                "form": form,
+                "limit": limit,
+                "cursor": cursor,
+                "wake_timeout": wake_timeout,
+            }),
+        )?,
     };
     print_json(&value)?;
     if matches!(

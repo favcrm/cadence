@@ -56,6 +56,20 @@ pub enum WebAction {
         /// Site slug.
         slug: String,
     },
+    /// Read a site's form submissions, newest first.
+    Submissions {
+        /// Site slug.
+        slug: String,
+        /// Only submissions of this form key.
+        #[arg(long)]
+        form: Option<String>,
+        /// Submissions to return, 1 to 100.
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Opaque cursor from the previous page's nextCursor.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
     /// Ask the owner to restore an earlier release (owner approval).
     Rollback {
         /// Site slug.
@@ -149,6 +163,19 @@ pub fn execute(action: &WebAction, target: &RemoteTarget, wake_timeout: u64) -> 
         }
         WebAction::Status { slug } => status(target, slug, wake_timeout),
         WebAction::Releases { slug } => releases(target, slug, wake_timeout),
+        WebAction::Submissions {
+            slug,
+            form,
+            limit,
+            cursor,
+        } => submissions(
+            target,
+            slug,
+            form.as_deref(),
+            *limit,
+            cursor.as_deref(),
+            wake_timeout,
+        ),
     }
 }
 
@@ -812,6 +839,80 @@ pub fn status(target: &RemoteTarget, slug: &str, wake_timeout: u64) -> Result<Va
         }));
     }
     Ok(json!({"org": target.org, "site": site, "pendingActions": pending}))
+}
+
+/// A site's form submissions, newest first. `form` filters one form key and
+/// `cursor` is the opaque `nextCursor` returned by the previous page; a
+/// malformed cursor is refused locally rather than sent.
+pub fn submissions(
+    target: &RemoteTarget,
+    slug: &str,
+    form: Option<&str>,
+    limit: u32,
+    cursor: Option<&str>,
+    wake_timeout: u64,
+) -> Result<Value> {
+    if !(1..=100).contains(&limit) {
+        return Err(Error::rejected("--limit must be between 1 and 100"));
+    }
+    if let Some(form) = form {
+        let valid = (1..=40).contains(&form.len())
+            && form
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !form.starts_with('-')
+            && !form.ends_with('-');
+        if !valid {
+            return Err(Error::rejected(
+                "--form must be 1-40 lowercase letters, digits or hyphens",
+            ));
+        }
+    }
+    if let Some(cursor) = cursor {
+        let valid = (1..=200).contains(&cursor.len())
+            && cursor
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-' | b'.'));
+        if !valid {
+            return Err(Error::rejected("--cursor is not a submissions cursor"));
+        }
+    }
+    let found = remote_cli::web_request(
+        target,
+        "web.read",
+        "GET",
+        &format!("/v1/web-sites/sites/by-slug/{slug}"),
+        &[("x-workspace-id", target.org_id.clone())],
+        None,
+        wake_timeout,
+    )?;
+    let site = remote_cli::web_envelope(found)?;
+    let site_id = site["siteId"].as_str().unwrap_or_default().to_string();
+    let mut path = format!("/v1/web-sites/sites/{site_id}/submissions?limit={limit}");
+    if let Some(form) = form {
+        path.push_str("&form=");
+        path.push_str(form);
+    }
+    if let Some(cursor) = cursor {
+        path.push_str("&cursor=");
+        path.push_str(cursor);
+    }
+    let response = remote_cli::web_request(
+        target,
+        "web.read",
+        "GET",
+        &path,
+        &[("x-workspace-id", target.org_id.clone())],
+        None,
+        wake_timeout,
+    )?;
+    let listing = remote_cli::web_envelope(response)?;
+    Ok(json!({
+        "org": target.org,
+        "site": slug,
+        "submissions": listing["submissions"],
+        "nextCursor": listing["nextCursor"],
+    }))
 }
 
 pub fn releases(target: &RemoteTarget, slug: &str, wake_timeout: u64) -> Result<Value> {
