@@ -994,6 +994,11 @@ fn crm_general_turn_searches_segments_campaign_and_proposes_email() {
         ["cust-a"],
         "search must find only the queried record"
     );
+    assert_eq!(
+        search["operation"]["result"]["total"],
+        json!(1),
+        "the assistant sees the full filtered count, not just the page"
+    );
     assert!(search["operation"]["resource_refs"]
         .as_array()
         .is_some_and(|refs| {
