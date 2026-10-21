@@ -89,6 +89,7 @@ import {
   type Route,
   type Screen,
 } from "./lib/router";
+import { humanThreadsAvailable } from "./lib/humanThreads";
 import { navigate, useHref } from "./lib/useLocation";
 import { NavigationProvider } from "../screen-ui/src/navigation";
 import { hostNavigation } from "./ui/hostNavigation";
@@ -915,7 +916,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <HeaderSearch issues={issuesState} route={route} navHref={hrefFor} />
 
           <div className="ml-auto flex items-center gap-1 shrink-0">
-            <NotificationInbox authEpoch={authEpoch} />
+            {humanThreadsAvailable(meta) && <NotificationInbox authEpoch={authEpoch} />}
             <StatusChips
               variant="header"
               readOnly={boardReadOnly}

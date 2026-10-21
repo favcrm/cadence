@@ -80,6 +80,8 @@ async function main() {
   let backendList = [A];
   let holdLists = false;
   let listCalls = 0;
+  // CAD-1704: a loopback board never mounts the human-threads inbox.
+  let humanThreadsCalls = 0;
   const pendingLists: Array<{ signal: AbortSignal | null; resolve: (response: Response) => void }> = [];
   const appReads: Array<{ id: string; path: string }> = [];
   const unexpected: string[] = [];
@@ -89,9 +91,12 @@ async function main() {
     const url = new URL(path, "http://localhost");
     if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
     if (url.pathname === "/api/meta") return json({ read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session: { id: "canonical-session", origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test" } });
-    if (url.pathname === "/api/human-threads/notifications") return json({
-      error: "sign in to use human threads", code: "signed_out", revision: null,
-    }, 401);
+    if (url.pathname === "/api/human-threads/notifications") {
+      humanThreadsCalls++;
+      return json({
+        error: "sign in to use human threads", code: "signed_out", revision: null,
+      }, 401);
+    }
     if (url.pathname === "/api/issues") return json({ issues: [] });
     if (path === "/api/projects") return json({ projects: [] });
     if (path === "/api/agents") return json({ daemon: "unreachable", agents: [], totals: null });
@@ -182,6 +187,7 @@ async function main() {
       assert(listCalls > 0, "real App requested the operator installation list");
       assert(host.textContent?.includes("Original CRM"), "App cached the verified A/crm installation before replacement");
     });
+    equal(humanThreadsCalls, 0, "a loopback board never mounts the human-threads inbox, so it never polls the route it does not serve");
     equal(appReads, [], "warming the board did not mount either installation");
 
     // A is now gone server-side. Keep its previous successful list in the

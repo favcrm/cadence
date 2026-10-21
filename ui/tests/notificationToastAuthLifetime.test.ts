@@ -42,7 +42,10 @@ type Room = { room: string; title: string; seq: number };
 
 function proof(id: string, sub: string): Meta {
   return {
-    hosted: false,
+    // CAD-1704: the notification inbox exists only on the hosted public
+    // surface (serve.rs dispatches /api/human-threads inside public_host).
+    // This fixture mocks that route, so it models that surface.
+    hosted: true,
     anonymous_reads: false,
     read_only: false,
     signed_in: true,
