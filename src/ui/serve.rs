@@ -1139,6 +1139,11 @@ fn read_dispatch(
     if let Err(response) = table_read_guard(row.class, request, state_dir, opts) {
         return response;
     }
+    // A bound value that fails its validator answers the row's own refusal,
+    // exactly as the write dispatcher does — never the handler.
+    if let Some(response) = bound.invalid() {
+        return response;
+    }
     match row.id {
         endpoints::RouteId::WorkspaceList => {
             apps::workspace(request, state_dir, "app_workspace_list", None)
@@ -1532,6 +1537,16 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     } else {
         None
     };
+
+    // A multi-segment tail under `/api/agents/` was the old arm's invalid
+    // alias (`a/b` carries `/`) and answered 400 before any handler. The
+    // table's single-segment row cannot bind it, so the answer is kept here.
+    if let Some(tail) = path.strip_prefix("/api/agents/") {
+        if tail.contains('/') {
+            send(request, err_response(400, "bad agent alias"));
+            return;
+        }
+    }
 
     // CAD-1696: a table read row answers from its own declaration, so the
     // board's reads and writes share one route authority. It runs after the
