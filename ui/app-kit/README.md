@@ -59,6 +59,8 @@ reference receiver and `screenProtocol.ts`):
   later disagreement tears the port down.
 - Teardown rejects every outstanding request with `ScreenClosedError`, so no
   caller is left pending on a dead mount.
+- A slot resolves the host's event (`{state, receipt?, data?, refusal?}`), not
+  just `state`; a `done` receipt is never dropped.
 
 What stays app-owned: the closed verb set and per-verb arg shapes (the PUSH
 `actions` advertisement), payload validation in `onPush`, and which asset refs

@@ -231,3 +231,23 @@ test("request shapes are bounded at send time", async () => {
   await assert.rejects(receiver.tool("social.publish", {}, "bad id"), /request_id/);
   assert.equal(inbox.filter((m) => m.op === "call" || m.op === "slot" || m.op === "tool").length, 0);
 });
+
+test("a slot resolves the host's event, not just its state", async () => {
+  const { host, inbox, pushes, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const pending = receiver.slot("publish.cancel", { run_id: "r1" }, "footer");
+  const request = await waitFor(() => inbox.find((m) => m.op === "slot"), "the slot request");
+  assert.equal(request.anchor, "footer");
+  host.postMessage({
+    v: 2,
+    op: "slot-state",
+    id: request.id,
+    state: "done",
+    receipt: { run_id: "r1", request_id: "req-1", state: "done" },
+  });
+  assert.deepEqual(await pending, {
+    state: "done",
+    receipt: { run_id: "r1", request_id: "req-1", state: "done" },
+  });
+});

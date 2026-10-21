@@ -231,10 +231,15 @@ export function createScreenReceiver(options = {}) {
     pending.delete(message.id);
     clearTimeout(entry.timer);
     if (message.op === "slot-state") {
-      const refusal = readRefusal(message.refusal);
-      if (message.refusal !== undefined && !refusal) entry.reject(new Error("malformed slot-state refusal"));
-      else if (refusal) entry.reject(new ScreenRefusalError(refusal));
-      else entry.resolve({ state: message.state });
+      // A slot is a host-drawn control: `done` may carry a receipt or data,
+      // and `refused` carries a refusal. The child resolves the event as-is
+      // (minus `id`/`op`/`v`) so the app maps its own outcome.
+      if (message.refusal !== undefined && !readRefusal(message.refusal)) {
+        entry.reject(new Error("malformed slot-state refusal"));
+        return true;
+      }
+      const { id: _id, op: _op, v: _v, ...event } = message;
+      entry.resolve(event);
       return true;
     }
     if (message.ok === true) {

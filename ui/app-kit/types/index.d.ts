@@ -28,7 +28,10 @@ export interface ScreenReceiverOptions {
 }
 
 export interface SlotState {
-  state?: string;
+  state?: "pending" | "done" | "refused";
+  receipt?: unknown;
+  data?: unknown;
+  refusal?: { code: string; text: string };
 }
 
 export interface ScreenReceiver {
