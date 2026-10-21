@@ -2212,10 +2212,7 @@ impl PiAdapter {
         if let Some(dir) = self.log_path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let mut log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)?;
+        let mut log = super::open_provider_log(&self.log_path)?;
         std::io::Write::write_all(
             &mut log,
             format!(

@@ -167,10 +167,7 @@ impl StdioAdapter {
         stderr_log: &std::path::Path,
         env: &[(String, String)],
     ) -> Result<u32> {
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(stderr_log)?;
+        let log = super::open_provider_log(stderr_log)?;
         let mut command = Command::new(&self.command[0]);
         command
             .args(&self.command[1..])
@@ -231,10 +228,7 @@ impl StdioAdapter {
     ) -> Result<u32> {
         let plan = context.spawn_plan(routing)?;
         {
-            let log = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(stderr_log)?;
+            let log = super::open_provider_log(stderr_log)?;
             // Not a pathname fallback: pre_exec must consume the verified fd.
             // This deliberately nonexistent target refuses if fd-exec cannot run.
             let mut command = Command::new("/cadence-protected-fd-exec-only");

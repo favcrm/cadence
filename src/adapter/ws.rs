@@ -159,10 +159,7 @@ impl WsAdapter {
             listener.local_addr()?.port()
         };
         let url = format!("ws://127.0.0.1:{port}");
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(stderr_log)?;
+        let log = super::open_provider_log(stderr_log)?;
         let mut command = Command::new(&self.command[0]);
         command
             .args(&self.command[1..])
