@@ -32,6 +32,7 @@ const ACTION_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const TOOL_ALIAS = /^[a-z][a-z0-9]{0,31}(\.[a-z][a-z0-9]{0,31}){0,3}$/;
 const TOOL_REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const ACTION_ARGS_BYTES = 16 * 1024;
+const GEN_SCOPE_KEYS = ["draft_id", "operation", "revision"];
 const ASSET_DATA_URL = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+=*$/;
 const COORD_MAX = 16384;
 
@@ -102,6 +103,16 @@ function validArgs(args) {
     return null;
   }
   return text !== undefined && byteLength(text) <= ACTION_ARGS_BYTES ? args : null;
+}
+
+/** CAD-1365: the optional revision the host binds a generation tool to.
+ *  Exact keys; `draft_id` is an ACTION_ID, `revision` a positive safe int. */
+function validGenerationScope(scope) {
+  if (!isPlain(scope) || Object.keys(scope).sort().join() !== "draft_id,operation,revision") return null;
+  if (!["caption", "image"].includes(scope.operation)) return null;
+  if (typeof scope.draft_id !== "string" || !ACTION_ID.test(scope.draft_id)) return null;
+  if (!Number.isSafeInteger(scope.revision) || scope.revision < 1) return null;
+  return scope;
 }
 
 /** `"footer"` or an exact `{x,y,w,h}` rect inside the frame coordinates. */
@@ -406,7 +417,7 @@ export function createScreenReceiver(options = {}) {
       }
       return request("slot", { verb, args, anchor });
     },
-    tool(alias, input = {}, requestId) {
+    tool(alias, input = {}, requestId, generationScope) {
       if (!actionsAccepted) {
         return Promise.reject(new ScreenClosedError('the tool channel needs accepts to include "screen-actions.v1"'));
       }
@@ -419,13 +430,21 @@ export function createScreenReceiver(options = {}) {
       if (typeof requestId !== "string" || !TOOL_REQUEST_ID.test(requestId)) {
         return Promise.reject(new TypeError("tool request_id is required and bounded"));
       }
+      if (generationScope !== undefined && validGenerationScope(generationScope) === null) {
+        return Promise.reject(new TypeError("tool generation_scope must be exactly {draft_id,operation,revision}"));
+      }
       // The host closes the mount on a second concurrent tool call; refuse
       // locally instead of destroying the channel.
       if (toolBusy) {
         return Promise.reject(new ScreenRefusalError({ code: "conflict", text: "Another tool call is already running." }));
       }
       toolBusy = true;
-      const pendingTool = request("tool", { alias, input, request_id: requestId }, (id) => {
+      const pendingTool = request("tool", {
+        alias,
+        input,
+        request_id: requestId,
+        ...(generationScope ? { generation_scope: generationScope } : {}),
+      }, (id) => {
         busyToolId = id;
       });
       // A host reply settles busy in `settle`. A local timeout must NOT:

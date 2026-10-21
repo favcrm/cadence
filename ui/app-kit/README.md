@@ -71,6 +71,9 @@ reference receiver and `screenProtocol.ts`):
 - `args`/`input` are plain objects within 16 KiB; `anchor` is exactly
   `{x,y,w,h}` in frame coordinates (or `"footer"`); ids follow
   `ACTION_ID`, tool aliases `TOOL_ALIAS`, `request_id` `TOOL_REQUEST_ID`.
+- `tool` takes an optional fourth argument, `generation_scope`
+  (`{draft_id, operation: "caption"|"image", revision}`), carried on the wire
+  so the host binds the generation to that draft revision.
 - Boot `generation` is a non-negative safe integer; `tag` is 1–32 lowercase
   letters/digits/dashes, and an `http` parent is only the host's
   `*.localhost:<port>` origin.

@@ -466,3 +466,30 @@ test("a malformed matching late reply tears down instead of releasing the gate",
   await waitFor(() => errors.length === 1, "the malformed late teardown");
   await assert.rejects(receiver.tool("social.publish", {}, "req-2"), ScreenClosedError);
 });
+
+test("a tool request carries generation_scope when given", async () => {
+  const { host, inbox, pushes, receiver } = connect({ accepts: ["screen.v2", "screen-actions.v1"] });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const scope = { operation: "caption", draft_id: "draft_1", revision: 3 };
+  const pending = receiver.tool("caption.generate", { idea: "x" }, "req-1", scope);
+  const request = await waitFor(() => inbox.find((m) => m.op === "tool"), "the scoped tool request");
+  assert.deepEqual(request.generation_scope, scope);
+  host.postMessage({ v: 2, op: "tool-reply", id: request.id, ok: true, data: { ok: true } });
+  await pending;
+});
+
+test("an invalid generation_scope is refused before posting", async () => {
+  const { host, inbox, pushes, receiver } = connect({ accepts: ["screen.v2", "screen-actions.v1"] });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  for (const scope of [
+    { operation: "video", draft_id: "draft_1", revision: 1 },
+    { operation: "caption", draft_id: "draft_1", revision: 0 },
+    { operation: "caption", draft_id: "draft 1", revision: 1 },
+    { operation: "caption", draft_id: "draft_1", revision: 1, extra: true },
+  ]) {
+    await assert.rejects(receiver.tool("caption.generate", {}, "req-1", scope), /generation_scope/);
+  }
+  assert.equal(inbox.filter((m) => m.op === "tool").length, 0);
+});
