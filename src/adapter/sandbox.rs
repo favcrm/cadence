@@ -175,6 +175,48 @@ pub fn create_remote_lane(
     Ok((lane, job))
 }
 
+/// What a poll loop ended with: the relayed result, or a stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// The job settled and its result was relayed by this run.
+    Relayed(SandboxResult),
+    /// The job failed; it was stopped and nothing was relayed.
+    Failed,
+    /// The caller asked to stop; the job was stopped.
+    Stopped,
+}
+
+/// Drive one remote job to an outcome. Polls `get_job` until it settles.
+/// A `completed` job relays its result once; a `failed` job is stopped and
+/// reports nothing; `stop_requested` stops the job immediately. Stopping
+/// is always sent through `stop_job`, never inferred.
+pub fn drive_job(
+    client: &dyn SandboxClient,
+    relay: &ResultRelay,
+    job: &SandboxJob,
+    stop_requested: bool,
+) -> Result<RunOutcome> {
+    if stop_requested {
+        client.stop_job(&job.job_id)?;
+        return Ok(RunOutcome::Stopped);
+    }
+    let snapshot = client.get_job(&job.job_id)?;
+    match snapshot.state.as_str() {
+        "failed" => {
+            client.stop_job(&job.job_id)?;
+            Ok(RunOutcome::Failed)
+        }
+        "completed" => {
+            relay.relay(client, job)?;
+            let result = relay
+                .recorded(&job.sandbox_id)
+                .ok_or_else(|| Error::internal("completed cloud sandbox job was not relayed"))?;
+            Ok(RunOutcome::Relayed(result))
+        }
+        _ => Ok(RunOutcome::Stopped),
+    }
+}
+
 /// Idempotency ledger for relayed results, keyed by sandbox id. A repeat
 /// relay for the same sandbox returns the first result and reports
 /// nothing new, so a retried poll never double-reports.
@@ -644,5 +686,78 @@ mod tests {
         assert_eq!(PI_BASE_URL, "http://gateway.internal");
         assert!(PI_PLACEHOLDER_TOKEN.starts_with("cadence-sandbox-"));
         assert!(!PI_PLACEHOLDER_TOKEN.contains("sk-"));
+    }
+
+    fn job_state(state: &str, result: Value) -> Value {
+        json!({"ok": true, "data": {
+            "job_id": "job-1", "state": state, "events": [], "result": result
+        }})
+    }
+
+    #[test]
+    fn enabled_dispatch_records_remote_lane_and_never_touches_host_worktree() {
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![(201, created("job-1"))]));
+        let (lane, job) =
+            create_remote_lane(&api, &entitled(), "co-1", &req("CAD-1")).unwrap();
+        assert_eq!(lane.branch, "cad-1-x");
+        assert_eq!(lane.sandbox_id, "csb_job-1");
+        assert_eq!(lane.job_id, "job-1");
+        // Only the create call hit the wire: no host worktree, no git.
+        assert_eq!(api.transport.calls.lock().unwrap().len(), 1);
+        assert_eq!(job.job_id, lane.job_id);
+    }
+
+    #[test]
+    fn disabled_dispatch_refuses_before_any_side_effect() {
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![]));
+        let ent = FakeEntitlement { enabled: Ok(false) };
+        let err = create_remote_lane(&api, &ent, "co-1", &req("CAD-1")).unwrap_err();
+        assert_eq!(code_of(&err), Some(ENTITLEMENT_REFUSED));
+        assert!(api.transport.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn completed_job_is_relayed_once_across_polls() {
+        let result = json!({"sha": SHA, "diff": "+x", "pr": null, "text": "done"});
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![
+            (200, job_state("completed", result.clone())),
+            (200, job_state("completed", result.clone())),
+        ]));
+        let job = SandboxJob {
+            job_id: "job-1".into(),
+            sandbox_id: "csb_job-1".into(),
+            branch: "b".into(),
+            expires_at: "x".into(),
+            gateway_token: "t".into(),
+        };
+        let relay = ResultRelay::default();
+        let first = drive_job(&api, &relay, &job, false).unwrap();
+        assert!(matches!(&first, RunOutcome::Relayed(r) if r.text == "done"));
+        // The relay ledger holds one entry; a second relay over the same
+        // sandbox reports nothing new and keeps the first recorded result.
+        let again = relay.relay(&api, &job).unwrap();
+        assert!(!again, "second relay must not report again");
+        assert_eq!(relay.reported.lock().unwrap().len(), 1);
+        assert_eq!(relay.recorded("csb_job-1").unwrap().text, "done");
+    }
+
+    #[test]
+    fn failed_job_is_stopped_and_relays_nothing() {
+        let api = HttpSandboxApi::new(FakeTransport::with(vec![
+            (200, job_state("failed", json!({"sha": null, "diff": null, "pr": null, "text": ""}))),
+            (200, json!({"ok": true, "data": {"job_id": "job-1", "state": "stopped"}})),
+        ]));
+        let job = SandboxJob {
+            job_id: "job-1".into(),
+            sandbox_id: "csb_job-1".into(),
+            branch: "b".into(),
+            expires_at: "x".into(),
+            gateway_token: "t".into(),
+        };
+        let relay = ResultRelay::default();
+        assert_eq!(drive_job(&api, &relay, &job, false).unwrap(), RunOutcome::Failed);
+        assert!(relay.recorded("csb_job-1").is_none());
+        let calls = api.transport.calls.lock().unwrap();
+        assert_eq!(calls.last().unwrap().1, format!("{JOBS_URL}/job-1/stop"));
     }
 }
