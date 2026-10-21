@@ -175,6 +175,9 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions, hosted: &crate::lease::Hos
     // app/RPC field or forged pin never does. `hosted_email` stays on
     // its lease-gated path: this admission must not activate it.
     compose_hosted_smtp(opts)?;
+    // CAD-1689: the WhatsApp door opens the same way, from its own
+    // image-owned admission, independent of the lease.
+    compose_hosted_whatsapp(opts)?;
     if opts.platforms.contains_key(PLATFORM) {
         return Ok(());
     }
@@ -221,6 +224,26 @@ fn compose_hosted_smtp(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
     };
     if let Some(admission) = admission {
         opts.smtp_internal = Some(super::smtp_internal::SmtpInternal::from_admission(
+            &admission,
+        )?);
+    }
+    Ok(())
+}
+
+/// CAD-1689: independent trusted WhatsApp door composition. Installs the
+/// fixed `api.internal` door only when the image-owned metadata carries the
+/// dedicated `hosted-whatsapp-door@1` admission; the lease path in `attach`
+/// is unchanged and an env URL never admits.
+fn compose_hosted_whatsapp(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
+    if opts.hosted_whatsapp.is_some() {
+        return Ok(());
+    }
+    let admission = match &opts.provider_deployments {
+        Some(metadata) => metadata.hosted_whatsapp(),
+        None => super::deployments::load()?.and_then(|metadata| metadata.hosted_whatsapp()),
+    };
+    if let Some(admission) = admission {
+        opts.hosted_whatsapp = Some(super::hosted_whatsapp::HostedWhatsapp::from_admission(
             &admission,
         )?);
     }

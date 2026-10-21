@@ -256,6 +256,13 @@ enum Wire {
 }
 
 impl HostedWhatsapp {
+    /// CAD-1689: the door base is fixed by the image-owned admission.
+    pub(crate) fn from_admission(
+        _admission: &super::deployments::HostedWhatsappAdmission,
+    ) -> Result<Self> {
+        Self::new(super::deployments::WHATSAPP_ORIGIN)
+    }
+
     pub fn new(base: &str) -> Result<Self> {
         let base = base.trim().trim_end_matches('/').to_string();
         if !(base.starts_with("http://") || base.starts_with("https://")) {

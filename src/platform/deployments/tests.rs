@@ -737,3 +737,30 @@ fn cad1416_business_documents_admission_is_exact_tuple_only() {
     assert!(all.hosted_media().is_some());
     assert!(all.hosted_smtp().is_some());
 }
+
+#[test]
+fn whatsapp_door_admission_needs_the_exact_tuple() {
+    let doc = |provider: &str, origin: &str, pin: &str, transport: &str| {
+        serde_json::to_vec(&serde_json::json!({"schema":1,"providers":[
+            {"provider":provider,"origin":origin,"manifest_pin":pin,"transport":transport}]}))
+        .unwrap()
+    };
+    let exact = DeploymentMetadata::parse(&doc(
+        "whatsapp",
+        "http://api.internal",
+        "whatsapp-door@1",
+        "hosted-whatsapp-door@1",
+    ))
+    .expect("exact tuple parses");
+    assert!(exact.hosted_whatsapp().is_some());
+    assert!(exact.hosted_smtp().is_none() && exact.hosted_media().is_none());
+    for bad in [
+        ("whatsapp", "http://evil.example", "whatsapp-door@1"),
+        ("whatsapp", "http://api.internal", "whatsapp-door@2"),
+        ("other", "http://api.internal", "whatsapp-door@1"),
+    ] {
+        assert!(
+            DeploymentMetadata::parse(&doc(bad.0, bad.1, bad.2, "hosted-whatsapp-door@1")).is_err()
+        );
+    }
+}
