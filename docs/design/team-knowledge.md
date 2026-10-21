@@ -109,7 +109,8 @@ contract only.
 
 ## Acceptance layers (kept separate)
 
-1. **Raw lexical tool probe.** `scripts/verify-pms-knowledge.py` measures
+1. **Raw lexical tool probe.** `scripts/verify-pms-knowledge.py`
+   (operator-local; never committed to this repository) measured
    `wiki search` directly. Raw full-question top-5 success is 0/3 and keyword
    top-5 success is 3/3 on the three PMS cases. These are tool measurements,
    not agent-turn measurements.

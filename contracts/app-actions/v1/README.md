@@ -124,11 +124,14 @@ mirrors the directory and the validator refuses any other tag.
   path in the message. They return a fresh, typed `Descriptor` —
   callers downstream of validation work from the typed form, not the
   raw JSON.
-- **Tests** (`tests/app_actions_contract.rs`): every published example
-  validates against the schema *and* parses; refusal vectors cover the
+- **Tests**: `tests/app_actions_contract.rs` validated every published
+  example against the schema and the parser, with refusal vectors for the
   forged-authority, duplicate-id, wrong-tag, unsupported-operation,
-  enum-coherence and bound cases. Running these tests is validation
-  evidence, not supplied by this document.
+  enum-coherence and bound cases. CAD-1073 retired that exhaustive suite;
+  the retained CAD-1415 acceptance
+  (`src/daemon/cad1415_app_actions_acceptance.rs`) exercises registered
+  installs and actions through the production dispatch path, not every
+  published grammar example.
 - Every consumer runs the validator on descriptor bytes *before* it
   reads a descriptor; downstream code assumes validated input.
 

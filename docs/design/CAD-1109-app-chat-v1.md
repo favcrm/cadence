@@ -116,7 +116,7 @@ count) in app mode and expandable (`StepsGroup`) in Home.
 
 Same discipline as `contracts/app-views/v1`: a JSON Schema
 `contracts/app-chat/v1/app-chat.schema.json` plus a TS validator
-`ui/src/features/app-shell/app-chat/contract.ts` (`parseAppChat`), two
+`ui/src/features/app-shell/chat/contract.ts` (`parseAppChat`), two
 notations of one grammar, changed together. Parity is a test (CAD-1110). A
 descriptor is data: JSON object, plain JSON types only, no accessors.
 

@@ -1741,8 +1741,9 @@ session:
   lateral authorship forgery between agents, with no operator
   privilege. The pty tie was kept because dropping it would have sent a
   `setsid` child of a pane back to `operator (ui)`; since CAD-313 that
-  child is refused instead, and CAD-280 re-decides the tie. `tests/board.rs` pins the
-  residual so a fix flips it deliberately.
+  child is refused instead, and CAD-280 re-decides the tie. The residual is
+  documented in `src/peer.rs`; the former `tests/board.rs` pin was retired
+  with CAD-1073, so no current test flips it deliberately.
 
 Same-user is not a hostile isolation boundary. The operator session
 closes the ambient default (a local caller tied to no agent, and every

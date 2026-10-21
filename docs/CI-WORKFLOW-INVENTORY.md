@@ -3,7 +3,9 @@
 This inventory was taken during the reduced-gate window; CAD-1102 ended that
 window and made the current gate permanent. Required branch checks observed at the start of CAD-1088 are **fmt,
 clippy, test, build, ui**; neither `test-shard` nor `test-once` is required.
-No branch/ruleset settings are changed by this cleanup.
+No branch/ruleset settings are changed by this cleanup. The last three rows
+were added when those workflows landed (CAD-1455, CAD-1506, CAD-1475); the
+rest of the table records the CAD-1088 snapshot.
 
 | Workflow | Triggers | Current role |
 | --- | --- | --- |
@@ -17,6 +19,9 @@ No branch/ruleset settings are changed by this cleanup.
 | `mutation.yml` | Dispatch | Manual guard-removal proof; takes a live cargo test target and test name |
 | `ci-selection-benchmark.yml` | Dispatch | Manual full-versus-selected integration benchmark |
 | `nextest-shard-benchmark.yml` | Dispatch | Manual shard/inventory benchmark |
+| `promotion-completion.yml` | `staging` run completion on main | Binds a promoted candidate's signed receipt to the finished upstream run and attests a small completion receipt; it never approves, rebuilds or deploys (CAD-1455) |
+| `release-mirror.yml` | Dispatch | Manual retry that copies an already published release into the owned release store; no build, retag or byte replacement (CAD-1506) |
+| `release-visibility.yml` | Dispatch on main | Operator-owned private→public flip of one published catalogue record after the `production` environment approval; never writes artifacts, deletes or withdraws (CAD-1475) |
 
 Dormant dispatch files/scripts are retained as rebuild scaffolding in this
 increment, not deleted or advertised as working checks. Do not dispatch them

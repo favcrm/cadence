@@ -218,7 +218,12 @@ there is no applied state or exactly-once external-effect claim here.
 
 ## Verification scope
 
-`tests/remote_result_outbox.rs` uses temporary local files and independent SQLite
+> **Historical.** CAD-1073 retired `tests/remote_result_outbox.rs`,
+> `tests/remote_result_cli.rs` and `tests/remote_result_sender.rs` with the
+> legacy suite. The scope below records what that suite covered; it is not
+> evidence that runs in the current build.
+
+`tests/remote_result_outbox.rs` used temporary local files and independent SQLite
 handles for codec/golden, malformed/forged fields, exact byte limits, reopened
 receipts, identical/conflicting concurrent retries, capacity races, immutable
 destination selection, corruption retention, privacy/symlinks and unchanged
@@ -229,13 +234,13 @@ first in source; red execution was unavailable because the external author had
 no admitted native build recipe. Compilation and behavioral execution belong to
 CI plus independent review, not the standalone formatter.
 
-`tests/remote_result_cli.rs` exercises the actual freshly built CLI with isolated
+`tests/remote_result_cli.rs` exercised the actual freshly built CLI with isolated
 short temp roots: no-HOME and poisoned profile/org/auth defaults with an absent
 daemon and inherited master label, separate-process metadata inspection, exact
 retry bytes/receipt, each destination conflict, altered text/head, canonical
 numeric retry, malformed/oversized stdin before creation, missing custody,
 foreign/symlink database/journal unchanged bytes, and concurrent process retry.
-`tests/remote_result_sender.rs` checks the exact pinned body/URL, strict 202
+`tests/remote_result_sender.rs` checked the exact pinned body/URL, strict 202
 receipt, altered command and pin conflict, wrong credentials/statuses, receipt
 reopen, v1 migration, concurrent duplicate send and actual CLI enrollment/status
 behavior, including zero connection to an untrusted outbox origin.
