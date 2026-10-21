@@ -1548,10 +1548,11 @@ fn cad879_self_requests_no_history() {
 fn recovery_record_verdict_fails_closed_on_every_bad_shape() {
     use cadence_agent::daemon::{INSTANCE_FILE, LAST_RECOVERY_FILE};
     let dir = tempfile::tempdir().unwrap();
-    let verdict = |dir: &std::path::Path| super::recovery_record_verdict(dir, Some("run-b"));
+    let verdict =
+        |dir: &std::path::Path| super::daemon::recovery_record_verdict(dir, Some("run-b"));
 
     // No start answer at all cannot stand in for a binding.
-    assert!(super::recovery_record_verdict(dir.path(), None).is_some());
+    assert!(super::daemon::recovery_record_verdict(dir.path(), None).is_some());
     // No record at all — the predecessor's drain is unverifiable.
     assert!(verdict(dir.path()).is_some());
     // Unparseable JSON is evidence that never reached the writer.
@@ -1650,15 +1651,21 @@ fn recovery_record_verdict_fails_closed_on_every_bad_shape() {
 fn started_instance_binds_only_to_a_spawned_daemon() {
     let health = json!({"instance": "run-x", "pid": 7});
     assert_eq!(
-        super::started_instance(&json!({"state": "started", "health": health})),
+        super::daemon::started_instance(&json!({"state": "started", "health": health})),
         Some("run-x".to_string())
     );
     assert_eq!(
-        super::started_instance(&json!({"state": "already_running", "health": health})),
+        super::daemon::started_instance(&json!({"state": "already_running", "health": health})),
         None
     );
-    assert_eq!(super::started_instance(&json!({"health": health})), None);
-    assert_eq!(super::started_instance(&json!({"state": "started"})), None);
+    assert_eq!(
+        super::daemon::started_instance(&json!({"health": health})),
+        None
+    );
+    assert_eq!(
+        super::daemon::started_instance(&json!({"state": "started"})),
+        None
+    );
 }
 
 /// Every `"key":` token in `text`, tagged with the JSON nesting depth it
