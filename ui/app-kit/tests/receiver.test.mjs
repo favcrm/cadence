@@ -1,6 +1,7 @@
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import {
+  MAX_ASSET_BYTES,
   MAX_STATE_BYTES,
   ScreenClosedError,
   ScreenRefusalError,
@@ -297,7 +298,7 @@ test("a slot stays open through pending and resolves on done", async () => {
   const { host, inbox, pushes, receiver } = connect({ onSlotState: (event) => events.push(event) });
   host.postMessage(push());
   await waitFor(() => pushes.length === 1, "the first push");
-  const pending = receiver.slot("publish.cancel", {}, "footer");
+  const pending = receiver.slot("publish.cancel", {});
   const request = await waitFor(() => inbox.find((m) => m.op === "slot"), "the slot request");
   host.postMessage({ v: 2, op: "slot-state", id: request.id, state: "pending" });
   await tick();
@@ -334,4 +335,60 @@ test("a refused boot returns an inert receiver whose calls also report closed", 
   await assert.rejects(receiver.call("read.run", {}), ScreenClosedError);
   await assert.rejects(receiver.asset("media:1"), ScreenClosedError);
   assert.equal(receiver.state("x"), false);
+});
+
+test("a v1-only receiver sends the bare ready envelope", async () => {
+  const { inbox } = connect({ accepts: ["screen.v1"] });
+  await tick();
+  assert.deepEqual(inbox[0], { v: 1, op: "ready" });
+});
+
+test("a second concurrent tool call is refused locally", async () => {
+  const { host, inbox, pushes, receiver } = connect({ accepts: ["screen.v2", "screen-actions.v1"], timeoutMs: 1000 });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const first = receiver.tool("social.publish", {}, "req-1");
+  const request = await waitFor(() => inbox.find((m) => m.op === "tool"), "the tool request");
+  await assert.rejects(receiver.tool("social.publish", {}, "req-2"), (error) => {
+    assert.ok(error instanceof ScreenRefusalError);
+    assert.equal(error.code, "conflict");
+    return true;
+  });
+  assert.equal(inbox.filter((m) => m.op === "tool").length, 1);
+  host.postMessage({ v: 2, op: "tool-reply", id: request.id, ok: true, data: { accepted: true } });
+  assert.deepEqual(await first, { accepted: true });
+  const third = receiver.tool("social.publish", {}, "req-3");
+  await waitFor(() => inbox.filter((m) => m.op === "tool").length === 2, "the third tool request");
+  const next = inbox.filter((m) => m.op === "tool").at(-1);
+  host.postMessage({ v: 2, op: "tool-reply", id: next.id, ok: true, data: {} });
+  await third;
+});
+
+test("a malformed call refusal tears down and rejects its own request", async () => {
+  const { host, inbox, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const pending = receiver.call("read.run", {});
+  const rejected = assert.rejects(pending, ScreenClosedError);
+  const request = await waitFor(() => inbox.find((m) => m.op === "call"), "the call");
+  host.postMessage({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "BAD CODE" } });
+  await waitFor(() => errors.length === 1, "the malformed teardown");
+  await rejected;
+});
+
+test("an oversized asset data URL tears down", async () => {
+  const { host, pushes, errors, receiver } = connect();
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the first push");
+  const pending = receiver.asset("media:1");
+  const rejected = assert.rejects(pending, ScreenClosedError);
+  await tick();
+  host.postMessage({
+    v: 2,
+    op: "asset",
+    ref: "media:1",
+    data_url: "data:image/png;base64," + "A".repeat(MAX_ASSET_BYTES),
+  });
+  await waitFor(() => errors.length === 1, "the bound teardown");
+  await rejected;
 });

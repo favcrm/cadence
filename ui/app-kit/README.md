@@ -53,12 +53,17 @@ reference receiver and `screenProtocol.ts`):
   that, and on a v1-only mount, they reject with `ScreenClosedError`
   (`code: "gone"`) instead of posting a request the host cannot answer.
 - `tool` additionally requires `accepts` to include `screen-actions.v1`; the
-  host closes a port that sends a tool call without the negotiation.
+  host closes a port that sends a tool call without the negotiation. One tool
+  call is outstanding at a time — a second is refused locally with
+  `conflict` (the host closes the mount on concurrent tool calls).
+- A v1-only mount sends the bare `{op:"ready"}` envelope; `screen.v1` is a
+  local PUSH filter, never a name on the wire (the host refuses it).
 - A slot's `pending` event arrives through `onSlotState` and leaves the
   promise open; only `done`/`refused` settle it, so the receipt is never lost.
 - Host replies must be `v:2` and answer the request's own kind (`call`→`reply`,
   `slot`→`slot-state`, `tool`→`tool-reply`); anything else tears the port down.
-- Asset replies carry `data:image/(jpeg|png|webp);base64,…` within the bound.
+- Asset replies carry `data:image/(jpeg|png|webp);base64,…` within the 96 KiB
+  image's encoded allowance (`MAX_ASSET_BYTES`).
 - `args`/`input` are plain objects within 16 KiB; `anchor` is exactly
   `{x,y,w,h}` in frame coordinates (or `"footer"`); ids follow
   `ACTION_ID`, tool aliases `TOOL_ALIAS`, `request_id` `TOOL_REQUEST_ID`.
@@ -69,8 +74,9 @@ reference receiver and `screenProtocol.ts`):
   later disagreement tears the port down.
 - Teardown rejects every outstanding request with `ScreenClosedError`, so no
   caller is left pending on a dead mount.
-- A slot resolves the host's event (`{state, receipt?, data?, refusal?}`), not
-  just `state`; a `done` receipt is never dropped.
+- A slot's `pending` is progress, not a result: it goes to `onSlotState` and
+  the promise stays open until `done`/`refused` (which resolve the host's
+  event, receipt included). The optional anchor defaults to `"footer"`.
 
 What stays app-owned: the closed verb set and per-verb arg shapes (the PUSH
 `actions` advertisement), payload validation in `onPush`, and which asset refs

@@ -15,7 +15,9 @@
 import { ScreenClosedError, ScreenRefusalError, ScreenTimeoutError, readRefusal } from "./refusal.mjs";
 
 export const MAX_STATE_BYTES = 32 * 1024;
-export const MAX_ASSET_BYTES = 2 * 1024 * 1024;
+/** The encoded allowance for a 96 KiB image (base64 + prefix), matching
+ *  `ASSET_BYTES_MAX` and the reference receiver's `MAX_DATA_URL`. */
+export const MAX_ASSET_BYTES = Math.ceil((96 * 1024 * 4) / 3) + 32;
 export const DEFAULT_TIMEOUT_MS = 15_000;
 
 const BOOT_ID = "cadence-screen-boot";
@@ -169,6 +171,14 @@ export function createScreenReceiver(options = {}) {
     throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1");
   }
   const actionsAccepted = accepts.includes("screen-actions.v1");
+  if (actionsAccepted && !accepts.includes("screen.v2")) {
+    throw new TypeError("screen-actions.v1 needs screen.v2");
+  }
+  // `screen.v1` is a local PUSH filter. The host's ready envelope admits only
+  // v2 contract names, and a v1-only mount sends the bare ready.
+  const ready = accepts.includes("screen.v2")
+    ? { v: 1, op: "ready", accepts: ["screen.v2", ...(actionsAccepted ? ["screen-actions.v1"] : [])] }
+    : { v: 1, op: "ready" };
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new TypeError("timeoutMs must be positive");
   if (!parent || typeof parent.postMessage !== "function") throw new TypeError("a parent window is required");
   if (typeof Channel !== "function") throw new TypeError("MessageChannel is unavailable");
@@ -193,6 +203,7 @@ export function createScreenReceiver(options = {}) {
   let locked = null;
   let liveV2 = false;
   let seq = 0;
+  let toolsInFlight = 0;
 
   const close = (reason, notify) => {
     if (tornDown) return;
@@ -271,15 +282,15 @@ export function createScreenReceiver(options = {}) {
       entry.resolve(event);
       return true;
     }
+    const refusal = message.ok === false ? readRefusal(message.refusal) : null;
+    if (message.ok !== true && !(message.ok === false && refusal)) {
+      // Throw before removal: teardown then rejects this entry with the rest.
+      throw new Error(`malformed ${message.op} reply`);
+    }
     pending.delete(message.id);
     clearTimeout(entry.timer);
-    if (message.ok === true) {
-      entry.resolve(message.data);
-      return true;
-    }
-    const refusal = readRefusal(message.refusal);
-    if (message.ok === false && refusal) entry.reject(new ScreenRefusalError(refusal));
-    else throw new Error(`malformed ${message.op} reply`);
+    if (message.ok === true) entry.resolve(message.data);
+    else entry.reject(new ScreenRefusalError(refusal));
     return true;
   };
 
@@ -329,7 +340,7 @@ export function createScreenReceiver(options = {}) {
       boot.parent_origin,
       [channel.port2],
     );
-    port.postMessage({ v: 1, op: "ready", accepts: [...accepts] });
+    port.postMessage(ready);
   } catch (error) {
     close(`init postMessage: ${error.message}`, true);
     return inert(`init postMessage: ${error.message}`);
@@ -349,7 +360,7 @@ export function createScreenReceiver(options = {}) {
       }
       return request("call", { verb, args });
     },
-    slot(verb, args = {}, anchor = {}) {
+    slot(verb, args = {}, anchor = "footer") {
       if (typeof verb !== "string" || verb.length === 0 || verb.length > 128) {
         return Promise.reject(new TypeError("verb must be a non-empty string of at most 128 characters"));
       }
@@ -374,7 +385,15 @@ export function createScreenReceiver(options = {}) {
       if (typeof requestId !== "string" || !TOOL_REQUEST_ID.test(requestId)) {
         return Promise.reject(new TypeError("tool request_id is required and bounded"));
       }
-      return request("tool", { alias, input, request_id: requestId });
+      // The host closes the mount on a second concurrent tool call; refuse
+      // locally instead of destroying the channel.
+      if (toolsInFlight > 0) {
+        return Promise.reject(new ScreenRefusalError({ code: "conflict", text: "Another tool call is already running." }));
+      }
+      toolsInFlight += 1;
+      return request("tool", { alias, input, request_id: requestId }).finally(() => {
+        toolsInFlight -= 1;
+      });
     },
     asset(ref) {
       if (typeof ref !== "string" || ref.length === 0 || ref.length > 512) {
