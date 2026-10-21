@@ -1034,6 +1034,28 @@ pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
     // actor and keep their pseudo-endpoint across restarts.
     for agent in shared.store.agents()? {
         if !agent.enabled {
+            // A disabled sandbox may still own a durable stop request
+            // from before the restart; recover it to stop the remote.
+            if agent.provider == "sandbox" && agent.endpoint_kind == "sandbox" {
+                for message in shared.store.messages(&agent.alias)? {
+                    if !matches!(message.state.as_str(), "queued" | "unknown")
+                        || message.source != "job_dispatch"
+                        || !shared.store.cloud_stop_requested(&message.id)?
+                    {
+                        continue;
+                    }
+                    let Some(task_id) = message.task_id.clone() else {
+                        continue;
+                    };
+                    let shared = Arc::clone(shared);
+                    let message_id = message.id.clone();
+                    std::thread::spawn(move || {
+                        if let Err(error) = shared.run_cloud_dispatch(&task_id, &message_id) {
+                            eprintln!("cloud sandbox recovery {task_id} failed: {error}");
+                        }
+                    });
+                }
+            }
             // No actor can prove these recovered panes; release any
             // matching report waiter to fail closed against recovery state.
             shared.adoptions_settle(&agent.alias);
@@ -1046,7 +1068,9 @@ pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
             // original remote job.
             if agent.provider == "sandbox" && agent.endpoint_kind == "sandbox" {
                 for message in shared.store.messages(&agent.alias)? {
-                    if message.state != "queued" || message.source != "job_dispatch" {
+                    if !matches!(message.state.as_str(), "queued" | "unknown")
+                        || message.source != "job_dispatch"
+                    {
                         continue;
                     }
                     let Some(task_id) = message.task_id.clone() else {

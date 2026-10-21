@@ -95,7 +95,13 @@ fn create_request(job: &Job, task: &Task, message_id: &str, body: &str) -> Resul
         branch: branch.to_string(),
         base_sha: base_sha.to_string(),
         spec,
-        idempotency_key: format!("cloud-sandbox:{}:{}", task.id, message_id),
+        // AOS caps the key at 128 chars; a fixed digest keeps it stable
+        // and short for any task/message id length.
+        idempotency_key: {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(format!("{}:{}", task.id, message_id).as_bytes());
+            format!("cloud-sandbox:{digest:x}")
+        },
     })
 }
 
@@ -130,7 +136,7 @@ pub fn run_dispatch(
         fail_message(store, message, &error);
         error
     })?;
-    let (lane, result) = match execute(pm, task, job, message, agent, stop) {
+    let (lane, result) = match execute(pm, store, task, job, message, agent, stop) {
         Ok(value) => value,
         Err(error) if error.code() == Some(UNCERTAIN) => {
             // The remote job may still be a writer. Leave the kickoff
@@ -197,6 +203,7 @@ pub fn interrupt_message(store: &Store, message: &Message, error: &Error) {
 
 fn execute(
     pm: &Pm,
+    store: &Store,
     task: &Task,
     job: &Job,
     message: &Message,
@@ -205,20 +212,29 @@ fn execute(
 ) -> Result<(RemoteLane, SandboxResult)> {
     let request = create_request(job, task, &message.id, &message.body)?;
     let client = HttpSandboxApi::new(UreqSandboxTransport::new(None));
+    let (authorized, prior_attempt) = store.authorize_cloud_create(&message.id)?;
+    if !authorized {
+        return Err(stopped_error(
+            "cloud sandbox dispatch was stopped before any remote create",
+        ));
+    }
     let job_handle = match client.create_job(&request) {
         Ok(handle) => handle,
         Err(error)
-            if matches!(
-                error.code(),
-                Some(crate::adapter::sandbox::ENTITLEMENT_REFUSED)
-                    | Some(crate::adapter::sandbox::SANDBOX_UNAVAILABLE)
-            ) =>
+            if !prior_attempt
+                && matches!(
+                    error.code(),
+                    Some(crate::adapter::sandbox::ENTITLEMENT_REFUSED)
+                        | Some(crate::adapter::sandbox::SANDBOX_UNAVAILABLE)
+                ) =>
         {
-            // A definitive refusal/route absence means no remote exists.
+            // No earlier attempt and a definitive refusal/route absence:
+            // no remote exists. A replay could describe a live job.
             return Err(error);
         }
         Err(error) => {
-            // A transport loss after the request may have created the job.
+            // The request may have created the job before its response was
+            // lost; preserve the same kickoff identity.
             return Err(uncertain(format!(
                 "cloud sandbox create outcome is unknown: {error}"
             )));
@@ -627,7 +643,9 @@ mod tests {
         let task = cloud_task(&repo, 3);
         let request = create_request(&job, &task, "m1", "body").unwrap();
         assert_eq!(request.spec, "body");
-        assert_eq!(request.idempotency_key, "cloud-sandbox:t1:m1");
+        assert!(request.idempotency_key.starts_with("cloud-sandbox:"));
+        assert!(request.idempotency_key.len() <= 128);
+        assert!(request.idempotency_key.len() >= 8);
         let mut next = task.clone();
         next.revision = 4;
         assert_eq!(
@@ -641,6 +659,14 @@ mod tests {
                 .unwrap()
                 .idempotency_key,
             request.idempotency_key
+        );
+        let mut long = task.clone();
+        long.id = "t".repeat(300);
+        let long_request = create_request(&job, &long, &"m".repeat(300), "body").unwrap();
+        assert!(
+            long_request.idempotency_key.len() <= 128,
+            "{}",
+            long_request.idempotency_key.len()
         );
         let long = "x".repeat(SANDBOX_SPEC_BYTES + 1);
         let err = create_request(&job, &task, "m1", &long)

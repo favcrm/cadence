@@ -19,6 +19,66 @@
     }
 
     #[test]
+    fn dispatch_refuses_a_changed_assignee_and_blocks_unknown_kickoffs() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        reg_pty(&s, "w2", &cwd);
+        s.create_task("j1", "t6", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let error = s
+            .dispatch_task_for("t6", None, None, "test", Some("w2"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("assignee changed"), "{error}");
+
+        s.create_task("j1", "t7", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, message, ..) = s.dispatch_task("t7", None, None, "test").unwrap();
+        let row = s.message(&message).unwrap().unwrap();
+        s.finish(&row, "unknown", &json!({"text": "unknown"}), None)
+            .unwrap();
+        let (_, same, duplicate, _) = s.dispatch_task("t7", None, None, "test").unwrap();
+        assert!(duplicate);
+        assert_eq!(same, message);
+    }
+
+    #[test]
+    fn stopped_fresh_create_is_refused_but_replay_is_allowed() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task("j1", "t4", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, message, ..) = s.dispatch_task("t4", None, None, "test").unwrap();
+        assert_eq!(s.authorize_cloud_create(&message).unwrap(), (true, false));
+        s.request_cloud_stop(&message).unwrap();
+        assert_eq!(s.authorize_cloud_create(&message).unwrap(), (true, true));
+
+        s.create_task("j1", "t5", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, fresh, ..) = s.dispatch_task("t5", None, None, "test").unwrap();
+        s.request_cloud_stop(&fresh).unwrap();
+        assert_eq!(s.authorize_cloud_create(&fresh).unwrap(), (false, false));
+    }
+
+    #[test]
+    fn cloud_create_attempt_is_durable() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task("j1", "t3", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, message, ..) = s.dispatch_task("t3", None, None, "test").unwrap();
+        assert!(!s.cloud_create_attempted(&message).unwrap());
+        s.note_cloud_create_attempt(&message).unwrap();
+        assert!(s.cloud_create_attempted(&message).unwrap());
+    }
+
+    #[test]
     fn cloud_publication_blocks_a_late_stop() {
         let (dir, s) = store();
         let cwd = dir.path().join("w");

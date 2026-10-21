@@ -447,18 +447,20 @@ impl Shared {
             crate::issue::cloud::probe_entitlement()?;
         }
         let (task, message, duplicate, behind_dead) = match &expect {
-            Some(expect) => self.store.dispatch_task_expecting(
+            Some(expect) => self.store.dispatch_task_expecting_for(
                 task_id,
                 to.as_deref(),
                 optional_str(params, "message"),
                 by,
                 expect,
+                target_alias,
             )?,
-            None => self.store.dispatch_task(
+            None => self.store.dispatch_task_for(
                 task_id,
                 to.as_deref(),
                 optional_str(params, "message"),
                 by,
+                target_alias,
             )?,
         };
         if cloud_dispatch {
@@ -497,10 +499,13 @@ impl Shared {
         let message = self.store.message(message_id)?.ok_or_else(|| {
             Error::rejected(format!("cloud dispatch message '{message_id}' is gone"))
         })?;
-        if !self
-            .store
-            .mark_running_queued(&message.id, &format!("cloud:{}", message.id))?
-        {
+        let turn = format!("cloud:{}", message.id);
+        let claimed = if message.state == "unknown" {
+            self.store.claim_cloud_recovery(&message.id, &turn)?
+        } else {
+            self.store.mark_running_queued(&message.id, &turn)?
+        };
+        if !claimed {
             return Ok(());
         }
         let task = self
@@ -521,27 +526,39 @@ impl Shared {
         let pm = self
             .pm()
             .map_err(|error| fail(&self.store, &message, error))?;
-        let outcome = crate::issue::cloud::run_dispatch(
-            &pm,
-            &self.store,
-            &task,
-            &job,
-            &message,
-            &agent,
-            &|| {
-                self.store
-                    .cloud_stop_requested(&message.id)
-                    .unwrap_or(false)
-            },
-        );
-        if let Err(error) = &outcome {
-            if error.code() == Some(crate::issue::cloud::UNCERTAIN) {
-                let _ = self
-                    .store
-                    .requeue_cloud_claim(&message.id, &format!("cloud:{}", message.id));
+        loop {
+            let outcome = crate::issue::cloud::run_dispatch(
+                &pm,
+                &self.store,
+                &task,
+                &job,
+                &message,
+                &agent,
+                &|| {
+                    self.store
+                        .cloud_stop_requested(&message.id)
+                        .unwrap_or(false)
+                },
+            );
+            if let Err(error) = &outcome {
+                if error.code() == Some(crate::issue::cloud::UNCERTAIN) {
+                    let _ = self
+                        .store
+                        .requeue_cloud_claim(&message.id, &format!("cloud:{}", message.id));
+                    // Re-enter the same kickoff/remote identity instead of
+                    // leaving a queued claim without a consumer.
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    if !self
+                        .store
+                        .mark_running_queued(&message.id, &format!("cloud:{}", message.id))?
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                }
             }
+            return outcome;
         }
-        outcome
     }
 
     /// `job verdict` — the reviewer is the verified caller (CAD-372),

@@ -847,7 +847,22 @@ impl Store {
         message_id: Option<&str>,
         by: &str,
     ) -> Result<(Task, String, bool, bool)> {
-        self.dispatch_task_inner(task_id, to, message_id, by, None)
+        self.dispatch_task_inner(task_id, to, message_id, by, None, None)
+    }
+
+    /// `dispatch_task` for a caller that selected the backend from the
+    /// pre-transaction assignee. The transaction refuses if the task's
+    /// assignee changed before this write, so a local/cloud choice can
+    /// never be applied to a different worker.
+    pub fn dispatch_task_for(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        expected_assignee: Option<&str>,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(task_id, to, message_id, by, Some(expected_assignee), None)
     }
 
     /// `dispatch_task` for an assist-bound job: the fenced transaction first
@@ -862,7 +877,28 @@ impl Store {
         by: &str,
         expect: &AssistDispatchExpect,
     ) -> Result<(Task, String, bool, bool)> {
-        self.dispatch_task_inner(task_id, to, message_id, by, Some(expect))
+        self.dispatch_task_inner(task_id, to, message_id, by, None, Some(expect))
+    }
+
+    /// `dispatch_task_expecting` with the pre-transaction assignee pinned
+    /// in the same fenced write.
+    pub fn dispatch_task_expecting_for(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        expect: &AssistDispatchExpect,
+        expected_assignee: Option<&str>,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(
+            task_id,
+            to,
+            message_id,
+            by,
+            Some(expected_assignee),
+            Some(expect),
+        )
     }
 
     fn dispatch_task_inner(
@@ -871,6 +907,7 @@ impl Store {
         to: Option<&str>,
         message_id: Option<&str>,
         by: &str,
+        expected_assignee: Option<Option<&str>>,
         expect: Option<&AssistDispatchExpect>,
     ) -> Result<(Task, String, bool, bool)> {
         self.write_tx(|conn| {
@@ -922,6 +959,15 @@ impl Store {
                              `cadence job dispatch {task_id} --to <worker>`"
                 ))
             })?;
+            if let Some(expected) = expected_assignee {
+                if Some(assignee) != expected {
+                    return Err(Error::rejected(format!(
+                        "Task '{task_id}' assignee changed to '{assignee}' while \
+                         dispatching — retry so the local/cloud choice follows the \
+                         final worker"
+                    )));
+                }
+            }
             let worker = self.agent_in(&tx, assignee)?;
             self.check_group_member(&job, &worker)?;
             refuse_archived_assignee(&worker)?;
@@ -935,7 +981,10 @@ impl Store {
                         .dispatch_message
                         .as_deref()
                         .and_then(|m| self.message_in(&tx, m).ok().flatten())
-                        .filter(|m| !is_terminal(&m.state))
+                        .filter(|m| {
+                            !is_terminal(&m.state)
+                                || (m.state == "unknown" && m.source == "job_dispatch")
+                        })
                         .map(|m| m.id);
                     if let Some(live_id) = live_id {
                         // Kickoff still in flight — a second dispatch is a

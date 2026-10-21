@@ -697,7 +697,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                     )));
                 }
                 Ok(_) => {}
-                Err(error) if error.to_string().contains("Unknown agent") => {}
+                Err(error) if error.to_string().contains("Unknown managed agent") => {}
                 Err(error) => return Err(error),
             }
         }

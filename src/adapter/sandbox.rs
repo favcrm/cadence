@@ -463,22 +463,20 @@ impl<T: SandboxTransport> SandboxClient for HttpSandboxApi<T> {
 }
 
 impl<T: SandboxTransport> HttpSandboxApi<T> {
-    /// Non-executing entitlement probe: AOS's GET job route checks the
-    /// company's `cloud_sandbox` row before it looks the job up. A fixed
-    /// absent id therefore returns 403 when disabled and 404 when enabled,
-    /// with no remote create or store write. This is the admission gate the
-    /// daemon and the CLI run before any cloud lane/message effect.
+    /// Non-executing entitlement probe. AOS's create route checks the
+    /// company's `cloud_sandbox` row before parsing the request, so an
+    /// intentionally invalid body returns 403 when disabled and 400
+    /// `invalid_request` when enabled without creating a job. A missing
+    /// route is a 404 and fails closed as unavailable.
     pub fn entitled(&self) -> Result<bool> {
-        let (status, envelope) = self
-            .transport
-            .send("GET", &format!("{JOBS_URL}/probe"), None)?;
+        let (status, envelope) = self.transport.send("POST", JOBS_URL, Some(&json!({})))?;
         let code = envelope
             .pointer("/error/code")
             .and_then(Value::as_str)
             .unwrap_or("");
         match (status, code) {
             (403, "cloud_sandbox_not_entitled") => Ok(false),
-            (404, _) | (200..=299, _) => Ok(true),
+            (400, "invalid_request") => Ok(true),
             _ => Err(map_error(status, code)),
         }
     }
@@ -877,22 +875,28 @@ mod tests {
     }
 
     #[test]
-    fn entitlement_probe_uses_get_and_distinguishes_refusal() {
+    fn entitlement_probe_uses_an_invalid_create_and_distinguishes_refusal() {
         let api = HttpSandboxApi::new(FakeTransport::with(vec![
-            (404, json!({"ok": false, "error": {"code": "not_found"}})),
+            (
+                400,
+                json!({"ok": false, "error": {"code": "invalid_request"}}),
+            ),
             (
                 403,
                 json!({"ok": false, "error": {"code": "cloud_sandbox_not_entitled"}}),
             ),
+            (404, json!({"ok": false, "error": {"code": "not_found"}})),
         ]));
         assert!(api.entitled().unwrap());
         let error = require_entitlement(&api, "co-1").unwrap_err();
         assert_eq!(error.code(), Some(ENTITLEMENT_REFUSED));
+        let unavailable = require_entitlement(&api, "co-1").unwrap_err();
+        assert_eq!(unavailable.code(), Some(ENTITLEMENT_REFUSED));
         let calls = api.transport.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert!(calls
-            .iter()
-            .all(|(method, url, _)| method == "GET" && url == &format!("{JOBS_URL}/probe")));
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|(method, url, body)| method == "POST"
+            && url == JOBS_URL
+            && body.as_ref() == Some(&json!({}))));
     }
 
     #[test]

@@ -1055,6 +1055,17 @@ impl Shared {
                         self.store.request_cloud_stop(&message.id)?;
                         queued += 1;
                     }
+                    "unknown" => {
+                        self.store.request_cloud_stop(&message.id)?;
+                        running += 1;
+                        if let Some(task_id) = message.task_id.clone() {
+                            let shared = Arc::clone(self);
+                            let message_id = message.id.clone();
+                            std::thread::spawn(move || {
+                                let _ = shared.run_cloud_dispatch(&task_id, &message_id);
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
