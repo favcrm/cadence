@@ -7,6 +7,7 @@
 
 use super::independent_public_owner_attribution::Native;
 use super::{call, Session};
+use crate::board_identity::Role;
 use crate::operator_auth::{BoardUser, PublicRealm};
 use crate::test_seam::Asserted;
 use serde_json::{json, Value};
@@ -37,12 +38,12 @@ fn content_for(kind: &str) -> Value {
 // open_public_bound constructor the owner fixture uses. owner() mints one
 // fixed JTI, so a second session or a second human needs a distinct JTI.
 // Test-only: no production path or gate is changed.
-fn public_session(native: &Native, sub: &str, jti: &str) -> Session {
+fn public_session(native: &Native, sub: &str, jti: &str, role: &str) -> Session {
     let user = BoardUser {
         sub: sub.into(),
         email: format!("{sub}@example.test"),
         name: format!("Synthetic {sub}"),
-        role: "operator".into(),
+        role: role.into(),
         handle: sub.into(),
     };
     let now = native.shared.operator_now();
@@ -273,23 +274,34 @@ fn public_call(
 
 #[test]
 fn cad811_works_read_only_member_refused_operator_reads() {
-    let native = Native::new_with_subs(&["synthetic-c811-owner", "c811-member"]);
-    let scope = native.fx.install("works-readonly", WORKS_OPS);
+    let native = Native::new_with_roles(&[
+        ("synthetic-c811-owner", Role::Operator),
+        ("c811-member", Role::Member),
+    ]);
+    let ops = [WORKS_OPS, &["records.list"]].concat();
+    let scope = native.fx.install("works-readonly", &ops);
     let (owner, _) = native.owner();
-    let action = native.mount(&owner, "public", &scope, 1);
-    // A genuine member: a verified, admitted human who is not the install
-    // owner and holds no operator session.
-    let member = public_session(&native, "c811-member", "c811-member-jti");
+    let member = public_session(&native, "c811-member", "c811-member-jti", "member");
+    let member_action = native.mount(&member, "public", &scope, 1);
+    let records = native.service(
+        &member,
+        "public",
+        &member_action,
+        "records.list",
+        json!({}),
+        false,
+    );
+    assert!(records.is_object(), "member read-only mount is valid");
     let before = works_snapshot(&native, &scope.install);
     refused(
-        public_call(&native, &member, &action, "works.query", json!({})),
+        public_call(&native, &member, &member_action, "works.query", json!({})),
         "member works.query",
     );
     refused(
         public_call(
             &native,
             &member,
-            &action,
+            &member_action,
             "works.get",
             json!({"id": "doc-x"}),
         ),
@@ -300,7 +312,15 @@ fn cad811_works_read_only_member_refused_operator_reads() {
         before,
         "member refusal must not write"
     );
-    let ok = native.service(&owner, "public", &action, "works.query", json!({}), false);
+    let owner_action = native.mount(&owner, "public", &scope, 2);
+    let ok = native.service(
+        &owner,
+        "public",
+        &owner_action,
+        "works.query",
+        json!({}),
+        false,
+    );
     assert!(ok.is_array(), "operator public works.query succeeds");
 }
 
@@ -335,6 +355,7 @@ fn cad811_works_same_human_second_session_review_refuses() {
         &native,
         "synthetic-c811-owner",
         "c811-works-second-session-jti",
+        "operator",
     );
     // A mount is bound to the session that minted it: the second session mints
     // its own action for the same scope, so the refusal is the store's
@@ -370,7 +391,7 @@ fn cad811_works_unverified_review_refuses_without_writes() {
         false,
     );
     let id = created["id"].as_str().expect("created id").to_owned();
-    let before = native.durable_snapshot(&scope);
+    let before = works_snapshot(&native, &scope.install);
     let local = native.local();
     refused(
         native.fx.call(
@@ -386,7 +407,7 @@ fn cad811_works_unverified_review_refuses_without_writes() {
         "unverified local review",
     );
     assert_eq!(
-        native.durable_snapshot(&scope),
+        works_snapshot(&native, &scope.install),
         before,
         "refused review must not write"
     );
@@ -546,7 +567,7 @@ fn cad811_works_near_limit_bridge_payload_and_oversize_refusal() {
         "near-limit valid content crosses the bridge"
     );
     // Beyond the 80 KiB envelope refuses without writes.
-    let before = native.durable_snapshot(&scope);
+    let before = works_snapshot(&native, &scope.install);
     refused(
         native.fx.call(
             Asserted::Operator,
@@ -557,7 +578,7 @@ fn cad811_works_near_limit_bridge_payload_and_oversize_refusal() {
         "oversized works.create",
     );
     assert_eq!(
-        native.durable_snapshot(&scope),
+        works_snapshot(&native, &scope.install),
         before,
         "oversized refusal must not write"
     );
@@ -628,6 +649,7 @@ fn cad811_works_two_verified_operators_approve_and_export() {
         &native,
         "synthetic-c811-reviewer",
         "c811-works-reviewer-jti",
+        "operator",
     );
     let reviewer_action = native.mount(&reviewer, "public", &scope, 2);
 
@@ -674,7 +696,7 @@ fn cad811_works_two_verified_operators_approve_and_export() {
         "works.export",
         (
             json!({"id": id, "revision": revision, "format": "html"}),
-            json!({"confirmed": true, "choice": "export"}),
+            json!({"confirmed": true, "choice": "html"}),
         ),
         false,
     );
@@ -682,6 +704,10 @@ fn cad811_works_two_verified_operators_approve_and_export() {
         receipt.is_object(),
         "author exports the approved current revision: {receipt}"
     );
+    assert_eq!(receipt["id"], id);
+    assert_eq!(receipt["revision"], revision);
+    assert_eq!(receipt["format"], "html");
+    assert_eq!(receipt["digest"], created["contentDigest"]);
 }
 
 // Prepares a SLOT confirmation over the real prepare RPC and returns the
@@ -731,7 +757,12 @@ fn cad811_works_confirmation_reuse_refuses() {
     let scope = native.fx.install("works-reuse", WORKS_OPS);
     let (author, _) = native.owner();
     let author_action = native.mount(&author, "public", &scope, 1);
-    let reviewer = public_session(&native, "synthetic-c811-reviewer", "c811-works-reuse-jti");
+    let reviewer = public_session(
+        &native,
+        "synthetic-c811-reviewer",
+        "c811-works-reuse-jti",
+        "operator",
+    );
     let reviewer_action = native.mount(&reviewer, "public", &scope, 2);
     let created = native.service(
         &author,
@@ -817,7 +848,12 @@ fn cad1662_changed_facts_after_prepare_refuse_through_slot_confirm() {
     let scope = native.fx.install("works-facts", WORKS_OPS);
     let (author, _) = native.owner();
     let author_action = native.mount(&author, "public", &scope, 1);
-    let reviewer = public_session(&native, "synthetic-c811-reviewer", "c811-works-facts-jti");
+    let reviewer = public_session(
+        &native,
+        "synthetic-c811-reviewer",
+        "c811-works-facts-jti",
+        "operator",
+    );
     let reviewer_action = native.mount(&reviewer, "public", &scope, 2);
     let created = native.service(
         &author,
@@ -860,8 +896,13 @@ fn cad1662_changed_facts_after_prepare_refuse_through_slot_confirm() {
         .expect_err("changed facts must refuse the confirm");
     assert_eq!(
         error.kind(),
-        "rejected",
+        "conflict",
         "changed facts: wrong refusal kind"
+    );
+    assert_eq!(
+        error.code(),
+        Some("facts_changed"),
+        "changed facts: wrong refusal code"
     );
     let shown = native.service(
         &author,
@@ -885,7 +926,12 @@ fn cad1662_expired_confirmation_refuses_through_slot_confirm() {
     let scope = native.fx.install("works-expiry", WORKS_OPS);
     let (author, _) = native.owner();
     let author_action = native.mount(&author, "public", &scope, 1);
-    let reviewer = public_session(&native, "synthetic-c811-reviewer", "c811-works-expiry-jti");
+    let reviewer = public_session(
+        &native,
+        "synthetic-c811-reviewer",
+        "c811-works-expiry-jti",
+        "operator",
+    );
     let reviewer_action = native.mount(&reviewer, "public", &scope, 2);
     let created = native.service(
         &author,
@@ -939,7 +985,12 @@ fn cad1662_retired_reviewer_authority_refuses_after_membership_withdrawal() {
     let scope = native.fx.install("works-revoke", WORKS_OPS);
     let (author, _) = native.owner();
     let author_action = native.mount(&author, "public", &scope, 1);
-    let reviewer = public_session(&native, "synthetic-c811-reviewer", "c811-works-revoke-jti");
+    let reviewer = public_session(
+        &native,
+        "synthetic-c811-reviewer",
+        "c811-works-revoke-jti",
+        "operator",
+    );
     let reviewer_action = native.mount(&reviewer, "public", &scope, 2);
     let created = native.service(
         &author,

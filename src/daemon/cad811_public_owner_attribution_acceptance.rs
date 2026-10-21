@@ -56,7 +56,18 @@ impl Native {
     /// lookup. The Works two-human test passes the owner plus one second
     /// synthetic sub; every other caller stays on `new()`.
     pub(super) fn new_with_subs(allowed_subs: &[&str]) -> Self {
-        let allowed_subs: Vec<String> = allowed_subs.iter().map(|sub| (*sub).to_owned()).collect();
+        let allowed: Vec<(&str, Role)> = allowed_subs
+            .iter()
+            .map(|sub| (*sub, Role::Operator))
+            .collect();
+        Self::new_with_roles(&allowed)
+    }
+
+    pub(super) fn new_with_roles(allowed: &[(&str, Role)]) -> Self {
+        let allowed: Vec<(String, Role)> = allowed
+            .iter()
+            .map(|(sub, role)| ((*sub).to_owned(), *role))
+            .collect();
         assert!(
             std::env::var_os("CADENCE_SOCKET").is_none(),
             "fixture BLOCKED: inherited socket override; do not clear caller identity"
@@ -133,14 +144,17 @@ impl Native {
             .expect("fresh unique Shared")
             .membership_lookup_for_test = Some(Box::new(move |_hash, sub, company, instance| {
             assert!(
-                allowed_subs.iter().any(|allowed| allowed.as_str() == sub)
+                allowed.iter().any(|(allowed, _)| allowed.as_str() == sub)
                     && company == COMPANY
                     && instance == INSTANCE,
                 "fixture BLOCKED: wrong synthetic membership binding"
             );
             seen.fetch_add(1, Ordering::SeqCst);
             Ok(if live.load(Ordering::SeqCst) {
-                Some(Role::Operator)
+                allowed
+                    .iter()
+                    .find(|(allowed, _)| allowed.as_str() == sub)
+                    .map(|(_, role)| *role)
             } else {
                 None
             })

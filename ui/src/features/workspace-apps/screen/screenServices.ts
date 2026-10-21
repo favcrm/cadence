@@ -16,7 +16,7 @@ function sanitized(value: unknown): unknown {
   if (!object(value)) return value;
   return Object.fromEntries(Object.entries(value).filter(([k]) => !SECRET_FIELDS.has(k)).map(([k, v]) => [k, sanitized(v)]));
 }
-function refusal(error: unknown, operation?: RecordCallVerb): ActionRefusal {
+function refusal(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): ActionRefusal {
   const status = error instanceof ApiError ? error.status : 0;
   if (operation === "smtp.show" && error instanceof ApiError && status === 400 && (error.code === "smtp_sender_unbound" || error.code === "smtp_sender_revoked")) {
     return { code: error.code, text: "No live SMTP sender is bound. Configure a sender before sending." };
@@ -66,7 +66,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
     if (!response.ok) throw new ApiError("Service refused", response.status, object(value) && typeof value.code === "string" ? { code: value.code } : undefined);
     return value;
   }
-  function failed(error: unknown, operation?: RecordCallVerb): ActionRefusal {
+  function failed(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): ActionRefusal {
     csv.clear();
     if (current() && error instanceof ApiError && [401, 403].includes(error.status)) { retired = true; purgeDisplayCache(); host.refused(); }
     return refusal(error, operation);
@@ -141,9 +141,9 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
               ? { ...result, confirmation_required: result.state === "open" } : result);
             if (!["smtp.manage", "chat.campaign.open", "chat.campaign.brief", "chat.whatsapp.brief", "records.csv.confirm"].includes(operation)) invalidateDisplay(domain);
             return { ok: true, data };
-          } catch (error) { return { ok: false, refusal: failed(error) }; }
+          } catch (error) { return { ok: false, refusal: failed(error, operation) }; }
         } };
-      } catch (error) { return failed(error); }
+      } catch (error) { return failed(error, operation); }
     },
   };
 }

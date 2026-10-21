@@ -1065,7 +1065,8 @@ impl Shared {
                 let id = required_str(args, "id")?;
                 let shown = records.app_works_get(context, id)?;
                 if shown["revision"] != args["revision"] {
-                    return Err(Error::rejected(
+                    return Err(Error::conflict_coded(
+                        "facts_changed",
                         "works revision changed before confirmation",
                     ));
                 }
