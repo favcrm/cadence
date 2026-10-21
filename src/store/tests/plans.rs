@@ -19,6 +19,46 @@
     }
 
     #[test]
+    fn active_cloud_refuses_task_cancel_and_agent_remove() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        s.register_agent(&NewAgent {
+            alias: "sb",
+            provider: "sandbox",
+            endpoint_kind: "sandbox",
+            role: "worker",
+            cwd: cwd.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(&json!({"upstream": "pm"}).to_string()),
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+        s.create_task(
+            "j1",
+            "t8",
+            None,
+            Some("sb"),
+            None,
+            Some("done"),
+            Some(cwd.to_str().unwrap()),
+            Some("cad-1"),
+            Some(&"0".repeat(40)),
+        )
+        .unwrap();
+        s.dispatch_task("t8", None, None, "test").unwrap();
+        let error = s.cancel_task("t8", "test").unwrap_err().to_string();
+        assert!(error.contains("active cloud dispatch"), "{error}");
+        let error = s
+            .remove_agent("sb", true, &json!({"by": "test"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("active cloud dispatch"), "{error}");
+    }
+
+    #[test]
     fn dispatch_refuses_a_changed_assignee_and_blocks_unknown_kickoffs() {
         let (dir, s) = store();
         let cwd = dir.path().join("w");

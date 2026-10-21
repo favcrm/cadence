@@ -1282,6 +1282,28 @@ impl Store {
                 )
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
                 .collect::<rusqlite::Result<_>>()?;
+            let agent = self.agent_in(&tx, alias)?;
+            if agent.provider == "sandbox" && agent.endpoint_kind == "sandbox" {
+                let active: Vec<&Message> = open
+                    .iter()
+                    .filter(|m| {
+                        m.source == "job_dispatch"
+                            && matches!(m.state.as_str(), "queued" | "running" | "unknown")
+                    })
+                    .collect();
+                if !active.is_empty() {
+                    return Err(Error::rejected(format!(
+                        "Agent '{alias}' has an active cloud dispatch ({}) — run \
+                         `cadence agent stop {alias}` and reconcile the remote before \
+                         removing the agent, even with --force",
+                        active
+                            .iter()
+                            .map(|m| format!("{} ({})", m.id, m.state))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
             let mut notify: Vec<String> = Vec::new();
             if !open_messages.is_empty() || !open_tasks.is_empty() {
                 let named = |kind: &str, rows: &[(String, String)]| {

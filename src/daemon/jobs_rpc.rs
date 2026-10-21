@@ -493,6 +493,18 @@ impl Shared {
             message: &crate::store::Message,
             error: Error,
         ) -> Error {
+            if store.cloud_create_attempted(&message.id).unwrap_or(false) {
+                let _ = store.requeue_cloud_claim(&message.id, &format!("cloud:{}", message.id));
+                return Error::Structured(crate::error::Structured {
+                    kind: "rejected",
+                    code: crate::issue::cloud::UNCERTAIN.to_string(),
+                    message: format!(
+                        "cloud sandbox recovery preflight failed after a prior create \
+                         attempt: {error}"
+                    ),
+                    revision: None,
+                });
+            }
             crate::issue::cloud::fail_message(store, message, &error);
             error
         }

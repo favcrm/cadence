@@ -1394,6 +1394,22 @@ impl Store {
 
     fn cancel_task_tx(&self, tx: &impl super::StoreConn, task: &Task, by: &str) -> Result<()> {
         if let Some(kickoff) = &task.dispatch_message {
+            if let Some((alias, _)) = tx.query_opt(
+                "SELECT alias,state FROM messages WHERE id=? AND source='job_dispatch' \
+                 AND state IN ('queued','running','unknown')",
+                [kickoff.as_str()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )? {
+                let agent = self.agent_in(tx, &alias)?;
+                if agent.provider == "sandbox" && agent.endpoint_kind == "sandbox" {
+                    return Err(Error::rejected(format!(
+                        "Task '{}' has an active cloud dispatch on '{alias}' — \
+                         run `cadence agent stop {alias}` and reconcile the remote \
+                         before cancelling the task",
+                        task.id
+                    )));
+                }
+            }
             tx.execute(
                 "UPDATE messages SET state='cancelled',completed=?
                  WHERE id=? AND state IN ('queued','submitting')",

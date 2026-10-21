@@ -131,11 +131,21 @@ pub fn run_dispatch(
     agent: &Agent,
     stop: &dyn Fn() -> bool,
 ) -> Result<()> {
-    let issue = job.issue_id.as_deref().ok_or_else(|| {
-        let error = Error::rejected("cloud sandbox dispatch needs a job bound to a tracker issue");
-        fail_message(store, message, &error);
-        error
-    })?;
+    let issue = match job.issue_id.as_deref() {
+        Some(issue) => issue,
+        None => {
+            let error =
+                Error::rejected("cloud sandbox dispatch needs a job bound to a tracker issue");
+            if store.cloud_create_attempted(&message.id).unwrap_or(false) {
+                return Err(uncertain(format!(
+                    "cloud sandbox recovery cannot resolve the tracker issue after a \
+                     prior create attempt: {error}"
+                )));
+            }
+            fail_message(store, message, &error);
+            return Err(error);
+        }
+    };
     let (lane, result) = match execute(pm, store, task, job, message, agent, stop) {
         Ok(value) => value,
         Err(error) if error.code() == Some(UNCERTAIN) => {
@@ -210,14 +220,23 @@ fn execute(
     agent: &Agent,
     stop: &dyn Fn() -> bool,
 ) -> Result<(RemoteLane, SandboxResult)> {
-    let request = create_request(job, task, &message.id, &message.body)?;
-    let client = HttpSandboxApi::new(UreqSandboxTransport::new(None));
     let (authorized, prior_attempt) = store.authorize_cloud_create(&message.id)?;
     if !authorized {
         return Err(stopped_error(
             "cloud sandbox dispatch was stopped before any remote create",
         ));
     }
+    let request = match create_request(job, task, &message.id, &message.body) {
+        Ok(request) => request,
+        Err(error) if prior_attempt => {
+            return Err(uncertain(format!(
+                "cloud sandbox recovery preflight failed after a prior create \
+                 attempt: {error}"
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    let client = HttpSandboxApi::new(UreqSandboxTransport::new(None));
     let job_handle = match client.create_job(&request) {
         Ok(handle) => handle,
         Err(error)
