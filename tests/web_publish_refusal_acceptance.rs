@@ -83,6 +83,7 @@ fn logged_out_every_web_action_refuses_with_no_auth_material() {
         &["publish", "rel_33333333"],
         &["status", "acc-site"],
         &["releases", "acc-site"],
+        &["submissions", "acc-site"],
         &["rollback", "acc-site", "rel_33333333"],
         &["unpublish", "acc-site"],
     ];

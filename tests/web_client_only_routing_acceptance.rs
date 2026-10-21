@@ -353,7 +353,7 @@ fn client_only_web_with_local_default_refuses_before_any_request() {
 
 /// Row 3: fresh machine. Saved remote default, `remote-auth` genuinely ABSENT.
 /// Previously this surfaced as an `internal` ENOENT (exit 70). The fixed
-/// behaviour is now covered, not only the known gap: all six web actions must
+/// behaviour is now covered, not only the known gap: all seven web actions must
 /// refuse with exit 3, name login and the missing credential, say nothing was
 /// sent, and create no credential directory, pending record, state or external
 /// call. Prepare gets a real HTML file so its freeze succeeds and the refusal
@@ -371,6 +371,7 @@ fn client_only_web_with_remote_default_and_absent_auth_dir_refuses_every_action(
         vec!["web", "publish", "rel_33333333"],
         vec!["web", "status", "acc-site"],
         vec!["web", "releases", "acc-site"],
+        vec!["web", "submissions", "acc-site"],
         vec!["web", "rollback", "acc-site", "rel_33333333"],
         vec!["web", "unpublish", "acc-site"],
     ];

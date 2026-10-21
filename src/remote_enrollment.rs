@@ -1263,16 +1263,27 @@ fn issuer_agent(builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope
 }
 
 fn web_management_path(path: &str) -> bool {
-    if !path.starts_with("/v1/web-sites/")
-        || path.len() > 2048
-        || path.contains('?')
+    if path.len() > 2048
         || path.contains('#')
         || path.contains('\\')
         || !path.bytes().all(|b| (0x21..0x7f).contains(&b))
     {
         return false;
     }
-    if let Some(rest) = path.strip_prefix("/v1/web-sites/uploads/") {
+    let (base, query) = match path.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (path, None),
+    };
+    if !base.starts_with("/v1/web-sites/") {
+        return false;
+    }
+    if let Some(query) = query {
+        // The submissions read is the one queried route. Its query is rebuilt
+        // from a fixed key order and the published grammars, so it can never
+        // carry an extra parameter, a fragment or an encoded separator.
+        return web_submissions_route(base) && web_submissions_query(query);
+    }
+    if let Some(rest) = base.strip_prefix("/v1/web-sites/uploads/") {
         if let Some((upload, segment)) = rest.split_once("/files/") {
             if is_upload_id(upload) {
                 // Only this route may name an encoded artifact path, and only if
@@ -1283,8 +1294,58 @@ fn web_management_path(path: &str) -> bool {
         }
     }
     // Every other route: no percent-encoded separators, traversal or double encoding.
-    let lower = path.to_ascii_lowercase();
-    !path.contains("..") && !lower.contains("%2f") && !lower.contains("%5c") && !lower.contains('%')
+    let lower = base.to_ascii_lowercase();
+    !base.contains("..") && !lower.contains("%2f") && !lower.contains("%5c") && !lower.contains('%')
+}
+
+/// `/v1/web-sites/sites/<site_id>/submissions`, the only route allowed a query.
+fn web_submissions_route(base: &str) -> bool {
+    let Some(rest) = base.strip_prefix("/v1/web-sites/sites/") else {
+        return false;
+    };
+    let Some((site, tail)) = rest.split_once('/') else {
+        return false;
+    };
+    let Some(suffix) = site.strip_prefix("site_") else {
+        return false;
+    };
+    tail == "submissions"
+        && (8..=80).contains(&suffix.len())
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// `limit=<1..100>` then optionally `form=` and/or `cursor=`, in that order.
+fn web_submissions_query(query: &str) -> bool {
+    let mut parts = query.split('&');
+    let Some(limit) = parts.next().and_then(|part| part.strip_prefix("limit=")) else {
+        return false;
+    };
+    let limit_ok = (1..=3).contains(&limit.len())
+        && limit.bytes().all(|b| b.is_ascii_digit())
+        && (1..=100).contains(&limit.parse::<u16>().unwrap_or(0));
+    if !limit_ok {
+        return false;
+    }
+    let rest: Vec<&str> = parts.collect();
+    match rest.as_slice() {
+        [] => true,
+        [part] if part.starts_with("form=") => part
+            .strip_prefix("form=")
+            .is_some_and(crate::web_sites::is_form_key),
+        [part] if part.starts_with("cursor=") => part
+            .strip_prefix("cursor=")
+            .is_some_and(crate::web_sites::is_form_cursor),
+        [form, cursor] => {
+            form.strip_prefix("form=")
+                .is_some_and(crate::web_sites::is_form_key)
+                && cursor
+                    .strip_prefix("cursor=")
+                    .is_some_and(crate::web_sites::is_form_cursor)
+        }
+        _ => false,
+    }
 }
 
 /// A file upload gets the caller's bounded deadline; JSON and other routes
@@ -4980,6 +5041,52 @@ mod tests {
             "/v1/web-sites/sites/site_11111111/releases%2F..",
             "/v1/web-sites/uploads/upl_22222222/finalize%2F",
             "/v1/web-sites/uploads/upl_bad/files/assets%2Fapp.js",
+        ] {
+            assert!(!web_management_path(bad), "{bad} accepted");
+        }
+    }
+
+    /// CAD-1659: reading form submissions is the one route that carries a
+    /// query. Only the published keys, in a fixed order, with the published
+    /// grammars pass; everything else keeps the no-query rule.
+    #[test]
+    fn submissions_route_admits_only_the_published_query() {
+        let route = "/v1/web-sites/sites/site_0bcef7ac757243108b1e65ca18ca3517/submissions";
+        for ok in [
+            "?limit=50",
+            "?limit=1",
+            "?limit=100&form=contact",
+            "?limit=10&form=contact&cursor=1730000000000:wsub_abcdefgh",
+            "?limit=10&cursor=1730000000000:wsub_abcdefgh",
+        ] {
+            assert!(web_management_path(&format!("{route}{ok}")), "{ok} refused");
+        }
+        for bad in [
+            "?limit=0",
+            "?limit=101",
+            "?limit=",
+            "?limit=10&limit=20",
+            "?limit=10&form=Contact",
+            "?limit=10&form=",
+            "?limit=10&form=a%2Fb",
+            "?limit=10&form=contact&extra=1",
+            "?limit=10&cursor=abc",
+            "?limit=10&cursor=1730000000000:wsub_abc",
+            "?limit=10&cursor=1730000000000:wsub_abcdefgh&limit=2",
+            "?limit=10#frag",
+            "?form=contact",
+        ] {
+            assert!(
+                !web_management_path(&format!("{route}{bad}")),
+                "{bad} accepted"
+            );
+        }
+        // Only the submissions route may carry a query at all.
+        for bad in [
+            "/v1/web-sites/sites/by-slug/a?limit=10",
+            "/v1/web-sites/sites/site_x/submissions?limit=10",
+            "/v1/web-sites/sites/site_aaaaaaaa/releases?limit=10",
+            "/v1/web-sites/sites/site_aaaa%2Fbbbb/submissions?limit=10",
         ] {
             assert!(!web_management_path(bad), "{bad} accepted");
         }

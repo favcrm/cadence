@@ -56,6 +56,20 @@ pub enum WebAction {
         /// Site slug.
         slug: String,
     },
+    /// Read a site's form submissions, newest first.
+    Submissions {
+        /// Site slug.
+        slug: String,
+        /// Only submissions of this form key.
+        #[arg(long)]
+        form: Option<String>,
+        /// Submissions to return, 1 to 100.
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Opaque cursor from the previous page's nextCursor.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
     /// Ask the owner to restore an earlier release (owner approval).
     Rollback {
         /// Site slug.
@@ -149,6 +163,19 @@ pub fn execute(action: &WebAction, target: &RemoteTarget, wake_timeout: u64) -> 
         }
         WebAction::Status { slug } => status(target, slug, wake_timeout),
         WebAction::Releases { slug } => releases(target, slug, wake_timeout),
+        WebAction::Submissions {
+            slug,
+            form,
+            limit,
+            cursor,
+        } => submissions(
+            target,
+            slug,
+            form.as_deref(),
+            *limit,
+            cursor.as_deref(),
+            wake_timeout,
+        ),
     }
 }
 
@@ -814,6 +841,56 @@ pub fn status(target: &RemoteTarget, slug: &str, wake_timeout: u64) -> Result<Va
     Ok(json!({"org": target.org, "site": site, "pendingActions": pending}))
 }
 
+/// A site's form submissions, newest first. `form` filters one form key and
+/// `cursor` is the opaque `nextCursor` returned by the previous page; a
+/// malformed cursor is refused locally rather than sent.
+pub fn submissions(
+    target: &RemoteTarget,
+    slug: &str,
+    form: Option<&str>,
+    limit: u32,
+    cursor: Option<&str>,
+    wake_timeout: u64,
+) -> Result<Value> {
+    validate_submission_query(form, limit, cursor)?;
+    let found = remote_cli::web_request(
+        target,
+        "web.read",
+        "GET",
+        &format!("/v1/web-sites/sites/by-slug/{slug}"),
+        &[("x-workspace-id", target.org_id.clone())],
+        None,
+        wake_timeout,
+    )?;
+    let site = remote_cli::web_envelope(found)?;
+    let site_id = site["siteId"].as_str().unwrap_or_default().to_string();
+    let mut path = format!("/v1/web-sites/sites/{site_id}/submissions?limit={limit}");
+    if let Some(form) = form {
+        path.push_str("&form=");
+        path.push_str(form);
+    }
+    if let Some(cursor) = cursor {
+        path.push_str("&cursor=");
+        path.push_str(cursor);
+    }
+    let response = remote_cli::web_request(
+        target,
+        "web.read",
+        "GET",
+        &path,
+        &[("x-workspace-id", target.org_id.clone())],
+        None,
+        wake_timeout,
+    )?;
+    let listing = remote_cli::web_envelope(response)?;
+    Ok(json!({
+        "org": target.org,
+        "site": slug,
+        "submissions": listing["submissions"],
+        "nextCursor": listing["nextCursor"],
+    }))
+}
+
 pub fn releases(target: &RemoteTarget, slug: &str, wake_timeout: u64) -> Result<Value> {
     let found = remote_cli::web_request(
         target,
@@ -837,4 +914,103 @@ pub fn releases(target: &RemoteTarget, slug: &str, wake_timeout: u64) -> Result<
     )?;
     let listing = remote_cli::web_envelope(response)?;
     Ok(json!({"org": target.org, "site": slug, "releases": listing["releases"]}))
+}
+
+/// Local pre-flight for `submissions`. The server owns the query grammar; this
+/// refuses the obviously invalid before any request is built, using the same
+/// form-key grammar as the published endpoint (`^[a-z0-9][a-z0-9-]{0,39}$`).
+pub fn validate_submission_query(
+    form: Option<&str>,
+    limit: u32,
+    cursor: Option<&str>,
+) -> Result<()> {
+    if !(1..=100).contains(&limit) {
+        return Err(Error::rejected("--limit must be between 1 and 100"));
+    }
+    if let Some(form) = form {
+        if !is_form_key(form) {
+            return Err(Error::rejected(
+                "--form must match ^[a-z0-9][a-z0-9-]{0,39}$",
+            ));
+        }
+    }
+    if let Some(cursor) = cursor {
+        if !is_form_cursor(cursor) {
+            return Err(Error::rejected(
+                "--cursor must be a nextCursor value from a previous page",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The published form-key grammar: one lowercase letter or digit, then up to 39
+/// more lowercase letters, digits or hyphens.
+pub fn is_form_key(value: &str) -> bool {
+    matches!(value.as_bytes().first(), Some(b'a'..=b'z' | b'0'..=b'9'))
+        && value.len() <= 40
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The published submissions cursor: `<created_at ms>:<wsub id>`.
+pub fn is_form_cursor(value: &str) -> bool {
+    let Some((millis, id)) = value.split_once(':') else {
+        return false;
+    };
+    let Some(suffix) = id.strip_prefix("wsub_") else {
+        return false;
+    };
+    (1..=16).contains(&millis.len())
+        && millis.bytes().all(|b| b.is_ascii_digit())
+        && (8..=80).contains(&suffix.len())
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+#[cfg(test)]
+mod submission_query_tests {
+    use super::validate_submission_query;
+
+    #[test]
+    fn form_keys_follow_the_published_grammar() {
+        let longest = "x".repeat(40);
+        for good in ["contact", "a", "contact-", "a1-2", longest.as_str()] {
+            assert!(
+                validate_submission_query(Some(good), 50, None).is_ok(),
+                "{good} must be accepted"
+            );
+        }
+        let too_long = "x".repeat(41);
+        for bad in ["", "-lead", "Contact", "con tact", too_long.as_str()] {
+            assert!(
+                validate_submission_query(Some(bad), 50, None).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn limit_and_cursor_are_refused_before_any_request() {
+        assert!(validate_submission_query(None, 1, None).is_ok());
+        assert!(validate_submission_query(None, 100, None).is_ok());
+        assert!(validate_submission_query(None, 0, None).is_err());
+        assert!(validate_submission_query(None, 101, None).is_err());
+        assert!(validate_submission_query(None, 50, Some("1730000000000:wsub_abcdefgh")).is_ok());
+        for bad in [
+            "1730000000000:wsub_abc",
+            "1730000000000:abc",
+            "x:wsub_abcdefgh",
+            "1730000000000:wsub_abcdefgh&limit=9",
+            "a b",
+            "",
+        ] {
+            assert!(
+                validate_submission_query(None, 50, Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
 }

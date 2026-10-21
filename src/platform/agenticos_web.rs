@@ -34,7 +34,8 @@ const TABLE: &str = r#"{"platform":"agenticos-web","manifest_version":"cadence-w
  {"tool":"rollback_site","effect":"draft","scopes":["web.prepare"],"label":"Create the owner action that would restore an earlier release"},
  {"tool":"unpublish_site","effect":"draft","scopes":["web.prepare"],"label":"Create the owner action that would take a site offline"},
  {"tool":"site_status","effect":"read","scopes":["web.read"],"label":"Show a site's live state and this machine's in-flight actions"},
- {"tool":"site_releases","effect":"read","scopes":["web.read"],"label":"List a site's releases, newest first"}
+ {"tool":"site_releases","effect":"read","scopes":["web.read"],"label":"List a site's releases, newest first"},
+ {"tool":"site_submissions","effect":"read","scopes":["web.read"],"label":"Read a site's form submissions, newest first"}
 ]}"#;
 
 pub struct AgenticosWebAdapter {
@@ -97,6 +98,17 @@ impl AgenticosWebAdapter {
             "site_releases" => {
                 crate::web_sites::releases(&target, required_str(input, "slug")?, wake)
             }
+            "site_submissions" => crate::web_sites::submissions(
+                &target,
+                required_str(input, "slug")?,
+                input.get("form").and_then(Value::as_str),
+                input["limit"]
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(50),
+                input.get("cursor").and_then(Value::as_str),
+                wake,
+            ),
             _ => Err(Error::rejected("unknown agenticos-web tool")),
         }
     }
