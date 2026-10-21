@@ -69,12 +69,22 @@ below, never a flattened message.
 | `POST /api/threads/{alias}` | `404 no such thread write route` |
 | `POST /api/issues/{id}` | `405 no such write route` (not `method not allowed`) |
 | `POST /api/setup` | `405 setup is read-only here — GET only` |
-| `GET` on a write-only row (e.g. `/api/app-installations/upload`) | `405 method not allowed` after admission |
+| `GET` on a write-only row (`/api/settings/agents`, `/api/reports`) | `405 method not allowed` after admission |
 
 So a row carries its mismatch pair — status, message — exactly as it carries its
 `invalid` pair, and `MethodOnly` answers the pair of the rows it found. A row
 that has no mismatch answer yet keeps the generic pair only where that is what
 the code does today.
+
+**A literal write row never shadows a wildcard read row.** `GET
+/api/app-installations/upload` is *not* a method mismatch today: the read arm
+matches any nonempty, slash-free id, so the literal `upload` is read as an
+installation id and the request reaches `app_workspace_show` after
+`admit_screen_read`. Resolution therefore cannot stop at the first
+path-compatible row: with a POST literal and a GET wildcard on the same path it
+must keep looking for a method-compatible row. `MethodOnly` is only correct when
+*no* row of the path names the method. The first read slice must assert this
+overlap, and must not treat `/upload` as a write-only path.
 
 ## 3. HEAD is a read
 
