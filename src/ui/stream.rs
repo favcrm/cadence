@@ -105,6 +105,9 @@ pub(crate) fn event_resources(name: &str) -> &'static [&'static str] {
         // CAD-818: the Threads view's own invalidation. It names only the
         // `threads` resource, so no existing stream refetches more.
         "threads" => &["threads"],
+        // CAD-1700: the master view's own invalidation. It names only the
+        // `master` resource, so no existing stream refetches more.
+        "master" => &["master"],
         _ => &[
             "issues",
             "projects",

@@ -279,6 +279,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("topic_caller + may_use_topic: an agent must be a subscriber (CAD-818)"),
     ),
     ("threads_stamp", Rule::Read),
+    ("master_stamp", Rule::Read),
     ("agent_events", Rule::Read),
     (
         "agent_requests",

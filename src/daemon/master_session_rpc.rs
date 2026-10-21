@@ -3,6 +3,23 @@
 use super::*;
 
 impl Shared {
+    /// CAD-1700: `master_stamp` — the board's `master` push frame reads
+    /// this cheaply (indexed SQL, no provider call). It changes whenever
+    /// the master's running/queued turns, any master thread entry, or the
+    /// app assistant / master permission revision (`master_rev`) changes.
+    pub(super) fn rpc_master_stamp(&self) -> Result<Value> {
+        let alias = crate::master::ALIAS;
+        let (live_seq, running, queued, entries, transition_ms) = self.store.master_stamp(alias)?;
+        Ok(json!({
+            "live": live_seq,
+            "running": running,
+            "queued": queued,
+            "entries": entries,
+            "transition_ms": transition_ms,
+            "rev": self.master_rev.load(std::sync::atomic::Ordering::Acquire),
+        }))
+    }
+
     /// `master_state` (CAD-551) — what the board's master header shows:
     /// the provider, the live session's model/effort/context (when the
     /// provider answers — Pi's `get_state`/`get_session_stats`), the
@@ -108,6 +125,10 @@ impl Shared {
                 .unwrap_or(Value::Null)
         };
         let running = self.store.running_message(alias)?;
+        // CAD-1700: the ordered queue behind the board's master pane, read
+        // once so `turn` and `queue` agree. `queued_messages` uses the same
+        // delivery order as `queued_head`, so the head is position 1.
+        let queued = self.store.queued_messages(alias, 20)?;
         let turn = match &running {
             Some(m) => json!({
                 "state": "working",
@@ -117,7 +138,7 @@ impl Shared {
                 "summary": m.body,
                 "since": m.started.unwrap_or(m.created),
             }),
-            None => match self.store.queued_head(alias)? {
+            None => match queued.first() {
                 Some(m) => json!({
                     "state": "queued",
                     "message": m.id,
@@ -125,10 +146,15 @@ impl Shared {
                     "app_origin": self.master_turn_app_origin(&m.id),
                     "summary": m.body,
                     "since": m.created,
+                    "position": 1,
                 }),
                 None => Value::Null,
             },
         };
+        let queue = queued
+            .iter()
+            .map(|m| json!({"message": m.id, "conversation": conversation_of(&m.id)}))
+            .collect::<Vec<_>>();
         Ok(json!({
             "alias": alias,
             "provider": agent.provider,
@@ -141,6 +167,7 @@ impl Shared {
             "session": session_json,
             "commands": commands,
             "turn": turn,
+            "queue": queue,
             "queued": self.store.queued_count(alias)?,
         }))
     }
@@ -481,6 +508,28 @@ impl Shared {
             }
             let _ = self.store.event_public(alias, "master_command", payload);
         };
+        // CAD-1700: `message` scopes `stop` and `cancel` to one master turn.
+        // It is refused on every other verb, so it cannot widen one. Each
+        // refusal leaves a `master_command` event, like every other call.
+        let message = match params.get("message") {
+            None => None,
+            Some(value) => {
+                if command != "stop" && command != "cancel" {
+                    let error =
+                        format!("'/{command}' takes no message - only /stop and /cancel do");
+                    audit("refused", Some(&error));
+                    return Err(Error::invalid("message_not_allowed", error));
+                }
+                match value.as_str() {
+                    Some(id) if !id.is_empty() && id.chars().count() <= 128 => Some(id),
+                    _ => {
+                        let error = "message must be a non-empty string of at most 128 characters";
+                        audit("refused", Some(error));
+                        return Err(Error::invalid("message_invalid", error));
+                    }
+                }
+            }
+        };
         if command == "help" {
             audit("ok", None);
             return Ok(json!({"command": command, "ok": true,
@@ -503,17 +552,88 @@ impl Shared {
         if command == "stop" {
             // The daemon's interrupt path: same authorization, audit and
             // stale-turn protection `cadence interrupt` has. `wait`
-            // bounds how long the answer waits for the settle.
+            // bounds how long the answer waits for the settle. With a
+            // `message`, the stop is bound to that exact running turn (CAD-1700).
             let mut p = json!({"alias": alias});
             if let Some(wait) = params.get("wait") {
                 p["wait"] = wait.clone();
             }
-            let out = self.rpc_interrupt(&p, peer_pid);
+            let out = match message {
+                Some(message) => {
+                    let running = self.store.running_message(alias);
+                    if running
+                        .as_ref()
+                        .ok()
+                        .and_then(|m| m.as_ref())
+                        .map(|m| m.id.as_str())
+                        != Some(message)
+                    {
+                        let error = format!(
+                            "message {message} is not the master's running turn — nothing was stopped"
+                        );
+                        audit("refused", Some(&error));
+                        return Err(Error::invalid("turn_not_running", error));
+                    }
+                    self.rpc_interrupt_bound(&p, peer_pid, Some(message))
+                }
+                None => self.rpc_interrupt(&p, peer_pid),
+            };
             match &out {
                 Ok(_) => audit("ok", None),
                 Err(e) => audit("refused", Some(&e.to_string())),
             }
             return out.map(|v| json!({"command": command, "ok": true, "result": v}));
+        }
+        if command == "cancel" {
+            // CAD-1700: cancel exactly one still-queued operator message to the
+            // master. A running or submitting turn is never cancelled here.
+            let Some(id) = message else {
+                audit("refused", Some("message_required"));
+                return Err(Error::invalid(
+                    "message_required",
+                    "cancel needs the queued message id - `message` is required",
+                ));
+            };
+            let refuse = |code: &'static str, text: String| {
+                audit("refused", Some(&text));
+                Err(Error::invalid(code, text))
+            };
+            let found = match self.store.message(id)? {
+                Some(m) if m.alias == alias && m.source == "operator" => m,
+                _ => {
+                    return refuse(
+                        "message_not_cancellable",
+                        format!("message {id} is not an operator message queued to the master"),
+                    )
+                }
+            };
+            match found.state.as_str() {
+                "queued" => {}
+                "running" | "submitting" => {
+                    return refuse(
+                        "message_running",
+                        format!("message {id} is already running - use Stop"),
+                    )
+                }
+                other => {
+                    return refuse(
+                        "message_not_queued",
+                        format!(
+                            "message {id} is '{other}' - only a queued message can be cancelled"
+                        ),
+                    )
+                }
+            }
+            let cancelled = self
+                .store
+                .cancel(id, "operator", Some("cancelled from the board"))?;
+            if let Some(result) = cancelled.result.clone() {
+                self.notify_routed_target(&cancelled, &result);
+            }
+            audit("ok", None);
+            self.wake();
+            return Ok(json!({"command": command, "ok": true,
+                             "result": {"message": cancelled.to_json()}}));
         }
         let agent = match self.store.agent(alias) {
             Ok(a) => a,
@@ -589,7 +709,8 @@ impl Shared {
 /// runs the `interrupt` path; `help` answers the list itself; the rest
 /// are adapter verbs.
 const MASTER_COMMANDS: &[&str] = &[
-    "state", "stats", "models", "model", "levels", "effort", "compact", "new", "stop", "help",
+    "state", "stats", "models", "model", "levels", "effort", "compact", "new", "stop", "cancel",
+    "help",
 ];
 
 /// The one-line `system` thread note a `master_command` mutation

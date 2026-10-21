@@ -267,6 +267,39 @@ impl Store {
         })
     }
 
+    /// CAD-1700: the master push stamp (read-only, indexed). `(live_seq,
+    /// running, queued, newest_thread_entry_seq, transition_ms)`: the newest
+    /// live master message seq, the running count, the queued count, the
+    /// newest master thread entry across every master thread, and the newest
+    /// master message transition. Moves on enqueue, run, finish, and any entry.
+    pub fn master_stamp(&self, alias: &str) -> Result<(i64, i64, i64, i64, i64)> {
+        self.read_tx(|conn| {
+            let live: (i64, i64, i64) = conn.query_row(
+                "SELECT COALESCE(MAX(seq),0),
+                        COALESCE(SUM(CASE WHEN state='running' THEN 1 ELSE 0 END),0),
+                        COALESCE(SUM(CASE WHEN state='queued' THEN 1 ELSE 0 END),0)
+                 FROM messages WHERE alias=? AND state IN ('queued','submitting','running')",
+                [alias],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            // Per-thread MAX keeps the (thread_id, seq) index doing the work;
+            // a global MAX(seq) would move for every agent's thread.
+            let entries: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(e.seq),0) FROM thread_entries e
+                 JOIN threads t ON t.id=e.thread_id WHERE t.alias=?",
+                [alias],
+                |r| r.get(0),
+            )?;
+            let transition: f64 = conn.query_row(
+                "SELECT COALESCE(MAX(COALESCE(completed, started, created)),0)
+                 FROM messages WHERE alias=?",
+                [alias],
+                |r| r.get(0),
+            )?;
+            Ok((live.0, live.1, live.2, entries, (transition * 1000.0) as i64))
+        })
+    }
+
     /// CAD-810 job fan-out, run inside the job transition's own transaction:
     /// when `job:<job id>` exists, the event is posted to its transcript and
     /// one turnless notice goes to each current member. Keyed by the job

@@ -774,6 +774,9 @@ struct Watch {
     monitoring: Option<u64>,
     /// CAD-818: the Threads stamp (newest topic/pair change), fingerprinted.
     threads: Option<u64>,
+    /// CAD-1700: the master push stamp (running/queued turns, master thread
+    /// entries, app assistant and permission revision), fingerprinted.
+    master: Option<u64>,
     /// id → fingerprint of the card as the client would render it.
     cards: HashMap<String, u64>,
     plans: HashMap<String, u64>,
@@ -1406,6 +1409,7 @@ impl Model {
                 agents: snap.agents_fp,
                 monitoring: self.monitoring_fp(),
                 threads: self.threads_fp(),
+                master: self.master_fp(),
                 cards: fps(&cards),
                 plans: fps(&plans),
                 rows: fps(&agent_rows(&snap)),
@@ -1426,6 +1430,12 @@ impl Model {
     /// daemon RPC (the same pattern as `monitoring_fp`).
     fn threads_fp(&self) -> Option<u64> {
         client::rpc(&self.state_dir, "threads_stamp", json!({}))
+            .ok()
+            .map(|l| value_fp(&l))
+    }
+
+    fn master_fp(&self) -> Option<u64> {
+        client::rpc(&self.state_dir, "master_stamp", json!({}))
             .ok()
             .map(|l| value_fp(&l))
     }
@@ -1560,6 +1570,13 @@ impl Model {
             w.threads = threads_fp;
             frames.push(legacy_frame("threads"));
         }
+        // CAD-1700: one `master` frame when the master stamp moves. Its
+        // resource is `master` alone, so no other stream refetches.
+        let master_fp = self.master_fp();
+        if master_fp.is_some() && master_fp != w.master {
+            w.master = master_fp;
+            frames.push(legacy_frame("master"));
+        }
         if snap.failed {
             // Cards, plans and agent rows read from the stand-in are
             // stripped or empty, and a client that refetches mid-outage
@@ -1683,6 +1700,7 @@ mod tests {
             agents: None,
             monitoring: None,
             threads: None,
+            master: None,
             cards: HashMap::new(),
             plans: HashMap::new(),
             rows: HashMap::new(),
@@ -1904,6 +1922,7 @@ mod tests {
             agents: None,
             monitoring: None,
             threads: None,
+            master: None,
             cards: HashMap::new(),
             plans: HashMap::new(),
             rows: HashMap::new(),

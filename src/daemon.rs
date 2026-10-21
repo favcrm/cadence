@@ -214,6 +214,8 @@ pub(crate) use cli_rpc::prime_jwks_for_test as prime_cli_jwks_for_test;
 mod connection_test;
 mod connections_rpc;
 #[cfg(all(test, feature = "test-seam"))]
+mod cad1700_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
 mod conversations_acceptance;
 mod conversations_rpc;
 mod crm_send_rpc;
@@ -564,6 +566,8 @@ pub struct Shared {
     pub store: Arc<Store>,
     /// Broadcast on any queue/event change.
     changed: Notify,
+    /// CAD-1700: the master's push revision (see `bump_master_rev`).
+    master_rev: AtomicU64,
     pending: Mutex<HashMap<String, PendingRequest>>,
     /// Brokered requests answered by `agent respond` but not yet
     /// collected by their `request_wait` caller: handle → (alias,
@@ -1097,6 +1101,7 @@ impl Shared {
                 Some(secs) => Some(Duration::from_secs(secs)),
             },
             checkup_dispatch: opts.checkup_dispatch.clone(),
+            master_rev: AtomicU64::new(0),
             router_backlog: std::sync::atomic::AtomicUsize::new(0),
             escalation_lock: Mutex::new(()),
             reclaim_at: Mutex::new(None),
@@ -1238,6 +1243,16 @@ impl Shared {
 
     fn wake(&self) {
         self.changed.notify_all();
+    }
+
+    /// CAD-1700: one push revision for the master's `master` frame. The
+    /// assistant and permission writes it covers live in per-install stores
+    /// the stamp cannot read cheaply, so each write bumps this and wakes the
+    /// watchers.
+    fn bump_master_rev(&self) {
+        self.master_rev
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.wake();
     }
 
     fn on_provider_event(&self, alias: &str, method: &str, params: Value) {
@@ -2819,6 +2834,7 @@ impl Shared {
             "topic_read" => self.rpc_topic_read(params, peer_pid),
             "topic_request" => self.rpc_topic_request(params, peer_pid),
             "threads_stamp" => self.rpc_threads_stamp(),
+            "master_stamp" => self.rpc_master_stamp(),
             "work_conversation_read" => self.rpc_work_conversation_read(params, peer_pid),
             "conversation_create" => self.rpc_conversation_create(params, peer_pid),
             "agent_events" => self.rpc_events(params, peer_pid),

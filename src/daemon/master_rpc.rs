@@ -1248,6 +1248,9 @@ impl Shared {
 
     fn audit_perm(&self, kind: &str, payload: Value) {
         let _ = self.store.event_public(PERM_AUDIT_STREAM, kind, payload);
+        // CAD-1700: every audited permission change (ask, decide, revoke)
+        // moves the master push stamp; the store write it follows is done.
+        self.bump_master_rev();
     }
 
     fn tell_master(&self, key: &str, text: &str) {

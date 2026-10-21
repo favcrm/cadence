@@ -3089,6 +3089,23 @@ impl Store {
         }
     }
 
+    /// CAD-1700: the queued master messages in delivery order (`submitting`
+    /// leads, then priority, then arrival), at most `limit`. A pane finds its
+    /// own queued message and what is ahead of it here.
+    pub fn queued_messages(&self, alias: &str, limit: usize) -> Result<Vec<Message>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM messages WHERE alias=? AND state IN ('queued','submitting')
+             ORDER BY state='submitting' DESC, priority DESC, seq LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![alias, limit as i64], row_message)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// CAD-413: per `stopped` agent with work waiting, its oldest queued
     /// message id and the queued count — the candidates an auto-resume
     /// sweep considers. Nudges are never queued for a stopped agent and
@@ -3206,5 +3223,94 @@ mod index_tests {
         let queued = index(&store, "worker", &queued_states, None);
         assert_eq!(queued.rows.len(), 1);
         assert_eq!(queued.rows[0].id, "m-pm");
+    }
+}
+
+/// CAD-1700: the master push stamp and the ordered queue it reports.
+#[cfg(test)]
+mod master_stamp_tests {
+    use super::*;
+    use crate::store::agents::NewAgent;
+    use crate::store::{NewEntry, KIND_MESSAGE, ROLE_SYSTEM};
+
+    fn open() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("cadence.sqlite3")).unwrap();
+        store
+            .register_agent(&NewAgent {
+                alias: "master",
+                provider: "fake",
+                endpoint_kind: "managed",
+                role: "master",
+                cwd: dir.path().to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn master_stamp_moves_on_enqueue_run_finish_and_thread_entry() {
+        let (_dir, store) = open();
+        let quiet = store.master_stamp("master").unwrap();
+        assert_eq!(store.master_stamp("master").unwrap(), quiet, "an idle master is stable");
+
+        store
+            .enqueue("master", "one", None, "m-1", "operator")
+            .unwrap();
+        let queued = store.master_stamp("master").unwrap();
+        assert_ne!(queued, quiet, "enqueue moves the stamp");
+        assert_eq!(queued.2, 1, "one queued message is counted");
+
+        store.mark_running("m-1", "tok").unwrap();
+        let running = store.master_stamp("master").unwrap();
+        assert_ne!(running, queued, "starting the turn moves the stamp");
+        assert_eq!((running.1, running.2), (1, 0), "one running, none queued");
+
+        store
+            .thread_append(
+                "master",
+                NewEntry {
+                    role: ROLE_SYSTEM,
+                    kind: KIND_MESSAGE,
+                    text: "a step",
+                    payload: None,
+                    message_id: Some("m-1"),
+                },
+            )
+            .unwrap();
+        let entry = store.master_stamp("master").unwrap();
+        assert!(entry.3 > running.3, "a thread entry moves the newest entry seq");
+
+        store
+            .finish_running("m-1", "completed", &json!({"text": "done"}), None)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            store.master_stamp("master").unwrap(),
+            entry,
+            "finishing the turn moves the stamp"
+        );
+    }
+
+    #[test]
+    fn queued_messages_come_back_in_delivery_order() {
+        let (_dir, store) = open();
+        for id in ["m-a", "m-b", "m-c"] {
+            store.enqueue("master", id, None, id, "operator").unwrap();
+        }
+        let queued = store.queued_messages("master", 20).unwrap();
+        assert_eq!(
+            queued.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["m-a", "m-b", "m-c"],
+            "arrival order is delivery order"
+        );
+        let head = store.queued_messages("master", 1).unwrap();
+        assert_eq!(head.len(), 1, "the limit bounds the page");
+        assert_eq!(head[0].id, "m-a", "the limit keeps the head first");
     }
 }
