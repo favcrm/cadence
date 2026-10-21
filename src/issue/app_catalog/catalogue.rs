@@ -334,11 +334,11 @@ pub(super) fn authorize(
     package_digest: &str,
 ) -> Result<()> {
     let origin = match directory {
-        CatalogueDirectory::Configured => crate::ui::public_directory::catalog_origin()
+        CatalogueDirectory::Configured => super::client::catalog_origin()
             .ok_or_else(|| Error::rejected("catalogue metadata is unavailable"))?,
         CatalogueDirectory::Origin(origin) => loopback_origin(origin)?,
     };
-    let doc = crate::ui::public_directory::fetch_versions_at(&origin, &locator.id)?;
+    let doc = super::client::fetch_versions_at(&origin, &locator.id)?;
     eligible(&doc, locator, package_app, package_version, package_digest)
 }
 
