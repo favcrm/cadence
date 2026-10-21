@@ -519,6 +519,7 @@ pub(crate) fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<
 /// caller that runs `issue start` itself (the board kickoff) can refuse
 /// before the first mutation.
 pub(crate) struct SeatCheck {
+    pub show: Value,
     pub agent: Value,
     pub cwd_override: Option<String>,
     pub provider: String,
@@ -554,6 +555,7 @@ pub(crate) fn check_seat(
         )?;
     }
     Ok(SeatCheck {
+        show,
         agent,
         cwd_override,
         provider,
@@ -609,6 +611,7 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
     // not fenced. A caller that starts a lane itself (the board) runs
     // this same check before `issue start`, so a refusal leaves nothing.
     let SeatCheck {
+        show,
         agent,
         cwd_override,
         provider,
@@ -685,7 +688,7 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
         acceptance_warning,
         reply_to,
         note,
-        show: json!({"agent": agent}),
+        show,
         provider,
         endpoint_kind,
         cwd_override,
