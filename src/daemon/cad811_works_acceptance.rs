@@ -204,32 +204,104 @@ fn cad811_works_undeclared_and_wrong_channel_refuse() {
     );
 }
 
+// Works-local durable snapshot: the four CAD-1649 Works tables only, read
+// from the install's record DB opened by its public path. Works-only
+// installs have no CRM tables, so durable_snapshot cannot be used here.
+fn works_snapshot(native: &Native, install: &str) -> Vec<String> {
+    let path = crate::store::app_records::record_db_path(native.fx.root.path(), install)
+        .expect("installation record path");
+    // No Works write has happened in a fresh install, so the record DB may
+    // not exist yet. A missing DB is an empty Works snapshot, not a failure.
+    if !path.exists() {
+        return Vec::new();
+    }
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("read-only works database");
+    let mut rows = Vec::new();
+    for table in [
+        "app_works_items",
+        "app_works_revisions",
+        "app_works_idempotency",
+        "app_works_audit",
+    ] {
+        let mut stmt = db
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .expect("read-only works snapshot");
+        let columns = stmt.column_count();
+        let table_rows = stmt
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|column| {
+                        use rusqlite::types::ValueRef;
+                        Ok(match row.get_ref(column)? {
+                            ValueRef::Null => "null".into(),
+                            ValueRef::Integer(value) => format!("i:{value}"),
+                            ValueRef::Real(value) => format!("r:{value}"),
+                            ValueRef::Text(value) => {
+                                format!("t:{}", String::from_utf8_lossy(value))
+                            }
+                            ValueRef::Blob(_) => "blob".into(),
+                        })
+                    })
+                    .collect::<rusqlite::Result<Vec<String>>>()
+            })
+            .expect("works snapshot query")
+            .collect::<rusqlite::Result<Vec<Vec<String>>>>()
+            .expect("works snapshot rows");
+        for row in table_rows {
+            rows.push(format!("{table}|{}", row.join("|")));
+        }
+    }
+    rows
+}
+
+// Every Works request in this module crosses the real public-origin relay,
+// never the loopback-only Fixture::call helper.
+fn public_call(
+    native: &Native,
+    session: &Session,
+    action: &str,
+    operation: &str,
+    args: Value,
+) -> crate::Result<Value> {
+    native.rpc(
+        "app_screen_service_call",
+        native.credentials(session, "public", call(action, operation, args)),
+    )
+}
+
 #[test]
 fn cad811_works_read_only_member_refused_operator_reads() {
-    let native = Native::new();
+    let native = Native::new_with_subs(&["synthetic-c811-owner", "c811-member"]);
     let scope = native.fx.install("works-readonly", WORKS_OPS);
     let (owner, _) = native.owner();
     let action = native.mount(&owner, "public", &scope, 1);
-    // Negative guard: read-only/member context refuses works.query/get.
-    let local = native.local();
+    // A genuine member: a verified, admitted human who is not the install
+    // owner and holds no operator session.
+    let member = public_session(&native, "c811-member", "c811-member-jti");
+    let before = works_snapshot(&native, &scope.install);
     refused(
-        native.fx.call(
-            Asserted::Operator,
-            &local,
-            call(&action, "works.query", json!({})),
-        ),
-        "read-only works.query",
+        public_call(&native, &member, &action, "works.query", json!({})),
+        "member works.query",
     );
     refused(
-        native.fx.call(
-            Asserted::Operator,
-            &local,
-            call(&action, "works.get", json!({"id": "doc-x"})),
+        public_call(
+            &native,
+            &member,
+            &action,
+            "works.get",
+            json!({"id": "doc-x"}),
         ),
-        "read-only works.get",
+        "member works.get",
+    );
+    assert_eq!(
+        works_snapshot(&native, &scope.install),
+        before,
+        "member refusal must not write"
     );
     let ok = native.service(&owner, "public", &action, "works.query", json!({}), false);
-    assert!(ok.is_array(), "operator screen works.query succeeds");
+    assert!(ok.is_array(), "operator public works.query succeeds");
 }
 
 #[test]
@@ -426,13 +498,30 @@ fn cad811_works_cross_install_denies_without_disclosure() {
         false,
     );
     let id = created["id"].as_str().expect("created id").to_owned();
+    // Success control at the same boundary: the owning install reads it.
+    let own = native.service(
+        &owner,
+        "public",
+        &action_a,
+        "works.get",
+        json!({"id": id}),
+        false,
+    );
+    assert_eq!(
+        own["id"],
+        json!(id),
+        "control: owning install reads the doc"
+    );
+    // Cross-install denial through the public relay, not loopback.
+    let before_b = works_snapshot(&native, &b.install);
     refused(
-        native.fx.call(
-            Asserted::Operator,
-            &owner,
-            call(&action_b, "works.get", json!({"id": id})),
-        ),
+        public_call(&native, &owner, &action_b, "works.get", json!({"id": id})),
         "cross-install works.get",
+    );
+    assert_eq!(
+        works_snapshot(&native, &b.install),
+        before_b,
+        "cross-install denial must not write the other install"
     );
 }
 
@@ -483,6 +572,7 @@ fn cad1662_manager_guard_forged_scope_and_identity_fields_refuse_without_write()
     let scope = native.fx.install("works-guard", WORKS_OPS);
     let (owner, _) = native.owner();
     let action = native.mount(&owner, "public", &scope, 1);
+    let before = works_snapshot(&native, &scope.install);
     for field in [
         "actor",
         "install_id",
@@ -498,23 +588,30 @@ fn cad1662_manager_guard_forged_scope_and_identity_fields_refuse_without_write()
             "idempotency_key": "guard"
         });
         args[field] = json!("forged");
+        // Public-origin relay, same boundary as the success control below.
         refused_exact(
-            native.fx.call(
-                Asserted::Operator,
-                &owner,
-                call(&action, "works.create", args),
-            ),
+            public_call(&native, &owner, &action, "works.create", args),
             field,
             "rejected",
             None,
         );
     }
-    let listed = native.service(&owner, "public", &action, "works.query", json!({}), false);
     assert_eq!(
-        listed.as_array().map(|rows| rows.len()),
-        Some(0),
-        "forged identity/scope must create nothing"
+        works_snapshot(&native, &scope.install),
+        before,
+        "forged identity/scope must write nothing"
     );
+    // Success control at the same boundary: a clean create is accepted, so
+    // the refusals above are the forgery, not the route.
+    let ok = native.service(
+        &owner,
+        "public",
+        &action,
+        "works.create",
+        json!({"kind": "doc", "title": "guard-ok", "content": content_for("doc"), "idempotency_key": "guard-ok"}),
+        false,
+    );
+    assert!(ok["id"].is_string(), "control: a clean create succeeds");
 }
 
 // CAD-1662 two-operator success: a verified author creates and requests
@@ -694,9 +791,22 @@ fn cad811_works_export_before_approval_refuses_through_slot() {
         "works.export",
         json!({"id": id, "revision": revision, "format": "html"}),
     );
+    let before = works_snapshot(&native, &scope.install);
     let error = confirm_slot(&native, &author, &author_action, &token, "export")
         .expect_err("export before approval must refuse");
-    assert_eq!(error.kind(), "rejected", "export gate: wrong refusal kind");
+    // Store refusals are `Error::invalid(code, ..)`: wire kind "rejected" with
+    // the store's own code. The code must survive the SLOT boundary intact.
+    assert_eq!(error.kind(), "rejected", "export gate: wire kind");
+    assert_eq!(
+        error.code(),
+        Some("needs_review"),
+        "export gate: store code needs_review must survive prepare/confirm"
+    );
+    assert_eq!(
+        works_snapshot(&native, &scope.install),
+        before,
+        "refused export must write nothing"
+    );
 }
 
 // Changed facts: a revision moved after prepare must refuse the confirm,

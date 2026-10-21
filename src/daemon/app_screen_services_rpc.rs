@@ -84,6 +84,7 @@ impl ScreenServiceConfirmation {
 impl Shared {
     /// Test-only clock seam: age every held confirmation past
     /// [`CONFIRM_TTL`] so the expiry refusal runs without sleeping.
+    #[cfg(feature = "test-seam")]
     pub(crate) fn age_screen_confirmations_for_test(&self) {
         let aged = Instant::now()
             .checked_sub(CONFIRM_TTL)
