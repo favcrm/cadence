@@ -1,5 +1,8 @@
-//! CAD-1429: `cadence web` — Publish Web over the AgenticOS `/v1/web-sites`
-//! contract (`packages/contracts/src/web-sites.ts`, version "1").
+//! CAD-1429/CAD-1642: the Publish Web workflow over the AgenticOS
+//! `/v1/web-sites` contract (`packages/contracts/src/web-sites.ts`, version
+//! "1"). The daemon `agenticos-web` adapter calls the per-action functions
+//! below from its account-bound entry; the acceptance harness uses [`run`].
+//! The CLI is a thin staging client in `cli/web.rs`.
 //!
 //! Every action runs against one explicitly selected workspace. The credential
 //! is the saved `hct_` grant verified by `remote_cli`; this module never reads a
@@ -126,8 +129,9 @@ struct ReleaseRef {
     manifest_digest: String,
 }
 
-/// Run one action and return its result without printing. The daemon adapter
-/// uses this; the CLI and the acceptance harness use [`run`].
+/// Run one action and return its result without printing. The `agenticos-web`
+/// adapter calls the per-action functions from `execute_for_account`; the
+/// acceptance harness uses [`run`] for its print/exit wrapper.
 pub fn execute(action: &WebAction, target: &RemoteTarget, wake_timeout: u64) -> Result<Value> {
     match action {
         WebAction::Prepare { input, name, spa } => {
@@ -148,8 +152,8 @@ pub fn execute(action: &WebAction, target: &RemoteTarget, wake_timeout: u64) -> 
     }
 }
 
-/// The CLI and harness entry: execute, print the result, and map an action's
-/// terminal state to the exit code the old command returned.
+/// The harness entry: execute, print the result, and map an action's terminal
+/// state to the exit code the pre-cutover command returned.
 pub fn run(action: &WebAction, target: &RemoteTarget, wake_timeout: u64) -> Result<i32> {
     let value = execute(action, target, wake_timeout)?;
     print_json(&value)?;
