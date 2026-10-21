@@ -916,6 +916,7 @@ impl Shared {
             let _ =
                 self.store
                     .remove_agent(ALIAS, true, &super::caller_audit(&AgentCaller::Operator));
+            self.remove_provider_log(ALIAS);
             return Err(e);
         }
         let body = if briefing.len() <= BOOTSTRAP_INLINE_MAX {

@@ -231,6 +231,7 @@ impl Shared {
             match self.store.timer_gc_remove(&agent.alias, older_than) {
                 Ok(Some(_)) => {
                     self.open_attach.lock().unwrap().remove(&agent.alias);
+                    self.remove_provider_log(&agent.alias);
                     removed.push(agent.alias);
                 }
                 Ok(None) => {}

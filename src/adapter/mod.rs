@@ -49,6 +49,44 @@ pub fn daemon_context_env(env: &ProviderEnv) -> Vec<(String, String)> {
         })
         .collect()
 }
+/// CAD-1249: one provider log per agent is capped to this many bytes.
+/// Opening a log first keeps only its newest `PROVIDER_LOG_MAX_BYTES`, so
+/// a chatty or abandoned provider cannot grow an unbounded file.
+pub const PROVIDER_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Open an agent's provider log for append, first trimming it to the
+/// newest [`PROVIDER_LOG_MAX_BYTES`]. The trim is best-effort: a log is
+/// not authoritative state, and a concurrent writer can race the read
+/// and truncate; the next open converges.
+pub fn open_provider_log(path: &std::path::Path) -> crate::error::Result<std::fs::File> {
+    cap_provider_log(path, PROVIDER_LOG_MAX_BYTES)?;
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?)
+}
+
+fn cap_provider_log(path: &std::path::Path, max: u64) -> crate::error::Result<()> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    let len = meta.len();
+    if len <= max {
+        return Ok(());
+    }
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(len - max))?;
+    let mut tail = Vec::with_capacity(max as usize);
+    file.read_to_end(&mut tail)?;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    out.write_all(&tail)?;
+    Ok(())
+}
+
 pub mod codex;
 pub mod fake;
 pub mod link;
@@ -1434,6 +1472,51 @@ mod tests {
         assert_eq!(
             daemon_context_env(&env),
             vec![("CADENCE_PM_DIR".to_string(), "/sbx/pm".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_provider_log_keeps_only_the_newest_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker.provider.log");
+        let cap = PROVIDER_LOG_MAX_BYTES as usize;
+        let mut data = vec![b'x'; cap + 4096];
+        let tail = b"newest-line\n";
+        let at = data.len() - tail.len();
+        data[at..].copy_from_slice(tail);
+        std::fs::write(&path, data).unwrap();
+        drop(open_provider_log(&path).unwrap());
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(after.len(), cap);
+        assert!(after.ends_with(tail));
+        // A log under the cap is untouched.
+        std::fs::write(&path, b"short log").unwrap();
+        drop(open_provider_log(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"short log");
+
+        // A scratch agents/ dir: four over-cap logs shrink to the cap each.
+        let agents = dir.path().join("agents");
+        std::fs::create_dir(&agents).unwrap();
+        for i in 0..4 {
+            let log = agents.join(format!("worker-{i}.provider.log"));
+            std::fs::write(&log, vec![b'x'; cap + 1024]).unwrap();
+        }
+        let total = |dir: &std::path::Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().metadata().unwrap().len())
+                .sum::<u64>()
+        };
+        let before = total(&agents);
+        for i in 0..4 {
+            let log = agents.join(format!("worker-{i}.provider.log"));
+            drop(open_provider_log(&log).unwrap());
+        }
+        let after = total(&agents);
+        assert!(after <= 4 * PROVIDER_LOG_MAX_BYTES);
+        eprintln!(
+            "scratch agents/ 4 logs: before={before} bytes, after={after} bytes, cap={}",
+            PROVIDER_LOG_MAX_BYTES
         );
     }
 }

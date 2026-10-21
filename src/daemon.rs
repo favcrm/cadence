@@ -778,6 +778,18 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// CAD-1249: drop an agent's provider log after its registry row is
+    /// removed. Best effort: a missing file is fine, and a cleanup error
+    /// is reported but never fails an already-committed removal.
+    fn remove_provider_log(&self, alias: &str) {
+        let path = self.provider_log_dir.join(format!("{alias}.provider.log"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!("agent log cleanup: {}: {error}", path.display()),
+        }
+    }
+
     pub fn new(state_dir: &Path, opts: &ServeOptions) -> Result<Arc<Self>> {
         Self::new_hot(state_dir, opts, HotStart::fresh())
     }
@@ -2834,6 +2846,7 @@ impl Shared {
                     self.open_attach.lock().unwrap().remove(&alias);
                     notify
                 };
+                self.remove_provider_log(&alias);
                 // A forced finish routed notices: wake their actors.
                 for target in &notify {
                     self.notify_agent(target);
@@ -2879,6 +2892,7 @@ impl Shared {
                                 );
                             }
                             self.open_attach.lock().unwrap().remove(&agent.alias);
+                            self.remove_provider_log(&agent.alias);
                             removed.push(agent.alias);
                         }
                     }
@@ -9417,6 +9431,18 @@ mod agent_gc_timer {
             "{err}"
         );
         assert!(shared.store.agent_opt("kept").unwrap().is_some());
+    }
+
+    #[test]
+    fn gc_timer_removes_the_provider_log_with_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = pinned(dir.path(), AgentGcSetting::older_than(AGENT_GC_FLOOR_SECS));
+        stopped_row(&shared, dir.path(), "gone", 30.0);
+        let log = shared.provider_log_dir.join("gone.provider.log");
+        std::fs::write(&log, b"provider chatter").unwrap();
+        shared.agent_gc_tick();
+        assert!(shared.store.agent_opt("gone").unwrap().is_none());
+        assert!(!log.exists());
     }
 }
 
