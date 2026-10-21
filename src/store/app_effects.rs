@@ -420,14 +420,20 @@ impl Store {
                     Ok(result)
         })
     }
-    pub fn app_effect_list(&self, install: Option<&str>, context: Option<&str>) -> Result<Value> {
+    pub fn app_effect_list(
+        &self,
+        install: Option<&str>,
+        context: Option<&str>,
+        state: Option<&str>,
+        offset: usize,
+    ) -> Result<Value> {
         if context.is_some() && install.is_none() {
             return Err(Error::rejected("context filter requires installation"));
         }
         self.read_tx(|conn| {
 
-                    let stmt_sql = "SELECT effect_id FROM app_effect_authorizations WHERE (? IS NULL OR install_id=?) AND (? IS NULL OR context_id=?) ORDER BY effect_id LIMIT 100";
-                    let ids = conn.query_vec(stmt_sql, params![install, install, context, context], |r| {
+                    let stmt_sql = "SELECT a.effect_id FROM app_effect_authorizations a LEFT JOIN platform_effects e ON e.effect_id=a.effect_id WHERE (? IS NULL OR a.install_id=?) AND (? IS NULL OR a.context_id=?) AND (? IS NULL OR e.state=?) ORDER BY a.effect_id LIMIT 100 OFFSET ?";
+                    let ids = conn.query_vec(stmt_sql, params![install, install, context, context, state, state, offset as i64], |r| {
                             r.get::<_, String>(0)
                         }).map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
                         .collect::<std::result::Result<Vec<_>, _>>()?;

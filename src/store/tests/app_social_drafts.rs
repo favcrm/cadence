@@ -440,6 +440,25 @@ fn social_draft_discard_is_soft_revision_checked_and_refused_while_in_use() {
     // A waiting effect does not block, and is declined so it cannot be approved later.
     let waiting = make("r-waiting");
     let digest = stage(&waiting, "eff-waiting");
+    assert!(
+        store.app_social_effect_list_page("ctx", 0).unwrap()["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|effect| effect["effect_id"] == "eff-waiting")
+    );
+    assert!(
+        store.app_social_effect_list_page("ctx", 100).unwrap()["effects"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store.app_social_effect_list_install_page(100).unwrap()["effects"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     store.app_social_draft_discard("ctx", &waiting, 1).unwrap();
     assert!(store
         .app_social_effect_decide("eff-waiting", &digest, true)

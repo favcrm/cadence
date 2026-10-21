@@ -942,8 +942,8 @@ impl Shared {
                     "tool_alias",
                 ],
                 "app_effect_show" => &["effect_id"],
-                "app_effect_list" => &["install_id", "context_id"],
-                "app_effect_decide" => &["effect_id", "digest", "decision"],
+                "app_effect_list" => &["install_id", "context_id", "state", "offset", "read_only"],
+                "app_effect_decide" => &["effect_id", "digest", "decision", "execute"],
                 "app_effect_publish_now" | "app_effect_confirm_publish" => &["effect_id", "digest"],
                 "app_effect_schedule" => &["effect_id", "digest", "due_epoch"],
                 "app_effect_reschedule" => {
@@ -954,11 +954,25 @@ impl Shared {
                 _ => return Err(Error::rejected("unknown app effect method")),
             },
         )?;
-        for key in ["install_id", "context_id"] {
+        for key in ["install_id", "context_id", "state"] {
             if params.get(key).is_some_and(|v| !v.is_string()) {
                 return Err(Error::rejected(
                     "app effect filters must be strings when present",
                 ));
+            }
+        }
+        let offset = match params.get("offset") {
+            Some(value) => usize::try_from(value.as_u64().ok_or_else(|| {
+                Error::rejected("app effect offset must be a non-negative integer")
+            })?)
+            .map_err(|_| Error::rejected("app effect offset is too large"))?,
+            None => 0,
+        };
+        for key in ["execute", "read_only"] {
+            if params.get(key).is_some_and(|value| !value.is_boolean()) {
+                return Err(Error::rejected(format!(
+                    "app effect {key} must be a boolean when present"
+                )));
             }
         }
         match method {
@@ -974,13 +988,38 @@ impl Shared {
             "app_effect_list" => {
                 let install = optional_str(params, "install_id");
                 let context = optional_str(params, "context_id");
-                let mut list = self.store.app_effect_list(install, context)?;
+                let state = optional_str(params, "state");
+                let mut list = self
+                    .store
+                    .app_effect_list(install, context, state, offset)?;
                 if let Some(install) = install {
-                    let records =
-                        crate::store::app_records::RecordStore::open(&self.state_dir, install)?;
-                    let social = match context {
-                        Some(context) => records.app_social_effect_list(context)?,
-                        None => records.app_social_effect_list_install()?,
+                    let read_only = params
+                        .get("read_only")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let records = if read_only {
+                        let Some(records) = crate::store::app_records::RecordStore::open_readonly(
+                            &self.state_dir,
+                            install,
+                        )?
+                        else {
+                            return Ok(list);
+                        };
+                        records
+                    } else {
+                        crate::store::app_records::RecordStore::open(&self.state_dir, install)?
+                    };
+                    let social = match (context, state) {
+                        (Some(context), Some(state)) => {
+                            records.app_social_effect_list_state(context, state, offset)?
+                        }
+                        (Some(context), None) => {
+                            records.app_social_effect_list_page(context, offset)?
+                        }
+                        (None, Some(state)) => {
+                            records.app_social_effect_list_install_state(state, offset)?
+                        }
+                        (None, None) => records.app_social_effect_list_install_page(offset)?,
                     };
                     if let (Some(all), Some(extra)) =
                         (list["effects"].as_array_mut(), social["effects"].as_array())
@@ -1060,6 +1099,10 @@ impl Shared {
                         ));
                     }
                 };
+                let execute = params
+                    .get("execute")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
                 if social_effect_install(id).is_some() {
                     return self.decide_social_effect(id, digest, accept);
                 }
@@ -1095,6 +1138,7 @@ impl Shared {
                 // The durable-decision fixture runs before the release locks.
                 // A callback may legitimately change/revoke current authority.
                 if !accept
+                    || !execute
                     || self
                         .effect_execute_gate
                         .as_ref()

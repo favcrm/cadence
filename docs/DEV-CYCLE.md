@@ -428,8 +428,28 @@ the context, enrolls the provider connection, binds every declared
 live destination list. A changed bundle needs a fresh sandbox or a catalog
 upgrade before rebinding.
 
+To clear the sandbox's pending run and release approvals in one explicit step:
+
+```sh
+cadence dev agenticos approve --name dev --install <install-id> \
+  [--context-id <id>] [--dry-run]
+```
+
+It approves only runs in `awaiting_approval` with their exact snapshot digest
+and effects in `waiting` with their exact digest. `--dry-run` pages the
+read-only `waiting` list and prints the same candidate IDs and digests a live
+run would approve. Without `--dry-run` it approves each batch and re-queries
+the `waiting` state, so later windows are reachable. Its decision is
+`execute: false`: the effect is decided with its exact digest but not run, so
+the command never publishes; a normal board approval still executes. A dry run
+opens an existing record file read-only and creates or migrates nothing; a live
+run uses the normal listing path. It refuses a non-dev store, does not create
+or dispatch work, and never runs as a daemon watcher. All its RPCs use the checked sandbox socket, never an inherited
+`CADENCE_SOCKET`; a symlinked or non-socket `cadence.sock` is refused.
+
 Only the install approval is automatic, and only for the exact digest in a dev
-store. Run, quote and effect approvals remain the normal host calls. The
-device publish sender is configured by the profile’s `CADENCE_PUBLISH_*`
-exports, so local publish does not need a hosted lease. Use a test Instagram
-account: a device publish is a real external side effect.
+store. The `approve` command is an explicit operator call; run, quote and
+effect approvals remain the normal host checks. The device publish sender is
+configured by the profile’s `CADENCE_PUBLISH_*` exports, so local publish does
+not need a hosted lease. Use a test Instagram account: a device publish is a
+real external side effect.
