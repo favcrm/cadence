@@ -540,6 +540,11 @@ pub(crate) fn check_seat(
             agent["error"].as_str().unwrap_or("attention")
         )));
     }
+    if agent["enabled"].as_bool() == Some(false) {
+        return Err(Error::rejected(format!(
+            "Worker '{alias}' is disabled — resume it before dispatching"
+        )));
+    }
     // CAD-202: the lane's pane must still be inside this project.
     let cwd_override = check_lane_cwd(project, alias, &agent, force)?;
     let provider = agent["provider"].as_str().unwrap_or_default().to_string();
@@ -617,6 +622,13 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
         provider,
         endpoint_kind,
     } = check_seat(&project, &args.to, args.force, state_dir)?;
+    if args.job_spec.is_none() && endpoint_kind == "sandbox" {
+        return Err(Error::rejected(format!(
+            "Worker '{}' is a cloud sandbox agent — cloud execution is only available \
+             through `dispatch --job` with the job's spec; nothing was created",
+            args.to
+        )));
+    }
     if args.job_spec.is_some() {
         let member = agent["alias"].as_str() == Some(reply_to.as_str())
             || agent["params"]["upstream"].as_str() == Some(reply_to.as_str());

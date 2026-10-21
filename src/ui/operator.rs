@@ -423,6 +423,9 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/master/permissions/rules/*/revoke",
         RouteClass::OperatorOnly,
     ),
+    // Setup: create one agent row through the daemon's `agent_register`
+    // (`rpc_register`). Operator-only; the daemon's own gate still applies.
+    route("POST", "/api/agents", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/resume", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/unfence", RouteClass::OperatorOnly),
     // CAD-608: the issue page's lane. Unlisted writes would fail closed
@@ -2686,6 +2689,8 @@ mod tests {
             route_class("POST", "/api/ideas/CAD-1/decide"),
             RouteClass::OperatorOnly
         );
+        // Setup: creating an agent is the operator's, never an agent's.
+        assert_eq!(route_class("POST", "/api/agents"), RouteClass::OperatorOnly);
         assert_eq!(
             route_class("POST", "/api/issues/CAD-1/answers"),
             RouteClass::OperatorOnly

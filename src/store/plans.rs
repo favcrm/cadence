@@ -225,6 +225,19 @@ impl Verdict {
     }
 }
 
+/// A pre-dispatch plan: the exact revision, kickoff id and body a fresh
+/// `dispatch_task` will use. `duplicate` means a live kickoff already
+/// exists and no new revision will be minted.
+pub struct DispatchPlan {
+    pub task: Task,
+    pub job: Job,
+    pub worker: Agent,
+    pub revision: i64,
+    pub message_id: String,
+    pub body: String,
+    pub duplicate: bool,
+}
+
 impl Store {
     pub(super) fn job_in(&self, conn: &impl super::StoreConn, id: &str) -> Result<Job> {
         conn.query_row("SELECT * FROM jobs WHERE id=?", [id], row_job)
@@ -713,6 +726,107 @@ impl Store {
         Ok(())
     }
 
+    /// The read-only half of `job dispatch`, used by the cloud runner to
+    /// obtain the exact revision, kickoff id and body before any local
+    /// write. The caller creates the remote job (AOS enforces the
+    /// entitlement) and passes the same message id into `dispatch_task`;
+    /// a race is caught by comparing the returned revision/message.
+    pub fn plan_task_dispatch(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        requested_message_id: Option<&str>,
+    ) -> Result<DispatchPlan> {
+        let task = self.task(task_id)?;
+        let job = self.job(&task.job_id)?;
+        if job.state != "open" {
+            return Err(Error::rejected(format!(
+                "Job '{}' is '{}' — dispatch needs an open job",
+                job.id, job.state
+            )));
+        }
+        let assignee = to.or(task.assignee.as_deref()).ok_or_else(|| {
+            Error::rejected(format!(
+                "Task '{task_id}' has no assignee — \
+                 `cadence job dispatch {task_id} --to <worker>`"
+            ))
+        })?;
+        let worker = self.agent(assignee)?;
+        self.check_group_member(&job, &worker)?;
+        let mut revision = task.revision;
+        match task.state.as_str() {
+            "draft" | "revising" => revision += 1,
+            "dispatched" | "running" => {
+                let live = task
+                    .dispatch_message
+                    .as_deref()
+                    .and_then(|id| self.message(id).ok().flatten())
+                    .filter(|message| !is_terminal(&message.state));
+                if let Some(live) = live {
+                    if to.is_some() && to != task.assignee.as_deref() {
+                        return Err(Error::rejected(format!(
+                            "Task '{task_id}' has a live kickoff — reassign \
+                             after it finishes or is reconciled"
+                        )));
+                    }
+                    let current_revision = task.revision;
+                    return Ok(DispatchPlan {
+                        task,
+                        job,
+                        worker,
+                        revision: current_revision,
+                        message_id: live.id,
+                        body: String::new(),
+                        duplicate: true,
+                    });
+                }
+                revision += 1;
+            }
+            "blocked" => {
+                if to.is_some() && to != task.assignee.as_deref() {
+                    revision += 1;
+                } else {
+                    return Err(Error::rejected(format!(
+                        "Task '{task_id}' is blocked — `cadence job task reopen \
+                         {task_id}` re-scopes it, or `job dispatch {task_id} \
+                         --to <worker>` reassigns"
+                    )));
+                }
+            }
+            state => {
+                return Err(Error::rejected(format!(
+                    "Task '{task_id}' is '{state}' — dispatch is legal from \
+                     draft, revising, or after the live kickoff ended"
+                )));
+            }
+        }
+        let attempt = self
+            .messages_for_task(task_id)?
+            .iter()
+            .filter(|message| message.source == "job_dispatch")
+            .count() as i64;
+        let message_id = requested_message_id.map(str::to_string).unwrap_or_else(|| {
+            Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!("cadence-dispatch:{task_id}:r{revision}:a{attempt}").as_bytes(),
+            )
+            .simple()
+            .to_string()
+        });
+        let body = kickoff_body(&job, &task, revision, &message_id, &worker)?;
+        let mut planned_task = task;
+        planned_task.revision = revision;
+        Ok(DispatchPlan {
+            task: planned_task,
+            job,
+            worker,
+            revision,
+            message_id,
+            body,
+            duplicate: false,
+        })
+    }
+
     /// `job dispatch`: one transaction — task `dispatched` at a new (or
     /// retried) revision, the kickoff message enqueued, events scoped.
     ///
@@ -733,7 +847,22 @@ impl Store {
         message_id: Option<&str>,
         by: &str,
     ) -> Result<(Task, String, bool, bool)> {
-        self.dispatch_task_inner(task_id, to, message_id, by, None)
+        self.dispatch_task_inner(task_id, to, message_id, by, None, None)
+    }
+
+    /// `dispatch_task` for a caller that selected the backend from the
+    /// pre-transaction assignee. The transaction refuses if the task's
+    /// assignee changed before this write, so a local/cloud choice can
+    /// never be applied to a different worker.
+    pub fn dispatch_task_for(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        expected_worker: Option<&Agent>,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(task_id, to, message_id, by, expected_worker, None)
     }
 
     /// `dispatch_task` for an assist-bound job: the fenced transaction first
@@ -748,7 +877,21 @@ impl Store {
         by: &str,
         expect: &AssistDispatchExpect,
     ) -> Result<(Task, String, bool, bool)> {
-        self.dispatch_task_inner(task_id, to, message_id, by, Some(expect))
+        self.dispatch_task_inner(task_id, to, message_id, by, None, Some(expect))
+    }
+
+    /// `dispatch_task_expecting` with the pre-transaction assignee pinned
+    /// in the same fenced write.
+    pub fn dispatch_task_expecting_for(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        expect: &AssistDispatchExpect,
+        expected_worker: Option<&Agent>,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(task_id, to, message_id, by, expected_worker, Some(expect))
     }
 
     fn dispatch_task_inner(
@@ -757,6 +900,7 @@ impl Store {
         to: Option<&str>,
         message_id: Option<&str>,
         by: &str,
+        expected_worker: Option<&Agent>,
         expect: Option<&AssistDispatchExpect>,
     ) -> Result<(Task, String, bool, bool)> {
         self.write_tx(|conn| {
@@ -809,8 +953,28 @@ impl Store {
                 ))
             })?;
             let worker = self.agent_in(&tx, assignee)?;
-            self.check_group_member(&job, &worker)?;
+            if let Some(expected) = expected_worker {
+                if worker.alias != expected.alias
+                    || worker.uid != expected.uid
+                    || worker.provider != expected.provider
+                    || worker.endpoint_kind != expected.endpoint_kind
+                {
+                    return Err(Error::rejected(format!(
+                        "Task '{task_id}' worker identity changed to '{}' while \
+                         dispatching — retry so the local/cloud choice follows the \
+                         final registered agent",
+                        worker.alias
+                    )));
+                }
+            }
             refuse_archived_assignee(&worker)?;
+            if !worker.enabled {
+                return Err(Error::rejected(format!(
+                    "Agent '{}' is disabled — resume it before dispatching",
+                    worker.alias
+                )));
+            }
+            self.check_group_member(&job, &worker)?;
 
             // Same-revision retry vs new revision.
             let mut revision = task.revision;
@@ -821,7 +985,10 @@ impl Store {
                         .dispatch_message
                         .as_deref()
                         .and_then(|m| self.message_in(&tx, m).ok().flatten())
-                        .filter(|m| !is_terminal(&m.state))
+                        .filter(|m| {
+                            !is_terminal(&m.state)
+                                || (m.state == "unknown" && m.source == "job_dispatch")
+                        })
                         .map(|m| m.id);
                     if let Some(live_id) = live_id {
                         // Kickoff still in flight — a second dispatch is a
@@ -1160,6 +1327,7 @@ impl Store {
                     task.state
                 )));
             }
+            self.refuse_active_cloud(tx, &task, "reopening the task")?;
             if let Some(assignee) = task.assignee.as_deref() {
                 let worker = self.agent_in(&tx, assignee)?;
                 refuse_archived_assignee(&worker)?;
@@ -1193,6 +1361,7 @@ impl Store {
                     task.state
                 )));
             }
+            self.refuse_active_cloud(tx, &task, "failing the task")?;
             tx.execute(
                 "UPDATE tasks SET state='failed',error=?,updated=? WHERE id=?",
                 params![reason, now(), task_id],
@@ -1229,7 +1398,47 @@ impl Store {
         })
     }
 
+    /// The sandbox alias holding an active cloud kickoff for this task.
+    fn active_cloud_alias(
+        &self,
+        tx: &impl super::StoreConn,
+        task: &Task,
+    ) -> Result<Option<String>> {
+        let Some(kickoff) = &task.dispatch_message else {
+            return Ok(None);
+        };
+        let Some(alias) = tx.query_opt(
+            "SELECT alias FROM messages WHERE id=? AND source='job_dispatch' \
+             AND state IN ('queued','running','unknown')",
+            [kickoff.as_str()],
+            |r| r.get::<_, String>(0),
+        )?
+        else {
+            return Ok(None);
+        };
+        let agent = self.agent_in(tx, &alias)?;
+        Ok((agent.provider == "sandbox" && agent.endpoint_kind == "sandbox").then_some(alias))
+    }
+
+    fn refuse_active_cloud(
+        &self,
+        tx: &impl super::StoreConn,
+        task: &Task,
+        verb: &str,
+    ) -> Result<()> {
+        if let Some(alias) = self.active_cloud_alias(tx, task)? {
+            return Err(Error::rejected(format!(
+                "Task '{}' has an active cloud dispatch on '{alias}' — \
+                 run `cadence agent stop {alias}` and reconcile the remote \
+                 before {verb}",
+                task.id
+            )));
+        }
+        Ok(())
+    }
+
     fn cancel_task_tx(&self, tx: &impl super::StoreConn, task: &Task, by: &str) -> Result<()> {
+        self.refuse_active_cloud(tx, task, "cancelling the task")?;
         if let Some(kickoff) = &task.dispatch_message {
             tx.execute(
                 "UPDATE messages SET state='cancelled',completed=?

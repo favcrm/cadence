@@ -962,6 +962,18 @@ impl Store {
                     message.state
                 )));
             }
+            let agent = self.agent_in(&tx, &message.alias)?;
+            if message.source == "job_dispatch"
+                && agent.provider == "sandbox"
+                && agent.endpoint_kind == "sandbox"
+            {
+                return Err(Error::rejected(format!(
+                    "Message '{message_id}' is cloud sandbox work — run \
+                     `cadence agent stop {}` and let the poller stop/reconcile the \
+                     remote; a local reconcile would release an unproven writer",
+                    message.alias
+                )));
+            }
             let result = json!({
                 "status": status,
                 "via": "operator_reconcile",

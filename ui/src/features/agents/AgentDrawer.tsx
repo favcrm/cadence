@@ -6,7 +6,7 @@ import { IconClose } from "../../ui/icons";
 import Button from "../../ui/Button";
 import AgentAvatar, { lookFor } from "./AgentAvatar";
 import { AgentActivity, AgentQueue, WorkBlock } from "./AgentBlocks";
-import { agentHoldsWorkButDead, lifecycleOf } from "./agentView";
+import { agentHoldsWorkButDead, agentLocation, lifecycleOf } from "./agentView";
 import { WriteGate } from "../auth/WriteGate";
 import { useTranslate } from "../../lib/locale";
 import type { Agent, AgentDetail, UsageLimit } from "../../lib/types";
@@ -318,6 +318,11 @@ export default function AgentDrawer({
             {a?.role ?? observed?.role ?? t("Agent")} ·{" "}
             {a?.provider ?? observed?.provider ?? t("Loading provider")}
             {profile && ` / ${profile.endpoint_kind}`}
+            {profile && (
+              <span className="ml-2 text-micro text-ink-500">
+                {agentLocation(profile) === "cloud" ? t("Cloud") : t("Local")}
+              </span>
+            )}
           </p>
           {observed && (
             <p className="text-micro text-ink-500 mt-1">

@@ -710,6 +710,35 @@ pub static SPECS: &[EndpointSpec] = &[
         launch_default: true,
         internal: false,
     },
+    // CAD-1673: the cloud sandbox runner seam (see `adapter::sandbox`).
+    // AOS-324: registered cloud runner. It has no local actor; dispatch
+    // selects it by `endpoint_kind` and starts the remote job. The image
+    // and budget are AOS-owned; no launch params are accepted.
+    EndpointSpec {
+        provider: "sandbox",
+        endpoint_kind: "sandbox",
+        display: "Cloud sandbox",
+        has_actor: false,
+        attach: Attach::None,
+        ready_gate: false,
+        screen_probe: false,
+        reports: Reporting::TurnResult,
+        report_hint: Reporting::TurnResult,
+        turn_token: None,
+        brokers_requests: false,
+        resumable: false,
+        resume_label: "",
+        live_settable_params: &[],
+        launch_params: &[],
+        session_id_label: "Sandbox session",
+        respond_rejection: None,
+        capabilities: &[],
+        doctor_caps: &[],
+        probe_bins: &[],
+        session_disposable: false,
+        launch_default: false,
+        internal: false,
+    },
 ];
 
 /// `health.capabilities` entry for daemon-wide model defaults.
@@ -1997,7 +2026,13 @@ mod tests {
     fn model_matrix_keeps_devin_and_drops_test_doubles() {
         let rows = model_provider_matrix();
         let ids: Vec<&str> = rows.iter().map(|row| row.id).collect();
-        assert_eq!(ids, vec!["codex", "claude", "pi", "omp", "devin", "cursor"]);
+        assert_eq!(
+            ids,
+            vec!["codex", "claude", "pi", "omp", "devin", "cursor", "sandbox"]
+        );
+        assert!(rows
+            .iter()
+            .any(|row| { row.id == "sandbox" && !row.eligible && row.limitation.is_some() }));
         assert!(rows.iter().any(|row| row.id == "claude" && row.eligible));
         assert!(rows.iter().any(|row| row.id == "pi" && row.eligible));
         assert!(rows

@@ -2057,6 +2057,239 @@ impl Store {
         })
     }
 
+    /// Claim an `unknown` cloud kickoff for restart/reconcile. The guarded
+    /// transition ensures one recovery consumer; the create replay and
+    /// stop use the original kickoff identity.
+    pub fn claim_cloud_recovery(&self, message_id: &str, turn_id: &str) -> Result<bool> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let changed = tx.execute(
+                "UPDATE messages SET state='running',turn_id=? \
+                 WHERE id=? AND state='unknown'",
+                params![turn_id, message_id],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            Self::event(
+                &tx,
+                &alias,
+                "cloud_recovery_claimed",
+                json!({"message": message_id, "turn_id": turn_id}),
+            )?;
+            self.task_on_running(&tx, message_id, &alias)?;
+            Ok(true)
+        })
+    }
+
+    /// Claim a queued kickoff for a non-actor backend. Returns `false` when
+    /// the message was cancelled or already claimed, so the caller must not
+    /// start an external job or resurrect a terminal delivery.
+    pub fn mark_running_queued(&self, message_id: &str, turn_id: &str) -> Result<bool> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let changed = tx.execute(
+                "UPDATE messages SET state='running',turn_id=? \
+                 WHERE id=? AND state='queued'",
+                params![turn_id, message_id],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            Self::event(
+                &tx,
+                &alias,
+                "turn_started",
+                json!({"message": message_id, "turn_id": turn_id}),
+            )?;
+            self.task_on_running(&tx, message_id, &alias)?;
+            Ok(true)
+        })
+    }
+
+    /// Record an operator stop request for a running cloud kickoff. The
+    /// poller observes it and calls the AOS stop route; the event is the
+    /// durable handoff because the runner is not an AgentCtl.
+    pub fn request_cloud_stop(&self, message_id: &str) -> Result<()> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            let publishing: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='cloud_publication_started' \
+                 AND json_extract(payload,'$.message')=? AND alias=?",
+                params![message_id, alias],
+                |r| r.get(0),
+            )?;
+            if publishing > 0 {
+                return Err(Error::rejected(
+                    "cloud dispatch is already completing; the stop was refused",
+                ));
+            }
+            Self::event(
+                &tx,
+                &alias,
+                "cloud_stop_requested",
+                json!({"message": message_id}),
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Serialize the first publication write with a concurrent operator
+    /// stop. A stop that commits first makes this return `false`; once this
+    /// commits, `request_cloud_stop` refuses to cancel the completion.
+    pub fn begin_cloud_publication(&self, message_id: &str) -> Result<bool> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            let stopped: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='cloud_stop_requested' \
+                 AND json_extract(payload,'$.message')=? AND alias=?",
+                params![message_id, alias],
+                |r| r.get(0),
+            )?;
+            if stopped > 0 {
+                return Ok(false);
+            }
+            Self::event(
+                &tx,
+                &alias,
+                "cloud_publication_started",
+                json!({"message": message_id}),
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Mark that a create request is about to be sent. A later definitive
+    /// refusal cannot be assumed to mean no remote exists: an earlier
+    /// attempt may have created it before its response was lost.
+    pub fn note_cloud_create_attempt(&self, message_id: &str) -> Result<()> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            Self::event(
+                &tx,
+                &alias,
+                "cloud_create_attempted",
+                json!({"message": message_id}),
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Whether any create request was already attempted for this kickoff.
+    pub fn cloud_create_attempted(&self, message_id: &str) -> Result<bool> {
+        self.read_tx(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='cloud_create_attempted' \
+                 AND json_extract(payload,'$.message')=? \
+                 AND alias=(SELECT alias FROM messages WHERE id=?)",
+                params![message_id, message_id],
+                |r| r.get(0),
+            )?;
+            Ok(count > 0)
+        })
+    }
+
+    /// Authorize one create attempt and record it in the same transaction
+    /// as the stop check. A stop that wins before the first attempt means
+    /// no remote may be created. Once an attempt is recorded, a later
+    /// definitive refusal is not proof that no remote exists.
+    /// Returns `(authorized, had_prior_attempt)`.
+    pub fn authorize_cloud_create(&self, message_id: &str) -> Result<(bool, bool)> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            let stopped: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='cloud_stop_requested' \
+                 AND json_extract(payload,'$.message')=? AND alias=?",
+                params![message_id, alias],
+                |r| r.get(0),
+            )?;
+            let attempted: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='cloud_create_attempted' \
+                 AND json_extract(payload,'$.message')=? AND alias=?",
+                params![message_id, alias],
+                |r| r.get(0),
+            )?;
+            if stopped > 0 && attempted == 0 {
+                return Ok((false, false));
+            }
+            Self::event(
+                &tx,
+                &alias,
+                "cloud_create_attempted",
+                json!({"message": message_id}),
+            )?;
+            Ok((true, attempted > 0))
+        })
+    }
+
+    /// Whether an operator stop was requested for this kickoff.
+    pub fn cloud_stop_requested(&self, message_id: &str) -> Result<bool> {
+        self.read_tx(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='cloud_stop_requested' \
+                 AND json_extract(payload,'$.message')=? \
+                 AND alias=(SELECT alias FROM messages WHERE id=?)",
+                params![message_id, message_id],
+                |r| r.get(0),
+            )?;
+            Ok(count > 0)
+        })
+    }
+
+    /// Return a cloud kickoff to `queued` when its remote job's state could
+    /// not be proven and the stop was not confirmed. The guarded claim
+    /// token means only the consumer that claimed this delivery can release
+    /// it; a retry then re-enters the same task/revision remote job.
+    pub fn requeue_cloud_claim(&self, message_id: &str, turn_id: &str) -> Result<bool> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let changed = tx.execute(
+                "UPDATE messages SET state='queued',turn_id=NULL \
+                 WHERE id=? AND state='running' AND turn_id=?",
+                params![message_id, turn_id],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            let alias: String =
+                tx.query_row("SELECT alias FROM messages WHERE id=?", [message_id], |r| {
+                    r.get(0)
+                })?;
+            Self::event(
+                &tx,
+                &alias,
+                "turn_requeued",
+                json!({"message": message_id, "turn_id": turn_id,
+                       "reason": "cloud sandbox job state unproven"}),
+            )?;
+            Ok(true)
+        })
+    }
+
     /// Return a `submitting` message to `queued` — the submission gate
     /// refused before any paste, so retry is safe.
     pub fn requeue(&self, message_id: &str) -> Result<()> {

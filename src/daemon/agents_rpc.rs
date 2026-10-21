@@ -1036,6 +1036,55 @@ impl Shared {
                 "Agent '{alias}' is archived — restore it before stopping it"
             )));
         }
+        // A sandbox runner has no host actor, so the inbox refusal below
+        // does not apply. A running kickoff is stopped by the poller on a
+        // durable request; a queued one is settled before any create.
+        if agent.provider == "sandbox" && agent.endpoint_kind == "sandbox" {
+            let mut running = 0;
+            let mut queued = 0;
+            for message in self.store.messages(&alias)? {
+                if message.source != "job_dispatch" {
+                    continue;
+                }
+                match message.state.as_str() {
+                    "running" => {
+                        self.store.request_cloud_stop(&message.id)?;
+                        running += 1;
+                    }
+                    "queued" => {
+                        self.store.request_cloud_stop(&message.id)?;
+                        queued += 1;
+                    }
+                    "unknown" => {
+                        self.store.request_cloud_stop(&message.id)?;
+                        running += 1;
+                        if let Some(task_id) = message.task_id.clone() {
+                            let shared = Arc::clone(self);
+                            let message_id = message.id.clone();
+                            std::thread::spawn(move || {
+                                let _ = shared.run_cloud_dispatch(&task_id, &message_id);
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if running == 0 && queued == 0 {
+                return Err(Error::rejected(format!(
+                    "Agent '{alias}' has no active cloud dispatch to stop"
+                )));
+            }
+            // A cloud stop is per-job. The actorless agent stays enabled:
+            // there is no actor/resume path to re-enable it, and a stopped
+            // job must not permanently block later dispatch.
+            let _ = self.store.event_public(
+                &alias,
+                "stop_requested",
+                json!({"cloud_jobs": running, "queued_stop_requested": queued}),
+            );
+            return Ok(json!({"alias": alias, "state": "stopping",
+                             "cloud_jobs": running, "queued_stop_requested": queued}));
+        }
         if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
             return Err(Error::rejected(format!(
                 "Agent '{alias}' is an inbox — no actor to stop; \

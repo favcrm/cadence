@@ -13,6 +13,7 @@ import {
 } from "./privateSession";
 import type {
   AgentDetail,
+  AgentRegisterBody,
   AgentsPayload,
   AppDetail,
   AppOutputsPayload,
@@ -786,6 +787,13 @@ export const api = {
       `/api/agents/${encodeURIComponent(alias)}/${verb}`,
       verb === "unfence" ? { status } : {},
     ),
+  /**
+   * `POST /api/agents` - create one agent row through the daemon's
+   * `agent_register` (the CLI's registration path). Operator-only. Cloud
+   * agents send `location: "cloud"` and the daemon pins provider and
+   * endpoint kind to `sandbox`.
+   */
+  registerAgent: (body: AgentRegisterBody) => post<Record<string, unknown>>("/api/agents", body),
   /** `POST /api/plans/<epic>/approve|reject` — operator-only (CAD-328). */
   decidePlan: (epic: string, verb: "approve" | "reject", reason?: string) => {
     let req: ReturnType<typeof planDecision>;

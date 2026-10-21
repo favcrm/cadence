@@ -685,6 +685,34 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         Some(job) => Some(check_job(state_dir, job)?),
         None => None,
     };
+    if args.job.is_none() {
+        if let Some(owner) = &args.owner {
+            // `issue_kickoff` may mint the worker after start; only an
+            // already-registered sandbox owner is refused here.
+            match client::rpc(state_dir, "agent_show", json!({"alias": owner})) {
+                Ok(show) if show["agent"]["enabled"].as_bool() == Some(false) => {
+                    return Err(Error::rejected(format!(
+                        "Agent '{owner}' is disabled — resume it before starting work"
+                    )));
+                }
+                Ok(show) if show["agent"]["endpoint_kind"].as_str() == Some("sandbox") => {
+                    return Err(Error::rejected(format!(
+                        "Cloud sandbox agent '{owner}' runs only `--job` dispatches — \
+                         nothing was created"
+                    )));
+                }
+                Ok(_) => {}
+                Err(error)
+                    if error.to_string().contains("Unknown managed agent")
+                        || error.to_string().contains("Daemon is not reachable") =>
+                {
+                    // No job and no live daemon: the ordinary dispatch path
+                    // will report the daemon failure at its own gate.
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
     let (project, dir) = write::issue_dir(pm, id)?;
     // CAD-360: the plan gate, before anything is created — `issue
     // start`, `dispatch` and `dispatch --job` all come through here.
@@ -692,6 +720,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     crate::issue::plan::gate(&pm.dir, &initial_front, &initial_body)?;
     // CAD-202: a pty assignee whose pane cwd is deleted or outside the
     // project's repos refuses here, before anything is created.
+    let mut cloud = false;
     let cwd_override = match &args.job {
         Some(JobArgs {
             assignee: Some(assignee),
@@ -699,6 +728,12 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             ..
         }) => {
             let show = client::rpc(state_dir, "agent_show", json!({"alias": assignee}))?;
+            if show["agent"]["enabled"].as_bool() == Some(false) {
+                return Err(Error::rejected(format!(
+                    "Agent '{assignee}' is disabled — resume it before starting work"
+                )));
+            }
+            cloud = show["agent"]["endpoint_kind"].as_str() == Some("sandbox");
             crate::issue::dispatch::check_lane_cwd(&project, assignee, &show["agent"], *force)?
         }
         _ => None,
@@ -790,6 +825,12 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         "issue start",
         || claim::since(&pm.dir, &project.key, &front, Duration::from_secs(2)),
     )?;
+    // A cloud start's admission is a read-only AOS probe, before the
+    // take-over commit and before the ordinary new-lane claim. A denied
+    // company leaves the tracker untouched.
+    if cloud {
+        client::rpc(state_dir, "cloud_probe", json!({}))?;
+    }
     if let Some(t) = &checked.take_over {
         let mut taken = front.clone();
         taken.claim = Some(claim::new_claim(&requester, Some(t.reason.clone())));
@@ -959,6 +1000,83 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         }
     }
     drop(lock);
+
+    if cloud {
+        // A cloud agent owns no host worktree. The remote runner clones the
+        // project repo. Record only the branch lane; the job carries the
+        // host repo path and branch/base for the daemon-side runner.
+        let mut claim_out = claim::json(&front, crate::issue::time::now_epoch());
+        claim_out["warning"] = json!(checked.warning);
+        claim_out["take_over"] = json!(checked
+            .take_over
+            .as_ref()
+            .map(|t| json!({"from": t.from, "reason": t.reason})));
+        let mut out = json!({
+            "issue": front.id,
+            "repo": root,
+            "worktree": root,
+            "branch": branch,
+            "base": {"ref": base, "sha": lane_base_sha},
+            "trailer": format!("Issue: {}", front.id),
+            "created": true,
+            "target_dir": null,
+            "slot_env": null,
+            "claim": claim_out,
+            "cloud": true,
+        });
+        write::add_ref(
+            pm,
+            id,
+            "branch",
+            &branch,
+            Some("cloud sandbox lane"),
+            None,
+            None,
+            None,
+            actor,
+        )?;
+        if let Some(warning) = &base_warning {
+            eprintln!("cadence: {warning}");
+            out["base"]["warning"] = json!(warning);
+        }
+        if let (Some(job), Some((job_state_dir, spec, spec_sha256))) = (&args.job, &job_probe) {
+            let task_acceptance =
+                crate::issue::dispatch::acceptance_listing(&parse::acceptance_items(&body));
+            let created_job = client::rpc(
+                job_state_dir,
+                "job_new",
+                json!({"pm": job.pm, "spec": spec, "spec_sha256": spec_sha256,
+                       "title": front.title, "issue": front.id,
+                       "repo": root, "base_ref": lane_base_sha,
+                       "task_worktree": root.to_string_lossy(),
+                       "task_branch": branch,
+                       "task_base_sha": lane_base_sha,
+                       "task_assignee": job.assignee,
+                       "task_acceptance": task_acceptance}),
+            )?;
+            let job_id = created_job["job"]["id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            out["job"] = json!(job_id.clone());
+            out["task"] = json!(format!("{job_id}-t1"));
+        }
+        if let Some(note) = &cwd_override {
+            write::add_comment(pm, id, note, None, Some("dispatch"), None, actor)?;
+            out["cwd_override"] = json!(note);
+        }
+        let mut leases =
+            crate::issue::areas::check_start(&pm.dir, state_dir, &project.key, &front, &requester);
+        let lines = crate::issue::areas::warning_lines(&leases);
+        if !lines.is_empty() {
+            let text = format!("Lease warnings at start:\n- {}", lines.join("\n- "));
+            if let Err(e) = write::add_comment(pm, id, &text, None, Some("lease"), None, actor) {
+                leases["record_error"] = json!(e.to_string());
+            }
+        }
+        out["leases"] = leases;
+        return Ok(out);
+    }
 
     // Unlocked: worktree creation and setup (cargo target, hooks). The
     // lifecycle ledger records the intent first, so a crash here leaves

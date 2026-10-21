@@ -301,6 +301,14 @@ impl Shared {
         Ok(json!({"task": task.to_json()}))
     }
 
+    /// Read-only entitlement probe for a cloud start. The CLI has no
+    /// hosted company context; the daemon does, and its refusal carries
+    /// the stable `cloud_sandbox_not_entitled` code.
+    pub(super) fn rpc_cloud_probe(self: &Arc<Self>, _params: &Value) -> Result<Value> {
+        crate::issue::cloud::probe_entitlement()?;
+        Ok(json!({"entitled": true}))
+    }
+
     /// `job dispatch` — bookkeeping plus the kickoff enqueue in one
     /// store transaction. Does not bypass the ready gate: `--ready` is
     /// claimed client-side exactly like `send --ready`.
@@ -423,31 +431,158 @@ impl Shared {
             }
             None => {}
         }
-        if let Some(alias) = to.as_deref().or(pending.assignee.as_deref()) {
-            let target = self.store.agent(alias)?;
-            crate::adapter::pi::refuse_confined_devin_agent(&target)?;
+        let target_alias = to.as_deref().or(pending.assignee.as_deref());
+        let target = target_alias
+            .map(|alias| self.store.agent(alias))
+            .transpose()?;
+        if let Some(target) = &target {
+            crate::adapter::pi::refuse_confined_devin_agent(target)?;
+            if !target.enabled {
+                return Err(Error::rejected(format!(
+                    "Agent '{}' is disabled — resume it before dispatching",
+                    target.alias
+                )));
+            }
+        }
+        let cloud_dispatch = target
+            .as_ref()
+            .is_some_and(|agent| agent.endpoint_kind == "sandbox");
+        // Read-only AOS probe before the dispatch transaction. A denied
+        // company leaves the task revision, job and kickoff untouched.
+        if cloud_dispatch {
+            crate::issue::cloud::probe_entitlement()?;
         }
         let (task, message, duplicate, behind_dead) = match &expect {
-            Some(expect) => self.store.dispatch_task_expecting(
+            Some(expect) => self.store.dispatch_task_expecting_for(
                 task_id,
                 to.as_deref(),
                 optional_str(params, "message"),
                 by,
                 expect,
+                target.as_ref(),
             )?,
-            None => self.store.dispatch_task(
+            None => self.store.dispatch_task_for(
                 task_id,
                 to.as_deref(),
                 optional_str(params, "message"),
                 by,
+                target.as_ref(),
             )?,
         };
+        if cloud_dispatch {
+            let shared = Arc::clone(self);
+            let task_id = task.id.clone();
+            let message_id = message.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = shared.run_cloud_dispatch(&task_id, &message_id) {
+                    eprintln!("cloud sandbox dispatch {task_id} failed: {error}");
+                }
+            });
+        }
         if let Some(assignee) = &task.assignee {
             self.notify_agent(assignee);
         }
         self.wake();
         Ok(json!({"task": task.to_json(), "message": message,
                   "duplicate": duplicate, "queued_behind_dead": behind_dead}))
+    }
+
+    /// Consume a sandbox agent's dispatched kickoff. The normal dispatch
+    /// transaction already set the task `dispatched` and queued `message`;
+    /// claim the queued delivery before any external side effect, then drive
+    /// the remote job and call the same finish/report path. A cancelled or
+    /// already-claimed delivery is left alone. `has_actor=false` means no
+    /// actor exists.
+    pub(super) fn run_cloud_dispatch(&self, task_id: &str, message_id: &str) -> Result<()> {
+        fn fail(
+            store: &crate::store::Store,
+            message: &crate::store::Message,
+            error: Error,
+        ) -> Error {
+            if store.cloud_create_attempted(&message.id).unwrap_or(false) {
+                let _ = store.requeue_cloud_claim(&message.id, &format!("cloud:{}", message.id));
+                return Error::Structured(crate::error::Structured {
+                    kind: "rejected",
+                    code: crate::issue::cloud::UNCERTAIN.to_string(),
+                    message: format!(
+                        "cloud sandbox recovery preflight failed after a prior create \
+                         attempt: {error}"
+                    ),
+                    revision: None,
+                });
+            }
+            crate::issue::cloud::fail_message(store, message, &error);
+            error
+        }
+        let message = self.store.message(message_id)?.ok_or_else(|| {
+            Error::rejected(format!("cloud dispatch message '{message_id}' is gone"))
+        })?;
+        let turn = format!("cloud:{}", message.id);
+        let claimed = if message.state == "unknown" {
+            self.store.claim_cloud_recovery(&message.id, &turn)?
+        } else {
+            self.store.mark_running_queued(&message.id, &turn)?
+        };
+        if !claimed {
+            return Ok(());
+        }
+        let task = self
+            .store
+            .task(task_id)
+            .map_err(|error| fail(&self.store, &message, error))?;
+        let job = self
+            .store
+            .job(&task.job_id)
+            .map_err(|error| fail(&self.store, &message, error))?;
+        let alias = task.assignee.as_deref().unwrap_or(message.alias.as_str());
+        let agent = self
+            .store
+            .agent(alias)
+            .map_err(|error| fail(&self.store, &message, error))?;
+        if agent.provider != "sandbox" || agent.endpoint_kind != "sandbox" {
+            let error = Error::rejected(format!(
+                "cloud kickoff recipient '{alias}' is no longer a sandbox agent"
+            ));
+            return Err(fail(&self.store, &message, error));
+        }
+        let _ = crate::issue::cloud::hosted_company(|key| std::env::var(key).ok())
+            .map_err(|error| fail(&self.store, &message, error))?;
+        let pm = self
+            .pm()
+            .map_err(|error| fail(&self.store, &message, error))?;
+        loop {
+            let outcome = crate::issue::cloud::run_dispatch(
+                &pm,
+                &self.store,
+                &task,
+                &job,
+                &message,
+                &agent,
+                &|| {
+                    self.store
+                        .cloud_stop_requested(&message.id)
+                        .unwrap_or(false)
+                },
+            );
+            if let Err(error) = &outcome {
+                if error.code() == Some(crate::issue::cloud::UNCERTAIN) {
+                    let _ = self
+                        .store
+                        .requeue_cloud_claim(&message.id, &format!("cloud:{}", message.id));
+                    // Re-enter the same kickoff/remote identity instead of
+                    // leaving a queued claim without a consumer.
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    if !self
+                        .store
+                        .mark_running_queued(&message.id, &format!("cloud:{}", message.id))?
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
+            return outcome;
+        }
     }
 
     /// `job verdict` — the reviewer is the verified caller (CAD-372),

@@ -386,6 +386,19 @@ impl Store {
                 }
                 return Err(Self::duplicate_alias());
             }
+            let active_cloud: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM messages WHERE alias=? AND source='job_dispatch' \
+                 AND state IN ('queued','running','unknown')",
+                [new.alias],
+                |r| r.get(0),
+            )?;
+            if active_cloud > 0 {
+                return Err(Error::rejected(format!(
+                    "Agent '{}' has an active cloud dispatch — stop and reconcile \
+                     the remote before registering this alias again",
+                    new.alias
+                )));
+            }
             let defaults = Self::read_model_defaults_tx(&*tx)?;
             let resolved =
                 match crate::model_defaults::resolve(crate::model_defaults::ResolveRequest {
@@ -1282,6 +1295,28 @@ impl Store {
                 )
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?
                 .collect::<rusqlite::Result<_>>()?;
+            let agent = self.agent_in(&tx, alias)?;
+            if agent.provider == "sandbox" && agent.endpoint_kind == "sandbox" {
+                let active: Vec<&Message> = open
+                    .iter()
+                    .filter(|m| {
+                        m.source == "job_dispatch"
+                            && matches!(m.state.as_str(), "queued" | "running" | "unknown")
+                    })
+                    .collect();
+                if !active.is_empty() {
+                    return Err(Error::rejected(format!(
+                        "Agent '{alias}' has an active cloud dispatch ({}) — run \
+                         `cadence agent stop {alias}` and reconcile the remote before \
+                         removing the agent, even with --force",
+                        active
+                            .iter()
+                            .map(|m| format!("{} ({})", m.id, m.state))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
             let mut notify: Vec<String> = Vec::new();
             if !open_messages.is_empty() || !open_tasks.is_empty() {
                 let named = |kind: &str, rows: &[(String, String)]| {

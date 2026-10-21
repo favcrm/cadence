@@ -23,6 +23,7 @@ pub mod board;
 mod cad811_screen_startup_acceptance;
 pub mod claim;
 pub mod cli;
+pub mod cloud;
 pub mod context;
 pub mod delivery_policy;
 pub mod delivery_requirements;

@@ -54,6 +54,7 @@ pub(super) enum RouteId {
     ModelDefaults,
     Locale,
     Reports,
+    AgentRegister,
     CatalogInstall,
     CatalogGitCheck,
     CatalogRequest,
@@ -341,6 +342,7 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
     ),
     row!(Locale, "/api/locale", CallerScoped, &[]),
     row!(Reports, "/api/reports", AgentAllowed, &[]),
+    row!(AgentRegister, "/api/agents", OperatorOnly, &[]),
     row!(
         CatalogInstall,
         "/api/app-catalog/install",

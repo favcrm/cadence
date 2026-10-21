@@ -131,7 +131,7 @@
             created: 0.0,
             updated: 0.0,
         };
-        let body = cloud_kickoff_body(&job, &task, 1).unwrap();
+        let body = cloud_kickoff_body(&job, &task, 1, 48_000).unwrap();
         assert!(
             body.contains("spec text truncated; the inlined copy is incomplete"),
             "{body}"
@@ -186,7 +186,7 @@
         };
         // CAD-160: criteria that cannot fit whole refuse, naming the
         // ceiling and the spec file — they are never cut.
-        let err = cloud_kickoff_body(&job, &task, 1).unwrap_err().to_string();
+        let err = cloud_kickoff_body(&job, &task, 1, 48_000).unwrap_err().to_string();
         assert!(err.contains("48000-char"), "{err}");
         assert!(err.contains(&spec.display().to_string()), "{err}");
         // Long criteria beside a long spec: the spec gives way, the
@@ -195,7 +195,7 @@
         std::fs::write(&spec, "S".repeat(20_000)).unwrap();
         let mut task = task;
         task.acceptance = Some(criteria.clone());
-        let body = cloud_kickoff_body(&job, &task, 1).unwrap();
+        let body = cloud_kickoff_body(&job, &task, 1, 48_000).unwrap();
         assert!(body.len() <= 48_000, "kickoff is {} bytes", body.len());
         assert!(body.contains(&format!(" Acceptance: {criteria}.")));
         assert!(body.contains("spec text truncated"), "{body}");
@@ -246,7 +246,7 @@
             created: 0.0,
             updated: 0.0,
         };
-        let body = cloud_kickoff_body(&job, &task, 1).unwrap();
+        let body = cloud_kickoff_body(&job, &task, 1, 48_000).unwrap();
         assert!(body.len() <= 48_000, "kickoff is {} bytes", body.len());
         assert!(
             body.ends_with("Do not report a SHA you have not committed."),
