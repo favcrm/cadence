@@ -197,7 +197,14 @@ var RECORD_CALL_VERBS = [
 	"whatsapp.handoff.set",
 	"chat.whatsapp.open",
 	"whatsapp.draft.show",
-	"whatsapp.draft.discard"
+	"whatsapp.draft.discard",
+	"works.query",
+	"works.get",
+	"works.create",
+	"works.patch",
+	"works.trash",
+	"works.restore",
+	"works.request_review"
 ];
 var RECORD_SLOT_VERBS = [
 	"records.csv.import",
@@ -219,7 +226,9 @@ var RECORD_SLOT_VERBS = [
 	"whatsapp.broadcast.send",
 	"whatsapp.broadcast.stop",
 	"whatsapp.handoff.release",
-	"chat.whatsapp.brief"
+	"chat.whatsapp.brief",
+	"works.review",
+	"works.export"
 ];
 [...RECORD_CALL_VERBS, ...RECORD_SLOT_VERBS];
 var LINK_ID_MAX = 128;
