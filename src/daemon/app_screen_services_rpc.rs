@@ -1001,11 +1001,6 @@ impl Shared {
             })?;
         let request: CallRequest = serde_json::from_value(params.clone())
             .map_err(|_| Error::rejected("unsupported screen service request"))?;
-        if request.operation.is_slot() {
-            return Err(Error::rejected(
-                "screen service operation requires confirmation",
-            ));
-        }
         bounded(request.operation, &request.args)?;
         let args = call_args(request.operation, &request.args)?;
         let proof = self.screen_service_proof(
