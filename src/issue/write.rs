@@ -23,6 +23,8 @@ mod rev;
 mod stage;
 
 use done::check_done_evidence;
+#[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
+pub(crate) use done::Staged;
 pub(crate) use done::{
     apply_pairs, commit_staged, commit_staged_scoped, mark_done_on_merge_locked,
     mark_done_on_merge_waiting_with, stage, RealWait, WaitClock,
@@ -42,6 +44,8 @@ pub use plan::{create_plan, decide_plan};
 use projects::check_component;
 pub(crate) use projects::{check_tags, issue_dir, load_front, save_front, split_tags};
 pub use projects::{project_add, set_acceptance, set_project_policy};
+#[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
+pub(crate) use rev::blocked_warnings;
 use rev::check_rev;
 pub use rev::issue_rev;
 pub(crate) use rev::{

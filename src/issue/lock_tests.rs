@@ -1187,18 +1187,28 @@ fn tracker_root_scope_covers_the_whole_tracker() {
     assert!(e.contains("interrupted"), "root wrongly disjoint: {e}");
 }
 
-/// Guard against API misuse: every write.rs function that takes a
+/// Guard against API misuse: every write-module function that takes a
 /// scoped lock must commit only through the scoped wrappers. Plain
 /// commit never checks scope, so an unscoped call beside
 /// `lock_for_paths` would silently write outside the admitted set.
-/// This test reads the source it guards and fails the build on drift.
+/// This test reads the sources it guards and fails the build on drift.
 #[test]
 fn write_rs_pairs_scoped_locks_with_scoped_commits() {
-    let src = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/issue/write.rs"),
-    )
-    .unwrap();
-    scoped_locks_pair_with_scoped_commits("src/issue/write.rs", &src);
+    for name in [
+        "src/issue/write.rs",
+        "src/issue/write/done.rs",
+        "src/issue/write/edit.rs",
+        "src/issue/write/new.rs",
+        "src/issue/write/plan.rs",
+        "src/issue/write/projects.rs",
+        "src/issue/write/rev.rs",
+        "src/issue/write/stage.rs",
+    ] {
+        let src =
+            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name))
+                .unwrap();
+        scoped_locks_pair_with_scoped_commits(name, &src);
+    }
 }
 
 /// The same guard for the batched edit (CAD-1600): it takes a scoped
@@ -1220,7 +1230,11 @@ fn scoped_locks_pair_with_scoped_commits(name: &str, src: &str) {
     let lines: Vec<&str> = src.lines().collect();
     let mut bounds = vec![0usize];
     for (i, l) in lines.iter().enumerate() {
-        if l.starts_with("pub fn ") || l.starts_with("pub(crate) fn ") || l.starts_with("fn ") {
+        if l.starts_with("pub fn ")
+            || l.starts_with("pub(crate) fn ")
+            || l.starts_with("pub(super) fn ")
+            || l.starts_with("fn ")
+        {
             bounds.push(i);
         }
     }
