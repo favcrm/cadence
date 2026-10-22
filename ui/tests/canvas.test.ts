@@ -89,8 +89,12 @@ equal([canvasSnapshot().open, canvasSnapshot().tabs.length], [false, 0], "switch
 equal(drawerLayout(1440, 480, "home", null), { mode: "push", width: 480 }, "home pushes at desktop");
 equal(drawerLayout(1440, 480, "app", 700), { mode: "push", width: 480 }, "app pushes at desktop");
 equal(drawerLayout(900, 480, "home", null), { mode: "push", width: 480 }, "home still pushes at 900 (chat keeps 420)");
-equal(drawerLayout(900, 480, "app", 860).mode, "sheet", "app at 900 with a full-width chat falls to the sheet");
-equal(drawerLayout(900, 480, "app", 500), { mode: "cover", width: 388 }, "app cover stops at the chat's right edge");
+// Tablet app shell: the chat pane is narrowed to 352px, the drawer covers beside it.
+equal(drawerLayout(900, 480, "app", 860), { mode: "cover", width: 480 }, "app at 900 covers beside the narrowed chat");
+equal(drawerLayout(768, 480, "app", 752), { mode: "cover", width: 388 }, "app at 768 covers with what is left of the chat");
+equal(drawerLayout(639, 480, "app", 623).mode, "sheet", "a phone gets the sheet");
+equal(drawerLayout(660, 480, "app", 644).mode, "sheet", "too narrow to keep 320px of chat beside 360px of canvas: sheet");
+equal(drawerLayout(1100, 660, "app", 700), { mode: "cover", width: 388 }, "app cover stops at the chat's right edge");
 equal(drawerLayout(1100, 660, "home", null), { mode: "cover", width: 544 }, "home cover keeps the chat's first 320px");
 equal(drawerLayout(375, 480, "home", null).mode, "sheet", "phone sheet");
 // No chat pane in the page (navigated away from the app): never a desktop sheet.

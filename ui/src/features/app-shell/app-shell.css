@@ -118,6 +118,16 @@
   }
 }
 
+/* CAD-1726: on a tablet, an open agent canvas covers beside the chat, never
+   over it — the chat pane keeps a 22rem column (352px) at the left. A phone
+   gets the canvas as a full-screen sheet instead. Keep in step with
+   APP_TABLET_CHAT_RIGHT in features/canvas/canvasStore.ts. */
+@media (min-width: 640px) and (max-width: 1023.98px) {
+  [data-canvas] .app-shell-grid[data-shell-panel="chat"] {
+    grid-template-columns: minmax(0, 22rem);
+  }
+}
+
 .app-shell-outlet {
   min-width: 0;
   min-height: 0;

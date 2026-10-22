@@ -309,6 +309,9 @@ export type CanvasMode = "push" | "cover" | "sheet";
 export const SHEET_BELOW = 640;
 export const CHAT_MIN = 320;
 const SIDEBAR = 208;
+/** The app chat pane's right edge on a tablet with the canvas open: 1rem page
+ *  padding + the 22rem column `app-shell.css` gives it. */
+export const APP_TABLET_CHAT_RIGHT = 16 + 352;
 
 export interface DrawerLayout {
   mode: CanvasMode;
@@ -335,7 +338,10 @@ export function drawerLayout(
   if (main - want >= need) return { mode: "push", width: want };
   // Without a chat pane in the page (the operator navigated away from an app
   // conversation) there is no edge to stop at: use the page-based cap.
-  const cap = surface === "app" && chatRight !== null ? viewport - chatRight - 12 : main - CHAT_MIN - 28;
+  // Tablet app shell: the board narrows the chat pane while the canvas is open
+  // (app-shell.css, `[data-canvas]`), so its edge is known without measuring.
+  const edge = surface === "app" && viewport < 1024 ? APP_TABLET_CHAT_RIGHT : chatRight;
+  const cap = surface === "app" && edge !== null ? viewport - edge - 12 : main - CHAT_MIN - 28;
   if (cap < MIN_WIDTH) return { mode: "sheet", width: viewport };
   return { mode: "cover", width: Math.min(want, cap) };
 }
