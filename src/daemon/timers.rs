@@ -893,6 +893,9 @@ impl Shared {
 
 /// CAD-754: issues classified per reconcile tick.
 const RECONCILE_BATCH: usize = 25;
+/// `gh` starts one hourly reconcile tick may make (CAD-1751 budget); past
+/// it a lookup fails like an unreachable gh and the batch carries on.
+const RECONCILE_GH_CAP: usize = 150;
 
 impl Shared {
     /// CAD-754: one bounded batch of the tracker reconcile — close
@@ -914,6 +917,7 @@ impl Shared {
     /// restart), a deleted cursor id resumes at its natural successor,
     /// and an error leaves it where it was.
     pub(super) fn reconcile_tick(&self, cursor: &mut Option<String>) {
+        crate::gh_guard::bind(&self.state_dir);
         let pm = match self.pm() {
             Ok(pm) => pm,
             Err(e) => {
@@ -921,8 +925,9 @@ impl Shared {
                 return;
             }
         };
-        match crate::issue::reconcile::run_daemon(&pm, "daemon", RECONCILE_BATCH, cursor.as_deref())
-        {
+        match crate::gh_guard::with_call_cap(RECONCILE_GH_CAP, || {
+            crate::issue::reconcile::run_daemon(&pm, "daemon", RECONCILE_BATCH, cursor.as_deref())
+        }) {
             Ok(out) => {
                 // A failed history walk is silent in the row counts:
                 // note-derived candidates simply never classify, so a

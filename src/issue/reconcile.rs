@@ -40,7 +40,6 @@ use crate::error::{Error, Result};
 use crate::issue::model;
 use crate::issue::time;
 use crate::issue::{board, finish, line_times::LineTimes, project, start, write, Pm};
-use crate::proc::run_bounded;
 use crate::worktree::layout;
 
 /// One GitHub PR row relevant to an issue lane.
@@ -95,7 +94,7 @@ fn gh_list(root: &Path, branch: &str) -> GhProbe {
         "10",
     ])
     .current_dir(root);
-    let Ok(out) = run_bounded(&mut cmd, Duration::from_secs(10)) else {
+    let Ok(out) = crate::gh_guard::run(&mut cmd, Duration::from_secs(10)) else {
         return GhProbe::Unreachable;
     };
     if !out.status.success() {
@@ -136,7 +135,7 @@ fn gh_view(cwd: &Path, url: &str) -> GhProbe {
         "number,state,mergedAt,headRefOid,baseRefName",
     ])
     .current_dir(cwd);
-    let Ok(out) = run_bounded(&mut cmd, Duration::from_secs(10)) else {
+    let Ok(out) = crate::gh_guard::run(&mut cmd, Duration::from_secs(10)) else {
         return GhProbe::Unreachable;
     };
     if !out.status.success() {

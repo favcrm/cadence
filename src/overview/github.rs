@@ -40,8 +40,7 @@ pub(super) fn git_text(repo: &Path, args: &[String]) -> Result<String, String> {
 }
 
 pub(super) fn gh_text(args: &[String]) -> Result<String, String> {
-    let out =
-        run_bounded(Command::new("gh").args(args), GH_TIMEOUT).map_err(|e| format!("gh: {e}"))?;
+    let out = crate::gh_guard::run(Command::new("gh").args(args), GH_TIMEOUT)?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(format!("gh {}: {}", args.join(" "), err));

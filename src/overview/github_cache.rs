@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -56,11 +56,92 @@ pub(super) fn write_cache(file: &Path, slugs: &[String], repos: &HashMap<String,
 }
 
 /// One repo's `gh` read — [`gh_repo`] in production, a stub in tests.
+#[cfg(test)]
 pub(super) type GhFetch = fn(&str) -> Result<Value, String>;
 
 /// gh refreshes in flight in this process, by cache file: while one
 /// runs, other requests serve the cache instead of starting another.
 static GH_REFRESHING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// `gh` calls one repo's refresh makes: `pr list` and the CI runs (the
+/// default branch is cached, see `main_ci`).
+pub(super) const GH_CALLS_PER_REPO: i64 = 2;
+/// The board's hourly `gh` budget for the overview refresh. The rest of
+/// the 1,000 an hour is the delivery sync (336), the hourly default-branch
+/// reads (15 repos) and the daemon's reconcile (150): 951 (CAD-1751).
+pub(super) const GH_BOARD_BUDGET_PER_HOUR: i64 = 450;
+
+/// The shortest gap between two refreshes of `repos` repos that stays
+/// inside [`GH_BOARD_BUDGET_PER_HOUR`]: 16 s per repo, never under the
+/// 60 s display cache.
+pub(super) fn refresh_floor_secs(repos: usize) -> i64 {
+    (repos as i64 * GH_CALLS_PER_REPO * 3600 / GH_BOARD_BUDGET_PER_HOUR).max(GH_CACHE_SECS)
+}
+
+/// A repo's last `gh` read, kept so a refresh that re-runs soon — one
+/// repo failing keeps the cache stale, so every request refreshes —
+/// spawns no `gh` for a repo read within the floor. Errors are kept
+/// too: a failing repo is retried once per floor, not once per request.
+type MemoRow = (String, Instant, Result<Value, String>);
+static REPO_MEMO: Mutex<Vec<MemoRow>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(super) fn reset_repo_memo() {
+    REPO_MEMO.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+fn memoized(
+    slug: &str,
+    every: Duration,
+    fetch: impl Fn(&str) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let kept = {
+        let memo = REPO_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+        memo.iter()
+            .find(|(s, at, _)| s == slug && at.elapsed() < every)
+            .map(|(_, _, r)| r.clone())
+    };
+    if let Some(r) = kept {
+        return r;
+    }
+    let r = fetch(slug);
+    let mut memo = REPO_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    memo.retain(|(s, _, _)| s != slug);
+    memo.push((slug.to_string(), Instant::now(), r.clone()));
+    r
+}
+
+/// The GitHub block the board and the CLI read: [`github_bounded`] over
+/// [`gh_repo`], with the call rate held to the budget — no refresh
+/// sooner than [`refresh_floor_secs`], and no repo read twice inside it.
+pub(super) fn github_throttled(
+    state_dir: &Path,
+    slugs: &[String],
+    wait: Duration,
+    cache_secs: i64,
+) -> (HashMap<String, Value>, Value) {
+    github_throttled_with(state_dir, slugs, wait, cache_secs, gh_repo)
+}
+
+pub(super) fn github_throttled_with(
+    state_dir: &Path,
+    slugs: &[String],
+    wait: Duration,
+    cache_secs: i64,
+    fetch: impl Fn(&str) -> Result<Value, String> + Send + Sync + 'static,
+) -> (HashMap<String, Value>, Value) {
+    crate::gh_guard::bind(state_dir);
+    let floor = refresh_floor_secs(slugs.len());
+    let every = Duration::from_secs(floor as u64);
+    github_bounded_notify(
+        state_dir,
+        slugs,
+        wait,
+        cache_secs.max(floor),
+        move |slug| memoized(slug, every, &fetch),
+        || {},
+    )
+}
 
 /// The GitHub block, 60 s-cached under the state dir, waiting as long
 /// as the one-shot CLI needs.
@@ -68,7 +149,7 @@ pub(super) fn github(state_dir: &Path, slugs: &[String]) -> (HashMap<String, Val
     let opts = Options::cli();
     // `session` shares this cache, but keeps its existing freshness bound.
     // The configurable display age applies only in `overview_from`.
-    github_bounded(state_dir, slugs, opts.gh_wait, GH_CACHE_SECS, gh_repo)
+    github_throttled(state_dir, slugs, opts.gh_wait, GH_CACHE_SECS)
 }
 
 /// The GitHub block with a bounded wait (CAD-249). Returns the repos
@@ -78,6 +159,7 @@ pub(super) fn github(state_dir: &Path, slugs: &[String]) -> (HashMap<String, Val
 /// caller waits at most `wait` for it. Past that, the last good body
 /// for this slug set is served as `stale` while the refresh finishes
 /// in the background and lands in the cache for the next request.
+#[cfg(test)]
 pub(super) fn github_bounded(
     state_dir: &Path,
     slugs: &[String],
@@ -118,6 +200,10 @@ pub(super) fn github_bounded_notify(
         // Nothing to fetch — and nothing to write: an empty slug set
         // must never stamp over a good cache.
         return (HashMap::new(), json!({"state": "ok", "as_of": now}));
+    }
+    if let Some(until) = crate::gh_guard::paused_until(state_dir) {
+        // Rate limited: no refresh until GitHub's reset.
+        return stale_github(cached, slugs, Some(crate::gh_guard::paused_note(until)));
     }
     let claimed = {
         let mut running = GH_REFRESHING.lock().unwrap_or_else(|e| e.into_inner());

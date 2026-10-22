@@ -198,7 +198,7 @@ pub(crate) fn pr_merged(root: &Path, branch: &str, tip: &str, into: &str) -> boo
         "10",
     ])
     .current_dir(root);
-    let Ok(out) = run_bounded(&mut cmd, Duration::from_secs(10)) else {
+    let Ok(out) = crate::gh_guard::run(&mut cmd, Duration::from_secs(10)) else {
         return false;
     };
     if !out.status.success() {

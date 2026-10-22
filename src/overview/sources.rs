@@ -1,8 +1,7 @@
 //! Bounded overview source acquisition, including borrowed board reuse.
 //! Row assembly and its contextual reads live separately in assembly.rs.
 
-use super::github::gh_repo;
-use super::github_cache::github_bounded;
+use super::github_cache::github_throttled;
 use super::{degraded, github_repos_cached, monitoring, now_epoch, Options};
 use crate::adapter::registry;
 use crate::client;
@@ -338,7 +337,7 @@ pub(super) fn collect<'a>(
             if opts.cache_only {
                 github_repos_cached(state_dir, &slugs)
             } else {
-                github_bounded(state_dir, &slugs, opts.gh_wait, opts.gh_cache_secs, gh_repo)
+                github_throttled(state_dir, &slugs, opts.gh_wait, opts.gh_cache_secs)
             }
         });
         // Local files only — the notes index keeps it one pass.
