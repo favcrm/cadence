@@ -2809,3 +2809,66 @@ fn cad1168_home_turn_origin_is_the_persisted_app_conversation() {
         .unwrap();
     assert_eq!(origin(&gx), Value::Null);
 }
+
+/// CAD-1726 control (not a refusal check): the master's live Home turn
+/// puts an artifact, the card lands in that turn's conversation, and the
+/// operator reads the same bytes back for exactly that conversation.
+#[test]
+fn cad1726_artifact_put_read_control() {
+    use base64::Engine;
+    let gx = gx();
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    gx.send_home("m-art");
+    let token = gx.run("m-art");
+    let put = gx.verb(
+        "artifact_put",
+        json!({"kind": "html", "title": "Weekly", "content": b64(b"<h1>v1</h1>")}),
+        "m-art",
+        &token,
+    );
+    // The explicit message/token form is not an artifact_put field.
+    assert!(put.is_err(), "{put:?}");
+    let put = gx
+        .call(
+            Asserted::Agent("master".into()),
+            "artifact_put",
+            json!({"kind": "html", "title": "Weekly", "content": b64(b"<h1>v1</h1>")}),
+        )
+        .unwrap();
+    let id = put["id"].as_str().unwrap().to_string();
+    assert_eq!(put["version"], json!(1));
+    let put2 = gx
+        .call(
+            Asserted::Agent("master".into()),
+            "artifact_put",
+            json!({"kind": "html", "title": "Weekly", "id": id, "content": b64(b"<h1>v2</h1>")}),
+        )
+        .unwrap();
+    assert_eq!(put2["version"], json!(2));
+    let home = gx.shared.store.ensure_thread("master").unwrap().id;
+    let cards: Vec<_> = gx
+        .shared
+        .store
+        .thread_entries_of(&home, 0, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "artifact")
+        .collect();
+    assert_eq!(cards.len(), 2);
+    assert_eq!(cards[1].payload.as_ref().unwrap()["version"], json!(2));
+    let read = gx
+        .operator(
+            "artifact_read",
+            json!({"id": id, "version": 2, "conversation": home}),
+        )
+        .unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(read["content"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(bytes, b"<h1>v2</h1>");
+    assert_eq!(read["mime"], json!("text/html; charset=utf-8"));
+    let list = gx
+        .operator("artifact_versions", json!({"id": id, "conversation": home}))
+        .unwrap();
+    assert_eq!(list["versions"].as_array().unwrap().len(), 2);
+}
