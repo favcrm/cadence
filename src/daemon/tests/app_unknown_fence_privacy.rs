@@ -129,6 +129,50 @@ fn non_app_unknown_still_publishes_raw_detail() {
     assert!(fence.contains("last provider event"), "{fence}");
 }
 
+#[test]
+fn long_non_app_reason_keeps_budget_and_activity_in_the_bounded_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = Shared::new(dir.path(), &ServeOptions::default()).unwrap();
+    shared
+        .store
+        .register_agent(&NewAgent {
+            alias: "w4",
+            provider: "fake",
+            endpoint_kind: "managed",
+            role: "worker",
+            cwd: dir.path().to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(r#"{"stall_secs":2400}"#),
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    shared
+        .store
+        .enqueue("w4", "work", None, "m-long", "user")
+        .unwrap();
+    let Take::Message(_m) = shared.store.take_queued("w4").unwrap() else {
+        panic!("w4: queued message must be taken");
+    };
+    shared.store.mark_running("m-long", "turn-long").unwrap();
+    let message = shared.store.message("m-long").unwrap().unwrap();
+    let raw = format!("provider refused: {}", "x".repeat(700));
+    let _ = shared.unknown("w4", &message, &raw);
+
+    // The private row stays verbatim, but the bounded public fence must
+    // still lead with the dispatch budget and activity evidence.
+    let stored = shared.store.message("m-long").unwrap().unwrap();
+    assert_eq!(stored.error.as_deref(), Some(raw.as_str()));
+    let agent = shared.store.agent("w4").unwrap();
+    let error = agent.error.unwrap();
+    assert!(error.contains("dispatch stall budget 2400s"), "{error}");
+    assert!(error.contains("last provider event"), "{error}");
+    let fence = shared.uncertain_fence_text("w4");
+    assert!(fence.contains("dispatch stall budget 2400s"), "{fence}");
+    assert!(fence.contains("last provider event"), "{fence}");
+}
+
 /// The restamp path (`preserved_unknown_detail` via actor exit,
 /// relaunch-skip and `start_actor_locked`) must not republish the
 /// app turn's operator-private account onto the public `agents.error`.

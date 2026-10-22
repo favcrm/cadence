@@ -1048,8 +1048,11 @@ impl Shared {
             .or(message.started)
             .map(|at| format!("last observed activity at {at:.0}"))
             .unwrap_or_else(|| "none recorded".to_string());
+        // Lead with the Cadence-authored evidence: the fence formatter
+        // bounds the detail, and a long provider account must not push
+        // the required budget/activity out of the bounded text.
         let fence_reason =
-            format!("{reason} (dispatch stall budget {budget}; last provider event: {last_event})");
+            format!("dispatch stall budget {budget}; last provider event: {last_event}; {reason}");
         // The operator-private row keeps the provider's own account
         // verbatim; the budget/activity evidence is fence text.
         let stored = json!({"status": "unknown", "text": "", "error": reason});
