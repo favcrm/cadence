@@ -127,6 +127,14 @@ Synchronize on the operation being proved:
   When proving fresh passes, discard one that might already have been in flight.
 - Interleavings: park at an explicit barrier and release it after the competing
   operation, rather than hoping a 3s pause covers the race.
+- Detached Git maintenance: a whole-`.git` byte snapshot is the oracle to
+  keep; Git may briefly create `objects/bitmap-ref-tips_*` while a detached
+  `maintenance`/`repack` runs. Isolate before the tracker is initialized:
+  private global config `[maintenance] auto = false` and `[gc] auto = 0`,
+  `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL` to that file, and remove
+  inherited `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT`; removing only
+  the count leaves the parameters active. Never sleep, widen a timeout, or filter
+  `.git` metadata to hide the class.
 - Contention: wait for the first failed native flock/SQLite acquisition,
   not a contender thread starting. Unit-test observers are thread-local and
   compiled out of normal builds. The opt-in SQLite observer keeps the native

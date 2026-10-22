@@ -16,8 +16,10 @@
 //! RPC only. It does not prove Home conversation behavior or a fresh native
 //! Home caller.
 //!
-//! Run only in an admitted focused test slot:
-//! `cadence build-slot run test --org local -- env CARGO_BUILD_JOBS=4 cargo test --features test-seam --test cad1433_project_creation_acceptance -- --test-threads 2`
+//! Run only in an admitted focused test slot. The check is a module of the
+//! consolidated `suite` target; a standalone
+//! `--test cad1433_project_creation_acceptance` target no longer exists:
+//! `cadence build-slot run test --org local -- env CARGO_BUILD_JOBS=4 cargo test --features test-seam --test suite cad1433_project_creation_acceptance::project_new_refuses_an_agent_before_any_repo_less_write -- --exact --test-threads 1`
 #![cfg(feature = "test-seam")]
 
 use cadence_agent::test_seam::{scoped, Asserted};
@@ -53,6 +55,23 @@ impl Fixture {
         std::env::set_var("XDG_DATA_HOME", root.path().join("home/data"));
         std::env::set_var("TMPDIR", root.path());
         std::env::set_var("CADENCE_SUITE_LOCK", root.path().join("locks/suite"));
+        // Git's automatic maintenance and auto-GC can run detached and leave
+        // transient scratch files (for example
+        // `.git/objects/bitmap-ref-tips_*`) inside the tracker while this
+        // fixture snapshots every byte. Pin one private configuration before
+        // `Pm::init` — which runs `git init` and the skeleton commit — and
+        // before the control repository is created, so system, inherited
+        // global and command-scope configuration cannot re-enable it.
+        let git_config = root.path().join("home/gitconfig");
+        std::fs::write(
+            &git_config,
+            "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n",
+        )
+        .unwrap();
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        std::env::set_var("GIT_CONFIG_GLOBAL", &git_config);
+        std::env::remove_var("GIT_CONFIG_PARAMETERS");
+        std::env::remove_var("GIT_CONFIG_COUNT");
         let pm = Pm::init(&root.path().join("pm")).unwrap();
         let provider_env = ProviderEnv::refusing_providers();
         provider_env.set("CADENCE_PM_DIR", pm.dir.to_str().unwrap());
