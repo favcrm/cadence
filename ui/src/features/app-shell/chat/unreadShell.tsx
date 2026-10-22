@@ -43,36 +43,74 @@ function UnreadProbe({ installId, finished }: { installId: string; finished: str
   return null;
 }
 
+/** One finished turn, as the shell saw it. */
+interface FinishedTurn {
+  conversation: string | null;
+  install: string | null;
+}
+
+/**
+ * The turn edge the shell announces on: a previous turn that is no longer
+ * the running/queued one — a new message replaced it, or the queue drained.
+ * Identity is the message, so a completion immediately followed by the next
+ * turn is still seen.
+ */
+function useFinishedTurn(turn: { message?: string; conversation?: string | null; app_origin?: { install_id: string } | null } | null): FinishedTurn | null {
+  const previous = useRef<{ message: string; conversation: string | null; install: string | null } | null | undefined>(undefined);
+  const current = turn
+    ? { message: turn.message ?? "", conversation: turn.conversation ?? null, install: turn.app_origin?.install_id ?? null }
+    : null;
+  const before = previous.current;
+  const finished =
+    before != null && (current === null || current.message !== before.message)
+      ? { conversation: before.conversation, install: before.install }
+      : null;
+  useEffect(() => {
+    previous.current = current;
+  }, [current?.message, current?.conversation, current?.install]);
+  return finished;
+}
+
 /** Mounted once by the board shell: one probe per installed app. */
 export function AssistantUnreadProbes({ apps }: { apps: { installId: string }[] | null }) {
   const master = useResource(resources.masterState);
   const toast = useNotificationToast();
-  const turn = master.data?.turn ?? null;
-  // The conversation a turn just FINISHED on (edge), which is a reply even
-  // before any list's `updated` is observed.
-  const previous = useRef<string | null | undefined>(undefined);
-  const finished = previous.current !== undefined && previous.current !== null && turn === null ? previous.current : null;
-  const finishedInstall = useRef<string | null>(null);
+  const finished = useFinishedTurn(master.data?.turn ?? null);
+  const [announced, setAnnounced] = useState<FinishedTurn | null>(null);
+
   useEffect(() => {
-    const origin = turn?.app_origin ?? null;
-    finishedInstall.current = turn === null ? finishedInstall.current : (origin?.install_id ?? null);
-    if (finished !== null && finishedInstall.current !== null) {
-      // The turn's own verified app origin is the proof and the destination:
-      // no cached list has to have caught up yet.
-      const params = new URLSearchParams({ conversation: finished });
-      toast.show("Assistant replied", `assistant:${finishedInstall.current}:${finished}`, {
-        href: `/app-installations/${encodeURIComponent(finishedInstall.current)}?${params.toString()}`,
+    if (finished === null) return;
+    setAnnounced(finished);
+  }, [finished]);
+
+  useEffect(() => {
+    if (announced === null || apps === null) return;
+    const conversation = announced.conversation;
+    // Subject conversations (campaign, WhatsApp) carry no app origin by
+    // design; their install is the one whose observed list holds them.
+    const install =
+      announced.install ??
+      (conversation === null
+        ? null
+        : (apps.find((app) => conversationList(app.installId).get().data?.conversations.some((c) => c.id === conversation))
+            ?.installId ?? null));
+    const open = new URLSearchParams(window.location.search).get("conversation");
+    if (install !== null && conversation !== null && conversation !== open) {
+      setAssistantUnread(install, true);
+      const params = new URLSearchParams({ conversation });
+      toast.show("Assistant replied", `assistant:${install}:${conversation}`, {
+        href: `/app-installations/${encodeURIComponent(install)}?${params.toString()}`,
         note: "An installed app's conversation",
       });
-      setAssistantUnread(finishedInstall.current, true);
     }
-    previous.current = turn === null ? null : (turn.conversation ?? null);
-  }, [turn, finished, toast]);
+    setAnnounced(null);
+  }, [announced, apps, toast]);
+
   if (apps === null) return null;
   return (
     <>
       {apps.map((app) => (
-        <UnreadProbe key={app.installId} installId={app.installId} finished={finished} />
+        <UnreadProbe key={app.installId} installId={app.installId} finished={finished?.conversation ?? null} />
       ))}
     </>
   );
