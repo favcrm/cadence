@@ -1,4 +1,5 @@
 import { chatContext } from "../chatScreen";
+import { useCanvasFeed } from "../../canvas/feed";
 import {
   useCallback,
   useEffect,
@@ -543,6 +544,13 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
 
   const items = threadItems(thread.data);
   const { shown, hidden } = visibleWindow(items, limit);
+  useCanvasFeed({
+    conversation: convId,
+    composerKey,
+    items,
+    loaded: loaded && thread.data?.missing !== true,
+    running: masterState.data?.turn?.state === "working",
+  });
   // A prepend (widened window or a fetched page) keeps the reader's row
   // at the same viewport offset, measured after the DOM updated.
   useLayoutEffect(() => {

@@ -21,6 +21,7 @@ import {
   type MasterStatus,
   type TurnState,
 } from "./master";
+import { useCanvasFeed } from "../canvas/feed";
 import Composer from "./Composer";
 import type { AttachDestination } from "../app-shell/chat/attach";
 import { atTail, jumpLabel, tailTop } from "./dock";
@@ -722,6 +723,13 @@ function MasterHome({
       ? serverTurn.app_origin
       : null;
   const step = useMemo(() => openStep(thread.data?.entries ?? []), [thread.data]);
+  useCanvasFeed({
+    conversation: homeConversation ?? null,
+    composerKey: "home",
+    items,
+    loaded: loaded && !missing,
+    running: turn.kind === "working",
+  });
   // The running turn's name-row activity anchors to this turn's own
   // message id — the item holding its newest stored entry (a pending
   // row has no stored entry yet, so its row is the anchor while it
