@@ -1035,9 +1035,18 @@ impl Shared {
         let budget = budget
             .map(|secs| format!("{secs}s"))
             .unwrap_or_else(|| "default".to_string());
-        let last_event = message
-            .started
-            .map(|at| format!("turn started at {at:.0}"))
+        let last_event = self
+            .provider_activity_epoch(alias)
+            .or_else(|| self.last_activity_epoch(alias))
+            .or_else(|| {
+                self.store
+                    .message(&message.id)
+                    .ok()
+                    .flatten()
+                    .and_then(|current| current.started)
+            })
+            .or(message.started)
+            .map(|at| format!("last observed activity at {at:.0}"))
             .unwrap_or_else(|| "none recorded".to_string());
         let reason =
             format!("{reason} (dispatch stall budget {budget}; last provider event: {last_event})");

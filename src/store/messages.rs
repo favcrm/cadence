@@ -2671,24 +2671,6 @@ impl Store {
         self.message_in(&conn, id)
     }
 
-    /// CAD-1353: record the stall budget chosen for this dispatch on its
-    /// kickoff message. A later dispatch in the same job updates only its
-    /// own message.
-    pub fn set_message_stall_secs(&self, id: &str, secs: i64) -> Result<()> {
-        if secs < 0 {
-            return Err(Error::rejected("stall_secs must be non-negative"));
-        }
-        let conn = self.conn();
-        let changed = conn.execute(
-            "UPDATE messages SET stall_secs=? WHERE id=?",
-            params![secs, id],
-        )?;
-        if changed == 0 {
-            return Err(Error::rejected(format!("No message '{id}'")));
-        }
-        Ok(())
-    }
-
     /// CAD-1353: the recorded budget for a dispatch, falling back to the
     /// job default. The agent's own `stall_secs` remains the final
     /// fallback in the watcher.

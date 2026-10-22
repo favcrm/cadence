@@ -331,6 +331,26 @@ impl Shared {
                 .max(0) as f64
     }
 
+    /// The epoch of the last activity the provider adapter itself
+    /// recorded for `alias`, when it tracks one. Unlike the message
+    /// snapshot (taken before the claim), this moves with later provider
+    /// events.
+    pub(super) fn provider_activity_epoch(&self, alias: &str) -> Option<f64> {
+        let ctl = self.lifecycle.lock().unwrap().agents.get(alias)?.clone();
+        let at = ctl.adapter.lock().unwrap().as_ref()?.activity_at()?;
+        Some(self.stall_epoch() - self.stall_now().saturating_duration_since(at).as_secs_f64())
+    }
+
+    /// Screen-observer fallback: the epoch of the last activity the stall
+    /// watch actually saw for `alias`, when it is tracking a turn.
+    pub(super) fn last_activity_epoch(&self, alias: &str) -> Option<f64> {
+        let ctl = self.lifecycle.lock().unwrap().agents.get(alias)?.clone();
+        let watch = ctl.stall.lock().unwrap();
+        watch.message.as_ref()?;
+        let silent = self.stall_now().saturating_duration_since(watch.activity);
+        Some(self.stall_epoch() - silent.as_secs_f64())
+    }
+
     /// Sample owned agents on a slow cadence until shutdown. The stall
     /// watch itself only ever emits events and notices — it never
     /// interrupts, re-dispatches or fences anything it observes. The

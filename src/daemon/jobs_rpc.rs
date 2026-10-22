@@ -457,20 +457,22 @@ impl Shared {
             return Err(Error::rejected("stall_secs must be non-negative"));
         }
         let (task, message, duplicate, behind_dead) = match &expect {
-            Some(expect) => self.store.dispatch_task_expecting_for(
+            Some(expect) => self.store.dispatch_task_expecting_for_with_stall(
                 task_id,
                 to.as_deref(),
                 optional_str(params, "message"),
                 by,
                 expect,
                 target.as_ref(),
+                stall_secs,
             )?,
-            None => self.store.dispatch_task_for(
+            None => self.store.dispatch_task_for_with_stall(
                 task_id,
                 to.as_deref(),
                 optional_str(params, "message"),
                 by,
                 target.as_ref(),
+                stall_secs,
             )?,
         };
         if cloud_dispatch {
@@ -485,14 +487,6 @@ impl Shared {
         }
         if let Some(assignee) = &task.assignee {
             self.notify_agent(assignee);
-        }
-        // CAD-1353: the budget is chosen per dispatch and recorded on
-        // the job. A duplicate dispatch re-delivers an existing kickoff,
-        // so it must not rewrite the budget that kickoff was sent with.
-        if !duplicate {
-            if let Some(secs) = stall_secs {
-                self.store.set_message_stall_secs(&message, secs)?;
-            }
         }
         let message_state = self.store.message(&message)?.map(|m| m.state);
         self.wake();
