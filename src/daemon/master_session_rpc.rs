@@ -125,10 +125,17 @@ impl Shared {
                 .unwrap_or(Value::Null)
         };
         let running = self.store.running_message(alias)?;
-        // CAD-1700: the ordered queue behind the board's master pane, read
-        // once so `turn` and `queue` agree. `queued_messages` uses the same
-        // delivery order as `queued_head`, so the head is position 1.
-        let queued = self.store.queued_messages(alias, 20)?;
+        // CAD-1700: the complete ordered queue behind the board's master
+        // pane, as routing metadata only — never message bodies, never a
+        // 20-row page. `queued_metadata` uses `queued_head`'s delivery
+        // order, so the head is position 1.
+        let queued = self.store.queued_metadata(alias)?;
+        // Only a queued turn needs the head's body and start time; one row
+        // read, never the whole queue's.
+        let head = match &running {
+            Some(_) => None,
+            None => self.store.queued_head(alias)?,
+        };
         let turn = match &running {
             Some(m) => json!({
                 "state": "working",
@@ -138,22 +145,31 @@ impl Shared {
                 "summary": m.body,
                 "since": m.started.unwrap_or(m.created),
             }),
-            None => match queued.first() {
-                Some(m) => json!({
-                    "state": "queued",
-                    "message": m.id,
-                    "conversation": conversation_of(&m.id),
-                    "app_origin": self.master_turn_app_origin(&m.id),
-                    "summary": m.body,
-                    "since": m.created,
-                    "position": 1,
-                }),
+            None => match &head {
+                Some(m) => {
+                    let conversation = match queued.iter().find(|(id, _)| id == &m.id) {
+                        Some((_, Some(thread))) => json!(thread),
+                        Some((_, None)) => Value::Null,
+                        // The head left the queue between the two reads:
+                        // report its own conversation, never a neighbour's.
+                        None => conversation_of(&m.id),
+                    };
+                    json!({
+                        "state": "queued",
+                        "message": m.id,
+                        "conversation": conversation,
+                        "app_origin": self.master_turn_app_origin(&m.id),
+                        "summary": m.body,
+                        "since": m.created,
+                        "position": 1,
+                    })
+                }
                 None => Value::Null,
             },
         };
         let queue = queued
             .iter()
-            .map(|m| json!({"message": m.id, "conversation": conversation_of(&m.id)}))
+            .map(|(id, conversation)| json!({"message": id, "conversation": conversation}))
             .collect::<Vec<_>>();
         Ok(json!({
             "alias": alias,
@@ -753,5 +769,96 @@ fn master_command_line(command: &str, result: &Value) -> Option<String> {
         "compact" => Some("Session context compacted".to_string()),
         "new" => Some("Provider session restarted".to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod cad1700_projection_tests {
+    use super::*;
+    use crate::store::NewAgent;
+    use crate::test_seam::{scoped, Asserted};
+
+    fn fixture() -> (tempfile::TempDir, Arc<Shared>) {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ServeOptions {
+            provider_env: crate::adapter::ProviderEnv::refusing_providers(),
+            ..Default::default()
+        };
+        opts.provider_env
+            .set("CADENCE_PM_DIR", dir.path().join("no-pm").to_str().unwrap());
+        let shared = Shared::new(dir.path(), &opts).unwrap();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "master",
+                provider: "pi",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: &cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        (dir, shared)
+    }
+
+    /// The master pane looks for its own queued message and what is ahead
+    /// of it in `master_state.queue`. The queue is complete in exact
+    /// delivery order, so the 21st queued message and its predecessor are
+    /// still represented, and the head row keeps its turn semantics
+    /// (state, message, summary, since, position). Red before CAD-1700 P2:
+    /// the projection stopped at 20 rows.
+    #[test]
+    fn cad1700_master_state_queue_is_complete_past_twenty() {
+        let (_dir, shared) = fixture();
+        let pid = std::process::id();
+        // Send admission (launch/model gates) is not under test: seed the
+        // canonical rows a Home send produces. `enqueue` itself writes the
+        // operator thread note when the alias has a home thread (the same
+        // `thread_note_enqueued` path every queued message takes), and that
+        // note carries the message id, so each row resolves its home
+        // conversation.
+        shared.store.ensure_thread("master").unwrap();
+        for i in 1..=25 {
+            let id = format!("m{i}");
+            shared
+                .store
+                .enqueue("master", &format!("hi {id}"), None, &id, "operator")
+                .unwrap();
+        }
+        let state = scoped(Asserted::Operator, || {
+            shared.dispatch("master_state", &json!({}), pid)
+        })
+        .unwrap();
+        let queue = state["queue"].as_array().unwrap();
+        let ids = queue
+            .iter()
+            .map(|row| row["message"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        let expected = (1..=25).map(|i| format!("m{i}")).collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the queue is complete and in delivery order"
+        );
+        assert_eq!(state["queued"], json!(25));
+        assert!(ids.contains(&"m20"), "the 20th message is represented");
+        assert!(ids.contains(&"m21"), "the 21st message is represented");
+        assert_eq!(state["turn"]["state"], json!("queued"));
+        assert_eq!(state["turn"]["message"], json!("m1"));
+        assert_eq!(state["turn"]["summary"], json!("hi m1"));
+        assert_eq!(state["turn"]["position"], json!(1));
+        let home = shared.store.thread("master").unwrap().unwrap().id;
+        for row in queue {
+            assert_eq!(
+                row["conversation"],
+                json!(home),
+                "each row's conversation comes from the one projection"
+            );
+        }
     }
 }

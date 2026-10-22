@@ -801,10 +801,11 @@ function MasterHome({
       void resources.masterState.refresh();
     }
   }, [tailSeq]);
-  // CAD-1700: Home on screen has shown everything up to its tail.
+  // Opening Home marks its complete latest reply watermark, not a bounded tail.
+  const homeReplySeq = thread.data?.replySeq ?? 0;
   useEffect(() => {
-    if (tailSeq > 0) noteHomeSeen(tailSeq);
-  }, [tailSeq]);
+    if (homeReplySeq > 0) noteHomeSeen(homeReplySeq);
+  }, [homeReplySeq]);
 
   // Smart scroll (CAD-551, panel-scoped CAD-600) plus send-pin
   // (CAD-610). Follow the tail while the operator is already there.
@@ -1038,6 +1039,7 @@ function MasterHome({
   );
 
   const runTurnCommand = useCallback((command: "stop" | "cancel", message: string) => {
+    if (writeBlock !== null) return;
     const id = ++cmdSeq.current;
     api
       .masterCommand(command, undefined, undefined, message)
@@ -1046,7 +1048,7 @@ function MasterHome({
         if (!r.ok) setCmds((c) => [...c, { id, name: command, ok: false, text: "The master did not accept the command." }]);
       })
       .catch((e: ApiError) => setCmds((c) => [...c, { id, name: command, ok: false, text: e.message }]));
-  }, []);
+  }, [writeBlock]);
 
   const onEarlier = useCallback(() => {
     const step = earlierStep(resources.masterThread, threadReader(MASTER), limit);
@@ -1202,10 +1204,10 @@ function MasterHome({
               reconnecting={link !== null && link !== "live"}
               since={serverTurn?.since ?? null}
               actions={{
-                onStop: (message) => runTurnCommand("stop", message),
-                onCancel: (message) => runTurnCommand("cancel", message),
+                onStop: writeBlock === null ? (message) => runTurnCommand("stop", message) : undefined,
+                onCancel: writeBlock === null ? (message) => runTurnCommand("cancel", message) : undefined,
                 onRetry:
-                  failedEntry !== null
+                  writeBlock === null && failedEntry !== null
                     ? () => {
                         engage();
                         const payload = failedEntry.payload ?? {};

@@ -70,6 +70,11 @@ export interface ThreadState {
   /** Older entries exist on the server than the ones held; null when
    *  the daemon cannot say (it predates backward reads). */
   moreBefore?: boolean | null;
+  /** CAD-1700: the newest visible assistant reply's `seq` in the COMPLETE
+   *  thread (`thread_read`'s `reply_seq`), independent of the loaded
+   *  window. Absent on a daemon that predates it; entries never advance
+   *  it, and a page never lowers it. */
+  replySeq?: number;
   entries: ThreadEntry[];
   pending: PendingMessage[];
 }
@@ -106,6 +111,17 @@ export function lastSeq(state: ThreadState | null): number | null {
   return entries.length ? entries[entries.length - 1].seq : null;
 }
 
+/** A visible agent reply — the same rule as the daemon's complete
+ *  watermark: agent `assistant_text`/`turn_result`, nonblank after the
+ *  ECMAScript whitespace trim `String.prototype.trim` applies. */
+function isReplyEntry(e: ThreadEntry): boolean {
+  return (
+    e.role === "agent" &&
+    (e.kind === "assistant_text" || e.kind === "turn_result") &&
+    e.text.trim() !== ""
+  );
+}
+
 /**
  * Fold entries into the state: dedupe by `seq`, keep `seq` order, and
  * retire every pending message whose stored operator entry arrived.
@@ -117,17 +133,33 @@ export function mergeEntries(state: ThreadState | null, incoming: ThreadEntry[])
   const bySeq = new Map<number, ThreadEntry>();
   for (const e of base.entries) bySeq.set(e.seq, e);
   let changed = false;
+  // A live/folded visible reply is itself authoritative (CAD-1700): a
+  // streamed answer advances the watermark even before a page carries
+  // it. Non-reply and blank entries never do; a page can only raise it.
+  const previousReply = base.replySeq ?? 0;
+  let replySeq = previousReply;
   for (const e of incoming) {
     if (!bySeq.has(e.seq)) changed = true;
     bySeq.set(e.seq, e);
+    if (isReplyEntry(e) && e.seq > replySeq) replySeq = e.seq;
   }
   const entries = changed ? [...bySeq.values()].sort((a, b) => a.seq - b.seq) : base.entries;
   const stored = new Set(
     entries.filter((e) => e.role === "operator" && e.message).map((e) => e.message as string),
   );
   const pending = base.pending.filter((p) => !stored.has(p.message));
-  if (!changed && pending.length === base.pending.length && base.exists) return base;
-  return { ...base, exists: true, missing: false, entries, pending };
+  const replyAdvanced = replySeq > previousReply;
+  if (!changed && pending.length === base.pending.length && base.exists && !replyAdvanced) {
+    return base;
+  }
+  return {
+    ...base,
+    exists: true,
+    missing: false,
+    entries,
+    pending,
+    ...(replySeq > 0 ? { replySeq } : {}),
+  };
 }
 
 /** `streamInto`'s reducer: an `entry` frame merges; anything else is ignored. */
@@ -147,11 +179,24 @@ export function reduceFrame(state: ThreadState | null, event: SseEvent): ThreadS
 /** A page from `GET /api/threads/<alias>` folded into the state. */
 export function mergePage(
   state: ThreadState | null,
-  page: { thread?: unknown; entries?: unknown[] },
+  page: { thread?: unknown; entries?: unknown[]; reply_seq?: unknown },
 ): ThreadState {
   const entries = (page.entries ?? []).map(asEntry).filter((e): e is ThreadEntry => e !== null);
   const merged = mergeEntries(state, entries);
-  const found = merged.missing ? { ...merged, missing: false } : merged;
+  // The page reports the COMPLETE thread's reply watermark, so keep the
+  // maximum: a bounded, forward or older page (and a live frame that
+  // carries only an entry) can never erase a reply it does not hold.
+  const reply =
+    typeof page.reply_seq === "number" &&
+    Number.isSafeInteger(page.reply_seq) &&
+    page.reply_seq >= 0
+      ? page.reply_seq
+      : undefined;
+  const withReply =
+    reply === undefined
+      ? merged
+      : { ...merged, replySeq: Math.max(merged.replySeq ?? 0, reply) };
+  const found = withReply.missing ? { ...withReply, missing: false } : withReply;
   const wireThread = page.thread && typeof page.thread === "object"
     ? (page.thread as Record<string, unknown>)
     : null;
@@ -436,6 +481,10 @@ export interface ThreadPageLike {
   /** Backward reads only (CAD-328): older entries remain. Absent on a
    *  daemon that predates `tail`/`before` — it answered a forward page. */
   more_before?: boolean;
+  /** CAD-1700: the complete thread's newest visible assistant reply seq
+   *  (0 when none), independent of the page cursor. Absent on a daemon
+   *  that predates it. */
+  reply_seq?: number;
 }
 
 /** How the store reads pages: forward after a seq, the newest page, or
@@ -484,7 +533,10 @@ export async function loadThread(
       // Too far behind to replay: reopen on the newest page.
     }
     const page = await read.tail(limit);
-    const fresh = mergePage({ ...EMPTY_THREAD, pending: held.pending }, page);
+    const fresh = mergePage(
+      { ...EMPTY_THREAD, pending: held.pending, replySeq: held.replySeq },
+      page,
+    );
     return {
       ...fresh,
       moreBefore: typeof page.more_before === "boolean" ? page.more_before : null,

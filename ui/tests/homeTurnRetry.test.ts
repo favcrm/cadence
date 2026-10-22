@@ -52,13 +52,16 @@ async function main() {
   const host = document.createElement("div"); document.body.append(host);
   const root = createRoot(host);
   const settle = async () => { for (let i = 0; i < 6; i++) await React.act(async () => { await nextTurn(); }); };
-  await React.act(async () => {
-    root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
-      readOnly: false, hosted: false, overview: resources.overview.get(),
-      onOpenIssue: () => undefined, overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
-    })));
-  });
-  await settle();
+  const render = async (readOnly: boolean) => {
+    await React.act(async () => {
+      root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
+        readOnly, hosted: false, overview: resources.overview.get(),
+        onOpenIssue: () => undefined, overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+      })));
+    });
+    await settle();
+  };
+  await render(false);
   entries.push({ seq: 2, role: "agent", kind: "turn_result", message: "turn-b", text: "Turn B failed", created: new Date().toISOString(), payload: { status: "failed", error: "Turn B failed" } });
   await React.act(async () => {
     resources.masterThread.write((state) => ({ ...state!, entries: [...entries], pending: [{ message: "transport-a", text: "Do not retry A", state: "failed", at: 1, refs: [{ kind: "issue", id: "CAD-A" }], attachments: [{ id: "file-a" }], conversation: "other-home" }] }));
@@ -72,6 +75,25 @@ async function main() {
   assert(sent?.text === "Retry turn B" && sent.message !== "transport-a" && sent.message !== "turn-b", "Home's failed-turn bar retries B with a fresh id, never unrelated transport failure A");
   assert(JSON.stringify(sent.refs) === JSON.stringify(refs) && JSON.stringify(sent.attachments) === JSON.stringify(attachments) && sent.conversation === "home-thread", "Home turn Retry preserves its references, files and captured conversation");
   assert(resources.masterThread.get().data?.pending.some((row) => row.message === "transport-a" && row.state === "failed"), "unrelated A remains available for its own row Retry");
+  await render(true);
+  await React.act(async () => {
+    resources.masterState.write(() => ({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true,
+      turn: { state: "working", message: "turn-b", conversation: "home-thread" }, queue: [] }));
+  });
+  await settle();
+  assert(host.querySelector("[data-turn-bar]") && !host.querySelector('[aria-label="Stop this turn"]'), "read-only Home observes its working turn without a mutating Stop");
+  await React.act(async () => {
+    resources.masterState.write(() => ({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true,
+      turn: { state: "working", message: "elsewhere", conversation: "other-home" }, queue: [{ message: "turn-b", conversation: "home-thread" }] }));
+  });
+  await settle();
+  assert(!Array.from(host.querySelectorAll("[data-turn-bar] button")).some((button) => button.textContent === "Cancel"), "read-only Home cannot cancel a queued turn");
+  await React.act(async () => {
+    resources.masterState.write(() => ({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
+    resources.masterThread.write((state) => ({ ...state!, pending: state!.pending.filter((row) => row.state === "failed") }));
+  });
+  await settle();
+  assert(!Array.from(host.querySelectorAll("[data-turn-bar] button")).some((button) => button.textContent === "Retry"), "read-only Home cannot retry a stored failure");
   await React.act(async () => { root.unmount(); });
   await win.happyDOM.close();
   console.log("Home turn Retry checks passed");

@@ -1,3 +1,4 @@
+import "fake-indexeddb/auto";
 import { streamFixture } from "./streamFixture";
 /** CAD-1098 S3: per-app assistant conversations in the shell chat. */
 import type * as SeenModule from "../src/features/app-shell/chat/unreadSeen";
@@ -290,6 +291,17 @@ await pick("Spring launch");
 
   threads["c-camp"].push(ent(3, "operator", "message", "queued brief update", sentMessage));
   await React.act(async () => { await conversationThread("c-camp").refresh(); });
+  // The server note retires the optimistic row before the owned message
+  // reaches the queue head. Position 21 must still be tracked from metadata.
+  queue = [
+    ...Array.from({ length: 20 }, (_, index) => ({ message: `ahead-${index}`, conversation: "c-gen" })),
+    { message: sentMessage, conversation: "c-camp" },
+  ];
+  await React.act(async () => { await resources.masterState.refresh(); });
+  await settle();
+  equal(bar()?.dataset.state, "queued", "position 21 stays Queued after optimistic retirement");
+  assert(bar()!.textContent!.includes("after General"), "position 21 names its immediate predecessor, not the running Home turn");
+  assert(barButton("View") && barButton("Cancel") && !barButton("Stop"), "position 21 retains View and Cancel, never Stop");
   turn = { state: "working", message: sentMessage, conversation: "c-camp", summary: "customers.search" };
   queue = [];
   // No timer: a `master` stream frame invalidates the state (CAD-1700).
@@ -405,13 +417,13 @@ await React.act(async () => {
   await conversationList("install-crm").refresh();
 });
 await settle();
-assert((readSeen("install-crm")["c-gen"] ?? 0) < 5, "the mounted hidden pane leaves the reply unseen");
+assert(((await readSeen("install-crm"))["c-gen"] ?? 0) < 5, "the mounted hidden pane leaves the reply unseen");
 await React.act(async () => {
   Object.defineProperty(win.document, "visibilityState", { value: "visible", configurable: true });
   win.document.dispatchEvent(new win.Event("visibilitychange"));
 });
 await settle();
-equal(readSeen("install-crm")["c-gen"], 5, "returning to the visible pane marks the displayed reply seen");
+equal((await readSeen("install-crm"))["c-gen"], 5, "returning to the visible pane marks the displayed reply seen");
 
 // Collapse state is per app.
 await React.act(async () => { (host.querySelector(".app-chat-collapse") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
@@ -487,6 +499,18 @@ assert(box().disabled, "the composer (and so /new) is disabled read-only");
 await React.act(async () => { newButton().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 await settle();
 equal(createPosts.length, before, "no conversation is created read-only");
+await pick("General");
+turn = { state: "working", message: "m-gen", conversation: "c-gen" };
+await React.act(async () => { await resources.masterState.refresh(); });
+await settle();
+assert(bar() && !barButton("Stop"), "a read-only pane observes its working turn without offering a mutating Stop");
+turn = { state: "working", message: "m-elsewhere", conversation: "c-camp" };
+queue = [{ message: "m-gen", conversation: "c-gen" }];
+await React.act(async () => { await resources.masterState.refresh(); });
+await settle();
+assert(bar()?.dataset.state === "queued" && !barButton("Cancel"), "a read-only pane observes its queue without offering a mutating Cancel");
+assert(barButton("View"), "read-only mode retains non-mutating predecessor navigation");
+queue = [];
 
 // Context navigation cannot manufacture a successful network reconnect.
 const Conversation = (require("../src/features/app-shell/chat/Conversation") as typeof ConversationModule).default;

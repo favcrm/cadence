@@ -95,7 +95,7 @@ import type { ChatBinding, MediaComposerTarget } from "./types";
 import { usePendingPermission } from "./usePendingApproval";
 import { turnBarState } from "./turnBarState";
 import { TurnBar } from "./TurnBar";
-import { isUnread, onSeenChanged, readSeen, writeSeen, type SeenMap } from "./unreadSeen";
+import { isUnread, onSeenChanged, writeSeen, type SeenMap } from "./unreadSeen";
 import { setVisibleConversation, useDocumentVisible } from "./chatVisibility";
 import { useConversationDestination } from "./conversationNavigation";
 import { earlierStep, useThreadStream } from "./conversationThread";
@@ -387,21 +387,18 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const [historyOpen, setHistoryOpen] = useState(false);
   // Client-side last-seen per conversation (CAD-1700). Opening a conversation
   // records its newest reply sequence; other tabs observe the seen write.
-  const [unreadSeen, setUnreadSeen] = useState<SeenMap>(() => readSeen(installId));
-  useEffect(() => {
-    setUnreadSeen(readSeen(installId));
-    return onSeenChanged(installId, setUnreadSeen);
-  }, [installId]);
+  const [seenState, setSeenState] = useState<{ installId: string; seen: SeenMap } | null>(null);
+  const unreadSeen = seenState?.installId === installId ? seenState.seen : null;
+  useEffect(() => onSeenChanged(installId, (seen) => setSeenState({ installId, seen })), [installId]);
   const selectedId = active.state === "ready" ? (active.selected?.id ?? null) : null;
   const selectedReply = active.state === "ready" ? (active.selected?.replySeq ?? null) : null;
   useEffect(() => {
-    if (!documentVisible || collapsed || selectedId === null || selectedReply === null) return;
-    writeSeen(installId, selectedId, selectedReply);
-    setUnreadSeen(readSeen(installId));
+    if (!documentVisible || collapsed || selectedId === null || selectedReply === null || selectedReply <= 0) return;
+    void writeSeen(installId, selectedId, selectedReply);
   }, [selectedId, selectedReply, installId, collapsed, documentVisible]);
   // A real assistant reply elsewhere lights the Conversations button.
   const hasUnreadOther =
-    active.state === "ready" && active.conversations.some((c) => c.id !== convId && isUnread(unreadSeen, c.id, c.replySeq));
+    unreadSeen !== null && active.state === "ready" && active.conversations.some((c) => c.id !== convId && isUnread(unreadSeen, c.id, c.replySeq));
   const historyButtonRef = useRef<HTMLButtonElement | null>(null);
   const historyMenuRef = useRef<HTMLDivElement | null>(null);
   // Escape and an outside press close the Conversations menu; focus goes
@@ -783,7 +780,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     applyFollow(next.state);
     scrollPanel(next.scroll);
   };
-  const canSend = viewer.operator === true && !viewer.readOnly && usable;
+  const canControlTurns = viewer.operator === true && !viewer.readOnly;
+  const canSend = canControlTurns && usable;
   const canCreate =
     viewer.operator === true &&
     !viewer.readOnly &&
@@ -952,6 +950,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         }
       : undefined;
   const turnCommand = (command: "stop" | "cancel", message: string) => {
+    if (!canControlTurns) return;
     const origin = { key: composerKey, visit: visitRef.current, frame: frameToken };
     void api
       .masterCommand(command, undefined, undefined, message)
@@ -963,9 +962,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       .finally(() => void resources.masterState.refresh());
   };
   const turnActions = {
-    onStop: (message: string) => turnCommand("stop", message),
-    onCancel: (message: string) => turnCommand("cancel", message),
-    onRetry: retryAction,
+    onStop: canControlTurns ? (message: string) => turnCommand("stop", message) : undefined,
+    onCancel: canControlTurns ? (message: string) => turnCommand("cancel", message) : undefined,
+    onRetry: canSend ? retryAction : undefined,
     onView:
       turnState.kind !== "queued"
         ? undefined
@@ -1482,7 +1481,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           data-chat-history
         >
           {active.conversations.map((c, i) => {
-            const unread = isUnread(unreadSeen, c.id, c.replySeq) && c.id !== convId;
+            const unread = unreadSeen !== null && isUnread(unreadSeen, c.id, c.replySeq) && c.id !== convId;
             return (
               <button
                 key={c.id}

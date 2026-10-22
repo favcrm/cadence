@@ -3089,16 +3089,34 @@ impl Store {
         }
     }
 
-    /// CAD-1700: the queued master messages in delivery order (`submitting`
-    /// leads, then priority, then arrival), at most `limit`. A pane finds its
-    /// own queued message and what is ahead of it here.
-    pub fn queued_messages(&self, alias: &str, limit: usize) -> Result<Vec<Message>> {
+    /// CAD-1700: the complete queue's routing metadata in delivery order
+    /// (`submitting` leads, then priority, then arrival): each message id
+    /// and the conversation its enqueue note landed in. One narrow
+    /// projection — no message bodies, no per-row lookup — so a pane can
+    /// find its own message and its predecessor at any queue position.
+    /// The first entry per message is the grouped `MIN(e.seq)`: `seq` is a
+    /// global AUTOINCREMENT key, so SQLite's bare-column-with-min rule
+    /// makes the row's bare `thread_id` exactly that entry — no window
+    /// function, which the store's authorizer does not allow.
+    pub fn queued_metadata(&self, alias: &str) -> Result<Vec<(String, Option<String>)>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT * FROM messages WHERE alias=? AND state IN ('queued','submitting')
-             ORDER BY state='submitting' DESC, priority DESC, seq LIMIT ?",
+            "WITH queue AS (
+                 SELECT id, state, priority, seq FROM messages
+                 WHERE alias=?1 AND state IN ('queued','submitting')
+             ), first_entry AS (
+                 SELECT e.message_id, e.thread_id, MIN(e.seq) AS first_seq
+                 FROM thread_entries e JOIN threads t ON t.id=e.thread_id
+                 WHERE e.message_id IN (SELECT id FROM queue)
+                   AND (t.alias=?1 OR t.archived_alias=?1)
+                 GROUP BY e.message_id
+             )
+             SELECT q.id, f.thread_id
+             FROM queue q
+             LEFT JOIN first_entry f ON f.message_id=q.id
+             ORDER BY q.state='submitting' DESC, q.priority DESC, q.seq",
         )?;
-        let rows = stmt.query_map(params![alias, limit as i64], row_message)?;
+        let rows = stmt.query_map([alias], |r| Ok((r.get(0)?, r.get(1)?)))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -3305,20 +3323,57 @@ mod master_stamp_tests {
         );
     }
 
+    /// CAD-1700: the pane's queue projection is complete rather than a
+    /// 20-row page, in delivery order, and carries each message's
+    /// conversation from the one narrow join. An enqueue writes the
+    /// message's operator note when the alias has a home thread, so every
+    /// master row resolves home; an alias with no home thread drops the
+    /// note (the documented CLI/unattributed path), so its row is NULL.
     #[test]
-    fn queued_messages_come_back_in_delivery_order() {
+    fn queued_metadata_is_complete_and_carries_conversations() {
         let (_dir, store) = open();
-        for id in ["m-a", "m-b", "m-c"] {
-            store.enqueue("master", id, None, id, "operator").unwrap();
+        let home = store.ensure_thread("master").unwrap().id;
+        for i in 1..=25 {
+            let id = format!("m{i}");
+            store.enqueue("master", &id, None, &id, "operator").unwrap();
         }
-        let queued = store.queued_messages("master", 20).unwrap();
+        let queued = store.queued_metadata("master").unwrap();
         assert_eq!(
-            queued.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["m-a", "m-b", "m-c"],
-            "arrival order is delivery order"
+            queued.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            (1..=25).map(|i| format!("m{i}")).collect::<Vec<_>>(),
+            "the projection is complete and in delivery order"
         );
-        let head = store.queued_messages("master", 1).unwrap();
-        assert_eq!(head.len(), 1, "the limit bounds the page");
-        assert_eq!(head[0].id, "m-a", "the limit keeps the head first");
+        assert_eq!(queued[19].0, "m20", "the predecessor is represented");
+        assert_eq!(queued[20].0, "m21", "the 21st message is represented");
+        assert!(
+            queued
+                .iter()
+                .all(|(_, conversation)| conversation.as_deref() == Some(home.as_str())),
+            "every enqueued master message resolves its home conversation"
+        );
+        // A canonical message whose note was dropped: w1 has an agent but
+        // no home thread, so its enqueue note lands nowhere.
+        store
+            .register_agent(&NewAgent {
+                alias: "w1",
+                provider: "fake",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: _dir.path().to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        store
+            .enqueue("w1", "unthreaded", None, "w-note", "operator")
+            .unwrap();
+        assert_eq!(
+            store.queued_metadata("w1").unwrap(),
+            vec![("w-note".to_string(), None::<String>)],
+            "a queued message with no thread note has no conversation"
+        );
     }
 }

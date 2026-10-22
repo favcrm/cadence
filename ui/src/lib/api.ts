@@ -120,6 +120,9 @@ export interface ThreadPage {
   cursor?: number;
   /** Backward reads (`tail`/`before`): older entries remain. */
   more_before?: boolean;
+  /** CAD-1700: the complete thread's newest visible assistant reply seq
+   *  (0 when none), independent of the page cursor. */
+  reply_seq?: number;
 }
 
 /** CAD-1485: `POST /api/member-assistant/state` — the member's assistant

@@ -2336,8 +2336,11 @@ past three), and a sent message's files render as read-only chips under
 its bubble (CAD-1419/CAD-1462).
 
 The shared turn bar (CAD-1700) names the conversation actually ahead of a
-queued message, including Home's server-issued thread id. View opens that
-predecessor, not necessarily the running turn's app. Review skips decided
+queued message, including Home's server-issued thread id. The master queue
+projection includes every queued message, so a position beyond twenty still
+retains Queued, View and Cancel after optimistic state retires. View opens
+that predecessor, not necessarily the running turn's app. Read-only viewers
+keep View and Review, but never Stop, Cancel or Retry. Review skips decided
 permission history and reaches the pending actionable card. Mounted cards
 refresh on pushed permission changes and ignore superseded reads. The bar
 retries the stored failure it displays with a fresh message id and its
@@ -2349,11 +2352,14 @@ pane is offscreen: an app reply opens its exact conversation, and a Home
 reply opens `/`. Only a foreground conversation is marked seen; a hidden
 tab cannot consume a foreground announcement. Seeing a conversation clears
 its dots and toast in every tab without clearing another unread room.
-The conversation-list `reply_seq` is computed from nonblank agent
-`assistant_text` / `turn_result` entries; creation, operator/system entries
-and tool progress do not count. Seen and announced reply sequences live
-only in versioned browser-local watermarks, not a server unread table; old
-any-write timestamp watermarks are ignored.
+The conversation-list and thread-read `reply_seq` values are computed from
+nonblank agent `assistant_text` / `turn_result` entries; creation,
+operator/system entries and tool progress do not count. Home uses the
+complete thread watermark, even when its reply is older than the loaded
+200-entry tail. Seen and announced reply sequences live only in browser
+IndexedDB, not a server unread table. Readwrite transactions serialize
+cross-tab changes and announcement reservations; localStorage carries only
+change signals. Old browser-local timestamp and sequence maps are ignored.
 
 The shared board watcher samples the master stamp every 250 ms while other
 tracker/agent work keeps its one-second cadence. Master invalidations

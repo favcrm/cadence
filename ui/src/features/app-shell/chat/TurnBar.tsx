@@ -3,8 +3,9 @@ import { useTranslate } from "../../../lib/locale";
 import type { TurnBarState } from "./turnBarState";
 
 export interface TurnBarActions {
-  onStop: (message: string) => void;
-  onCancel: (message: string) => void;
+  /** Mutating actions are absent when the viewer cannot write. */
+  onStop?: (message: string) => void;
+  onCancel?: (message: string) => void;
   /** Absent when there is no captured envelope to resend: Retry is hidden. */
   onRetry?: () => void;
   onReview: () => void;
@@ -41,8 +42,9 @@ export function TurnBar({
       {t(label)}
     </button>
   );
+  const { onStop, onCancel } = actions;
   const stop = (message: string | null) =>
-    message === null ? null : button("Stop", () => actions.onStop(message), true, t("Stop this turn"));
+    message === null || onStop === undefined ? null : button("Stop", () => onStop(message), true, t("Stop this turn"));
 
   let title: string;
   let detail = "";
@@ -58,7 +60,7 @@ export function TurnBar({
       controls = (
         <>
           {actions.onView ? button("View", actions.onView) : null}
-          {state.cancelMessage !== null ? button("Cancel", () => actions.onCancel(state.cancelMessage!)) : null}
+          {state.cancelMessage !== null && onCancel ? button("Cancel", () => onCancel(state.cancelMessage!)) : null}
         </>
       );
       break;

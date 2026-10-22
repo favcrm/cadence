@@ -4,8 +4,8 @@ import { useSyncExternalStore } from "react";
  * Where a new assistant reply waits unseen (CAD-1700): `home` or an app
  * install id. The shell's app-list and Home-thread observers publish here;
  * the nav reads it to draw a quiet dot. In-memory, per tab: durable reply
- * watermarks live in `unreadSeen` (localStorage), whose same-tab and storage
- * subscriptions clear the dot when a conversation is seen in any tab.
+ * watermarks live in `unreadSeen` (IndexedDB); committed seen changes
+ * wake same-tab and cross-tab subscribers to clear the dot.
  */
 const unread = new Set<string>();
 const listeners = new Set<() => void>();
