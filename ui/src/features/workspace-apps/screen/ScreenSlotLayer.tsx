@@ -93,8 +93,8 @@ export default function ScreenSlotLayer({ view, link, onTap, onCancel, onDismiss
             style={{ width: box.footer ? "min(100%, 320px)" : "max-content", maxWidth: "100%",
               height: "auto", minHeight: Math.min(box.footer ? 40 : box.h, Math.max(0, approvalHeight - (box.footer ? 17 : 0))),
               maxHeight: Math.max(0, approvalHeight - (box.footer ? 17 : 0)), minWidth: box.footer ? 0 : Math.min(box.w, 320),
-              boxSizing: "border-box", pointerEvents: "auto", flexShrink: 0, alignItems: "flex-start",
-              overflowY: "auto", whiteSpace: "normal" }}
+              boxSizing: "border-box", pointerEvents: "auto", flexShrink: 0, display: "block",
+              padding: "8px 12px", lineHeight: 1.4, textAlign: "center", overflowY: "auto", whiteSpace: "normal" }}
             onPointerDown={event => { pressed.current = event.timeStamp; }}
             onClick={event => {
               // Keyboard activation has no pointerdown: it counts as pressed now.
