@@ -72,7 +72,9 @@ use crate::store::{self, Store};
 /// path honours.
 /// v54 (CAD-1239) adds the retired-agent archive marker, lifecycle revision
 /// and retention triggers.
-pub const SCHEMA_VERSION: i64 = 54;
+/// v55 (CAD-1353) adds `messages.stall_secs`, the budget chosen for one
+/// dispatch, leaving `jobs.stall_secs` as the shared default.
+pub const SCHEMA_VERSION: i64 = 55;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

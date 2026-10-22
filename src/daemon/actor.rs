@@ -1016,6 +1016,45 @@ impl Shared {
     /// already requires operator proof (`rpc_message_read`), so the
     /// operator still reconciles from the full detail.
     pub(super) fn unknown(&self, alias: &str, message: &Message, reason: &str) -> Result<()> {
+        // CAD-1353: the provider's idle fence is the real unknown-outcome
+        // diagnostic. Name the budget this dispatch was given and the
+        // last provider event we can point at, not only the idle window.
+        let budget = self.store.message_stall_budget(message).or_else(|| {
+            self.store.agent(alias).ok().and_then(|agent| {
+                agent
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("stall_secs"))
+                    .and_then(|value| {
+                        value
+                            .as_i64()
+                            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                    })
+            })
+        });
+        let budget = budget
+            .map(|secs| format!("{secs}s"))
+            .unwrap_or_else(|| "default".to_string());
+        let last_event = self
+            .provider_activity_epoch(alias)
+            .or_else(|| self.last_activity_epoch(alias))
+            .or_else(|| {
+                self.store
+                    .message(&message.id)
+                    .ok()
+                    .flatten()
+                    .and_then(|current| current.started)
+            })
+            .or(message.started)
+            .map(|at| format!("last observed activity at {at:.0}"))
+            .unwrap_or_else(|| "none recorded".to_string());
+        // Lead with the Cadence-authored evidence: the fence formatter
+        // bounds the detail, and a long provider account must not push
+        // the required budget/activity out of the bounded text.
+        let fence_reason =
+            format!("dispatch stall budget {budget}; last provider event: {last_event}; {reason}");
+        // The operator-private row keeps the provider's own account
+        // verbatim; the budget/activity evidence is fence text.
         let stored = json!({"status": "unknown", "text": "", "error": reason});
         self.store
             .finish(message, "unknown", &stored, Some(reason))?;
@@ -1023,7 +1062,7 @@ impl Shared {
         let public_reason = if message.source == "app_run_dispatch" {
             store::app_runs::app_uncertain_turn_reason()
         } else {
-            reason.to_string()
+            fence_reason
         };
         // One write: the fence is visible immediately, so the cleared
         // endpoint must land with it — a reader in between must never

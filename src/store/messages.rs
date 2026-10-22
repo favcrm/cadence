@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::proto::identifier;
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::agents::Agent;
 use super::schema::Take;
@@ -61,6 +61,9 @@ pub struct Message {
     pub created: f64,
     pub started: Option<f64>,
     pub completed: Option<f64>,
+    /// CAD-1353: the stall budget chosen for this dispatch. `None` falls
+    /// back to the job default, then the agent's `stall_secs`.
+    pub stall_secs: Option<i64>,
     /// CAD-819: the daemon-derived sender participant (uid, label). NULL
     /// on a legacy row, which reads as an unknown sender.
     pub sender_uid: Option<String>,
@@ -93,6 +96,7 @@ pub(super) fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         created: row.get("created")?,
         started: row.get("started")?,
         completed: row.get("completed")?,
+        stall_secs: row.get("stall_secs")?,
         sender_uid: row.get("sender_uid")?,
         sender: row.get("sender")?,
         recipient_uid: row.get("recipient_uid")?,
@@ -2606,6 +2610,31 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// CAD-1353: one grouped read for the fleet status view — how many
+    /// deliveries each alias is waiting to start and how long the oldest
+    /// has waited. A running turn is already delivering, so it is not
+    /// counted as queued; the stall view reports it separately.
+    pub fn open_delivery_summary(&self) -> Result<HashMap<String, (i64, Option<f64>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT alias, COUNT(*), MIN(created) FROM messages
+             WHERE alias != '' AND state IN ('queued','submitting','unknown')
+             AND source != 'topic_notice' GROUP BY alias",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, i64>(1)?, row.get::<_, Option<f64>>(2)?),
+            ))
+        })?;
+        let mut summary = HashMap::new();
+        for row in rows {
+            let (alias, counts) = row?;
+            summary.insert(alias, counts);
+        }
+        Ok(summary)
+    }
+
     /// Running rows only, via the queue index: recurring summaries must
     /// not deserialize completed bodies and results on every board tick.
     pub(crate) fn running_messages(&self, alias: &str) -> Result<Vec<Message>> {
@@ -2640,6 +2669,18 @@ impl Store {
     pub fn message(&self, id: &str) -> Result<Option<Message>> {
         let conn = self.conn();
         self.message_in(&conn, id)
+    }
+
+    /// CAD-1353: the recorded budget for a dispatch, falling back to the
+    /// job default. The agent's own `stall_secs` remains the final
+    /// fallback in the watcher.
+    pub fn message_stall_budget(&self, message: &Message) -> Option<i64> {
+        if let Some(secs) = message.stall_secs {
+            return Some(secs);
+        }
+        let task_id = message.task_id.as_deref()?;
+        let task = self.task(task_id).ok()?;
+        self.job(&task.job_id).ok()?.stall_secs
     }
 
     /// Whether a message row with this id exists. A bare existence probe

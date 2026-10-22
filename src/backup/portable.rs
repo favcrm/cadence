@@ -579,6 +579,7 @@ const CATALOG: &[(&str, &[&str])] = &[
             "sender",
             "recipient",
             "origin",
+            "stall_secs",
         ],
     ),
     ("model_defaults", &["id", "revision", "document"]),

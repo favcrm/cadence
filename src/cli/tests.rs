@@ -1786,3 +1786,18 @@ fn documented_self_payload_keys_match_the_builders() {
         "the documented inbox keys and the built ones disagree"
     );
 }
+
+#[test]
+fn duplicate_dispatch_names_the_existing_message_and_state() {
+    let duplicate = json!({
+        "duplicate": true,
+        "message": "cadence-dispatch:t1:r2",
+        "message_state": "running",
+    });
+    assert_eq!(
+        super::job::duplicate_dispatch_line(&duplicate).as_deref(),
+        Some("duplicate of cadence-dispatch:t1:r2 (state running)"),
+    );
+    let fresh = json!({"duplicate": false, "message": "cadence-dispatch:t1:r1"});
+    assert_eq!(super::job::duplicate_dispatch_line(&fresh), None);
+}
