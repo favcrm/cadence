@@ -137,8 +137,10 @@ cadence --org acme issue set <issue-id> status=doing --if-rev <issue-rev>
 ```
 
 Use the exact revision returned by each corresponding read, not a guessed one.
-For a new wiki path, omit `--if-rev`; for an existing page use its revision to
-avoid overwriting another writer. Search results are discovery, not evidence:
+To create a new wiki page, pass the create-only sentinel `--if-rev none`, which
+refuses the write if the path already exists; to update an existing page, pass
+the revision returned by its read to avoid overwriting another writer.
+Search results are discovery, not evidence:
 read the actual page and cite its canonical path and revision. Wiki and CLI
 scopes are separate, and the target path/project still has to be authorized.
 An issue `status=doing` update is not a local assignment claim or delivery.
@@ -171,7 +173,9 @@ cadence --org acme agent watch
 recipient rights, start the ticket, send an execution instruction, or trigger
 inference. The recipient deliberately reads the referenced resources under
 their own current authority. `watch` observes the daemon's durable inbox; it is
-not a second claim-polling loop. It and `inbox` do not start a stopped daemon.
+not a second claim-polling loop, and it may start a stopped daemon through its
+normal startup path. `inbox` (including `--clear`) is observation only and does
+not start a stopped daemon: a stopped daemon is reported as stopped, unchanged.
 
 Notify requires an explicit operation key (1–120 units), text (1–4000 UTF-16
 code units), at most 16 total references (each 1–200 units), and a bounded
@@ -211,9 +215,11 @@ and [remote ticket writes](../REMOTE-AUTH.md#remote-ticket-writes-cad-1179).
   issuer, organization and audience. It does not adopt whichever org becomes the
   global default. Use separate private native state for another identity. Current
   membership/grant removal fences commands and delivery; reconnect is not a bypass.
-- `cadence --org acme agent disconnect` stops the local binding and unregisters
-  this runner's roster/default where hosted authority permits. It does **not** stop
-  existing actors, cancel claims, revoke the credential or erase business data.
+- `cadence --org acme agent disconnect` disables the local binding and, as a
+  separate step, attempts to unregister this runner's roster/default where hosted
+  authority permits. It can start a stopped daemon before disconnecting, and it
+  does **not** stop existing actors, cancel claims, revoke the credential or erase
+  business data.
   `directory_unregistered: false` means remote unregister was not confirmed, even
   though local delivery is off. Server revocation is a separate control.
 
