@@ -38,6 +38,16 @@
 //!   `cad1700_cancel_refuses_a_forged_operator_source` FAILS — the forged
 //!   `source: "operator"` message is cancelled (`ok: true`, state
 //!   `cancelled`), so the provenance rule is what refuses it. Sensitive.
+//! - **`message_required`** (the missing-message branch made unreachable):
+//!   `cad1700_cancel_refuses_everything_but_the_operators_own_queued_message`
+//!   FAILS — got `message_not_cancellable` instead. Sensitive.
+//! - **`message_running`** (the running/submitting arm disabled): the same
+//!   test FAILS — got `message_not_queued` instead. Sensitive.
+//! - **Relay message validation** (`message` length/empty check removed in
+//!   `src/ui/home.rs`): **NOT COVERED.** The group still passed 6/6: the
+//!   mapping test exercises `master_command_err` directly and never drives
+//!   the relay's own `message` validation, which needs a `Request`. A board
+//!   HTTP test must add that case.
 //! - **Relay refusal mapping** (`master_command_err` collapsed to the
 //!   shared mapping): `scoped_command_refusals_map_to_409` FAILS —
 //!   `turn_not_running maps to 409`, got 400. Sensitive.
