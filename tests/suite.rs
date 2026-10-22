@@ -12,6 +12,12 @@
 //!
 //! A file that is gated by `#![cfg(feature = "test-seam")]` keeps that gate
 //! as a module attribute, so the suite still builds without the feature.
+//!
+//! `autotests = false` means a new `tests/*.rs` file is NOT built unless it
+//! is added here as a `mod` (or declared as its own `[[test]]` in
+//! `Cargo.toml`). CI's target inventory comes from `cargo metadata`, so a
+//! forgotten registration is a silent coverage hole: add the `mod` in the
+//! same change that adds the file.
 
 // Five acceptance files each include `fixtures/aos_media_door.rs` with their
 // own `#[path] mod` so each stays self-contained; before CAD-1727 they were

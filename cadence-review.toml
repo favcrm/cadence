@@ -56,9 +56,10 @@ full_suite = "scripts/cadence-nextest --locked --features test-seam --lib --bins
 # are the PR's new tests.
 test_globs = ["tests/**"]
 
-# How one test runs alone — {test} = fn name, {file} = diff path,
-# {target} = file stem (cargo's --test <stem>). Substitutions arrive
-# single-quoted — do not quote them again here.
+# How one test runs alone — {test} = the test name (module-qualified for a
+# file `tests/suite.rs` lists), {file} = diff path, {target} = the cargo
+# target: the file stem, or `suite` for a suite module. Substitutions
+# arrive single-quoted — do not quote them again here.
 test_command = "scripts/cadence-nextest --features test-seam --test {target} -- {test} --exact"
 
 # Optional (CAD-799): how a `src/` unit test runs alone when no file

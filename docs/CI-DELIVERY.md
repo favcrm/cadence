@@ -351,9 +351,10 @@ in the `test` aggregate. Revisit build-once distribution only with a
 producer that is not serial on the critical path and a measured win over a
 cache-hit shard.
 
-CAD-1727 changed that cost shape: the 109 per-file test binaries are now
-one `suite` binary, so a full test profile is 1.8 GiB instead of 16.8 GiB
-and a shard links once instead of 109 times. The CAD-869 measurement stands
+CAD-1727 changed that cost shape: 83 of the per-file test binaries are now
+modules of one `suite` target, so a full test profile is 4.9 GiB (27
+executables) instead of 16.8 GiB (109), and a shard links the suite once
+plus the 15 explicitly declared targets. The CAD-869 measurement stands
 for the tree it was taken on; an archive producer's size and transfer cost
 are now different, so re-measure before reviving that flow.
 

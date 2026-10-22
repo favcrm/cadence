@@ -51,7 +51,8 @@ pub use config::{
 
 mod analysis;
 pub use analysis::{
-    extract_failed_tests, glob_match, parse_new_tests, schema_migration_hit, test_command, NewTest,
+    extract_failed_tests, glob_match, parse_new_tests, schema_migration_hit, suite_modules,
+    test_command, NewTest,
 };
 
 // ---------------------------------------------------------------------------
@@ -734,22 +735,28 @@ fn set_failure_reports(report: &mut Value, comparisons: &[Value]) {
 }
 
 /// The isolated command for a failing test name (CAD-799): the
-/// `--test <stem>` template when the test's file is known, else the
+/// `--test <target>` template when the test's file is known, else the
 /// recipe's `test_command_lib` — a `src/` unit test has no test file
-/// under `test_globs`, only a module-qualified name. `None` means the
+/// under `test_globs`, only a module-qualified name. A test in a suite
+/// module substitutes the `suite` target (CAD-1727). `None` means the
 /// test cannot be isolated at all; the row stays `inconclusive`.
-fn isolated_command(cfg: &ReviewConfig, name: &str, file: Option<String>) -> Option<String> {
+fn isolated_command(
+    cfg: &ReviewConfig,
+    name: &str,
+    file: Option<String>,
+    suite: &[String],
+) -> Option<String> {
     let nt = |file: String| NewTest {
         name: name.to_string(),
         file,
         body: String::new(),
     };
     match file.filter(|f| safe_rel_path(f)) {
-        Some(file) => Some(test_command(&cfg.test_command, &nt(file))),
+        Some(file) => Some(test_command(&cfg.test_command, &nt(file), suite)),
         None => cfg
             .test_command_lib
             .as_deref()
-            .map(|t| test_command(t, &nt(String::new()))),
+            .map(|t| test_command(t, &nt(String::new()), &[])),
     }
 }
 
@@ -848,14 +855,29 @@ fn lock_slug(slug: &str, root: &Path) -> String {
 /// `git grep -l 'fn <name>'` in the tree, filtered to `globs` — locates
 /// a failing test that did not come from the PR's own new tests (a
 /// pre-existing test the suite saw fail).
+///
+/// A suite test's name is module-qualified (`<module>::<fn>`), so grep for
+/// the bare `fn` and prefer the file whose stem is the first module segment
+/// (CAD-1727). Without this a suite failure is never located and falls to
+/// the lib template, where no `--test <stem>` target exists.
 fn find_test_file(dir: &Path, name: &str, globs: &[String], git_secs: u64) -> Option<String> {
-    let out = git_status(dir, &["grep", "-l", &format!("fn {name}")], git_secs).ok()?;
-    out.stdout
+    let bare = name.rsplit("::").next().unwrap_or(name);
+    let module = name.split("::").next().unwrap_or("");
+    let suite = suite_modules(dir);
+    let out = git_status(dir, &["grep", "-l", &format!("fn {bare}")], git_secs).ok()?;
+    let matches: Vec<&str> = out
+        .stdout
         .lines()
         .map(str::trim)
-        .filter(|f| !f.is_empty())
-        .find(|f| globs.iter().any(|g| glob_match(g, f)))
-        .map(str::to_string)
+        .filter(|f| !f.is_empty() && globs.iter().any(|g| glob_match(g, f)))
+        .collect();
+    if suite.iter().any(|m| m == module) {
+        let want = format!("tests/{module}.rs");
+        if let Some(f) = matches.iter().find(|f| **f == want) {
+            return Some((*f).to_string());
+        }
+    }
+    matches.first().map(|f| (*f).to_string())
 }
 
 /// An `{unknown}` isolated result for the report — the test was never
@@ -1317,8 +1339,9 @@ pub fn run(opts: &Options) -> Result<i32> {
         }
 
         // Stress each matched new test N times in isolation.
+        let suite = suite_modules(&tree.dir);
         for nt in &new_tests {
-            let cmd = test_command(&cfg.test_command, nt);
+            let cmd = test_command(&cfg.test_command, nt, &suite);
             let mut failures = 0u32;
             let mut runs = Vec::new();
             let mut unknown = 0u32;
@@ -1440,6 +1463,7 @@ pub fn run(opts: &Options) -> Result<i32> {
             }
         }
         let base_result_path = runner_result_path(&base_tree.dir, &cfg.runner);
+        let suite = suite_modules(&tree.dir);
         for name in &failures_to_check {
             // Names come from test output the PR controls — validate
             // before they reach a shell, and never execute a bad one.
@@ -1463,7 +1487,7 @@ pub fn run(opts: &Options) -> Result<i32> {
             // CAD-799: a name with no `tests/` file is a `src/` unit
             // test — `test_command_lib` isolates it by name when the
             // recipe declares one; otherwise it stays inconclusive.
-            let Some(cmd) = isolated_command(&cfg, name, file) else {
+            let Some(cmd) = isolated_command(&cfg, name, file, &suite) else {
                 comparisons.push(json!({
                     "test": name, "in_run": "fail",
                     "result": "unknown",
@@ -2559,7 +2583,7 @@ index 555..666 100644
         // Substitutions arrive shell-quoted — the template must not
         // pre-quote.
         assert_eq!(
-            test_command("cargo test --test {target} {test}", &nt),
+            test_command("cargo test --test {target} {test}", &nt, &[]),
             "cargo test --test 'daemon' 'x'"
         );
     }
@@ -2997,10 +3021,10 @@ test_command_lib = "cargo test --lib --bins -- {test} --exact"
 "#;
         let cfg = ReviewConfig::parse(toml, "t").unwrap();
 
-        let cmd = isolated_command(&cfg, "t::x", Some("tests/daemon.rs".into())).unwrap();
+        let cmd = isolated_command(&cfg, "t::x", Some("tests/daemon.rs".into()), &[]).unwrap();
         assert_eq!(cmd, "cargo test --test 'daemon' -- 't::x'");
 
-        let cmd = isolated_command(&cfg, "rollout::tests::x", None).unwrap();
+        let cmd = isolated_command(&cfg, "rollout::tests::x", None, &[]).unwrap();
         assert_eq!(
             cmd,
             "cargo test --lib --bins -- 'rollout::tests::x' --exact"
@@ -3008,11 +3032,43 @@ test_command_lib = "cargo test --lib --bins -- {test} --exact"
 
         let no_lib: ReviewConfig =
             ReviewConfig::parse(&toml.replace("test_command_lib", "unused_lib"), "t").unwrap();
-        assert!(isolated_command(&no_lib, "rollout::tests::x", None).is_none());
+        assert!(isolated_command(&no_lib, "rollout::tests::x", None, &[]).is_none());
         // An unsafe relative path is never executed — falls to the
         // lib template, not to `--test <stem>`.
-        let cmd = isolated_command(&cfg, "x", Some("../escape.rs".into())).unwrap();
+        let cmd = isolated_command(&cfg, "x", Some("../escape.rs".into()), &[]).unwrap();
         assert_eq!(cmd, "cargo test --lib --bins -- 'x' --exact");
+    }
+
+    /// CAD-1727: a test in a suite module runs the `suite` target with its
+    /// module-qualified name; a standalone target keeps its stem.
+    #[test]
+    fn isolated_command_routes_suite_modules() {
+        let toml = r#"
+prepare = []
+gates = ["true"]
+full_suite = "x"
+test_globs = ["tests/**"]
+test_command = "cargo test --test {target} -- {test}"
+"#;
+        let cfg = ReviewConfig::parse(toml, "t").unwrap();
+        let suite = vec!["daemon".to_string()];
+
+        let cmd =
+            isolated_command(&cfg, "daemon::x", Some("tests/daemon.rs".into()), &suite).unwrap();
+        assert_eq!(cmd, "cargo test --test 'suite' -- 'daemon::x'");
+
+        let nt = NewTest {
+            name: "x".into(),
+            file: "tests/daemon.rs".into(),
+            body: String::new(),
+        };
+        assert_eq!(
+            test_command(&cfg.test_command, &nt, &suite),
+            "cargo test --test 'suite' -- 'daemon::x'"
+        );
+
+        let cmd = isolated_command(&cfg, "x", Some("tests/standalone.rs".into()), &suite).unwrap();
+        assert_eq!(cmd, "cargo test --test 'standalone' -- 'x'");
     }
 
     #[test]
