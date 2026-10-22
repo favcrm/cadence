@@ -9,6 +9,7 @@
 #![cfg(feature = "test-seam")]
 
 use cadence_agent::contract_fixture::{ToolTable, Verified};
+use cadence_agent::daemon::test_events::{self, Event};
 use cadence_agent::platform::connections::{
     BoundActionMapping, CapabilityDescriptor, CapabilitySemantics, ProviderDescriptor,
 };
@@ -289,6 +290,13 @@ impl Fx {
     fn show(&self, id: &str) -> Value {
         self.op("app_run_show", json!({"run_id": id}))
     }
+    /// Discard any pass already in flight, then observe complete revalidations.
+    fn wait_monitor_ticks(&self, count: usize) {
+        test_events::subscribe(&self.state())
+            .wait_for(Event::AppRunsAdvanced, count + 1, Duration::from_secs(15))
+            .expect("run-monitor did not revalidate this fixture");
+    }
+
     fn wait_state(&self, id: &str, want: &str, what: &str) {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -355,7 +363,7 @@ fn transient_quote_outage_does_not_kill_the_run_but_stale_authority_does() {
     // The provider door goes down. Monitor ticks keep re-validating; the
     // run must stay `running` instead of failing before the first turn.
     fx.provider.set_quote_down(true);
-    std::thread::sleep(Duration::from_secs(4));
+    fx.wait_monitor_ticks(3);
     let shown = fx.show(&id);
     assert_eq!(shown["state"], "running", "{shown}");
     assert_eq!(shown["steps"][0]["state"], "dispatched", "{shown}");

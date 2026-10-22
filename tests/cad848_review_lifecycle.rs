@@ -87,6 +87,7 @@ struct Fixture {
     conflict_edit: PathBuf,
     inject_conflict: bool,
     proc_root: PathBuf,
+    report_epoch: std::cell::Cell<i64>,
 }
 
 impl Fixture {
@@ -257,6 +258,7 @@ esac
             conflict_edit,
             inject_conflict,
             proc_root,
+            report_epoch: std::cell::Cell::new(2_000_000_000),
         }
     }
 
@@ -274,6 +276,8 @@ esac
             &std::env::var_os("PATH").unwrap_or_default(),
         ));
         let path = std::env::join_paths(paths).unwrap();
+        let report_epoch = self.report_epoch.get();
+        self.report_epoch.set(report_epoch + 1);
         let mut command = Command::new(BINARY);
         command
             .args([
@@ -288,6 +292,7 @@ esac
             .current_dir(&self.repo)
             .env("PATH", path)
             .env("HOME", &self.home)
+            .env("CADENCE_TEST_REVIEW_REPORT_EPOCH", report_epoch.to_string())
             .env(
                 "CADENCE_SUITE_LOCK",
                 self._root.path().join("fixture-suite.lock"),
@@ -388,7 +393,6 @@ fn cad848_clean_merge_result_is_restored_before_receipted_release() {
         fixture.review_tree.to_string_lossy().to_string()
     );
     let first_artifacts = fixture.record()["release_artifacts"].clone();
-    std::thread::sleep(std::time::Duration::from_millis(1100));
 
     // An explicit second review of the same PR must create and release a new
     // generation after the prior checkout is absent and unregistered.

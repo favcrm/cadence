@@ -7,6 +7,7 @@
 #![cfg(feature = "test-seam")]
 
 use cadence_agent::contract_fixture::{ToolTable, Verified};
+use cadence_agent::daemon::test_events::{self, Event};
 use cadence_agent::platform::connections::{
     BoundActionMapping, CapabilityDescriptor, CapabilitySemantics, ProviderDescriptor,
 };
@@ -1013,14 +1014,16 @@ impl Fx {
         let deadline = std::time::Instant::now() + Duration::from_secs(4);
         let mut run = self.op("app_run_show", json!({"run_id": run_id}));
         while std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(100));
-            run = self.op("app_run_show", json!({"run_id": run_id}));
             if run["state"] == "failed" {
-                // Ensure two one-second run-monitor intervals elapse after
-                // failure, not just a direct re-dispatch.
-                std::thread::sleep(Duration::from_millis(2300));
+                // Discard a pass already in flight, then observe two complete
+                // revalidation passes of this daemon after failure.
+                test_events::subscribe(&self.state())
+                    .wait_for(Event::AppRunsAdvanced, 3, Duration::from_secs(4))
+                    .expect("run-monitor did not revalidate after failure");
                 return self.op("app_run_show", json!({"run_id": run_id}));
             }
+            std::thread::sleep(Duration::from_millis(10));
+            run = self.op("app_run_show", json!({"run_id": run_id}));
         }
         run
     }

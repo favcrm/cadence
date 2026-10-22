@@ -40,6 +40,8 @@ pub use app_image_jobs::test_probe as image_job_probe;
 mod app_records_rpc;
 mod app_runs_rpc;
 mod app_screen_services_rpc;
+#[cfg(feature = "test-seam")]
+pub mod test_events;
 
 #[cfg(all(test, feature = "test-seam"))]
 mod cad811_installed_crm_qa_fixture;
@@ -2057,6 +2059,10 @@ impl Shared {
             let ticket = self.adoptions_notify.ticket();
             if !self.adoption_pending(alias, message, token) {
                 return true;
+            }
+            #[cfg(feature = "test-seam")]
+            if let Some(path) = std::env::var_os("CADENCE_TEST_ADOPTION_WAIT_ENTERED") {
+                std::fs::write(path, message).expect("write adoption-wait test witness");
             }
             if !self.adoptions_notify.wait_if_unchanged(ticket, deadline) {
                 return !self.adoption_pending(alias, message, token);

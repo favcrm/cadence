@@ -40,12 +40,17 @@ enum RunEnd {
     Held,
 }
 
-/// Test-seam probes: worker-start count, a pause between settle and registry
+/// Test-seam probes: worker starts, a barrier between settle and registry
 /// removal, and a stand-in for a tripped lease fence.
 #[cfg(feature = "test-seam")]
 pub mod test_probe {
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
     type ReceiptAttachHook = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+    type AfterRunHook = std::sync::Arc<dyn Fn(&std::path::Path, &str) + Send + Sync>;
+    static AFTER_RUN: std::sync::Mutex<Option<AfterRunHook>> = std::sync::Mutex::new(None);
+    pub fn set_after_run_hook(hook: Option<AfterRunHook>) {
+        *AFTER_RUN.lock().unwrap() = hook;
+    }
     static BEFORE_RECEIPT_ATTACH: std::sync::Mutex<Option<ReceiptAttachHook>> =
         std::sync::Mutex::new(None);
     /// A test observer immediately before real context retention. The callback
@@ -61,16 +66,12 @@ pub mod test_probe {
     }
     static STARTS: AtomicUsize = AtomicUsize::new(0);
     static FENCE: AtomicBool = AtomicBool::new(false);
-    static PAUSE_MS: AtomicU64 = AtomicU64::new(0);
     static FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     pub fn starts() -> usize {
         STARTS.load(SeqCst)
     }
     pub fn trip_fence(on: bool) {
         FENCE.store(on, SeqCst);
-    }
-    pub fn pause_after_settle_ms(ms: u64) {
-        PAUSE_MS.store(ms, SeqCst);
     }
     /// One-shot fault for the next worker run: 1 panics, 2 returns an error.
     pub fn fault_next(kind: u8) {
@@ -85,8 +86,11 @@ pub mod test_probe {
     pub(super) fn fenced() -> bool {
         FENCE.load(SeqCst)
     }
-    pub(super) fn pause() {
-        std::thread::sleep(std::time::Duration::from_millis(PAUSE_MS.load(SeqCst)));
+    pub(super) fn after_run(state_dir: &std::path::Path, call_id: &str) {
+        let hook = AFTER_RUN.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(state_dir, call_id);
+        }
     }
 }
 
@@ -112,6 +116,21 @@ impl Shared {
         let shared = Arc::clone(self);
         let (install, call_id) = (install.to_owned(), call_id.to_owned());
         std::thread::spawn(move || {
+            // Declared before the registry guard so its completion witness is
+            // sent after cleanup, including unwinding and the respawn decision.
+            #[cfg(feature = "test-seam")]
+            struct Ended(Arc<Shared>);
+            #[cfg(feature = "test-seam")]
+            impl Drop for Ended {
+                fn drop(&mut self) {
+                    super::test_events::completed(
+                        &self.0.state_dir,
+                        super::test_events::Event::ImageWorkerEnded,
+                    );
+                }
+            }
+            #[cfg(feature = "test-seam")]
+            let _ended = Ended(Arc::clone(&shared));
             // Removes the registry entry on every exit, a panic included.
             struct Registered(Arc<Shared>, String);
             impl Drop for Registered {
@@ -131,7 +150,7 @@ impl Shared {
                     RunEnd::Held
                 });
             #[cfg(feature = "test-seam")]
-            test_probe::pause();
+            test_probe::after_run(&shared.state_dir, &call_id);
             drop(guard);
             // Only a run that settled can have raced a re-check that landed
             // before the removal (it saw a live worker and spawned none): if
@@ -256,6 +275,11 @@ impl Shared {
             let reason = failure.reason;
             match reason.settle() {
                 ImageSettle::Retry if crate::store::now() < job.deadline => {
+                    #[cfg(feature = "test-seam")]
+                    super::test_events::completed(
+                        &self.state_dir,
+                        super::test_events::Event::ImageAttemptFailed,
+                    );
                     if reason != ImageReason::PollTimeout {
                         self.image_job_sleep(wait);
                         wait = (wait * 2).min(BACKOFF_MAX);

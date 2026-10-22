@@ -893,6 +893,10 @@ impl Fx {
         }
     }
 
+    fn events(&self) -> cadence_agent::daemon::test_events::Subscription {
+        cadence_agent::daemon::test_events::subscribe(&self.dir())
+    }
+
     fn keys(&self) -> std::collections::BTreeSet<String> {
         self.door.media.submit_keys().into_iter().collect()
     }
@@ -983,11 +987,19 @@ fn a_restart_replays_the_same_key_and_leaves_no_image_intent_pending() {
     fx.image(&draft, "image-r1").unwrap();
     fx.wait_door("GET job");
 
-    // The daemon dies mid-job. Its worker gives up within one attempt
-    // (1.5 s here); the intent stays pending and the job stays held at
-    // AgenticOS, so only the next boot can settle it.
+    // The daemon dies mid-job. Its worker ends its held attempt; wait for
+    // that causal exit instead of a fixed settle window. The intent stays
+    // pending and the job stays held at AgenticOS, so only the next boot can
+    // settle it.
+    let events = fx.events();
     fx.stop_daemon();
-    std::thread::sleep(Duration::from_millis(2500));
+    events
+        .wait_for(
+            cadence_agent::daemon::test_events::Event::ImageWorkerEnded,
+            1,
+            Duration::from_secs(10),
+        )
+        .expect("stopped daemon's image worker did not exit");
     assert_eq!(fx.intent(&draft).unwrap()["state"], "pending");
     let key = fx.keys().into_iter().next().unwrap();
     let mark = fx.door.media.log().len();
@@ -1075,9 +1087,17 @@ fn an_unreachable_door_keeps_the_intent_pending_then_settles_uncertain_and_recov
     fx.image(&draft, "image-d1").unwrap();
     fx.wait_door("GET job");
 
-    // AgenticOS goes away: no fake terminal state while the window is open.
+    // AgenticOS goes away: observe a completed retryable attempt while the
+    // window is open, not merely a worker starting its provider call.
+    let events = fx.events();
     fx.door.media.set(Scenario::Down);
-    std::thread::sleep(Duration::from_millis(800));
+    events
+        .wait_for(
+            cadence_agent::daemon::test_events::Event::ImageAttemptFailed,
+            1,
+            Duration::from_secs(10),
+        )
+        .expect("image worker did not process a retryable failure");
     assert_eq!(fx.intent(&draft).unwrap()["state"], "pending");
 
     // The window is bounded: the intent settles with one of the two retry reasons.
@@ -1144,6 +1164,8 @@ use cadence_agent::daemon::image_job_probe as probe;
 impl Fx {
     /// Worker starts over the next two seconds, with nothing else going on.
     fn starts_over_two_seconds(&self, before: usize) -> usize {
+        // Negative claim: no respawn during a bounded observation window.
+        // The window is the claim, so this one stays time-based.
         std::thread::sleep(Duration::from_secs(2));
         probe::starts() - before
     }
@@ -1196,8 +1218,15 @@ fn a_job_with_no_spec_runs_one_worker_at_boot_and_does_not_respawn() {
     let draft = fx.new_draft("m1", &source);
     fx.image(&draft, "image-m1").unwrap();
     fx.wait_door("GET job");
+    let events = fx.events();
     fx.stop_daemon();
-    std::thread::sleep(Duration::from_millis(2500));
+    events
+        .wait_for(
+            cadence_agent::daemon::test_events::Event::ImageWorkerEnded,
+            1,
+            Duration::from_secs(10),
+        )
+        .expect("stopped daemon's image worker did not exit");
     let path = cadence_agent::store::app_records::record_db_path(&fx.dir(), &fx.install).unwrap();
     rusqlite::Connection::open(path)
         .unwrap()
@@ -1216,22 +1245,46 @@ fn a_job_with_no_spec_runs_one_worker_at_boot_and_does_not_respawn() {
 #[test]
 fn a_re_check_that_lands_before_the_slot_is_freed_is_restarted_exactly_once() {
     // The job settles `uncertain` (poll_timeout) at the end of a 1.2 s window;
-    // the worker then sits 3 s before freeing its slot. A same-id re-check in
-    // that gap finds the slot taken and spawns nothing: the worker itself must
-    // restart the job, once, and it then completes.
+    // a barrier holds the worker before it frees its slot. A same-id re-check
+    // in that gap finds the slot taken and spawns nothing: the worker itself
+    // must restart the job, once, and it then completes.
     let fx = Fx::start_small_with(1200, 100);
     let source = fx.fetch();
     fx.door.media.set(Scenario::Hold);
     let draft = fx.new_draft("c1", &source);
     let before = probe::starts();
-    probe::pause_after_settle_ms(3000);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let state = fx.dir();
+    probe::set_after_run_hook(Some(Arc::new(move |dir, _| {
+        if dir == state {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }
+    })));
+    struct Release(std::sync::mpsc::Sender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            probe::set_after_run_hook(None);
+            let _ = self.0.send(());
+        }
+    }
+    let release = Release(release_tx);
     fx.image(&draft, "image-c1").unwrap();
     fx.wait_intent(&draft, "uncertain");
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("settled worker never reached registry barrier");
     fx.door.media.set(Scenario::Normal);
     fx.image(&draft, "image-c1").unwrap();
     assert_eq!(fx.intent(&draft).unwrap()["state"], "pending");
+    drop(release);
     fx.wait_intent(&draft, "completed");
-    probe::pause_after_settle_ms(0);
     assert_eq!(probe::starts() - before, 2, "one restart, no loop");
     assert_eq!(fx.keys().len(), 1);
     assert_eq!(fx.door.media.job_count(), 1);

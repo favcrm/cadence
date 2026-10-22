@@ -562,8 +562,15 @@ fn retry_never_charges_the_same_image_intent_twice() {
     // 3. The daemon dies mid-job; the next boot settles it under the SAME key
     //    with the same body. (The in-process worker of the stopped daemon ends
     //    its current attempt first; a real process would just be gone.)
+    let events = daemon::test_events::subscribe(&fx.dir());
     fx.stop_daemon();
-    std::thread::sleep(Duration::from_millis(2500));
+    events
+        .wait_for(
+            daemon::test_events::Event::ImageWorkerEnded,
+            1,
+            Duration::from_secs(10),
+        )
+        .expect("stopped daemon's image worker did not exit");
     assert_eq!(fx.intent(&held)["state"], "pending");
     fx.door.media.set(Scenario::Normal);
     fx.launch();

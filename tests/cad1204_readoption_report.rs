@@ -77,6 +77,10 @@ impl Fx {
                 root.join("barrier/release"),
             )
             .env("CADENCE_FAKE_TMUX_BARRIER_MAX_SECS", "20")
+            .env(
+                "CADENCE_TEST_ADOPTION_WAIT_ENTERED",
+                root.join("barrier/report-waiting"),
+            )
             .env("CADENCE_STUB_LOCKS", root.join("stub-locks"))
             .env("CADENCE_STUB_COMMAND", format!("python3 {TUI}"))
             .env_remove("CADENCE_STATE_DIR")
@@ -300,10 +304,14 @@ fn pending_report_is_held_then_completed_once_after_real_readoption() {
     let root = fx.root.clone();
     let id = before.id.clone();
     let tok = token.clone();
-    let report = thread::spawn(move || result(&root, &id, &tok));
-    thread::sleep(Duration::from_millis(100));
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let report = thread::spawn(move || completed_tx.send(result(&root, &id, &tok)).unwrap());
+    wait_file(&fx.root.join("barrier/report-waiting"));
     assert!(
-        !report.is_finished(),
+        matches!(
+            completed_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
         "report answered while adoption proof was parked"
     );
     assert_eq!(
@@ -312,7 +320,10 @@ fn pending_report_is_held_then_completed_once_after_real_readoption() {
         "pending report mutated durable state"
     );
     fx.release(&release);
-    let out = report.join().unwrap();
+    let out = completed_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("report did not finish after adoption");
+    report.join().unwrap();
     assert!(
         out.status.success(),
         "genuine pending report refused: {}",
@@ -363,26 +374,22 @@ fn invalid_identity_and_dead_pane_fail_closed_during_pending_adoption() {
     let alias_root = fx.root.clone();
     let alias_id = message.id.clone();
     let alias_token = token.clone();
-    let (alias_started_tx, alias_started_rx) = std::sync::mpsc::channel();
+    let (alias_completed_tx, alias_completed_rx) = std::sync::mpsc::channel();
     let forged_alias = thread::spawn(move || {
-        alias_started_tx.send(()).unwrap();
-        forged_alias_report(&alias_root, &alias_id, &alias_token)
+        alias_completed_tx
+            .send(forged_alias_report(&alias_root, &alias_id, &alias_token))
+            .unwrap();
     });
-    alias_started_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("forged-alias RPC caller did not start during pending adoption");
     drop(started_tx);
     for _ in 0..invalid_reports.len() {
         started_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("invalid report caller did not start during pending adoption");
     }
-    thread::sleep(Duration::from_millis(100));
-    assert!(
-        forged_alias.is_finished(),
-        "forged-alias RPC was held instead of rejected during pending adoption"
-    );
-    let alias_response = forged_alias.join().unwrap();
+    let alias_response = alias_completed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("forged-alias RPC was held instead of rejected during pending adoption");
+    forged_alias.join().unwrap();
     assert_eq!(
         alias_response["ok"], false,
         "forged alias was not refused: {alias_response}"
@@ -460,16 +467,23 @@ fn dead_pane_at_adoption_refuses_pending_report_without_completion() {
     let root = fx.root.clone();
     let id = message.id.clone();
     let tok = token.clone();
-    let pending = thread::spawn(move || result(&root, &id, &tok));
-    thread::sleep(Duration::from_millis(50));
-    assert!(!pending.is_finished());
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let pending = thread::spawn(move || completed_tx.send(result(&root, &id, &tok)).unwrap());
+    wait_file(&fx.root.join("barrier/report-waiting"));
+    assert!(matches!(
+        completed_rx.recv_timeout(Duration::from_millis(50)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
     let state = fx.root.join("tmux/state.json");
     let mut kill = Command::new(TMUX);
     kill.args(["-L", "unused", "kill-session"])
         .env("CADENCE_FAKE_TMUX_STATE", state);
     reaper::output(&mut kill).unwrap();
     fx.release(&release);
-    let out = pending.join().unwrap();
+    let out = completed_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("dead-pane report did not finish after adoption");
+    pending.join().unwrap();
     assert!(
         !out.status.success(),
         "report accepted after pane death: {}",

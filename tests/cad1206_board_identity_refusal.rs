@@ -8,7 +8,8 @@
 //! pointing at anything else is never signalled. And a real board started
 //! from a build named `cadence-new` is a board: `dev down` stops it.
 
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -191,9 +192,9 @@ impl Drop for Cleanup<'_> {
 
 /// A copy of `/bin/sh` under `exe_name` (so /proc/<pid>/exe has that
 /// basename), started with the argv of a board for `named_state` and kept
-/// alive by an open stdin. `sh -c 'read x' ui run …` leaves the extra words
-/// as positional parameters, so the argv reads `<exe> -c … ui run
-/// --state-dir <dir>`.
+/// alive by an open stdin. The read/ack loop lets the test prove it remains
+/// responsive after a stop command, rather than sleeping for signal delivery.
+/// The trailing arguments still name `ui run --state-dir <dir>`.
 fn spawn_stranger(host: &Host, exe_name: &str, named_state: &Path) -> Child {
     // One directory per stranger: a copy cannot be rewritten while running.
     let dir = Builder::new().tempdir_in(host.path("bin")).unwrap().keep();
@@ -206,10 +207,16 @@ fn spawn_stranger(host: &Host, exe_name: &str, named_state: &Path) -> Child {
     let mut child = loop {
         let mut cmd = Command::new(&exe);
         cmd.arg0(exe.to_str().unwrap())
-            .args(["-c", "read x", "ui", "run", "--state-dir"])
+            .args([
+                "-c",
+                "while read x; do printf 'ack\\n'; done",
+                "ui",
+                "run",
+                "--state-dir",
+            ])
             .arg(named_state)
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let spawned = cadence_agent::reaper::spawn(&mut cmd);
         match spawned {
@@ -221,9 +228,6 @@ fn spawn_stranger(host: &Host, exe_name: &str, named_state: &Path) -> Child {
             Err(e) => panic!("spawning stranger {exe_name}: {e}"),
         }
     };
-    // Keep stdin open for the life of the child.
-    let stdin = child.stdin.take().unwrap();
-    std::mem::forget(stdin);
     let pid = child.id();
     assert!(
         wait_until(Duration::from_secs(5), || {
@@ -232,7 +236,31 @@ fn spawn_stranger(host: &Host, exe_name: &str, named_state: &Path) -> Child {
         }),
         "stranger {exe_name} did not start"
     );
+    assert_responsive(&mut child);
     child
+}
+
+fn assert_responsive(child: &mut Child) {
+    child.stdin.as_mut().unwrap().write_all(b"ping\n").unwrap();
+    let stdout = child.stdout.as_mut().unwrap();
+    let mut ready = libc::pollfd {
+        fd: stdout.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(
+        unsafe { libc::poll(&mut ready, 1, 5000) },
+        1,
+        "stranger did not acknowledge"
+    );
+    assert_ne!(
+        ready.revents & libc::POLLIN,
+        0,
+        "stranger exited instead of acknowledging"
+    );
+    let mut ack = [0; 4];
+    stdout.read_exact(&mut ack).unwrap();
+    assert_eq!(&ack, b"ack\n");
 }
 
 fn new_build(host: &Host, name: &str) -> PathBuf {
@@ -294,7 +322,7 @@ fn stranger_is_never_signalled(
         !all.contains("panicked") && out.status.code().is_some_and(|c| c < 100),
         "{what}: `ui stop` crashed\n{all}"
     );
-    std::thread::sleep(Duration::from_millis(500));
+    assert_responsive(c.strangers.last_mut().unwrap());
     assert!(
         alive(pid1),
         "{what}: `ui stop` signalled a stranger ({exe_name}) it must not touch\n{all}"
@@ -331,7 +359,7 @@ fn stranger_is_never_signalled(
         !all.contains("panicked") && down.status.code().is_some_and(|c| c < 100),
         "{what}: `dev down` crashed\n{all}"
     );
-    std::thread::sleep(Duration::from_millis(500));
+    assert_responsive(c.strangers.last_mut().unwrap());
     assert!(
         alive(pid2),
         "{what}: `dev down` signalled a stranger ({exe_name}) it must not touch\n{all}"
@@ -418,7 +446,10 @@ fn c_board_from_a_cadence_new_build_is_stopped_by_dev_down() {
     );
     let _ = std::io::stderr().flush();
     // Nothing may be left before Cleanup gets a chance to hide it.
-    std::thread::sleep(SETTLE);
+    assert!(
+        wait_until(SETTLE, || procs_under(host.root.path()).is_empty()),
+        "processes did not exit after `dev down`"
+    );
     let left = procs_under(host.root.path());
     assert!(left.is_empty(), "orphans after `dev down`: {left:?}");
     drop(c);
