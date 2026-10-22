@@ -739,21 +739,37 @@ fn forged_destination_grant_scope_approval_and_price_are_refused() {
 /// A minimal HTTP POST against a board on `dir` over an ephemeral port,
 /// asserting `who` through the seam headers. Returns (status, body).
 fn http_post(dir: &std::path::Path, who: &str, path: &str, body: &str) -> (u16, String) {
-    let free = |p: &u16| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok();
-    let port = (3110..3200).find(free).unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
+    // Start-and-acknowledge: a probed-then-dropped port can be taken before
+    // this board binds, so a failed bind tries the next candidate (CAD-1724).
     let stop = Arc::new(AtomicBool::new(false));
-    let opts = cadence_agent::ui::ServeOpts {
-        host: "127.0.0.1".into(),
-        port,
-        stop: Some(stop.clone()),
-        startup: Some(tx),
-        test_seam: true,
-        ..Default::default()
-    };
-    let (dir_owned, pm) = (dir.to_path_buf(), dir.join("pm"));
-    let board = std::thread::spawn(move || cadence_agent::ui::serve(&dir_owned, &pm, &opts));
-    rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+    let (port, board) = (3110..3200)
+        .find_map(|port| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let opts = cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(stop.clone()),
+                startup: Some(tx),
+                test_seam: true,
+                ..Default::default()
+            };
+            let (dir_owned, pm) = (dir.to_path_buf(), dir.join("pm"));
+            let board =
+                std::thread::spawn(move || cadence_agent::ui::serve(&dir_owned, &pm, &opts));
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(())) => Some((port, board)),
+                Ok(Err(_)) => {
+                    // The board reported a bind failure and has returned; join it so
+                    // no server can survive the attempt.
+                    let _ = board.join();
+                    None
+                }
+                // A board that never reported is not a port collision: fail loudly
+                // rather than retry with a server possibly still running.
+                Err(_) => panic!("board on port {port} did not report startup"),
+            }
+        })
+        .expect("no board port in 3110-3199");
     let token = Seam::token_at(dir).unwrap();
     let host = format!("cadence-{port}.localhost:{port}");
     let req = format!(

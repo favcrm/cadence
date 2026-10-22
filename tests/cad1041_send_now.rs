@@ -359,34 +359,55 @@ fn r3_agent_and_member_are_refused_over_rpc_and_http() {
             let _ = request.respond(tiny_http::Response::from_string(jwks.clone()));
         }
     });
-    let free = |p: &u16| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok();
-    let port = (3110..3200).find(free).unwrap();
+    // Start-and-acknowledge: a probed-then-dropped port can be taken by another
+    // test binary before this board binds, so a failed bind tries the next
+    // candidate instead of failing the test (CAD-1724).
+    let stop = Arc::new(AtomicBool::new(false));
+    let (port, board) = (3110..3200)
+        .find_map(|port| {
+            let (public, local) = (
+                format!("acme.board.localhost:{port}"),
+                format!("cadence-{port}.localhost:{port}"),
+            );
+            let _ = &local;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let public_board = cadence_agent::ui::PublicBoard {
+                host: public.clone(),
+                authorize_url: format!("{issuer}/v2/board/authorize"),
+                issuer: issuer.clone(),
+                company: "co_1".into(),
+            };
+            let opts = cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(stop.clone()),
+                startup: Some(tx),
+                test_seam: true,
+                allow_hosts: vec![public.clone()],
+                allow_origins: vec![format!("http://{public}")],
+                public: Some(public_board),
+                ..Default::default()
+            };
+            let (dir, pm) = (fx.dir(), fx.dir().join("no-pm"));
+            let board = std::thread::spawn(move || cadence_agent::ui::serve(&dir, &pm, &opts));
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(())) => Some((port, board)),
+                Ok(Err(_)) => {
+                    // The board reported a bind failure and has returned; join it so
+                    // no server can survive the attempt.
+                    let _ = board.join();
+                    None
+                }
+                // A board that never reported is not a port collision: fail loudly
+                // rather than retry with a server possibly still running.
+                Err(_) => panic!("board on port {port} did not report startup"),
+            }
+        })
+        .expect("no board port in 3110-3199");
     let (public, local) = (
         format!("acme.board.localhost:{port}"),
         format!("cadence-{port}.localhost:{port}"),
     );
-    let (tx, rx) = std::sync::mpsc::channel();
-    let stop = Arc::new(AtomicBool::new(false));
-    let public_board = cadence_agent::ui::PublicBoard {
-        host: public.clone(),
-        authorize_url: format!("{issuer}/v2/board/authorize"),
-        issuer: issuer.clone(),
-        company: "co_1".into(),
-    };
-    let opts = cadence_agent::ui::ServeOpts {
-        host: "127.0.0.1".into(),
-        port,
-        stop: Some(stop.clone()),
-        startup: Some(tx),
-        test_seam: true,
-        allow_hosts: vec![public.clone()],
-        allow_origins: vec![format!("http://{public}")],
-        public: Some(public_board),
-        ..Default::default()
-    };
-    let (dir, pm) = (fx.dir(), fx.dir().join("no-pm"));
-    let board = std::thread::spawn(move || cadence_agent::ui::serve(&dir, &pm, &opts));
-    rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
     let post = |host: &str, path: &str, extra: &str, body: &str| -> (u16, String) {
         let req = format!(
             "POST {path} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\nX-Cadence-Board: 1\r\n\

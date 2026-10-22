@@ -847,7 +847,7 @@ impl Store {
         message_id: Option<&str>,
         by: &str,
     ) -> Result<(Task, String, bool, bool)> {
-        self.dispatch_task_inner(task_id, to, message_id, by, None, None)
+        self.dispatch_task_inner(task_id, to, message_id, by, None, None, None)
     }
 
     /// `dispatch_task` for a caller that selected the backend from the
@@ -862,7 +862,44 @@ impl Store {
         by: &str,
         expected_worker: Option<&Agent>,
     ) -> Result<(Task, String, bool, bool)> {
-        self.dispatch_task_inner(task_id, to, message_id, by, expected_worker, None)
+        self.dispatch_task_inner(task_id, to, message_id, by, expected_worker, None, None)
+    }
+
+    /// `dispatch_task` with the caller's per-dispatch stall budget. The
+    /// budget is written inside the same guarded transaction as the
+    /// kickoff, before it is visible or notified; a duplicate writes
+    /// nothing.
+    pub fn dispatch_task_with_stall(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        stall_secs: Option<i64>,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(task_id, to, message_id, by, None, None, stall_secs)
+    }
+
+    /// `dispatch_task_for` with the per-dispatch stall budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_task_for_with_stall(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        expected_worker: Option<&Agent>,
+        stall_secs: Option<i64>,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(
+            task_id,
+            to,
+            message_id,
+            by,
+            expected_worker,
+            None,
+            stall_secs,
+        )
     }
 
     /// `dispatch_task` for an assist-bound job: the fenced transaction first
@@ -877,11 +914,12 @@ impl Store {
         by: &str,
         expect: &AssistDispatchExpect,
     ) -> Result<(Task, String, bool, bool)> {
-        self.dispatch_task_inner(task_id, to, message_id, by, None, Some(expect))
+        self.dispatch_task_inner(task_id, to, message_id, by, None, Some(expect), None)
     }
 
     /// `dispatch_task_expecting` with the pre-transaction assignee pinned
     /// in the same fenced write.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_task_expecting_for(
         &self,
         task_id: &str,
@@ -891,9 +929,54 @@ impl Store {
         expect: &AssistDispatchExpect,
         expected_worker: Option<&Agent>,
     ) -> Result<(Task, String, bool, bool)> {
-        self.dispatch_task_inner(task_id, to, message_id, by, expected_worker, Some(expect))
+        self.dispatch_task_inner(
+            task_id,
+            to,
+            message_id,
+            by,
+            expected_worker,
+            Some(expect),
+            None,
+        )
     }
 
+    /// `dispatch_task_expecting` with the per-dispatch stall budget.
+    pub fn dispatch_task_expecting_with_stall(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        expect: &AssistDispatchExpect,
+        stall_secs: Option<i64>,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(task_id, to, message_id, by, None, Some(expect), stall_secs)
+    }
+
+    /// `dispatch_task_expecting_for` with the per-dispatch stall budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_task_expecting_for_with_stall(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        expect: &AssistDispatchExpect,
+        expected_worker: Option<&Agent>,
+        stall_secs: Option<i64>,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(
+            task_id,
+            to,
+            message_id,
+            by,
+            expected_worker,
+            Some(expect),
+            stall_secs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_task_inner(
         &self,
         task_id: &str,
@@ -902,6 +985,7 @@ impl Store {
         by: &str,
         expected_worker: Option<&Agent>,
         expect: Option<&AssistDispatchExpect>,
+        stall_secs: Option<i64>,
     ) -> Result<(Task, String, bool, bool)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
@@ -1063,6 +1147,17 @@ impl Store {
                 None,
                 None,
             )?;
+            if !duplicate {
+                if let Some(secs) = stall_secs {
+                    if secs < 0 {
+                        return Err(Error::rejected("stall_secs must be non-negative"));
+                    }
+                    tx.execute(
+                        "UPDATE messages SET stall_secs=? WHERE id=?",
+                        params![secs, &kickoff],
+                    )?;
+                }
+            }
             if duplicate {
                 return Ok((task, kickoff, true, false));
             }

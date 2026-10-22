@@ -155,6 +155,8 @@ mod cad1327_acceptance;
 mod cad1337_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1337_migration_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1353_delivery_status_acceptance;
 mod cad1365_generation_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1365_media_publish_acceptance;
@@ -2121,6 +2123,23 @@ impl Shared {
             // the bounded class, never raw provider text.
             Ok(true) | Err(_) => return store::app_runs::app_uncertain_turn_reason(),
         }
+        let from_agent = self
+            .store
+            .agent(alias)
+            .ok()
+            .and_then(|agent| agent.error)
+            .map(|stored| bound_unknown_detail(unknown_fence_detail(&stored)))
+            .filter(|detail| !detail.is_empty() && detail != UNKNOWN_GENERIC_REASON);
+        // CAD-1353: the public fence set by `unknown` carries the
+        // dispatch budget and last provider activity. A restamp must keep
+        // that evidence instead of falling back to the now-verbatim
+        // operator-private message row.
+        if let Some(detail) = from_agent
+            .as_ref()
+            .filter(|detail| detail.contains("dispatch stall budget"))
+        {
+            return detail.clone();
+        }
         if let Some(detail) = self.store.preferred_unknown_error(alias).ok().flatten() {
             let bounded = bound_unknown_detail(&detail);
             if !bounded.is_empty() && bounded != UNKNOWN_GENERIC_REASON {
@@ -2131,11 +2150,8 @@ impl Shared {
         if !from_actor.is_empty() && from_actor != UNKNOWN_GENERIC_REASON {
             return from_actor;
         }
-        if let Some(stored) = self.store.agent(alias).ok().and_then(|agent| agent.error) {
-            let bounded = bound_unknown_detail(unknown_fence_detail(&stored));
-            if !bounded.is_empty() {
-                return bounded;
-            }
+        if let Some(detail) = from_agent {
+            return detail;
         }
         UNKNOWN_GENERIC_REASON.to_string()
     }
@@ -2414,6 +2430,7 @@ impl Shared {
                 // CAD-1266: one pass over `tasks` for the whole fleet, not
                 // one query per agent.
                 let mut open_tasks = self.store.open_task_ids_by_assignee()?;
+                let deliveries = self.store.open_delivery_summary()?;
                 let listed_agents = self.store.agents()?;
                 let aliases: Vec<String> = listed_agents.iter().map(|a| a.alias.clone()).collect();
                 // CAD-96/CAD-1239: one grouped read for the operational
@@ -2470,6 +2487,9 @@ impl Shared {
                         view.apply(&mut j);
                     }
                     apply_auto_stop_view(&mut j, &agent, markers.get(&agent.alias));
+                    let (queued, oldest) =
+                        deliveries.get(&agent.alias).copied().unwrap_or((0, None));
+                    apply_delivery_view(&mut j, &agent, queued, oldest);
                     if let Some(awaiting) = self.awaiting_report_view(&agent) {
                         j["awaiting_report"] = awaiting;
                     }
@@ -2626,6 +2646,14 @@ impl Shared {
                 }
                 let marker = self.store.last_event_of(&alias, AUTO_STOP_MARKER_KINDS)?;
                 apply_auto_stop_view(&mut agent_json, &agent, marker.as_ref());
+                let active = self.store.active_messages(&alias)?;
+                let waiting: Vec<_> = active
+                    .into_iter()
+                    .filter(|message| message.state != "running")
+                    .collect();
+                let queued = waiting.len() as i64;
+                let oldest = waiting.iter().map(|m| m.created).reduce(f64::min);
+                apply_delivery_view(&mut agent_json, &agent, queued, oldest);
                 if let Some(awaiting) = self.awaiting_report_view(&agent) {
                     agent_json["awaiting_report"] = awaiting;
                 }
@@ -5502,8 +5530,9 @@ use serve::{
 pub use serve::{INSTANCE_FILE, LAST_RECOVERY_FILE};
 #[allow(unused_imports)]
 use timers::{
-    apply_auto_stop_view, auto_stop_view, AgentGcState, AgentGcTimer, AutoStopState, AutoStopTimer,
-    AutoStopVerdict, AGENT_GC_EVERY, AUTO_STOP_MARKER_KINDS, AUTO_STOP_PASSIVE_KINDS,
+    apply_auto_stop_view, apply_delivery_view, auto_stop_view, delivery_view, AgentGcState,
+    AgentGcTimer, AutoStopState, AutoStopTimer, AutoStopVerdict, AGENT_GC_EVERY,
+    AUTO_STOP_MARKER_KINDS, AUTO_STOP_PASSIVE_KINDS,
 };
 pub use timers::{
     auto_stop_label, AgentGcSetting, AutoStopSetting, AGENT_GC_FLOOR_SECS, AUTO_RESUME_EVENT,
