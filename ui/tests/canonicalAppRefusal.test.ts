@@ -112,7 +112,7 @@ let listCalls = 0;
 const appReads: string[] = [];
 const requested: string[] = [];
 
-globalThis.fetch = (async (input: unknown) => {
+globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const path = String(input);
   const url = new URL(path, "http://localhost");
   requested.push(url.pathname);
@@ -131,11 +131,14 @@ globalThis.fetch = (async (input: unknown) => {
   if (path === "/api/app-installations") { listCalls++; return json(INSTALLS); }
   if (path.startsWith("/api/app-installations/")) {
     const id = decodeURIComponent(url.pathname.slice("/api/app-installations/".length)).split("/")[0];
-    appReads.push(id);
     const install = INSTALLS.find((i) => i.install_id === id);
+    // Authorized shell summaries do not mount a workspace. Keep all reads
+    // counted for members, removed ids, and every detail/context/action route.
+    if (operatorSession && install?.removed === null && url.pathname === `/api/app-installations/${id}/conversations` && (init?.method ?? "GET") === "GET")
+      return json({ alias: install.name, install_id: id, general: null, conversations: [] });
+    appReads.push(id);
     if (install && url.pathname === `/api/app-installations/${id}`) return json(install);
     if (install && url.pathname === `/api/app-installations/${id}/contexts`) return json({ contexts: id === "install-ok" ? [CTX_A] : [] });
-    if (install && url.pathname.endsWith("/conversations")) return json({ alias: install.name, install_id: id, general: null, conversations: [] });
     if (url.pathname.endsWith("/bindings")) return json({ bindings: [] });
     if (url.pathname.endsWith("/effects")) return json({ effects: [] });
     if (install) return json({ error: "not stubbed" }, 404);
