@@ -88,3 +88,8 @@
 .artifact-card-title { color: var(--color-ink-100); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .artifact-card-meta { color: var(--color-ink-500); font-size: 0.75rem; }
 .artifact-card-open { grid-row: 1 / span 2; grid-column: 3; color: var(--color-accent); font-size: 0.8125rem; }
+
+/* The chat panel's dock (20), jump pill (25), slash menu (30) and chip menu
+   (40) are positioned with no stacking context above them; contain them so
+   they cannot paint over the canvas (15). */
+[data-chat-panel] { isolation: isolate; }
