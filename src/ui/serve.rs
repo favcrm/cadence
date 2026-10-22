@@ -1115,8 +1115,10 @@ fn table_read_guard(
         operator::RouteClass::AgentAllowed => {
             operator::admit_read(request, state_dir, opts).map(|_| ())
         }
-        // The generic read gate already admitted this request; a second
-        // `admit_read` would only repeat it.
+        // `CallerScoped` means "the generic read gate is the whole guard": it
+        // already admitted this request, and a second `admit_read` would only
+        // repeat it. `endpoints::tests::only_the_agent_detail_row_is_gate_only`
+        // pins that meaning to the one read row that relies on it.
         operator::RouteClass::CallerScoped => Ok(()),
         operator::RouteClass::Session
         | operator::RouteClass::RecipientToken
@@ -3150,5 +3152,22 @@ mod read_dispatch_tests {
 
         // The row's own pair, not a generic status, and never `agent_detail`.
         assert_eq!(response.status_code(), StatusCode(400));
+    }
+
+    /// The fail-closed arm of the class mapping: a read row declared with a
+    /// write-only class is refused, never admitted with no guard.
+    #[test]
+    fn a_read_row_with_a_write_only_class_is_refused() {
+        let state = tempfile::tempdir().expect("state dir");
+        let request: Request = tiny_http::TestRequest::new().with_path("/x").into();
+        for class in [
+            operator::RouteClass::Session,
+            operator::RouteClass::RecipientToken,
+            operator::RouteClass::Refused,
+        ] {
+            let response = table_read_guard(class, &request, state.path(), &ServeOpts::default())
+                .expect_err("a write-only class cannot guard a read");
+            assert_eq!(response.status_code(), StatusCode(500), "{class:?}");
+        }
     }
 }

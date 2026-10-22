@@ -650,6 +650,18 @@ mod tests {
         );
     }
 
+    /// `CallerScoped` as a read means "no guard beyond the generic gate"; that
+    /// is a decision per row, so the set that relies on it is pinned here.
+    #[test]
+    fn only_the_agent_detail_row_is_gate_only() {
+        let gate_only: Vec<RouteId> = ENDPOINTS
+            .iter()
+            .filter(|row| row.method == "GET" && row.class == RouteClass::CallerScoped)
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(gate_only, vec![RouteId::AgentDetail]);
+    }
+
     #[test]
     fn the_read_rows_keep_their_classes() {
         assert_eq!(
