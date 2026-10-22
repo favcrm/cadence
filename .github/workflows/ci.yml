@@ -316,10 +316,13 @@ jobs:
           # artifacts instead of skipping an existing stale key.
           shared-key: gate-test-ld1
           save-if: false
-      # CAD-1487: 83 test binaries × N shards make linking the shard
-      # bottleneck; mold/lld cuts it. cache-warm's test leg enables the
-      # same flag so main keeps the gate-test cache hot for it — the one
-      # cold run is this PR's own gate until the merge push re-warms.
+      # CAD-1487: linking dominated a shard while every tests/*.rs file was
+      # its own executable; CAD-1727 collapsed them into the one `suite`
+      # binary. mold/lld stays: it links that 223 MB suite and the product
+      # binaries materially faster than the default linker. cache-warm's
+      # test leg enables the same flag so main keeps the gate-test cache
+      # hot for it — the one cold run is this PR's own gate until the merge
+      # push re-warms.
       - name: Enable fast linker (mold/lld; falls back to the default linker)
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
