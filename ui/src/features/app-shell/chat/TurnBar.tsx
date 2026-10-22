@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { useTranslate } from "../../../lib/locale";
-import type { TurnBarState } from "./turnBar";
+import type { TurnBarState } from "./turnBarState";
 
 export interface TurnBarActions {
   onStop: (message: string) => void;

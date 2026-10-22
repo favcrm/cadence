@@ -34,7 +34,7 @@ import { TurnBar } from "../app-shell/chat/TurnBar";
 import { usePendingPermission } from "../app-shell/chat/usePendingApproval";
 import { noteHomeSeen } from "../app-shell/chat/homeUnread";
 import { earlierStep, useThreadStream } from "../app-shell/chat/conversationThread";
-import { turnBarState } from "../app-shell/chat/turnBar";
+import { turnBarState } from "../app-shell/chat/turnBarState";
 import MemberChat from "./MemberChat";
 import { memberScope } from "./memberThread";
 import { time } from "./ThreadView";

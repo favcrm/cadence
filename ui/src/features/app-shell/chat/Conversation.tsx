@@ -93,7 +93,7 @@ import type { FileUploadProjection } from "./descriptorClient";
 import type { AttachDestination } from "./attach";
 import type { ChatBinding, MediaComposerTarget } from "./types";
 import { usePendingPermission } from "./usePendingApproval";
-import { turnBarState } from "./turnBar";
+import { turnBarState } from "./turnBarState";
 import { TurnBar } from "./TurnBar";
 import { isUnread, onSeenChanged, readSeen, writeSeen, type SeenMap } from "./unreadSeen";
 import { useNotificationToast } from "../../threads/NotificationToast";
