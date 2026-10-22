@@ -47,9 +47,17 @@ export function plainStep(text: string): string {
   return "Working on it";
 }
 
-/** The agent's own words with absolute paths taken out. */
+/** A word that names a filesystem path: it starts with `/`, `~/`, `./` or
+ *  `../` (after any opening punctuation), has a `/` after `=` or `:`, or
+ *  names the master's tmp or the state dir. */
+const PATHISH = /^[("'`[{<]*(?:\/|~\/|\.\/|\.\.\/)|[=:][^\s]*\/|master\/tmp|\.local\/state/;
+
+/** The agent's own words with every path-like word replaced by an ellipsis. */
 function plainWords(text: string): string {
-  return text.replace(/(^|[\s("'`])\/[\w.~@%+=,-]+(?:\/[\w.~@%+=,-]*)*/g, "$1…");
+  return text
+    .split(/(\s+)/)
+    .map((w) => (PATHISH.test(w) ? "…" : w))
+    .join("");
 }
 
 /** Artifact ids a tool call asks to add a version to: `artifact put … --id art-x`. */

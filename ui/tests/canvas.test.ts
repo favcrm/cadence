@@ -144,8 +144,24 @@ for (const raw of [
   "weird",
 ]) {
   const plain = plainStep(raw);
-  if (/bash:|\/home|\.local\/state|master\/tmp|[{}]|--/.test(plain)) throw new Error(`plain step leaks: ${plain}`);
+  if (/bash:|\/home|\.local\/state|master\/tmp|[{}]|--/i.test(plain)) throw new Error(`plain step leaks: ${plain}`);
 }
+// The agent's own words keep their sentence but lose every path.
+const planOf = (text: string) =>
+  feedParts(threadItems({ exists: true, pending: [], entries: [e(1, "operator", "message", "go", "mp"), e(2, "agent", "assistant_text", text, "mp")] }), 0, true).working?.plan;
+for (const leak of [
+  "Writing to master/tmp/r.md first",
+  "Saved at ~/.local/state/cadence/master/tmp/r.md",
+  "path=/home/u/x",
+  "--file=/home/u/x",
+  "file:/home/u/x",
+  "Using ./../tmp/x now",
+  "see /home/u/x and (/tmp/y)",
+]) {
+  const plan = planOf(leak) ?? "";
+  if (/\/|~|\.local|master/.test(plan)) throw new Error(`plan leaks: ${plan}`);
+}
+equal(planOf("Pulling the Q3 numbers, then summarising and/or charting them."), "Pulling the Q3 numbers, then summarising and/or charting them.", "a normal sentence survives intact");
 equal(plainStep("Bash: cadence artifact put --kind md --id art-a --file ./../tmp/r.md"), "Putting it in the canvas", "a put reads plainly");
 
 // "updating vN" only names artifacts the turn asked to add a version to.
