@@ -72,7 +72,8 @@ use crate::store::{self, Store};
 /// path honours.
 /// v54 (CAD-1239) adds the retired-agent archive marker, lifecycle revision
 /// and retention triggers.
-pub const SCHEMA_VERSION: i64 = 54;
+/// v55 (CAD-1726) adds `artifacts`, the agent canvas artifact versions.
+pub const SCHEMA_VERSION: i64 = 55;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

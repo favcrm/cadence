@@ -1647,7 +1647,8 @@ mod tests {
             // CAD-1168: `attachment read` is in both profiles — an app
             // turn reads the file its own message carried.
             app.iter().all(|t| (t.starts_with("Bash(cadence app ")
-                || *t == "Bash(cadence attachment read *)")
+                || *t == "Bash(cadence attachment read *)"
+                || *t == "Bash(cadence artifact put *)")
                 && home.contains(t)),
             "{app:?}"
         );

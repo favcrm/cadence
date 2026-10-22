@@ -3863,7 +3863,9 @@ mod cad1098_tests {
         assert!(!app.is_empty());
         assert!(
             // CAD-1168: `attachment read` rides both profiles.
-            heads(&app).iter().all(|h| h == "app" || h == "attachment"),
+            heads(&app)
+                .iter()
+                .all(|h| h == "app" || h == "attachment" || h == "artifact"),
             "{app:?}"
         );
         assert!(app.iter().all(|r| home.contains(r)));

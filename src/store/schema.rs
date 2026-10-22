@@ -1434,6 +1434,14 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=54", [])?;
                 tx.commit()?;
             }
+            if version < 55 {
+                // CAD-1726: agent canvas artifact versions. New table only;
+                // bytes live content-addressed under `<state>/artifacts/`.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::artifacts::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=55", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

@@ -248,6 +248,7 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         )),
         Commands::McpPermission { timeout_secs } => mcp_permission::run(state_dir, timeout_secs),
         Commands::McpAgent => mcp_agent::run(state_dir),
+        Commands::Artifact { action } => artifact::run(state_dir, action),
         Commands::Attachment { action } => attachment::run(state_dir, action),
         _ => unreachable!("agents dispatch received a non-agent command"),
     }

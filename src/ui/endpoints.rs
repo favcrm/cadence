@@ -65,6 +65,8 @@ pub(super) enum RouteId {
     FavoriteDefault,
     FavoriteOpened,
     RequestDismiss,
+    ArtifactRead,
+    ArtifactVersions,
 }
 
 /// How one bound parameter is validated, and what a failure answers.
@@ -163,6 +165,38 @@ const MOUNT_BINDINGS: &[Binding] = &[
         allow_empty: false,
         validate: valid_tag,
         invalid: (404, "no such write route"),
+    },
+];
+
+/// CAD-1726: an artifact id is the daemon-minted `art-…` grammar; the
+/// version is a positive integer. Anything else is a miss.
+fn valid_artifact_id(value: &str) -> bool {
+    crate::store::artifact_id(value)
+}
+
+fn valid_version(value: &str) -> bool {
+    value.len() <= 9 && value.parse::<u32>().is_ok_and(|v| v >= 1)
+}
+
+const ARTIFACT_ID: &[Binding] = &[Binding {
+    name: "artifact",
+    allow_empty: false,
+    validate: valid_artifact_id,
+    invalid: (404, "no such artifact"),
+}];
+
+const ARTIFACT_VERSION: &[Binding] = &[
+    Binding {
+        name: "artifact",
+        allow_empty: false,
+        validate: valid_artifact_id,
+        invalid: (404, "no such artifact"),
+    },
+    Binding {
+        name: "version",
+        allow_empty: false,
+        validate: valid_version,
+        invalid: (404, "no such artifact"),
     },
 ];
 
@@ -315,6 +349,18 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
         "/api/app-installations/{id}/screens/{tag}/mount",
         ScreenRead,
         MOUNT_BINDINGS
+    ),
+    get!(
+        ArtifactRead,
+        "/api/artifacts/{artifact}/{version}",
+        OperatorOnly,
+        ARTIFACT_VERSION
+    ),
+    get!(
+        ArtifactVersions,
+        "/api/artifacts/{artifact}",
+        OperatorOnly,
+        ARTIFACT_ID
     ),
     row!(UpdateStart, "/api/update", OperatorOnly, &[]),
     row!(UpdateCheck, "/api/update/check", OperatorOnly, &[]),
@@ -515,7 +561,9 @@ mod tests {
                 .pattern
                 .replace("{id}", "inst-1")
                 .replace("{tag}", "screen")
-                .replace("{alias}", "swe-1");
+                .replace("{alias}", "swe-1")
+                .replace("{artifact}", "art-1")
+                .replace("{version}", "1");
             let bound = resolve(row.method, &probe).expect("a declared pattern resolves");
             if bound.endpoint.id != row.id {
                 // `GET /api/app-installations/{id}` and the POST rows share a

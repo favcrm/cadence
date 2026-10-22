@@ -1141,6 +1141,8 @@ pub(crate) fn write_route(
             RouteId::WorkspaceList
             | RouteId::WorkspaceShow
             | RouteId::ConversationsRead
+            | RouteId::ArtifactRead
+            | RouteId::ArtifactVersions
             | RouteId::AgentDetail => err_response(500, "a read row reached the write dispatcher"),
             RouteId::SessionOpen => operator::open(&mut request, state_dir, opts),
             RouteId::SessionLogout => operator::logout(&request, state_dir, opts),

@@ -118,6 +118,9 @@ pub const MASTER_ALLOWED: &[&str] = &[
     // CAD-1168: read a retained chat attachment — the daemon still
     // checks the turn is the master's live one inside the handler.
     "chat_file_read",
+    // CAD-1726: put a canvas artifact on the master's own live turn; the
+    // handler binds scope to that turn and refuses every other caller.
+    "artifact_put",
     // Retained Library image bytes, still exact-turn and source/receiver scoped.
     "app_media_inspect",
 ];
@@ -250,6 +253,7 @@ pub const MASTER_APP_ALLOWED: &[&str] = &[
     // assigned turn (message + current token), and an id is only ever
     // learned from that turn's own envelope.
     "chat_file_read",
+    "artifact_put",
     "app_media_inspect",
     "message_report",
     "thread_read",

@@ -200,6 +200,21 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "chat_file_read",
         Rule::Handler("operator or the master's live assigned turn (CAD-1168)"),
     ),
+    // CAD-1726: canvas artifacts. Put is the master's live assigned turn
+    // (scope from that turn); read and versions are the operator's, scope
+    // re-proved against the conversation in view.
+    (
+        "artifact_put",
+        Rule::Handler("the master's live assigned turn; scope from the turn, never the request (CAD-1726)"),
+    ),
+    (
+        "artifact_read",
+        Rule::Handler("operator only on proof; stored scope re-proved against the conversation in view (CAD-1726)"),
+    ),
+    (
+        "artifact_versions",
+        Rule::Handler("operator only on proof; stored scope re-proved against the conversation in view (CAD-1726)"),
+    ),
     // CAD-1098: the app conversations are the operator's chat, like
     // `thread_send` — one proof (`operator_chat`), identical on the board.
     (

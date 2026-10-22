@@ -681,10 +681,9 @@ fn gate1_live_actor_home_app_home_opens_each_session_with_its_profile() {
     // CAD-1168: `attachment read` rides both profiles.
     assert!(
         !app.is_empty()
-            && app
-                .iter()
-                .all(|t| t.starts_with("Bash(cadence app ")
-                    || *t == "Bash(cadence attachment read *)"),
+            && app.iter().all(|t| t.starts_with("Bash(cadence app ")
+                || *t == "Bash(cadence attachment read *)"
+                || *t == "Bash(cadence artifact put *)"),
         "{app:?}"
     );
     assert_eq!(master::allowed_tools(Home), master::CLAUDE_ALLOWED_TOOLS);
