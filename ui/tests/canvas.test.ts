@@ -14,7 +14,7 @@ import {
 import { feedParts, plainStep } from "../src/features/canvas/feed";
 import { parseCsv } from "../src/features/canvas/csv";
 import { askBody, askLabel, makeAskRef } from "../src/features/canvas/askRefs";
-import { threadItems, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
+import { isArtifactPutCall, threadItems, toolSteps, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);
@@ -128,7 +128,7 @@ const state: ThreadState = {
   ],
   pending: [],
 };
-const parts = feedParts(threadItems(state), 3, true);
+const parts = feedParts(threadItems(state), 3, "m1");
 equal(parts.cards.map((c) => [c.key, c.live, c.operatorTurn, c.turn]), [["art-a@2", true, true, "m1"]], "malformed ids are dropped");
 equal(
   parts.working,
@@ -148,7 +148,7 @@ for (const raw of [
 }
 // The agent's own words keep their sentence but lose every path.
 const planOf = (text: string) =>
-  feedParts(threadItems({ exists: true, pending: [], entries: [e(1, "operator", "message", "go", "mp"), e(2, "agent", "assistant_text", text, "mp")] }), 0, true).working?.plan;
+  feedParts(threadItems({ exists: true, pending: [], entries: [e(1, "operator", "message", "go", "mp"), e(2, "agent", "assistant_text", text, "mp")] }), 0, "mp").working?.plan;
 for (const leak of [
   "Writing to master/tmp/r.md first",
   "Saved at ~/.local/state/cadence/master/tmp/r.md",
@@ -169,7 +169,49 @@ for (const hostile of [":".repeat(200_000), "a=".repeat(100_000)]) {
 }
 equal(planOf("a:b:c/d and x=1:2"), "… and x=1:2", "key=value without a path is kept");
 equal(planOf("Pulling the Q3 numbers, then summarising and/or charting them."), "Pulling the Q3 numbers, then summarising and/or charting them.", "a normal sentence survives intact");
-equal(plainStep("Bash: cadence artifact put --kind md --id art-a --file ./../tmp/r.md"), "Putting it in the canvas", "a put reads plainly");
+// The agent's own commentary never carries a command line or inline JSON.
+equal(planOf('Done.\nbash: cadence status\n$ ls\nBASH: x\nResult {"bytes":9,"digest":"d"} ok'), "Done.\nResult … ok", "command lines and inline JSON go");
+for (const hostile of ["{".repeat(200_000), '{"a":'.repeat(40_000), " ".repeat(200_000) + "bash:"]) {
+  const started = performance.now();
+  planOf(hostile);
+  if (performance.now() - started > 100) throw new Error("plan scrub is not linear");
+}
+
+// Real daemon order: call, then the card (written inside the put RPC), then the
+// result. The card must not split the call from its result.
+const realOrder = threadItems({
+  exists: true,
+  pending: [],
+  entries: [
+    e(1, "operator", "message", "report", "m1"),
+    e(2, "agent", "tool_call", "bash: cadence artifact put --kind md --title x --file ./../tmp/r.md", "m1", { tool_use_id: "t1" }),
+    e(3, "agent", "artifact", "Artifact", "m1", { id: "art-a", version: 1, kind: "md", title: "x", bytes: 5 }),
+    e(4, "agent", "tool_result", '{"bytes":5,"digest":"d"}', "m1", { tool_use_id: "t1" }),
+  ],
+});
+equal(realOrder.map((i) => i.type), ["operator", "tools", "artifact"], "the card waits for the put's result");
+const runSteps = realOrder[1].type === "tools" ? toolSteps(realOrder[1].entries) : [];
+equal([runSteps.length, runSteps[0]?.done, runSteps[0] ? isArtifactPutCall(runSteps[0].call.text) : null], [1, true, true], "one paired put step");
+equal([isArtifactPutCall("Bash: cadence help artifact put"), isArtifactPutCall("Bash: grep artifact put notes.md")], [false, false], "only a real put call matches");
+
+// A follow-up queued behind the running turn does not take over the strip.
+const queued = threadItems({
+  exists: true,
+  pending: [],
+  entries: [
+    e(1, "operator", "message", "tighten it", "mA"),
+    e(2, "agent", "tool_call", "bash: cadence artifact put --kind md --title x --id art-a --file ./../tmp/r.md", "mA", { tool_use_id: "t1" }),
+    e(3, "operator", "message", "and also this", "mB"),
+    e(4, "agent", "artifact", "Artifact", "mA", { id: "art-a", version: 2, kind: "md", title: "x", bytes: 5 }),
+  ],
+});
+const queuedParts = feedParts(queued, 0, "mA");
+equal([queuedParts.turn, queuedParts.working?.turn], ["mA", "mA"], "the running message owns the strip");
+resetCanvas();
+openArtifact({ id: "art-a", version: 1, kind: "md", title: "x", bytes: 5 });
+feedCanvas({ conversation: "c1", surface: "home", composerKey: "home", ...queuedParts });
+equal(canvasSnapshot().tabs[0].turn, queuedParts.working?.turn, "the landed put matches the running turn, so no stale updating chip");
+equal(plainStep("bash: cadence artifact put --kind md --id art-a --file ./../tmp/r.md"), "Putting it in the canvas", "a put reads plainly");
 
 // "updating vN" only names artifacts the turn asked to add a version to.
 const putState: ThreadState = {
@@ -180,8 +222,8 @@ const putState: ThreadState = {
     e(2, "agent", "tool_call", "Bash: cadence artifact put --kind md --title x --id art-a --file ./../tmp/r.md", "m1", { tool_use_id: "t9" }),
   ],
 };
-equal(feedParts(threadItems(putState), 0, true).working?.updating, ["art-a"], "the put names its target");
-equal(feedParts(threadItems(putState), 0, false).working, null, "no strip when no turn runs");
+equal(feedParts(threadItems(putState), 0, "m1").working?.updating, ["art-a"], "the put names its target");
+equal(feedParts(threadItems(putState), 0, null).working, null, "no strip when no turn runs");
 
 // CSV: RFC 4180 quoting, a header row, a row cap, and a refusal to guess.
 equal(

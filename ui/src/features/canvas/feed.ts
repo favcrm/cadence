@@ -5,7 +5,7 @@
  * parsed from message text, tool output or URLs.
  */
 import { useEffect, useRef } from "react";
-import { openStep, stepSummary, toolSteps, type ThreadItem } from "../home/thread";
+import { isArtifactPutCall, openStep, stepSummary, toolSteps, type ThreadItem } from "../home/thread";
 import {
   ARTIFACT_KINDS,
   feedCanvas,
@@ -40,7 +40,7 @@ export function artifactRef(payload: Record<string, unknown> | null | undefined)
 export function plainStep(text: string): string {
   const raw = stepSummary(text);
   const tool = /^([A-Za-z_][\w .-]{0,30}?):/.exec(raw)?.[1]?.trim().toLowerCase() ?? "";
-  if (/\bartifact put\b/.test(raw)) return "Putting it in the canvas";
+  if (isArtifactPutCall(text)) return "Putting it in the canvas";
   if (tool === "read" || tool === "cat" || tool === "grep" || tool === "glob" || tool === "ls") return "Reading";
   if (tool === "write" || tool === "edit") return "Writing a draft";
   if (tool === "bash") return "Checking the board";
@@ -52,17 +52,25 @@ export function plainStep(text: string): string {
  *  names the master's tmp or the state dir. */
 const PATHISH = /^[("'`[{<]*(?:\/|~\/|\.\/|\.\.\/)|[=:][^\s=:]*\/|master\/tmp|\.local\/state/;
 
-/** The agent's own words with every path-like word replaced by an ellipsis. */
+/** The agent's own words: command lines (`bash:`, `$ `) dropped, and every
+ *  path-like or inline-JSON word replaced by an ellipsis. Linear: one pass per
+ *  line, one anchored test per word. */
 function plainWords(text: string): string {
   return text
-    .split(/(\s+)/)
-    .map((w) => (PATHISH.test(w) ? "…" : w))
-    .join("");
+    .split("\n")
+    .filter((line) => !/^\s*(?:bash:|\$ )/i.test(line))
+    .map((line) =>
+      line
+        .split(/(\s+)/)
+        .map((w) => (PATHISH.test(w) || ((w[0] === "{" || w[0] === "[") && w.includes('":')) ? "…" : w))
+        .join(""),
+    )
+    .join("\n");
 }
 
 /** Artifact ids a tool call asks to add a version to: `artifact put … --id art-x`. */
 function putTargets(text: string): string[] {
-  if (!/\bartifact put\b/.test(text)) return [];
+  if (!isArtifactPutCall(text)) return [];
   const m = /--id[ =](art-[A-Za-z0-9]+)/.exec(text);
   return m ? [m[1]] : [];
 }
@@ -76,9 +84,11 @@ export interface FeedParts {
 /**
  * `liveAfter`: entries at or below this seq are history (the host's mount
  * point); only later ones may open the drawer by themselves. `running`:
- * the host's own word that a turn is in flight.
+ * the message id of the turn the host says is running (null when none); the
+ * strip and the chip follow that turn, not the newest operator message, which
+ * may be a follow-up queued behind it.
  */
-export function feedParts(items: ThreadItem[], liveAfter: number, running: boolean): FeedParts {
+export function feedParts(items: ThreadItem[], liveAfter: number, running: string | null): FeedParts {
   const operatorTurns = new Set<string>();
   let turn: string | null = null;
   let lastOperator = -1;
@@ -104,22 +114,25 @@ export function feedParts(items: ThreadItem[], liveAfter: number, running: boole
     });
   }
   let working: Working | null = null;
-  if (running) {
-    const tail = items.slice(lastOperator + 1);
+  if (running !== null) {
+    turn = running;
+    const own = (m: string | null | undefined) => !m || m === running;
+    const start = items.findIndex((i) => i.type === "operator" && i.entry.message === running);
+    const tail = items.slice((start >= 0 ? start : lastOperator) + 1);
     let plan: string | null = null;
     const steps: WorkStep[] = [];
     const updating = new Set<string>();
     for (const item of tail) {
-      if (item.type === "commentary" && item.entry.text.trim()) plan = plainWords(item.entry.text.trim());
+      if (item.type === "commentary" && own(item.entry.message) && item.entry.text.trim()) plan = plainWords(item.entry.text.trim());
       if (item.type === "tools") {
-        for (const s of toolSteps(item.entries)) {
+        for (const s of toolSteps(item.entries.filter((x) => own(x.message)))) {
           steps.push({ text: plainStep(s.call.text), raw: s.summary, done: s.done });
           for (const id of putTargets(s.call.text)) updating.add(id);
         }
       }
     }
     const tools = [...tail].reverse().find((i) => i.type === "tools");
-    const open = tools && tools.type === "tools" ? openStep(tools.entries) : null;
+    const open = tools && tools.type === "tools" ? openStep(tools.entries.filter((x) => own(x.message))) : null;
     working = {
       plan,
       step: open ? plainStep(open.text) : null,
@@ -154,7 +167,7 @@ export function useCanvasFeed(opts: {
   composerKey: string | null;
   items: ThreadItem[];
   loaded: boolean;
-  running: boolean;
+  running: string | null;
 }): void {
   const { conversation, surface, composerKey, items, loaded, running } = opts;
   const mark = useRef<{ conversation: string | null; seq: number | null }>({ conversation: null, seq: null });

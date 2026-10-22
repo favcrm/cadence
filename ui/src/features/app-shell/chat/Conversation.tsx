@@ -840,7 +840,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     composerKey,
     items,
     loaded: loaded && thread.data?.missing !== true,
-    running: working,
+    running: working ? (turnMessage ?? null) : null,
   });
   const queuedOwn = masterState.data?.turn?.state === "queued" && turnOwned;
   // Keep feedback across POST acknowledgement; the daemon's proven turn wins.
