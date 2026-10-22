@@ -76,7 +76,7 @@ pub const PAGE_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// PRs one pass reads, least recently read first; the rest wait for the
 /// next pass. One `gh` call each, so the sync costs at most
 /// `MAX_PER_PASS` x (60 timer passes + 24 page-view passes) = 336 an
-/// hour (CAD-1751 budget).
+/// hour at the default [`EVERY`] of 60 s (CAD-1751 budget).
 pub const MAX_PER_PASS: usize = 4;
 /// Bytes of one error text a row shows.
 const ERROR_MAX: usize = 300;
@@ -361,6 +361,9 @@ impl DeliverySync {
     /// The board's sync thread: wait for the timer or a page view, then
     /// run a pass. Never returns.
     fn run_forever(self: Arc<Self>, state_dir: PathBuf, pm_dir: PathBuf) {
+        // The pause lives in the board's state dir; bind it before the first
+        // pass, not on the first overview refresh (CAD-1751).
+        crate::gh_guard::bind(&state_dir);
         loop {
             let trigger = {
                 let mut st = self.lock();
