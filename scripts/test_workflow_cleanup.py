@@ -210,7 +210,8 @@ class CleanupTests(unittest.TestCase):
                     r"            echo [^\n]+\n"
                     r"            exit 1\n"
                     r"          fi$")
-        # CAD-1090: every tests/*.rs target, via the shared selection script.
+        # CAD-1090: the shared selection script reports every test target
+        # (CAD-1727: now the one suite binary).
         self.assertIn("scripts/run-result-tests", shards)
         self.assertIn("--partition", shards)
         runner = (ROOT / "scripts/run-result-tests").read_text()
@@ -244,7 +245,10 @@ class CleanupTests(unittest.TestCase):
             self.assertIn(needle, junit)
         selected = subprocess.run([str(ROOT / "scripts/result-test-args")],
                                   capture_output=True, text=True, check=True).stdout.split()
-        self.assertIn("safety_floor", selected)
+        # CAD-1727: the safety floor is a module of the one suite target now;
+        # the selection must still cover it.
+        self.assertIn("suite", selected)
+        self.assertIn("mod safety_floor;", (ROOT / "tests" / "suite.rs").read_text())
         meta = json.loads(subprocess.run(
             ["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked"],
             cwd=ROOT, capture_output=True, text=True, check=True).stdout)

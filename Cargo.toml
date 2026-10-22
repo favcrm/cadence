@@ -2,6 +2,12 @@
 name = "cadence-agent"
 version = "0.2.5"
 edition = "2021"
+# CAD-1727: `tests/*.rs` are modules of the one `suite` target below, not
+# one linked executable each. 109 executables cost 15.74 GiB per lane and
+# every `src/` change relinked all of them; sccache cannot cache `test`
+# crates (only rlib/metadata outputs). nextest still runs each test in its
+# own process, so isolation and suite-lock rules are unchanged.
+autotests = false
 license = "MIT"
 description = "Local controller coordinating coding agents across terminals"
 
@@ -49,10 +55,62 @@ test-seam = []
 # against real AOS test handlers; never part of ordinary `cargo test`.
 cli-runtime-test = ["test-seam"]
 
+# CAD-1727: the one integration-test binary; the remaining `tests/*.rs`
+# files are its modules. cad1703 keeps its `#![cfg(feature = "test-seam")]`
+# gate as a module attribute, so no required-features entry is needed.
 [[test]]
-name = "cad1703_my_work_acceptance"
-path = "tests/cad1703_my_work_acceptance.rs"
-required-features = ["test-seam"]
+name = "suite"
+path = "tests/suite.rs"
+
+# CAD-1727: these checks re-exec `current_exe()` with `--exact <fn>`; the
+# child filter only matches an unprefixed test name, which a module of
+# `suite` no longer has. Keep each as its own declared target instead of
+# editing acceptance checks written by reviewers.
+[[test]]
+name = "cad1065_operator_gate"
+path = "tests/cad1065_operator_gate.rs"
+[[test]]
+name = "cad1158_lease_off_smtp_refusal"
+path = "tests/cad1158_lease_off_smtp_refusal.rs"
+[[test]]
+name = "cad1158_smtp_startup"
+path = "tests/cad1158_smtp_startup.rs"
+[[test]]
+name = "cad1191_concurrent_start_acceptance"
+path = "tests/cad1191_concurrent_start_acceptance.rs"
+[[test]]
+name = "cad1196_finish_host_acceptance"
+path = "tests/cad1196_finish_host_acceptance.rs"
+[[test]]
+name = "cad1210_test_binary_guard_acceptance"
+path = "tests/cad1210_test_binary_guard_acceptance.rs"
+[[test]]
+name = "cad1236_host_requirements_acceptance"
+path = "tests/cad1236_host_requirements_acceptance.rs"
+[[test]]
+name = "cad1244_builtin_upgrade_acceptance"
+path = "tests/cad1244_builtin_upgrade_acceptance.rs"
+[[test]]
+name = "cad1425_client_update_refusal_acceptance"
+path = "tests/cad1425_client_update_refusal_acceptance.rs"
+[[test]]
+name = "cad1377_reconcile_acceptance"
+path = "tests/cad1377_reconcile_acceptance.rs"
+[[test]]
+name = "cad1508_binding_carry_acceptance"
+path = "tests/cad1508_binding_carry_acceptance.rs"
+[[test]]
+name = "cad1534_lane_base_acceptance"
+path = "tests/cad1534_lane_base_acceptance.rs"
+[[test]]
+name = "cad1676_seat_dispatch_acceptance"
+path = "tests/cad1676_seat_dispatch_acceptance.rs"
+[[test]]
+name = "cad848_deletion_refusal"
+path = "tests/cad848_deletion_refusal.rs"
+[[test]]
+name = "cad848_reclaim_enumeration_refusal"
+path = "tests/cad848_reclaim_enumeration_refusal.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

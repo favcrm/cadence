@@ -243,18 +243,62 @@ fn set_version_bump(s: &str) -> bool {
 }
 
 /// The isolated-test command for one test: `{test}` `{file}` `{target}`
-/// substitution (`{target}` is the file stem — cargo's `--test <stem>`).
-/// Every value is single-quoted: the names come from diff and test
-/// output the PR controls, so the template must not pre-quote.
-pub fn test_command(template: &str, test: &NewTest) -> String {
+/// substitution. `{target}` is the cargo test target: the file stem, or
+/// `suite` for a file that `tests/suite.rs` declares as a module — those
+/// test names are module-qualified, so `{test}` gains the module prefix.
+/// A tree without the suite target (a base checkout before CAD-1727) keeps
+/// the file stem and drops a prefix equal to it, so the same test runs on
+/// both trees. Every value is single-quoted: the names come from diff and
+/// test output the PR controls, so the template must not pre-quote.
+pub fn test_command(template: &str, test: &NewTest, suite: &[String]) -> String {
     let stem = Path::new(&test.file)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let in_suite = !stem.is_empty() && suite.iter().any(|m| m == &stem);
+    let (target, name) = if in_suite {
+        let name = if test.name.contains("::") {
+            test.name.clone()
+        } else {
+            format!("{stem}::{}", test.name)
+        };
+        ("suite".to_string(), name)
+    } else {
+        let name = match test.name.split_once("::") {
+            Some((first, rest)) if first == stem => rest.to_string(),
+            _ => test.name.clone(),
+        };
+        (stem, name)
+    };
     template
-        .replace("{test}", &sh_quote(&test.name))
+        .replace("{test}", &sh_quote(&name))
         .replace("{file}", &sh_quote(&test.file))
-        .replace("{target}", &sh_quote(&stem))
+        .replace("{target}", &sh_quote(&target))
+}
+
+/// Module names `tests/suite.rs` declares with `mod <name>;`. The review
+/// routes a test in one of those files through the `suite` target instead
+/// of a `--test <stem>` target that no longer exists (CAD-1727).
+pub fn suite_modules(dir: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(dir.join("tests/suite.rs")) else {
+        return Vec::new();
+    };
+    let mut mods: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("mod "))
+        .filter_map(|r| r.strip_suffix(';'))
+        .map(str::trim)
+        .filter(|m| {
+            !m.is_empty()
+                && m.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !m.chars().next().is_some_and(|c| c.is_ascii_digit())
+        })
+        .map(str::to_string)
+        .collect();
+    mods.sort();
+    mods.dedup();
+    mods
 }
 
 fn sh_quote(s: &str) -> String {

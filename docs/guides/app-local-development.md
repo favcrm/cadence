@@ -19,8 +19,12 @@ An app repository declares a `cadence` object in its `package.json`:
 ```
 
 - `app` is the package identity (1–64 lowercase `[a-z0-9-]` characters).
-- `dev` is the long-running preview command. It is run with `sh -c` in the
-  package root and owns its port, renderer and fixture data.
+- `dev` is one long-running preview command, parsed into arguments (quotes
+  are supported; shell expansion and globbing are not). Leading
+  `NAME=value` assignments apply to its environment. It owns its port,
+  renderer and fixture data. Put multiple steps in a script: `;`, `&&`,
+  `||`, `|`, redirects, backticks and command substitution are refused so
+  Cadence can `exec` the command and signals reach its cleanup.
 - `check` is optional; when present it runs to completion before `dev` and a
   non-zero exit stops the preview.
 - The package must contain `app/app.md`.
@@ -37,8 +41,10 @@ From the app repository:
 cadence app dev --package .
 ```
 
-The command validates the contract, runs `check` when declared, then runs
-`dev`. It passes a scrubbed environment:
+The command validates the contract, runs `check` when declared, then replaces
+itself with the app's `sh -c dev` command. Terminal and service signals reach
+that command, so its own cleanup must stop any child server. It passes a
+scrubbed environment:
 
 | Variable | Value |
 |---|---|
