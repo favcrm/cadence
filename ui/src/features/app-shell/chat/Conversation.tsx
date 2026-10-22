@@ -570,12 +570,13 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const conversationsNow = active.state === "ready" ? active.conversations : null;
   useEffect(() => {
     if (conversationsNow === null || finishedConversation === null) return;
-    const first = announced.current === null;
     const known = announced.current ?? new Map<string, number>();
+    let sawFinished = false;
     conversationsNow.forEach((c, index) => {
       const seen = known.get(c.id);
       known.set(c.id, c.updated);
-      if (first || c.id !== finishedConversation || c.id === convId) return;
+      if (c.id === finishedConversation) sawFinished = true;
+      if (c.id !== finishedConversation || c.id === convId) return;
       if (seen === undefined || c.updated <= seen) return;
       if (!isUnread(readSeen(installId), c.id, c.updated)) return;
       const params = new URLSearchParams({ install: installId, conversation: c.id });
@@ -585,7 +586,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       });
     });
     announced.current = known;
-    setFinishedConversation(null);
+    // The conversation must be in the list before the edge is consumed; a
+    // list that has not caught up yet keeps it for the next refresh.
+    if (sawFinished) setFinishedConversation(null);
   }, [conversationsNow, finishedConversation, convId, installId, toast, t, mode.appPath, mode.scopeLabel, subjects]);
 
   useEffect(() => setFailedFrames(new Set()), [installId, convId]);

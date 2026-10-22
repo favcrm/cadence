@@ -1202,10 +1202,23 @@ function MasterHome({
                     : turnBar.kind === "failed" && turnBar.message !== null
                       ? () => {
                           const entry = threadEntries.find((e) => e.message === turnBar.message && e.role === "operator");
-                          if (entry) {
-                            engage();
-                            void sendToMaster(entry.text, newMessageId());
-                          }
+                          if (!entry) return;
+                          engage();
+                          const payload = entry.payload ?? {};
+                          const list = (key: string) => (Array.isArray(payload[key]) ? (payload[key] as unknown[]) : []);
+                          const refs = list("refs").flatMap((item) => {
+                            const r = item as { kind?: unknown; id?: unknown };
+                            return typeof r.kind === "string" && typeof r.id === "string"
+                              ? [{ kind: r.kind, id: r.id }]
+                              : [];
+                          });
+                          const attachments = list("attachments").flatMap((item) => {
+                            const a = item as { id?: unknown };
+                            return typeof a.id === "string" ? [{ id: a.id }] : [];
+                          });
+                          const conversation =
+                            typeof payload.conversation === "string" ? payload.conversation : undefined;
+                          void sendToMaster(entry.text, newMessageId(), refs, attachments.length ? attachments : undefined, conversation);
                         }
                       : undefined,
                 onView:

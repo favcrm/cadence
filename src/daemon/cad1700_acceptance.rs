@@ -25,15 +25,14 @@
 //!   FAILS — the operator-layer refusal is replaced by
 //!   `interrupt refused: agent 'w1' cannot change another agent …`.
 //!   Sensitive.
-//! - **Running-turn invariant** (`stop`'s running check and the
-//!   pre-adapter re-check): neutralizing either one ALONE leaves all five
-//!   tests green — they enforce the same rule (defence in depth). Neutralizing
-//!   BOTH fails two:
-//!   `cad1700_stop_refuses_anything_but_the_current_running_turn`
-//!   (`stop m-queued is refused: Agent 'master' has no live endpoint …`,
-//!   the wrong reason) and
-//!   `cad1700_a_stale_stop_never_interrupts_a_newer_turn` (no refusal at all,
-//!   `left: None`). Sensitive as a pair.
+//! - **Running-turn invariant**, sharpened: each check now has its own
+//!   wording asserted, so they are individually observable.
+//!   `stop`'s running check disabled → `cad1700_stop_refuses_anything_but_the_current_running_turn`
+//!   FAILS (the re-check answers with `is no longer the master's running
+//!   turn`, not the asserted `is not …`). The pre-adapter re-check is pinned
+//!   by `cad1700_a_stale_stop_never_interrupts_a_newer_turn`'s wording
+//!   assertion; its individual re-run is pending. Neutralizing BOTH still
+//!   fails those two tests (wrong reason / no refusal at all).
 //! - **Cancel provenance** (`sender` / `sender_uid` conditions dropped):
 //!   `cad1700_cancel_refuses_a_forged_operator_source` FAILS — the forged
 //!   `source: "operator"` message is cancelled (`ok: true`, state
@@ -43,6 +42,8 @@
 //!   FAILS — got `message_not_cancellable` instead. Sensitive.
 //! - **`message_running`** (the running/submitting arm disabled): the same
 //!   test FAILS — got `message_not_queued` instead. Sensitive.
+//! - **`message_not_queued`** (code changed): the cancel-refusals test
+//!   FAILS — got `message_not_queued_MUTANT`. Sensitive.
 //! - **Relay message validation** (`command_message`'s length/empty rule
 //!   relaxed): `scoped_command_message_is_validated_before_the_relay` FAILS —
 //!   an over-long id is accepted. Sensitive (the unknown-field rule is
@@ -248,12 +249,25 @@ fn cad1700_stop_refuses_anything_but_the_current_running_turn() {
             code, "turn_not_running",
             "stop {message} is refused: {text}"
         );
+        // The command's own check refuses first, with its wording; the
+        // pre-adapter re-check words it differently, so this pins WHICH
+        // guard answered.
+        assert!(
+            text.contains("is not the master's running turn"),
+            "the command's running check refuses {message}: {text}"
+        );
     }
     // A stale click: `m-old` was the running turn once, `m-new` runs now.
-    let (code, _) = refusal(fx.command("stop", Some("m-old")));
+    // The command's check sees the mismatch first; the pre-adapter re-check
+    // is pinned by the interleaving test below.
+    let (code, text) = refusal(fx.command("stop", Some("m-old")));
     assert_eq!(
         code, "turn_not_running",
         "a stale id never reaches the newer turn"
+    );
+    assert!(
+        text.contains("is not the master's running turn"),
+        "the command's running check refuses a stale id: {text}"
     );
     assert_eq!(fx.state("m-new"), "running", "the newer turn still runs");
 
