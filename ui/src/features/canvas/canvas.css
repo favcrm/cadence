@@ -1,11 +1,12 @@
 /* CAD-1726: the agent canvas. Above app screen frames (5) and the header
-   (10), below the board's dialogs, scrims and drawers (40+). */
+   (10), below every scrim, modal drawer and popover (20 and up: RunDrawer
+   scrim 20, needs/app-shell drawers 50-51, dialogs 40-50). */
 .canvas-drawer {
   position: fixed;
   top: 0;
   right: 0;
   bottom: 0;
-  z-index: 30;
+  z-index: 15;
   display: flex;
   flex-direction: column;
   max-width: 100vw;
@@ -16,7 +17,7 @@
 .canvas-drawer[data-mode="sheet"] {
   width: 100%;
   border-left: 0;
-  z-index: 35;
+  z-index: 15;
 }
 @keyframes canvas-in {
   from { transform: translateX(1.5rem); opacity: 0; }

@@ -47,15 +47,19 @@ export function useArtifactBytes(conversation: string, id: string, version: numb
   return state;
 }
 
-function useObjectUrl(data: Loaded | null): string | null {
-  const [url, setUrl] = useState<string | null>(null);
-  useEffect(() => {
-    if (!data) return;
-    const next = URL.createObjectURL(new Blob([data.bytes], { type: data.mime.split(";")[0] }));
-    setUrl(next);
-    return () => URL.revokeObjectURL(next);
-  }, [data]);
-  return data ? url : null;
+/** A `data:` URL for an image: the board CSP allows `data:` images and not
+ *  `blob:` ones. SVG only ever shows as an `<img>` source, never as a URL. */
+function imageDataUrl(data: Loaded): string {
+  let bin = "";
+  const bytes = new Uint8Array(data.bytes);
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return `data:${data.mime.split(";")[0]};base64,${btoa(bin)}`;
+}
+
+function sizeLabel(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 const decode = (data: Loaded): string => new TextDecoder("utf-8").decode(data.bytes);
@@ -75,7 +79,6 @@ export default function ArtifactView({
   contentRef: React.RefObject<HTMLDivElement | null>;
 }) {
   const t = useTranslate();
-  const url = useObjectUrl(kind === "pdf" || kind === "image" ? data : null);
   switch (kind) {
     case "md":
       return (
@@ -103,14 +106,17 @@ export default function ArtifactView({
     case "image":
       return (
         <div className="canvas-doc" data-artifact-view="image">
-          {url ? <img className="canvas-image" src={url} alt={title} /> : null}
+          <img className="canvas-image" src={imageDataUrl(data)} alt={title} />
         </div>
       );
     case "pdf":
+      // No inline PDF: the board CSP allows no blob/object source, so the
+      // drawer offers Download (in the footer) and says so.
       return (
         <div className="canvas-doc canvas-pdf" data-artifact-view="pdf">
-          {url ? <object className="canvas-frame" data={url} type="application/pdf" aria-label={title} /> : null}
-          <p className="text-micro text-ink-500">{t("If the PDF does not show here, use Download.")}</p>
+          <p className="text-body text-ink-100">{title}</p>
+          <p className="num text-micro text-ink-500">PDF · {sizeLabel(data.bytes.byteLength)}</p>
+          <p className="text-micro text-ink-400">{t("A preview is not available yet. Use Download.")}</p>
         </div>
       );
   }

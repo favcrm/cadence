@@ -65,7 +65,7 @@ Look around (read-only):
   many agents are running"; never estimate it without it.
 - `cadence agent list [--all]`, `cadence agent show <alias>` —
   registered agents and one agent's record.
-- `cadence artifact put --kind md|pdf|html|image|csv --title <t> --file <f> [--id <id>]` —
+- `cadence artifact put --kind md|pdf|html|image|csv --title <t> --file <f in master/tmp> [--id <id>]` —
   show a result beside the chat; the same `--id` adds a version.
 - `cadence attachment read <id>` — one chat attachment your
   turn was sent (the id comes from your message's Attachments
