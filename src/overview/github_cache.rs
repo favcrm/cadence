@@ -67,11 +67,12 @@ static GH_REFRESHING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 /// default branch is cached, see `main_ci`).
 pub(super) const GH_CALLS_PER_REPO: i64 = 2;
 /// The board's hourly `gh` budget for the overview refresh. The rest of
-/// the 1,000 an hour is the daemon's reconcile (CAD-1751).
-pub(super) const GH_BOARD_BUDGET_PER_HOUR: i64 = 800;
+/// the 1,000 an hour is the delivery sync (336) and the daemon's
+/// reconcile (CAD-1751).
+pub(super) const GH_BOARD_BUDGET_PER_HOUR: i64 = 500;
 
 /// The shortest gap between two refreshes of `repos` repos that stays
-/// inside [`GH_BOARD_BUDGET_PER_HOUR`]: 9 s per repo, never under the
+/// inside [`GH_BOARD_BUDGET_PER_HOUR`]: 14.4 s per repo, never under the
 /// 60 s display cache.
 pub(super) fn refresh_floor_secs(repos: usize) -> i64 {
     (repos as i64 * GH_CALLS_PER_REPO * 3600 / GH_BOARD_BUDGET_PER_HOUR).max(GH_CACHE_SECS)

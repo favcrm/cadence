@@ -181,3 +181,48 @@ fn cad1751_pause_lives_in_the_boards_own_state_dir() {
         .count();
     assert_eq!(after, spent, "no gh call while paused");
 }
+
+/// The delivery sync is a polling caller too: it stays inside the board's
+/// budget with the overview, and while `gh` is paused it reads nothing and
+/// reports an error row (so it records no evidence).
+#[test]
+fn cad1751_delivery_sync_is_bounded_and_stops_while_paused() {
+    let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // Timer passes (60/h) plus page-view passes (4 per 10 min = 24/h).
+    let sync_per_hour = crate::ui::delivery_sync::MAX_PER_PASS as i64 * (60 + 24);
+    assert_eq!(sync_per_hour, 336);
+    assert!(
+        GH_BOARD_BUDGET_PER_HOUR + sync_per_hour <= 900,
+        "daemon keeps the rest of 1,000"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_gh(dir.path());
+    crate::gh_guard::bind(dir.path());
+    let url = "https://github.com/acme/repo01/pull/1";
+    let first = crate::delivery::sync_pr(dir.path(), "CAD-1", url, gh.to_str().unwrap());
+    assert!(first["error"].as_str().is_some(), "{first}");
+    assert!(
+        crate::gh_guard::paused_until(dir.path()).is_some(),
+        "the reply paused gh"
+    );
+    let spent = std::fs::read_to_string(dir.path().join("gh-calls"))
+        .unwrap()
+        .lines()
+        .count();
+    for _ in 0..20 {
+        let row = crate::delivery::sync_pr(dir.path(), "CAD-1", url, gh.to_str().unwrap());
+        assert!(
+            row["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("paused until")),
+            "{row}"
+        );
+        assert!(row.get("head").is_none(), "no evidence while paused");
+    }
+    let after = std::fs::read_to_string(dir.path().join("gh-calls"))
+        .unwrap()
+        .lines()
+        .count();
+    assert_eq!(after, spent, "no gh call while paused");
+}

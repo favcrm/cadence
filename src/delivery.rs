@@ -1074,8 +1074,16 @@ pub fn sync_pr(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Value 
 /// shares (the sync and the approve-and-land transaction). Returned
 /// parsed; the caller stamps `read_at` (CAD-564: the read starts now).
 pub(crate) fn pr_view(gh_bin: &str, slug: &str, number: u64) -> Result<Value> {
-    let view = gh(
+    pr_view_via(gh_bin, slug, number, false)
+}
+
+/// [`pr_view`], optionally through the rate-limit pause. Only the board's
+/// polling sync passes `polled`; the approve, landing and requirements
+/// paths are user-triggered gate reads and stay unguarded.
+fn pr_view_via(gh_bin: &str, slug: &str, number: u64, polled: bool) -> Result<Value> {
+    let view = gh_via(
         gh_bin,
+        polled,
         &[
             "pr",
             "view",
@@ -1096,7 +1104,7 @@ fn sync_one(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Result<Va
     // true at `read_at`, and a record change applied after it (a done
     // report's new head) is newer than anything the observation shows.
     let read_at = crate::issue::time::now_epoch();
-    let pr = pr_view(gh_bin, &slug, number)?;
+    let pr = pr_view_via(gh_bin, &slug, number, true)?;
     let rollup = pr["statusCheckRollup"]
         .as_array()
         .cloned()
@@ -1148,8 +1156,22 @@ pub fn resolve_gh(path: Option<std::ffi::OsString>) -> std::path::PathBuf {
 }
 
 pub(crate) fn gh(gh_bin: &str, args: &[&str]) -> Result<String> {
-    let out = crate::proc::run_bounded(Command::new(gh_bin).args(args), GH_TIMEOUT)
-        .map_err(|e| Error::rejected(format!("gh {}: {e}", args.join(" "))))?;
+    gh_via(gh_bin, false, args)
+}
+
+/// `polled` runs `gh` through [`crate::gh_guard`]: while GitHub's rate
+/// limit is paused no process starts and the read fails like any failed
+/// read, so the sync records no evidence.
+fn gh_via(gh_bin: &str, polled: bool, args: &[&str]) -> Result<String> {
+    let mut cmd = Command::new(gh_bin);
+    cmd.args(args);
+    let out = if polled {
+        crate::gh_guard::run(&mut cmd, GH_TIMEOUT)
+            .map_err(|e| Error::rejected(format!("gh {}: {e}", args.join(" "))))?
+    } else {
+        crate::proc::run_bounded(&mut cmd, GH_TIMEOUT)
+            .map_err(|e| Error::rejected(format!("gh {}: {e}", args.join(" "))))?
+    };
     if !out.status.success() {
         return Err(Error::rejected(format!(
             "gh {}: {}",

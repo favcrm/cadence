@@ -73,8 +73,11 @@ pub const PAGE_GAP: Duration = Duration::from_secs(15);
 /// this.
 pub const PAGE_BUDGET: usize = 4;
 pub const PAGE_WINDOW: Duration = Duration::from_secs(10 * 60);
-/// PRs one pass reads; the rest wait for the next pass.
-pub const MAX_PER_PASS: usize = 20;
+/// PRs one pass reads, least recently read first; the rest wait for the
+/// next pass. One `gh` call each, so the sync costs at most
+/// `MAX_PER_PASS` x (60 timer passes + 24 page-view passes) = 336 an
+/// hour (CAD-1751 budget).
+pub const MAX_PER_PASS: usize = 4;
 /// Bytes of one error text a row shows.
 const ERROR_MAX: usize = 300;
 /// Failing tickets a row names before "and N more".
