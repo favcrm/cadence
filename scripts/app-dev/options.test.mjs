@@ -20,6 +20,24 @@ test("fixtures are default and only explicitly private hostnames are allowed", (
     port: 3186,
     host: "127.0.0.1",
     allowedHosts: [],
+    container: false,
   });
   assert.equal(devOptions(["social-content", "--port", "3187"]).port, 3187);
+});
+test("container mode binds all interfaces without a tailnet host", () => {
+  const args = [
+    "social-content",
+    "--host",
+    "0.0.0.0",
+    "--container",
+    "true",
+  ];
+  const options = devOptions(args, { inContainer: true });
+  assert.equal(options.host, "0.0.0.0");
+  assert.equal(options.container, true);
+  assert.throws(() => devOptions(args, { inContainer: false }), /only valid inside/);
+  assert.throws(() => devOptions(["social-content", "--host", "0.0.0.0"]));
+  assert.throws(() =>
+    devOptions(["social-content", "--host", "0.0.0.0", "--container", "false"]),
+  );
 });
