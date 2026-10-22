@@ -981,6 +981,31 @@ const BOARD_COMMANDS: &[&str] = &[
     "state", "stats", "models", "model", "levels", "effort", "compact", "new", "stop", "cancel",
 ];
 
+/// CAD-1700: the relay's accepted fields and its `message` rule — a known
+/// field list (so a poisoned page cannot smuggle one through) and a
+/// non-empty id of at most 128 characters. Runs before the daemon is asked.
+fn command_message(body: &Value) -> Result<Option<&str>, HttpResp> {
+    let known = ["command", "arg", "wait", "message"];
+    if let Some(key) = body
+        .as_object()
+        .and_then(|o| o.keys().find(|k| !known.contains(&k.as_str())))
+    {
+        return Err(err_response(400, &format!("unknown field '{key}'")));
+    }
+    match body.get("message") {
+        None => Ok(None),
+        Some(message) => match message.as_str() {
+            Some(id) if !id.is_empty() && id.chars().count() <= 128 => Ok(Some(id)),
+            _ => Err(coded_response(
+                400,
+                "message_invalid",
+                "message must be a non-empty string of at most 128 characters",
+                None,
+            )),
+        },
+    }
+}
+
 /// `POST /api/master/command` `{"command": "…", "arg": "…", "message": "…"}` —
 /// operator-only (`operator::WRITE_ROUTES`), relayed to the daemon's
 /// `master_command`; `/stop` lands on the daemon's `interrupt` path.
@@ -996,16 +1021,12 @@ pub(super) fn master_command(request: &mut Request, state_dir: &std::path::Path)
         Ok(v) => v,
         Err(_) => return err_response(400, "body must be a JSON object"),
     };
-    // Only `command`, `arg` and `wait` cross the relay — anything else
-    // is refused whole, so an identity-shaped or unexpected field never
-    // silently reaches the daemon.
-    let known = ["command", "arg", "wait", "message"];
-    if let Some(key) = body
-        .as_object()
-        .and_then(|o| o.keys().find(|k| !known.contains(&k.as_str())))
-    {
-        return err_response(400, &format!("unknown field '{key}'"));
-    }
+    // Only `command`, `arg`, `wait` and `message` cross the relay, and the
+    // id is bounded — checked before the daemon is asked.
+    let message = match command_message(&body) {
+        Ok(message) => message,
+        Err(resp) => return resp,
+    };
     let command = body.get("command").and_then(Value::as_str).unwrap_or("");
     if !BOARD_COMMANDS.contains(&command) {
         return coded_response(
@@ -1033,21 +1054,8 @@ pub(super) fn master_command(request: &mut Request, state_dir: &std::path::Path)
     if let Some(wait) = body.get("wait") {
         params["wait"] = wait.clone();
     }
-    // CAD-1700: `message` must be a non-empty id of at most 128 characters.
-    if let Some(message) = body.get("message") {
-        match message.as_str() {
-            Some(id) if !id.is_empty() && id.chars().count() <= 128 => {
-                params["message"] = json!(id);
-            }
-            _ => {
-                return coded_response(
-                    400,
-                    "message_invalid",
-                    "message must be a non-empty string of at most 128 characters",
-                    None,
-                )
-            }
-        }
+    if let Some(message) = message {
+        params["message"] = json!(message);
     }
     match client::rpc(state_dir, "master_command", params) {
         Ok(out) => json_response(out),
@@ -1302,5 +1310,27 @@ mod busy_status_tests {
                 "{code} maps to {status}"
             );
         }
+    }
+
+    /// CAD-1700: the relay's `message` validation — an unknown field, a
+    /// non-string or an over-long id is refused before the daemon is asked;
+    /// a valid id passes through.
+    #[test]
+    fn scoped_command_message_is_validated_before_the_relay() {
+        let body = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        assert!(
+            command_message(&body(r#"{"command":"cancel","message":"m-1","extra":1}"#)).is_err()
+        );
+        assert!(command_message(&body(r#"{"command":"cancel","message":7}"#)).is_err());
+        let long = format!(r#"{{"command":"cancel","message":"{}"}}"#, "x".repeat(129));
+        assert!(command_message(&body(&long)).is_err());
+        assert!(matches!(
+            command_message(&body(r#"{"command":"cancel","message":"m-1"}"#)),
+            Ok(Some("m-1"))
+        ));
+        assert!(matches!(
+            command_message(&body(r#"{"command":"cancel"}"#)),
+            Ok(None)
+        ));
     }
 }

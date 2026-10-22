@@ -43,11 +43,10 @@
 //!   FAILS — got `message_not_cancellable` instead. Sensitive.
 //! - **`message_running`** (the running/submitting arm disabled): the same
 //!   test FAILS — got `message_not_queued` instead. Sensitive.
-//! - **Relay message validation** (`message` length/empty check removed in
-//!   `src/ui/home.rs`): **NOT COVERED.** The group still passed 6/6: the
-//!   mapping test exercises `master_command_err` directly and never drives
-//!   the relay's own `message` validation, which needs a `Request`. A board
-//!   HTTP test must add that case.
+//! - **Relay message validation** (`command_message`'s length/empty rule
+//!   relaxed): `scoped_command_message_is_validated_before_the_relay` FAILS —
+//!   an over-long id is accepted. Sensitive (the unknown-field rule is
+//!   asserted by the same test's first case).
 //! - **Relay refusal mapping** (`master_command_err` collapsed to the
 //!   shared mapping): `scoped_command_refusals_map_to_409` FAILS —
 //!   `turn_not_running maps to 409`, got 400. Sensitive.
