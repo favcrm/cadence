@@ -112,17 +112,14 @@ fn fx() -> Fx {
         .set("CADENCE_HOME", dir.path().to_str().unwrap());
     let shared = Shared::new(dir.path(), &opts).unwrap();
     let cwd = dir.path().to_str().unwrap().to_string();
-    for (alias, provider, kind, role) in [
-        ("master", "pi", "managed", "master"),
-        ("w1", "fake", "fake", "worker"),
-    ] {
+    for (alias, provider, kind) in [("master", "pi", "managed"), ("w1", "fake", "fake")] {
         shared
             .store
             .register_agent(&NewAgent {
                 alias,
                 provider,
                 endpoint_kind: kind,
-                role,
+                role: "worker",
                 cwd: &cwd,
                 sandbox: "read-only",
                 instructions: None,
@@ -248,9 +245,10 @@ fn cad1700_cancel_refuses_everything_but_the_operators_own_queued_message() {
     fx.send("m-mine");
     fx.send("m-other");
     // A message queued to the master by the daemon, not by the operator.
+    let daemon_id = crate::proto::daemon_message_id("permission", "cad1700");
     fx.shared
         .store
-        .enqueue_daemon("master", "notice", "m-daemon", "notice")
+        .enqueue_daemon("master", "notice", &daemon_id, "permission")
         .unwrap();
     // A queued message for another agent.
     fx.shared
@@ -274,7 +272,7 @@ fn cad1700_cancel_refuses_everything_but_the_operators_own_queued_message() {
         "message_not_queued",
         "only a queued message can be cancelled"
     );
-    for message in ["m-daemon", "m-w1", "m-missing"] {
+    for message in [daemon_id.as_str(), "m-w1", "m-missing"] {
         assert_eq!(
             refusal(fx.command("cancel", Some(message))).0,
             "message_not_cancellable",
@@ -287,7 +285,7 @@ fn cad1700_cancel_refuses_everything_but_the_operators_own_queued_message() {
         "another agent's queue is untouched"
     );
     assert_eq!(
-        fx.state("m-daemon"),
+        fx.state(&daemon_id),
         "queued",
         "a daemon message is untouched"
     );

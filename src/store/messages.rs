@@ -3241,7 +3241,7 @@ mod master_stamp_tests {
                 alias: "master",
                 provider: "fake",
                 endpoint_kind: "managed",
-                role: "master",
+                role: "worker",
                 cwd: dir.path().to_str().unwrap(),
                 sandbox: "read-only",
                 instructions: None,
@@ -3275,6 +3275,7 @@ mod master_stamp_tests {
         assert_ne!(running, queued, "starting the turn moves the stamp");
         assert_eq!((running.1, running.2), (1, 0), "one running, none queued");
 
+        store.ensure_thread("master").unwrap();
         store
             .thread_append(
                 "master",
