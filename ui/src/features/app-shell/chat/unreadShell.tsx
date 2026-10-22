@@ -91,27 +91,41 @@ export function AssistantUnreadProbes({ apps }: { apps: { installId: string }[] 
   const toast = useNotificationToast();
   const finished = useFinishedTurn(master.data?.turn ?? null);
   const [announced, setAnnounced] = useState<FinishedTurn | null>(null);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     if (finished === null) return;
     setAnnounced(finished);
+    setAttempt(0);
   }, [finished]);
 
   useEffect(() => {
     if (announced === null || apps === null) return;
     const conversation = announced.conversation;
+    if (conversation === null) {
+      setAnnounced(null);
+      return;
+    }
     // Subject conversations (campaign, WhatsApp) carry no app origin by
     // design; their install is the one whose observed list holds them.
     const install =
       announced.install ??
-      (conversation === null
-        ? null
-        : (apps.find((app) => conversationList(app.installId).get().data?.conversations.some((c) => c.id === conversation))
-            ?.installId ?? null));
+      apps.find((app) => conversationList(app.installId).get().data?.conversations.some((c) => c.id === conversation))
+        ?.installId ??
+      null;
+    if (install === null) {
+      // No list has loaded yet: hold the announcement and retry, rather than
+      // dropping a reply the operator has not seen.
+      if (attempt < 15) {
+        const timer = setTimeout(() => setAttempt((n) => n + 1), 1000);
+        return () => clearTimeout(timer);
+      }
+      setAnnounced(null);
+      return;
+    }
     // The live pane selection is the only authority here: a URL query can be
     // stale after the picker moved, and must not veto a real reply.
-    const shown = visibleConversation()?.conversation === conversation;
-    if (install !== null && conversation !== null && !shown) {
+    if (visibleConversation()?.conversation !== conversation) {
       setAssistantUnread(install, true);
       const params = new URLSearchParams({ conversation });
       toast.show("Assistant replied", `assistant:${install}:${conversation}`, {
@@ -120,7 +134,7 @@ export function AssistantUnreadProbes({ apps }: { apps: { installId: string }[] 
       });
     }
     setAnnounced(null);
-  }, [announced, apps, toast]);
+  }, [announced, apps, toast, attempt]);
 
   if (apps === null) return null;
   return (
