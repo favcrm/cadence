@@ -54,6 +54,7 @@ import {
   conversationThread,
   createConversation,
   hasUnansweredOperator,
+  conversationList,
   idleThread,
   invalidateConversationSelection,
   outboxFor,
@@ -97,7 +98,7 @@ import { turnBarState } from "./turnBarState";
 import { TurnBar } from "./TurnBar";
 import { isUnread, onSeenChanged, readSeen, writeSeen, type SeenMap } from "./unreadSeen";
 import { setAssistantUnread } from "./assistantUnread";
-import { setVisibleConversation } from "./chatVisibility";
+import { knownInstalls, setVisibleConversation } from "./chatVisibility";
 import { earlierStep, useThreadStream } from "./conversationThread";
 
 /**
@@ -961,11 +962,19 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
             ? () => selectConversation(installId, turnState.aheadConversation!)
             : (() => {
                 // Another install's conversation: the running turn's verified
-                // app origin is the one host-resolved way to open it.
+                // app origin when it is the running one, else the install
+                // whose observed list holds the queued predecessor.
                 const turn = masterState.data?.turn ?? null;
                 const origin = turn?.app_origin ?? null;
-                if (origin === null || turn?.conversation !== turnState.aheadConversation) return undefined;
-                const href = `/app-installations/${encodeURIComponent(origin.install_id)}?conversation=${encodeURIComponent(turnState.aheadConversation)}`;
+                if (origin !== null && turn?.conversation === turnState.aheadConversation) {
+                  const href = `/app-installations/${encodeURIComponent(origin.install_id)}?conversation=${encodeURIComponent(turnState.aheadConversation)}`;
+                  return () => window.location.assign(href);
+                }
+                const owner = knownInstalls().find((install) =>
+                  conversationList(install).get().data?.conversations.some((c) => c.id === turnState.aheadConversation),
+                );
+                if (owner === undefined) return undefined;
+                const href = `/app-installations/${encodeURIComponent(owner)}?conversation=${encodeURIComponent(turnState.aheadConversation)}`;
                 return () => window.location.assign(href);
               })(),
     onReview: () => {

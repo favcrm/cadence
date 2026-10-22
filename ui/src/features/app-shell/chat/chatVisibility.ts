@@ -13,3 +13,18 @@ export function setVisibleConversation(installId: string, conversation: string |
 export function visibleConversation(): { installId: string; conversation: string | null } | null {
   return visible;
 }
+
+/**
+ * The installed apps the shell currently knows about. A queued turn ahead of
+ * the running one carries no app origin, so its destination is resolved by
+ * looking for its conversation in these installs' observed lists.
+ */
+let installs: string[] = [];
+
+export function setKnownInstalls(ids: string[]): void {
+  installs = ids;
+}
+
+export function knownInstalls(): string[] {
+  return installs;
+}

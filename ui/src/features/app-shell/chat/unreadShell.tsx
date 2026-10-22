@@ -4,7 +4,7 @@ import { resources } from "../../../lib/resources";
 import { useNotificationToast } from "../../threads/NotificationToast";
 import { conversationList } from "../conversationClient";
 import { setAssistantUnread } from "./assistantUnread";
-import { visibleConversation } from "./chatVisibility";
+import { visibleConversation, setKnownInstalls } from "./chatVisibility";
 import { isUnread, readSeen } from "./unreadSeen";
 
 /**
@@ -92,6 +92,10 @@ export function AssistantUnreadProbes({ apps }: { apps: { installId: string }[] 
   const finished = useFinishedTurn(master.data?.turn ?? null);
   const [announced, setAnnounced] = useState<FinishedTurn | null>(null);
   const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    setKnownInstalls(apps === null ? [] : apps.map((app) => app.installId));
+  }, [apps]);
 
   useEffect(() => {
     if (finished === null) return;
