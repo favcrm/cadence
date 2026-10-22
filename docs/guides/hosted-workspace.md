@@ -13,9 +13,10 @@ for the exact revision/evidence boundary. Authentication details remain in
 [REMOTE-AUTH](../REMOTE-AUTH.md); local package rules remain in
 [Workspace app catalog](app-catalog.md).
 
-The event bridge and selected-hosted app journey have separate observed
-integration checkpoints. Their exercised scope and fixture/rollout limitations
-are recorded below; neither substitutes for native assignment/wiki/ticket proof.
+The event bridge, the selected-hosted app journey and a two-state native
+assignment/wiki/ticket collaboration check have separate observed integration
+checkpoints. Their exercised scope and fixture/rollout limitations are recorded
+below; none of them covers every capacity, rotation or abrupt-loss case.
 
 ## What runs where
 
@@ -334,18 +335,31 @@ claims are not Cadence price or performance evidence.
   refusal permits a later standalone upgrade; and journal/entered-writer
   uncertainty remains explicit, on both transports. These use synthetic
   test-seam caller/grant fixtures, not production authentication or a provider.
+- A throwaway two-state native smoke on `5ed960195af9beda4e974014dd4f11c324ee1e07`
+  passed 1/1: separate company/teammate native states performed real
+  selected-remote wiki create/read/revision update (with stale-revision refusal)
+  and ticket create/update (with stale refusal and standalone isolation); an
+  explicit assignment dispatched, was read by bare GET, claimed, ACKed and
+  delivered to the inbox while reporting truthfully `running`→`blocked`; a
+  daemon restart preserved the original claim without duplicate delivery, and an
+  explicit default switch afterwards retained the original claim, generation and
+  member pins. The harness was removed after the run, so the retained evidence is
+  the pass summary and asserted inbox contents — the runner suppressed console
+  logs. This is one explicit collaboration path, not interactive CLI `login`
+  UX, a production deployment, or a measured cost result.
 - The [historical POC](https://github.com/agenticos-stack/agenticos-v2/commit/0aaafd244adbbad854ca74c4208ffb16bd67b4ee)
   exercised 13 synthetic-authority/loopback **plain WS** groups. It is not WSS,
   genuine-auth or abrupt-power-loss durability proof. Pure-kernel native/WASM
-  parity likewise does not prove the integrated native adapter journey.
+  parity is a separate check, not a substitute for the integrated native adapter
+  path exercised by the two-state smoke above.
 
 The persistence, pagination, generation, same-member renewal and revocation
 mechanisms described above are source contracts; these checkpoints do not claim
 that every capacity/gap, identity-rotation, held-context cancellation, concurrent
-reassignment or abrupt-loss/whole-company restore case passed. They do not by
-themselves establish the native assignment/wiki/ticket collaboration journey.
-Restart replay is not proof of zero-loss multi-store recovery. No startup/cost
-benchmark was run.
+reassignment or abrupt-loss/whole-company restore case passed. The two-state smoke
+covers one explicit collaboration path; it is not interactive login UX, production
+deployment or a multi-host capacity trial. Restart replay is not proof of
+zero-loss multi-store recovery. No startup/cost benchmark was run.
 
 ### Source and release boundary
 
