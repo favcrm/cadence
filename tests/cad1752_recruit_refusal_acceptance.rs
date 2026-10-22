@@ -1514,6 +1514,9 @@ try:
 except OSError as e:
     journal({"escape": type(e).__name__})
 session = opt("--session")
+if opt("--fork") and os.path.exists(os.path.join(cwd, "fail-fork")):
+    journal({"fork": "refused"})
+    sys.exit(3)
 if opt("--fork"):
     src = opt("--fork")
     with open(src) as f:
@@ -2170,4 +2173,79 @@ fn cad1752_no_relaunch_mid_turn_or_for_others() {
         }
     }
     assert!(wrong.is_empty(), "relaunched outside the rule: {wrong:#?}");
+}
+
+/// A lane relaunch whose endpoint cannot open (the fork fails) settles the
+/// message once as failed and fences the agent: one attempt, no fresh
+/// session, no wider grant. Guard: the relaunch error arm in the actor
+/// loop (`src/daemon/actor.rs`).
+#[test]
+fn cad1752_failed_lane_relaunch_fails_the_message_once() {
+    let fx = LaneFx::start();
+    // Control: a fork that succeeds, into alpha-2.
+    let ok = fx.hire(confined_hire("dev-ok"));
+    fx.record_dispatch("ALPHA-2", &fx.lane("alpha-2"));
+    fx.plant(&ok, "fork-ok", Some("ALPHA-2"), Some(&fx.lane("alpha-2")));
+    fx.send(&ok, "fork-ok-wake", "ticketless");
+    assert_eq!(fx.settled("fork-ok").0, "completed", "control fork");
+
+    // The same setup, but the stand-in exits 3 on a --fork in alpha-1.
+    let lane = fx.lane("alpha-1");
+    std::fs::write(lane.join("fail-fork"), b"").unwrap();
+    let alias = fx.hire(confined_hire("dev-f"));
+    let home = std::fs::canonicalize(fx.show(&alias)["cwd"].as_str().unwrap()).unwrap();
+    let starts = |dir: &std::path::Path| -> Vec<Value> {
+        fx.journal(dir)
+            .into_iter()
+            .filter_map(|j| j.get("argv").cloned())
+            .collect()
+    };
+    let home_before = starts(&home).len();
+    fx.record_dispatch("ALPHA-1", &lane);
+    fx.plant(&alias, "fork-fail", Some("ALPHA-1"), Some(&lane));
+    fx.send(&alias, "fork-fail-wake", "ticketless");
+    let (state, error) = fx.settled("fork-fail");
+    let error = error.unwrap_or_default();
+    assert_eq!(state, "failed", "{error}");
+    assert!(
+        error.contains("relaunch for ALPHA-1 failed"),
+        "not the relaunch failure: {error}"
+    );
+    fx.until("agent fenced", || fx.show(&alias)["state"] == "attention");
+    std::thread::sleep(Duration::from_millis(2000));
+    let shown = fx.show(&alias);
+    assert_eq!(shown["state"], "attention", "{shown}");
+    eprintln!("CAD-1752 fenced agent error: {}", shown["error"]);
+    assert!(
+        shown["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "attention without an error: {shown}"
+    );
+    // One attempt in the lane, and it was the fork.
+    let in_lane: Vec<Value> = starts(&lane)
+        .into_iter()
+        .filter(|argv| argv.to_string().contains("dev-f"))
+        .collect();
+    assert_eq!(in_lane.len(), 1, "lane launch attempts: {in_lane:?}");
+    assert!(in_lane[0].to_string().contains("--fork"), "{in_lane:?}");
+    // No fresh-session fallback anywhere, and no relaunch home.
+    assert_eq!(
+        starts(&home).len(),
+        home_before,
+        "relaunched home after the failure"
+    );
+    let events = fx.relaunches(&alias);
+    eprintln!("CAD-1752 relaunched_for_lane events after the failure: {events:?}");
+    assert!(events.len() <= 1, "relaunch loop: {events:?}");
+    // The follow-up was not run by a fallback endpoint.
+    assert_ne!(fx.message("fork-fail-wake").0, "completed");
+    // Not widened: the stored workdir is the recorded lane or none.
+    let stored = shown["params"]
+        .get("launch_workdir")
+        .cloned()
+        .unwrap_or(Value::Null);
+    eprintln!("CAD-1752 launch_workdir after the failure: {stored}");
+    assert!(
+        stored.is_null() || stored == json!(lane.to_string_lossy()),
+        "launch_workdir widened: {stored}"
+    );
 }
