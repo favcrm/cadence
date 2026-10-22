@@ -1464,6 +1464,7 @@ pub fn run(opts: &Options) -> Result<i32> {
         }
         let base_result_path = runner_result_path(&base_tree.dir, &cfg.runner);
         let suite = suite_modules(&tree.dir);
+        let suite_base = suite_modules(&base_tree.dir);
         for name in &failures_to_check {
             // Names come from test output the PR controls — validate
             // before they reach a shell, and never execute a bad one.
@@ -1487,7 +1488,9 @@ pub fn run(opts: &Options) -> Result<i32> {
             // CAD-799: a name with no `tests/` file is a `src/` unit
             // test — `test_command_lib` isolates it by name when the
             // recipe declares one; otherwise it stays inconclusive.
-            let Some(cmd) = isolated_command(&cfg, name, file, &suite) else {
+            let cmd_gated = isolated_command(&cfg, name, file.clone(), &suite);
+            let cmd_base = isolated_command(&cfg, name, file, &suite_base);
+            let (Some(cmd_gated), Some(cmd_base)) = (cmd_gated, cmd_base) else {
                 comparisons.push(json!({
                     "test": name, "in_run": "fail",
                     "result": "unknown",
@@ -1501,7 +1504,7 @@ pub fn run(opts: &Options) -> Result<i32> {
             };
             let on_gated = run_step_with_result(
                 "compare-gated",
-                &cmd,
+                &cmd_gated,
                 &tree.dir,
                 &env(gated_tree),
                 t.test_secs,
@@ -1513,7 +1516,7 @@ pub fn run(opts: &Options) -> Result<i32> {
             } else {
                 let on_base = run_step_with_result(
                     "compare-base",
-                    &cmd,
+                    &cmd_base,
                     &base_tree.dir,
                     &env("base"),
                     t.test_secs,
@@ -1572,7 +1575,7 @@ pub fn run(opts: &Options) -> Result<i32> {
                 base_side["reason"] = json!(r);
             }
             let mut row = json!({
-                "test": name, "cmd": cmd,
+                "test": name, "cmd": cmd_gated,
                 "in_run": "fail",
                 "result": gated,
                 "gated": gated_side.clone(),
@@ -3069,6 +3072,11 @@ test_command = "cargo test --test {target} -- {test}"
 
         let cmd = isolated_command(&cfg, "x", Some("tests/standalone.rs".into()), &suite).unwrap();
         assert_eq!(cmd, "cargo test --test 'standalone' -- 'x'");
+
+        // A base tree before the suite target keeps the file stem and the
+        // bare test name, so the same failure still runs there.
+        let cmd = isolated_command(&cfg, "daemon::x", Some("tests/daemon.rs".into()), &[]).unwrap();
+        assert_eq!(cmd, "cargo test --test 'daemon' -- 'x'");
     }
 
     #[test]

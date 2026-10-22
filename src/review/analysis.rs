@@ -246,8 +246,10 @@ fn set_version_bump(s: &str) -> bool {
 /// substitution. `{target}` is the cargo test target: the file stem, or
 /// `suite` for a file that `tests/suite.rs` declares as a module — those
 /// test names are module-qualified, so `{test}` gains the module prefix.
-/// Every value is single-quoted: the names come from diff and test
-/// output the PR controls, so the template must not pre-quote.
+/// A tree without the suite target (a base checkout before CAD-1727) keeps
+/// the file stem and drops a prefix equal to it, so the same test runs on
+/// both trees. Every value is single-quoted: the names come from diff and
+/// test output the PR controls, so the template must not pre-quote.
 pub fn test_command(template: &str, test: &NewTest, suite: &[String]) -> String {
     let stem = Path::new(&test.file)
         .file_stem()
@@ -262,7 +264,11 @@ pub fn test_command(template: &str, test: &NewTest, suite: &[String]) -> String 
         };
         ("suite".to_string(), name)
     } else {
-        (stem, test.name.clone())
+        let name = match test.name.split_once("::") {
+            Some((first, rest)) if first == stem => rest.to_string(),
+            _ => test.name.clone(),
+        };
+        (stem, name)
     };
     template
         .replace("{test}", &sh_quote(&name))
