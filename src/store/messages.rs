@@ -61,6 +61,9 @@ pub struct Message {
     pub created: f64,
     pub started: Option<f64>,
     pub completed: Option<f64>,
+    /// CAD-1353: the stall budget chosen for this dispatch. `None` falls
+    /// back to the job default, then the agent's `stall_secs`.
+    pub stall_secs: Option<i64>,
     /// CAD-819: the daemon-derived sender participant (uid, label). NULL
     /// on a legacy row, which reads as an unknown sender.
     pub sender_uid: Option<String>,
@@ -93,6 +96,7 @@ pub(super) fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         created: row.get("created")?,
         started: row.get("started")?,
         completed: row.get("completed")?,
+        stall_secs: row.get("stall_secs")?,
         sender_uid: row.get("sender_uid")?,
         sender: row.get("sender")?,
         recipient_uid: row.get("recipient_uid")?,
@@ -2665,6 +2669,36 @@ impl Store {
     pub fn message(&self, id: &str) -> Result<Option<Message>> {
         let conn = self.conn();
         self.message_in(&conn, id)
+    }
+
+    /// CAD-1353: record the stall budget chosen for this dispatch on its
+    /// kickoff message. A later dispatch in the same job updates only its
+    /// own message.
+    pub fn set_message_stall_secs(&self, id: &str, secs: i64) -> Result<()> {
+        if secs < 0 {
+            return Err(Error::rejected("stall_secs must be non-negative"));
+        }
+        let conn = self.conn();
+        let changed = conn.execute(
+            "UPDATE messages SET stall_secs=? WHERE id=?",
+            params![secs, id],
+        )?;
+        if changed == 0 {
+            return Err(Error::rejected(format!("No message '{id}'")));
+        }
+        Ok(())
+    }
+
+    /// CAD-1353: the recorded budget for a dispatch, falling back to the
+    /// job default. The agent's own `stall_secs` remains the final
+    /// fallback in the watcher.
+    pub fn message_stall_budget(&self, message: &Message) -> Option<i64> {
+        if let Some(secs) = message.stall_secs {
+            return Some(secs);
+        }
+        let task_id = message.task_id.as_deref()?;
+        let task = self.task(task_id).ok()?;
+        self.job(&task.job_id).ok()?.stall_secs
     }
 
     /// Whether a message row with this id exists. A bare existence probe

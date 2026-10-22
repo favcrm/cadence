@@ -119,8 +119,8 @@ pub(crate) enum JobAction {
         #[arg(long)]
         message: Option<String>,
         /// Per-dispatch no-provider-event budget in seconds, recorded
-        /// on the job (0 disables). Overrides `job new --stall-secs`
-        /// for this dispatch; a duplicate dispatch records nothing.
+        /// on this kickoff message (0 disables). Falls back to
+        /// `job new --stall-secs`; a duplicate records nothing.
         #[arg(long)]
         stall_secs: Option<u64>,
     },

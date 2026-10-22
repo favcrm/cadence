@@ -311,7 +311,8 @@ impl Store {
                     body TEXT NOT NULL, reply_to TEXT, source TEXT NOT NULL,
                     state TEXT NOT NULL DEFAULT 'queued',
                     turn_id TEXT, result TEXT, error TEXT,
-                    created REAL NOT NULL, started REAL, completed REAL);
+                    created REAL NOT NULL, started REAL, completed REAL,
+                    stall_secs INTEGER);
                  CREATE INDEX IF NOT EXISTS msg_queue ON messages(alias,state,seq);
                  CREATE TABLE IF NOT EXISTS events(
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1432,6 +1433,23 @@ impl Store {
                        BEGIN SELECT RAISE(ABORT,'archived'); END;",
                 )?;
                 tx.execute("UPDATE schema_version SET version=54", [])?;
+                tx.commit()?;
+            }
+            if version < 55 {
+                // v55: CAD-1353 — the stall budget chosen by
+                // `job dispatch --stall-secs` belongs to that kickoff
+                // message, not the shared job default. A later dispatch
+                // must not retune an earlier task's watch.
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(messages)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                if !columns.iter().any(|column| column == "stall_secs") {
+                    tx.execute_batch("ALTER TABLE messages ADD COLUMN stall_secs INTEGER")?;
+                }
+                tx.execute("UPDATE schema_version SET version=55", [])?;
                 tx.commit()?;
             }
             if let Some(crossing) = permit.crossing {

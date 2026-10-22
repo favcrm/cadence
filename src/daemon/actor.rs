@@ -1016,14 +1016,39 @@ impl Shared {
     /// already requires operator proof (`rpc_message_read`), so the
     /// operator still reconciles from the full detail.
     pub(super) fn unknown(&self, alias: &str, message: &Message, reason: &str) -> Result<()> {
+        // CAD-1353: the provider's idle fence is the real unknown-outcome
+        // diagnostic. Name the budget this dispatch was given and the
+        // last provider event we can point at, not only the idle window.
+        let budget = self.store.message_stall_budget(message).or_else(|| {
+            self.store.agent(alias).ok().and_then(|agent| {
+                agent
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("stall_secs"))
+                    .and_then(|value| {
+                        value
+                            .as_i64()
+                            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                    })
+            })
+        });
+        let budget = budget
+            .map(|secs| format!("{secs}s"))
+            .unwrap_or_else(|| "default".to_string());
+        let last_event = message
+            .started
+            .map(|at| format!("turn started at {at:.0}"))
+            .unwrap_or_else(|| "none recorded".to_string());
+        let reason =
+            format!("{reason} (dispatch stall budget {budget}; last provider event: {last_event})");
         let stored = json!({"status": "unknown", "text": "", "error": reason});
         self.store
-            .finish(message, "unknown", &stored, Some(reason))?;
+            .finish(message, "unknown", &stored, Some(&reason))?;
         self.notify_routed_target(message, &stored);
         let public_reason = if message.source == "app_run_dispatch" {
             store::app_runs::app_uncertain_turn_reason()
         } else {
-            reason.to_string()
+            reason
         };
         // One write: the fence is visible immediately, so the cleared
         // endpoint must land with it — a reader in between must never

@@ -865,19 +865,13 @@ impl Shared {
         }
     }
 
-    /// The silence budget for a running message: the job's
-    /// `stall_secs` for task-attached deliveries, else the agent's
+    /// The silence budget for a running message: the budget recorded on
+    /// this dispatch, else the job's `stall_secs`, else the agent's
     /// `stall_secs` param, else the default. `0` disables the episode
     /// (silence is still measured for the views).
     fn stall_budget(&self, agent: &Agent, message: &Message) -> u64 {
-        if let Some(task_id) = &message.task_id {
-            if let Ok(task) = self.store.task(task_id) {
-                if let Ok(job) = self.store.job(&task.job_id) {
-                    if let Some(s) = job.stall_secs {
-                        return s.max(0) as u64;
-                    }
-                }
-            }
+        if let Some(secs) = self.store.message_stall_budget(message) {
+            return secs.max(0) as u64;
         }
         agent
             .params

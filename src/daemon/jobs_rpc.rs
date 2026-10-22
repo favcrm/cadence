@@ -491,7 +491,7 @@ impl Shared {
         // so it must not rewrite the budget that kickoff was sent with.
         if !duplicate {
             if let Some(secs) = stall_secs {
-                self.store.set_job_stall_secs(&task.job_id, secs)?;
+                self.store.set_message_stall_secs(&message, secs)?;
             }
         }
         let message_state = self.store.message(&message)?.map(|m| m.state);
