@@ -7,11 +7,11 @@ CAD-631/632. Draft PR307 is a design reference, not a runtime dependency.
 
 ## Start
 
-Node22+ and the pnpm version pinned in ui/package.json are required. From a clean
+Node 22+ and Bun 1.4.4, pinned in ui/package.json, are required. From a clean
 source checkout, one command installs the locked existing tools and starts HMR:
 
 ```sh
-(cd ui && pnpm install --frozen-lockfile) && node scripts/app-dev.mjs social-content
+(cd ui && bun install --frozen-lockfile) && node scripts/app-dev.mjs social-content
 ```
 
 Default: http://127.0.0.1:3186/. Existing private reachability, without tailnet,

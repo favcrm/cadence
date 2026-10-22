@@ -3,11 +3,11 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "packageManager": "pnpm@12.2.1",
+  "packageManager": "bun@1.4.4",
   "scripts": {
     "dev": "vite",
     "build": "node scripts/check-module-names.mjs && vite build && node scripts/build-app-fixtures.mjs",
-    "test:url-state": "pnpm test",
+    "test:url-state": "bun run test",
     "typecheck": "tsrs --noEmit",
     "lint": "oxlint --deny-warnings src tests scripts screen-ui acceptance vite.config.ts",
     "preview": "vite preview",

@@ -285,7 +285,7 @@ one line per step (`[ OK ]`, `[FAIL] name: exit N`, `[SKIP] name: why`):
    `scripts/split-map-sync --check` only when its inventory exists;
 3. `cargo clippy --all-targets --locked -- -D warnings`, then the same with
    `--features test-seam`, when Rust or Cargo files changed;
-4. `pnpm --dir ui run typecheck` when `ui/` changed;
+4. `bun run --cwd ui typecheck` when `ui/` changed;
 5. the active Python test commands that CI's `fmt` job runs, including
    review-recipe and release-freeze regressions, when `scripts/`, `.github/`
    or `tests/scripts/` changed;

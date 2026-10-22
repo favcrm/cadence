@@ -16,12 +16,12 @@ acceptance-tested capability, not a promise of universal session attachment.
 ## Install
 
 To build from source with the board used in the quick start, install a recent
-stable Rust toolchain via [rustup](https://rustup.rs), Node 22 and the pnpm
-version declared in `ui/package.json`. Build the UI before installing Cadence:
+stable Rust toolchain via [rustup](https://rustup.rs), Node 22 and Bun 1.4.4
+(pinned in `ui/package.json`). Build the UI before installing Cadence:
 
 ```bash
-pnpm -C ui install --frozen-lockfile
-pnpm -C ui build
+bun install --cwd ui --frozen-lockfile
+bun run --cwd ui build
 cargo install --path . --locked --features ui
 ```
 

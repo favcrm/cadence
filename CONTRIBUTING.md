@@ -25,8 +25,8 @@ briefing; an external session must not borrow a native alias or turn token.
 
 Use a stable Rust toolchain with rustfmt/clippy, Python 3.11+ for script checks
 (the recipe validator uses standard-library `tomllib`), and
-Node 22 with the pnpm version declared in [ui/package.json](ui/package.json).
-Install UI dependencies with `pnpm -C ui install --frozen-lockfile`.
+Node 22 with Bun 1.4.4, as declared in [ui/package.json](ui/package.json).
+Install UI dependencies with `bun install --cwd ui --frozen-lockfile`.
 The [nextest installer](scripts/install-cadence-nextest) and
 [runner](scripts/cadence-nextest) pin and verify the test executable.
 
@@ -38,9 +38,9 @@ python3 -m unittest discover -s scripts -p 'test_check_doc_links.py'
 rtk proxy cargo fmt --all -- --check
 ```
 
-For UI changes, run `pnpm -C ui typecheck`, `pnpm -C ui test:url-state` and
-`pnpm -C ui build`. Despite its name, `test:url-state` covers the compiled
-frontend test directory. Use `pnpm -C ui test` when that alias is available in
+For UI changes, run `bun run --cwd ui typecheck`, `bun run --cwd ui test:url-state` and
+`bun run --cwd ui build`. Despite its name, `test:url-state` covers the compiled
+frontend test directory. Use `bun run --cwd ui test` when that alias is available in
 the checked-out package scripts.
 
 Select the affected Rust test binary and a meaningful filter. For example,
@@ -124,17 +124,17 @@ export CADENCE_DEV_BOARD_PORT=3117
 export XDG_CONFIG_HOME="$CADENCE_SANDBOX_ROOT/config"
 mkdir -m 700 -p "$XDG_CONFIG_HOME"
 unset CADENCE_TOKEN CADENCE_ISSUER CADENCE_ORG
-npx --yes pnpm@12.2.1 -C ui install --frozen-lockfile
-npx --yes pnpm@12.2.1 -C ui build
+bun install --cwd ui --frozen-lockfile
+bun run --cwd ui build
 # On a shared host, obtain the documented build-slot admission first.
 CARGO_BUILD_JOBS=4 cargo build --locked --features ui
 ./target/debug/cadence sandbox up dev --port "$CADENCE_DEV_BOARD_PORT"
-npx --yes pnpm@12.2.1 -C ui dev --host 127.0.0.1
+bun run --cwd ui dev --host 127.0.0.1
 ```
 
 Open the Vite URL printed by the final command. UI edits reload there without a
 Rust build or cloud deployment; `/api` proxies only to the selected sandbox
-board. The pinned pnpm command refuses a missing or out-of-range
+board. The Vite development command refuses a missing or out-of-range
 `CADENCE_DEV_BOARD_PORT`, including the production port 3010. For Rust edits,
 leave Vite running, then rebuild and restart the sandbox:
 

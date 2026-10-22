@@ -57,7 +57,7 @@ paths = ["src/secret/**", "src/cli/secret.rs", "src/cli/connection.rs",
 paths = ["Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml", ".cargo/**",
   ".config/**", "**/package.json", "**/pnpm-lock.yaml", ".github/**", "scripts/**",
   "**/.github/**", "**/.cargo/**", "config/**",
-  "**/package-lock.json", "**/yarn.lock", "**/bun.lockb", "**/.npmrc",
+  "**/package-lock.json", "**/yarn.lock", "**/bun.lock", "**/bun.lockb", "**/.npmrc",
   "**/build.rs", "**/rust-toolchain.toml", "**/Cargo.toml", "**/Cargo.lock"]
 
 # Trigger 6: outward or fleet actions, installs and rollouts. Never delegable.

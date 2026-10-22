@@ -41,7 +41,7 @@ name = "cadence-installer-observer"
 path = "src/bin/cadence-installer-observer/main.rs"
 
 [features]
-# Embed the built `ui/` SPA into the binary. Requires `pnpm build` inside
+# Embed the built `ui/` SPA into the binary. Requires `bun run build` inside
 # `ui/` first; without the feature `cadence ui run --dist <dir>` serves
 # the same files from disk.
 ui = []
