@@ -121,6 +121,9 @@ pub const MASTER_ALLOWED: &[&str] = &[
     // CAD-1726: put a canvas artifact on the master's own live turn; the
     // handler binds scope to that turn and refuses every other caller.
     "artifact_put",
+    // CAD-1752: propose hiring a catalogue role on the master's own live
+    // turn; the handler binds to that turn and writes one inert entry.
+    "hire_propose",
     // Retained Library image bytes, still exact-turn and source/receiver scoped.
     "app_media_inspect",
 ];

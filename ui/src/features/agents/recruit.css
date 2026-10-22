@@ -160,3 +160,7 @@ textarea.rc-text { min-height: 7.5rem; resize: vertical; line-height: 1.5; width
 }
 .ap-job-sum p { margin: 0 0 0.4rem; }
 .ap-job-sum .rc-does { font-size: var(--text-secondary); }
+
+/* Master's hire proposal in the thread */
+.rc-proposal { display: grid; gap: 0.65rem; max-width: 30rem; margin: 0.4rem 0; }
+.rc-proposal-why { margin: 0; color: var(--color-ink-300); font-size: var(--text-secondary); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }

@@ -58,42 +58,49 @@ impl Shared {
         Ok(())
     }
 
-    /// The scope of the master's live turn: `(scope, context, thread_id,
-    /// alias, message)`, proven the way `chat_file_read` proves it.
-    fn artifact_turn(&self, peer_pid: u32) -> Result<(String, String, String, String, String)> {
+    /// The master's live assigned turn: `(alias, message)`, proven from the
+    /// connection and re-proved against the persisted turn (running state,
+    /// token current). Every other caller is refused. `verb` and `what`
+    /// only word the refusals (`artifact put` / `puts artifacts`).
+    pub(super) fn master_live_turn(
+        &self,
+        verb: &str,
+        what: &str,
+        peer_pid: u32,
+    ) -> Result<(String, String)> {
         let alias = match self.caller_identity(peer_pid) {
             Ok(Caller::Agent(v)) => v.agent.alias.clone(),
             Ok(Caller::NoAgentIdentity) => {
-                return Err(Error::rejected(
-                    "artifact put is the agent's: it needs the master's live assigned turn",
-                ))
+                return Err(Error::rejected(format!(
+                    "{verb} is the agent's: it needs the master's live assigned turn"
+                )))
             }
             Err(e) => {
                 return Err(Error::rejected(format!(
-                    "artifact put refused: caller identity underivable — {e}"
+                    "{verb} refused: caller identity underivable — {e}"
                 )))
             }
         };
         if !crate::master::is_master(&alias) {
             return Err(Error::rejected(format!(
-                "artifact put refused for agent '{alias}' — only the master puts artifacts, \
+                "{verb} refused for agent '{alias}' — only the master {what}, \
                  holding its live turn token"
             )));
         }
         let message = self.store.active_message_id(&alias)?.ok_or_else(|| {
-            Error::rejected(
-                "artifact put needs the master's active assigned turn — none is running",
-            )
+            Error::rejected(format!(
+                "{verb} needs the master's active assigned turn — none is running"
+            ))
         })?;
         let stored = self
             .store
             .message(&message)?
-            .ok_or_else(|| Error::rejected("artifact put: turn is unknown"))?;
+            .ok_or_else(|| Error::rejected(format!("{verb}: turn is unknown")))?;
         let token = stored.turn_id.clone().unwrap_or_default();
         if token.is_empty() || stored.alias != alias || stored.state != "running" {
-            return Err(Error::rejected(
-                "artifact put needs the master's active assigned turn",
-            ));
+            return Err(Error::rejected(format!(
+                "{verb} needs the master's active assigned turn"
+            )));
         }
         let agent = self.store.agent(&alias)?;
         if !crate::adapter::registry::turn_token_current(
@@ -102,10 +109,17 @@ impl Shared {
             agent.generation.as_deref(),
             &token,
         ) {
-            return Err(Error::rejected(
-                "artifact put: turn token is no longer current",
-            ));
+            return Err(Error::rejected(format!(
+                "{verb}: turn token is no longer current"
+            )));
         }
+        Ok((alias, message))
+    }
+
+    /// The scope of the master's live turn: `(scope, context, thread_id,
+    /// alias, message)`, proven the way `chat_file_read` proves it.
+    fn artifact_turn(&self, peer_pid: u32) -> Result<(String, String, String, String, String)> {
+        let (alias, message) = self.master_live_turn("artifact put", "puts artifacts", peer_pid)?;
         let thread = self
             .store
             .message_conversation(&alias, &message)?

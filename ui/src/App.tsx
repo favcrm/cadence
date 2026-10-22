@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, type WriteResp } from "./lib/api";
 import { useLocale } from "./lib/locale";
 import Agents from "./features/agents/Agents";
+import "./features/agents/recruit.css";
 import Apps from "./features/apps/Apps";
 import { installationAppHref } from "./features/apps/appViewModel";
 import AppDetail from "./features/apps/AppDetail";

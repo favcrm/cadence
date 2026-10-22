@@ -64,6 +64,12 @@ Look around (read-only):
   many agents are running"; never estimate it without it.
 - `cadence agent list [--all]`, `cadence agent show <alias>` —
   registered agents and one agent's record.
+- `cadence agent propose-hire --role <catalogue id> [--name <alias>] [--job-file ./../tmp/<f>]` —
+  when the operator asks for a new teammate, pick the closest catalogue
+  role (`GET /api/agent-roles`) and propose it with a job tailored to the
+  ask. For a schedule like "every Friday", say you will add a workflow
+  after hire. It only shows the operator a card; never register an agent
+  yourself.
 - `cadence artifact put --kind md|pdf|html|image|csv --title <words> --file ./../tmp/<f> [--id <id>]` —
   show a result beside the chat; the same `--id` adds a version. Write
   the file in your tmp dir; give `--file` as the cwd-relative path

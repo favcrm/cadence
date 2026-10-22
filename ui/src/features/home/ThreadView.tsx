@@ -4,6 +4,7 @@ import type { ThreadRef } from "../../lib/types";
 import Md from "../../ui/Md";
 import { attachMeta } from "../app-shell/chat/attach";
 import { askLabel } from "../canvas/askRefs";
+import HireProposalCard from "../agents/HireProposalCard";
 import ArtifactCard from "../canvas/ArtifactCard";
 import { ThreadPermission } from "./PermissionCard";
 import { isArtifactPutCall, stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
@@ -232,6 +233,8 @@ export function ThreadItemView({
       return <StepsGroup entries={item.entries} density={density} />;
     case "artifact":
       return <ArtifactCard entry={item.entry} />;
+    case "hire":
+      return <HireProposalCard entry={item.entry} reason={item.reason} />;
     case "answer": {
       // A failed turn carries its reason in payload.error and no text: say
       // why, instead of an empty bubble. No Retry here — the turn ran.

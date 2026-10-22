@@ -19,7 +19,6 @@ import {
   type HistoryFilter,
 } from "./agentTabModel";
 import { agentLocation } from "./agentView";
-import "./recruit.css";
 
 export interface TabContext {
   alias: string;

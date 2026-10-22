@@ -4,7 +4,6 @@ import Button from "../../ui/Button";
 import type { Agent, AgentRole } from "../../lib/types";
 import { HireGate, GhostCard, RoleCard } from "./RecruitCards";
 import { categoryLabel, matchesRole, onTeamCount, type RolesState } from "./agentRoles";
-import "./recruit.css";
 
 /** The catalogue: category chips with counts, search, grouped cards, then
  *  Ask Master and Start blank. Hire goes through `onPick` (the sheet). */

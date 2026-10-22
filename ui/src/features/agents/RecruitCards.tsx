@@ -3,7 +3,6 @@ import { useTranslate } from "../../lib/locale";
 import type { AgentRole, AgentRolesPayload } from "../../lib/types";
 import AgentAvatar from "./AgentAvatar";
 import { categoryLabel } from "./agentRoles";
-import "./recruit.css";
 
 /** The operator-only banner shown to a viewer who cannot hire. */
 export function HireGate({ reason }: { reason: string | null }) {

@@ -16,7 +16,7 @@ import type { SseEvent } from "../../lib/sse";
  */
 
 export type ThreadRole = "operator" | "agent" | "system";
-export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact";
+export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact" | "hire_proposal";
 
 /** One stored entry (`thread_read` / the stream's `entry` frame). */
 export interface ThreadEntry {
@@ -213,6 +213,7 @@ export type ThreadItem =
   | { type: "tools"; key: string; entries: ThreadEntry[] }
   | { type: "answer"; key: string; entry: ThreadEntry }
   | { type: "artifact"; key: string; entry: ThreadEntry }
+  | { type: "hire"; key: string; entry: ThreadEntry; reason: string | null }
   | { type: "pending"; key: string; pending: PendingMessage };
 
 const TOOL_KINDS = new Set(["tool_call", "tool_result"]);
@@ -248,6 +249,15 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
       items.push({ type: "commentary", key, entry });
     } else if (entry.kind === "turn_result") {
       items.push({ type: "answer", key, entry });
+    } else if (entry.kind === "hire_proposal") {
+      // CAD-1752: Master's inert proposal. Its reasoning is the turn's own
+      // commentary just before the card; that line moves into the card
+      // instead of showing twice.
+      const last = items[items.length - 1];
+      const lead =
+        last?.type === "commentary" && last.entry.message === entry.message ? items.pop() : null;
+      const reason = lead?.type === "commentary" ? lead.entry.text.trim() || null : null;
+      items.push({ type: "hire", key, entry, reason });
     } else if (entry.kind === "artifact") {
       // CAD-1726: a card for a canvas artifact — metadata, never content.
       items.push({ type: "artifact", key, entry });

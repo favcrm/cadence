@@ -23,7 +23,6 @@ import {
   lifecycleOf,
 } from "./agentView";
 import "./agents.css";
-import "./recruit.css";
 
 const TONE: Record<string, string> = {
   fail: "var(--color-fail)",

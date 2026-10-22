@@ -2,14 +2,12 @@ import { useContext, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { useTranslate } from "../../lib/locale";
-import { IconClose } from "../../ui/icons";
 import Button from "../../ui/Button";
 import { WriteGate } from "../auth/WriteGate";
 import type { AgentRole, AgentRolesPayload } from "../../lib/types";
 import AgentAvatar from "./AgentAvatar";
 import { HireGate } from "./RecruitCards";
 import { aliasProblem, categoryLabel, modelSourceText, runsOnText } from "./agentRoles";
-import "./recruit.css";
 
 function Chip({ text, planned = false }: { text: string; planned?: boolean }) {
   const t = useTranslate();
@@ -27,6 +25,7 @@ export default function HireSheet({
   role,
   payload,
   alias: suggested,
+  job: startJob,
   taken,
   onClose,
   onHired,
@@ -34,6 +33,8 @@ export default function HireSheet({
   role: AgentRole;
   payload: AgentRolesPayload;
   alias: string;
+  /** A prefilled job (a proposal's); the role's own when absent. */
+  job?: string;
   taken: string[];
   onClose: () => void;
   onHired: (alias: string, role: AgentRole) => void;
@@ -42,7 +43,7 @@ export default function HireSheet({
   const writeBlock = useContext(WriteGate);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [alias, setAlias] = useState(suggested);
-  const [job, setJob] = useState(role.instructions);
+  const [job, setJob] = useState(startJob ?? role.instructions);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const hosted = payload.install.hosted;
@@ -111,10 +112,11 @@ export default function HireSheet({
           variant="ghost"
           size="sm"
           className="x"
-          icon={<IconClose />}
           aria-label={t("Close")}
           onClick={onClose}
-        />
+        >
+          ✕
+        </Button>
       </div>
       <div className="rc-sheet-b">
         <HireGate reason={writeBlock} />

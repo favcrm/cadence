@@ -47,7 +47,6 @@ import {
   type AgentFilter,
 } from "./agentView";
 import "./agents.css";
-import "./recruit.css";
 import type { Agent, AgentRole, AgentsPayload, IssueCard } from "../../lib/types";
 
 /** Exact assigned/owned issue links not already shown with current work. */

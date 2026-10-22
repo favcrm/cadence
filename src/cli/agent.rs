@@ -303,6 +303,19 @@ pub(crate) enum AgentAction {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Propose hiring a catalogue role (the master, on its live turn): the
+    /// operator reviews a card and hires from it. Registers nothing.
+    ProposeHire {
+        /// A catalogue role id (`GET /api/agent-roles`), e.g. `accountant`.
+        #[arg(long)]
+        role: String,
+        /// The name to suggest; omitted, the board picks `<role>-<n>`.
+        #[arg(long)]
+        name: Option<String>,
+        /// A job tailored to the ask; omitted, the role's own job is used.
+        #[arg(long)]
+        job_file: Option<PathBuf>,
+    },
     /// Stop the agent's actor (queued messages are retained).
     Stop { alias: String },
     /// Resume a stopped agent on its saved native thread. Like a
@@ -916,6 +929,23 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
             )?;
             cadence_agent::briefing::deliver_job_update(&state_dir, &alias, &text, &mut out);
             out
+        }
+        AgentAction::ProposeHire { role, name, job_file } => {
+            // The job is read through the master's command-file rules, never
+            // a raw read.
+            let job = match job_file {
+                Some(path) => Some(crate::cli::read_master_command_file(
+                    &state_dir,
+                    Some(&path),
+                    cadence_agent::store::MAX_INSTRUCTIONS_BYTES as u64,
+                )?),
+                None => None,
+            };
+            client::rpc(
+                &state_dir,
+                "hire_propose",
+                json!({"role": role, "name": name, "job": job}),
+            )?
         }
         AgentAction::Remove { alias, force } => client::rpc(
             &state_dir,

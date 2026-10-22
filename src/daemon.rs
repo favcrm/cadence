@@ -224,6 +224,7 @@ mod dispatch_rpc;
 mod effect_rpc;
 #[cfg(all(test, feature = "test-seam"))]
 mod explorer_acceptance;
+mod hire_rpc;
 mod idea_rpc;
 mod identity;
 #[cfg(target_os = "linux")]
@@ -2789,6 +2790,7 @@ impl Shared {
             "chat_file_upload" => self.rpc_chat_file_upload(params, peer_pid),
             "chat_file_read" => self.rpc_chat_file_read(params, peer_pid),
             "artifact_put" => self.rpc_artifact_put(params, peer_pid),
+            "hire_propose" => self.rpc_hire_propose(params, peer_pid),
             "artifact_read" => self.rpc_artifact_read(params, peer_pid),
             "artifact_versions" => self.rpc_artifact_versions(params, peer_pid),
             "conversation_list" => self.rpc_conversation_list(params, peer_pid),
