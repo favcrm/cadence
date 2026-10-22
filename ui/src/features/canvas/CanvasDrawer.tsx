@@ -8,6 +8,7 @@ import { makeAskRef } from "./askRefs";
 import {
   clampWidth,
   closeDrawer,
+  defaultWidth,
   closeTab,
   drawerLayout,
   focusTab,
@@ -29,7 +30,7 @@ const FOOT: Record<string, string[]> = {
   md: ["board Markdown renderer", "no raw HTML"],
   pdf: ["download only"],
   image: ["inline image"],
-  csv: ["plain text"],
+  csv: ["table · first 2,000 rows"],
 };
 
 function useViewport(): number {
@@ -75,6 +76,16 @@ function WorkingStrip({ working, updating }: { working: Working; updating: strin
         </span>
         {updating ? <span className="artbadge">{updating}</span> : null}
       </div>
+      {working.steps.length > 0 ? (
+        <details className="cv-details">
+          <summary>{t("details")}</summary>
+          <ul>
+            {working.steps.map((s, i) => (
+              <li key={`${i}:${s.raw}`}>{s.raw}</li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
       <div className="cv-bar" aria-hidden>
         <i className="cv-bar-run" />
       </div>
@@ -94,20 +105,31 @@ function focusComposer(): void {
   box?.focus();
 }
 
-function Body({ conversation, tab, composerKey, working, sheet }: {
+function Body({ conversation, tab, composerKey, working, sheet, expanded, onExpand }: {
   conversation: string;
   tab: CanvasTab;
   composerKey: string | null;
   working: Working | null;
   sheet: boolean;
+  expanded: boolean;
+  onExpand: () => void;
 }) {
   const t = useTranslate();
   const state = useArtifactBytes(conversation, tab.id, tab.selected);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const info = tab.versions[tab.selected];
-  // "updating v1 → v2": only when this very turn already put the newest
-  // version, so the agent is demonstrably still working on this artifact.
-  const updating = working && tab.turn !== null && tab.turn === working.turn ? `${t("updating")} v${tab.latest} → v${tab.latest + 1}` : null;
+  // "updating v1 → v2" only while this turn has asked to add a version to
+  // this artifact and it has not landed; once it has, "updated to v2".
+  const putThisTurn = !!working && tab.turn !== null && tab.turn === working.turn;
+  const updating = !working
+    ? null
+    : putThisTurn
+      ? tab.latest > 1
+        ? `${t("updated to")} v${tab.latest}`
+        : null
+      : working.updating.includes(tab.id)
+        ? `${t("updating")} v${tab.latest} → v${tab.latest + 1}`
+        : null;
 
   const download = () => {
     if (state.status !== "ready") return;
@@ -153,9 +175,23 @@ function Body({ conversation, tab, composerKey, working, sheet }: {
           </span>
         </span>
         {!sheet ? (
-          <button type="button" className="cv-iconbtn" onClick={closeDrawer} aria-label={t("Close canvas")}>
-            <IconClose size={12} />
-          </button>
+          <>
+            <button
+              type="button"
+              className="cv-iconbtn"
+              onClick={onExpand}
+              aria-pressed={expanded}
+              aria-label={expanded ? t("Restore canvas width") : t("Expand canvas")}
+              title={expanded ? t("Restore canvas width") : t("Expand canvas")}
+            >
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                {expanded ? <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" /> : <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />}
+              </svg>
+            </button>
+            <button type="button" className="cv-iconbtn" onClick={closeDrawer} aria-label={t("Close canvas")}>
+              <IconClose size={12} />
+            </button>
+          </>
         ) : null}
         <span className="cv-tools">
           <span className="vers" role="group" aria-label={t("Version")}>
@@ -218,10 +254,12 @@ export default function CanvasDrawer() {
   const t = useTranslate();
   const canvas = useCanvas();
   const viewport = useViewport();
-  const [width, setWidth] = useState(readWidth);
-  const want = clampWidth(width, viewport);
+  // The width the operator dragged to wins; until then each kind has its own.
+  const [dragged, setDragged] = useState(readWidth);
+  const [expanded, setExpanded] = useState(false);
   const open = canvas.open && canvas.tabs.length > 0 && canvas.conversation !== null;
   const tab = canvas.tabs.find((x) => x.id === canvas.active) ?? canvas.tabs[0] ?? null;
+  const want = clampWidth(dragged ?? defaultWidth(tab?.kind ?? "md", viewport), viewport);
   const [layout, setLayout] = useState<DrawerLayout>({ mode: "push", width: want });
   const pushed = useRef(0);
   const rootRef = useRef<HTMLElement | null>(null);
@@ -231,7 +269,7 @@ export default function CanvasDrawer() {
   useLayoutEffect(() => {
     if (!open) return;
     const surface: Surface = canvas.surface;
-    const next = drawerLayout(viewport, want, surface, surface === "app" ? chatRightEdge(pushed.current) : null);
+    const next = drawerLayout(viewport, want, surface, surface === "app" ? chatRightEdge(pushed.current) : null, expanded);
     pushed.current = next.mode === "push" ? next.width : 0;
     setLayout((cur) => (cur.mode === next.mode && cur.width === next.width ? cur : next));
   });
@@ -255,10 +293,17 @@ export default function CanvasDrawer() {
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !e.defaultPrevented) closeDrawer();
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      // Esc first restores the width, then closes.
+      if (expanded) setExpanded(false);
+      else closeDrawer();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+  }, [open, expanded]);
+
+  useEffect(() => {
+    if (!open) setExpanded(false);
   }, [open]);
 
   // The active tab scrolls into view when it changes.
@@ -268,7 +313,7 @@ export default function CanvasDrawer() {
 
   const commit = useCallback((px: number) => {
     const next = clampWidth(px, window.innerWidth);
-    setWidth(next);
+    setDragged(next);
     writeWidth(next);
   }, []);
 
@@ -279,7 +324,7 @@ export default function CanvasDrawer() {
   };
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!drag.current) return;
-    setWidth(clampWidth(drag.current.w + (drag.current.x - e.clientX), window.innerWidth));
+    setDragged(clampWidth(drag.current.w + (drag.current.x - e.clientX), window.innerWidth));
   };
   const onPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!drag.current) return;
@@ -307,7 +352,7 @@ export default function CanvasDrawer() {
       aria-label={t("Canvas")}
       style={sheet ? undefined : { width: layout.width }}
     >
-      {!sheet ? (
+      {!sheet && !expanded ? (
         <div
           className="cv-grip"
           role="separator"
@@ -345,6 +390,8 @@ export default function CanvasDrawer() {
         composerKey={canvas.composerKey}
         working={working}
         sheet={sheet}
+        expanded={expanded}
+        onExpand={() => setExpanded((x) => !x)}
       />
     </aside>
   );

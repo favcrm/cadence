@@ -3,6 +3,7 @@ import {
   canvasSnapshot,
   clampWidth,
   closeDrawer,
+  defaultWidth,
   closeTab,
   feedCanvas,
   openArtifact,
@@ -10,7 +11,8 @@ import {
   selectVersion,
   type FeedCard,
 } from "../src/features/canvas/canvasStore";
-import { feedParts } from "../src/features/canvas/feed";
+import { feedParts, plainStep } from "../src/features/canvas/feed";
+import { parseCsv } from "../src/features/canvas/csv";
 import { askBody, askLabel, makeAskRef } from "../src/features/canvas/askRefs";
 import { threadItems, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
 
@@ -101,6 +103,14 @@ equal(drawerLayout(375, 480, "home", null).mode, "sheet", "phone sheet");
 equal(drawerLayout(1280, 480, "app", null), { mode: "cover", width: 480 }, "app, no chat pane, 1280 covers");
 equal(drawerLayout(900, 480, "app", null), { mode: "cover", width: 480 }, "app, no chat pane, 900 covers");
 equal(drawerLayout(1100, 660, "app", null), { mode: "cover", width: 544 }, "app, no chat pane, narrow room covers by the page rule");
+// Default widths scale with the viewport, wider for html/csv/pdf, within their clamps.
+equal([defaultWidth("md", 1835), defaultWidth("md", 1000), defaultWidth("md", 800)], [760, 480, 480], "default width 45%, 480..760");
+equal([defaultWidth("html", 1835), defaultWidth("csv", 1280), defaultWidth("pdf", 900)], [960, 704, 560], "document kinds 55%, 560..960");
+// Expand: cover taking most of the page; Home keeps a 64px chat strip, the app shell stops at the chat pane.
+equal(drawerLayout(1440, 480, "home", null, true), { mode: "cover", width: 1168 }, "home expands beside a chat strip");
+equal(drawerLayout(1440, 480, "app", 700, true), { mode: "cover", width: 728 }, "app expand never covers the chat pane");
+equal(drawerLayout(900, 480, "app", 860, true).mode, "cover", "app expand at 900 stays beside the narrowed chat");
+equal(drawerLayout(500, 480, "home", null, true).mode, "sheet", "a phone is a sheet either way");
 equal([clampWidth(100, 1440), clampWidth(2000, 1440), clampWidth(500, 1440)], [360, 864, 500], "width clamps to 360px..60%");
 
 // The feed reads cards and the live step from the thread, nothing else.
@@ -120,7 +130,46 @@ const state: ThreadState = {
 };
 const parts = feedParts(threadItems(state), 3, true);
 equal(parts.cards.map((c) => [c.key, c.live, c.operatorTurn, c.turn]), [["art-a@2", true, true, "m1"]], "malformed ids are dropped");
-equal(parts.working, { plan: "Pulling the numbers", step: "Bash: cadence status", steps: [{ text: "Bash: cadence status", done: false }], count: 1, turn: "m1" }, "plan, live step, no invented total");
+equal(
+  parts.working,
+  { plan: "Pulling the numbers", step: "Checking the board", steps: [{ text: "Checking the board", raw: "Bash: cadence status", done: false }], count: 1, turn: "m1", updating: [] },
+  "plan, live step in plain words, no invented total",
+);
+
+// The Working view never shows a command line, an absolute path or JSON.
+for (const raw of [
+  "Bash: cadence artifact put --kind md --title x --file /home/ubuntu/.local/state/cadence/master/tmp/r.md",
+  "Bash: cat /home/ubuntu/.local/state/cadence/master/tmp/a.json",
+  'Read: /home/ubuntu/x {"bytes":4,"digest":"d"}',
+  "weird",
+]) {
+  const plain = plainStep(raw);
+  if (/bash:|\/home|\.local\/state|master\/tmp|[{}]|--/.test(plain)) throw new Error(`plain step leaks: ${plain}`);
+}
+equal(plainStep("Bash: cadence artifact put --kind md --id art-a --file ./../tmp/r.md"), "Putting it in the canvas", "a put reads plainly");
+
+// "updating vN" only names artifacts the turn asked to add a version to.
+const putState: ThreadState = {
+  exists: true,
+  pending: [],
+  entries: [
+    e(1, "operator", "message", "tighten it", "m1"),
+    e(2, "agent", "tool_call", "Bash: cadence artifact put --kind md --title x --id art-a --file ./../tmp/r.md", "m1", { tool_use_id: "t9" }),
+  ],
+};
+equal(feedParts(threadItems(putState), 0, true).working?.updating, ["art-a"], "the put names its target");
+equal(feedParts(threadItems(putState), 0, false).working, null, "no strip when no turn runs");
+
+// CSV: RFC 4180 quoting, a header row, a row cap, and a refusal to guess.
+equal(
+  parseCsv('a,b\r\n"x, y","say ""hi"""\n"two\nlines",3\n'),
+  { header: ["a", "b"], rows: [["x, y", 'say "hi"'], ["two\nlines", "3"]], total: 2 },
+  "quoted fields",
+);
+equal(parseCsv('a,b\n"open,1'), null, "an unterminated quote falls back to text");
+equal(parseCsv('a,b\n"x"y,1'), null, "text after a closing quote falls back to text");
+const big = parseCsv(`h\n${Array.from({ length: 2500 }, (_, i) => i).join("\n")}`);
+equal([big?.rows.length, big?.total], [2000, 2500], "at most 2,000 rows, total reported");
 
 // Ask to change: the chip expands into the body the master receives.
 const ask = makeAskRef({ artifact: "art-a", version: 2, title: "Report", passage: "Tuesday lunch is soft" });

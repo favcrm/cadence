@@ -34,6 +34,31 @@ export function artifactRef(payload: Record<string, unknown> | null | undefined)
   };
 }
 
+/** Plain words for a tool step: the tool's name decides, never its
+ *  arguments — no command line, path or JSON reaches the Working view. The
+ *  raw step stays in the "details" disclosure. */
+export function plainStep(text: string): string {
+  const raw = stepSummary(text);
+  const tool = /^([A-Za-z_][\w .-]{0,30}?):/.exec(raw)?.[1]?.trim().toLowerCase() ?? "";
+  if (/\bartifact put\b/.test(raw)) return "Putting it in the canvas";
+  if (tool === "read" || tool === "cat" || tool === "grep" || tool === "glob" || tool === "ls") return "Reading";
+  if (tool === "write" || tool === "edit") return "Writing a draft";
+  if (tool === "bash") return "Checking the board";
+  return "Working on it";
+}
+
+/** The agent's own words with absolute paths taken out. */
+function plainWords(text: string): string {
+  return text.replace(/(^|[\s("'`])\/[\w.~@%+=,-]+(?:\/[\w.~@%+=,-]*)*/g, "$1…");
+}
+
+/** Artifact ids a tool call asks to add a version to: `artifact put … --id art-x`. */
+function putTargets(text: string): string[] {
+  if (!/\bartifact put\b/.test(text)) return [];
+  const m = /--id[ =](art-[A-Za-z0-9]+)/.exec(text);
+  return m ? [m[1]] : [];
+}
+
 export interface FeedParts {
   cards: FeedCard[];
   working: Working | null;
@@ -75,20 +100,25 @@ export function feedParts(items: ThreadItem[], liveAfter: number, running: boole
     const tail = items.slice(lastOperator + 1);
     let plan: string | null = null;
     const steps: WorkStep[] = [];
+    const updating = new Set<string>();
     for (const item of tail) {
-      if (item.type === "commentary" && item.entry.text.trim()) plan = item.entry.text.trim();
+      if (item.type === "commentary" && item.entry.text.trim()) plan = plainWords(item.entry.text.trim());
       if (item.type === "tools") {
-        for (const s of toolSteps(item.entries)) steps.push({ text: stepSummary(s.summary), done: s.done });
+        for (const s of toolSteps(item.entries)) {
+          steps.push({ text: plainStep(s.call.text), raw: s.summary, done: s.done });
+          for (const id of putTargets(s.call.text)) updating.add(id);
+        }
       }
     }
     const tools = [...tail].reverse().find((i) => i.type === "tools");
     const open = tools && tools.type === "tools" ? openStep(tools.entries) : null;
     working = {
       plan,
-      step: open ? stepSummary(open.text) : null,
+      step: open ? plainStep(open.text) : null,
       steps: steps.slice(-4),
       count: steps.length,
       turn,
+      updating: [...updating],
     };
   }
   return { cards, working, turn };
