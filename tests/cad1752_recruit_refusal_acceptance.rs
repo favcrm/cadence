@@ -2486,3 +2486,366 @@ fn cad1752_catalogue_register_refuses_unlaunchable_model() {
     );
     assert!(fx.agent("acct-ok").is_some());
 }
+
+// ------------------------------------------ stage 4: Ask Master (hire_propose)
+//
+// The CAD-1726 harness shape, from outside the crate: a real `Shared`
+// dispatching under seam assertions, no actors. The master is a Pi row
+// whose endpoint generation is set, so a token minted under it is current;
+// a turn is made RUNNING exactly as the adapter would mark it.
+
+const MASTER_GEN: &str = "0123456789abcdef0123456789abcdef";
+
+struct Mx {
+    dir: tempfile::TempDir,
+    shared: Arc<daemon::Shared>,
+}
+
+impl Mx {
+    fn start() -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix("c1752m-")
+            .tempdir()
+            .unwrap();
+        let pm = dir.path().join("pm");
+        cadence_agent::issue::Pm::init(&pm).unwrap();
+        let opts = daemon::ServeOptions {
+            provider_env: cadence_agent::adapter::ProviderEnv::refusing_providers(),
+            ..Default::default()
+        };
+        opts.provider_env
+            .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+        opts.provider_env
+            .set("CADENCE_HOME", dir.path().to_str().unwrap());
+        let shared = daemon::Shared::new(dir.path(), &opts).unwrap();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        for (alias, provider, kind) in [("master", "pi", "managed"), ("w1", "fake", "fake")] {
+            shared
+                .store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider,
+                    endpoint_kind: kind,
+                    role: "worker",
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params: (alias == "master").then_some(r#"{"model":"fixture/model"}"#),
+                    team_role: None,
+                    model_policy: None,
+                })
+                .unwrap();
+        }
+        // The master's launch gate needs an allowed explicit model, as the
+        // CAD-1726 fixture seeds it (nothing launches here).
+        let mut settings = shared.store.settings().unwrap();
+        settings.doc.pi = Some(
+            serde_json::from_value(json!({"models": {
+                "allow": ["fixture/model"], "default": {"master": "fixture/model"}}}))
+            .unwrap(),
+        );
+        shared
+            .store
+            .save_settings(settings.revision, settings.doc, "c1752-fixture")
+            .unwrap();
+        shared
+            .store
+            .set_identity_with_quota(
+                "master",
+                &cadence_agent::adapter::Identity {
+                    thread_id: "t".into(),
+                    session_id: "s".into(),
+                    model: None,
+                    effort: None,
+                    pid: std::process::id(),
+                    endpoint: None,
+                    generation: Some(MASTER_GEN.into()),
+                    attach: None,
+                },
+                None,
+            )
+            .unwrap();
+        Self { dir, shared }
+    }
+
+    fn call(&self, who: Asserted, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        scoped(who, || {
+            self.shared.dispatch(method, &params, std::process::id())
+        })
+    }
+    fn operator(&self, method: &str, params: Value) -> Value {
+        self.call(Asserted::Operator, method, params)
+            .unwrap_or_else(|e| panic!("operator {method}: {e}"))
+    }
+    fn propose(&self, params: Value) -> cadence_agent::Result<Value> {
+        self.call(Asserted::Agent("master".into()), "hire_propose", params)
+    }
+    fn db(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.dir.path().join("cadence.sqlite3")).unwrap()
+    }
+    fn count(&self, sql: &str) -> i64 {
+        self.db().query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// The operator's Home message to the master, made RUNNING under a
+    /// token minted for `generation`.
+    fn home_turn(&self, id: &str, generation: &str) {
+        self.operator(
+            "thread_send",
+            json!({"alias": "master", "text": format!("hi {id}"), "message": id}),
+        );
+        self.run(id, generation);
+    }
+
+    fn run(&self, id: &str, generation: &str) {
+        let token = cadence_agent::adapter::registry::PI_MANAGED_TURN_TOKENS.mint(generation);
+        self.db()
+            .execute(
+                "UPDATE messages SET state='submitting', started=1.0 WHERE id=?",
+                [id],
+            )
+            .unwrap();
+        self.shared.store.mark_running(id, &token).unwrap();
+    }
+
+    fn finish(&self, id: &str) {
+        self.db()
+            .execute("UPDATE messages SET state='completed' WHERE id=?", [id])
+            .unwrap();
+    }
+
+    fn proposals(&self) -> Vec<Value> {
+        let home = self.shared.store.ensure_thread("master").unwrap().id;
+        self.shared
+            .store
+            .thread_entries_of(&home, 0, 200)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "hire_proposal")
+            .map(|e| e.payload.unwrap_or(Value::Null))
+            .collect()
+    }
+
+    fn agents(&self) -> i64 {
+        self.count("SELECT count(*) FROM agents")
+    }
+
+    /// No trace of a registration for `name`.
+    fn assert_unregistered(&self, name: &str, what: &str) {
+        assert!(
+            self.shared.store.agent_opt(name).unwrap().is_none(),
+            "{what}: agent row '{name}'"
+        );
+        let state = self.dir.path();
+        assert!(
+            !state.join("agents").join(name).join("home").exists(),
+            "{what}: home dir for '{name}'"
+        );
+        assert!(
+            !client::briefing_path(state, &json!({}), name).exists(),
+            "{what}: briefing for '{name}'"
+        );
+        let events: i64 = self
+            .db()
+            .query_row("SELECT count(*) FROM events WHERE alias=?1", [name], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(events, 0, "{what}: events for '{name}'");
+    }
+}
+
+fn hire(role: &str) -> Value {
+    json!({"role": role})
+}
+
+/// Item 1. Guards: `master_live_turn` (`src/daemon/artifacts_rpc.rs`:
+/// master only, a running turn, a current token) and the Home check in
+/// `rpc_hire_propose` (`src/daemon/hire_rpc.rs`).
+#[test]
+fn cad1752_hire_propose_refuses_every_caller_but_the_masters_home_turn() {
+    let mx = Mx::start();
+    let mut wrong = Vec::new();
+    // `why` lists the accepted reasons, `|`-separated: the master's own
+    // policy gate (`master_policy`) may refuse before the handler does.
+    let mut check = |what: &str, result: cadence_agent::Result<Value>, why: &str| match result {
+        Err(err) if why.split('|').any(|w| err.to_string().contains(w)) => {
+            eprintln!("CAD-1752 hire_propose {what}: {err}");
+        }
+        other => wrong.push(format!("{what}: {other:?} (wanted '{why}')")),
+    };
+
+    // A non-master agent and the operator, while the master's turn runs.
+    mx.home_turn("h-live", MASTER_GEN);
+    check(
+        "non-master agent",
+        mx.call(
+            Asserted::Agent("w1".into()),
+            "hire_propose",
+            hire("accountant"),
+        ),
+        "only the master proposes hires",
+    );
+    check(
+        "operator connection",
+        mx.call(Asserted::Operator, "hire_propose", hire("accountant")),
+        "hire propose is the agent's",
+    );
+    check(
+        "unproven caller",
+        mx.call(Asserted::Unproven, "hire_propose", hire("accountant")),
+        "hire propose",
+    );
+    // The turn has finished.
+    mx.finish("h-live");
+    check(
+        "finished turn",
+        mx.propose(hire("accountant")),
+        "none is running|may call only the scoped app verbs",
+    );
+    // A token from another endpoint generation.
+    mx.home_turn("h-gen", "fedcba9876543210fedcba9876543210");
+    check(
+        "token from another generation",
+        mx.propose(hire("accountant")),
+        "turn token is no longer current",
+    );
+    mx.finish("h-gen");
+    // An app-scoped (non-Home) turn.
+    let source = format!(
+        "{}/tests/fixtures/apps/social-content",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let install = mx.operator("app_workspace_install", json!({"source": source}))["install_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let conversation = mx.operator(
+        "conversation_create",
+        json!({"alias": "master", "install_id": install, "general": true}),
+    )["conversation"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    mx.operator(
+        "thread_send",
+        json!({"alias": "master", "text": "hi app", "message": "h-app",
+               "app": {"install_id": install}, "conversation": conversation}),
+    );
+    mx.run("h-app", MASTER_GEN);
+    check(
+        "app-scoped turn",
+        mx.propose(hire("accountant")),
+        "made in the master's Home conversation|may call only the scoped app verbs",
+    );
+    mx.finish("h-app");
+    drop(check);
+    assert!(
+        mx.proposals().is_empty(),
+        "a refused call recorded {:?}",
+        mx.proposals()
+    );
+    assert!(wrong.is_empty(), "callers not refused: {wrong:#?}");
+
+    // Control: the master on its live Home turn records exactly one entry.
+    let before = mx.agents();
+    mx.home_turn("h-ok", MASTER_GEN);
+    let out = mx
+        .propose(hire("accountant"))
+        .expect("the master's Home turn");
+    assert_eq!(out["state"], "proposed", "{out}");
+    assert_eq!(mx.proposals().len(), 1);
+    assert_eq!(mx.agents(), before, "a proposal registered an agent");
+}
+
+/// Item 2. Guard: the same-turn duplicate refusal in
+/// `Store::hire_proposal_put` (`src/store/threads.rs`).
+#[test]
+fn cad1752_hire_propose_refuses_a_replay_on_one_turn() {
+    let mx = Mx::start();
+    mx.home_turn("r-1", MASTER_GEN);
+    let first = json!({"role": "accountant", "name": "ledger-1"});
+    mx.propose(first.clone()).expect("first proposal");
+    let again = mx.propose(first.clone());
+    assert!(
+        again
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("already proposed exactly this hire")),
+        "replay on the same turn: {again:?}"
+    );
+    assert_eq!(mx.proposals().len(), 1, "{:?}", mx.proposals());
+    // Control: the next turn may propose it again.
+    mx.finish("r-1");
+    mx.home_turn("r-2", MASTER_GEN);
+    mx.propose(first).expect("a new turn");
+    assert_eq!(mx.proposals().len(), 2);
+}
+
+/// Item 3. Guards: `rpc_hire_propose` writes only the thread entry, and
+/// refuses a name that is an existing agent or `master`.
+#[test]
+fn cad1752_hire_propose_never_registers() {
+    let mx = Mx::start();
+    mx.home_turn("n-1", MASTER_GEN);
+    let before = mx.agents();
+    let named = mx
+        .propose(json!({"role": "accountant", "name": "ledger-2", "job": "Chase invoices."}))
+        .expect("named proposal");
+    assert_eq!(named["proposal"]["name"], "ledger-2", "{named}");
+    let unnamed = mx
+        .propose(json!({"role": "researcher"}))
+        .expect("unnamed proposal");
+    assert!(unnamed["proposal"]["name"].is_null(), "{unnamed}");
+    assert_eq!(mx.proposals().len(), 2);
+    assert_eq!(mx.agents(), before, "a proposal created an agent row");
+    mx.assert_unregistered("ledger-2", "named proposal");
+    let entries = std::fs::read_dir(mx.dir.path().join("agents"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(entries, 0, "a proposal created agent dirs");
+
+    let mut wrong = Vec::new();
+    for (name, why) in [("w1", "already exists"), ("master", "master")] {
+        match mx.propose(json!({"role": "accountant", "name": name})) {
+            Err(err) if err.to_string().contains(why) => {}
+            other => wrong.push(format!("name '{name}': {other:?}")),
+        }
+    }
+    assert!(wrong.is_empty(), "names not refused: {wrong:#?}");
+    assert_eq!(mx.proposals().len(), 2, "a refused name recorded an entry");
+    assert_eq!(mx.agents(), before);
+}
+
+/// Item 4. Guard: the request-field allowlist (`role`, `name`, `job`) at
+/// the top of `rpc_hire_propose`.
+#[test]
+fn cad1752_hire_propose_refuses_forged_fields() {
+    let mx = Mx::start();
+    mx.home_turn("f-1", MASTER_GEN);
+    let home = mx.shared.store.ensure_thread("master").unwrap().id;
+    let mut wrong = Vec::new();
+    for (field, value) in [
+        ("conversation", json!(home)),
+        ("turn", json!("pi-forged")),
+        ("message", json!("f-1")),
+        ("alias", json!("master")),
+        ("agent", json!("w1")),
+        ("catalogue", json!("developer")),
+    ] {
+        let mut params = hire("accountant");
+        params[field] = value;
+        match mx.propose(params) {
+            Err(err) if matches!(err, cadence_agent::Error::Rejected(_)) => {
+                eprintln!("CAD-1752 hire_propose forged '{field}': {err}");
+                if !err.to_string().contains(field) {
+                    wrong.push(format!("'{field}': refused without naming it: {err}"));
+                }
+            }
+            other => wrong.push(format!("'{field}': {other:?}")),
+        }
+    }
+    assert!(mx.proposals().is_empty(), "a forged call recorded an entry");
+    assert!(wrong.is_empty(), "forged fields: {wrong:#?}");
+    mx.propose(hire("accountant")).expect("control");
+    assert_eq!(mx.proposals().len(), 1);
+}
