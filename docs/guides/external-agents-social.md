@@ -17,6 +17,18 @@ pasted provider token) is not a shortcut.
 - Destinations come from owner-authorized discovery, never a typed
   handle or pasted URL.
 
+## Operator: choose the publishing account
+
+In the app's native **Publish to Instagram** settings, connect Instagram,
+then choose **Use @account for publishing**. The current account is marked
+**Publishing here**; the information button holds setup details. Hosted
+connection setup returns to the same installation's native settings page.
+
+Host-drawn confirmations show the complete account/action label, wrapping
+inside the app area when space is narrow. A time-zone change is confirmed
+as **Save time zone**, with the account and zone named. These controls do not
+replace the operator's separate approval of a post.
+
 ## V1 access: SSH shell + joined agent identity (works today)
 
 SSH or tailnet gives the agent a shell on the host — nothing more.
