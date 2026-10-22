@@ -16,7 +16,7 @@
 
 # Run once in the review checkout before gating. The UI clippy gate needs
 # the UI built (the `ui` cargo feature embeds ui/dist); node_modules is
-# linked from the main checkout so pnpm build reuses its store.
+# linked from the main checkout so the build reuses installed dependencies.
 prepare = [
     "cd ui && ln -sfn ../../../../ui/node_modules node_modules",
     "cd ui && node_modules/.bin/vite build",
@@ -32,9 +32,9 @@ gates = [
     "python3 scripts/check-review-recipe",
     "python3 scripts/test-review-recipe",
     "cargo fmt --all -- --check",
-    "cd ui && pnpm typecheck",
-    "cd ui && pnpm lint",
-    "cd ui && pnpm test",
+    "cd ui && bun run typecheck",
+    "cd ui && bun run lint",
+    "cd ui && bun run test",
     "cargo clippy --all-targets --locked -- -D warnings",
     "cargo clippy --all-targets --locked --features test-seam -- -D warnings",
     "cargo clippy --all-targets --locked --features ui -- -D warnings",

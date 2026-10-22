@@ -56,7 +56,7 @@ excludes prereleases.
 
 Application execution uses fresh short owned `/tmp` roots, separate HOME/XDG/TMP
 directories and an explicit environment allowlist. Its PATH contains only selected
-system tools; Cargo, Rust, Node, npm, pnpm and `gh` are absent. Neither acquisition
+system tools; Cargo, Rust, Node, npm, pnpm, Bun and `gh` are absent. Neither acquisition
 tokens nor arbitrary inherited provider credentials reach the installer or binary.
 The only Cadence invocation is `--version`. No production home/state, port 3010,
 tailnet or installed operator CLI is used. Hosted runner teardown removes these

@@ -81,7 +81,7 @@ PATH_ALLOWLIST = [
     "ls", "wc", "awk", "diff", "touch", "true", "false", "hostname",
     "whoami", "df", "du",
 ]
-FORBIDDEN_ON_PATH = ["rustc", "cargo", "rustup", "node", "npm", "pnpm", "gh"]
+FORBIDDEN_ON_PATH = ["rustc", "cargo", "rustup", "node", "npm", "pnpm", "bun", "gh"]
 
 
 # --- strict metadata -------------------------------------------------------

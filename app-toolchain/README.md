@@ -1,22 +1,22 @@
 # Cadence app tooling
 
-This archive is a versioned starter toolchain for app-owned React/Vite projects. It contains pinned React 19, Vite 8, and the React Vite plugin, a frozen pnpm lockfile, the canonical Cadence frame kit, and the app-side screen-bridge receiver (`app-kit/`). It is tooling plus that receiver: it is not a Cadence SDK, an authority, an app runtime, or a requirement that apps adopt a particular architecture. Validation, fixtures and previews stay with the matching host CLI.
+This archive is a versioned starter toolchain for app-owned React/Vite projects. It contains pinned React 19, Vite 8, and the React Vite plugin, a frozen Bun lockfile, the canonical Cadence frame kit, and the app-side screen-bridge receiver (`app-kit/`). It is tooling plus that receiver: it is not a Cadence SDK, an authority, an app runtime, or a requirement that apps adopt a particular architecture. Validation, fixtures and previews stay with the matching host CLI.
 
 ## Start a private app project
 
-This archive is generated and tested with Node.js 22 and pnpm 12.2.1; `toolchain.json` records the exact package-manager pin for this release. Download `cadence-app-toolchain-<tag>.tar.gz` and its `.sha256` sidecar from the same Cadence GitHub Release. Verify the sidecar before extracting; verify the GitHub build-provenance attestation against the release tag and Cadence workflow before relying on the artifact. Keep the archive's `package.json`, `pnpm-lock.yaml`, `toolchain.json`, and `LICENSE` together in your app-owned project.
+This archive is generated and tested with Node.js 22 and Bun 1.4.4; `toolchain.json` records the exact package-manager pin for this release. Download `cadence-app-toolchain-<tag>.tar.gz` and its `.sha256` sidecar from the same Cadence GitHub Release. Verify the sidecar before extracting; verify the GitHub build-provenance attestation against the release tag and Cadence workflow before relying on the artifact. Keep the archive's `package.json`, `bun.lock`, `toolchain.json`, and `LICENSE` together in your app-owned project.
 
 Install without changing the reviewed dependency graph:
 
 ```sh
-pnpm install --frozen-lockfile
+bun install --frozen-lockfile
 ```
 
 Create an app-owned `index.html` and `src/main.jsx`, then run:
 
 ```sh
-pnpm build
-pnpm dev
+bun run build
+bun run dev
 ```
 
 The ordinary Vite scripts and files remain app-owned; this package adds no lifecycle/install scripts or Cadence-specific harness.

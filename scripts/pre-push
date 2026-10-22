@@ -14,8 +14,8 @@ Steps run in order and stop at the first failure:
   3. clippy       cargo clippy --all-targets --locked -- -D warnings, and again with
                   --features test-seam                       (Rust changed)
      release seam sh scripts/check-release-test-seam          (Rust/check changed or --tests)
-  4. ui typecheck pnpm --dir ui run typecheck                (ui/ changed)
-     ui lint     pnpm --dir ui run lint                     (ui/ changed)
+  4. ui typecheck bun run --cwd ui typecheck                 (ui/ changed)
+     ui lint     bun run --cwd ui lint                      (ui/ changed)
   5. contracts    active Python test commands in CI's fmt job
                                                               (scripts/, .github/ or tests/scripts/ changed)
   6. nextest wrapper  scripts/test-cadence-nextest, which includes the
@@ -142,9 +142,9 @@ def plan(root, changed, with_tests):
     steps.append(("release seam", ["sh", "scripts/check-release-test-seam"],
                   None if need_seam else "no Rust or seam-check changes; --tests not requested"))
     ui = touched(changed, "ui/")
-    steps.append(("ui typecheck", ["pnpm", "--dir", "ui", "run", "typecheck"],
+    steps.append(("ui typecheck", ["bun", "run", "--cwd", "ui", "typecheck"],
                   None if ui else "ui/ unchanged"))
-    steps.append(("ui lint", ["pnpm", "--dir", "ui", "run", "lint"],
+    steps.append(("ui lint", ["bun", "run", "--cwd", "ui", "lint"],
                   None if ui else "ui/ unchanged"))
     cs = contract_scripts(root)
     need = touched(changed, "scripts/", ".github/", "tests/scripts/")

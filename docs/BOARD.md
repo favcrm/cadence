@@ -2040,17 +2040,17 @@ inside a disclosure. An unproven viewer sees the sign-in explanation and makes
 no protected Outbox request. This view adds no publication or file-management
 actions.
 
-`ui/`: Vite + React 19 + TypeScript + Tailwind 4, pnpm. Design tokens
+`ui/`: Vite + React 19 + TypeScript + Tailwind 4, Bun 1.4.4 with Node 22 for scripts and tests. Design tokens
 per `~/Project/agentic-alpha/DESIGN.md` — graphite ink ramp, IBM Plex
 Sans/Mono, teal `#2dd4bf` on interactive elements only.
 
 ```bash
 cd ui
-npx --yes pnpm@12.2.1 install
-CADENCE_DEV_BOARD_PORT=3117 npx --yes pnpm@12.2.1 dev  # Vite HMR; /api → isolated sandbox board
-npx --yes pnpm@12.2.1 typecheck  # tsrs --noEmit (TypeScript 7, Rust checker)
-npx --yes pnpm@12.2.1 lint       # oxlint --deny-warnings (rules: ui/.oxlintrc.json)
-npx --yes pnpm@12.2.1 build      # → local ui/dist (--features ui embeds it)
+bun install --frozen-lockfile
+CADENCE_DEV_BOARD_PORT=3117 bun run dev  # Vite HMR; /api → isolated sandbox board
+bun run typecheck  # tsrs --noEmit (TypeScript 7, Rust checker)
+bun run lint       # oxlint --deny-warnings (rules: ui/.oxlintrc.json)
+bun run build      # → local ui/dist (--features ui embeds it)
 ```
 
 The UI build also emits precompressed Brotli (`.br`) and gzip (`.gz`)

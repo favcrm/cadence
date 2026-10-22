@@ -40,8 +40,8 @@ for (const name of names) {
 for (const [name, version] of Object.entries({ ...kitPackage.dependencies, ...kitPackage.peerDependencies })) {
   if (versions[name] !== version) throw new Error(`Kit dependency differs from host pin: ${name}`);
 }
-const pnpm = execFileSync("pnpm", ["--version"], { cwd: ui, env: { ...process.env, COREPACK_ENABLE_NETWORK: "0" } }).toString().trim();
-if (hostPackage.packageManager !== `pnpm@${pnpm}`) throw new Error("pnpm differs from source pin");
+const bun = execFileSync("bun", ["--version"], { cwd: ui }).toString().trim();
+if (hostPackage.packageManager !== `bun@${bun}`) throw new Error("bun differs from source pin");
 // TypeScript 7 ships no JS compiler API; @typescript/typescript6 is its official API companion.
 const ts = requireTool("@typescript/typescript6");
 const { build } = await import(pathToFileURL(requireTool.resolve("vite")));
@@ -100,7 +100,7 @@ function visit(file) {
 }
 visit(entry);
 const cssNames = ["styles", "theme", "controls", "base", "foundation", "primitives", "drawer-base", "drawer"].map((name) => `screen-ui/src/${name}.css`);
-const sourceNames = [...seen, ...cssNames, "screen-ui/package.json", "scripts/package-screen-ui.mjs", "package.json", "pnpm-lock.yaml"].sort();
+const sourceNames = [...seen, ...cssNames, "screen-ui/package.json", "scripts/package-screen-ui.mjs", "package.json", "bun.lock"].sort();
 const sourceFiles = sourceNames.map((name) => ({ path: `ui/${name}`, sha256: sha256(readFileSync(join(ui, name))) }));
 if (!working) {
   for (const file of sourceFiles) {
@@ -111,7 +111,7 @@ const closureHash = sha256(JSON.stringify(sourceFiles));
 const provenance = {
   package: `${kitPackage.name}@${kitPackage.version}`,
   closureSha256: closureHash, files: sourceFiles,
-  toolchain: { node: process.version, pnpm, packages: versions },
+  toolchain: { node: process.version, bun, packages: versions },
 };
 const temp = mkdtempSync(join(tmpdir(), "screen-ui-"));
 try {

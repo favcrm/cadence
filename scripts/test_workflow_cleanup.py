@@ -97,8 +97,8 @@ class CleanupTests(unittest.TestCase):
         install = step_index("run", "scripts/ci-rust-toolchain --profile minimal")
         cache = step_index("uses", "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6")
         export = step_index("run", "scripts/ci-rust-toolchain --export --profile minimal")
-        ui_install = step_index("run", "pnpm install --frozen-lockfile")
-        ui_build = step_index("run", "pnpm build")
+        ui_install = step_index("run", "bun install --frozen-lockfile")
+        ui_build = step_index("run", "bun run build")
         build = step_index("run", "cargo build --release --locked --features ui")
         rehearsal = step_index("name", "Real-binary migration and backup recovery rehearsal")
         self.assertLess(install, cache)
@@ -125,7 +125,7 @@ class CleanupTests(unittest.TestCase):
         uses = re.findall(r"^      (?:- |  )uses: ([^ #\n]+)", body, re.M)
         self.assertCountEqual(uses, [
             "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
-            "pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1",
+            "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
             "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
             "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
             "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
@@ -157,7 +157,7 @@ class CleanupTests(unittest.TestCase):
             self.assertIn("change-scope", body)
             self.assertIn("needs.queue-evidence.outputs.tested", body)
             commands = [step for step in re.split(r"(?=^      - )", body, flags=re.M)
-                        if re.search(r"(?:run:|uses:).*(?:cargo |pnpm |rust-cache@|ci-rust-toolchain)", step)]
+                        if re.search(r"(?:run:|uses:).*(?:cargo |bun |rust-cache@|ci-rust-toolchain)", step)]
             self.assertTrue(commands, name)
             for step in commands:
                 category = "ui" if name == "ui" else "rust"

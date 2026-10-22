@@ -24,7 +24,7 @@ try {
   vite = await import(pathToFileURL(require.resolve("vite")).href);
 } catch {
   throw new Error(
-    "Install the existing UI tools first: pnpm -C ui install --frozen-lockfile",
+    "Install the existing UI tools first: bun install --cwd ui --frozen-lockfile",
   );
 }
 const react = (

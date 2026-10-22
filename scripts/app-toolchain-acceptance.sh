@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Independent CAD-1272 end-to-end acceptance. Requires an actual built cadence CLI
-# and pnpm 12.2.1 already available; it never builds Rust or installs pnpm.
+# and Bun 1.4.4 already available; it never builds Rust or installs Bun.
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -16,7 +16,7 @@ fi
 release_version=${BASH_REMATCH[1]}
 source_sha=${BASH_REMATCH[2]}
 tag="v$release_version"
-[[ $(pnpm --version) == 12.2.1 ]] || { echo 'acceptance requires pnpm 12.2.1' >&2; exit 1; }
+[[ $(bun --version) == 1.4.4 ]] || { echo 'acceptance requires Bun 1.4.4' >&2; exit 1; }
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/cad1272-app-toolchain.XXXXXX")
 trap 'rm -rf "$work"' EXIT
@@ -29,7 +29,7 @@ test -f "$archive" && test -f "$sidecar"
 (cd "$out" && sha256sum -c "$asset.sha256")
 
 # The archive is a fixed consumer surface, not a snapshot of the checkout.
-expected_members=$(printf '%s\n' LICENSE README.md frame-kit/frame.html frame-kit/kit.css frame-kit/metadata.json package.json pnpm-lock.yaml toolchain.json app-kit/README.md app-kit/package.json app-kit/src/index.mjs app-kit/src/receiver.mjs app-kit/src/refusal.mjs app-kit/types/index.d.ts | sort)
+expected_members=$(printf '%s\n' LICENSE README.md frame-kit/frame.html frame-kit/kit.css frame-kit/metadata.json package.json bun.lock toolchain.json app-kit/README.md app-kit/package.json app-kit/src/index.mjs app-kit/src/receiver.mjs app-kit/src/refusal.mjs app-kit/types/index.d.ts | sort)
 actual_members=$(tar -tzf "$archive" | sort)
 if [[ "$actual_members" != "$expected_members" ]]; then
   printf 'unexpected toolchain archive members\nexpected:\n%s\nactual:\n%s\n' "$expected_members" "$actual_members" >&2
@@ -67,7 +67,7 @@ expected_pins = {**ui["dependencies"], **ui["devDependencies"]}
 expected_pins = {name: expected_pins[name] for name in ("react", "react-dom", "vite", "@vitejs/plugin-react")}
 assert pkg["dependencies"] == expected, (pkg.get("dependencies"), expected)
 assert pkg["devDependencies"] == expected_dev, (pkg.get("devDependencies"), expected_dev)
-assert pkg["packageManager"] == ui["packageManager"] == "pnpm@12.2.1"
+assert pkg["packageManager"] == ui["packageManager"] == "bun@1.4.4"
 assert pkg.get("scripts", {}).get("build") == "vite build"
 assert meta.get("schema") == "cadence-app-toolchain/1", meta
 assert meta.get("tag") == tag and meta.get("source_sha") == source_sha, meta
@@ -107,7 +107,7 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 export default defineConfig({ plugins: [react()] });
 JS
-(cd "$consumer" && pnpm install --frozen-lockfile --ignore-scripts && pnpm build)
+(cd "$consumer" && bun install --frozen-lockfile --ignore-scripts && bun run build)
 test -s "$consumer/dist/index.html"
 
 # Run the exact inline publisher guard from ci.yml, not an imitation of it.
@@ -178,7 +178,7 @@ tar -xzf "$archive" -C "$repacked"
 printf '\n// tampered\n' >> "$repacked/app-kit/src/receiver.mjs"
 tar -czf "$fixture/dist/$asset" -C "$repacked" \
   LICENSE README.md frame-kit/frame.html frame-kit/kit.css frame-kit/metadata.json \
-  package.json pnpm-lock.yaml toolchain.json \
+  package.json bun.lock toolchain.json \
   app-kit/README.md app-kit/package.json app-kit/src/index.mjs app-kit/src/receiver.mjs \
   app-kit/src/refusal.mjs app-kit/types/index.d.ts
 (
