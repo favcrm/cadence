@@ -229,6 +229,7 @@ mod identity;
 #[cfg(target_os = "linux")]
 mod installer_client;
 mod installer_enrollment_wire;
+mod lane_relaunch;
 mod turn_project;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRecord;

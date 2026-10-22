@@ -88,6 +88,13 @@ impl Shared {
             }
             None => Value::Null,
         };
+        // The launch workdir (and so a confined agent's grant) is the
+        // daemon's to set when it relaunches for a ticket, never a caller's.
+        if parsed.get("launch_workdir").is_some() {
+            return Err(Error::rejected(
+                "params 'launch_workdir' is set by the daemon, not the caller",
+            ));
+        }
         let mut defaulted = false;
         if let Some(hire) = &hired {
             let mut obj = match parsed {
@@ -688,6 +695,11 @@ impl Shared {
             ));
         }
         for (key, value) in patch.as_object().unwrap() {
+            if key == "launch_workdir" {
+                return Err(Error::rejected(
+                    "params 'launch_workdir' is set by the daemon, not the caller",
+                ));
+            }
             proto::param_key(key)?;
             if matches!(
                 key.as_str(),

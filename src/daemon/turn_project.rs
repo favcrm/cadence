@@ -21,32 +21,41 @@ impl Shared {
     pub(super) fn turn_project(&self, agent: &Agent) -> Option<TurnProject> {
         let pm_dir = self.pm_dir().ok()?;
         let messages = self.store.active_messages(&agent.alias).unwrap_or_default();
-        let lanes = |running: bool| -> Vec<TurnProject> {
-            let mut found: Vec<TurnProject> = Vec::new();
-            for message in &messages {
-                let live = matches!(message.state.as_str(), "running" | "submitting");
-                let Some(issue) = message.issue.as_deref().filter(|_| live == running) else {
-                    continue;
-                };
-                let Some(key) = crate::issue::project::key_for_issue(&pm_dir, issue) else {
-                    continue;
-                };
-                found.push(TurnProject { key });
+        let hire = agent
+            .params
+            .as_ref()
+            .is_some_and(|params| params.get("catalogue").is_some());
+        let key_of = |issue: &str| crate::issue::project::key_for_issue(&pm_dir, issue);
+        // The turn in flight decides: a running (or submitting) message's
+        // own issue, and a ticketless one has no project however much is
+        // queued behind it. `unknown` is neither running nor queued work.
+        if let Some(live) = messages
+            .iter()
+            .find(|m| matches!(m.state.as_str(), "running" | "submitting"))
+        {
+            match live.issue.as_deref() {
+                Some(issue) => return key_of(issue).map(|key| TurnProject { key }),
+                None if hire => return None,
+                None => {}
             }
-            found
-        };
-        // The turn in flight decides; queued work only when it is
-        // unambiguous (one project), never a guess between two.
-        let mut running = lanes(true);
-        if !running.is_empty() {
-            return Some(running.swap_remove(0));
-        }
-        let queued = lanes(false);
-        if let Some(first) = queued.first() {
-            if queued.iter().all(|lane| lane.key == first.key) {
-                return queued.into_iter().next();
+        } else {
+            // Nothing runs: queued dispatches count only when they all
+            // point at one project, never a guess between two.
+            let queued: Vec<Option<String>> = messages
+                .iter()
+                .filter(|m| m.state == "queued")
+                .filter_map(|m| m.issue.as_deref())
+                .map(key_of)
+                .collect();
+            if let Some(Some(first)) = queued.first() {
+                if queued.iter().all(|key| key.as_ref() == Some(first)) {
+                    return Some(TurnProject { key: first.clone() });
+                }
+                return None;
             }
-            return None;
+            if !queued.is_empty() {
+                return None;
+            }
         }
         if agent
             .params

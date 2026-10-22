@@ -132,7 +132,7 @@ use pi_guard::*;
 use pi_launch::*;
 
 pub use pi_confine::{
-    pi_master_confinement, pi_worker_confinement, refuse_confined_devin,
+    launch_workdir, pi_master_confinement, pi_worker_confinement, refuse_confined_devin,
     refuse_confined_devin_agent, worker_confined, CONFINE_WORKER_EXTRA_READ_ENV,
     CONFINE_WORKER_EXTRA_WRITE_ENV,
 };
@@ -1241,6 +1241,7 @@ impl ProviderAdapter for PiAdapter {
         // including launch/effort setup, must revoke its prompt capability.
         // Keep all fallible post-launch work inside one cleanup boundary.
         *self.transport.write().unwrap() = Arc::clone(&transport);
+        let workdir = launch_workdir(agent).to_string_lossy().into_owned();
         let initialized = (|| {
             #[cfg(all(unix, target_os = "linux"))]
             let pid = match protected {
@@ -1249,10 +1250,10 @@ impl ProviderAdapter for PiAdapter {
                         .map_err(Error::rejected)?;
                     transport.launch_protected(ctx, &routing, &self.log_path)?
                 }
-                None => transport.launch(&agent.cwd, &self.log_path, &env)?,
+                None => transport.launch(&workdir, &self.log_path, &env)?,
             };
             #[cfg(not(all(unix, target_os = "linux")))]
-            let pid = transport.launch(&agent.cwd, &self.log_path, &env)?;
+            let pid = transport.launch(&workdir, &self.log_path, &env)?;
             // Effort: validate against the model's real levels, then verify
             // what stuck — Pi answers success even on a silent fallback.
             if let Some(effort) = params.get("effort").and_then(Value::as_str) {
