@@ -9,7 +9,8 @@
 //! the board is never less strict than the RPC. The conversation is a query
 //! field, never a path or header the stored row could be trusted from.
 //!
-//! Every response is `nosniff` and uncached; HTML and SVG also carry a
+//! Every response is `nosniff` (the serve layer adds it once for all
+//! responses) and uncached; HTML and SVG also carry a
 //! restrictive `Content-Security-Policy: sandbox` (no script, no network)
 //! so a direct navigation to the URL cannot run agent-written code.
 
@@ -58,7 +59,6 @@ pub(super) fn read(
     let mut resp = HttpResp::from_data(bytes);
     let header = |name: &str, value: &str| Header::from_bytes(name, value).unwrap();
     resp.add_header(header("Content-Type", mime));
-    resp.add_header(header("X-Content-Type-Options", "nosniff"));
     resp.add_header(header("Cache-Control", "private, no-store"));
     if mime.starts_with("text/html") || mime.starts_with("image/svg") {
         resp.add_header(header(
@@ -78,12 +78,7 @@ pub(super) fn versions(request: &Request, state_dir: &std::path::Path, id: &str)
         "artifact_versions",
         json!({"id": id, "conversation": conversation}),
     ) {
-        Ok(v) => with_nosniff(json_response(v)),
+        Ok(v) => json_response(v),
         Err(e) => home::rpc_err(&e, "artifact_versions"),
     }
-}
-
-fn with_nosniff(mut resp: HttpResp) -> HttpResp {
-    resp.add_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap());
-    resp
 }

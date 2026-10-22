@@ -1,3 +1,4 @@
+import { askBody, askLabel, citesArtifact } from "../../canvas/askRefs";
 import {
   useCallback,
   useEffect,
@@ -488,7 +489,9 @@ export default function Composer({
       let handoff: void | Promise<void>;
       try {
         handoff = onSend({
-          body,
+          // A cited artifact is expanded into the body: refs are stored for the
+          // board, only the body reaches the agent.
+          body: askBody(body, refs),
           refs,
           // Only ready rows ride a send — gating above already withheld
           // it while anything unresolved remained.
@@ -599,7 +602,7 @@ export default function Composer({
       onKeyDown={onKey}
       rows={compact ? 1 : 2}
       disabled={!!block}
-      placeholder={t(block ? blockedPlaceholder : (placeholder ?? ""))}
+      placeholder={t(block ? blockedPlaceholder : citesArtifact(refs) ? "Say what to change…" : (placeholder ?? ""))}
       aria-label={t(ariaLabel ?? "Message to Assistant")}
       aria-expanded={matches.length > 0 || undefined}
       className={
@@ -763,7 +766,7 @@ export default function Composer({
               title={`${t("remove the")} ${r.kind}:${r.id} ${t("reference")}`}
               onClick={() => setRefs(refs.filter((x) => x !== r))}
             >
-              {r.kind}:{r.id} <span aria-hidden>×</span>
+              {askLabel(r)} <span aria-hidden>×</span>
             </button>
           ))}
         </div>

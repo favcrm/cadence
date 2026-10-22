@@ -23,6 +23,13 @@ export interface ArtifactRef {
   kind: ArtifactKind;
   title: string;
   bytes: number;
+  digest?: string;
+}
+
+/** What the board knows of one stored version (from its thread card). */
+export interface VersionInfo {
+  bytes: number;
+  digest?: string;
 }
 
 export interface CanvasTab {
@@ -36,16 +43,37 @@ export interface CanvasTab {
   selected: number;
   /** Selected tracks `latest` until the operator picks an older one. */
   follow: boolean;
+  /** Sizes and digests of the versions the thread has announced. */
+  versions: Record<number, VersionInfo>;
+  /** The turn that put the newest version, if known. */
+  turn: string | null;
 }
 
-/** The running turn in plain words: the agent's latest commentary and the live step. */
+/** One tool step of the running turn, as the thread records it. */
+export interface WorkStep {
+  text: string;
+  done: boolean;
+}
+
+/**
+ * The running turn in plain words, from the thread alone: the agent's latest
+ * commentary, the live step, the recent steps and how many ran so far. The
+ * daemon announces no stage names and no total, so there is no "of M".
+ */
 export interface Working {
   plan: string | null;
   step: string | null;
+  steps: WorkStep[];
+  count: number;
+  turn: string | null;
 }
+
+export type Surface = "home" | "app";
 
 export interface CanvasState {
   conversation: string | null;
+  /** Which host feeds the canvas (decides how much room the chat keeps). */
+  surface: Surface;
   /** The composer draft key of the conversation in view (Ask to change). */
   composerKey: string | null;
   open: boolean;
@@ -69,6 +97,7 @@ export interface FeedCard {
 
 export interface FeedInput {
   conversation: string | null;
+  surface: Surface;
   composerKey: string | null;
   cards: FeedCard[];
   working: Working | null;
@@ -84,8 +113,12 @@ let closedTurns = new Set<string>();
 let autoOpened = new Set<string>();
 let currentTurn: string | null = null;
 
-function emptyState(conversation: string | null = null, composerKey: string | null = null): CanvasState {
-  return { conversation, composerKey, open: false, tabs: [], active: null, working: null };
+function emptyState(
+  conversation: string | null = null,
+  composerKey: string | null = null,
+  surface: Surface = "home",
+): CanvasState {
+  return { conversation, surface, composerKey, open: false, tabs: [], active: null, working: null };
 }
 
 function set(next: CanvasState): void {
@@ -108,16 +141,45 @@ export function useCanvas(): CanvasState {
 }
 
 /** Test and conversation-switch reset. */
-export function resetCanvas(conversation: string | null = null, composerKey: string | null = null): void {
+export function resetCanvas(
+  conversation: string | null = null,
+  composerKey: string | null = null,
+  surface: Surface = "home",
+): void {
   seen = new Set();
   closedTurns = new Set();
   autoOpened = new Set();
   currentTurn = null;
-  set(emptyState(conversation, composerKey));
+  set(emptyState(conversation, composerKey, surface));
 }
 
 function sameWorking(a: Working | null, b: Working | null): boolean {
-  return a === b || (a !== null && b !== null && a.plan === b.plan && a.step === b.step);
+  return a === b || (a !== null && b !== null && JSON.stringify(a) === JSON.stringify(b));
+}
+
+function newTab(ref: ArtifactRef, turn: string | null): CanvasTab {
+  return {
+    id: ref.id,
+    kind: ref.kind,
+    title: ref.title,
+    bytes: ref.bytes,
+    latest: ref.version,
+    selected: ref.version,
+    follow: true,
+    versions: { [ref.version]: { bytes: ref.bytes, digest: ref.digest } },
+    turn,
+  };
+}
+
+function withVersion(t: CanvasTab, ref: ArtifactRef, turn: string | null): CanvasTab {
+  const newer = ref.version > t.latest;
+  return {
+    ...t,
+    versions: { ...t.versions, [ref.version]: { bytes: ref.bytes, digest: ref.digest } },
+    ...(newer
+      ? { title: ref.title, bytes: ref.bytes, latest: ref.version, selected: t.follow ? ref.version : t.selected, turn }
+      : {}),
+  };
 }
 
 /**
@@ -126,7 +188,7 @@ function sameWorking(a: Working | null, b: Working | null): boolean {
  * before can add a tab, move a version or open the drawer.
  */
 export function feedCanvas(input: FeedInput): void {
-  if (input.conversation !== state.conversation) resetCanvas(input.conversation, input.composerKey);
+  if (input.conversation !== state.conversation) resetCanvas(input.conversation, input.composerKey, input.surface);
   currentTurn = input.turn;
   let tabs = state.tabs;
   let open = state.open;
@@ -135,28 +197,31 @@ export function feedCanvas(input: FeedInput): void {
     if (seen.has(card.key)) continue;
     seen.add(card.key);
     const { ref } = card;
-    const existing = tabs.find((t) => t.id === ref.id);
-    if (!existing) {
-      tabs = [...tabs, { id: ref.id, kind: ref.kind, title: ref.title, bytes: ref.bytes, latest: ref.version, selected: ref.version, follow: true }];
-    } else if (ref.version > existing.latest) {
-      tabs = tabs.map((t) =>
-        t.id !== ref.id ? t : { ...t, title: ref.title, bytes: ref.bytes, latest: ref.version, selected: t.follow ? ref.version : t.selected },
-      );
+    // A card only ever updates a tab that is already open. A tab is added by
+    // opening a card, or by the one auto-open per operator turn (CAD-651).
+    if (tabs.some((t) => t.id === ref.id)) {
+      tabs = tabs.map((t) => (t.id === ref.id ? withVersion(t, ref, card.turn) : t));
     }
     if (card.live && card.operatorTurn && card.turn && !autoOpened.has(card.turn) && !closedTurns.has(card.turn)) {
       autoOpened.add(card.turn);
+      if (!tabs.some((t) => t.id === ref.id)) tabs = [...tabs, newTab(ref, card.turn)];
       open = true;
       active = ref.id;
     }
   }
-  if (!open && tabs.length === 0) active = null;
-  if (active === null && tabs.length > 0) active = tabs[0].id;
+  if (tabs.length === 0) {
+    open = false;
+    active = null;
+  } else if (active === null || !tabs.some((t) => t.id === active)) {
+    active = tabs[0].id;
+  }
   const composerKey = input.composerKey;
+  const working = sameWorking(input.working, state.working) ? state.working : input.working;
   if (
     tabs === state.tabs && open === state.open && active === state.active &&
-    composerKey === state.composerKey && sameWorking(input.working, state.working)
+    composerKey === state.composerKey && working === state.working && input.surface === state.surface
   ) return;
-  set({ ...state, tabs, open, active, composerKey, working: sameWorking(input.working, state.working) ? state.working : input.working });
+  set({ ...state, tabs, open, active, composerKey, working, surface: input.surface });
 }
 
 /** Open (or focus) an artifact from its card. */
@@ -164,9 +229,15 @@ export function openArtifact(ref: ArtifactRef): void {
   const existing = state.tabs.find((t) => t.id === ref.id);
   const tabs = existing
     ? state.tabs.map((t) =>
-        t.id !== ref.id ? t : { ...t, selected: ref.version, follow: ref.version >= t.latest, latest: Math.max(t.latest, ref.version) },
+        t.id !== ref.id
+          ? t
+          : {
+              ...withVersion(t, ref, t.turn),
+              selected: ref.version,
+              follow: ref.version >= Math.max(t.latest, ref.version),
+            },
       )
-    : [...state.tabs, { id: ref.id, kind: ref.kind, title: ref.title, bytes: ref.bytes, latest: ref.version, selected: ref.version, follow: true }];
+    : [...state.tabs, newTab(ref, null)];
   set({ ...state, tabs, active: ref.id, open: true });
 }
 
@@ -233,14 +304,36 @@ export function writeWidth(px: number): void {
   }
 }
 
-/** push | cover | sheet — by viewport and the page's minimum. */
+/** push | cover | sheet — by viewport and the room the chat keeps. */
 export type CanvasMode = "push" | "cover" | "sheet";
 export const SHEET_BELOW = 640;
-export const PAGE_MIN = 560;
+export const CHAT_MIN = 320;
 const SIDEBAR = 208;
 
-export function canvasMode(viewport: number, width: number): CanvasMode {
-  if (viewport < SHEET_BELOW) return "sheet";
-  const side = viewport >= 1024 ? SIDEBAR : 0;
-  return viewport - side - width >= PAGE_MIN ? "push" : "cover";
+export interface DrawerLayout {
+  mode: CanvasMode;
+  width: number;
+}
+
+/**
+ * The mockup's per-surface rule: push while the chat keeps its room (Home:
+ * the chat's 320px; the app shell: the chat plus 20rem of app area). When it
+ * does not fit, cover stops short of the chat — on Home it keeps the chat's
+ * first 320px, in the app shell it ends at the chat pane's right edge
+ * (`chatRight`, the pane's right edge with no drawer padding). If that leaves
+ * less than the minimum width, the drawer is a full-screen sheet instead.
+ */
+export function drawerLayout(
+  viewport: number,
+  want: number,
+  surface: Surface,
+  chatRight: number | null,
+): DrawerLayout {
+  if (viewport < SHEET_BELOW) return { mode: "sheet", width: viewport };
+  const main = viewport - (viewport >= 1024 ? SIDEBAR : 0);
+  const need = surface === "home" ? CHAT_MIN : CHAT_MIN + 320 + 42;
+  if (main - want >= need) return { mode: "push", width: want };
+  const cap = surface === "home" ? main - CHAT_MIN - 28 : chatRight === null ? 0 : viewport - chatRight - 12;
+  if (cap < MIN_WIDTH) return { mode: "sheet", width: viewport };
+  return { mode: "cover", width: Math.min(want, cap) };
 }

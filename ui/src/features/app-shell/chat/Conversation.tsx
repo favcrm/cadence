@@ -544,13 +544,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
 
   const items = threadItems(thread.data);
   const { shown, hidden } = visibleWindow(items, limit);
-  useCanvasFeed({
-    conversation: convId,
-    composerKey,
-    items,
-    loaded: loaded && thread.data?.missing !== true,
-    running: masterState.data?.turn?.state === "working",
-  });
   // A prepend (widened window or a fetched page) keeps the reader's row
   // at the same viewport offset, measured after the DOM updated.
   useLayoutEffect(() => {
@@ -841,6 +834,14 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     ((thread.data?.entries ?? []).some((e) => e.message === turnMessage) ||
       (thread.data?.pending ?? []).some((p) => p.message === turnMessage && p.state !== "failed"));
   const working = masterState.data?.turn?.state === "working" && turnOwned;
+  useCanvasFeed({
+    conversation: convId,
+    surface: "app",
+    composerKey,
+    items,
+    loaded: loaded && thread.data?.missing !== true,
+    running: working,
+  });
   const queuedOwn = masterState.data?.turn?.state === "queued" && turnOwned;
   // Keep feedback across POST acknowledgement; the daemon's proven turn wins.
   const sending = (thread.data?.pending ?? []).some((p) => p.state === "sending");

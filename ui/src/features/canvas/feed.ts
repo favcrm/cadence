@@ -5,20 +5,22 @@
  * parsed from message text, tool output or URLs.
  */
 import { useEffect, useRef } from "react";
-import { openStep, stepSummary, type ThreadItem } from "../home/thread";
+import { openStep, stepSummary, toolSteps, type ThreadItem } from "../home/thread";
 import {
   ARTIFACT_KINDS,
   feedCanvas,
   type ArtifactKind,
   type ArtifactRef,
   type FeedCard,
+  type Surface,
+  type WorkStep,
   type Working,
 } from "./canvasStore";
 
 /** A stored artifact card's payload, validated; null when malformed. */
 export function artifactRef(payload: Record<string, unknown> | null | undefined): ArtifactRef | null {
   if (!payload) return null;
-  const { id, version, kind, title, bytes } = payload;
+  const { id, version, kind, title, bytes, digest } = payload;
   if (typeof id !== "string" || !/^art-[A-Za-z0-9]+$/.test(id)) return null;
   if (typeof version !== "number" || !Number.isInteger(version) || version < 1) return null;
   if (typeof kind !== "string" || !ARTIFACT_KINDS.includes(kind as ArtifactKind)) return null;
@@ -28,6 +30,7 @@ export function artifactRef(payload: Record<string, unknown> | null | undefined)
     kind: kind as ArtifactKind,
     title: typeof title === "string" && title.trim() ? title : "Untitled",
     bytes: typeof bytes === "number" && Number.isFinite(bytes) ? bytes : 0,
+    digest: typeof digest === "string" && /^[0-9a-f]{64}$/.test(digest) ? digest : undefined,
   };
 }
 
@@ -71,16 +74,22 @@ export function feedParts(items: ThreadItem[], liveAfter: number, running: boole
   if (running) {
     const tail = items.slice(lastOperator + 1);
     let plan: string | null = null;
-    let step: string | null = null;
+    const steps: WorkStep[] = [];
     for (const item of tail) {
       if (item.type === "commentary" && item.entry.text.trim()) plan = item.entry.text.trim();
+      if (item.type === "tools") {
+        for (const s of toolSteps(item.entries)) steps.push({ text: stepSummary(s.summary), done: s.done });
+      }
     }
     const tools = [...tail].reverse().find((i) => i.type === "tools");
-    if (tools && tools.type === "tools") {
-      const open = openStep(tools.entries);
-      step = open ? stepSummary(open.text) : null;
-    }
-    working = { plan, step };
+    const open = tools && tools.type === "tools" ? openStep(tools.entries) : null;
+    working = {
+      plan,
+      step: open ? stepSummary(open.text) : null,
+      steps: steps.slice(-4),
+      count: steps.length,
+      turn,
+    };
   }
   return { cards, working, turn };
 }
@@ -103,17 +112,18 @@ export function topSeq(items: ThreadItem[]): number {
  */
 export function useCanvasFeed(opts: {
   conversation: string | null;
+  surface: Surface;
   composerKey: string | null;
   items: ThreadItem[];
   loaded: boolean;
   running: boolean;
 }): void {
-  const { conversation, composerKey, items, loaded, running } = opts;
+  const { conversation, surface, composerKey, items, loaded, running } = opts;
   const mark = useRef<{ conversation: string | null; seq: number | null }>({ conversation: null, seq: null });
   useEffect(() => {
     if (mark.current.conversation !== conversation) mark.current = { conversation, seq: null };
     if (!loaded || conversation === null) return;
     if (mark.current.seq === null) mark.current.seq = topSeq(items);
-    feedCanvas({ conversation, composerKey, ...feedParts(items, mark.current.seq, running) });
-  }, [conversation, composerKey, items, loaded, running]);
+    feedCanvas({ conversation, surface, composerKey, ...feedParts(items, mark.current.seq, running) });
+  }, [conversation, surface, composerKey, items, loaded, running]);
 }

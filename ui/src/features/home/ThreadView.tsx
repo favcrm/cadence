@@ -3,6 +3,7 @@ import { useTranslate } from "../../lib/locale";
 import type { ThreadRef } from "../../lib/types";
 import Md from "../../ui/Md";
 import { attachMeta } from "../app-shell/chat/attach";
+import { askLabel } from "../canvas/askRefs";
 import ArtifactCard from "../canvas/ArtifactCard";
 import { ThreadPermission } from "./PermissionCard";
 import { stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
@@ -339,7 +340,7 @@ function RefChips({ refs, onOpenIssue }: { refs: ThreadRef[]; onOpenIssue?: (id:
           </span>
         ) : (
           <span key={`${r.kind}:${r.id}`} className="refchip num" title={`${r.kind}:${r.id}`}>
-            {r.kind}:{r.id}
+            {askLabel(r)}
           </span>
         ),
       )}

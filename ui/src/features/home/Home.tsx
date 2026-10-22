@@ -725,10 +725,12 @@ function MasterHome({
   const step = useMemo(() => openStep(thread.data?.entries ?? []), [thread.data]);
   useCanvasFeed({
     conversation: homeConversation ?? null,
+    surface: "home",
     composerKey: "home",
     items,
     loaded: loaded && !missing,
-    running: turn.kind === "working",
+    // The turn must be this conversation's own: an app-origin turn is not.
+    running: turn.kind === "working" && turnOrigin === null,
   });
   // The running turn's name-row activity anchors to this turn's own
   // message id — the item holding its newest stored entry (a pending

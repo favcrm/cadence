@@ -1,24 +1,36 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslate } from "../../lib/locale";
 import { IconClose } from "../../ui/icons";
-import { composerDraft, setComposerDraft } from "../app-shell/chat/composerStore";
+import { setComposerRefs } from "../app-shell/chat/composerStore";
 import ArtifactView, { downloadName, useArtifactBytes } from "./ArtifactView";
+import { KIND_LABEL, sizeLabel } from "./ArtifactCard";
+import { makeAskRef } from "./askRefs";
 import {
-  canvasMode,
   clampWidth,
   closeDrawer,
   closeTab,
+  drawerLayout,
   focusTab,
   readWidth,
   selectVersion,
   useCanvas,
   writeWidth,
   type CanvasTab,
+  type DrawerLayout,
+  type Surface,
   type Working,
 } from "./canvasStore";
 
 /** Versions the store keeps per artifact (the daemon prunes older ones). */
 const KEPT_VERSIONS = 20;
+
+const FOOT: Record<string, string[]> = {
+  html: ["sandboxed frame", "no scripts · no network"],
+  md: ["board Markdown renderer", "no raw HTML"],
+  pdf: ["download only"],
+  image: ["inline image"],
+  csv: ["plain text"],
+};
 
 function useViewport(): number {
   const [w, setW] = useState(() => window.innerWidth);
@@ -30,14 +42,42 @@ function useViewport(): number {
   return w;
 }
 
-/** The running turn in plain words: the agent's latest commentary and the live step. */
-function WorkingStrip({ working }: { working: Working }) {
+/** The chat pane's right edge with no drawer padding applied (app shell). */
+function chatRightEdge(pushed: number): number | null {
+  const pane = document.querySelector<HTMLElement>("[data-chat-pane]");
+  return pane ? pane.getBoundingClientRect().right + pushed : null;
+}
+
+/**
+ * The running turn from the thread alone. The daemon announces no stage names
+ * and no total, so: the agent's latest words, the steps so far (the live one
+ * marked), "step N" with no "of M", and an indeterminate bar.
+ */
+function WorkingStrip({ working, updating }: { working: Working; updating: string | null }) {
   const t = useTranslate();
   return (
-    <div className="canvas-working" role="status" aria-live="polite" data-canvas-working>
-      <span className="canvas-working-label num">{t("Working")}</span>
-      {working.plan ? <p className="canvas-working-plan">{working.plan}</p> : null}
-      {working.step ? <p className="canvas-working-step num">{working.step}</p> : null}
+    <div className="cv-work" role="status" aria-live="polite" data-canvas-working>
+      {working.plan ? <p className="cv-plan">{working.plan}</p> : null}
+      {working.steps.length > 0 ? (
+        <ol className="cv-stage" aria-label={t("Steps so far")}>
+          {working.steps.map((s, i) => (
+            <li key={`${i}:${s.text}`} data-s={s.done ? "done" : "now"}>
+              {s.text}
+            </li>
+          ))}
+        </ol>
+      ) : null}
+      <div className="cv-live">
+        <span className="workdot live" aria-hidden />
+        <span>
+          {working.count > 0 ? `${t("step")} ${working.count}` : t("Working")}
+          {working.step ? ` · ${working.step}` : ""}
+        </span>
+        {updating ? <span className="artbadge">{updating}</span> : null}
+      </div>
+      <div className="cv-bar" aria-hidden>
+        <i className="cv-bar-run" />
+      </div>
     </div>
   );
 }
@@ -49,18 +89,25 @@ function selectedPassage(root: HTMLElement | null): string {
   return sel.toString().trim().slice(0, 1200);
 }
 
-function Body({ conversation, tab, composerKey, working }: {
+function focusComposer(): void {
+  const box = document.querySelector<HTMLElement>("#app-shell-chat-box, [data-composer] textarea");
+  box?.focus();
+}
+
+function Body({ conversation, tab, composerKey, working, sheet }: {
   conversation: string;
   tab: CanvasTab;
   composerKey: string | null;
   working: Working | null;
+  sheet: boolean;
 }) {
   const t = useTranslate();
   const state = useArtifactBytes(conversation, tab.id, tab.selected);
   const contentRef = useRef<HTMLDivElement | null>(null);
-  const first = Math.max(1, tab.latest - KEPT_VERSIONS + 1);
-  const versions: number[] = [];
-  for (let v = first; v <= tab.latest; v++) versions.push(v);
+  const info = tab.versions[tab.selected];
+  // "updating v1 → v2": only when this very turn already put the newest
+  // version, so the agent is demonstrably still working on this artifact.
+  const updating = working && tab.turn !== null && tab.turn === working.turn ? `${t("updating")} v${tab.latest} → v${tab.latest + 1}` : null;
 
   const download = () => {
     if (state.status !== "ready") return;
@@ -74,71 +121,120 @@ function Body({ conversation, tab, composerKey, working }: {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
-  // Ask to change: the selected passage (or, with none, the artifact itself)
-  // goes into the composer as a quoted reference. Nothing is sent.
+  // Ask to change: a reference chip in the composer, never a send. On a phone
+  // the sheet closes so the composer shows.
   const askToChange = () => {
     if (!composerKey) return;
     const passage = selectedPassage(contentRef.current);
-    const head = `Re: "${tab.title}" v${tab.selected}`;
-    const quote = passage ? `\n${passage.split("\n").map((l) => `> ${l}`).join("\n")}` : "";
-    const existing = composerDraft(composerKey);
-    setComposerDraft(composerKey, `${existing ? `${existing}\n\n` : ""}${head}${quote}\n\nChange: `);
-    document.getElementById("app-shell-chat-box")?.focus();
+    setComposerRefs(composerKey, [makeAskRef({ artifact: tab.id, version: tab.selected, title: tab.title, passage })]);
+    if (sheet) closeDrawer();
+    requestAnimationFrame(focusComposer);
   };
 
+  const first = Math.max(1, tab.latest - KEPT_VERSIONS + 1);
+  const versions: number[] = [];
+  for (let v = first; v <= tab.latest; v++) versions.push(v);
   return (
     <>
-      {working ? <WorkingStrip working={working} /> : null}
-      <div className="canvas-body" data-canvas-body>
-        {state.status === "loading" ? <p className="text-label text-ink-500">{t("Loading…")}</p> : null}
-        {state.status === "failed" ? (
-          <p className="text-label text-fail" role="alert">{state.error}</p>
+      <header className="cv-head">
+        {sheet ? (
+          <button type="button" className="cv-iconbtn cv-back" onClick={closeDrawer} aria-label={t("Back to chat")}>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <path d="m15 18-6-6 6-6" />
+            </svg>
+          </button>
         ) : null}
+        <span className="arttype">{KIND_LABEL[tab.kind] ?? "FILE"}</span>
+        <span className="cv-title">
+          <b>{tab.title}</b>
+          <span>
+            <span className={`artbadge ${working ? "" : "ok"}`}>{working ? t("drafting") : t("ready")}</span>
+            {tab.kind} · v{tab.selected}
+          </span>
+        </span>
+        {!sheet ? (
+          <button type="button" className="cv-iconbtn" onClick={closeDrawer} aria-label={t("Close canvas")}>
+            <IconClose size={12} />
+          </button>
+        ) : null}
+        <span className="cv-tools">
+          <span className="vers" role="group" aria-label={t("Version")}>
+            {versions.map((v) => (
+              <button key={v} type="button" aria-pressed={v === tab.selected} onClick={() => selectVersion(tab.id, v)}>
+                v{v}
+              </button>
+            ))}
+          </span>
+          {!sheet ? (
+            <>
+              <button type="button" className="btn btn-ghost" disabled={!composerKey || !!working} onClick={askToChange}>
+                {t("Ask to change")}
+              </button>
+              <button type="button" className="btn" disabled={!!working} onClick={download}>
+                {t("Download")}
+              </button>
+            </>
+          ) : null}
+        </span>
+        {sheet ? (
+          <span className="cv-tools">
+            <button type="button" className="btn btn-ghost" disabled={!composerKey || !!working} onClick={askToChange}>
+              {t("Ask to change")}
+            </button>
+            <button type="button" className="btn" disabled={!!working} onClick={download}>
+              {t("Download")}
+            </button>
+          </span>
+        ) : null}
+      </header>
+      {working ? <WorkingStrip working={working} updating={updating} /> : null}
+      <div className="cv-body" data-canvas-body>
+        {state.status === "loading" ? <p className="text-label text-ink-500 p-3">{t("Loading…")}</p> : null}
+        {state.status === "failed" ? <p className="text-label text-fail p-3" role="alert">{state.error}</p> : null}
         {state.status === "ready" ? (
           <ArtifactView kind={tab.kind} title={tab.title} data={state.data} contentRef={contentRef} />
         ) : null}
       </div>
-      {!working ? (
-        <div className="canvas-foot" data-canvas-foot>
-          <label className="canvas-versions text-micro text-ink-400">
-            <span className="num">{t("Version")}</span>
-            <select
-              value={tab.selected}
-              onChange={(e) => selectVersion(tab.id, Number(e.currentTarget.value))}
-              aria-label={t("Version")}
-            >
-              {versions.map((v) => (
-                <option key={v} value={v}>v{v}{v === tab.latest ? ` · ${t("latest")}` : ""}</option>
-              ))}
-            </select>
-          </label>
-          <span className="flex-1" />
-          <button type="button" className="btn" onClick={download} disabled={state.status !== "ready"}>
-            {t("Download")}
-          </button>
-          <button type="button" className="btn" onClick={askToChange} disabled={!composerKey}>
-            {t("Ask to change")}
-          </button>
-        </div>
-      ) : null}
+      <footer className="cv-foot">
+        <span>
+          v{tab.selected} · {sizeLabel(info?.bytes ?? tab.bytes)}
+          {info?.digest ? ` · sha256:${info.digest.slice(0, 6)}…${info.digest.slice(-3)}` : ""}
+        </span>
+        {(FOOT[tab.kind] ?? []).map((f) => (
+          <span key={f}>{f}</span>
+        ))}
+      </footer>
     </>
   );
 }
 
 /**
  * The agent canvas (CAD-1726): one non-modal drawer docked to the right,
- * mounted once at the shell. push / cover / sheet by the room the page has;
- * resizable by pointer and arrow keys; Esc closes; no scrim, no focus trap.
+ * mounted once at the shell. push / cover / sheet by the room the chat keeps
+ * (see `drawerLayout`); resizable by pointer and arrow keys; Esc closes; no
+ * scrim, no focus trap.
  */
 export default function CanvasDrawer() {
   const t = useTranslate();
   const canvas = useCanvas();
   const viewport = useViewport();
   const [width, setWidth] = useState(readWidth);
-  const w = clampWidth(width, viewport);
-  const mode = canvasMode(viewport, w);
+  const want = clampWidth(width, viewport);
   const open = canvas.open && canvas.tabs.length > 0 && canvas.conversation !== null;
   const tab = canvas.tabs.find((x) => x.id === canvas.active) ?? canvas.tabs[0] ?? null;
+  const [layout, setLayout] = useState<DrawerLayout>({ mode: "push", width: want });
+  const pushed = useRef(0);
+  const rootRef = useRef<HTMLElement | null>(null);
+
+  // The layout is measured from the page (the chat pane's edge), so it is
+  // recomputed after every render that could move it.
+  useLayoutEffect(() => {
+    if (!open) return;
+    const surface: Surface = canvas.surface;
+    const next = drawerLayout(viewport, want, surface, surface === "app" ? chatRightEdge(pushed.current) : null);
+    pushed.current = next.mode === "push" ? next.width : 0;
+    setLayout((cur) => (cur.mode === next.mode && cur.width === next.width ? cur : next));
+  });
 
   // The page makes room (push) or steps aside through these two attributes.
   useLayoutEffect(() => {
@@ -148,13 +244,13 @@ export default function CanvasDrawer() {
       root.style.removeProperty("--canvas-w");
       return;
     }
-    root.setAttribute("data-canvas", mode);
-    root.style.setProperty("--canvas-w", `${w}px`);
+    root.setAttribute("data-canvas", layout.mode);
+    root.style.setProperty("--canvas-w", `${layout.width}px`);
     return () => {
       root.removeAttribute("data-canvas");
       root.style.removeProperty("--canvas-w");
     };
-  }, [open, mode, w]);
+  }, [open, layout.mode, layout.width]);
 
   useEffect(() => {
     if (!open) return;
@@ -165,6 +261,11 @@ export default function CanvasDrawer() {
     return () => window.removeEventListener("keydown", onKey);
   }, [open]);
 
+  // The active tab scrolls into view when it changes.
+  useEffect(() => {
+    rootRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [canvas.active, canvas.tabs.length, open]);
+
   const commit = useCallback((px: number) => {
     const next = clampWidth(px, window.innerWidth);
     setWidth(next);
@@ -173,7 +274,7 @@ export default function CanvasDrawer() {
 
   const drag = useRef<{ x: number; w: number } | null>(null);
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    drag.current = { x: e.clientX, w };
+    drag.current = { x: e.clientX, w: layout.width };
     e.currentTarget.setPointerCapture(e.pointerId);
   };
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -184,34 +285,37 @@ export default function CanvasDrawer() {
     if (!drag.current) return;
     drag.current = null;
     e.currentTarget.releasePointerCapture(e.pointerId);
-    writeWidth(w);
+    writeWidth(layout.width);
   };
   const onResizeKey = (e: React.KeyboardEvent<HTMLDivElement>) => {
     const step = e.shiftKey ? 96 : 24;
-    if (e.key === "ArrowLeft") commit(w + step);
-    else if (e.key === "ArrowRight") commit(w - step);
+    if (e.key === "ArrowLeft") commit(layout.width + step);
+    else if (e.key === "ArrowRight") commit(layout.width - step);
     else return;
     e.preventDefault();
   };
 
   if (!open || !tab || canvas.conversation === null) return null;
+  const sheet = layout.mode === "sheet";
+  const working = canvas.working;
   return (
     <aside
+      ref={rootRef}
       className="canvas-drawer"
       data-canvas-drawer
-      data-mode={mode}
+      data-mode={layout.mode}
       aria-label={t("Canvas")}
-      style={mode === "sheet" ? undefined : { width: w }}
+      style={sheet ? undefined : { width: layout.width }}
     >
-      {mode !== "sheet" ? (
+      {!sheet ? (
         <div
-          className="canvas-resize"
+          className="cv-grip"
           role="separator"
           aria-orientation="vertical"
           aria-label={t("Resize canvas")}
           aria-valuemin={360}
           aria-valuemax={Math.max(360, Math.floor(viewport * 0.6))}
-          aria-valuenow={w}
+          aria-valuenow={layout.width}
           tabIndex={0}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
@@ -220,42 +324,27 @@ export default function CanvasDrawer() {
           onKeyDown={onResizeKey}
         />
       ) : null}
-      <header className="canvas-head">
-        {mode === "sheet" ? (
-          <button type="button" className="canvas-back" onClick={closeDrawer} aria-label={t("Back to chat")}>
-            ←
-          </button>
-        ) : null}
-        <div className="canvas-tabs" role="tablist" aria-label={t("Artifacts")}>
+      {canvas.tabs.length > 1 ? (
+        <div className="cv-tabs" role="tablist" aria-label={t("Artifacts")}>
           {canvas.tabs.map((x) => (
-            <span key={x.id} className="canvas-tab" data-active={x.id === tab.id || undefined}>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={x.id === tab.id}
-                className="canvas-tab-label"
-                onClick={() => focusTab(x.id)}
-              >
+            <span key={x.id} className="cv-tab" data-active={x.id === tab.id || undefined}>
+              <button type="button" role="tab" aria-selected={x.id === tab.id} className="cv-tab-label" onClick={() => focusTab(x.id)}>
                 {x.title}
               </button>
-              <button type="button" className="canvas-tab-close" aria-label={`${t("Close")} ${x.title}`} onClick={() => closeTab(x.id)}>
+              <button type="button" className="cv-tab-close" aria-label={`${t("Close")} ${x.title}`} onClick={() => closeTab(x.id)}>
                 <IconClose size={10} />
               </button>
             </span>
           ))}
         </div>
-        {mode !== "sheet" ? (
-          <button type="button" className="canvas-close" onClick={closeDrawer} aria-label={t("Close canvas")}>
-            <IconClose size={12} />
-          </button>
-        ) : null}
-      </header>
+      ) : null}
       <Body
         key={`${tab.id}@${tab.selected}`}
         conversation={canvas.conversation}
         tab={tab}
         composerKey={canvas.composerKey}
-        working={canvas.working}
+        working={working}
+        sheet={sheet}
       />
     </aside>
   );
