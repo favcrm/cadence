@@ -2122,6 +2122,23 @@ impl Shared {
             // the bounded class, never raw provider text.
             Ok(true) | Err(_) => return store::app_runs::app_uncertain_turn_reason(),
         }
+        let from_agent = self
+            .store
+            .agent(alias)
+            .ok()
+            .and_then(|agent| agent.error)
+            .map(|stored| bound_unknown_detail(unknown_fence_detail(&stored)))
+            .filter(|detail| !detail.is_empty() && detail != UNKNOWN_GENERIC_REASON);
+        // CAD-1353: the public fence set by `unknown` carries the
+        // dispatch budget and last provider activity. A restamp must keep
+        // that evidence instead of falling back to the now-verbatim
+        // operator-private message row.
+        if let Some(detail) = from_agent
+            .as_ref()
+            .filter(|detail| detail.contains("dispatch stall budget"))
+        {
+            return detail.clone();
+        }
         if let Some(detail) = self.store.preferred_unknown_error(alias).ok().flatten() {
             let bounded = bound_unknown_detail(&detail);
             if !bounded.is_empty() && bounded != UNKNOWN_GENERIC_REASON {
@@ -2132,11 +2149,8 @@ impl Shared {
         if !from_actor.is_empty() && from_actor != UNKNOWN_GENERIC_REASON {
             return from_actor;
         }
-        if let Some(stored) = self.store.agent(alias).ok().and_then(|agent| agent.error) {
-            let bounded = bound_unknown_detail(unknown_fence_detail(&stored));
-            if !bounded.is_empty() {
-                return bounded;
-            }
+        if let Some(detail) = from_agent {
+            return detail;
         }
         UNKNOWN_GENERIC_REASON.to_string()
     }

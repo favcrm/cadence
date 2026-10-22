@@ -120,6 +120,13 @@ fn non_app_unknown_still_publishes_raw_detail() {
     assert!(reason.contains(raw), "{reason}");
     assert!(reason.contains("dispatch stall budget"), "{reason}");
     assert!(reason.contains("last provider event"), "{reason}");
+
+    // The actor-exit restamp reads preserved_unknown_detail; it must keep
+    // the enriched fence rather than falling back to the raw private row.
+    let fence = shared.uncertain_fence_text("w2");
+    assert!(fence.contains(raw), "{fence}");
+    assert!(fence.contains("dispatch stall budget"), "{fence}");
+    assert!(fence.contains("last provider event"), "{fence}");
 }
 
 /// The restamp path (`preserved_unknown_detail` via actor exit,
