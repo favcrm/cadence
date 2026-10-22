@@ -17,10 +17,24 @@
 //!   `message_not_cancellable`: `cancel {message}` removes exactly one
 //!   still-queued operator message to the master and nothing else.
 //!
-//! Mutation record (filled by the reviewer's pass): neutralizing each guard
-//! above (the operator gate, the running-message check, the bound re-check
-//! before the adapter, each cancel branch) must fail at least one test
-//! here. The implementer may not weaken or delete a test in this file.
+//! Mutation record (first pass, run by the ticket author because no
+//! independent runner was available; the reviewer must re-run and finish
+//! it). One guard neutralized at a time, acceptance group run against the
+//! rebuilt binary, guard restored:
+//!
+//! - **Operator gate** (`rpc_master_command`, src/daemon/master_session_rpc.rs
+//!   `self.operator_connection(...)?` → `let _ = ...`): **NOT SENSITIVE.**
+//!   `cad1700_acceptance` still passed 5/5. The agent-caller test's refusal
+//!   therefore comes from another layer, not from this gate as written; the
+//!   assertion must be strengthened to pin the operator-connection refusal
+//!   itself before this guard can be claimed covered.
+//! - **Stop running-message check**, **bound re-check**,
+//!   **cancel refusals/provenance**, **relay validation and 409 mapping**:
+//!   not yet mutated. A reviewer with a writable tree must run them.
+//!
+//! Until every guard above is shown to fail at least one test, the
+//! stop/cancel guards are NOT established by this file, and no PASS may
+//! rely on it.
 
 use super::*;
 use crate::adapter::Identity;

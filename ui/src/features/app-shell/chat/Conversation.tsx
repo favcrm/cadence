@@ -943,7 +943,18 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     failedSend !== null
       ? () => retry(failedSend.message, failedSend.text)
       : failedEntry !== null
-        ? () => void send(failedEntry.text, [])
+        ? () => {
+            const raw = failedEntry.payload?.refs;
+            const refs = Array.isArray(raw)
+              ? raw.flatMap((item) => {
+                  const ref = item as { kind?: unknown; id?: unknown };
+                  return typeof ref.kind === "string" && typeof ref.id === "string"
+                    ? [{ kind: ref.kind, id: ref.id }]
+                    : [];
+                })
+              : [];
+            void send(failedEntry.text, refs);
+          }
         : undefined;
   const turnCommand = (command: "stop" | "cancel", message: string) => {
     const origin = { key: composerKey, visit: visitRef.current, frame: frameToken };
@@ -961,7 +972,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     onCancel: (message: string) => turnCommand("cancel", message),
     onRetry: retryAction,
     onView:
-      turnState.kind === "queued" && turnState.aheadConversation !== null
+      turnState.kind === "queued" &&
+      turnState.aheadConversation !== null &&
+      active.state === "ready" &&
+      active.conversations.some((c) => c.id === turnState.aheadConversation)
         ? () => selectConversation(installId, turnState.aheadConversation!)
         : undefined,
     onReview: () => {
