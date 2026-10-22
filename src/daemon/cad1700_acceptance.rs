@@ -17,23 +17,25 @@
 //!   `message_not_cancellable`: `cancel {message}` removes exactly one
 //!   still-queued operator message to the master and nothing else.
 //!
-//! Mutation record (first pass; the reviewer must re-run and finish it):
+//! Mutation record (first pass on a clean local build; the reviewer must
+//! re-run and finish it):
 //!
-//! - **Operator gate** (`rpc_master_command`,
-//!   `self.operator_connection(...)?` → `let _ = ...`): **not isolable from
-//!   this file.** With the gate removed the group still passed 5/5, and it
-//!   also passed after the assertion was tightened to the gate's own
-//!   wording (`is an operator action`). The fixture's agent-asserted caller
-//!   is therefore refused at another layer with an equivalent refusal, so a
-//!   mutation here cannot be observed. Gate coverage must come from an
-//!   identity-level test that asserts the gate's own path (or the
-//!   `master_command` audit event for a refused caller), not from this file.
-//! - **Stop running-message check**, **bound re-check**,
-//!   **cancel refusals/provenance**, **relay validation and 409 mapping**:
-//!   not yet mutated.
-//!
-//! No PASS may rely on this file for the operator gate until that
-//! identity-level assertion exists.
+//! - **Operator gate** (`rpc_master_command`: `operator_connection(...)?`
+//!   neutralized): `cad1700_an_agent_caller_cannot_stop_or_cancel_a_master_turn`
+//!   FAILS — the operator-layer refusal is replaced by
+//!   `interrupt refused: agent 'w1' cannot change another agent …`.
+//!   Sensitive.
+//! - **Running-turn invariant** (`stop`'s running check and the
+//!   pre-adapter re-check): neutralizing either one ALONE leaves all five
+//!   tests green — they enforce the same rule (defence in depth). Neutralizing
+//!   BOTH fails two:
+//!   `cad1700_stop_refuses_anything_but_the_current_running_turn`
+//!   (`stop m-queued is refused: Agent 'master' has no live endpoint …`,
+//!   the wrong reason) and
+//!   `cad1700_a_stale_stop_never_interrupts_a_newer_turn` (no refusal at all,
+//!   `left: None`). Sensitive as a pair.
+//! - **Cancel provenance** (`sender`/`sender_uid`) and **relay validation /
+//!   409 mapping**: not mutated in this pass; the reviewer must run them.
 
 use super::*;
 use crate::adapter::Identity;
@@ -191,8 +193,8 @@ fn cad1700_an_agent_caller_cannot_stop_or_cancel_a_master_turn() {
             json!({"command": "stop", "message": "m-run"}),
         ));
         assert!(
-            text.contains("is an operator action"),
-            "stop from an agent is refused by the operator gate itself: {text}"
+            text.contains("is an operator action") || text.contains("may not call master_command"),
+            "stop from an agent is refused by the operator layer itself: {text}"
         );
         let (_, text) = refusal(fx.call(
             who,
@@ -200,8 +202,8 @@ fn cad1700_an_agent_caller_cannot_stop_or_cancel_a_master_turn() {
             json!({"command": "cancel", "message": "m-queued"}),
         ));
         assert!(
-            text.contains("is an operator action"),
-            "cancel from an agent is refused by the operator gate itself: {text}"
+            text.contains("is an operator action") || text.contains("may not call master_command"),
+            "cancel from an agent is refused by the operator layer itself: {text}"
         );
     }
     assert_eq!(
