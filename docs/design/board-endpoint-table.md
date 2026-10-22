@@ -13,8 +13,9 @@ one declared table without changing which handler wins for any existing path.
 | Write class table | `src/ui/operator.rs` `WRITE_ROUTES` | 189 rows, fail-closed default `OperatorOnly` |
 | Per-area parsers | `src/ui/<area>.rs` `route()` | 20 modules; return a typed `Route` enum or `None` |
 
-The counts are a static grep over this revision, not a runtime census; every
-line reference was checked against the same tree.
+The counts are a static grep over the revision this note was written on, not a
+runtime census; every line reference was checked against that tree. Line numbers
+drift with later changes — the symbol and module names are the stable citation.
 
 Adding one endpoint touches eight places: the area's `route()` arm, the body
 struct, the handler, the dispatch arm in one chain, a `WRITE_ROUTES` row, the
@@ -99,10 +100,12 @@ The question: does replacing first-match-wins with a most-specific-match router
    `/api/app-requests/dismiss`. As a table these become seven rows with one
    handler id; no overlap.
 
-**Finding:** no pair in either chain depends on first-match *over* most-specific
-for the paths the board actually serves. The one place the rules would disagree
-is the malformed extra-segment form above, where a table is deliberately
-stricter. The one pair where order mattered (`migrations/{id}/recover`)
+**Finding:** §8 records the one real overlap —
+`POST /api/app-installations/migrations/upgrade/recover` satisfies both
+`/migrations/{id}/recover` and `/{id}/upgrade/recover`, declaration order decides,
+and the pre-migration chain relays catalog recovery with id `upgrade`. Every
+other shared stem is either disjoint by segment count or narrowed by the
+extra-segment rule above, where the table is deliberately stricter. The one pair where order mattered (`migrations/{id}/recover`)
 resolves the same way under both rules. The audit is static: it compared the arms
 as written, not observed responses.
 

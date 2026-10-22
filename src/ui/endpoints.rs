@@ -5,8 +5,11 @@
 //! disagree. A group moves whole — never half a stem — so no path is ever owned
 //! by two mechanisms.
 //!
-//! A row without a dispatch arm does not compile: `write_route` matches on
-//! [`RouteId`] with an exhaustive `match`. Add the arm with the row.
+//! A write row without its arm does not compile: `write_route` matches on
+//! [`RouteId`] with no catch-all. `read_dispatch` also matches on it, but keeps
+//! a catch-all that refuses a write row with `500`, so a *read* row without its
+//! arm answers `500` at runtime instead of failing the build — its test has to
+//! catch that.
 
 use super::operator::RouteClass;
 use super::serve::err_response;
