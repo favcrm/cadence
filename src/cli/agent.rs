@@ -294,6 +294,15 @@ pub(crate) enum AgentAction {
         #[arg(long)]
         no_resume: bool,
     },
+    /// Replace the agent's standing instructions (operator only). The
+    /// reply's `applies` says when the agent sees them; the agent is not
+    /// restarted.
+    Instructions {
+        alias: String,
+        /// File with the new instructions.
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Stop the agent's actor (queued messages are retained).
     Stop { alias: String },
     /// Resume a stopped agent on its saved native thread. Like a
@@ -893,6 +902,18 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
                 return Ok(0);
             }
             out
+        }
+        AgentAction::Instructions { alias, file } => {
+            let text = crate::cli::read_master_command_file(
+                &state_dir,
+                Some(&file),
+                cadence_agent::store::MAX_INSTRUCTIONS_BYTES as u64,
+            )?;
+            client::rpc(
+                &state_dir,
+                "agent_instructions_set",
+                json!({"alias": alias, "instructions": text}),
+            )?
         }
         AgentAction::Remove { alias, force } => client::rpc(
             &state_dir,

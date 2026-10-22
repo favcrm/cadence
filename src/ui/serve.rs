@@ -1161,6 +1161,10 @@ fn read_dispatch(
                 Err(error) => err_response(404, &error),
             }
         }
+        endpoints::RouteId::AgentRoles => match client::rpc(state_dir, "agent_roles", json!({})) {
+            Ok(roles) => json_response(roles),
+            Err(error) => home::rpc_err(&error, "agent_roles"),
+        },
         endpoints::RouteId::ArtifactRead => artifacts::read(
             request,
             state_dir,

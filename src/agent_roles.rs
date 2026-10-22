@@ -91,7 +91,10 @@ pub const ROLES: &[Role] = &[
             "Opens a PR and answers review",
         ],
         skills: &["cadence"],
-        tools: &["Repo of the ticket (files, terminal)", "GitHub: push branch, open PR"],
+        tools: &[
+            "Repo of the ticket (files, terminal)",
+            "GitHub: push branch, open PR",
+        ],
         first_tasks: &[
             "Fix the newest bug ticket",
             "Add a dark-mode toggle",
@@ -112,8 +115,15 @@ pub const ROLES: &[Role] = &[
             "Shares a preview link for comments",
         ],
         skills: &["cadence", "website-builder"],
-        tools: &["Repo of the ticket (design kit)", "Canvas: publish a preview"],
-        first_tasks: &["Mock a pricing page", "Tidy the settings screen", "Make a phone layout"],
+        tools: &[
+            "Repo of the ticket (design kit)",
+            "Canvas: publish a preview",
+        ],
+        first_tasks: &[
+            "Mock a pricing page",
+            "Tidy the settings screen",
+            "Make a phone layout",
+        ],
     },
     Role {
         id: "pm",
@@ -130,7 +140,11 @@ pub const ROLES: &[Role] = &[
         ],
         skills: &["cadence"],
         tools: &["Board: tickets and threads", "Message other agents"],
-        first_tasks: &["Plan this week", "What is blocked?", "Split this idea into tickets"],
+        first_tasks: &[
+            "Plan this week",
+            "What is blocked?",
+            "Split this idea into tickets",
+        ],
     },
     Role {
         id: "qa",
@@ -147,7 +161,11 @@ pub const ROLES: &[Role] = &[
         ],
         skills: &["cadence"],
         tools: &["Repo of the ticket", "Test browser"],
-        first_tasks: &["Test the newest PR", "Check sign-up on a phone", "Smoke-test checkout"],
+        first_tasks: &[
+            "Test the newest PR",
+            "Check sign-up on a phone",
+            "Smoke-test checkout",
+        ],
     },
     Role {
         id: "devops",
@@ -181,7 +199,11 @@ pub const ROLES: &[Role] = &[
         ],
         skills: &["cadence"],
         tools: &["Repo of the ticket (read)"],
-        first_tasks: &["Review this plan", "Map the auth flow", "Where should this live?"],
+        first_tasks: &[
+            "Review this plan",
+            "Map the auth flow",
+            "Where should this live?",
+        ],
     },
     Role {
         id: "accountant",
@@ -198,7 +220,11 @@ pub const ROLES: &[Role] = &[
         ],
         skills: &["business-documents", "company-outputs"],
         tools: &["Invoices app (read)", "CRM orders (read)"],
-        first_tasks: &["Reconcile October", "List unpaid invoices", "Draft the monthly summary"],
+        first_tasks: &[
+            "Reconcile October",
+            "List unpaid invoices",
+            "Draft the monthly summary",
+        ],
     },
     Role {
         id: "researcher",
@@ -215,7 +241,11 @@ pub const ROLES: &[Role] = &[
         ],
         skills: &["company-outputs"],
         tools: &["Web search", "Wiki (read, write own notes)"],
-        first_tasks: &["Compare 3 competitors", "Size this market", "Summarise this report"],
+        first_tasks: &[
+            "Compare 3 competitors",
+            "Size this market",
+            "Summarise this report",
+        ],
     },
     Role {
         id: "quotation",
@@ -232,7 +262,11 @@ pub const ROLES: &[Role] = &[
         ],
         skills: &["business-documents"],
         tools: &["CRM (read)", "Document templates"],
-        first_tasks: &["Quote for Acme, 40 seats", "Update a quote", "Explain this discount"],
+        first_tasks: &[
+            "Quote for Acme, 40 seats",
+            "Update a quote",
+            "Explain this discount",
+        ],
     },
     Role {
         id: "analyst",
@@ -249,7 +283,11 @@ pub const ROLES: &[Role] = &[
         ],
         skills: &["company-outputs"],
         tools: &["App data (read)", "Canvas: charts and reports"],
-        first_tasks: &["Why did sales dip?", "Top 10 customers", "Weekly KPI report"],
+        first_tasks: &[
+            "Why did sales dip?",
+            "Top 10 customers",
+            "Weekly KPI report",
+        ],
     },
     Role {
         id: "support",
@@ -266,7 +304,11 @@ pub const ROLES: &[Role] = &[
         ],
         skills: &["company-outputs"],
         tools: &["Inbox: email / WhatsApp (read, draft)", "Wiki (read)"],
-        first_tasks: &["Reply to today's emails", "Find common questions", "Write an FAQ"],
+        first_tasks: &[
+            "Reply to today's emails",
+            "Find common questions",
+            "Write an FAQ",
+        ],
     },
     Role {
         id: "sales",
@@ -283,7 +325,11 @@ pub const ROLES: &[Role] = &[
         ],
         skills: &["company-outputs"],
         tools: &["CRM (read)", "Inbox (draft)"],
-        first_tasks: &["Who needs a follow-up?", "Draft 5 follow-ups", "Summarise the pipeline"],
+        first_tasks: &[
+            "Who needs a follow-up?",
+            "Draft 5 follow-ups",
+            "Summarise the pipeline",
+        ],
     },
 ];
 

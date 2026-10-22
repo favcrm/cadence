@@ -820,7 +820,7 @@ pub(super) fn agent_action_route(path: &str) -> Option<(&str, &str)> {
     (!alias.is_empty() && !verb.contains('/')).then_some((alias, verb))
 }
 
-/// `POST /api/agents/<alias>/resume|unfence` — operator-only on the
+/// `POST /api/agents/<alias>/resume|unfence|instructions` — operator-only on the
 /// board (`operator::admit`); the daemon's own rules still apply
 /// (`agent_unfence` is operator-only by connection, `agent_resume` the
 /// target's SelfService). `resume` takes no body; `unfence` takes
@@ -879,6 +879,31 @@ pub(super) fn agent_action(
             (
                 "agent_unfence",
                 json!({"alias": alias, "status": status, "resume": true}),
+            )
+        }
+        // CAD-1752: replace the agent's standing instructions. The daemon
+        // proves the operator connection; the body is `{instructions}` only.
+        "instructions" => {
+            let body: Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(_) => return err_response(400, "instructions takes {\"instructions\": …}"),
+            };
+            let obj = body.as_object();
+            let Some(text) = obj
+                .and_then(|o| o.get("instructions"))
+                .and_then(Value::as_str)
+            else {
+                return err_response(400, "instructions needs the new text");
+            };
+            if let Some(extra) = obj.and_then(|o| o.keys().find(|k| k.as_str() != "instructions")) {
+                return err_response(
+                    400,
+                    &format!("instructions takes the text only — '{extra}' is not accepted"),
+                );
+            }
+            (
+                "agent_instructions_set",
+                json!({"alias": alias, "instructions": text}),
             )
         }
         _ => return err_response(404, "no such agent route"),

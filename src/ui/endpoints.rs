@@ -43,6 +43,7 @@ pub(super) enum RouteId {
     WorkspaceShow,
     ConversationsRead,
     AgentDetail,
+    AgentRoles,
     ExplorerUpdateCheck,
     ExplorerRemovePreview,
     ExplorerRemove,
@@ -320,6 +321,8 @@ pub(super) const ENDPOINTS: &[Endpoint] = &[
         CallerScoped,
         ALIAS_BINDING
     ),
+    // CAD-1752: the role catalogue is a read for any signed-in viewer.
+    get!(AgentRoles, "/api/agent-roles", AgentAllowed, &[]),
     row!(
         ExplorerUpdateCheck,
         "/api/app-installations/{id}/update-check",

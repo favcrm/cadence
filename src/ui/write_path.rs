@@ -388,7 +388,8 @@ pub(crate) fn post_report(
 #[serde(deny_unknown_fields)]
 pub(crate) struct AgentRegisterReq {
     alias: String,
-    location: String,
+    /// Start blank only; a `catalogue` hire takes the runtime from the install.
+    location: Option<String>,
     provider: Option<String>,
     endpoint_kind: Option<String>,
     role: Option<String>,
@@ -398,13 +399,16 @@ pub(crate) struct AgentRegisterReq {
     sandbox: Option<String>,
     instructions: Option<String>,
     params: Option<String>,
+    /// CAD-1752: hire from this role of `GET /api/agent-roles`.
+    catalogue: Option<String>,
+    look: Option<String>,
 }
 
 /// Maps a setup location to the `(provider, endpoint_kind)` pair the daemon
 /// registers. `cloud` pins both to `sandbox`; `local` needs the explicit
 /// pair and refuses `sandbox`, which only Cloud may set.
 fn resolve_location(req: &AgentRegisterReq) -> std::result::Result<(String, String), String> {
-    match req.location.trim() {
+    match req.location.as_deref().map(str::trim).unwrap_or_default() {
         "local" => {
             let provider = req.provider.as_deref().map(str::trim).unwrap_or_default();
             let endpoint = req
@@ -442,6 +446,36 @@ pub(crate) fn post_agent(request: &mut Request, state_dir: &Path) -> HttpResp {
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    // CAD-1752: a catalogue hire is relayed without a runtime — the daemon
+    // takes provider and endpoint kind from the install and refuses a
+    // caller that names them; here the board refuses `location` as well.
+    if req.catalogue.is_some() {
+        if req.location.is_some() || req.provider.is_some() || req.endpoint_kind.is_some() {
+            return err_response(
+                400,
+                "a catalogue hire takes its runtime from the install - send no location, provider or endpoint kind",
+            );
+        }
+        let params = json!({
+            "alias": req.alias.trim(),
+            "catalogue": req.catalogue,
+            "look": req.look,
+            "role": req.role,
+            "team_role": req.team_role,
+            "model_policy": req.model_policy,
+            "cwd": req.cwd,
+            "sandbox": req.sandbox,
+            "instructions": req.instructions,
+            "params": req.params,
+        });
+        return match client::rpc(state_dir, "agent_register", params) {
+            Ok(out) => json_response(out),
+            Err(err) => super::home::rpc_err(&err, "agent_register"),
+        };
+    }
+    if req.look.is_some() {
+        return err_response(400, "look only applies to a catalogue hire");
+    }
     let (provider, endpoint_kind) = match resolve_location(&req) {
         Ok(pair) => pair,
         Err(message) => return err_response(400, &message),
@@ -1143,7 +1177,8 @@ pub(crate) fn write_route(
             | RouteId::ConversationsRead
             | RouteId::ArtifactRead
             | RouteId::ArtifactVersions
-            | RouteId::AgentDetail => err_response(500, "a read row reached the write dispatcher"),
+            | RouteId::AgentDetail
+            | RouteId::AgentRoles => err_response(500, "a read row reached the write dispatcher"),
             RouteId::SessionOpen => operator::open(&mut request, state_dir, opts),
             RouteId::SessionLogout => operator::logout(&request, state_dir, opts),
             RouteId::SessionDeviceCode => operator::device_code(&mut request, state_dir, opts),
@@ -2439,7 +2474,7 @@ mod agent_setup_tests {
     fn req(location: &str, provider: Option<&str>, endpoint: Option<&str>) -> AgentRegisterReq {
         AgentRegisterReq {
             alias: "scout".into(),
-            location: location.into(),
+            location: Some(location.into()),
             provider: provider.map(Into::into),
             endpoint_kind: endpoint.map(Into::into),
             role: None,
@@ -2449,6 +2484,8 @@ mod agent_setup_tests {
             sandbox: None,
             instructions: None,
             params: None,
+            catalogue: None,
+            look: None,
         }
     }
 
