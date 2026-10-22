@@ -5,9 +5,9 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-# CAD-426: the monolithic `integration` binary is split into per-area
-# tests/*.rs binaries. TARGET is `all-targets` or a test binary name
-# (the tests/<name>.rs stem, e.g. `daemon`, `board`, `agents_pty`).
+# CAD-1727: the integration checks are modules of the one `suite` target
+# (tests/suite.rs). TARGET is `all-targets` or a test target name
+# (`suite`, or a separately declared target).
 # CAD-482: remaining args (e.g. `--features test-seam`) reach both the
 # cargo and the nextest inventory, so parity holds on the same feature
 # set the suite runs with.
@@ -61,8 +61,9 @@ case "$TARGET" in
         NEXTEST_TARGET_ARGS="--all-targets"
         ;;
     integration)
-        die "the 'integration' binary was split into per-area tests/*.rs \
-binaries (CAD-426); use all-targets or a binary name such as 'daemon'"
+        die "the 'integration' binary was retired in CAD-426 and the \
+per-area binaries were collapsed into 'suite' (CAD-1727); use all-targets \
+or a test target name such as 'suite'"
         ;;
     *[!A-Za-z0-9_]*|"")
         die "unsupported target '$TARGET' (use all-targets or a tests/*.rs stem)"

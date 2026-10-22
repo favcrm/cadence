@@ -246,6 +246,12 @@ all lib/bin tests and the split-map inventory contract. A reference from
 another tracked source makes the file shared. Production source, shared
 fixtures, manifests, workflows, tools and unknown paths run all targets.
 The selection is deliberately conservative, not a Rust dependency graph.
+
+CAD-1727 collapsed those targets into one `suite` binary and set
+`autotests = false`, so the trusted-base classifier refuses target
+narrowing for that shape and PRs run the full Rust scope. That is
+intentional: the six shards partition the one binary's tests, and a full
+build is now a single link.
 Non-PR events retain all targets; exact-SHA main queue-evidence reuse is
 unchanged. Inventory parity, pinned nextest, zero retries, default-feature
 refusal proofs and doctests remain for every Rust selection. Each run
@@ -283,8 +289,8 @@ one line per step (`[ OK ]`, `[FAIL] name: exit N`, `[SKIP] name: why`):
 5. the active Python test commands that CI's `fmt` job runs, including
    review-recipe and release-freeze regressions, when `scripts/`, `.github/`
    or `tests/scripts/` changed;
-6. with `--tests`, `cargo test --locked --test safety_floor -- --test-threads 2`
-   regardless of whether the floor's source appears in the diff.
+6. with `--tests`, `scripts/run-result-tests` (every test target, then the
+   lib and binary-target unit tests)
 
 "Changed" is the union of commits since `origin/main`, working-tree edits
 and untracked files; use `--base REF` to override and `--list` to print the
@@ -344,6 +350,12 @@ assignment receipts and zero retries, enforced by `scripts/ci-shard-check.py`
 in the `test` aggregate. Revisit build-once distribution only with a
 producer that is not serial on the critical path and a measured win over a
 cache-hit shard.
+
+CAD-1727 changed that cost shape: the 109 per-file test binaries are now
+one `suite` binary, so a full test profile is 1.8 GiB instead of 16.8 GiB
+and a shard links once instead of 109 times. The CAD-869 measurement stands
+for the tree it was taken on; an archive producer's size and transfer cost
+are now different, so re-measure before reviving that flow.
 
 ## CI throughput benchmark (CAD-840)
 
