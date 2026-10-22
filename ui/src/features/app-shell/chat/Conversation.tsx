@@ -558,20 +558,25 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // it: `updated` also moves for an operator send or a tool step, which is
   // not a reply (CAD-1700 review).
   const lastTurn = useRef<{ conversation: string | null } | null | undefined>(undefined);
-  const conversationsNow = active.state === "ready" ? active.conversations : null;
+  // The conversation a turn just FINISHED on, as its own state: the toast
+  // effect consumes the edge, so a list refresh alone can never announce.
+  const [finishedConversation, setFinishedConversation] = useState<string | null>(null);
   useEffect(() => {
     const current = masterState.data?.turn ?? null;
     const before = lastTurn.current;
     lastTurn.current = current === null ? null : { conversation: current.conversation ?? null };
-    if (conversationsNow === null) return;
-    const finished = before != null ? (before.conversation ?? null) : undefined;
+    if (before != null && current === null) setFinishedConversation(before.conversation ?? null);
+  }, [masterState.data]);
+  const conversationsNow = active.state === "ready" ? active.conversations : null;
+  useEffect(() => {
+    if (conversationsNow === null || finishedConversation === null) return;
     const first = announced.current === null;
     const known = announced.current ?? new Map<string, number>();
     conversationsNow.forEach((c, index) => {
       const seen = known.get(c.id);
       known.set(c.id, c.updated);
-      if (first || c.id === convId || seen === undefined || c.updated <= seen) return;
-      if (finished !== c.id) return;
+      if (first || c.id !== finishedConversation || c.id === convId) return;
+      if (seen === undefined || c.updated <= seen) return;
       if (!isUnread(readSeen(installId), c.id, c.updated)) return;
       const params = new URLSearchParams({ install: installId, conversation: c.id });
       toast.show(t("Assistant replied"), `assistant:${installId}:${c.id}`, {
@@ -580,7 +585,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       });
     });
     announced.current = known;
-  }, [conversationsNow, convId, installId, toast, t, mode.appPath, mode.scopeLabel, subjects, masterState.data]);
+    setFinishedConversation(null);
+  }, [conversationsNow, finishedConversation, convId, installId, toast, t, mode.appPath, mode.scopeLabel, subjects]);
 
   useEffect(() => setFailedFrames(new Set()), [installId, convId]);
   // A context or installation change drops the importer (its scope key
@@ -944,16 +950,23 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       ? () => retry(failedSend.message, failedSend.text)
       : failedEntry !== null
         ? () => {
-            const raw = failedEntry.payload?.refs;
-            const refs = Array.isArray(raw)
-              ? raw.flatMap((item) => {
-                  const ref = item as { kind?: unknown; id?: unknown };
-                  return typeof ref.kind === "string" && typeof ref.id === "string"
-                    ? [{ kind: ref.kind, id: ref.id }]
-                    : [];
-                })
-              : [];
-            void send(failedEntry.text, refs);
+            const payload = failedEntry.payload ?? {};
+            const listOf = (key: string) => (Array.isArray(payload[key]) ? (payload[key] as unknown[]) : []);
+            const objects = <T,>(raw: unknown[], pick: (item: Record<string, unknown>) => T | null) =>
+              raw.flatMap((item) => {
+                const picked = item && typeof item === "object" ? pick(item as Record<string, unknown>) : null;
+                return picked === null ? [] : [picked];
+              });
+            const refs = objects(listOf("refs"), (r) =>
+              typeof r.kind === "string" && typeof r.id === "string" ? { kind: r.kind, id: r.id } : null,
+            );
+            const attachments = objects(listOf("attachments"), (a) => (typeof a.id === "string" ? { id: a.id } : null));
+            const mediaRefs = objects(listOf("media_refs"), (m) =>
+              typeof m.asset_id === "string" && typeof m.revision === "number" && typeof m.sha256 === "string"
+                ? { asset_id: m.asset_id, revision: m.revision, sha256: m.sha256 }
+                : null,
+            );
+            void send(failedEntry.text, refs, attachments.length ? attachments : undefined, mediaRefs.length ? mediaRefs : undefined);
           }
         : undefined;
   const turnCommand = (command: "stop" | "cancel", message: string) => {
@@ -972,12 +985,13 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     onCancel: (message: string) => turnCommand("cancel", message),
     onRetry: retryAction,
     onView:
-      turnState.kind === "queued" &&
-      turnState.aheadConversation !== null &&
-      active.state === "ready" &&
-      active.conversations.some((c) => c.id === turnState.aheadConversation)
-        ? () => selectConversation(installId, turnState.aheadConversation!)
-        : undefined,
+      turnState.kind !== "queued"
+        ? undefined
+        : turnState.aheadConversation === null
+          ? () => window.location.assign("/")
+          : active.state === "ready" && active.conversations.some((c) => c.id === turnState.aheadConversation)
+            ? () => selectConversation(installId, turnState.aheadConversation!)
+            : undefined,
     onReview: () => {
       const card = listRef.current?.querySelector<HTMLElement>("[data-permission-thread], .app-assistant-activity");
       (card ?? listRef.current)?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });

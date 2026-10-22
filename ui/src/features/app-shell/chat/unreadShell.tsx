@@ -24,7 +24,11 @@ function UnreadProbe({ installId, finished }: { installId: string; finished: str
     if (conversations === null) return;
     const seen = readSeen(installId);
     const unread = conversations.some((c) => isUnread(seen, c.id, c.updated));
-    setAssistantUnread(installId, unread || (finished !== null && conversations.some((c) => c.id === finished)));
+    // A finished turn counts only while that conversation is still unseen:
+    // another tab opening it writes the seen map, and this must not re-raise.
+    const finishedUnread =
+      finished !== null && conversations.some((c) => c.id === finished && isUnread(seen, c.id, c.updated));
+    setAssistantUnread(installId, unread || finishedUnread);
   }, [conversations, installId, finished, written]);
 
   useEffect(() => {
