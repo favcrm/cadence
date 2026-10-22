@@ -5,13 +5,14 @@ use super::*;
 use crate::issue::{app, app_view, workflow, write};
 use crate::store::Store;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 
 /// CAD-1194: the install-check source form that names a host built-in.
 const BUILTIN_SOURCE_PREFIX: &str = "builtin:";
 const INSTALL_PENDING: &str = ".apps/install-pending.yaml";
 const UPGRADE_PENDING: &str = ".apps/upgrade-pending.yaml";
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UpgradeJournal {
     schema: u32,
@@ -26,6 +27,12 @@ pub(crate) struct UpgradeJournal {
     before_record: String,
     after_record: String,
     files: BTreeMap<String, String>,
+    /// CAD-1652: the exact bundle files this upgrade will unlink. It is
+    /// written to the retained journal before the first unlink so recovery
+    /// can stage the deletions with the catalog commit even when the commit
+    /// fails. Empty means no pruning, or a legacy journal that never pruned.
+    #[serde(default)]
+    prune: Vec<String>,
     /// CAD-1140: for every configured binding whose slot declaration is
     /// byte-identical between the old and new bundles, the exact receipt
     /// (`binding id -> config`) the preflight read, each pinned to the
@@ -1114,6 +1121,7 @@ pub(super) fn upgrade_check_from(
 pub(crate) fn upgrade(
     pm: &Pm,
     request: &UpgradeRequest<'_>,
+    retain: impl FnOnce() -> Option<BTreeSet<String>>,
     preflight: impl FnOnce(
         &BTreeMap<String, String>,
         &app::Manifest,
@@ -1183,6 +1191,7 @@ pub(crate) fn upgrade(
         request.directory,
     )?;
     let _lock = pm.lock()?;
+    let retain = retain();
     let root = Root::open(&pm.dir)?;
     let (mut catalog, before_catalog) = current(&root)?;
     let before_catalog =
@@ -1264,6 +1273,7 @@ pub(crate) fn upgrade(
         after_catalog: yaml(&catalog)?,
         before_record,
         after_record: yaml(&next_record)?,
+        prune: Vec::new(),
         bindings: carried.into_iter().collect(),
         catalogue: decision.origin,
         catalogue_manual: decision.manual,
@@ -1286,7 +1296,7 @@ pub(crate) fn upgrade(
     ).map_err(|error| {
         Error::internal(format!("workspace upgrade marker incomplete ({}); retained journal can be resumed with `cadence app catalog upgrade-recover {} --request-id {}`", error.kind(), &*id, request_id))
     })?;
-    let foreign = apply_upgrade(pm, &root, &journal, Some(deliver)).map_err(|error| {
+    let (foreign, prune) = apply_upgrade(pm, &root, &journal, retain.as_ref(), Some(deliver)).map_err(|error| {
         Error::internal(format!("workspace upgrade delivery incomplete ({}); recover with `cadence app catalog upgrade-recover {} --request-id {}`", error.kind(), &*id, request_id))
     })?;
     let mut row = describe(&root, &catalog, &id)?;
@@ -1294,6 +1304,7 @@ pub(crate) fn upgrade(
     row["foreign_files"] = json!(foreign);
     row["structural_diff"] = journal.diff;
     row["compatibility"] = journal.compatibility;
+    row["prune"] = prune;
     Ok(row)
 }
 
@@ -1301,8 +1312,9 @@ fn apply_upgrade<F: FnOnce(&UpgradeJournal) -> Result<Vec<String>>>(
     pm: &Pm,
     root: &Root,
     journal: &UpgradeJournal,
+    retain: Option<&BTreeSet<String>>,
     deliver: Option<F>,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, Value)> {
     if journal.schema != 1 || journal.files.is_empty() || journal.files.len() > 128 {
         return Err(Error::rejected("unsupported workspace upgrade journal"));
     }
@@ -1475,6 +1487,71 @@ fn apply_upgrade<F: FnOnce(&UpgradeJournal) -> Result<Vec<String>>>(
     }
     root.put(&record_path, &journal.after_record)?;
     root.put(Path::new(CATALOG), &journal.after_catalog)?;
+    // CAD-1652: the new revision is written; prune unreferenced old ones in
+    // the same tracker commit. The deletion inventory is persisted in the
+    // retained journal before the first unlink, so a failed commit can replay
+    // exactly the admitted deletions. An unreadable receipt index passes
+    // `None` and prunes nothing.
+    let prune = if !journal.prune.is_empty() {
+        let Some(receipts) = retain else {
+            return Err(Error::rejected(
+                "upgrade journal has a prune inventory but the receipt index is unavailable",
+            ));
+        };
+        let mut protected = receipts.clone();
+        if let Some(active) = new_entry.bundle_revision.as_deref() {
+            protected.insert(active.trim_start_matches("sha256:").to_string());
+        }
+        protected.insert(
+            journal
+                .expected_digest
+                .trim_start_matches("sha256:")
+                .to_string(),
+        );
+        for file in &journal.prune {
+            if !prune_path_ok(file, journal.id.as_ref()) {
+                return Err(Error::rejected(
+                    "upgrade journal has invalid prune inventory",
+                ));
+            }
+            let Some(revision) = prune_revision_dir(file, journal.id.as_ref()) else {
+                return Err(Error::rejected(
+                    "upgrade journal has invalid prune inventory",
+                ));
+            };
+            let Some(digest) = revision.file_name().and_then(|name| name.to_str()) else {
+                return Err(Error::rejected(
+                    "upgrade journal has invalid prune inventory",
+                ));
+            };
+            if protected.contains(digest) {
+                return Err(Error::rejected(
+                    "upgrade journal prune inventory names a retained revision",
+                ));
+            }
+            // A previous attempt may already have committed this deletion.
+            // Staging a missing, untracked pathspec would fail `git add` and
+            // wedge recovery forever; only replay what Git still tracks.
+            if tracked_in_index(pm, file) {
+                paths.push(pm.dir.join(file));
+            }
+        }
+        let (removed, failed) = delete_prune_inventory(root, journal.id.as_ref(), &journal.prune);
+        json!({"recovered": true, "pruned": [], "prunedBytes": 0,
+               "removed": removed, "failed": failed})
+    } else {
+        let plan = plan_prune(
+            root,
+            journal.id.as_ref(),
+            new_entry.bundle_revision.as_deref(),
+            &journal.expected_digest,
+            retain,
+        );
+        if !plan.files.is_empty() {
+            persist_prune_inventory(root, journal, &plan.files)?;
+        }
+        apply_prune_plan(root, &pm.dir, plan, &mut paths)
+    };
     let foreign = write::commit(
         pm,
         &paths,
@@ -1494,10 +1571,13 @@ fn apply_upgrade<F: FnOnce(&UpgradeJournal) -> Result<Vec<String>>>(
         deliver(journal)?;
     }
     root.remove(Path::new(UPGRADE_PENDING))?;
-    Ok(foreign
-        .into_iter()
-        .filter(|path| path != UPGRADE_PENDING)
-        .collect())
+    Ok((
+        foreign
+            .into_iter()
+            .filter(|path| path != UPGRADE_PENDING)
+            .collect(),
+        prune,
+    ))
 }
 
 /// `deliver` is the same binding carry the original `upgrade` staged: a
@@ -1507,11 +1587,13 @@ pub(crate) fn upgrade_recover(
     pm: &Pm,
     id: &str,
     request_id: &str,
+    retain: impl FnOnce() -> Option<BTreeSet<String>>,
     deliver: impl FnOnce(&UpgradeJournal) -> Result<Vec<String>>,
 ) -> Result<Value> {
     let id = InstallationId::parse(id)?;
     crate::proto::identifier(request_id, "upgrade request ID")?;
     let _lock = pm.lock()?;
+    let retain = retain();
     let root = Root::open(&pm.dir)?;
     let journal: UpgradeJournal = decode(&required(
         &root,
@@ -1550,13 +1632,14 @@ pub(crate) fn upgrade_recover(
             &yaml(&json!({"install_id":&*id,"request_id":request_id}))?,
         )?;
     }
-    let foreign = apply_upgrade(pm, &root, &journal, Some(deliver))?;
+    let (foreign, prune) = apply_upgrade(pm, &root, &journal, retain.as_ref(), Some(deliver))?;
     let catalog = Catalog::load(&pm.dir)?;
     let mut row = describe(&root, &catalog, &id)?;
     row["committed"] = json!(true);
     row["foreign_files"] = json!(foreign);
     row["structural_diff"] = journal.diff;
     row["compatibility"] = journal.compatibility;
+    row["prune"] = prune;
     Ok(row)
 }
 
@@ -2289,6 +2372,330 @@ pub(crate) fn with_completed_bundle_snapshot<T>(
     callback(&json!({"digest":digest}), &files)
 }
 
+/// A validated deletion candidate. `files` are relative to the PM root and
+/// are the only paths the pruner may unlink.
+struct PruneCandidate {
+    name: String,
+    files: Vec<String>,
+    bytes: u64,
+}
+
+struct PrunePlan {
+    report: Value,
+    files: Vec<String>,
+    candidates: Vec<PruneCandidate>,
+}
+
+fn skipped_prune(reason: &str) -> PrunePlan {
+    PrunePlan {
+        report: json!({"retained": [], "pruned": [], "retainedBytes": 0, "prunedBytes": 0,
+                       "skipped": reason}),
+        files: Vec::new(),
+        candidates: Vec::new(),
+    }
+}
+
+/// CAD-1652: plan deletion of old workspace bundle revisions that neither
+/// the active pointer, the just-replaced revision, nor a store receipt
+/// references. This is deliberately read-only: the caller persists the
+/// exact inventory in the upgrade journal before any unlink, and only then
+/// applies the plan. A malformed revision shape is retained, never walked.
+///
+/// The caller supplies `None` when the receipt index could not be read. That
+/// is not an error for the upgrade: it means "prune nothing", because an
+/// unreadable receipt cannot prove a revision is unreferenced.
+fn plan_prune(
+    root: &Root,
+    id: &str,
+    active: Option<&str>,
+    previous: &str,
+    receipts: Option<&BTreeSet<String>>,
+) -> PrunePlan {
+    let Some(receipts) = receipts else {
+        return skipped_prune("receipt-index-unavailable");
+    };
+    let previous = previous.strip_prefix("sha256:").unwrap_or(previous);
+    let mut retain = receipts.clone();
+    if let Some(active) = active {
+        retain.insert(active.to_string());
+    }
+    if is_revision_name(previous) {
+        retain.insert(previous.to_string());
+    }
+    let revisions = Path::new(".apps/installations").join(id).join("revisions");
+    match root.kind(&revisions) {
+        Ok(None) => {
+            return PrunePlan {
+                report: json!({"retained": retain.into_iter().collect::<Vec<_>>(), "pruned": [],
+                               "retainedBytes": 0, "prunedBytes": 0, "skipped": null}),
+                files: Vec::new(),
+                candidates: Vec::new(),
+            }
+        }
+        Ok(Some(mode)) if mode & libc::S_IFMT == libc::S_IFDIR => {}
+        Ok(Some(_)) => return skipped_prune("revisions-path-not-directory"),
+        Err(_) => return skipped_prune("revisions-path-unreadable"),
+    }
+    let mut budget = MAX_INVENTORY_ENTRIES;
+    let names = match root.list(&revisions, &mut budget) {
+        Ok(names) => names,
+        Err(_) => return skipped_prune("revisions-list-unreadable"),
+    };
+    let mut retained = Vec::new();
+    let mut candidates = Vec::new();
+    let mut retained_bytes = 0u64;
+    let mut pruned_bytes = 0u64;
+    let mut scanned = 0usize;
+    let mut skipped = None;
+    for name in names {
+        if !is_revision_name(&name) {
+            continue;
+        }
+        if retain.contains(&name) {
+            let bundle = revisions.join(&name).join("bundle");
+            if let Ok(files) = snapshot(root, &bundle, false) {
+                retained_bytes += files.values().map(|text| text.len() as u64).sum::<u64>();
+            }
+            retained.push(name);
+            continue;
+        }
+        scanned += 1;
+        if scanned > 64 {
+            skipped = Some("revision-scan-bound");
+            break;
+        }
+        let path = revisions.join(&name);
+        // The revision must be exactly `bundle/`; an unknown sibling means
+        // this is not a shape this pruner understood, so leave it untouched.
+        let mut shape_budget = MAX_INVENTORY_ENTRIES;
+        let entries = match root.list(&path, &mut shape_budget) {
+            Ok(entries) => entries,
+            Err(_) => {
+                retained.push(name);
+                skipped = Some("revision-unreadable");
+                continue;
+            }
+        };
+        if entries.len() != 1 || entries[0] != "bundle" {
+            retained.push(name);
+            skipped = Some("revision-unknown-entry");
+            continue;
+        }
+        let bundle = path.join("bundle");
+        let files = match snapshot(root, &bundle, false) {
+            Ok(files) => files,
+            Err(_) => {
+                retained.push(name);
+                skipped = Some("revision-unreadable");
+                continue;
+            }
+        };
+        let bytes = files.values().map(|text| text.len() as u64).sum::<u64>();
+        let files = files
+            .keys()
+            .map(|file| bundle.join(file).to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        candidates.push(PruneCandidate {
+            name: name.clone(),
+            files,
+            bytes,
+        });
+        pruned_bytes += bytes;
+    }
+    let mut pruned = candidates
+        .iter()
+        .map(|candidate| candidate.name.clone())
+        .collect::<Vec<_>>();
+    let mut files = candidates
+        .iter()
+        .flat_map(|candidate| candidate.files.iter().cloned())
+        .collect::<Vec<_>>();
+    retained.sort();
+    pruned.sort();
+    files.sort();
+    PrunePlan {
+        report: json!({
+            "retained": retained,
+            "pruned": pruned,
+            "retainedBytes": retained_bytes,
+            "prunedBytes": pruned_bytes,
+            "skipped": skipped,
+        }),
+        files,
+        candidates,
+    }
+}
+
+fn tracked_in_index(pm: &Pm, relative: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&pm.dir)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(relative)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn persist_prune_inventory(root: &Root, journal: &UpgradeJournal, files: &[String]) -> Result<()> {
+    let mut durable = journal.clone();
+    durable.prune = files.to_vec();
+    let text = yaml(&durable)?;
+    if text.len() as u64 > JOURNAL_CAP {
+        return Err(Error::rejected(
+            "workspace upgrade journal exceeds its limit after pruning",
+        ));
+    }
+    root.put(
+        &upgrade_journal_path(&journal.id, &journal.request_id),
+        &text,
+    )
+}
+
+/// Apply a plan only after its inventory is durable in the journal. Every
+/// admitted file is staged before the first unlink; a failed candidate is
+/// reported as `failed`, never as `retained`, because some of its bytes may
+/// already be gone.
+fn apply_prune_plan(root: &Root, base: &Path, plan: PrunePlan, paths: &mut Vec<PathBuf>) -> Value {
+    let mut report = plan.report.clone();
+    let mut pruned = Vec::new();
+    let mut failed = Vec::new();
+    let mut pruned_bytes = 0u64;
+    for candidate in plan.candidates {
+        for file in &candidate.files {
+            paths.push(base.join(file));
+        }
+        if delete_candidate(root, &candidate) {
+            pruned.push(candidate.name);
+            pruned_bytes += candidate.bytes;
+        } else {
+            failed.push(candidate.name);
+        }
+    }
+    report["pruned"] = json!(pruned);
+    report["prunedBytes"] = json!(pruned_bytes);
+    report["failed"] = json!(failed);
+    report
+}
+
+fn delete_candidate(root: &Root, candidate: &PruneCandidate) -> bool {
+    for file in &candidate.files {
+        if root.remove(Path::new(file)).is_err() {
+            return false;
+        }
+    }
+    for dir in candidate_dirs(&candidate.files) {
+        if root.remove_dir(Path::new(&dir)).is_err() {
+            return false;
+        }
+    }
+    let Some(revision) = candidate.files.first().and_then(|file| {
+        let mut dir = Path::new(file).parent();
+        while let Some(candidate) = dir {
+            if candidate.file_name().is_some_and(|name| name == "bundle") {
+                return candidate.parent().map(Path::to_path_buf);
+            }
+            dir = candidate.parent();
+        }
+        None
+    }) else {
+        return false;
+    };
+    if root.remove_dir(&revision.join("bundle")).is_err() {
+        return false;
+    }
+    if root.remove_dir(&revision).is_err() {
+        return false;
+    }
+    true
+}
+
+/// Replay a journaled inventory after a failed commit. Only admitted bundle
+/// files are removed; enclosing directories are removed only when empty.
+fn delete_prune_inventory(root: &Root, id: &str, files: &[String]) -> (usize, Vec<String>) {
+    let mut removed = 0usize;
+    let mut failed = Vec::new();
+    for file in files {
+        match root.remove(Path::new(file)) {
+            Ok(()) => removed += 1,
+            Err(_) => failed.push(file.clone()),
+        }
+    }
+    for dir in candidate_dirs(files) {
+        let _ = root.remove_dir(Path::new(&dir));
+    }
+    let mut revisions = BTreeSet::new();
+    for file in files {
+        if let Some(revision) = prune_revision_dir(file, id) {
+            revisions.insert(revision);
+        }
+    }
+    for revision in revisions {
+        let _ = root.remove_dir(&revision.join("bundle"));
+        let _ = root.remove_dir(&revision);
+    }
+    (removed, failed)
+}
+
+fn candidate_dirs(files: &[String]) -> Vec<String> {
+    let mut dirs = BTreeSet::new();
+    for file in files {
+        let mut parent = Path::new(file).parent();
+        while let Some(dir) = parent {
+            if dir.file_name().is_some_and(|name| name == "bundle") {
+                break;
+            }
+            dirs.insert(dir.to_string_lossy().into_owned());
+            parent = dir.parent();
+        }
+    }
+    let mut dirs = dirs.into_iter().collect::<Vec<_>>();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(Path::new(dir).components().count()));
+    dirs
+}
+
+fn prune_revision_dir(file: &str, id: &str) -> Option<PathBuf> {
+    let prefix = format!(".apps/installations/{id}/revisions/");
+    let rest = file.strip_prefix(&prefix)?;
+    let mut parts = rest.split('/');
+    let revision = parts.next()?;
+    if !is_revision_name(revision) || parts.next()? != "bundle" {
+        return None;
+    }
+    Some(
+        Path::new(".apps/installations")
+            .join(id)
+            .join("revisions")
+            .join(revision),
+    )
+}
+
+fn prune_path_ok(path: &str, id: &str) -> bool {
+    let prefix = format!(".apps/installations/{id}/revisions/");
+    let Some(rest) = path.strip_prefix(&prefix) else {
+        return false;
+    };
+    let mut parts = rest.splitn(3, '/');
+    let Some(revision) = parts.next() else {
+        return false;
+    };
+    let Some(bundle) = parts.next() else {
+        return false;
+    };
+    let Some(member) = parts.next() else {
+        return false;
+    };
+    bundle == "bundle" && is_revision_name(revision) && member_path_ok(member)
+}
+
+fn is_revision_name(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 /// CAD-1422: `builtin:<catalog_id>` is the retired embedded-catalog
 /// source form. It is never resolved as a bundle: `builtin::refuse_retired`
 /// is the explicit retired refusal, so an install or upgrade naming it fails
@@ -2708,6 +3115,7 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
                 catalogue: &CatalogueClaim::Absent,
                 directory: CatalogueDirectory::Configured,
             },
+            || None,
             |_, _| Ok((json!({}), BTreeMap::new())),
             |_| Ok(Vec::new()),
         )
@@ -2716,6 +3124,195 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         assert_eq!(after["capabilities"]["source"]["capability"], "social.read");
         assert_eq!(after["capabilities"]["source"]["effect"], "read");
         assert_eq!(after["connection_slots"], json!([]));
+    }
+
+    fn upgrade_fixture(
+        pm: &Pm,
+        id: &str,
+        source: &std::path::Path,
+        retain: Option<BTreeSet<String>>,
+    ) -> Value {
+        let before = show(pm, id).unwrap();
+        let digest = before["digest"].as_str().unwrap();
+        let generation = before["catalog_generation"].as_str().unwrap();
+        let check = upgrade_check(
+            pm,
+            id,
+            source.to_str().unwrap(),
+            digest,
+            generation,
+            &CatalogueClaim::Absent,
+        )
+        .unwrap();
+        let new_digest = check["digest"].as_str().unwrap();
+        upgrade(
+            pm,
+            &UpgradeRequest {
+                id,
+                source: source.to_str().unwrap(),
+                expected_digest: digest,
+                expected_generation: generation,
+                expected_new_digest: new_digest,
+                request_id: &format!("fixture-upgrade-{}", before["version"].as_str().unwrap()),
+                catalogue: &CatalogueClaim::Absent,
+                directory: CatalogueDirectory::Configured,
+            },
+            || retain,
+            |_, _| Ok((json!({}), BTreeMap::new())),
+            |_| Ok(Vec::new()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cad1652_upgrade_prunes_unreferenced_revisions() {
+        let (pm_dir, _state, sources, id) = installed();
+        let pm = Pm::at(pm_dir.path()).unwrap();
+        let source_b = sources.path().join("bundle-b");
+        bundle(&source_b, MANIFEST_B);
+        let source_c = sources.path().join("bundle-c");
+        bundle(
+            &source_c,
+            &MANIFEST_B.replace("version: '2'", "version: '3'"),
+        );
+        let source_d = sources.path().join("bundle-d");
+        bundle(
+            &source_d,
+            &MANIFEST_B.replace("version: '2'", "version: '4'"),
+        );
+        let b_digest = upgrade_fixture(&pm, &id, &source_b, None)["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        upgrade_fixture(&pm, &id, &source_c, None);
+        let report = upgrade_fixture(&pm, &id, &source_d, Some(BTreeSet::new()));
+        let b_hex = b_digest.strip_prefix("sha256:").unwrap();
+        let pruned = report["prune"]["pruned"].as_array().unwrap();
+        assert!(pruned.contains(&json!(b_hex)), "{report}");
+        assert!(!pm
+            .dir
+            .join(".apps/installations")
+            .join(&id)
+            .join("revisions")
+            .join(b_hex)
+            .exists());
+    }
+
+    #[test]
+    fn cad1652_recovery_is_idempotent_after_prune_commit() {
+        let (pm_dir, _state, sources, id) = installed();
+        let pm = Pm::at(pm_dir.path()).unwrap();
+        let source_b = sources.path().join("bundle-b");
+        bundle(&source_b, MANIFEST_B);
+        let source_c = sources.path().join("bundle-c");
+        bundle(
+            &source_c,
+            &MANIFEST_B.replace("version: '2'", "version: '3'"),
+        );
+        let source_d = sources.path().join("bundle-d");
+        bundle(
+            &source_d,
+            &MANIFEST_B.replace("version: '2'", "version: '4'"),
+        );
+        let b_digest = upgrade_fixture(&pm, &id, &source_b, None)["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        upgrade_fixture(&pm, &id, &source_c, None);
+        let before = show(&pm, &id).unwrap();
+        let check = upgrade_check(
+            &pm,
+            &id,
+            source_d.to_str().unwrap(),
+            before["digest"].as_str().unwrap(),
+            before["catalog_generation"].as_str().unwrap(),
+            &CatalogueClaim::Absent,
+        )
+        .unwrap();
+        let request_id = "fail-delivery";
+        let err = upgrade(
+            &pm,
+            &UpgradeRequest {
+                id: &id,
+                source: source_d.to_str().unwrap(),
+                expected_digest: before["digest"].as_str().unwrap(),
+                expected_generation: before["catalog_generation"].as_str().unwrap(),
+                expected_new_digest: check["digest"].as_str().unwrap(),
+                request_id,
+                catalogue: &CatalogueClaim::Absent,
+                directory: CatalogueDirectory::Configured,
+            },
+            || Some(BTreeSet::new()),
+            |_, _| Ok((json!({}), BTreeMap::new())),
+            |_| Err(Error::rejected("synthetic delivery failure")),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("delivery incomplete"), "{err}");
+        let b_hex = b_digest.strip_prefix("sha256:").unwrap();
+        let journal = std::fs::read_to_string(
+            pm.dir
+                .join(".apps/upgrade-journals")
+                .join(&id)
+                .join(format!("{request_id}.yaml")),
+        )
+        .unwrap();
+        assert!(journal.contains(b_hex), "{journal}");
+        assert!(pm.dir.join(UPGRADE_PENDING).exists());
+
+        // A tampered journal may not name the active/new bundle or a
+        // receipt-pinned revision. Reload the original inventory after
+        // proving the rejection left the active bytes intact.
+        let journal_path = pm
+            .dir
+            .join(".apps/upgrade-journals")
+            .join(&id)
+            .join(format!("{request_id}.yaml"));
+        let active_hex = check["digest"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap();
+        let mut tampered: serde_yaml::Value = serde_yaml::from_str(&journal).unwrap();
+        tampered["prune"] = serde_yaml::Value::Sequence(vec![serde_yaml::Value::String(format!(
+            ".apps/installations/{id}/revisions/{active_hex}/bundle/app.md"
+        ))]);
+        std::fs::write(&journal_path, serde_yaml::to_string(&tampered).unwrap()).unwrap();
+        let err = upgrade_recover(
+            &pm,
+            &id,
+            request_id,
+            || Some(BTreeSet::new()),
+            |_| Ok(Vec::new()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("retained revision"), "{err}");
+        assert!(pm
+            .dir
+            .join(".apps/installations")
+            .join(&id)
+            .join("revisions")
+            .join(active_hex)
+            .join("bundle/app.md")
+            .exists());
+        std::fs::write(&journal_path, &journal).unwrap();
+
+        let recovered = upgrade_recover(
+            &pm,
+            &id,
+            request_id,
+            || Some(BTreeSet::new()),
+            |_| Ok(Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(recovered["committed"], true, "{recovered}");
+        assert!(!pm.dir.join(UPGRADE_PENDING).exists(), "{recovered}");
+        assert!(!pm
+            .dir
+            .join(".apps/installations")
+            .join(&id)
+            .join("revisions")
+            .join(b_hex)
+            .exists());
     }
 
     /// Forged or unknown installation IDs never describe a bundle —
@@ -2876,5 +3473,109 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         drop(held);
         // Odd with no live writer: a crash leftover, read under the lock.
         assert_eq!(list(&other).unwrap().as_array().unwrap().len(), 1);
+    }
+    #[test]
+    fn cad1652_prunes_only_unreferenced_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let root = Root::open(base).unwrap();
+        let id = "install";
+        let active = "a".repeat(64);
+        let previous = "b".repeat(64);
+        let receipt = "c".repeat(64);
+        let stale = "d".repeat(64);
+        for digest in [&active, &previous, &receipt, &stale] {
+            let bundle = base
+                .join(".apps/installations")
+                .join(id)
+                .join("revisions")
+                .join(digest)
+                .join("bundle");
+            std::fs::create_dir_all(&bundle).unwrap();
+            std::fs::write(bundle.join("app.md"), "x").unwrap();
+        }
+        let receipts = BTreeSet::from([receipt.clone()]);
+        let plan = plan_prune(&root, id, Some(&active), &previous, Some(&receipts));
+        let mut paths = Vec::new();
+        let report = apply_prune_plan(&root, base, plan, &mut paths);
+        assert_eq!(report["pruned"], json!([stale]));
+        assert_eq!(report["skipped"], Value::Null);
+        assert!(!base
+            .join(".apps/installations")
+            .join(id)
+            .join("revisions")
+            .join(&stale)
+            .exists());
+        assert!(base
+            .join(".apps/installations")
+            .join(id)
+            .join("revisions")
+            .join(&active)
+            .exists());
+        assert!(base
+            .join(".apps/installations")
+            .join(id)
+            .join("revisions")
+            .join(&previous)
+            .exists());
+        assert!(base
+            .join(".apps/installations")
+            .join(id)
+            .join("revisions")
+            .join(&receipt)
+            .exists());
+        assert!(paths.iter().any(|path| path.ends_with("app.md")));
+
+        let unknown = "e".repeat(64);
+        let bundle = base
+            .join(".apps/installations")
+            .join(id)
+            .join("revisions")
+            .join(&unknown)
+            .join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("app.md"), "x").unwrap();
+        let plan = plan_prune(&root, id, Some(&active), &previous, None);
+        let mut paths = Vec::new();
+        let report = apply_prune_plan(&root, base, plan, &mut paths);
+        assert_eq!(report["skipped"], "receipt-index-unavailable");
+        assert!(base
+            .join(".apps/installations")
+            .join(id)
+            .join("revisions")
+            .join(&unknown)
+            .exists());
+        assert!(paths.is_empty());
+
+        // A revision with any sibling outside `bundle/` is not a shape this
+        // pruner understands; it must remain byte-for-byte untouched.
+        let sibling = "f".repeat(64);
+        let revision = base
+            .join(".apps/installations")
+            .join(id)
+            .join("revisions")
+            .join(&sibling);
+        let bundle = revision.join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("app.md"), "keep").unwrap();
+        std::fs::write(revision.join("z-link"), "keep").unwrap();
+        let plan = plan_prune(&root, id, Some(&active), &previous, Some(&BTreeSet::new()));
+        let mut paths = Vec::new();
+        let report = apply_prune_plan(&root, base, plan, &mut paths);
+        assert_eq!(report["skipped"], "revision-unknown-entry", "{report}");
+        assert!(
+            paths
+                .iter()
+                .all(|path| !path.to_string_lossy().contains(&sibling)),
+            "{paths:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("app.md")).unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            std::fs::read_to_string(revision.join("z-link")).unwrap(),
+            "keep"
+        );
     }
 }

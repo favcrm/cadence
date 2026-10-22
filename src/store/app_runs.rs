@@ -6,7 +6,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const ARTIFACT_BYTES: usize = 256 * 1024;
 pub const RUN_ARTIFACT_BYTES: usize = 1024 * 1024;
@@ -386,7 +386,54 @@ pub struct LocalRunProvenance<'a> {
     pub human: Option<&'a Value>,
 }
 
+pub(super) fn insert_bundle_digest(out: &mut BTreeSet<String>, value: &str) -> Result<()> {
+    let value = value.strip_prefix("sha256:").unwrap_or(value);
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(Error::internal("receipt bundle digest is invalid"));
+    }
+    out.insert(value.to_string());
+    Ok(())
+}
+
 impl Store {
+    /// CAD-1652: every bundle digest a receipt in this installation still
+    /// names. A query failure is returned to the caller, which then prunes
+    /// nothing; it is never treated as "no references".
+    pub(crate) fn bundle_digests(&self, install: &str) -> Result<BTreeSet<String>> {
+        let conn = self.conn();
+        let mut out = BTreeSet::new();
+        let mut stmt = conn.prepare("SELECT bundle_digest FROM app_runs WHERE install_id=?1")?;
+        let rows = stmt.query_map([install], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            insert_bundle_digest(&mut out, &row?)?;
+        }
+        // A binding's pin is authority, not an optional annotation. Missing
+        // or malformed config disables pruning rather than proving "no pin".
+        let mut stmt = conn.prepare("SELECT config FROM app_bindings WHERE install_id=?1")?;
+        let rows = stmt.query_map([install], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let config = row?;
+            let config: Value = serde_json::from_str(&config)
+                .map_err(|_| Error::internal("binding receipt config is invalid"))?;
+            let digest = config
+                .get("bundle_digest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::internal("binding receipt lacks bundle_digest"))?;
+            insert_bundle_digest(&mut out, digest)?;
+        }
+        let mut stmt =
+            conn.prepare("SELECT digest FROM app_install_capabilities WHERE install_id=?1")?;
+        let rows = stmt.query_map([install], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            insert_bundle_digest(&mut out, &row?)?;
+        }
+        Ok(out)
+    }
+
     pub(super) fn refuse_app_task(conn: &impl super::StoreConn, task_id: &str) -> Result<()> {
         if conn
             .query_row(
