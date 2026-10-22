@@ -354,6 +354,116 @@ impl Shared {
         Ok(json!({"alias": alias, "state": "starting", "provider": provider}))
     }
 
+    /// CAD-1752: `cadence agent instructions` — replace an agent's
+    /// standing instructions. Operator only, by the connection: an agent
+    /// (the target itself and its PM included) is refused, so this is
+    /// stricter than `agent set`'s `authorize_agent_mutation`.
+    pub(super) fn rpc_instructions_set(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection_on_agent("agent instructions", params, peer_pid)?;
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        let text = required_str(params, "instructions")?;
+        if crate::master::is_master(&alias) {
+            return Err(Error::rejected(
+                "the master's instructions are its SOUL and AGENT files, not this verb",
+            ));
+        }
+        let agent = self.store.agent(&alias)?;
+        if agent
+            .params
+            .as_ref()
+            .is_some_and(|p| p.get("profile").is_some())
+        {
+            return Err(Error::rejected(
+                "a profile agent's job comes from its settings profile, not from instructions",
+            ));
+        }
+        let audit = json!({"by": "operator", "by_kind": "operator", "caller_pid": peer_pid});
+        let (old, new) = self.store.set_instructions_by(&alias, text, &audit)?;
+        // Only some adapters read the stored row, and only when a session
+        // opens; nothing here restarts the agent.
+        let applies = match (agent.provider.as_str(), agent.endpoint_kind.as_str()) {
+            ("codex", _) | ("devin", "cloud") => "next_launch",
+            _ => "not_delivered",
+        };
+        Ok(json!({
+            "alias": alias, "state": "updated", "applies": applies,
+            "old_sha256": old, "new_sha256": new,
+        }))
+    }
+
+    /// CAD-1752: the role catalogue plus what a hire registers on this
+    /// install and the model each role would launch on. A read: the
+    /// catalogue is static and the model rows come from the same settings
+    /// `model_defaults_get` already serves to any viewer.
+    pub(super) fn rpc_agent_roles(self: &Arc<Self>) -> Result<Value> {
+        let provider = "pi";
+        let endpoint = registry::default_kind(provider)?;
+        let roles: Vec<Value> = crate::agent_roles::ROLES
+            .iter()
+            .map(|role| {
+                let mut row = role.to_json();
+                row["model"] = match self.role_model(endpoint, role.team_role) {
+                    Ok((id, source)) => json!({"id": id, "source": source}),
+                    Err(err) => json!({"error": err.to_string()}),
+                };
+                row
+            })
+            .collect();
+        Ok(json!({
+            "categories": crate::agent_roles::CATEGORIES
+                .iter()
+                .map(|(id, label)| json!({"id": id, "label": label}))
+                .collect::<Vec<_>>(),
+            "roles": roles,
+            "install": {
+                "hosted": crate::issue::cloud::hosted_company(|key| std::env::var(key).ok()).is_ok(),
+                "provider": provider,
+                "endpoint_kind": endpoint,
+            },
+        }))
+    }
+
+    /// The model a worker of `team_role` launches on: the same two steps
+    /// `rpc_register` takes for pi — the defaults layer, else `[pi]` policy.
+    fn role_model(&self, endpoint: &str, team_role: &str) -> Result<(String, String)> {
+        let defaults = self.store.model_defaults()?;
+        let resolved = crate::model_defaults::resolve(crate::model_defaults::ResolveRequest {
+            provider: "pi",
+            endpoint_kind: endpoint,
+            runtime_role: "worker",
+            team_role: Some(team_role),
+            model_policy: None,
+            params: None,
+            config: &defaults.config,
+            revision: defaults.revision,
+        })?;
+        let policy = self.stored_pi_policy()?;
+        let selection = resolved.model_selection.as_ref();
+        let picked = selection
+            .and_then(|sel| sel.get("model"))
+            .and_then(Value::as_str);
+        if let Some(model) = picked {
+            crate::pi_policy::require_allowed(policy.as_ref(), "worker", model)?;
+            let source = selection
+                .and_then(|sel| sel.get("source"))
+                .and_then(Value::as_str)
+                .unwrap_or("provider_default");
+            return Ok((model.to_string(), source.to_string()));
+        }
+        let (model, platform) =
+            crate::pi_policy::resolve_model_with_source(policy.as_ref(), "worker", None)?;
+        let source = if platform {
+            "platform_default"
+        } else {
+            "pi_policy_default"
+        };
+        Ok((model, source.to_string()))
+    }
+
     pub(super) fn rpc_events(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let raw = required_str(params, "alias")?;
         // The daemon stream has no agents row — read-only, so a plain

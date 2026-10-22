@@ -943,6 +943,49 @@ impl Store {
         })
     }
 
+    /// CAD-1752: replace an agent's standing instructions. The row and the
+    /// `instructions_updated` event commit together; the event carries the
+    /// old and new sha256 digests, never the text. Returns `(old, new)`.
+    pub fn set_instructions_by(
+        &self,
+        alias: &str,
+        text: &str,
+        audit: &Value,
+    ) -> Result<(Option<String>, String)> {
+        if text.len() > super::MAX_INSTRUCTIONS_BYTES {
+            return Err(Error::rejected(format!(
+                "Instructions must be at most {} UTF-8 bytes",
+                super::MAX_INSTRUCTIONS_BYTES,
+            )));
+        }
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let agent = self.agent_in(&tx, alias)?;
+            if agent.archived_at.is_some() {
+                return Err(Error::rejected(format!(
+                    "Agent '{alias}' is archived — restore it before changing it"
+                )));
+            }
+            let old = agent
+                .instructions
+                .as_deref()
+                .map(|t| crate::delegation::sha256_hex(t.as_bytes()));
+            let new = crate::delegation::sha256_hex(text.as_bytes());
+            tx.execute(
+                "UPDATE agents SET instructions=?,updated=? WHERE alias=?",
+                params![text, now(), alias],
+            )?;
+            let mut detail = json!({"target": alias, "old_sha256": old, "new_sha256": new});
+            if let Some(extra) = audit.as_object() {
+                for (k, v) in extra {
+                    detail[k.as_str()] = v.clone();
+                }
+            }
+            Self::event(&tx, alias, "instructions_updated", detail)?;
+            Ok((old, new))
+        })
+    }
+
     pub fn model_defaults(&self) -> Result<ModelDefaultsSnapshot> {
         self.read_tx(|conn| {
             let tx = &mut *conn;
