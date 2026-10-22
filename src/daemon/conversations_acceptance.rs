@@ -240,6 +240,81 @@ impl Gx {
     }
 }
 
+#[test]
+fn conversation_reply_watermark_ignores_non_reply_writes() {
+    let fx = gx();
+    let list = || {
+        fx.operator(
+            "conversation_list",
+            json!({"alias": "master", "install_id": fx.crm}),
+        )
+        .unwrap()
+    };
+    let first = list();
+    let id = first["general"].as_str().unwrap();
+    let reply = |page: &Value| {
+        page["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap()["reply_seq"]
+            .as_i64()
+            .expect("a conversation exposes its reply watermark")
+    };
+    assert_eq!(reply(&first), 0, "empty General has no assistant reply");
+    let append = |thread: &str, role: &str, kind: &str, text: &str| {
+        fx.shared
+            .store
+            .thread_append_to(
+                thread,
+                store::NewEntry {
+                    role,
+                    kind,
+                    text,
+                    payload: None,
+                    message_id: None,
+                },
+            )
+            .unwrap()
+            .unwrap()
+    };
+    append(id, "operator", "message", "Please review this");
+    append(id, "agent", "tool_call", "customers.search");
+    append(
+        id,
+        "system",
+        "turn_result",
+        "A system notice is not a reply",
+    );
+    for blank in ["", " \t\r\n", "\u{00a0}\u{2003}\u{feff}"] {
+        append(id, "agent", "turn_result", blank);
+        assert_eq!(
+            reply(&list()),
+            0,
+            "blank/non-reply writes never light a reply dot"
+        );
+    }
+    let answer = append(id, "agent", "assistant_text", "The audience is ready");
+    assert_eq!(reply(&list()), answer);
+    append(id, "operator", "message", "One more question");
+    append(id, "agent", "tool_result", "Found 12 customers");
+    let foreign = fx.conversation(&fx.social, &fx.social_ctx, json!({}));
+    append(
+        &foreign,
+        "agent",
+        "turn_result",
+        "Another installation's answer",
+    );
+    assert_eq!(
+        reply(&list()),
+        answer,
+        "later writes preserve this reply's watermark"
+    );
+    let completed = append(id, "agent", "turn_result", "Review complete");
+    assert_eq!(reply(&list()), completed);
+}
+
 fn err_text(r: Result<Value>) -> String {
     r.expect_err("expected a refusal").to_string()
 }

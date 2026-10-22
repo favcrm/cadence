@@ -68,6 +68,14 @@ const KINDS: &[&str] = &[
     KIND_HIRE_PROPOSAL,
 ];
 
+// ECMAScript String.trim whitespace: the Home notifier applies that same
+// visible-text rule. SQLite's default trim removes only ordinary spaces.
+const REPLY_WHITESPACE: &str = concat!(
+    "\t\n\u{b}\u{c}\r \u{a0}\u{1680}",
+    "\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}",
+    "\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}"
+);
+
 /// Entry text cap. Queued messages are at most 48 000 bytes; a longer
 /// provider text is cut with a marker rather than refused.
 pub const TEXT_CAP: usize = 64_000;
@@ -775,6 +783,37 @@ impl Store {
             row_thread,
         )?;
         Ok(rows)
+    }
+
+    /// Conversation-list wire rows with the newest visible assistant reply.
+    /// Creation, operator/system entries and tool progress are not replies.
+    /// The watermark is computed from existing entries; no read state is stored.
+    pub fn conversation_summaries(&self, alias: &str, install: &str) -> Result<Vec<Value>> {
+        let conn = self.conn();
+        Ok(conn.query_vec(
+            "SELECT t.*, COALESCE((
+                SELECT e.seq FROM thread_entries e
+                WHERE e.thread_id=t.id AND e.role=? AND e.kind IN (?,?)
+                  AND length(trim(e.text, ?)) > 0
+                ORDER BY e.seq DESC LIMIT 1
+             ), 0) AS reply_seq
+             FROM threads t WHERE t.alias=? AND t.install_id=?
+             ORDER BY t.is_general DESC, t.created, t.id LIMIT ?",
+            params![
+                ROLE_AGENT,
+                KIND_ASSISTANT_TEXT,
+                KIND_TURN_RESULT,
+                REPLY_WHITESPACE,
+                alias,
+                install,
+                CONVERSATION_LIMIT + 1
+            ],
+            |row| {
+                let mut value = row_thread(row)?.to_json();
+                value["reply_seq"] = json!(row.get::<_, i64>("reply_seq")?);
+                Ok(value)
+            },
+        )?)
     }
 
     /// Make or find a conversation (CAD-1098). The caller has already

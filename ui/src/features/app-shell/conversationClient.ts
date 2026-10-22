@@ -16,7 +16,7 @@ import { EMPTY_THREAD, loadThread, type PageReader, type ThreadEntry, type Threa
  * Wire (the daemon's final shapes):
  * - `GET  /api/app-installations/<install>/conversations`
  *     -> `{ alias, install_id, general, conversations: [{ id, title, subject,
- *        context_id, is_general, archived, created, updated }] }`
+ *        context_id, is_general, archived, created, updated, reply_seq }] }`
  *     The list always carries the install's General conversation (the
  *     daemon ensures it). An unknown install is 404.
  * - `POST /api/app-installations/<install>/conversations`
@@ -35,8 +35,8 @@ export interface Conversation {
   title: string | null;
   subject: string | null;
   isGeneral: boolean;
-  /** Epoch seconds of the last change (any entry write), from the daemon. */
-  updated: number;
+  /** Sequence of the newest visible assistant reply; zero before any reply. */
+  replySeq: number;
 }
 
 export interface ConversationList {
@@ -58,7 +58,7 @@ function parseConversation(raw: unknown): Conversation | null {
     title: typeof v.title === "string" && v.title !== "" ? v.title : null,
     subject: typeof v.subject === "string" ? v.subject : null,
     isGeneral: v.is_general === true,
-    updated: typeof v.updated === "number" ? v.updated : 0,
+    replySeq: typeof v.reply_seq === "number" && Number.isSafeInteger(v.reply_seq) && v.reply_seq >= 0 ? v.reply_seq : 0,
   };
 }
 

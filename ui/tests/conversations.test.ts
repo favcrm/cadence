@@ -58,6 +58,7 @@ const threads: Record<string, any[]> = {
 let turn: any = null;
 // CAD-1700: the master queue in delivery order, and the board commands posted.
 let queue: { message: string; conversation: string | null }[] = [];
+let operations: unknown[] = [];
 const commandPosts: unknown[] = [];
 // Set inside a check to hold one send in flight (pending state "sending").
 let deferSend: ((resolve: (r: Response) => void) => void) | null = null;
@@ -98,7 +99,7 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   }
   if (url.pathname === "/api/threads/master") {
     const id = url.searchParams.get("conversation") ?? "";
-    return json({ entries: threads[id] ?? [], more_before: false });
+    return json({ thread: { id: id || "home-thread", alias: "master" }, entries: threads[id] ?? [], more_before: false });
   }
   if (url.pathname === "/api/master/state") return json({ alias: "master", provider: "p", endpoint_kind: "k", live: true, turn, queue });
   if (url.pathname === "/api/master/command") {
@@ -107,6 +108,9 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   }
   if (url.pathname === "/api/crm-send/list") return json({ sends: [] });
   if (url.pathname === "/api/crm-send/origin") return json({ unsubscribe_origin: null, stored: false });
+  if (url.pathname.endsWith("/assistant/actions")) return json({ actions: [] });
+  if (url.pathname.endsWith("/assistant/operations")) return json({ operations });
+  if (url.pathname.endsWith("/assistant/permissions")) return json({ permissions: [] });
   return json({ records: [], truncated: false, next_cursor: null, segments: [], exclusions: [], suppressions: [], contents: [], proposals: [], bindings: [] });
 }) as typeof fetch;
 
@@ -242,6 +246,14 @@ await pick("Spring launch");
   equal(bar()?.dataset.state, "queued", "an owned queued message shows Queued");
   assert(bar()!.textContent!.includes("after General"), `Queued names what is ahead; got ${bar()?.textContent}`);
   assert(barButton("Stop") === null, "a queued message offers no Stop");
+  turn = { state: "working", message: "m-home", conversation: "home-thread" };
+  await React.act(async () => {
+    await resources.masterThread.refresh();
+    await resources.masterState.refresh();
+  });
+  await settle();
+  assert(bar()!.textContent!.includes("after Home"), "the real Home thread ID is labelled Home");
+  assert(barButton("View") !== null, "a Home predecessor has a View action");
   await React.act(async () => { barButton("Cancel")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
   await settle();
   equal(commandPosts.at(-1), { command: "cancel", message: sentMessage }, "Cancel names exactly this conversation's queued message");
@@ -255,6 +267,33 @@ await pick("Spring launch");
   await settle();
   equal(bar()?.dataset.state, "working", "the owned running turn shows Working after a master frame");
   assert(bar()!.textContent!.includes("customers.search"), "Working names the live step");
+  operations = [{
+    id: "op-tags", action_id: "customer.tags.update", status: "pending_permission", revision: 1,
+    summary: "Tag the selected customer", resource_refs: [],
+    permission_request: {
+      reason: "This changes one customer", allow_always: true,
+      scope: { install_id: "install-crm", context_id: "ctx-a", action_id: "customer.tags.update", resource_id: "ada" },
+      preview: { customer_label: "Ada", before_tags: [], after_tags: ["vip"], expected_revision: 1 },
+    },
+  }];
+  const { noteMasterChanged } = require("../src/lib/masterChanged");
+  await React.act(async () => { noteMasterChanged(); });
+  await settle();
+  assert(barButton("Review") !== null && barButton("Stop") === null, "a pushed operation permission replaces Stop with Review");
+  const approval = host.querySelector('[data-operation-status="pending_permission"]') as HTMLElement;
+  assert(approval, "the actionable app approval card is mounted");
+  let scrolled: HTMLElement | null = null;
+  const originalScroll = HTMLElement.prototype.scrollIntoView;
+  HTMLElement.prototype.scrollIntoView = function () { scrolled = this; };
+  try {
+    await React.act(async () => { barButton("Review")!.click(); });
+    assert(scrolled === approval, "Review reaches the operation approval card, not the transcript");
+  } finally {
+    HTMLElement.prototype.scrollIntoView = originalScroll;
+  }
+  operations = [];
+  await React.act(async () => { noteMasterChanged(); });
+  await settle();
   await React.act(async () => { barButton("Stop")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
   await settle();
   equal(commandPosts.at(-1), { command: "stop", message: sentMessage }, "Stop names exactly this conversation's running turn");

@@ -8,7 +8,7 @@ export interface TurnBarActions {
   /** Absent when there is no captured envelope to resend: Retry is hidden. */
   onRetry?: () => void;
   onReview: () => void;
-  /** Opens what is ahead of a queued message (Home only says where it is). */
+  /** Opens the exact queued predecessor: Home or an installed app's conversation. */
   onView?: () => void;
 }
 

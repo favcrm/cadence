@@ -54,7 +54,6 @@ import {
   conversationThread,
   createConversation,
   hasUnansweredOperator,
-  conversationList,
   idleThread,
   invalidateConversationSelection,
   outboxFor,
@@ -97,8 +96,8 @@ import { usePendingPermission } from "./usePendingApproval";
 import { turnBarState } from "./turnBarState";
 import { TurnBar } from "./TurnBar";
 import { isUnread, onSeenChanged, readSeen, writeSeen, type SeenMap } from "./unreadSeen";
-import { setAssistantUnread } from "./assistantUnread";
-import { knownInstalls, setVisibleConversation } from "./chatVisibility";
+import { setVisibleConversation } from "./chatVisibility";
+import { useConversationDestination } from "./conversationNavigation";
 import { earlierStep, useThreadStream } from "./conversationThread";
 
 /**
@@ -363,6 +362,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const convId = active.state === "ready" ? (active.selected?.id ?? null) : null;
   const thread = useResource(store);
   const masterState = useQuery(resources.masterState);
+  const homeThread = useResource(resources.masterThread);
   // One draft per conversation: the composer remounts per store, so
   // switching conversations keeps each one's typed text (the stores and
   // their drafts are per-conversation cache entries, never shared).
@@ -377,24 +377,22 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const streamDown = streamLink !== "live";
   const [historyOpen, setHistoryOpen] = useState(false);
   // Client-side last-seen per conversation (CAD-1700). Opening a conversation
-  // records its newest `updated`; another tab's write arrives via `storage`.
+  // records its newest reply sequence; other tabs observe the seen write.
   const [unreadSeen, setUnreadSeen] = useState<SeenMap>(() => readSeen(installId));
   useEffect(() => {
     setUnreadSeen(readSeen(installId));
     return onSeenChanged(installId, setUnreadSeen);
   }, [installId]);
   const selectedId = active.state === "ready" ? (active.selected?.id ?? null) : null;
-  const selectedUpdated = active.state === "ready" ? (active.selected?.updated ?? null) : null;
+  const selectedReply = active.state === "ready" ? (active.selected?.replySeq ?? null) : null;
   useEffect(() => {
-    if (selectedId === null || selectedUpdated === null) return;
-    writeSeen(installId, selectedId, selectedUpdated);
+    if (collapsed || selectedId === null || selectedReply === null) return;
+    writeSeen(installId, selectedId, selectedReply);
     setUnreadSeen(readSeen(installId));
-  }, [selectedId, selectedUpdated, installId]);
-  // Any conversation other than the open one has a newer entry than this
-  // browser has seen: the Conversations button wears the accent dot.
+  }, [selectedId, selectedReply, installId, collapsed]);
+  // A real assistant reply elsewhere lights the Conversations button.
   const hasUnreadOther =
-    active.state === "ready" && active.conversations.some((c) => c.id !== convId && isUnread(unreadSeen, c.id, c.updated));
-  useEffect(() => setAssistantUnread(installId, hasUnreadOther), [installId, hasUnreadOther]);
+    active.state === "ready" && active.conversations.some((c) => c.id !== convId && isUnread(unreadSeen, c.id, c.replySeq));
   const historyButtonRef = useRef<HTMLButtonElement | null>(null);
   const historyMenuRef = useRef<HTMLDivElement | null>(null);
   // Escape and an outside press close the Conversations menu; focus goes
@@ -552,10 +550,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const subjects = useMemo(() => descriptor?.subjects ?? [], [descriptor]);
   // The shell's announcer reads this: the picker's selection is client state,
   // so the route alone cannot say whether a reply is already on screen.
-  useEffect(() => {
-    setVisibleConversation(installId, convId);
+  useLayoutEffect(() => {
+    setVisibleConversation(installId, collapsed ? null : convId);
     return () => setVisibleConversation(installId, null);
-  }, [installId, convId]);
+  }, [installId, convId, collapsed]);
 
   useEffect(() => setFailedFrames(new Set()), [installId, convId]);
   // A context or installation change drops the importer (its scope key
@@ -888,6 +886,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       reconnecting: streamDown,
       liveSince,
       conversationName: (id) => {
+        if (id === homeThread.data?.conversation) return t("Home");
         if (active.state !== "ready") return null;
         const index = active.conversations.findIndex((c) => c.id === id);
         return index < 0 ? null : conversationLabel(active.conversations[index], index, subjects, t);
@@ -906,6 +905,11 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         ? (masterState.data?.turn?.message ?? null)
         : null,
   });
+  const aheadHref = useConversationDestination(
+    turnState.kind === "queued" ? turnState.aheadConversation : null,
+    masterState.data,
+    homeThread.data?.conversation,
+  );
   // Retry resends this conversation's own failed operator message; with no
   // captured pending row the bar rebuilds one from the failed turn's own
   // operator entry (same text, a fresh message id).
@@ -956,29 +960,13 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     onView:
       turnState.kind !== "queued"
         ? undefined
-        : turnState.aheadConversation === null
-          ? () => window.location.assign("/")
-          : active.state === "ready" && active.conversations.some((c) => c.id === turnState.aheadConversation)
-            ? () => selectConversation(installId, turnState.aheadConversation!)
-            : (() => {
-                // Another install's conversation: the running turn's verified
-                // app origin when it is the running one, else the install
-                // whose observed list holds the queued predecessor.
-                const turn = masterState.data?.turn ?? null;
-                const origin = turn?.app_origin ?? null;
-                if (origin !== null && turn?.conversation === turnState.aheadConversation) {
-                  const href = `/app-installations/${encodeURIComponent(origin.install_id)}?conversation=${encodeURIComponent(turnState.aheadConversation)}`;
-                  return () => window.location.assign(href);
-                }
-                const owner = knownInstalls().find((install) =>
-                  conversationList(install).get().data?.conversations.some((c) => c.id === turnState.aheadConversation),
-                );
-                if (owner === undefined) return undefined;
-                const href = `/app-installations/${encodeURIComponent(owner)}?conversation=${encodeURIComponent(turnState.aheadConversation)}`;
-                return () => window.location.assign(href);
-              })(),
+        : active.state === "ready" && active.conversations.some((c) => c.id === turnState.aheadConversation)
+          ? () => selectConversation(installId, turnState.aheadConversation!)
+          : aheadHref !== null ? () => window.location.assign(aheadHref) : undefined,
     onReview: () => {
-      const card = listRef.current?.querySelector<HTMLElement>("[data-permission-thread], .app-assistant-activity");
+      const card = listRef.current?.parentElement?.querySelector<HTMLElement>(
+        "[data-permission-thread], .app-assistant-activity [data-operation-status='pending_permission']",
+      );
       (card ?? listRef.current)?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });
     },
   };
@@ -1480,7 +1468,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           data-chat-history
         >
           {active.conversations.map((c, i) => {
-            const unread = isUnread(unreadSeen, c.id, c.updated) && c.id !== convId;
+            const unread = isUnread(unreadSeen, c.id, c.replySeq) && c.id !== convId;
             return (
               <button
                 key={c.id}

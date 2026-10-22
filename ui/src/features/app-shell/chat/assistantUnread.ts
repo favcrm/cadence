@@ -2,12 +2,10 @@ import { useSyncExternalStore } from "react";
 
 /**
  * Where a new assistant reply waits unseen (CAD-1700): `home` or an app
- * install id. The surfaces that can tell (an app pane comparing its
- * conversations with this browser's last-seen, Home comparing its thread
- * tail) publish here; the nav reads it to draw a quiet dot. In-memory,
- * per tab: the durable last-seen lives in `unreadSeen` (localStorage), so
- * opening a conversation in one tab clears it in every tab through the
- * pane's `storage` subscription, which republishes here.
+ * install id. The shell's app-list and Home-thread observers publish here;
+ * the nav reads it to draw a quiet dot. In-memory, per tab: durable reply
+ * watermarks live in `unreadSeen` (localStorage), whose same-tab and storage
+ * subscriptions clear the dot when a conversation is seen in any tab.
  */
 const unread = new Set<string>();
 const listeners = new Set<() => void>();

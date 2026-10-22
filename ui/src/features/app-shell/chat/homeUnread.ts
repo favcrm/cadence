@@ -1,74 +1,51 @@
 import { useEffect } from "react";
-import { api } from "../../../lib/api";
 import { subscribeMasterChanged } from "../../../lib/masterChanged";
-import { privateReadsAllowed } from "../../../lib/privateSession";
+import { resources } from "../../../lib/resources";
+import { useResource } from "../../../lib/useResource";
+import type { ThreadEntry } from "../../home/thread";
+import { useNotificationToast } from "../../threads/NotificationToast";
 import { setAssistantUnread } from "./assistantUnread";
+import { announceReply, isUnread, onSeenChanged, readSeen, writeSeen } from "./unreadSeen";
 
-/**
- * Home's "new reply" dot (CAD-1700). Home records the newest assistant
- * entry it has shown (`noteHomeSeen`); while the operator is elsewhere,
- * each `master` stream frame re-reads Home's tail once and lights the dot
- * when a newer assistant entry landed. Seen state is per browser
- * (localStorage), so opening Home in one tab clears it in every tab.
- */
-const KEY = "cadence.assistant.seen.home";
-
-function seenHome(): number {
-  try {
-    return Number(window.localStorage.getItem(KEY)) || 0;
-  } catch {
-    return 0;
-  }
-}
+const HOME = "home";
 
 /** Home is on screen and has shown everything up to `seq`. */
 export function noteHomeSeen(seq: number): void {
-  try {
-    if (seq <= seenHome()) return;
-    window.localStorage.setItem(KEY, String(seq));
-  } catch {
-    // Storage unavailable: the dot clears for this tab only.
-  }
-  setAssistantUnread("home", false);
+  writeSeen(HOME, HOME, seq);
+  setAssistantUnread(HOME, false);
 }
 
-/** Newest assistant (non-operator) entry seq in a thread page, or 0. */
-function newestReply(entries: unknown[]): number {
+function newestReply(entries: ThreadEntry[]): number {
   let newest = 0;
-  for (const raw of entries) {
-    const e = raw as { seq?: unknown; role?: unknown };
-    if (typeof e.seq === "number" && e.role !== "operator" && e.seq > newest) newest = e.seq;
+  for (const entry of entries) {
+    if (entry.role === "agent" &&
+        (entry.kind === "assistant_text" || entry.kind === "turn_result") &&
+        entry.text.trim() !== "" && entry.seq > newest) newest = entry.seq;
   }
   return newest;
 }
 
-/** Mounted once by the board shell; inert on Home itself. */
+/** The shell observes the same Home thread as the pane: master frames refresh
+ * it without polling. No installation lookup is needed for a Home reply. */
 export function useHomeUnread(onHome: boolean): void {
+  const thread = useResource(resources.masterThread);
+  const entries = thread.data?.entries;
+  const toast = useNotificationToast();
+  useEffect(() => subscribeMasterChanged(() => resources.masterThread.invalidate()), []);
   useEffect(() => {
-    if (onHome) {
-      setAssistantUnread("home", false);
-      return;
-    }
-    let alive = true;
-    const check = () => {
-      if (!privateReadsAllowed()) return;
-      api
-        .thread("master", { tail: true, limit: 20 })
-        .then((page) => {
-          if (alive) setAssistantUnread("home", newestReply(page.entries) > seenHome());
-        })
-        .catch(() => undefined);
+    const update = () => {
+      const seq = newestReply(entries ?? []);
+      if (onHome) {
+        noteHomeSeen(seq);
+        return;
+      }
+      const unread = isUnread(readSeen(HOME), HOME, seq);
+      setAssistantUnread(HOME, unread);
+      if (unread && announceReply(HOME, HOME, seq)) {
+        toast.show("Assistant replied", "assistant:home", { href: "/", note: "Home" });
+      }
     };
-    const onStorage = (event: StorageEvent) => {
-      if (event.key === KEY) check();
-    };
-    check();
-    const off = subscribeMasterChanged(check);
-    window.addEventListener("storage", onStorage);
-    return () => {
-      alive = false;
-      off();
-      window.removeEventListener("storage", onStorage);
-    };
-  }, [onHome]);
+    update();
+    return onSeenChanged(HOME, update);
+  }, [entries, onHome, toast]);
 }

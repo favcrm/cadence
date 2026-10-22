@@ -35,6 +35,7 @@ import { usePendingPermission } from "../app-shell/chat/usePendingApproval";
 import { noteHomeSeen } from "../app-shell/chat/homeUnread";
 import { earlierStep, useThreadStream } from "../app-shell/chat/conversationThread";
 import { turnBarState } from "../app-shell/chat/turnBarState";
+import { useConversationDestination } from "../app-shell/chat/conversationNavigation";
 import MemberChat from "./MemberChat";
 import { memberScope } from "./memberThread";
 import { time } from "./ThreadView";
@@ -691,8 +692,8 @@ function MasterHome({
   const turn = turnState(master.data, masterRow, submitting);
   // The turn bar (turnBar.ts) is the same derivation Conversation uses, so
   // the two surfaces cannot disagree: Stop only for the running turn's own
-  // message, Cancel only for this surface's own queued message. Home's
-  // conversation is the Master thread, which the turn reports as `null`.
+  // message, Cancel only for this surface's own queued message. Home uses
+  // the server-issued thread ID, just as app conversations do.
   const threadEntries = thread.data?.entries ?? [];
   const permissionPending = usePendingPermission(threadEntries);
   // Results older than this Home visit are history, not a live outcome.
@@ -706,7 +707,12 @@ function MasterHome({
       reconnecting: link !== null && link !== "live",
       liveSince,
     },
-    null,
+    homeConversation ?? null,
+  );
+  const aheadHref = useConversationDestination(
+    turnBar.kind === "queued" ? turnBar.aheadConversation : null,
+    master.data,
+    homeConversation,
   );
   const failedSend = (thread.data?.pending ?? []).find((p) => p.state === "failed") ?? null;
   const serverTurn = master.data?.turn;
@@ -1221,12 +1227,9 @@ function MasterHome({
                           void sendToMaster(entry.text, newMessageId(), refs, attachments.length ? attachments : undefined, conversation);
                         }
                       : undefined,
-                onView:
-                  turnBar.kind === "queued" && turnBar.aheadConversation === null
-                    ? undefined
-                    : turnBar.kind === "queued" && appOriginHref(turnOrigin, resolveAppPath) !== null
-                      ? () => window.location.assign(appOriginHref(turnOrigin, resolveAppPath)!)
-                      : undefined,
+                onView: turnBar.kind === "queued" && aheadHref !== null
+                  ? aheadHref === "/" ? jumpToLatest : () => window.location.assign(aheadHref)
+                  : undefined,
                 onReview: () => {
                   const card = scrollRef.current?.querySelector<HTMLElement>("[data-permission-thread]");
                   card?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });

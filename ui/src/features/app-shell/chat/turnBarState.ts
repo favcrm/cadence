@@ -38,7 +38,7 @@ export function turnFailureReason(entry: ThreadEntry): string | null {
 }
 
 /**
- * The bar's state for one conversation (`conversationId` null = Home).
+ * The bar's state for one conversation (Home uses its server-issued thread id).
  * Stop carries the running message only when that turn belongs to this
  * conversation. Cancel is offered only for a message THIS surface sent
  * whose stored entry is the operator's own (a daemon notice or an agent

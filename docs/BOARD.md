@@ -2334,6 +2334,19 @@ message rows. Attachments the operator picked show as compact wrapping
 chips above the composer (one status/remove icon slot each, +N more
 past three), and a sent message's files render as read-only chips under
 its bubble (CAD-1419/CAD-1462).
+
+The shared turn bar (CAD-1700) names the conversation actually ahead of a
+queued message, including Home's server-issued thread id. View opens that
+predecessor, not necessarily the running turn's app; Review reaches the
+actionable permission card. The shell observes replies even while their
+conversation is offscreen: an app reply opens its exact conversation, and a
+Home reply opens `/`. Dots clear when a reply is seen, including in another
+tab. The conversation-list `reply_seq` is computed from nonblank agent
+`assistant_text` / `turn_result` entries; creation, operator/system entries
+and tool progress do not count. Seen and announced reply sequences live
+only in versioned browser-local watermarks, not a server unread table; old
+any-write timestamp watermarks are ignored.
+
 A plan the thread mentions (or a `plan` row in Needs you) renders as a
 card — goal, tickets with size and acceptance, weighted progress, and
 Approve / Reject-with-reason through the plan endpoints above. The
