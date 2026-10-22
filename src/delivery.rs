@@ -1183,6 +1183,8 @@ fn gh_via(gh_bin: &str, polled: bool, args: &[&str]) -> Result<String> {
 }
 
 #[cfg(test)]
+mod cad1751_pause_refusal_acceptance;
+#[cfg(test)]
 mod tests {
     use super::*;
 
