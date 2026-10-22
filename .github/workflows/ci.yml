@@ -234,6 +234,7 @@ jobs:
       - run: python3 scripts/test_ci_fast_linker.py
       - run: python3 scripts/test_release_reuse.py
       - run: python3 -m unittest scripts/test_enqueue_human_paths.py
+      - run: python3 scripts/test_cad1743_bun_guards.py
       - run: python3 -m unittest scripts/test_enqueue_scope_approval.py
       - run: python3 scripts/test_enqueue_requirements.py
       - run: python3 scripts/test_enqueue_current_ci.py
