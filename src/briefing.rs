@@ -430,9 +430,20 @@ pub fn briefing_body(
     // cwd belongs to — PM-curated facts every worker should carry.
     // Absent pm dir / unresolvable project / no rules → no section.
     let memory = (|| -> Option<String> {
-        let cwd = agent["cwd"].as_str()?;
         let pm = crate::issue::Pm::open_default().ok()?;
-        let proj = crate::issue::project::resolve(&pm.dir, None, Path::new(cwd)).ok()?;
+        // CAD-1752: the project of the agent's task (`agent_show`'s
+        // `turn_project`), else the one its cwd belongs to. A catalogue
+        // agent with no task has neither, so it carries no memory section.
+        let proj = match agent["turn_project"].as_str() {
+            Some(key) => crate::issue::project::list(&pm.dir)
+                .ok()?
+                .into_iter()
+                .find(|p| p.key == key)?,
+            None => {
+                let cwd = agent["cwd"].as_str()?;
+                crate::issue::project::resolve(&pm.dir, None, Path::new(cwd)).ok()?
+            }
+        };
         let (matched, errors) = crate::memory::project_rules(&pm, &proj.key);
         if let Some(line) = crate::memory::load_errors_line(&errors) {
             eprintln!("{line}");

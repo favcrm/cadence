@@ -314,13 +314,21 @@ impl Shared {
             })?;
         let pm_dir = self.pm_dir()?;
         let projects = crate::issue::project::list(&pm_dir)?;
-        let key = crate::issue::project::key_for_cwd(&pm_dir, &cwd).ok_or_else(|| {
-            Error::rejected(format!(
-                "check slot caller cwd {} resolves to no project — the recipe \
-                 allowlist lives in the project's project.yaml",
-                cwd.display()
-            ))
-        })?;
+        // CAD-1752: a shell outside any repo (a catalogue agent's home dir)
+        // takes the project of the task its agent is running.
+        let key = crate::issue::project::key_for_cwd(&pm_dir, &cwd)
+            .or_else(|| {
+                let who = self.slot_identity(pid).ok().flatten()?;
+                let agent = self.store.agent_opt(who.lane()).ok().flatten()?;
+                self.turn_project(&agent).map(|turn| turn.key)
+            })
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "check slot caller cwd {} resolves to no project and its agent has no \
+                     running task — the recipe allowlist lives in the project's project.yaml",
+                    cwd.display()
+                ))
+            })?;
         let project = projects.iter().find(|p| p.key == key).unwrap();
         let recipes = project.build.as_ref().map(|b| &b.recipes);
         let r = recipes.and_then(|rs| rs.get(recipe)).ok_or_else(|| {

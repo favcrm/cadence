@@ -409,6 +409,17 @@ pub fn key_for_cwd(pm_dir: &Path, cwd: &Path) -> Option<String> {
         .map(|p| p.key.clone())
 }
 
+/// The project key owning an issue id, by its `<PREFIX>-<n>` prefix.
+/// `None` for a malformed id or an unknown prefix.
+pub fn key_for_issue(pm_dir: &Path, issue_id: &str) -> Option<String> {
+    let (prefix, _) = issue_id.rsplit_once('-')?;
+    list(pm_dir)
+        .ok()?
+        .into_iter()
+        .find(|p| p.prefix == prefix)
+        .map(|p| p.key)
+}
+
 /// Resolve the project an issue command files into: `--project` flag,
 /// then `CADENCE_PROJECT`, then the cwd's git identity against every
 /// project.yaml (remote first, then checkout path). No match fails

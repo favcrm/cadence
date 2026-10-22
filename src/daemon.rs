@@ -229,6 +229,7 @@ mod identity;
 #[cfg(target_os = "linux")]
 mod installer_client;
 mod installer_enrollment_wire;
+mod turn_project;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRecord;
 mod bootstrap_files;
@@ -2439,6 +2440,8 @@ impl Shared {
                 // CAD-1266: one pass over `tasks` for the whole fleet, not
                 // one query per agent.
                 let mut open_tasks = self.store.open_task_ids_by_assignee()?;
+                // CAD-1752: the issues those tasks serve, for `--project`.
+                let mut lane_issues = self.store.open_task_issues_by_assignee()?;
                 let deliveries = self.store.open_delivery_summary()?;
                 let listed_agents = self.store.agents()?;
                 let aliases: Vec<String> = listed_agents.iter().map(|a| a.alias.clone()).collect();
@@ -2468,6 +2471,7 @@ impl Shared {
                     // The alias's current non-terminal task assignments —
                     // derived from tasks.assignee, never stored.
                     j["tasks"] = json!(open_tasks.remove(&agent.alias).unwrap_or_default());
+                    j["lane_issues"] = json!(lane_issues.remove(&agent.alias).unwrap_or_default());
                     j["capabilities"] =
                         registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
                     j["native_turn_steering_enabled"] = json!(
@@ -2642,6 +2646,9 @@ impl Shared {
                 if profile_snapshot {
                     agent_json["instructions"] = json!(agent.instructions);
                 }
+                // CAD-1752: the project of the task this agent is running
+                // (else its cwd's); the briefing's memory section reads it.
+                agent_json["turn_project"] = json!(self.turn_project(&agent).map(|t| t.key));
                 agent_json["capabilities"] =
                     registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
                 agent_json["native_turn_steering_enabled"] = json!(
