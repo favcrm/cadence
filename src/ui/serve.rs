@@ -3124,3 +3124,31 @@ mod write_lock_tests {
         assert!(guard.is_some(), "a poisoned lock is recovered, as before");
     }
 }
+
+#[cfg(test)]
+mod read_dispatch_tests {
+    use super::*;
+
+    /// The table's own tests call `bound.invalid()` directly, which is how
+    /// CAD-1696's validators stayed declared-but-unenforced until CAD-1718.
+    /// This drives the dispatcher, so removing the call there fails here
+    /// (mutation-checked: without it the response is 404 from `agent_detail`).
+    #[test]
+    fn a_failing_validator_answers_before_the_handler() {
+        let state = tempfile::tempdir().expect("state dir");
+        let mut request: Request = tiny_http::TestRequest::new()
+            .with_path("/api/agents/")
+            .into();
+        let bound =
+            endpoints::resolve("GET", "/api/agents/").expect("the row binds an empty alias");
+        assert!(
+            bound.invalid().is_some(),
+            "precondition: the empty alias fails its validator"
+        );
+
+        let response = read_dispatch(&mut request, state.path(), &ServeOpts::default(), bound);
+
+        // The row's own pair, not a generic status, and never `agent_detail`.
+        assert_eq!(response.status_code(), StatusCode(400));
+    }
+}
