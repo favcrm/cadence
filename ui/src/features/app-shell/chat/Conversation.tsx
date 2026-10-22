@@ -96,7 +96,6 @@ import { usePendingPermission } from "./usePendingApproval";
 import { turnBarState } from "./turnBarState";
 import { TurnBar } from "./TurnBar";
 import { isUnread, onSeenChanged, readSeen, writeSeen, type SeenMap } from "./unreadSeen";
-import { useNotificationToast } from "../../threads/NotificationToast";
 import { setAssistantUnread } from "./assistantUnread";
 import { earlierStep, useThreadStream } from "./conversationThread";
 
@@ -549,42 +548,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     (active.state === "legacy" && mode.conversationRequest === null) ||
     (active.state === "ready" && (convId !== null || draftSubject !== null));
   const subjects = useMemo(() => descriptor?.subjects ?? [], [descriptor]);
-  // One toast per conversation per newer reply: a non-open conversation's
-  // `updated` moved past what this browser saw. The first list read only
-  // baselines (a reload is not news); later `master` frames refresh it.
-  const toast = useNotificationToast();
-  // A conversation is "replied to" only when the master's turn FINISHED on
-  // it: `updated` also moves for an operator send or a tool step, which is
-  // not a reply (CAD-1700 review).
-  const lastTurn = useRef<{ conversation: string | null } | null | undefined>(undefined);
-  // The conversation a turn just FINISHED on, as its own state: the toast
-  // effect consumes the edge, so a list refresh alone can never announce.
-  const [finishedConversation, setFinishedConversation] = useState<string | null>(null);
-  useEffect(() => {
-    const current = masterState.data?.turn ?? null;
-    const before = lastTurn.current;
-    lastTurn.current = current === null ? null : { conversation: current.conversation ?? null };
-    if (before != null && current === null) setFinishedConversation(before.conversation ?? null);
-  }, [masterState.data]);
-  const conversationsNow = active.state === "ready" ? active.conversations : null;
-  useEffect(() => {
-    if (conversationsNow === null || finishedConversation === null) return;
-    let sawFinished = false;
-    conversationsNow.forEach((c, index) => {
-      if (c.id !== finishedConversation) return;
-      sawFinished = true;
-      if (c.id === convId) return;
-      if (!isUnread(readSeen(installId), c.id, c.updated)) return;
-      const params = new URLSearchParams({ install: installId, conversation: c.id });
-      toast.show(t("Assistant replied"), `assistant:${installId}:${c.id}`, {
-        href: `${mode.appPath ?? location.pathname}?${params.toString()}`,
-        note: `${mode.scopeLabel} › ${conversationLabel(c, index, subjects, t)}`,
-      });
-    });
-    // The conversation must be in the list before the edge is consumed; a
-    // list that has not caught up yet keeps it for the next refresh.
-    if (sawFinished) setFinishedConversation(null);
-  }, [conversationsNow, finishedConversation, convId, installId, toast, t, mode.appPath, mode.scopeLabel, subjects]);
 
   useEffect(() => setFailedFrames(new Set()), [installId, convId]);
   // A context or installation change drops the importer (its scope key
