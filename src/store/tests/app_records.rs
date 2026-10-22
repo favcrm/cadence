@@ -9,6 +9,111 @@ fn record_file(dir: &TempDir, install: &str) -> RecordStore {
     RecordStore::open(dir.path(), install).unwrap()
 }
 
+#[test]
+fn readonly_list_reads_a_legacy_social_layout_without_migrating() {
+    let dir = TempDir::new().unwrap();
+    let install = "install-legacy";
+    let path = record_db_path(dir.path(), install).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE record_schema(version INTEGER NOT NULL);
+         INSERT INTO record_schema VALUES(1);
+         CREATE TABLE record_identity(install_id TEXT NOT NULL, created REAL NOT NULL);
+         INSERT INTO record_identity VALUES('install-legacy', 0);
+         CREATE TABLE app_social_drafts(draft_id TEXT PRIMARY KEY, install_id TEXT NOT NULL,
+           context_id TEXT NOT NULL, revision INTEGER NOT NULL, caption TEXT NOT NULL,
+           source_json TEXT NOT NULL, asset_id TEXT, created REAL NOT NULL, updated REAL NOT NULL);
+         CREATE TABLE app_social_effects( effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL,
+           context_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL,
+           request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, frozen_json TEXT NOT NULL,
+           state TEXT NOT NULL CHECK(state IN ('waiting','approved','declined','sending','posted','refused')),
+           approval_id TEXT NOT NULL, outcome_json TEXT, created REAL NOT NULL, updated REAL NOT NULL);
+         INSERT INTO app_social_effects VALUES('eff-legacy','install-legacy','ctx',
+           'draft-legacy',1,'req-legacy','digest-legacy','{}','waiting','approval-legacy',NULL,1,1);",
+    )
+    .unwrap();
+    drop(conn);
+    let before = std::fs::read(&path).unwrap();
+    let records = RecordStore::open_readonly(dir.path(), install)
+        .unwrap()
+        .unwrap();
+    let list = records
+        .app_social_effect_list_state("ctx", "waiting", 0)
+        .unwrap();
+    assert_eq!(list["effects"].as_array().unwrap().len(), 1);
+    assert_eq!(list["effects"][0]["effect_id"], "eff-legacy");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn readonly_list_returns_empty_when_social_tables_are_absent() {
+    let dir = TempDir::new().unwrap();
+    let install = "install-empty";
+    let path = record_db_path(dir.path(), install).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE record_schema(version INTEGER NOT NULL);
+         INSERT INTO record_schema VALUES(1);
+         CREATE TABLE record_identity(install_id TEXT NOT NULL, created REAL NOT NULL);
+         INSERT INTO record_identity VALUES('install-empty', 0);",
+    )
+    .unwrap();
+    drop(conn);
+    let before = std::fs::read(&path).unwrap();
+    let records = RecordStore::open_readonly(dir.path(), install)
+        .unwrap()
+        .unwrap();
+    assert!(records
+        .app_social_effect_list_state("ctx", "waiting", 0)
+        .unwrap()["effects"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn readonly_list_rejects_an_unknown_social_effect_layout() {
+    let dir = TempDir::new().unwrap();
+    let install = "install-foreign";
+    let path = record_db_path(dir.path(), install).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE record_schema(version INTEGER NOT NULL);
+         INSERT INTO record_schema VALUES(1);
+         CREATE TABLE record_identity(install_id TEXT NOT NULL, created REAL NOT NULL);
+         INSERT INTO record_identity VALUES('install-foreign', 0);
+         CREATE TABLE app_social_effects(effect_id TEXT PRIMARY KEY);",
+    )
+    .unwrap();
+    drop(conn);
+    let records = RecordStore::open_readonly(dir.path(), install)
+        .unwrap()
+        .unwrap();
+    let error = records
+        .app_social_effect_list_state("ctx", "waiting", 0)
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown"), "{error}");
+}
+
+#[test]
+fn readonly_open_never_creates_a_missing_record_store() {
+    let dir = TempDir::new().unwrap();
+    assert!(RecordStore::open_readonly(dir.path(), "install-missing")
+        .unwrap()
+        .is_none());
+    let path = record_db_path(dir.path(), "install-missing").unwrap();
+    assert!(!path.exists());
+    assert!(!path.parent().unwrap().exists());
+    let _open = record_file(&dir, "install-a");
+    assert!(RecordStore::open_readonly(dir.path(), "install-a")
+        .unwrap()
+        .is_some());
+}
+
 fn customer(name: &str, email: &str) -> CustomerProfile {
     CustomerProfile::parse(&json!({"schema": 1, "display_name": name, "email": email, "tags": [], "consent": {"email": "granted"}})).unwrap()
 }

@@ -462,6 +462,47 @@ impl RecordStore {
         }
     }
 
+    /// Read-only open for inventory commands: a missing record file is
+    /// absent social state, not an invitation to create or migrate one.
+    pub fn open_readonly(state_dir: &Path, install_id: &str) -> Result<Option<Self>> {
+        let path = record_db_path(state_dir, install_id)?;
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Err(Error::rejected(CORRUPT_RECORD_FILE)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(Error::internal(format!(
+                    "record file cannot be checked: {error}"
+                )))
+            }
+        }
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| Error::rejected(CORRUPT_RECORD_FILE))?;
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let stored: String = conn
+            .query_row("SELECT install_id FROM record_identity", [], |row| {
+                row.get(0)
+            })
+            .map_err(|_| Error::rejected(CORRUPT_RECORD_FILE))?;
+        if stored != install_id {
+            return Err(Error::rejected(CORRUPT_RECORD_FILE));
+        }
+        let version: i64 = conn
+            .query_row("SELECT version FROM record_schema", [], |row| row.get(0))
+            .map_err(|_| Error::rejected(CORRUPT_RECORD_FILE))?;
+        if version != FILE_SCHEMA {
+            return Err(Error::rejected("record file schema is not current"));
+        }
+        Ok(Some(Self {
+            install_id: install_id.to_owned(),
+            conn: Mutex::new(conn),
+        }))
+    }
+
     fn open_once(state_dir: &Path, install_id: &str) -> Result<Self> {
         let path = record_db_path(state_dir, install_id)?;
         if let Some(parent) = path.parent() {

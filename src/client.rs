@@ -4,6 +4,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -371,6 +372,45 @@ pub fn rpc_timeout(
     timeout: Duration,
 ) -> Result<Value> {
     proto::unwrap(rpc_frame(state_dir, method, params, timeout)?)
+}
+
+/// Send one request pinned to this state dir's own socket. The dev
+/// sandbox verbs use this so an inherited `CADENCE_SOCKET` can never
+/// redirect a checked sandbox operation to another daemon.
+pub fn rpc_state(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
+    let socket = checked_state_socket(state_dir)?;
+    proto::unwrap(rpc_frame_on(
+        state_dir,
+        &socket,
+        method,
+        params,
+        Duration::from_secs(700),
+    )?)
+}
+
+/// The sandbox socket must be the socket file in the checked state dir.
+/// A symlink there could point the dev command at another daemon (for
+/// example production), so it is refused before any request is sent.
+fn checked_state_socket(state_dir: &Path) -> Result<PathBuf> {
+    let socket = socket_path(state_dir);
+    match std::fs::symlink_metadata(&socket) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(Error::rejected("sandbox socket must not be a symlink"))
+        }
+        Ok(meta) if meta.nlink() > 1 => {
+            Err(Error::rejected("sandbox socket must not be hard-linked"))
+        }
+        Ok(meta) if !meta.file_type().is_socket() => {
+            Err(Error::rejected("sandbox socket is not a socket"))
+        }
+        Ok(_) => Ok(socket),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(Error::rejected("sandbox daemon is not running"))
+        }
+        Err(error) => Err(Error::internal(format!(
+            "sandbox socket cannot be checked: {error}"
+        ))),
+    }
 }
 
 /// One read under a single absolute deadline covering connect, the request

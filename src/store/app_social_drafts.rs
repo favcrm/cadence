@@ -173,6 +173,38 @@ fn normalized_social_effect_ddl(sql: &str) -> String {
     normalized
 }
 
+const LEGACY_SOCIAL_EFFECT_DDL: &str = "CREATE TABLE app_social_effects( effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('waiting','approved','declined','sending','posted','refused')), approval_id TEXT NOT NULL, outcome_json TEXT, media_key TEXT, created REAL NOT NULL, updated REAL NOT NULL)";
+const LEGACY_SOCIAL_EFFECT_WITHOUT_MEDIA_DDL: &str = "CREATE TABLE app_social_effects( effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('waiting','approved','declined','sending','posted','refused')), approval_id TEXT NOT NULL, outcome_json TEXT, created REAL NOT NULL, updated REAL NOT NULL)";
+const LEGACY_SOCIAL_EFFECT_MEDIA_LAST_DDL: &str = "CREATE TABLE app_social_effects( effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('waiting','approved','declined','sending','posted','refused')), approval_id TEXT NOT NULL, outcome_json TEXT, created REAL NOT NULL, updated REAL NOT NULL, media_key TEXT)";
+const CURRENT_SOCIAL_EFFECT_DDL: &str = "CREATE TABLE app_social_effects( effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('waiting','approved','scheduled','cancelled','declined','sending','posted','refused')), approval_id TEXT NOT NULL, outcome_json TEXT, media_key TEXT, due_epoch INTEGER, timezone TEXT, created REAL NOT NULL, updated REAL NOT NULL)";
+
+fn supported_social_effect_ddl(sql: &str) -> bool {
+    let actual = normalized_social_effect_ddl(sql);
+    let quoted_current = CURRENT_SOCIAL_EFFECT_DDL.replacen(
+        "TABLE app_social_effects(",
+        "TABLE \"app_social_effects\"(",
+        1,
+    );
+    [
+        LEGACY_SOCIAL_EFFECT_DDL,
+        LEGACY_SOCIAL_EFFECT_WITHOUT_MEDIA_DDL,
+        LEGACY_SOCIAL_EFFECT_MEDIA_LAST_DDL,
+        CURRENT_SOCIAL_EFFECT_DDL,
+    ]
+    .iter()
+    .any(|ddl| actual == normalized_social_effect_ddl(ddl))
+        || actual == normalized_social_effect_ddl(&quoted_current)
+}
+
+fn social_effect_table_supported(conn: &impl StoreConn) -> Result<bool> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='app_social_effects'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(supported_social_effect_ddl(&sql))
+}
+
 fn migrate_social_effect_schedule_schema(conn: &rusqlite::Connection) -> Result<()> {
     let columns = conn
         .prepare("PRAGMA table_info(app_social_effects)")?
@@ -248,26 +280,7 @@ fn migrate_social_effect_schedule_schema(conn: &rusqlite::Connection) -> Result<
         [],
         |r| r.get(0),
     )?;
-    let legacy_ddl = "CREATE TABLE app_social_effects( effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('waiting','approved','declined','sending','posted','refused')), approval_id TEXT NOT NULL, outcome_json TEXT, media_key TEXT, created REAL NOT NULL, updated REAL NOT NULL)";
-    let legacy_without_media_ddl = "CREATE TABLE app_social_effects( effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('waiting','approved','declined','sending','posted','refused')), approval_id TEXT NOT NULL, outcome_json TEXT, created REAL NOT NULL, updated REAL NOT NULL)";
-    let legacy_media_last_ddl = "CREATE TABLE app_social_effects( effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('waiting','approved','declined','sending','posted','refused')), approval_id TEXT NOT NULL, outcome_json TEXT, created REAL NOT NULL, updated REAL NOT NULL, media_key TEXT)";
-    let current_ddl = "CREATE TABLE app_social_effects( effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('waiting','approved','scheduled','cancelled','declined','sending','posted','refused')), approval_id TEXT NOT NULL, outcome_json TEXT, media_key TEXT, due_epoch INTEGER, timezone TEXT, created REAL NOT NULL, updated REAL NOT NULL)";
-    let quoted_current_ddl = current_ddl.replacen(
-        "TABLE app_social_effects(",
-        "TABLE \"app_social_effects\"(",
-        1,
-    );
-    let actual = normalized_social_effect_ddl(&old_sql);
-    if ![
-        legacy_ddl,
-        legacy_without_media_ddl,
-        legacy_media_last_ddl,
-        current_ddl,
-    ]
-    .iter()
-    .any(|ddl| actual == normalized_social_effect_ddl(ddl))
-        && actual != normalized_social_effect_ddl(&quoted_current_ddl)
-    {
+    if !supported_social_effect_ddl(&old_sql) {
         return Err(Error::rejected(
             "social effect table definition is unknown; refusing a lossy scheduling migration",
         ));
@@ -834,8 +847,48 @@ impl RecordStore {
         )
     }
 
+    fn table_columns(conn: &impl StoreConn, table: &str) -> Result<Vec<String>> {
+        conn.query_vec(&format!("PRAGMA table_info({table})"), [], |row| {
+            row.get::<_, String>(1)
+        })
+        .map_err(Into::into)
+    }
+
     fn social_effect_in(conn: &impl StoreConn, install: &str, id: &str) -> Result<Value> {
-        let row=conn.query_row("SELECT context_id,draft_id,revision,request_id,digest,frozen_json,state,approval_id,outcome_json,created,updated,due_epoch,timezone FROM app_social_effects WHERE install_id=? AND effect_id=?",params![install,id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,f64>(9)?,r.get::<_,f64>(10)?,r.get::<_,Option<i64>>(11)?,r.get::<_,Option<String>>(12)?))).optional()?.ok_or_else(||Error::rejected("social draft effect not found"))?;
+        let columns = Self::table_columns(conn, "app_social_effects")?;
+        let due = if columns.iter().any(|column| column == "due_epoch") {
+            "due_epoch"
+        } else {
+            "NULL"
+        };
+        let timezone = if columns.iter().any(|column| column == "timezone") {
+            "timezone"
+        } else {
+            "NULL"
+        };
+        let sql = format!(
+            "SELECT context_id,draft_id,revision,request_id,digest,frozen_json,state,approval_id,outcome_json,created,updated,{due} AS due_epoch,{timezone} AS timezone FROM app_social_effects WHERE install_id=? AND effect_id=?"
+        );
+        let row = conn
+            .query_row(&sql, params![install, id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                    r.get::<_, f64>(9)?,
+                    r.get::<_, f64>(10)?,
+                    r.get::<_, Option<i64>>(11)?,
+                    r.get::<_, Option<String>>(12)?,
+                ))
+            })
+            .optional()?
+            .ok_or_else(|| Error::rejected("social draft effect not found"))?;
         let frozen: Value = serde_json::from_str(&row.5)
             .map_err(|_| Error::rejected("social draft effect is corrupt"))?;
         Ok(
@@ -846,18 +899,76 @@ impl RecordStore {
         Self::social_effect_in(&*self.conn(), self.install(), id)
     }
     pub fn app_social_effect_list(&self, context: &str) -> Result<Value> {
-        self.app_social_effect_list_scoped(Some(context))
+        self.app_social_effect_list_scoped(Some(context), None, 0)
+    }
+
+    pub fn app_social_effect_list_page(&self, context: &str, offset: usize) -> Result<Value> {
+        self.app_social_effect_list_scoped(Some(context), None, offset)
+    }
+
+    pub fn app_social_effect_list_state(
+        &self,
+        context: &str,
+        state: &str,
+        offset: usize,
+    ) -> Result<Value> {
+        self.app_social_effect_list_scoped(Some(context), Some(state), offset)
     }
 
     pub fn app_social_effect_list_install(&self) -> Result<Value> {
-        self.app_social_effect_list_scoped(None)
+        self.app_social_effect_list_scoped(None, None, 0)
     }
 
-    fn app_social_effect_list_scoped(&self, context: Option<&str>) -> Result<Value> {
+    pub fn app_social_effect_list_install_page(&self, offset: usize) -> Result<Value> {
+        self.app_social_effect_list_scoped(None, None, offset)
+    }
+
+    pub fn app_social_effect_list_install_state(
+        &self,
+        state: &str,
+        offset: usize,
+    ) -> Result<Value> {
+        self.app_social_effect_list_scoped(None, Some(state), offset)
+    }
+
+    fn app_social_effect_list_scoped(
+        &self,
+        context: Option<&str>,
+        state: Option<&str>,
+        offset: usize,
+    ) -> Result<Value> {
         let conn = self.conn();
-        let ids = conn.prepare("SELECT e.effect_id FROM app_social_effects e WHERE e.install_id=? AND (? IS NULL OR e.context_id=?) AND NOT EXISTS (SELECT 1 FROM app_social_drafts d WHERE d.install_id=e.install_id AND d.context_id=e.context_id AND d.draft_id=e.draft_id AND d.discarded_at IS NOT NULL) ORDER BY e.created DESC,e.effect_id LIMIT 101")?
-            .query_map(params![self.install(), context, context], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let effect_columns = Self::table_columns(&*conn, "app_social_effects")?;
+        if effect_columns.is_empty() {
+            return Ok(json!({"effects": []}));
+        }
+        if !social_effect_table_supported(&*conn)? {
+            return Err(Error::rejected(
+                "social effect table definition is unknown; refusing a read-only inventory",
+            ));
+        }
+        let draft_columns = Self::table_columns(&*conn, "app_social_drafts")?;
+        let discarded = if draft_columns.iter().any(|column| column == "discarded_at") {
+            "AND NOT EXISTS (SELECT 1 FROM app_social_drafts d WHERE d.install_id=e.install_id AND d.context_id=e.context_id AND d.draft_id=e.draft_id AND d.discarded_at IS NOT NULL)"
+        } else {
+            ""
+        };
+        let ids = match state {
+            Some(state) => conn
+                .prepare(&format!("SELECT e.effect_id FROM app_social_effects e WHERE e.install_id=? AND (? IS NULL OR e.context_id=?) AND (? IS NULL OR e.state=?) {discarded} ORDER BY e.created DESC,e.effect_id LIMIT 100 OFFSET ?"))?
+                .query_map(
+                    params![self.install(), context, context, state, state, offset as i64],
+                    |r| r.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => conn
+                .prepare(&format!("SELECT e.effect_id FROM app_social_effects e WHERE e.install_id=? AND (? IS NULL OR e.context_id=?) {discarded} ORDER BY e.created DESC,e.effect_id LIMIT 101 OFFSET ?"))?
+                .query_map(
+                    params![self.install(), context, context, offset as i64],
+                    |r| r.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
         if ids.len() > 100 {
             return Err(Error::rejected(
                 "social effect inventory exceeds its supported bound",
