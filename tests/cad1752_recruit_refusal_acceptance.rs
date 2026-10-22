@@ -617,6 +617,99 @@ fn cad1752_daemon_catalogue_register_refuses_agent_caller() {
     assert_eq!(mode(&fx.home("acct-a")), 0o700);
 }
 
+/// A refusal the daemon states (`Error::Rejected`), not an internal
+/// failure such as a store constraint.
+fn assert_stated_rejection(err: &cadence_agent::Error, what: &str) {
+    assert!(
+        matches!(err, cadence_agent::Error::Rejected(_)),
+        "{what}: not a stated rejection: {err:?}"
+    );
+    assert!(
+        !err.to_string().contains("UNIQUE constraint"),
+        "{what}: the store's constraint answered, not a guard: {err}"
+    );
+}
+
+/// Rule (PM decision on CAD-1752): a catalogue hire is an operator act, so
+/// every agent caller is refused whatever its group position, including a
+/// group root naming itself as the new agent's `upstream`.
+#[test]
+fn cad1752_daemon_catalogue_register_refuses_group_root_agent() {
+    let fx = Fx::start(Board::None);
+    fx.seed("pm-root", None, None);
+    let params = json!({"alias": "acct-g", "catalogue": "accountant",
+                        "params": r#"{"upstream":"pm-root"}"#});
+    let grouped = client::briefing_path(&fx.state(), &json!({"upstream": "pm-root"}), "acct-g");
+
+    let err = fx
+        .rpc(
+            Asserted::Agent("pm-root".into()),
+            "agent_register",
+            params.clone(),
+        )
+        .expect_err("a group-root agent hired from the catalogue into its own group");
+    assert_stated_rejection(&err, "group root");
+    assert_not_hired(&fx, "acct-g", "group root");
+    assert!(
+        !grouped.exists(),
+        "group root: {} was written",
+        grouped.display()
+    );
+
+    // Control: the operator, the same request, the same state.
+    let out = fx.op("agent_register", params);
+    assert_eq!(out["alias"], "acct-g", "{out}");
+    let row = fx
+        .agent("acct-g")
+        .expect("operator hire registered nothing");
+    assert_eq!(row.params.unwrap()["upstream"], "pm-root");
+    assert_eq!(mode(&fx.home("acct-g")), 0o700);
+}
+
+/// A catalogue register naming an alias that already exists is refused
+/// with a stated rejection, for an agent caller and for the operator, and
+/// creates no `<state>/agents/<alias>/home` for the existing agent.
+#[test]
+fn cad1752_daemon_catalogue_register_existing_alias_leaves_no_home() {
+    let fx = Fx::start(Board::None);
+    fx.seed("pm-root", None, None);
+    fx.seed("worker-1", Some(r#"{"upstream":"pm-root"}"#), None);
+    fx.seed("stranger", None, Some("stranger job"));
+    let params = json!({"alias": "stranger", "catalogue": "accountant"});
+    assert!(
+        !fx.home("stranger").exists(),
+        "fixture: home already present"
+    );
+
+    for (what, who) in [
+        ("an agent caller", Asserted::Agent("worker-1".into())),
+        ("the operator", Asserted::Operator),
+    ] {
+        let err = fx
+            .rpc(who, "agent_register", params.clone())
+            .expect_err(&format!(
+                "{what}: a catalogue hire over an existing alias was admitted"
+            ));
+        assert_stated_rejection(&err, what);
+        assert!(
+            !fx.home("stranger").exists(),
+            "{what}: {} was created for the existing agent",
+            fx.home("stranger").display()
+        );
+        let row = fx.agent("stranger").unwrap();
+        assert_eq!(row.provider, "claude", "{what}: existing row changed");
+        assert_eq!(row.instructions.as_deref(), Some("stranger job"), "{what}");
+    }
+
+    // Control: the operator hires under a fresh alias in the same state.
+    fx.op(
+        "agent_register",
+        json!({"alias": "acct-x", "catalogue": "accountant"}),
+    );
+    assert!(fx.agent("acct-x").is_some());
+    assert_eq!(mode(&fx.home("acct-x")), 0o700);
+}
+
 // ---------------------------------------------------------------- item 3
 
 /// Guard: `catalogue_hire` refuses a caller-named runtime
