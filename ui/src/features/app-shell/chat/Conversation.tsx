@@ -97,6 +97,7 @@ import { turnBarState } from "./turnBarState";
 import { TurnBar } from "./TurnBar";
 import { isUnread, onSeenChanged, readSeen, writeSeen, type SeenMap } from "./unreadSeen";
 import { setAssistantUnread } from "./assistantUnread";
+import { setVisibleConversation } from "./chatVisibility";
 import { earlierStep, useThreadStream } from "./conversationThread";
 
 /**
@@ -548,6 +549,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     (active.state === "legacy" && mode.conversationRequest === null) ||
     (active.state === "ready" && (convId !== null || draftSubject !== null));
   const subjects = useMemo(() => descriptor?.subjects ?? [], [descriptor]);
+  // The shell's announcer reads this: the picker's selection is client state,
+  // so the route alone cannot say whether a reply is already on screen.
+  useEffect(() => {
+    setVisibleConversation(installId, convId);
+    return () => setVisibleConversation(installId, null);
+  }, [installId, convId]);
 
   useEffect(() => setFailedFrames(new Set()), [installId, convId]);
   // A context or installation change drops the importer (its scope key

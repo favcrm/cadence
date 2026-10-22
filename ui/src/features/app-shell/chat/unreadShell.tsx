@@ -4,6 +4,7 @@ import { resources } from "../../../lib/resources";
 import { useNotificationToast } from "../../threads/NotificationToast";
 import { conversationList } from "../conversationClient";
 import { setAssistantUnread } from "./assistantUnread";
+import { visibleConversation } from "./chatVisibility";
 import { isUnread, readSeen } from "./unreadSeen";
 
 /**
@@ -55,19 +56,31 @@ interface FinishedTurn {
  * Identity is the message, so a completion immediately followed by the next
  * turn is still seen.
  */
-function useFinishedTurn(turn: { message?: string; conversation?: string | null; app_origin?: { install_id: string } | null } | null): FinishedTurn | null {
-  const previous = useRef<{ message: string; conversation: string | null; install: string | null } | null | undefined>(undefined);
+function useFinishedTurn(turn: {
+  message?: string;
+  conversation?: string | null;
+  position?: number | null;
+  app_origin?: { install_id: string } | null;
+} | null): FinishedTurn | null {
+  const previous = useRef<{ message: string; conversation: string | null; install: string | null; working: boolean } | null | undefined>(undefined);
   const current = turn
-    ? { message: turn.message ?? "", conversation: turn.conversation ?? null, install: turn.app_origin?.install_id ?? null }
+    ? {
+        message: turn.message ?? "",
+        conversation: turn.conversation ?? null,
+        install: turn.app_origin?.install_id ?? null,
+        // `position` is null only while the turn is WORKING: a queued
+        // message that is cancelled or becomes the head was never a reply.
+        working: turn.position === null,
+      }
     : null;
   const before = previous.current;
   const finished =
-    before != null && (current === null || current.message !== before.message)
+    before != null && before.working && (current === null || current.message !== before.message)
       ? { conversation: before.conversation, install: before.install }
       : null;
   useEffect(() => {
     previous.current = current;
-  }, [current?.message, current?.conversation, current?.install]);
+  }, [current?.message, current?.conversation, current?.install, current?.working]);
   return finished;
 }
 
@@ -94,8 +107,10 @@ export function AssistantUnreadProbes({ apps }: { apps: { installId: string }[] 
         ? null
         : (apps.find((app) => conversationList(app.installId).get().data?.conversations.some((c) => c.id === conversation))
             ?.installId ?? null));
-    const open = new URLSearchParams(window.location.search).get("conversation");
-    if (install !== null && conversation !== null && conversation !== open) {
+    const open = visibleConversation();
+    const routeOpen = new URLSearchParams(window.location.search).get("conversation");
+    const shown = open?.conversation !== null && open?.conversation === conversation;
+    if (install !== null && conversation !== null && !shown && conversation !== routeOpen) {
       setAssistantUnread(install, true);
       const params = new URLSearchParams({ conversation });
       toast.show("Assistant replied", `assistant:${install}:${conversation}`, {
