@@ -233,6 +233,10 @@ jobs:
       - run: python3 scripts/acceptance/test-cad-1400-release-install-gate.py
       - run: python3 scripts/test_ci_fast_linker.py
       - run: python3 scripts/test_release_reuse.py
+      # CAD-1745: the independent shard-report selector acceptance drives the
+      # real CLI over a raw REST transport substitute (carried aliases
+      # included) and feeds the selected reports through check-test-junit.py.
+      - run: python3 scripts/test_select_shard_artifacts.py
       - run: python3 -m unittest scripts/test_enqueue_human_paths.py
       - run: python3 scripts/test_cad1743_bun_guards.py
       - run: python3 -m unittest scripts/test_enqueue_scope_approval.py
@@ -372,12 +376,14 @@ jobs:
           fi
       # Artifacts always land (even on a red shard) so the aggregate can
       # prove where coverage stopped. junit.xml is required; the shard
-      # step already failed when it is missing.
+      # step already failed when it is missing. CAD-1745: the name carries
+      # the producing attempt, so a rerun's report can never be confused
+      # with — or overwrite — the immutable report of an earlier attempt.
       - name: Upload shard junit and expected inventory
         if: always() && needs.change-scope.outputs.rust != 'false'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: test-shard-${{ matrix.shard }}
+          name: test-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: |
             target/nextest/cadence/junit.xml
             target/nextest/cadence/expected-targets.txt
@@ -387,12 +393,18 @@ jobs:
   # The required `test` check: merges every shard's junit and re-runs
   # the zero-target coverage guard the single job used to run. A skipped
   # shard set (docs-only PR scope) still resolves to a green no-op gate;
-  # a red shard or a hole in the merged report fails here.
+  # a red shard or a hole in the merged report fails here. CAD-1745: it
+  # merges exactly the reports of each partition's latest actual
+  # execution, so a rerun keeps untouched partitions without reusing an
+  # older failure or success.
   test:
     needs: [queue-evidence, change-scope, test-shards]
     if: ${{ always() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
     steps:
       - name: Not applicable — rust PR feedback gate
         if: ${{ needs.change-scope.outputs.rust == 'false' }}
@@ -405,11 +417,37 @@ jobs:
             echo "::error::test-shards finished as '${{ needs.test-shards.result }}'" >&2
             exit 1
           fi
+      # CAD-1745: a failed-job-only rerun copies an untouched green shard's
+      # row into the new attempt without re-running or re-uploading it.
+      # Resolve each partition to the attempt that actually executed it
+      # (the copied row aliases the earlier execution), then fetch exactly
+      # those six artifacts by ID. Older reports stay on the run as
+      # evidence; a non-green or ambiguous current execution fails this
+      # step instead of falling back to an older success.
+      - name: Select each partition's authoritative shard report
+        id: select
+        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # A PR run's head is the PR head; queue and push runs checkout
+          # github.sha. The jobs and artifacts APIs report that same head.
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/select-shard-artifacts.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --sha "$SOURCE_SHA" \
+            --attempt "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         with:
-          pattern: test-shard-*
+          artifact-ids: ${{ steps.select.outputs.artifact_ids }}
           path: junits
+          # The REST artifact list is the same read-only source the
+          # selector checked, and it retains every earlier attempt's
+          # artifacts; each selected artifact lands in junits/<name>/.
+          github-token: ${{ github.token }}
       - name: Validate merged shard coverage and results
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         run: |

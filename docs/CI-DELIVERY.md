@@ -329,6 +329,17 @@ assignment receipts (eight automatically; four or eight on a manual
 benchmark). Default-feature refusal proofs and doctests
 remain in `test-once`. Exact-SHA main queue-evidence reuse is unchanged.
 
+Uploads are named `test-shard-<n>-attempt-<run_attempt>` (CAD-1745). A
+failed-job-only rerun copies an untouched green partition into the new
+attempt without re-running or re-uploading it, so the aggregate resolves
+each copied row to the unique earlier execution it aliases (identical
+start/completion timestamps and runner, later `created_at`). It then takes
+every partition's latest *actual* execution and downloads exactly those
+six artifact IDs. Earlier reports remain on the run as evidence, and a
+non-green latest execution, missing or ambiguous provenance, or a missing,
+expired or foreign-run artifact fails the aggregate instead of falling
+back to an older success.
+
 ## Why shards compile themselves (CAD-869)
 
 CAD-858 (#603) tried a serial `test-build` producer that archived the
