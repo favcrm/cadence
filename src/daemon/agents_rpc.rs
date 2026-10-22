@@ -10,7 +10,23 @@ impl Shared {
         // The role is resolved here so the flag cannot be set by naming
         // an id the daemon does not know.
         let hired = match optional_str(params, "catalogue") {
-            Some(id) => Some(catalogue_hire(params, id)?),
+            Some(id) => {
+                // A hire is the operator's act, whatever group the caller
+                // sits in: no agent may recruit, and nothing is written
+                // (no row, no home dir) before that is proven.
+                self.operator_connection_on_agent("catalogue hire", params, peer_pid)
+                    .map_err(|e| {
+                        Error::rejected(format!(
+                            "agent register refused: a catalogue hire is the operator's act ({e})"
+                        ))
+                    })?;
+                if self.store.agent_opt(alias)?.is_some() {
+                    return Err(Error::rejected(format!(
+                        "Agent '{alias}' already exists - pick another alias"
+                    )));
+                }
+                Some(catalogue_hire(params, id)?)
+            }
             None => None,
         };
         let provider = match &hired {
@@ -320,11 +336,15 @@ impl Shared {
             parsed
         };
         self.authorize_register(alias, &parsed, peer_pid)?;
+        // The alias was checked free above; should the insert still fail
+        // (a racing register, a params cap), the empty home is removed.
+        let mut new_home = None;
         if needs_home {
             let home = crate::adapter::pi::pi_agent_home(&self.state_dir, alias)?;
-            cwd = std::fs::canonicalize(home)?;
+            cwd = std::fs::canonicalize(&home)?;
+            new_home = Some(home);
         }
-        self.store.register_agent(&crate::store::NewAgent {
+        let registered = self.store.register_agent(&crate::store::NewAgent {
             alias,
             provider,
             endpoint_kind: endpoint,
@@ -335,7 +355,15 @@ impl Shared {
             params: pi_params.as_deref().or(agent_params),
             team_role,
             model_policy,
-        })?;
+        });
+        if let Err(err) = registered {
+            if let Some(home) = new_home {
+                if !matches!(self.store.agent_opt(alias), Ok(Some(_))) {
+                    let _ = std::fs::remove_dir(home);
+                }
+            }
+            return Err(err);
+        }
         // CAD-559: when `[pi].models.default` filled the launch model,
         // `register_agent` labeled it `explicit` — restamp the real
         // provenance before the row can be read or launched.
