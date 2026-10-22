@@ -52,11 +52,49 @@ export function plainStep(text: string): string {
  *  names the master's tmp or the state dir. */
 const PATHISH = /^[("'`[{<]*(?:\/|~\/|\.\/|\.\.\/)|[=:][^\s=:]*\/|master\/tmp|\.local\/state/;
 
+/** The longest JSON span `scrubJson` will look at. */
+const JSON_SPAN_MAX = 20_000;
+
+/** Replace a balanced `{…}` / `[…]` that starts a line or word and holds a
+ *  `":` with an ellipsis, so pretty-printed or spaced JSON never reaches the
+ *  strip. One forward pass: a span that does not balance within the cap is
+ *  kept as written and skipped, never rescanned. */
+function scrubJson(text: string): string {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if ((c === "{" || c === "[") && (i === 0 || /\s/.test(text[i - 1]))) {
+      const end = Math.min(text.length, i + JSON_SPAN_MAX);
+      let depth = 0;
+      let j = i;
+      for (; j < end; j++) {
+        const d = text[j];
+        if (d === "{" || d === "[") depth++;
+        else if (d === "}" || d === "]") {
+          depth--;
+          if (depth === 0) {
+            j++;
+            break;
+          }
+        }
+      }
+      const span = text.slice(i, j);
+      out += depth === 0 && span.includes('":') ? "…" : span;
+      i = j;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
 /** The agent's own words: command lines (`bash:`, `$ `) dropped, and every
  *  path-like or inline-JSON word replaced by an ellipsis. Linear: one pass per
  *  line, one anchored test per word. */
 function plainWords(text: string): string {
-  return text
+  return scrubJson(text)
     .split("\n")
     .filter((line) => !/^\s*(?:bash:|\$ )/i.test(line))
     .map((line) =>

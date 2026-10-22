@@ -19,6 +19,8 @@ export function parseCsv(text: string): CsvTable | null {
   let field = "";
   let quoted = false;
   let wasQuoted = false;
+  // A quoted field makes its record real even when the field is empty (`""`).
+  let rowQuoted = false;
   let i = text.charCodeAt(0) === 0xfeff ? 1 : 0;
   const endField = () => {
     row.push(field);
@@ -27,8 +29,9 @@ export function parseCsv(text: string): CsvTable | null {
   };
   const endRow = () => {
     endField();
-    if (row.length > 1 || row[0] !== "") records.push(row);
+    if (row.length > 1 || row[0] !== "" || rowQuoted) records.push(row);
     row = [];
+    rowQuoted = false;
   };
   for (; i < text.length; i++) {
     const c = text[i];
@@ -42,7 +45,7 @@ export function parseCsv(text: string): CsvTable | null {
     }
     if (c === '"') {
       if (field !== "" || wasQuoted) return null;
-      quoted = wasQuoted = true;
+      quoted = wasQuoted = rowQuoted = true;
     } else if (wasQuoted && c !== "," && c !== "\n" && c !== "\r") {
       return null;
     } else if (c === ",") endField();

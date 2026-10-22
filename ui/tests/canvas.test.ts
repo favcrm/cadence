@@ -113,6 +113,11 @@ equal(drawerLayout(900, 480, "app", 860, true).mode, "cover", "app expand at 900
 equal(drawerLayout(500, 480, "home", null, true).mode, "sheet", "a phone is a sheet either way");
 equal([clampWidth(100, 1440), clampWidth(2000, 1440), clampWidth(500, 1440)], [360, 864, 500], "width clamps to 360px..60%");
 
+// A quoted-empty record is a record; blank lines and the trailing newline are not.
+equal(parseCsv('h\r\n""\r\nx\r\n'), { header: ["h"], rows: [[""], ["x"]], total: 2 }, "a quoted-empty row is kept");
+equal(parseCsv('""\r\nx\r\n'), { header: [""], rows: [["x"]], total: 1 }, "a quoted-empty header is kept");
+equal(parseCsv("a\n\nb\n"), { header: ["a"], rows: [["b"]], total: 1 }, "blank lines are skipped");
+
 // The feed reads cards and the live step from the thread, nothing else.
 const e = (seq: number, role: string, kind: string, text: string, message: string, payload: Record<string, unknown> | null = null): ThreadEntry => ({
   seq, role, kind, text, payload, message,
@@ -172,6 +177,16 @@ equal(planOf("Pulling the Q3 numbers, then summarising and/or charting them."), 
 // The agent's own commentary never carries a command line or inline JSON.
 equal(planOf('Done.\nbash: cadence status\n$ ls\nBASH: x\nResult {"bytes":9,"digest":"d"} ok'), "Done.\nResult … ok", "command lines and inline JSON go");
 for (const hostile of ["{".repeat(200_000), '{"a":'.repeat(40_000), " ".repeat(200_000) + "bash:"]) {
+  const started = performance.now();
+  planOf(hostile);
+  if (performance.now() - started > 100) throw new Error("plan scrub is not linear");
+}
+
+// Pretty-printed and spaced JSON never reaches the strip; ordinary brackets do.
+equal(planOf('Result:\n{\n  "bytes": 9,\n  "digest": "d"\n}\nAll set.'), "Result:\n…\nAll set.", "multiline JSON goes");
+equal(planOf('Got {"a": 1, "b": 2} back'), "Got … back", "spaced compact JSON goes");
+equal(planOf("Steps [1] and (2) done"), "Steps [1] and (2) done", "plain brackets stay");
+for (const hostile of ["{ ".repeat(100_000), '{"a": '.repeat(40_000), "[".repeat(200_000)]) {
   const started = performance.now();
   planOf(hostile);
   if (performance.now() - started > 100) throw new Error("plan scrub is not linear");
