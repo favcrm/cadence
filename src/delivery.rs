@@ -1064,10 +1064,19 @@ pub fn project_pr_refusal(pm_dir: &Path, project: &str, pr: &str) -> Result<Opti
 /// Observe one ticket's PR — the row [`sync`] reports for it, with
 /// `error` set when reading or reporting it failed.
 pub fn sync_pr(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Value {
-    match sync_one(state_dir, issue, url, gh_bin) {
+    sync_pr_counted(state_dir, issue, url, gh_bin).0
+}
+
+/// [`sync_pr`] and how many `gh` processes it started (the view, plus the
+/// `--disable-auto` write when the observation asks for it), so the
+/// board's pass can hold itself to a process budget (CAD-1751).
+pub fn sync_pr_counted(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> (Value, usize) {
+    let mut spawned = 0;
+    let row = match sync_one(state_dir, issue, url, gh_bin, &mut spawned) {
         Ok(v) => v,
         Err(e) => json!({"issue": issue, "error": e.to_string()}),
-    }
+    };
+    (row, spawned)
 }
 
 /// One bounded `gh pr view` — the read half every GitHub touch
@@ -1098,12 +1107,19 @@ fn pr_view_via(gh_bin: &str, slug: &str, number: u64, polled: bool) -> Result<Va
         .map_err(|e| Error::rejected(format!("gh pr view: unreadable ({e})")))
 }
 
-fn sync_one(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Result<Value> {
+fn sync_one(
+    state_dir: &Path,
+    issue: &str,
+    url: &str,
+    gh_bin: &str,
+    spawned: &mut usize,
+) -> Result<Value> {
     let (slug, number) = crate::issue::task_report::parse_pr_url(url)?;
     // CAD-564: the read starts now — whatever this call returns was
     // true at `read_at`, and a record change applied after it (a done
     // report's new head) is newer than anything the observation shows.
     let read_at = crate::issue::time::now_epoch();
+    *spawned += 1;
     let pr = pr_view_via(gh_bin, &slug, number, true)?;
     let rollup = pr["statusCheckRollup"]
         .as_array()
@@ -1122,6 +1138,7 @@ fn sync_one(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Result<Va
     });
     let mut answer = crate::client::rpc(state_dir, "delivery_observe", observed)?;
     if answer["disable_auto"] == true {
+        *spawned += 1;
         gh(
             gh_bin,
             &[

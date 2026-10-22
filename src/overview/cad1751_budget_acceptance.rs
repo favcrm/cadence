@@ -182,20 +182,11 @@ fn cad1751_pause_lives_in_the_boards_own_state_dir() {
     assert_eq!(after, spent, "no gh call while paused");
 }
 
-/// The delivery sync is a polling caller too: it stays inside the board's
-/// budget with the overview, and while `gh` is paused it reads nothing and
+/// While `gh` is paused the delivery sync it reads nothing and
 /// reports an error row (so it records no evidence).
 #[test]
 fn cad1751_delivery_sync_is_bounded_and_stops_while_paused() {
     let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    // Timer passes (60/h) plus page-view passes (4 per 10 min = 24/h).
-    let sync_per_hour = crate::ui::delivery_sync::MAX_PER_PASS as i64 * (60 + 24);
-    assert_eq!(sync_per_hour, 336);
-    assert!(
-        GH_BOARD_BUDGET_PER_HOUR + sync_per_hour <= 900,
-        "daemon keeps the rest of 1,000"
-    );
-
     let dir = tempfile::tempdir().unwrap();
     let gh = fake_gh(dir.path());
     crate::gh_guard::bind(dir.path());
@@ -225,4 +216,90 @@ fn cad1751_delivery_sync_is_bounded_and_stops_while_paused() {
         .lines()
         .count();
     assert_eq!(after, spent, "no gh call while paused");
+}
+
+/// The real delivery pass, with records whose observation asks for the
+/// `--disable-auto` write, over a simulated hour of passes: every pass
+/// starts at most `PASS_GH_BUDGET` gh processes (the protective write still
+/// runs), and the whole board's worst case stays under 1,000 an hour.
+#[test]
+fn cad1751_delivery_pass_gh_processes_stay_inside_the_budget() {
+    use crate::ui::delivery_sync::{DeliverySync, PASSES_PER_HOUR, PASS_GH_BUDGET};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let pm = root.path().join("pm");
+    std::fs::create_dir_all(pm.join("demo")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        pm.join("demo/project.yaml"),
+        "key: demo\nprefix: DEM\nrepos:\n- remote: github.com/acme/app\n",
+    )
+    .unwrap();
+    let pr = r#"{"headRefOid":"a","baseRefOid":"b","baseRefName":"main","state":"OPEN","statusCheckRollup":[],"additions":1,"deletions":1,"changedFiles":1,"autoMergeRequest":{"enabledAt":"x"}}"#;
+    let gh = root.path().join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> {log}\ncase \"$*\" in *\"pr view\"*) echo '{pr}';; esac\n",
+            log = root.path().join("gh-calls").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let records: Vec<Value> = (1..=9)
+        .map(|n| {
+            let mut r = crate::delivery::Record::new(&format!("D-{n}"), "demo", "w1", 0);
+            r.state = crate::delivery::State::Passed;
+            r.pr = Some(format!("https://github.com/acme/app/pull/{n}"));
+            serde_json::to_value(r).unwrap()
+        })
+        .collect();
+    let listener = UnixListener::bind(crate::client::socket_path(&state)).unwrap();
+    let (pm_dir, list) = (pm.clone(), records);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut line = String::new();
+            if BufReader::new(&stream).read_line(&mut line).is_err() {
+                continue;
+            }
+            let req: Value = serde_json::from_str(&line).unwrap_or_default();
+            let answer = match req["method"].as_str() {
+                Some("delivery_list") => json!({"records": list, "pm_dir": pm_dir}),
+                Some("delivery_observe") => json!({"disable_auto": true}),
+                _ => json!({}),
+            };
+            let _ = writeln!(stream, "{}", crate::proto::ok(answer));
+        }
+    });
+    crate::gh_guard::bind(&state);
+    let sync = DeliverySync::new(None, Ok(gh));
+    let calls = || {
+        std::fs::read_to_string(root.path().join("gh-calls"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let (mut total, mut writes) = (0, 0);
+    for _ in 0..PASSES_PER_HOUR {
+        let before = calls();
+        sync.pass(&state, &pm, || true);
+        let spawned = calls() - before;
+        assert!(spawned <= PASS_GH_BUDGET, "a pass started {spawned} gh");
+        total += spawned;
+    }
+    let log = std::fs::read_to_string(root.path().join("gh-calls")).unwrap();
+    writes += log.lines().filter(|l| l.contains("pr merge")).count();
+    assert!(writes > 0, "the --disable-auto write still runs");
+    assert!(
+        total <= PASSES_PER_HOUR * PASS_GH_BUDGET,
+        "{total} gh in a simulated hour"
+    );
+    // Whole board, worst case: delivery sync + overview refresh + hourly
+    // default-branch reads (15 repos) + the daemon's reconcile cap (150).
+    let board = PASSES_PER_HOUR * PASS_GH_BUDGET + GH_BOARD_BUDGET_PER_HOUR as usize + 15 + 150;
+    assert!(board <= 1000, "{board} gh an hour");
 }

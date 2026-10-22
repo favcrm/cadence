@@ -82,8 +82,37 @@ fn record_pause(state_dir: &Path, reset: Option<i64>) -> i64 {
 /// error is the refusal text; a `gh` failure is returned as `Ok` for
 /// the caller to read as it always did.
 pub(crate) fn run(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
+    if CALLS_LEFT.with(|c| match c.get() {
+        Some(0) => true,
+        Some(n) => {
+            c.set(Some(n - 1));
+            false
+        }
+        None => false,
+    }) {
+        return Err("gh call cap for this pass is spent".to_string());
+    }
     let dir = BOUND.lock().unwrap_or_else(|e| e.into_inner()).clone();
     run_in(dir.as_deref(), cmd, timeout)
+}
+
+thread_local! {
+    static CALLS_LEFT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with at most `cap` guarded `gh` starts on this thread; past
+/// it they fail like any failed read. Bounds a periodic pass whose own
+/// size is not bounded (the daemon's reconcile).
+pub(crate) fn with_call_cap<T>(cap: usize, f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CALLS_LEFT.with(|c| c.set(None));
+        }
+    }
+    CALLS_LEFT.with(|c| c.set(Some(cap)));
+    let _reset = Reset;
+    f()
 }
 
 /// The state dir this process's board or daemon runs on. The pause file

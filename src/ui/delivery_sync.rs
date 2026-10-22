@@ -73,11 +73,18 @@ pub const PAGE_GAP: Duration = Duration::from_secs(15);
 /// this.
 pub const PAGE_BUDGET: usize = 4;
 pub const PAGE_WINDOW: Duration = Duration::from_secs(10 * 60);
-/// PRs one pass reads, least recently read first; the rest wait for the
-/// next pass. One `gh` call each, so the sync costs at most
-/// `MAX_PER_PASS` x (60 timer passes + 24 page-view passes) = 336 an
-/// hour at the default [`EVERY`] of 60 s (CAD-1751 budget).
+/// PRs one pass selects, least recently read first; the rest wait.
 pub const MAX_PER_PASS: usize = 4;
+/// `gh` processes one pass may start (CAD-1751). A sync starts a view and,
+/// when the observation asks for it, a `--disable-auto` write: at most
+/// [`GH_PER_SYNC`]. A pass starts no further PR once the next could pass
+/// the budget; the PRs it skips are the least recently read next time.
+pub const PASS_GH_BUDGET: usize = 4;
+pub const GH_PER_SYNC: usize = 2;
+/// Passes per hour at the default [`EVERY`] of 60 s: 3600 / 60 timer passes
+/// plus [`PAGE_BUDGET`] page-view passes per [`PAGE_WINDOW`] (4 per 10 min
+/// = 24) = 84. So the sync starts at most 84 x 4 = 336 `gh` an hour.
+pub const PASSES_PER_HOUR: usize = 60 + 24;
 /// Bytes of one error text a row shows.
 const ERROR_MAX: usize = 300;
 /// Failing tickets a row names before "and N more".
@@ -425,7 +432,12 @@ impl DeliverySync {
     /// the board is the operator's, then read each due PR in its
     /// project's repos with the fixed `gh` and report it. One ticket's
     /// failure is that ticket's.
-    fn pass(&self, state_dir: &Path, board_pm: &Path, is_operator: impl Fn() -> bool) -> Pass {
+    pub(crate) fn pass(
+        &self,
+        state_dir: &Path,
+        board_pm: &Path,
+        is_operator: impl Fn() -> bool,
+    ) -> Pass {
         let list = match client::rpc(state_dir, "delivery_list", json!({})) {
             Ok(v) => v,
             Err(e) => {
@@ -471,13 +483,18 @@ impl DeliverySync {
                     .into(),
             );
         };
+        let mut spawned = 0;
         for rec in &due {
             let Some(url) = rec.pr.as_deref() else {
                 continue;
             };
+            if spawned + GH_PER_SYNC > PASS_GH_BUDGET {
+                break;
+            }
             let outcome = match delivery::project_pr_refusal(&pm_dir, &rec.project, url) {
                 Ok(None) => {
-                    let row = delivery::sync_pr(state_dir, &rec.issue, url, &gh);
+                    let (row, n) = delivery::sync_pr_counted(state_dir, &rec.issue, url, &gh);
+                    spawned += n;
                     match row["error"].as_str() {
                         Some(e) => Err(e.to_string()),
                         None => Ok(()),
