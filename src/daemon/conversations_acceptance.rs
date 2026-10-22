@@ -737,6 +737,9 @@ const APP_TURN_MAY_CALL: &[&str] = &[
     "app_segment_assistant_show",
     // CAD-1168: the turn reads the retained file its message carried.
     "chat_file_read",
+    // CAD-1726: the turn puts a canvas artifact; the handler takes the
+    // conversation and scope from the live turn, never the request.
+    "artifact_put",
     "message_report",
     "thread_read",
 ];
