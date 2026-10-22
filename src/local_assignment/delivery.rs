@@ -169,7 +169,7 @@ pub fn write_note(dir: &Path, kickoff: &Kickoff, context: &Value) -> Result<Path
 
 fn kickoff_line(kickoff: &Kickoff, note: &Path, context: &Value) -> Result<String> {
     let title = context
-        .pointer("/issue/title")
+        .pointer("/issue_title")
         .and_then(Value::as_str)
         .unwrap_or("hosted issue");
     let title: String = title
@@ -241,6 +241,15 @@ fn issue_context(target: &RemoteTarget, kickoff: &Kickoff, wake_timeout: u64) ->
     let (show_ok, issue) = outcome(show);
     let (history_ok, history) = outcome(history);
     let (wiki_ok, wiki) = outcome(wiki);
+    // The hosted CLI answers `issue_show` with the issue nested under `issue`;
+    // a top-level title is accepted too. Resolve the title once, here, so the
+    // kickoff line never has to search the stored envelope.
+    let issue_title = issue
+        .pointer("/issue/title")
+        .or_else(|| issue.pointer("/title"))
+        .and_then(Value::as_str)
+        .unwrap_or("hosted issue")
+        .to_string();
     let mut context = json!({
         "org": target.org,
         "organization_id": kickoff.organization_id,
@@ -249,6 +258,7 @@ fn issue_context(target: &RemoteTarget, kickoff: &Kickoff, wake_timeout: u64) ->
         "claim_id": kickoff.claim_id,
         "generation": kickoff.generation,
         "issue": issue,
+        "issue_title": issue_title,
         "comments": history,
         "wiki": wiki,
         "report": {
