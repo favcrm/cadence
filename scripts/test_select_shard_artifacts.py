@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """CAD-1745: bind reports to actual executions, not carried job aliases.
 
+CAD-1758: a queued/in_progress shard index row may be reconciled with its
+current job detail. The fixture transport serves that one read as raw REST
+only; reconciliation and artifact selection stay in the real CLI.
+
 Independent acceptance from the ticket and observed GitHub API contract.
 Only gh's read-only transport is simulated. The real selector CLI and
 existing JUnit validator execute in subprocesses. No implementation is
@@ -92,6 +96,21 @@ query = {key: values[-1] for key, values in parse_qs(url.query).items()}
 query.update(params)
 prefix = "/repos/{}/actions/runs/{}/".format(fixture["repo"], fixture["run"])
 path = "/" + url.path.lstrip("/")
+detail_prefix = "/repos/{}/actions/jobs/".format(fixture["repo"])
+detail_id = None
+if path.startswith(detail_prefix) and path[len(detail_prefix):].isdigit():
+    detail_id = int(path[len(detail_prefix):])
+if detail_id is not None:
+    # Native single-job lookup: one JSON object, no pagination/slurp wrapper.
+    if detail_id in fixture.get("fail_details", []):
+        print("synthetic job detail read failure", file=sys.stderr)
+        raise SystemExit(1)
+    record = fixture.get("job_details", {}).get(str(detail_id))
+    if record is None:
+        print("synthetic job detail unavailable", file=sys.stderr)
+        raise SystemExit(1)
+    print(json.dumps(record))
+    raise SystemExit(0)
 if path == prefix + "jobs":
     key = "jobs"
     rows = fixture[key]
@@ -192,6 +211,8 @@ class ShardArtifactAcceptance(unittest.TestCase):
         self.calls = 0
         self.jobs = [job(p) for p in range(1, 7)]
         self.artifacts = [artifact(p) for p in range(1, 7)]
+        self.job_details = {}
+        self.fail_details = set()
         self.api_options = {}
         self.red_ids = set()
         self.empty_ids = set()
@@ -205,6 +226,23 @@ class ShardArtifactAcceptance(unittest.TestCase):
         self.jobs.insert(0, job(6, attempt, 770601, status=status,
                                 conclusion=conclusion))
         self.artifacts.insert(0, artifact(6, attempt, 420017))
+
+    def stale_index_row(self, partition=6, attempt=2, status="queued"):
+        """Return the authoritative row, leaving a nonterminal index copy."""
+        index = next(i for i, row in enumerate(self.jobs)
+                     if row["name"] == f"test-shards ({partition})"
+                     and row["run_attempt"] == attempt)
+        actual = copy.deepcopy(self.jobs[index])
+        self.jobs[index] = job(partition, attempt, actual["id"],
+                               status=status, conclusion=None,
+                               created_at=actual["created_at"])
+        return actual
+
+    def offer_detail(self, actual, **changes):
+        detail = copy.deepcopy(actual)
+        detail.update(changes)
+        self.job_details[str(actual["id"])] = detail
+        return detail
 
     def bind_fixture_to_run(self, run_id):
         for row in self.jobs:
@@ -250,7 +288,10 @@ class ShardArtifactAcceptance(unittest.TestCase):
         fake.write_text(f"#!{sys.executable}\n" + FAKE_GH)
         fake.chmod(0o700)
         payload = {"repo": REPO, "run": run_id, "jobs": self.jobs,
-                   "artifacts": self.artifacts, **self.api_options}
+                   "artifacts": self.artifacts,
+                   "job_details": self.job_details,
+                   "fail_details": sorted(self.fail_details),
+                   **self.api_options}
         (root / "api.json").write_text(json.dumps(payload))
         evidence = self.reports(root)
         before = self.snapshot(evidence)
@@ -607,6 +648,122 @@ class ShardArtifactAcceptance(unittest.TestCase):
         for listing in ("jobs", "artifacts"):
             with self.subTest(listing=listing, page=2):
                 self.api_options = {"fail_listing": listing, "fail_page": 2}
+                self.refused()
+
+    def test_stale_nonterminal_index_resolves_same_id_successful_detail(self):
+        # Reproduces the CAD-1758 observation: the jobs index still says the
+        # shard row is queued/in_progress while its immutable detail already
+        # reports the completed, successful attempt that uploaded the artifact.
+        for scenario, expected in (("first", ORIGINAL_IDS), ("rerun", MIXED_IDS)):
+            for status in ("queued", "in_progress"):
+                with self.subTest(scenario=scenario, index_status=status):
+                    self.jobs = [job(p) for p in range(1, 7)]
+                    self.artifacts = [artifact(p) for p in range(1, 7)]
+                    self.job_details = {}
+                    self.fail_details = set()
+                    if scenario == "first":
+                        attempt, partition = 1, 1
+                    else:
+                        self.add_rerun()
+                        attempt, partition = 2, 6
+                    actual = self.stale_index_row(partition, attempt, status)
+                    self.offer_detail(actual)
+                    self.selected(expected=expected, attempt=attempt)
+
+    def test_still_nonterminal_detail_refuses(self):
+        self.add_rerun()
+        jobs = copy.deepcopy(self.jobs)
+        artifacts = copy.deepcopy(self.artifacts)
+        for status in ("queued", "in_progress"):
+            with self.subTest(detail_status=status):
+                self.jobs = copy.deepcopy(jobs)
+                self.artifacts = copy.deepcopy(artifacts)
+                self.job_details = {}
+                actual = self.stale_index_row()
+                self.offer_detail(
+                    actual, status=status, conclusion=None, completed_at=None,
+                    started_at=None if status == "queued" else actual["started_at"],
+                    runner_id=None if status == "queued" else actual["runner_id"],
+                )
+                self.refused()
+
+    def test_failed_or_cancelled_detail_refuses(self):
+        self.add_rerun()
+        jobs = copy.deepcopy(self.jobs)
+        artifacts = copy.deepcopy(self.artifacts)
+        for conclusion in ("failure", "cancelled"):
+            with self.subTest(detail_conclusion=conclusion):
+                self.jobs = copy.deepcopy(jobs)
+                self.artifacts = copy.deepcopy(artifacts)
+                self.job_details = {}
+                actual = self.stale_index_row()
+                self.offer_detail(actual, conclusion=conclusion)
+                self.refused()
+
+    def test_unavailable_or_malformed_detail_refuses(self):
+        self.add_rerun()
+        jobs = copy.deepcopy(self.jobs)
+        artifacts = copy.deepcopy(self.artifacts)
+        for mode in ("transport-failure", "missing", "not-an-object", "missing-name",
+                     "missing-completed_at"):
+            with self.subTest(detail=mode):
+                self.jobs = copy.deepcopy(jobs)
+                self.artifacts = copy.deepcopy(artifacts)
+                self.job_details = {}
+                self.fail_details = set()
+                actual = self.stale_index_row()
+                if mode == "transport-failure":
+                    self.fail_details.add(actual["id"])
+                elif mode == "not-an-object":
+                    self.job_details[str(actual["id"])] = [actual]
+                elif mode == "missing-name":
+                    self.job_details[str(actual["id"])] = {
+                        key: value for key, value in actual.items() if key != "name"
+                    }
+                elif mode == "missing-completed_at":
+                    self.job_details[str(actual["id"])] = {
+                        key: value for key, value in actual.items()
+                        if key != "completed_at"
+                    }
+                self.refused()
+
+    def test_detail_identity_swap_refuses(self):
+        self.add_rerun()
+        jobs = copy.deepcopy(self.jobs)
+        artifacts = copy.deepcopy(self.artifacts)
+        swaps = (
+            ("id", lambda detail: detail["id"] + 1),
+            ("run_id", lambda detail: RUN + 1),
+            ("run_attempt", lambda detail: detail["run_attempt"] - 1),
+            ("head_sha", lambda detail: OTHER_SHA),
+            ("name", lambda detail: "test-shards (5)"),
+        )
+        for field, change in swaps:
+            with self.subTest(field=field):
+                self.jobs = copy.deepcopy(jobs)
+                self.artifacts = copy.deepcopy(artifacts)
+                self.job_details = {}
+                actual = self.stale_index_row()
+                self.offer_detail(actual, **{field: change(actual)})
+                self.refused()
+
+    def test_indexed_terminal_failure_cannot_be_refreshed_by_successful_detail(self):
+        # A detail read may only reconcile a nonterminal index row. Offering
+        # the same ID's successful record must not rewrite a terminal row.
+        self.add_rerun()
+        jobs = copy.deepcopy(self.jobs)
+        artifacts = copy.deepcopy(self.artifacts)
+        for conclusion in ("failure", "cancelled"):
+            with self.subTest(index_conclusion=conclusion):
+                self.jobs = copy.deepcopy(jobs)
+                self.artifacts = copy.deepcopy(artifacts)
+                self.job_details = {}
+                index = next(i for i, row in enumerate(self.jobs)
+                             if row["name"] == "test-shards (6)"
+                             and row["run_attempt"] == 2)
+                successful = copy.deepcopy(self.jobs[index])
+                self.jobs[index] = dict(successful, conclusion=conclusion)
+                self.offer_detail(successful)
                 self.refused()
 
 

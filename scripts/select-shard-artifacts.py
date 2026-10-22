@@ -7,9 +7,14 @@ carried rows never uploaded again. Resolve each carried row to the unique
 earlier execution it aliases, take every partition's latest *actual*
 execution, and print the artifacts uploaded by exactly those attempts.
 
-Read-only: `gh api` lists this run's jobs and artifacts. Every completed
-row must carry created_at, started_at, completed_at and runner_id, and a
-real execution must order them created <= started <= completed. Any doubt
+Read-only: `gh api` lists this run's jobs and artifacts and, for a shard
+row the index still reports as queued or in_progress, reads that job's
+current record once. The record is used only when its immutable identity
+(id, run, attempt, head and name) still matches the row; an unreadable,
+malformed, foreign or still-nonterminal record exits nonzero without
+`artifact_ids` like every other doubt below. Every completed row must
+carry created_at, started_at, completed_at and runner_id, and a real
+execution must order them created <= started <= completed. Any doubt
 below — missing or ambiguous provenance, a latest execution that did not
 succeed, an expired artifact or one from another run or head — exits
 nonzero without printing `artifact_ids`, so the caller never falls back to
@@ -24,6 +29,7 @@ import sys
 
 SHARDS = range(1, 7)
 JOB_NAME = re.compile(r"test-shards \(([1-6])\)")
+PENDING = ("queued", "in_progress")
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
@@ -94,7 +100,38 @@ def execution_provenance(job, shard):
     return created, started, completed
 
 
-def select(jobs, artifacts, run_id, sha, attempt):
+def reconcile(job, shard, job_id, record):
+    """Use a pending row's current record only while it is that same job.
+
+    The jobs index can lag behind a job that has already finished, so a
+    queued or in-progress row is resolved once by its positive job id. The
+    current record replaces the row only when it is terminal and every
+    immutable identity field still names the same job on the same run,
+    attempt and head; this is never a way to adopt a different job or
+    older evidence.
+    """
+    if not isinstance(record, dict):
+        raise ValueError(f"shard {shard} job {job_id} record is malformed")
+    if (
+        type(record.get("id")) is not int
+        or record["id"] != job_id
+        or type(record.get("run_id")) is not int
+        or record["run_id"] != job["run_id"]
+        or type(record.get("run_attempt")) is not int
+        or record["run_attempt"] != job["run_attempt"]
+        or record.get("head_sha") != job["head_sha"]
+        or record.get("name") != job["name"]
+    ):
+        raise ValueError(f"shard {shard} job {job_id} record changed identity")
+    if record.get("status") != "completed":
+        raise ValueError(
+            f"shard {shard} job {job_id} record is not terminal "
+            f"({record.get('status')})"
+        )
+    return record
+
+
+def select(jobs, artifacts, run_id, sha, attempt, detail):
     grouped = {shard: [] for shard in SHARDS}
     seen = set()
     for job in jobs:
@@ -118,6 +155,8 @@ def select(jobs, artifacts, run_id, sha, attempt):
             raise ValueError(f"shard {shard} job {job_id} is not this run and head")
         if job_attempt > attempt:
             raise ValueError(f"shard {shard} job {job_id} is from a later attempt")
+        if job.get("status") in PENDING:
+            job = reconcile(job, shard, job_id, detail(job_id))
         grouped[shard].append(job)
 
     selected = []
@@ -208,6 +247,25 @@ def gh_pages(endpoint, key):
     return rows
 
 
+def job_record(repo, job_id):
+    """Read one job's current record; a single read, not a listing."""
+    try:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{repo}/actions/jobs/{job_id}"],
+            check=True, capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or "").strip().splitlines()
+        raise ValueError(
+            "GitHub API job read failed: "
+            + (detail[0] if detail else str(error.returncode))
+        ) from None
+    try:
+        return json.loads(result.stdout)
+    except ValueError:
+        raise ValueError("malformed job API response") from None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True)
@@ -224,7 +282,8 @@ def main():
     endpoint = f"repos/{args.repo}/actions/runs/{run_id}"
     jobs = gh_pages(f"{endpoint}/jobs?filter=all&per_page=100", "jobs")
     artifacts = gh_pages(f"{endpoint}/artifacts?per_page=100", "artifacts")
-    ids = select(jobs, artifacts, run_id, args.sha, attempt)
+    ids = select(jobs, artifacts, run_id, args.sha, attempt,
+                 lambda job_id: job_record(args.repo, job_id))
     print("artifact_ids=" + ",".join(str(value) for value in ids))
 
 
