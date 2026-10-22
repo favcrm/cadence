@@ -1048,16 +1048,18 @@ impl Shared {
             .or(message.started)
             .map(|at| format!("last observed activity at {at:.0}"))
             .unwrap_or_else(|| "none recorded".to_string());
-        let reason =
+        let fence_reason =
             format!("{reason} (dispatch stall budget {budget}; last provider event: {last_event})");
+        // The operator-private row keeps the provider's own account
+        // verbatim; the budget/activity evidence is fence text.
         let stored = json!({"status": "unknown", "text": "", "error": reason});
         self.store
-            .finish(message, "unknown", &stored, Some(&reason))?;
+            .finish(message, "unknown", &stored, Some(reason))?;
         self.notify_routed_target(message, &stored);
         let public_reason = if message.source == "app_run_dispatch" {
             store::app_runs::app_uncertain_turn_reason()
         } else {
-            reason
+            fence_reason
         };
         // One write: the fence is visible immediately, so the cleared
         // endpoint must land with it — a reader in between must never

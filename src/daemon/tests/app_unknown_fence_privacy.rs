@@ -116,7 +116,10 @@ fn non_app_unknown_still_publishes_raw_detail() {
         .iter()
         .find(|e| e.kind == "attention")
         .expect("attention event");
-    assert_eq!(attention.payload["reason"].as_str().unwrap(), raw);
+    let reason = attention.payload["reason"].as_str().unwrap();
+    assert!(reason.contains(raw), "{reason}");
+    assert!(reason.contains("dispatch stall budget"), "{reason}");
+    assert!(reason.contains("last provider event"), "{reason}");
 }
 
 /// The restamp path (`preserved_unknown_detail` via actor exit,
