@@ -190,6 +190,14 @@ Statuses: `backlog ready doing review done dropped`. Issues are never
 deleted — `dropped` is the end state. `dropped` issues don't render on
 the board (`issue ls` still lists them).
 
+## Pi adapter implementation
+
+`src/adapter/pi.rs` owns the RPC transport and turn lifecycle. Its private
+modules separate launch argv, paths and environment (`pi_launch.rs`),
+confinement profiles (`pi_confine.rs`), the generated tool guard
+(`pi_guard.rs`), and provider catalogues (`pi_devin_catalog.rs` and
+`pi_agenticos.rs`). Public adapter entry points remain at `adapter::pi`.
+
 ## `[pi]` in pm.yaml — the operator's Pi policy (CAD-559)
 
 `pm.yaml` can carry a `[pi]` table pinning what a managed pi agent may
