@@ -42,8 +42,10 @@
 //!   FAILS — got `message_not_cancellable` instead. Sensitive.
 //! - **`message_running`** (the running/submitting arm disabled): the same
 //!   test FAILS — got `message_not_queued` instead. Sensitive.
-//! - **`message_not_queued`** (code changed): the cancel-refusals test
-//!   FAILS — got `message_not_queued_MUTANT`. Sensitive.
+//! - **`message_not_queued`** (the nonqueued arm bypassed): the
+//!   cancel-refusals test FAILS — the request reaches `Store::cancel`, whose
+//!   own state guard answers with an empty code (`left: ""`), so the
+//!   accepted handler refusal is gone. Sensitive.
 //! - **Relay message validation** (`command_message`'s length/empty rule
 //!   relaxed): `scoped_command_message_is_validated_before_the_relay` FAILS —
 //!   an over-long id is accepted. Sensitive (the unknown-field rule is

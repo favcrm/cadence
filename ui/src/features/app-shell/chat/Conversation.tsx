@@ -553,7 +553,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // `updated` moved past what this browser saw. The first list read only
   // baselines (a reload is not news); later `master` frames refresh it.
   const toast = useNotificationToast();
-  const announced = useRef<Map<string, number> | null>(null);
   // A conversation is "replied to" only when the master's turn FINISHED on
   // it: `updated` also moves for an operator send or a tool step, which is
   // not a reply (CAD-1700 review).
@@ -570,14 +569,11 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const conversationsNow = active.state === "ready" ? active.conversations : null;
   useEffect(() => {
     if (conversationsNow === null || finishedConversation === null) return;
-    const known = announced.current ?? new Map<string, number>();
     let sawFinished = false;
     conversationsNow.forEach((c, index) => {
-      const seen = known.get(c.id);
-      known.set(c.id, c.updated);
-      if (c.id === finishedConversation) sawFinished = true;
-      if (c.id !== finishedConversation || c.id === convId) return;
-      if (seen === undefined || c.updated <= seen) return;
+      if (c.id !== finishedConversation) return;
+      sawFinished = true;
+      if (c.id === convId) return;
       if (!isUnread(readSeen(installId), c.id, c.updated)) return;
       const params = new URLSearchParams({ install: installId, conversation: c.id });
       toast.show(t("Assistant replied"), `assistant:${installId}:${c.id}`, {
@@ -585,7 +581,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         note: `${mode.scopeLabel} › ${conversationLabel(c, index, subjects, t)}`,
       });
     });
-    announced.current = known;
     // The conversation must be in the list before the edge is consumed; a
     // list that has not caught up yet keeps it for the next refresh.
     if (sawFinished) setFinishedConversation(null);
@@ -994,7 +989,15 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           ? () => window.location.assign("/")
           : active.state === "ready" && active.conversations.some((c) => c.id === turnState.aheadConversation)
             ? () => selectConversation(installId, turnState.aheadConversation!)
-            : undefined,
+            : (() => {
+                // Another install's conversation: the running turn's verified
+                // app origin is the one host-resolved way to open it.
+                const turn = masterState.data?.turn ?? null;
+                const origin = turn?.app_origin ?? null;
+                if (origin === null || turn?.conversation !== turnState.aheadConversation) return undefined;
+                const href = `/app-installations/${encodeURIComponent(origin.install_id)}?conversation=${encodeURIComponent(turnState.aheadConversation)}`;
+                return () => window.location.assign(href);
+              })(),
     onReview: () => {
       const card = listRef.current?.querySelector<HTMLElement>("[data-permission-thread], .app-assistant-activity");
       (card ?? listRef.current)?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });
