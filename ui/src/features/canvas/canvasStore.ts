@@ -51,7 +51,10 @@ export interface CanvasTab {
 
 /** One tool step of the running turn, as the thread records it. */
 export interface WorkStep {
+  /** Plain words: no command line, path or JSON. */
   text: string;
+  /** The step as the thread recorded it, for the "details" disclosure. */
+  raw: string;
   done: boolean;
 }
 
@@ -66,6 +69,8 @@ export interface Working {
   steps: WorkStep[];
   count: number;
   turn: string | null;
+  /** Artifact ids this turn has asked to add a version to (`--id`). */
+  updating: string[];
 }
 
 export type Surface = "home" | "app";
@@ -280,19 +285,29 @@ export function selectVersion(id: string, version: number): void {
 
 const WIDTH_KEY = "cadence.canvas.width";
 export const MIN_WIDTH = 360;
-export const DEFAULT_WIDTH = 480;
 
 export function clampWidth(px: number, viewport: number): number {
   const max = Math.max(MIN_WIDTH, Math.floor(viewport * 0.6));
   return Math.min(max, Math.max(MIN_WIDTH, Math.round(px)));
 }
 
-export function readWidth(): number {
+/** The width when the operator has not dragged one: it scales with the
+ *  viewport, wider for kinds that are read as a page. */
+export function defaultWidth(kind: ArtifactKind, viewport: number): number {
+  const wide = kind === "html" || kind === "csv" || kind === "pdf";
+  const [share, lo, hi] = wide ? [0.55, 560, 960] : [0.45, 480, 760];
+  return Math.min(hi, Math.max(lo, Math.round(viewport * share)));
+}
+
+/** The width the operator dragged to, or null (it wins over the default). */
+export function readWidth(): number | null {
   try {
-    const n = Number(globalThis.localStorage?.getItem(WIDTH_KEY));
-    return Number.isFinite(n) && n >= MIN_WIDTH ? n : DEFAULT_WIDTH;
+    const raw = globalThis.localStorage?.getItem(WIDTH_KEY);
+    if (raw === null || raw === undefined) return null;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= MIN_WIDTH ? n : null;
   } catch {
-    return DEFAULT_WIDTH;
+    return null;
   }
 }
 
@@ -308,6 +323,8 @@ export function writeWidth(px: number): void {
 export type CanvasMode = "push" | "cover" | "sheet";
 export const SHEET_BELOW = 640;
 export const CHAT_MIN = 320;
+/** What the chat keeps on Home when the canvas is expanded: a narrow strip. */
+export const CHAT_STRIP = 64;
 const SIDEBAR = 208;
 /** The app chat pane's right edge on a tablet with the canvas open: 1rem page
  *  padding + the 22rem column `app-shell.css` gives it. */
@@ -331,9 +348,17 @@ export function drawerLayout(
   want: number,
   surface: Surface,
   chatRight: number | null,
+  expanded = false,
 ): DrawerLayout {
   if (viewport < SHEET_BELOW) return { mode: "sheet", width: viewport };
   const main = viewport - (viewport >= 1024 ? SIDEBAR : 0);
+  if (expanded) {
+    // Expand: cover, taking most of the page. Home keeps a narrow strip of
+    // chat; the app shell stops at the chat pane's right edge, as cover does.
+    const edge = surface === "app" && viewport < 1024 ? APP_TABLET_CHAT_RIGHT : chatRight;
+    const room = surface === "app" && edge !== null ? viewport - edge - 12 : main - CHAT_STRIP;
+    return room < MIN_WIDTH ? { mode: "sheet", width: viewport } : { mode: "cover", width: room };
+  }
   const need = surface === "home" ? CHAT_MIN : CHAT_MIN + 320 + 42;
   if (main - want >= need) return { mode: "push", width: want };
   // Without a chat pane in the page (the operator navigated away from an app

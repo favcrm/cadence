@@ -3,6 +3,7 @@ import {
   canvasSnapshot,
   clampWidth,
   closeDrawer,
+  defaultWidth,
   closeTab,
   feedCanvas,
   openArtifact,
@@ -10,9 +11,10 @@ import {
   selectVersion,
   type FeedCard,
 } from "../src/features/canvas/canvasStore";
-import { feedParts } from "../src/features/canvas/feed";
+import { feedParts, plainStep } from "../src/features/canvas/feed";
+import { parseCsv } from "../src/features/canvas/csv";
 import { askBody, askLabel, makeAskRef } from "../src/features/canvas/askRefs";
-import { threadItems, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
+import { isArtifactPutCall, threadItems, toolSteps, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);
@@ -101,7 +103,20 @@ equal(drawerLayout(375, 480, "home", null).mode, "sheet", "phone sheet");
 equal(drawerLayout(1280, 480, "app", null), { mode: "cover", width: 480 }, "app, no chat pane, 1280 covers");
 equal(drawerLayout(900, 480, "app", null), { mode: "cover", width: 480 }, "app, no chat pane, 900 covers");
 equal(drawerLayout(1100, 660, "app", null), { mode: "cover", width: 544 }, "app, no chat pane, narrow room covers by the page rule");
+// Default widths scale with the viewport, wider for html/csv/pdf, within their clamps.
+equal([defaultWidth("md", 1835), defaultWidth("md", 1000), defaultWidth("md", 800)], [760, 480, 480], "default width 45%, 480..760");
+equal([defaultWidth("html", 1835), defaultWidth("csv", 1280), defaultWidth("pdf", 900)], [960, 704, 560], "document kinds 55%, 560..960");
+// Expand: cover taking most of the page; Home keeps a 64px chat strip, the app shell stops at the chat pane.
+equal(drawerLayout(1440, 480, "home", null, true), { mode: "cover", width: 1168 }, "home expands beside a chat strip");
+equal(drawerLayout(1440, 480, "app", 700, true), { mode: "cover", width: 728 }, "app expand never covers the chat pane");
+equal(drawerLayout(900, 480, "app", 860, true).mode, "cover", "app expand at 900 stays beside the narrowed chat");
+equal(drawerLayout(500, 480, "home", null, true).mode, "sheet", "a phone is a sheet either way");
 equal([clampWidth(100, 1440), clampWidth(2000, 1440), clampWidth(500, 1440)], [360, 864, 500], "width clamps to 360px..60%");
+
+// A quoted-empty record is a record; blank lines and the trailing newline are not.
+equal(parseCsv('h\r\n""\r\nx\r\n'), { header: ["h"], rows: [[""], ["x"]], total: 2 }, "a quoted-empty row is kept");
+equal(parseCsv('""\r\nx\r\n'), { header: [""], rows: [["x"]], total: 1 }, "a quoted-empty header is kept");
+equal(parseCsv("a\n\nb\n"), { header: ["a"], rows: [["b"]], total: 1 }, "blank lines are skipped");
 
 // The feed reads cards and the live step from the thread, nothing else.
 const e = (seq: number, role: string, kind: string, text: string, message: string, payload: Record<string, unknown> | null = null): ThreadEntry => ({
@@ -118,9 +133,130 @@ const state: ThreadState = {
   ],
   pending: [],
 };
-const parts = feedParts(threadItems(state), 3, true);
+const parts = feedParts(threadItems(state), 3, "m1");
 equal(parts.cards.map((c) => [c.key, c.live, c.operatorTurn, c.turn]), [["art-a@2", true, true, "m1"]], "malformed ids are dropped");
-equal(parts.working, { plan: "Pulling the numbers", step: "Bash: cadence status", steps: [{ text: "Bash: cadence status", done: false }], count: 1, turn: "m1" }, "plan, live step, no invented total");
+equal(
+  parts.working,
+  { plan: "Pulling the numbers", step: "Checking the board", steps: [{ text: "Checking the board", raw: "Bash: cadence status", done: false }], count: 1, turn: "m1", updating: [] },
+  "plan, live step in plain words, no invented total",
+);
+
+// The Working view never shows a command line, an absolute path or JSON.
+for (const raw of [
+  "Bash: cadence artifact put --kind md --title x --file /home/ubuntu/.local/state/cadence/master/tmp/r.md",
+  "Bash: cat /home/ubuntu/.local/state/cadence/master/tmp/a.json",
+  'Read: /home/ubuntu/x {"bytes":4,"digest":"d"}',
+  "weird",
+]) {
+  const plain = plainStep(raw);
+  if (/bash:|\/home|\.local\/state|master\/tmp|[{}]|--/i.test(plain)) throw new Error(`plain step leaks: ${plain}`);
+}
+// The agent's own words keep their sentence but lose every path.
+const planOf = (text: string) =>
+  feedParts(threadItems({ exists: true, pending: [], entries: [e(1, "operator", "message", "go", "mp"), e(2, "agent", "assistant_text", text, "mp")] }), 0, "mp").working?.plan;
+for (const leak of [
+  "Writing to master/tmp/r.md first",
+  "Saved at ~/.local/state/cadence/master/tmp/r.md",
+  "path=/home/u/x",
+  "--file=/home/u/x",
+  "file:/home/u/x",
+  "Using ./../tmp/x now",
+  "see /home/u/x and (/tmp/y)",
+]) {
+  const plan = planOf(leak) ?? "";
+  if (/\/|~|\.local|master/.test(plan)) throw new Error(`plan leaks: ${plan}`);
+}
+// Scrubbing stays linear: long runs of `:` or `a=` finish at once.
+for (const hostile of [":".repeat(200_000), "a=".repeat(100_000)]) {
+  const started = performance.now();
+  planOf(hostile);
+  if (performance.now() - started > 100) throw new Error("plan scrub is not linear");
+}
+equal(planOf("a:b:c/d and x=1:2"), "… and x=1:2", "key=value without a path is kept");
+equal(planOf("Pulling the Q3 numbers, then summarising and/or charting them."), "Pulling the Q3 numbers, then summarising and/or charting them.", "a normal sentence survives intact");
+// The agent's own commentary never carries a command line or inline JSON.
+equal(planOf('Done.\nbash: cadence status\n$ ls\nBASH: x\nResult {"bytes":9,"digest":"d"} ok'), "Done.\nResult … ok", "command lines and inline JSON go");
+for (const hostile of ["{".repeat(200_000), '{"a":'.repeat(40_000), " ".repeat(200_000) + "bash:"]) {
+  const started = performance.now();
+  planOf(hostile);
+  if (performance.now() - started > 100) throw new Error("plan scrub is not linear");
+}
+
+// Pretty-printed and spaced JSON never reaches the strip; ordinary brackets do.
+equal(planOf('Result:\n{\n  "bytes": 9,\n  "digest": "d"\n}\nAll set.'), "Result:\n…\nAll set.", "multiline JSON goes");
+equal(planOf('Got {"a": 1, "b": 2} back'), "Got … back", "spaced compact JSON goes");
+equal(planOf('Result: {"text": "Use } here", "bytes": 9, "digest": "d"}'), "Result: …", "a } inside a string does not end the span");
+equal(planOf('Got {"a": "x ] y", "b": 1} ok'), "Got … ok", "a ] inside a string");
+equal(planOf('Got {"a": "x { y", "b": 1} ok'), "Got … ok", "a { inside a string");
+equal(planOf('Got {"a": "say \\"hi\\"", "b": 1} ok'), "Got … ok", "an escaped quote before the closing brace");
+equal(planOf('{\n  "bytes" : 9,\n  "digest" : "d"\n}'), "…", "spaces before the colon");
+equal(planOf('Got {"bytes"\t: 9} ok'), "Got … ok", "a tab before the colon");
+equal(planOf("See [note], {braces} and [1, 2, 3] here"), "See [note], {braces} and [1, 2, 3] here", "prose brackets stay");
+equal(planOf("Steps [1] and (2) done"), "Steps [1] and (2) done", "plain brackets stay");
+for (const hostile of ["{ ".repeat(100_000), '{"a": '.repeat(40_000), "[".repeat(200_000), '"{'.repeat(100_000), '\\"'.repeat(100_000), "{" + '"'.repeat(200_000)]) {
+  const started = performance.now();
+  planOf(hostile);
+  if (performance.now() - started > 100) throw new Error("plan scrub is not linear");
+}
+
+// Real daemon order: call, then the card (written inside the put RPC), then the
+// result. The card must not split the call from its result.
+const realOrder = threadItems({
+  exists: true,
+  pending: [],
+  entries: [
+    e(1, "operator", "message", "report", "m1"),
+    e(2, "agent", "tool_call", "bash: cadence artifact put --kind md --title x --file ./../tmp/r.md", "m1", { tool_use_id: "t1" }),
+    e(3, "agent", "artifact", "Artifact", "m1", { id: "art-a", version: 1, kind: "md", title: "x", bytes: 5 }),
+    e(4, "agent", "tool_result", '{"bytes":5,"digest":"d"}', "m1", { tool_use_id: "t1" }),
+  ],
+});
+equal(realOrder.map((i) => i.type), ["operator", "tools", "artifact"], "the card waits for the put's result");
+const runSteps = realOrder[1].type === "tools" ? toolSteps(realOrder[1].entries) : [];
+equal([runSteps.length, runSteps[0]?.done, runSteps[0] ? isArtifactPutCall(runSteps[0].call.text) : null], [1, true, true], "one paired put step");
+equal([isArtifactPutCall("Bash: cadence help artifact put"), isArtifactPutCall("Bash: grep artifact put notes.md")], [false, false], "only a real put call matches");
+
+// A follow-up queued behind the running turn does not take over the strip.
+const queued = threadItems({
+  exists: true,
+  pending: [],
+  entries: [
+    e(1, "operator", "message", "tighten it", "mA"),
+    e(2, "agent", "tool_call", "bash: cadence artifact put --kind md --title x --id art-a --file ./../tmp/r.md", "mA", { tool_use_id: "t1" }),
+    e(3, "operator", "message", "and also this", "mB"),
+    e(4, "agent", "artifact", "Artifact", "mA", { id: "art-a", version: 2, kind: "md", title: "x", bytes: 5 }),
+  ],
+});
+const queuedParts = feedParts(queued, 0, "mA");
+equal([queuedParts.turn, queuedParts.working?.turn], ["mA", "mA"], "the running message owns the strip");
+resetCanvas();
+openArtifact({ id: "art-a", version: 1, kind: "md", title: "x", bytes: 5 });
+feedCanvas({ conversation: "c1", surface: "home", composerKey: "home", ...queuedParts });
+equal(canvasSnapshot().tabs[0].turn, queuedParts.working?.turn, "the landed put matches the running turn, so no stale updating chip");
+equal(plainStep("bash: cadence artifact put --kind md --id art-a --file ./../tmp/r.md"), "Putting it in the canvas", "a put reads plainly");
+
+// "updating vN" only names artifacts the turn asked to add a version to.
+const putState: ThreadState = {
+  exists: true,
+  pending: [],
+  entries: [
+    e(1, "operator", "message", "tighten it", "m1"),
+    e(2, "agent", "tool_call", "Bash: cadence artifact put --kind md --title x --id art-a --file ./../tmp/r.md", "m1", { tool_use_id: "t9" }),
+  ],
+};
+equal(feedParts(threadItems(putState), 0, "m1").working?.updating, ["art-a"], "the put names its target");
+equal(feedParts(threadItems(putState), 0, null).working, null, "no strip when no turn runs");
+
+// CSV: RFC 4180 quoting, a header row, a row cap, and a refusal to guess.
+equal(
+  parseCsv('a,b\r\n"x, y","say ""hi"""\n"two\nlines",3\n'),
+  { header: ["a", "b"], rows: [["x, y", 'say "hi"'], ["two\nlines", "3"]], total: 2 },
+  "quoted fields",
+);
+equal(parseCsv('a,b\n"open,1'), null, "an unterminated quote falls back to text");
+equal(parseCsv('a,b\n"x"y,1'), null, "text after a closing quote falls back to text");
+const big = parseCsv(`h\n${Array.from({ length: 2500 }, (_, i) => i).join("\n")}`);
+equal([big?.rows.length, big?.total], [2000, 2500], "at most 2,000 rows, total reported");
 
 // Ask to change: the chip expands into the body the master receives.
 const ask = makeAskRef({ artifact: "art-a", version: 2, title: "Report", passage: "Tuesday lunch is soft" });

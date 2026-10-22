@@ -13,9 +13,11 @@ pub(crate) enum ArtifactAction {
         /// md, pdf, html, image or csv.
         #[arg(long)]
         kind: String,
-        /// Shown on the card and the tab.
-        #[arg(long)]
-        title: String,
+        /// Shown on the card and the tab. Several words may follow with no
+        /// quotes (`--title Weekly summary`): the master's command guard
+        /// splits on spaces and refuses quotes.
+        #[arg(long, num_args = 1.., required = true)]
+        title: Vec<String>,
         /// The file to put (at most 10 MiB). The master writes it into its
         /// master/tmp first.
         #[arg(long)]
@@ -73,7 +75,7 @@ pub(super) fn run(state_dir: PathBuf, action: ArtifactAction) -> Result<i32> {
             }
             let mut params = json!({
                 "kind": kind,
-                "title": title,
+                "title": title.join(" "),
                 "content": base64::engine::general_purpose::STANDARD.encode(bytes),
             });
             if let Some(id) = id {

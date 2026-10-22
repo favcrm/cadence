@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslate } from "../../lib/locale";
 import Md from "../../ui/Md";
 import { artifactBytes } from "./artifactClient";
+import { CSV_MAX_ROWS, parseCsv } from "./csv";
 import type { ArtifactKind } from "./canvasStore";
 
 export interface Loaded {
@@ -64,7 +65,50 @@ function sizeLabel(bytes: number): string {
 
 const decode = (data: Loaded): string => new TextDecoder("utf-8").decode(data.bytes);
 
-/** Render one artifact version. Markdown through `Md`, CSV as text, HTML in
+/** A CSV as a table: header row, sticky header, monospace cells, scrolling
+ *  both ways; the first `CSV_MAX_ROWS` rows. Plain text when it will not parse. */
+function CsvView({ text, contentRef }: { text: string; contentRef: React.RefObject<HTMLDivElement | null> }) {
+  const t = useTranslate();
+  const table = useMemo(() => parseCsv(text), [text]);
+  if (!table) {
+    return (
+      <div ref={contentRef} className="canvas-doc min-w-0" data-artifact-view="csv">
+        <pre className="num text-micro text-ink-200 whitespace-pre overflow-auto">{text}</pre>
+      </div>
+    );
+  }
+  return (
+    <div ref={contentRef} className="canvas-doc cv-csv" data-artifact-view="csv" data-csv-table>
+      <div className="cv-csv-scroll">
+        <table>
+          <thead>
+            <tr>
+              {table.header.map((h, i) => (
+                <th key={i} scope="col">{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {table.rows.map((r, i) => (
+              <tr key={i}>
+                {r.map((c, j) => (
+                  <td key={j}>{c}</td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {table.total > CSV_MAX_ROWS ? (
+        <p className="num text-micro text-ink-500">
+          {t("showing first")} {CSV_MAX_ROWS} {t("of")} {table.total}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/** Render one artifact version. Markdown through `Md`, CSV as a table, HTML in
  *  an inert frame, images inline, PDF in the browser's viewer with Download
  *  beside it where inline PDF is poor. */
 export default function ArtifactView({
@@ -87,11 +131,7 @@ export default function ArtifactView({
         </div>
       );
     case "csv":
-      return (
-        <div ref={contentRef} className="canvas-doc min-w-0" data-artifact-view="csv">
-          <pre className="num text-micro text-ink-200 whitespace-pre overflow-auto">{decode(data)}</pre>
-        </div>
-      );
+      return <CsvView text={decode(data)} contentRef={contentRef} />;
     case "html":
       return (
         <iframe

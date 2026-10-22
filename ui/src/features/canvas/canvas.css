@@ -84,6 +84,12 @@
 
 .cv-body { position: relative; flex: 1; min-height: 0; overflow: auto; background: var(--color-ink-900); padding: 12px; display: flex; flex-direction: column; }
 .canvas-doc { min-width: 0; }
+.cv-csv { display: flex; flex: 1; flex-direction: column; gap: 6px; min-height: 0; }
+.cv-csv-scroll { flex: 1; min-height: 0; overflow: auto; border: 1px solid var(--color-ink-800); border-radius: 6px; }
+.cv-csv table { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; font: var(--text-micro) var(--font-mono); color: var(--color-ink-200); }
+.cv-csv th, .cv-csv td { padding: 4px 10px; border-bottom: 1px solid var(--color-ink-800); text-align: left; white-space: nowrap; max-width: 28rem; overflow: hidden; text-overflow: ellipsis; }
+.cv-csv th { position: sticky; top: 0; z-index: 1; background: var(--color-ink-850); color: var(--color-ink-100); font-weight: 600; }
+.cv-csv tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--color-ink-850) 50%, transparent); }
 .canvas-frame { flex: 1; width: 100%; min-height: 20rem; border: 0; background: white; }
 .canvas-pdf { display: grid; gap: 6px; align-content: start; }
 .canvas-image { max-width: 100%; height: auto; }
@@ -103,3 +109,8 @@
    (40) are positioned with no stacking context above them; contain them so
    they cannot paint over the canvas (15). */
 [data-chat-panel] { isolation: isolate; }
+
+/* Working view: the raw steps stay behind "details". */
+.cv-details { color: var(--color-ink-500); font: var(--text-micro) var(--font-mono); }
+.cv-details summary { cursor: pointer; width: max-content; font-family: var(--font-sans); }
+.cv-details ul { margin: 4px 0 0; padding: 0; list-style: none; display: grid; gap: 2px; overflow-wrap: anywhere; }

@@ -225,8 +225,21 @@ const TOOL_KINDS = new Set(["tool_call", "tool_result"]);
  */
 export function threadItems(state: ThreadState | null): ThreadItem[] {
   const items: ThreadItem[] = [];
+  // The daemon stores an artifact's card inside the put RPC, before the put's
+  // own `tool_result`. A card met inside a tools run waits until the run ends
+  // so it cannot split the call from its result (CAD-1728).
+  let held: ThreadItem[] = [];
+  const flush = () => {
+    items.push(...held);
+    held = [];
+  };
   for (const entry of state?.entries ?? []) {
     const key = `e${entry.seq}`;
+    if (entry.kind === "artifact" && items[items.length - 1]?.type === "tools") {
+      held.push({ type: "artifact", key, entry });
+      continue;
+    }
+    if (!TOOL_KINDS.has(entry.kind)) flush();
     if (TOOL_KINDS.has(entry.kind)) {
       const last = items[items.length - 1];
       if (last?.type === "tools") last.entries.push(entry);
@@ -244,6 +257,7 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
       items.push({ type: "system", key, entry });
     }
   }
+  flush();
   for (const pending of state?.pending ?? []) {
     items.push({ type: "pending", key: `p${pending.message}`, pending });
   }
@@ -251,6 +265,11 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
 }
 
 // ---- CAD-551: steps, refusals, and the working row's "what now" ----
+
+/** A tool call that runs `cadence artifact put` (not text that merely names it). */
+export function isArtifactPutCall(text: string): boolean {
+  return /^\s*(?:bash:\s*)?(?:\S*\/)?cadence\s+artifact\s+put\b/i.test(text);
+}
 
 /** One tool call and the result that answered it (when it has). */
 export interface ToolStep {

@@ -6,7 +6,7 @@ import { attachMeta } from "../app-shell/chat/attach";
 import { askLabel } from "../canvas/askRefs";
 import ArtifactCard from "../canvas/ArtifactCard";
 import { ThreadPermission } from "./PermissionCard";
-import { stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
+import { isArtifactPutCall, stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
 
 /**
  * The one renderer for master-thread entries (CAD-1029). Home renders at
@@ -81,7 +81,7 @@ function StepsGroup({ entries, density = "full" }: { entries: ThreadEntry[]; den
               {s.error && !s.refused && <span className="step-tag text-fail shrink-0">{t("error")}</span>}
               {s.result && s.call.kind === "tool_call" && (
                 <span className="num truncate max-w-[40%] text-ink-500" title={s.result.text}>
-                  {stepSummary(s.result.text)}
+                  {!s.error && isArtifactPutCall(s.call.text) ? t("in the card") : stepSummary(s.result.text)}
                 </span>
               )}
             </li>
