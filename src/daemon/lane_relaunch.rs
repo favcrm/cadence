@@ -129,6 +129,14 @@ impl Shared {
         }
         *agent = self.store.agent(&alias)?;
         *adapter = self.open_actor_adapter(&alias, ctl, agent)?;
+        // The fork carries every entry of the old session, so the new
+        // session id is not a lost conversation: no continuity pack.
+        {
+            let mut due = self.continuity_due.lock().unwrap();
+            if due.get(&alias) == Some(&crate::continuity::Reason::New) {
+                due.remove(&alias);
+            }
+        }
         let _ = self.store.event_public(
             &alias,
             "relaunched_for_lane",

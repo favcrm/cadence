@@ -1328,6 +1328,13 @@ impl ProviderAdapter for PiAdapter {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
+            // CAD-1752: the session file Pi actually opened (a lane
+            // relaunch forks into a new one) is this worker's current one.
+            if !master {
+                if let Some(file) = data.get("sessionFile").and_then(Value::as_str) {
+                    record_current_session(&self.state_dir, &agent.alias, file);
+                }
+            }
             let Some((reported_full, reported_id)) = resolved_pi_model(&data) else {
                 return Err(Error::provider("pi did not report a nonempty provider and model id at open — transport closed (CAD-603)"));
             };
