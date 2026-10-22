@@ -2776,7 +2776,7 @@ pub(super) fn run_dev(
                 "package previews must bind loopback",
             ));
         }
-        return run_package_dev(package, port, host);
+        return run_package_dev(package, port, host, true);
     }
     let name = name.ok_or_else(|| {
         Error::invalid(
@@ -2827,7 +2827,7 @@ struct AppPackageContract {
 /// An app-owned preview: the package's `package.json` declares the app
 /// name and the commands; Cadence only validates the package and runs
 /// them. No daemon, state dir, PM, socket or approval is read.
-fn run_package_dev(root: &Path, port: u16, host: &str) -> Result<i32> {
+fn run_package_dev(root: &Path, port: u16, host: &str, exec_child: bool) -> Result<i32> {
     let root = root
         .canonicalize()
         .map_err(|e| Error::invalid("app_dev_package", format!("package root: {e}")))?;
@@ -2838,8 +2838,28 @@ fn run_package_dev(root: &Path, port: u16, host: &str) -> Result<i32> {
             return Ok(status.code().unwrap_or(1));
         }
     }
-    let status = shell_status(&contract.dev, &root, &contract.app, port, host)?;
-    Ok(status.code().unwrap_or(1))
+    let mut child = dev_command(&contract.dev, &root, &contract.app, port, host)?;
+    if exec_child {
+        use std::os::unix::process::CommandExt;
+        let error = child.exec();
+        eprintln!("app dev: {error}");
+        return Ok(launch_error_code(&error));
+    }
+    match cadence_agent::reaper::status(&mut child) {
+        Ok(status) => Ok(status.code().unwrap_or(1)),
+        Err(error) => {
+            eprintln!("app dev: {error}");
+            Ok(launch_error_code(&error))
+        }
+    }
+}
+
+fn launch_error_code(error: &std::io::Error) -> i32 {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        127
+    } else {
+        126
+    }
 }
 
 fn package_contract(root: &Path) -> Result<AppPackageContract> {
@@ -2866,9 +2886,9 @@ fn package_contract(root: &Path) -> Result<AppPackageContract> {
         .and_then(Value::as_str)
         .ok_or_else(|| Error::invalid("app_dev_package", "cadence.app must be a string"))?;
     cadence_agent::proto::identifier(app, "app name")?;
-    let dev = package_command(cadence.get("dev"), "cadence.dev")?;
+    let dev = package_command(cadence.get("dev"), "cadence.dev", true)?;
     let check = match cadence.get("check") {
-        Some(value) => Some(package_command(Some(value), "cadence.check")?),
+        Some(value) => Some(package_command(Some(value), "cadence.check", false)?),
         None => None,
     };
     if !root.join("app/app.md").is_file() {
@@ -2884,7 +2904,7 @@ fn package_contract(root: &Path) -> Result<AppPackageContract> {
     })
 }
 
-fn package_command(value: Option<&Value>, field: &str) -> Result<String> {
+fn package_command(value: Option<&Value>, field: &str, one_command: bool) -> Result<String> {
     let text = value
         .and_then(Value::as_str)
         .ok_or_else(|| Error::invalid("app_dev_package", format!("{field} must be a string")))?;
@@ -2894,7 +2914,209 @@ fn package_command(value: Option<&Value>, field: &str) -> Result<String> {
             format!("{field} must be 1..=4096 bytes"),
         ));
     }
+    if one_command && parse_dev_command(text).is_err() {
+        return Err(Error::invalid(
+            "app_dev_package",
+            "cadence.dev must be one command; put multiple steps in a script",
+        ));
+    }
     Ok(text.to_owned())
+}
+
+/// A command Cadence can prefix with `exec` without truncating a shell list.
+/// Quoted metacharacters are ordinary arguments; unquoted separators,
+/// redirects, subshells, command substitution and newlines are refused.
+struct DevCommand {
+    envs: Vec<(String, String)>,
+    argv: Vec<String>,
+}
+
+fn parse_dev_command(text: &str) -> Result<DevCommand> {
+    let words = split_shell_words(text)?;
+    let mut envs = Vec::new();
+    let mut index = 0;
+    while let Some((key, value)) = words.get(index).and_then(|word| assignment(word)) {
+        envs.push((key.to_owned(), value.to_owned()));
+        index += 1;
+    }
+    if index == words.len() {
+        return Err(Error::invalid(
+            "app_dev_package",
+            "cadence.dev needs a command after its assignments",
+        ));
+    }
+    Ok(DevCommand {
+        envs,
+        argv: words[index..].to_vec(),
+    })
+}
+
+fn assignment(word: &str) -> Option<(&str, &str)> {
+    let (key, value) = word.split_once('=')?;
+    let mut chars = key.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some((key, value))
+}
+
+/// Split one command into words without invoking a shell. Quoted separators
+/// stay in the argument; unquoted separators, redirects, subshells, command
+/// substitution and newlines refuse. Expansions are not performed; an app
+/// that needs a shell belongs in a script.
+fn split_shell_words(text: &str) -> Result<Vec<String>> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\n' || ch == '\r' {
+            return Err(Error::invalid(
+                "app_dev_package",
+                "cadence.dev must be one command; newlines are refused",
+            ));
+        }
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            } else if active == '"' && ch == '\\' {
+                let next = chars.get(index + 1).ok_or_else(|| {
+                    Error::invalid("app_dev_package", "cadence.dev ends with a backslash")
+                })?;
+                if *next == '\n' || *next == '\r' {
+                    return Err(Error::invalid(
+                        "app_dev_package",
+                        "cadence.dev must be one command; newlines are refused",
+                    ));
+                }
+                if matches!(*next, '$' | '`' | '"' | '\\') {
+                    current.push(*next);
+                    index += 1;
+                } else {
+                    current.push('\\');
+                }
+            } else if ch == '`' || (ch == '$' && chars.get(index + 1) == Some(&'(')) {
+                return Err(Error::invalid(
+                    "app_dev_package",
+                    "cadence.dev does not allow command substitution",
+                ));
+            } else {
+                current.push(ch);
+            }
+            started = true;
+            index += 1;
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                started = true;
+            }
+            '\\' => {
+                let next = chars.get(index + 1).ok_or_else(|| {
+                    Error::invalid("app_dev_package", "cadence.dev ends with a backslash")
+                })?;
+                current.push(*next);
+                started = true;
+                index += 1;
+            }
+            ' ' | '\t' => {
+                if started {
+                    words.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            ';' | '&' | '|' | '<' | '>' | '`' | '(' | ')' => {
+                return Err(Error::invalid(
+                    "app_dev_package",
+                    "cadence.dev must be one command; put multiple steps in a script",
+                ));
+            }
+            '$' if chars.get(index + 1) == Some(&'(') => {
+                return Err(Error::invalid(
+                    "app_dev_package",
+                    "cadence.dev does not allow command substitution",
+                ));
+            }
+            _ => {
+                current.push(ch);
+                started = true;
+            }
+        }
+        index += 1;
+    }
+    if quote.is_some() {
+        return Err(Error::invalid(
+            "app_dev_package",
+            "cadence.dev has an unterminated quote",
+        ));
+    }
+    if started {
+        words.push(current);
+    }
+    Ok(words)
+}
+
+fn configure_app_env(
+    child: &mut std::process::Command,
+    root: &Path,
+    app: &str,
+    port: u16,
+    host: &str,
+) {
+    child
+        .current_dir(root)
+        .env_clear()
+        .env("CADENCE_APP_ROOT", root)
+        .env("CADENCE_APP_NAME", app)
+        .env("CADENCE_APP_PORT", port.to_string())
+        .env("CADENCE_APP_HOST", host)
+        .env("CADENCE_APP_CONTRACT", "1");
+    copy_preview_env(child);
+}
+
+fn shell_base(root: &Path, app: &str, port: u16, host: &str) -> std::process::Command {
+    let mut child = std::process::Command::new("sh");
+    configure_app_env(&mut child, root, app, port, host);
+    child
+}
+
+/// Run the one parsed `dev` command directly, with leading `NAME=value`
+/// assignments applied to its environment. No shell means `exec` replaces
+/// Cadence cleanly and signals reach the app's own trap.
+fn dev_command(
+    command: &str,
+    root: &Path,
+    app: &str,
+    port: u16,
+    host: &str,
+) -> Result<std::process::Command> {
+    let DevCommand { envs, argv } = parse_dev_command(command)?;
+    let mut child = std::process::Command::new(&argv[0]);
+    child.args(&argv[1..]);
+    configure_app_env(&mut child, root, app, port, host);
+    for (key, value) in envs {
+        child.env(key, value);
+    }
+    Ok(child)
+}
+
+fn shell_command(
+    command: &str,
+    root: &Path,
+    app: &str,
+    port: u16,
+    host: &str,
+) -> std::process::Command {
+    let mut child = shell_base(root, app, port, host);
+    child.arg("-c").arg(command);
+    child
 }
 
 fn shell_status(
@@ -2904,18 +3126,7 @@ fn shell_status(
     port: u16,
     host: &str,
 ) -> Result<std::process::ExitStatus> {
-    let mut child = std::process::Command::new("sh");
-    child
-        .arg("-c")
-        .arg(command)
-        .current_dir(root)
-        .env_clear()
-        .env("CADENCE_APP_ROOT", root)
-        .env("CADENCE_APP_NAME", app)
-        .env("CADENCE_APP_PORT", port.to_string())
-        .env("CADENCE_APP_HOST", host)
-        .env("CADENCE_APP_CONTRACT", "1");
-    copy_preview_env(&mut child);
+    let mut child = shell_command(command, root, app, port, host);
     cadence_agent::reaper::status(&mut child)
         .map_err(|e| Error::internal(format!("app dev command: {e}")))
 }
@@ -2941,14 +3152,19 @@ mod tests {
     use super::*;
 
     fn package_dir(dev: &str, check: Option<&str>) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("app")).unwrap();
+        std::fs::create_dir_all(dir.path().join("scripts")).unwrap();
         std::fs::write(
             dir.path().join("app/app.md"),
             "---\napp: fixture\ntitle: Fixture\nversion: 0.0.1\n---\n",
         )
         .unwrap();
-        let mut cadence = serde_json::json!({"app": "fixture", "dev": dev});
+        let script = dir.path().join("scripts/dev.sh");
+        std::fs::write(&script, format!("#!/bin/sh\nset -eu\n{dev}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cadence = serde_json::json!({"app": "fixture", "dev": "scripts/dev.sh"});
         if let Some(check) = check {
             cadence["check"] = serde_json::json!(check);
         }
@@ -2961,6 +3177,78 @@ mod tests {
     }
 
     #[test]
+    fn package_dev_rejects_a_multi_step_dev_command() {
+        let dir = package_dir("printf dev > dev.txt", None);
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::json!({"cadence": {"app": "fixture", "dev": "printf a; printf b"}})
+                .to_string(),
+        )
+        .unwrap();
+        let error = run_dev(None, None, Some(dir.path()), 3191, "127.0.0.1", &[]).unwrap_err();
+        assert!(error.to_string().contains("one command"), "{error}");
+    }
+
+    #[test]
+    fn package_dev_preserves_quoted_arguments_and_leading_environment() {
+        let dir = package_dir(":", None);
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::json!({
+                "cadence": {
+                    "app": "fixture",
+                    "dev": "GREETING=hello sh -c 'printf \"%s\" \"$GREETING & value\" > quoted.txt'"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let code = run_package_dev(dir.path(), 3191, "127.0.0.1", false).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("quoted.txt")).unwrap(),
+            "hello & value"
+        );
+    }
+
+    #[test]
+    fn package_dev_rejects_a_newline_separated_dev_command() {
+        let dir = package_dir(":", None);
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::json!({
+                "cadence": {"app": "fixture", "dev": "scripts/dev.sh\nscripts/dev.sh"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let error = run_dev(None, None, Some(dir.path()), 3191, "127.0.0.1", &[]).unwrap_err();
+        assert!(error.to_string().contains("one command"), "{error}");
+    }
+
+    #[test]
+    fn parse_dev_command_preserves_double_quoted_backslashes() {
+        let DevCommand { envs, argv } = parse_dev_command(r#"node "a\qb" "a\"b""#).unwrap();
+        assert!(envs.is_empty());
+        assert_eq!(argv[0], "node");
+        assert_eq!(argv[1], r"a\qb");
+        assert_eq!(argv[2], "a\"b");
+    }
+
+    #[test]
+    fn package_dev_missing_executable_returns_127() {
+        let dir = package_dir(":", None);
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::json!({"cadence": {"app": "fixture", "dev": "does-not-exist-xyz"}})
+                .to_string(),
+        )
+        .unwrap();
+        let code = run_package_dev(dir.path(), 3191, "127.0.0.1", false).unwrap();
+        assert_eq!(code, 127);
+    }
+
+    #[test]
     fn package_dev_runs_check_then_dev_with_the_contract_environment() {
         let dir = package_dir(
             "printf '%s' \"$CADENCE_APP_PORT\" > port.txt; \
@@ -2970,7 +3258,7 @@ mod tests {
              printf dev > dev.txt",
             Some("test ! -e dev.txt && printf checked > check.txt"),
         );
-        let code = run_dev(None, None, Some(dir.path()), 3191, "127.0.0.1", &[]).unwrap();
+        let code = run_package_dev(dir.path(), 3191, "127.0.0.1", false).unwrap();
         assert_eq!(code, 0);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("check.txt")).unwrap(),
@@ -3004,7 +3292,7 @@ mod tests {
             "printf dev > dev.txt",
             Some("printf check > check.txt; exit 7"),
         );
-        let code = run_dev(None, None, Some(dir.path()), 3191, "127.0.0.1", &[]).unwrap();
+        let code = run_package_dev(dir.path(), 3191, "127.0.0.1", false).unwrap();
         assert_eq!(code, 7);
         assert!(dir.path().join("check.txt").is_file());
         assert!(!dir.path().join("dev.txt").exists());
