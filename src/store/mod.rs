@@ -42,6 +42,8 @@ pub use threads::{COMPACTED_EVENT as THREAD_COMPACTED_EVENT, PACK_EVENT as THREA
 
 mod agents;
 mod cloud_dispatch_outbox;
+#[cfg(test)]
+mod wait_probe;
 pub(crate) use agents::AGENT_GC_RECORDS_ONLY;
 pub use agents::{Agent, ModelDefaultsSnapshot, NewAgent, AGENT_STATES};
 

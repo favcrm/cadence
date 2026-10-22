@@ -127,6 +127,13 @@ Synchronize on the operation being proved:
   When proving fresh passes, discard one that might already have been in flight.
 - Interleavings: park at an explicit barrier and release it after the competing
   operation, rather than hoping a 3s pause covers the race.
+- Contention: wait for the first failed native flock/SQLite acquisition,
+  not a contender thread starting. Unit-test observers are thread-local and
+  compiled out of normal builds. The opt-in SQLite observer keeps the native
+  lock and the existing busy bound; ordinary connections keep their handler.
+- Shared fetches: park the chosen fetch, observe its actual joiners, perform
+  the competing write/subscription, then release it. Fixture mtimes advance
+  explicitly when the behavior depends on filesystem timestamp ordering.
 - Logical age and timestamp boundaries: seed aged records or advance an
   isolated test clock. Review report naming has a `test-seam`-only
   `CADENCE_TEST_REVIEW_REPORT_EPOCH`; the publisher acceptance injects its clock

@@ -1632,9 +1632,12 @@ impl Shared {
                     }
                 }
             }
+            #[cfg(feature = "test-seam")]
+            super::test_events::completed(
+                &self.state_dir,
+                super::test_events::Event::AppRunsAdvanced,
+            );
         }
-        #[cfg(feature = "test-seam")]
-        super::test_events::completed(&self.state_dir, super::test_events::Event::AppRunsAdvanced);
     }
     fn app_artifact_current(&self, id: &str, turn: Option<(&str, &str)>) -> Result<Value> {
         let install = self.store.app_artifact_installation(id)?;

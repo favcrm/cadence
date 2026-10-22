@@ -6749,9 +6749,15 @@ mod master_home_acceptance {
 
         // Replay: a second watch-loop pass and a repeated read add no report.
         let base = report_count(&master_body(&daemon));
-        // ASSIST_NOTICE_EVERY is 2 s: wait past at least one further watcher
-        // pass so the replay actually runs the real drain again.
-        std::thread::sleep(Duration::from_millis(2_500));
+        // Discard an in-flight drain, then witness a fresh completed pass
+        // of this owned daemon's real watch loop.
+        super::super::test_events::subscribe(&daemon.state)
+            .wait_for(
+                super::super::test_events::Event::AssistNoticesDrained,
+                2,
+                Duration::from_secs(10),
+            )
+            .expect("the owned daemon did not drain notices again");
         assert_eq!(
             report_count(&master_body(&daemon)),
             base,

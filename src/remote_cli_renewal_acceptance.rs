@@ -396,13 +396,18 @@ mod matrix {
             expected_generation: 1,
         };
         let answer = Arc::new(renewal_ok(&prior, &pending, &target));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let waiting_rx = Arc::new(Mutex::new(waiting_rx));
         let handles: Vec<_> = (0..2)
             .map(|_| {
                 let dir = dir.clone();
                 let target = target.clone();
                 let posts = posts.clone();
                 let answer = answer.clone();
+                let waiting_tx = waiting_tx.clone();
+                let waiting_rx = waiting_rx.clone();
                 std::thread::spawn(move || {
+                    CREDENTIAL_WAITING.with(|observer| *observer.borrow_mut() = Some(waiting_tx));
                     renewed_credential_with(
                         &dir,
                         &target,
@@ -417,8 +422,13 @@ mod matrix {
                                 deadline,
                                 |_url, _bearer, _access, body, _timeout| {
                                     posts.lock().unwrap().push(body.clone());
-                                    // Hold the wire briefly so the threads overlap.
-                                    std::thread::sleep(Duration::from_millis(60));
+                                    // Release only after the other renewal actually
+                                    // encounters the held credential flock.
+                                    waiting_rx
+                                        .lock()
+                                        .unwrap()
+                                        .recv_timeout(Duration::from_secs(5))
+                                        .expect("the second renewal never contended");
                                     Ok((200, serde_json::to_vec(&*answer).unwrap(), None))
                                 },
                             )

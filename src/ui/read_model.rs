@@ -1716,18 +1716,18 @@ mod tests {
     }
 
     /// A model whose daemon fetch counts its calls, answers with the call
-    /// number as `agents.v`, sleeps `delay(call)` and panics on `panic_on`.
+    /// number as `agents.v`, runs `on_fetch(call)` and panics on `panic_on`.
     fn fake_daemon(
-        delay: impl Fn(u64) -> Duration + Send + Sync + 'static,
+        on_fetch: impl Fn(u64) + Send + Sync + 'static,
         panic_on: Option<u64>,
     ) -> (Arc<Model>, Arc<AtomicU64>) {
-        fake_daemon_failing(delay, panic_on, |_| false)
+        fake_daemon_failing(on_fetch, panic_on, |_| false)
     }
 
     /// [`fake_daemon`] whose fetch number `n` reports a failed refresh when
     /// `fails(n)`. Every snapshot carries `n` as its job and agent fingerprint.
     fn fake_daemon_failing(
-        delay: impl Fn(u64) -> Duration + Send + Sync + 'static,
+        on_fetch: impl Fn(u64) + Send + Sync + 'static,
         panic_on: Option<u64>,
         fails: impl Fn(u64) -> bool + Send + Sync + 'static,
     ) -> (Arc<Model>, Arc<AtomicU64>) {
@@ -1735,7 +1735,7 @@ mod tests {
         let seen = calls.clone();
         let fetch: Fetch = Box::new(move |_| {
             let n = seen.fetch_add(1, Ordering::SeqCst) + 1;
-            std::thread::sleep(delay(n));
+            on_fetch(n);
             if panic_on == Some(n) {
                 panic!("fetch {n} unwound");
             }
@@ -1765,9 +1765,65 @@ mod tests {
         )
     }
 
+    struct FetchGate {
+        entered: mpsc::Receiver<()>,
+        release: mpsc::Sender<()>,
+    }
+
+    impl FetchGate {
+        fn wait(&self) {
+            self.entered
+                .recv_timeout(Duration::from_secs(5))
+                .expect("fetch never entered");
+        }
+    }
+
+    impl Drop for FetchGate {
+        fn drop(&mut self) {
+            let _ = self.release.send(());
+        }
+    }
+
+    fn fetch_gate(call: u64) -> (impl Fn(u64) + Send + Sync, FetchGate) {
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let hook = move |n| {
+            if n == call {
+                entered_tx.send(()).unwrap();
+                lock(&release_rx)
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("fetch was not released");
+            }
+        };
+        (hook, FetchGate { entered, release })
+    }
+
+    fn wait_for_joins(model: &Model, count: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while model.daemon_joins.load(Ordering::Relaxed) < count {
+            assert!(
+                Instant::now() < deadline,
+                "readers never joined the parked fetch"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn write_tracker_change(pm: &Path) {
+        let stamp = dir_mtime(pm).unwrap_or_else(SystemTime::now) + Duration::from_secs(1);
+        let path = pm.join("note.md");
+        std::fs::write(&path, "x").unwrap();
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stamp))
+            .unwrap();
+    }
+
     #[test]
     fn concurrent_cold_reads_share_one_daemon_fetch() {
-        let (model, calls) = fake_daemon(|_| Duration::from_millis(400), None);
+        let (on_fetch, parked) = fetch_gate(1);
+        let (model, calls) = fake_daemon(on_fetch, None);
         let barrier = Arc::new(std::sync::Barrier::new(8));
         let readers: Vec<_> = (0..8)
             .map(|_| {
@@ -1778,6 +1834,9 @@ mod tests {
                 })
             })
             .collect();
+        parked.wait();
+        wait_for_joins(&model, 7);
+        drop(parked);
         for reader in readers {
             assert_eq!(reader.join().unwrap(), 1);
         }
@@ -1788,23 +1847,15 @@ mod tests {
 
     #[test]
     fn a_watched_read_serves_the_kept_snapshot_while_a_refresh_is_slow() {
-        let (model, calls) = fake_daemon(
-            |n| {
-                if n == 1 {
-                    Duration::ZERO
-                } else {
-                    Duration::from_millis(1500)
-                }
-            },
-            None,
-        );
+        let (on_fetch, parked) = fetch_gate(2);
+        let (model, calls) = fake_daemon(on_fetch, None);
         lock(&model.hub).running = true;
         assert_eq!(model.agents()["v"], 1);
         let refresh = {
             let m = model.clone();
             std::thread::spawn(move || m.fetch_shared())
         };
-        std::thread::sleep(Duration::from_millis(150));
+        parked.wait();
         let asked = Instant::now();
         let served = model.agents();
         assert!(
@@ -1813,6 +1864,7 @@ mod tests {
         );
         assert_eq!(served["v"], 1);
         assert!(served["snapshot_age_secs"].as_f64().unwrap() > 0.0);
+        drop(parked);
         assert_eq!(refresh.join().unwrap().agents["v"], 2);
         assert_eq!(model.agents()["v"], 2);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -1820,28 +1872,21 @@ mod tests {
 
     #[test]
     fn a_fetch_started_before_a_write_never_overwrites_the_post_write_view() {
-        let (model, calls) = fake_daemon(
-            |n| {
-                if n == 1 {
-                    Duration::from_millis(400)
-                } else {
-                    Duration::ZERO
-                }
-            },
-            None,
-        );
+        let (on_fetch, parked) = fetch_gate(1);
+        let (model, calls) = fake_daemon(on_fetch, None);
         lock(&model.hub).running = true;
         let before_write = {
             let m = model.clone();
             std::thread::spawn(move || m.agents()["v"].clone())
         };
-        std::thread::sleep(Duration::from_millis(100));
+        parked.wait();
         model.invalidate();
         assert_eq!(
             model.agents()["v"],
             2,
             "the write must not join the older fetch"
         );
+        drop(parked);
         assert_eq!(before_write.join().unwrap(), 1);
         assert_eq!(
             model.agents()["v"],
@@ -1872,13 +1917,20 @@ mod tests {
 
     #[test]
     fn the_first_stream_subscriber_joins_the_shared_fetch() {
-        let (model, calls) = fake_daemon(|_| Duration::from_millis(400), None);
+        let (on_fetch, parked) = fetch_gate(1);
+        let (model, calls) = fake_daemon(on_fetch, None);
         let reader = {
             let m = model.clone();
             std::thread::spawn(move || m.agents()["v"].clone())
         };
-        std::thread::sleep(Duration::from_millis(100));
-        let _rx = model.subscribe();
+        parked.wait();
+        let subscriber = {
+            let m = model.clone();
+            std::thread::spawn(move || m.subscribe())
+        };
+        wait_for_joins(&model, 1);
+        drop(parked);
+        let _rx = subscriber.join().unwrap();
         assert_eq!(reader.join().unwrap(), 1);
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -1890,7 +1942,7 @@ mod tests {
 
     #[test]
     fn a_failed_refresh_keeps_the_last_good_snapshot_and_says_so() {
-        let (model, calls) = fake_daemon_failing(|_| Duration::ZERO, None, |n| n == 2);
+        let (model, calls) = fake_daemon_failing(|_| {}, None, |n| n == 2);
         lock(&model.hub).running = true;
         let good = model.agents();
         assert_eq!(good["v"], 1);
@@ -1913,7 +1965,7 @@ mod tests {
 
     #[test]
     fn the_stream_reports_an_unreachable_daemon_over_last_good_rows() {
-        let (model, _) = fake_daemon_failing(|_| Duration::ZERO, None, |n| n == 2);
+        let (model, _) = fake_daemon_failing(|_| {}, None, |n| n == 2);
         let mut watch = blank_watch();
         let mut frames = Vec::new();
         model.tick(&mut watch, &mut frames);
@@ -1929,7 +1981,7 @@ mod tests {
 
     #[test]
     fn the_watcher_publishes_nothing_for_a_failed_refresh() {
-        let (model, _) = fake_daemon_failing(|_| Duration::ZERO, None, |n| n == 2);
+        let (model, _) = fake_daemon_failing(|_| {}, None, |n| n == 2);
         let mut watch = blank_watch();
         let mut frames = Vec::new();
         model.tick(&mut watch, &mut frames);
@@ -1956,16 +2008,8 @@ mod tests {
         // a post-write read builds fetch 2 and keeps it. Fetch 1 ends
         // afterwards: the cache refuses it, and the watcher must not
         // publish it after the newer view.
-        let (model, calls) = fake_daemon(
-            |n| {
-                if n == 1 {
-                    Duration::from_millis(500)
-                } else {
-                    Duration::ZERO
-                }
-            },
-            None,
-        );
+        let (on_fetch, parked) = fetch_gate(1);
+        let (model, calls) = fake_daemon(on_fetch, None);
         let ticking = {
             let m = model.clone();
             std::thread::spawn(move || {
@@ -1975,10 +2019,11 @@ mod tests {
                 (watch.agents, watch.at)
             })
         };
-        std::thread::sleep(Duration::from_millis(100));
+        parked.wait();
         model.invalidate();
         let post_write = model.agents();
         assert_eq!(post_write["v"], 2);
+        drop(parked);
         let (published, _) = ticking.join().unwrap();
         assert_ne!(published, Some(1), "published the pre-write build");
         assert_eq!(published, Some(3), "the watcher fetches a current view");
@@ -1995,11 +2040,10 @@ mod tests {
         std::fs::create_dir_all(&pm).unwrap();
         let calls = Arc::new(AtomicU64::new(0));
         let seen = calls.clone();
+        let (on_fetch, parked) = fetch_gate(1);
         let fetch: Fetch = Box::new(move |_| {
             let n = seen.fetch_add(1, Ordering::SeqCst) + 1;
-            if n == 1 {
-                std::thread::sleep(Duration::from_millis(400));
-            }
+            on_fetch(n);
             DaemonSnap {
                 at: Instant::now(),
                 outcomes: Default::default(),
@@ -2020,15 +2064,23 @@ mod tests {
             let m = model.clone();
             std::thread::spawn(move || m.agents())
         };
-        std::thread::sleep(Duration::from_millis(100));
+        parked.wait();
         let mut watch = blank_watch();
         watch.tracker = dir_mtime(&pm);
         let mut frames = Vec::new();
-        model.tick(&mut watch, &mut frames);
+        let ticking = {
+            let m = model.clone();
+            std::thread::spawn(move || {
+                m.tick(&mut watch, &mut frames);
+                (watch, frames)
+            })
+        };
+        wait_for_joins(&model, 1);
+        drop(parked);
+        let (mut watch, mut frames) = ticking.join().unwrap();
         reader.join().unwrap();
         assert_eq!(watch.agents, Some(1));
-        std::thread::sleep(Duration::from_millis(1100));
-        std::fs::write(pm.join("note.md"), "x").unwrap();
+        write_tracker_change(&pm);
         frames.clear();
         let before = calls.load(Ordering::SeqCst);
         model.tick(&mut watch, &mut frames);
@@ -2062,6 +2114,7 @@ mod tests {
         issue_write::project_add(&pm, "cadence", "CAD", &[], &[], &[], None).unwrap();
         let pm_dir = pm.dir.clone();
         let write_card = move |title: &str| {
+            let stamp = dir_mtime(&pm_dir).unwrap() + Duration::from_secs(1);
             let dir = pm_dir.join("cadence").join("CAD-1");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
@@ -2072,6 +2125,10 @@ mod tests {
                 ),
             )
             .unwrap();
+            std::fs::File::open(dir.join("issue.md"))
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(stamp))
+                .unwrap();
         };
         write_card("first");
         let second = pm.dir.join("cadence").join("CAD-2");
@@ -2136,7 +2193,6 @@ mod tests {
         // tracker change lands.
         model.invalidate();
         down.store(true, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(20));
         write_card("second");
         std::fs::write(tmp.path().join("pm").join("note.md"), "x").unwrap();
         frames.clear();
@@ -2239,7 +2295,7 @@ mod tests {
 
     #[test]
     fn a_tick_skips_a_snapshot_older_than_the_one_it_published() {
-        let (model, _) = fake_daemon(|_| Duration::ZERO, None);
+        let (model, _) = fake_daemon(|_| {}, None);
         let mut watch = blank_watch();
         let mut frames = Vec::new();
         model.tick(&mut watch, &mut frames);
@@ -2251,13 +2307,20 @@ mod tests {
 
     #[test]
     fn a_waiter_retries_when_the_fetch_it_joined_unwinds() {
-        let (model, calls) = fake_daemon(|_| Duration::from_millis(300), Some(1));
+        let (on_fetch, parked) = fetch_gate(1);
+        let (model, calls) = fake_daemon(on_fetch, Some(1));
         let crashing = {
             let m = model.clone();
             std::thread::spawn(move || m.agents())
         };
-        std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(model.agents()["v"], 2);
+        parked.wait();
+        let waiter = {
+            let m = model.clone();
+            std::thread::spawn(move || m.agents())
+        };
+        wait_for_joins(&model, 1);
+        drop(parked);
+        assert_eq!(waiter.join().unwrap()["v"], 2);
         assert!(crashing.join().is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }

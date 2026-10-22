@@ -303,18 +303,25 @@
         let facts = s.pty_endpoint_facts().unwrap();
         s.shutdown_backoff_ms = 5_000;
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        crate::store::wait_probe::WAITING.with(|observer| *observer.borrow_mut() = Some(waiting_tx));
+        crate::store::wait_probe::RELEASED.with(|release| *release.borrow_mut() = Some(released_rx));
+        crate::store::wait_probe::configure(&s.conn()).unwrap();
         let path = dir.path().join("t.sqlite3");
         let writer = std::thread::spawn(move || {
             let conn = Connection::open(path).unwrap();
             conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
             conn.execute_batch("BEGIN IMMEDIATE").unwrap();
             locked_tx.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(400));
+            waiting_rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("drain never contended on the native write lock");
             conn.execute_batch(
                 "INSERT INTO events(alias,kind,payload,at) VALUES('ok','probe','{}',0);
                  COMMIT",
             )
             .unwrap();
+            released_tx.send(()).unwrap();
         });
         locked_rx.recv().unwrap();
         let started = std::time::Instant::now();

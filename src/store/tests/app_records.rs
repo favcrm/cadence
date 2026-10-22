@@ -639,15 +639,29 @@ fn cad780_open_waits_out_a_held_write_lock_then_succeeds() {
         .unwrap();
     let path = record_db_path(dir.path(), "install-locked").unwrap();
     let holder = rusqlite::Connection::open(&path).unwrap();
+    // An already-WAL file can be opened read-only without waiting on a
+    // writer. Force the WAL transition this contention check is about.
+    holder
+        .pragma_update(None, "journal_mode", "DELETE")
+        .unwrap();
     holder
         .execute_batch("BEGIN IMMEDIATE; INSERT INTO app_suppressions(context_id,kind,key,reason,at) VALUES('ctx-1','email','held@example.com','test',0.0);")
         .unwrap();
     let opened = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| RecordStore::open(dir.path(), "install-locked"));
-        // The opener's first attempts meet the held write lock; the
-        // holder commits inside the bounded wait.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let worker = scope.spawn(|| {
+            crate::store::wait_probe::WAITING
+                .with(|observer| *observer.borrow_mut() = Some(waiting_tx));
+            crate::store::wait_probe::RELEASED
+                .with(|release| *release.borrow_mut() = Some(released_rx));
+            RecordStore::open(dir.path(), "install-locked")
+        });
+        waiting_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opener never encountered the held native lock");
         holder.execute_batch("COMMIT;").unwrap();
+        released_tx.send(()).unwrap();
         worker.join().unwrap()
     });
     let store = opened.unwrap();
@@ -676,10 +690,15 @@ fn cad780_open_sees_an_initializing_file_then_converges() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     rusqlite::Connection::open(&path).unwrap();
     let opened = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| RecordStore::open(dir.path(), "install-initializing"));
-        // The opener's first reads land before any table exists; the
-        // initializer commits inside the bounded wait.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let worker = scope.spawn(|| {
+            crate::store::wait_probe::WAITING
+                .with(|observer| *observer.borrow_mut() = Some(waiting_tx));
+            RecordStore::open(dir.path(), "install-initializing")
+        });
+        waiting_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opener never observed incomplete initialization");
         let init = rusqlite::Connection::open(&path).unwrap();
         init.execute_batch(
             "BEGIN IMMEDIATE;

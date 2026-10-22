@@ -208,8 +208,15 @@ mod tests {
             took < Duration::from_millis(1500),
             "commit waited for the push: {took:?}"
         );
-        // The background push finishes on its own; let it before cleanup.
-        std::thread::sleep(Duration::from_secs(4));
+        // Wait for the real background push to commit its remote ref.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !origin.join("refs/heads/main").is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "background push never updated origin"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

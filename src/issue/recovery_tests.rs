@@ -396,9 +396,15 @@ fn a_path_staged_before_the_crash_is_not_attributable() {
     let (_tmp, pm) = tracker();
     std::fs::write(pm.dir.join("earlier.txt"), b"staged earlier\n").unwrap();
     git(&pm.dir, &["add", "--", "earlier.txt"]).unwrap();
-    // The crash starts a second later, so the file's write time is
-    // provably before it.
-    std::thread::sleep(std::time::Duration::from_millis(1200));
+    // Seed a write time before the crash; recovery uses timestamp ordering,
+    // not the passage of wall time in this test.
+    std::fs::File::open(pm.dir.join("earlier.txt"))
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(2)),
+        )
+        .unwrap();
     let (child, _) = spawn_writer(&pm, "hold_dirty", false);
     sigkill(child);
     let r = review(&pm, None).unwrap();

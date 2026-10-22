@@ -646,6 +646,11 @@ fn read_credential_metadata(dir: &Path, target: &RemoteTarget) -> Result<Credent
     Ok(cred)
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CREDENTIAL_WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) fn private_lock(dir: &Path, slug: &str, deadline: Instant) -> Result<File> {
     private_directory(dir)?;
     let file = OpenOptions::new()
@@ -665,6 +670,12 @@ pub(crate) fn private_lock(dir: &Path, slug: &str, deadline: Instant) -> Result<
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(file);
         }
+        #[cfg(test)]
+        CREDENTIAL_WAITING.with(|observer| {
+            if let Some(sender) = observer.borrow_mut().take() {
+                let _ = sender.send(());
+            }
+        });
         if Instant::now() >= deadline {
             return Err(Error::busy_coded(
                 "timeout",

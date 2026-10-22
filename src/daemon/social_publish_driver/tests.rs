@@ -416,7 +416,7 @@ fn cad1020_due_approved_intent_publishes_once_with_no_operator() {
         clock.load(Ordering::SeqCst) - 1,
     );
     daemon.wait_state(&intent, "posted");
-    std::thread::sleep(Duration::from_millis(200));
+    daemon.ticks(2);
     assert_eq!(door.sent(), vec![key(&intent)], "published exactly once");
 }
 
@@ -438,7 +438,8 @@ fn cad1020_two_daemons_racing_publish_once() {
         assert!(Instant::now() < until, "nothing was published");
         std::thread::sleep(Duration::from_millis(20));
     }
-    std::thread::sleep(Duration::from_millis(200));
+    first.ticks(2);
+    second.ticks(2);
     assert!(
         door.preflights.lock().unwrap().len() >= 2,
         "both daemons staged it"
@@ -470,7 +471,7 @@ fn cad1020_crash_after_door_accepts_reconciles_without_resend() {
     *door.after_accept.lock().unwrap() = None;
     let restarted = Daemon::start(dir.path(), &door, &clock);
     restarted.wait_state(&intent, "posted");
-    std::thread::sleep(Duration::from_millis(200));
+    restarted.ticks(2);
     assert_eq!(door.sent(), vec![key(&intent)], "never re-sent");
 }
 
@@ -503,7 +504,7 @@ fn cad1020_refused_or_uncertain_preflight_publishes_nothing() {
         assert!(Instant::now() < until, "the flaky intent was never staged");
         std::thread::sleep(Duration::from_millis(20));
     }
-    std::thread::sleep(Duration::from_millis(200));
+    daemon.ticks(2);
     assert_eq!(daemon.state(&flaky), "queued");
     assert!(door.sent().is_empty(), "nothing was published");
 }
@@ -526,7 +527,7 @@ fn cad1020_not_due_or_cancelled_intent_is_never_sent() {
     daemon.wait_state(&witness, "posted");
     clock.store(now + 60, Ordering::SeqCst);
     daemon.wait_state(&next, "posted");
-    std::thread::sleep(Duration::from_millis(200));
+    daemon.ticks(2);
     assert_eq!(daemon.state(&later), "queued");
     assert_eq!(daemon.state(&cancelled), "cancelled");
     assert_eq!(door.sent(), vec![key(&witness), key(&next)]);

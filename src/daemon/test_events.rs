@@ -8,6 +8,7 @@ pub enum Event {
     ImageWorkerEnded,
     ImageAttemptFailed,
     AppRunsAdvanced,
+    AssistNoticesDrained,
 }
 
 struct Observer {

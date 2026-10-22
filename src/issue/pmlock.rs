@@ -566,6 +566,7 @@ fn hold_line(held: Duration, scope: &Scope, site: &Location<'_>) -> Option<Strin
 #[cfg(test)]
 thread_local! {
     pub(crate) static HOLD_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    pub(crate) static WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
 }
 
 impl PmLock {
@@ -1485,6 +1486,12 @@ impl Pm {
                 Attempt::Held => false,
                 Attempt::Legacy => true,
             };
+            #[cfg(test)]
+            WAITING.with(|observer| {
+                if let Some(sender) = observer.borrow_mut().take() {
+                    let _ = sender.send(());
+                }
+            });
             match deadline {
                 None if !busy && retries < PROBE_RETRIES => {
                     retries += 1;
@@ -1931,13 +1938,16 @@ mod tests {
         let held = pm.lock().unwrap();
         let t = Instant::now();
         std::thread::scope(|sc| {
-            sc.spawn(|| {
-                std::thread::sleep(Duration::from_millis(400));
+            let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+            WAITING.with(|observer| *observer.borrow_mut() = Some(waiting_tx));
+            sc.spawn(move || {
+                waiting_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("writer never contended");
                 drop(held);
             });
             let got = pm.lock_for(Duration::from_secs(10)).unwrap();
             let waited = t.elapsed();
-            assert!(waited >= Duration::from_millis(350), "waited {waited:?}");
             assert!(waited < Duration::from_secs(3), "waited {waited:?}");
             drop(got);
         });
@@ -1977,8 +1987,8 @@ mod tests {
             HOLD_LINES.with(|l| l.borrow().is_empty()),
             "short hold reported"
         );
-        let lock = pm.lock_for_paths(&[pm.dir.join("proj")]).unwrap();
-        std::thread::sleep(HOLD_REPORT + Duration::from_millis(100));
+        let mut lock = pm.lock_for_paths(&[pm.dir.join("proj")]).unwrap();
+        lock.since = Instant::now() - HOLD_REPORT - Duration::from_millis(100);
         drop(lock);
         let lines = HOLD_LINES.with(|l| l.borrow().clone());
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -1999,19 +2009,30 @@ mod tests {
         let (_d, pm) = tracker();
         std::fs::create_dir_all(pm.dir.join("foreign")).unwrap();
         std::fs::write(pm.dir.join("foreign/old.txt"), "mine\n").unwrap();
-        std::thread::sleep(Duration::from_millis(30));
+        std::fs::File::open(pm.dir.join("foreign/old.txt"))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(2)),
+            )
+            .unwrap();
         let mut lock = pm.lock().unwrap();
-        std::thread::sleep(Duration::from_millis(30));
         // Dying here leaves the fence file behind: a crashed writer.
         lock.armed = false;
         drop(lock);
         let clean = pm.lock().unwrap();
         // The foreign file alone is not a leftover: that lock was
         // admitted. Now the crash adds a file inside the foreign dir.
-        std::thread::sleep(Duration::from_millis(30));
         let mut clean = clean;
         clean.armed = false;
         std::fs::write(pm.dir.join("foreign/half-written.md"), "x\n").unwrap();
+        std::fs::File::open(pm.dir.join("foreign/half-written.md"))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() + Duration::from_secs(2)),
+            )
+            .unwrap();
         drop(clean);
         let err = pm.lock().unwrap_err();
         assert!(err.to_string().contains("foreign/half-written.md"), "{err}");

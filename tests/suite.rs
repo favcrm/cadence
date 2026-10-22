@@ -2,8 +2,8 @@
 //! re-exec themselves.
 //!
 //! CAD-1727: `autotests = false` in `Cargo.toml` stops Cargo turning each
-//! `tests/*.rs` file into its own linked executable. The 83 files below are
-//! modules of this one target. Fifteen files stay separate declared targets:
+//! `tests/*.rs` file into its own linked executable. The 84 files below are
+//! modules of this target; fifteen files stay separate declared targets:
 //! fourteen spawn `current_exe()` with `--exact <fn>` (their child filter
 //! only matches an unprefixed test name) and cad1425 is built alone by the
 //! cross-build legs. None of those test files is edited (they are acceptance
@@ -67,6 +67,7 @@ mod cad1328_acceptance;
 mod cad1331_locale_member_refusal;
 mod cad1332_acceptance;
 mod cad1349_cargo_shim_acceptance;
+mod cad1353_reviewer_a6_acceptance;
 mod cad1374_chat_identity_acceptance;
 mod cad1374_explorer_attribution_acceptance;
 mod cad1374_issue_wiki_activity_acceptance;
