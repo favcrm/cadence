@@ -56,9 +56,11 @@ const PATHISH = /^[("'`[{<]*(?:\/|~\/|\.\/|\.\.\/)|[=:][^\s=:]*\/|master\/tmp|\.
 const JSON_SPAN_MAX = 20_000;
 
 /** Replace a balanced `{…}` / `[…]` that starts a line or word and holds a
- *  `":` with an ellipsis, so pretty-printed or spaced JSON never reaches the
- *  strip. One forward pass: a span that does not balance within the cap is
- *  kept as written and skipped, never rescanned. */
+ *  JSON property (a string, optional whitespace, then `:`) with an ellipsis,
+ *  so pretty-printed or spaced JSON never reaches the strip. One forward pass
+ *  that tracks strings and escapes, so a delimiter inside a string does not
+ *  count. A span that does not balance within the cap is kept as written and
+ *  skipped, never rescanned. */
 function scrubJson(text: string): string {
   let out = "";
   let i = 0;
@@ -67,9 +69,30 @@ function scrubJson(text: string): string {
     if ((c === "{" || c === "[") && (i === 0 || /\s/.test(text[i - 1]))) {
       const end = Math.min(text.length, i + JSON_SPAN_MAX);
       let depth = 0;
+      let inStr = false;
+      let esc = false;
+      let afterStr = false;
+      let prop = false;
       let j = i;
       for (; j < end; j++) {
         const d = text[j];
+        if (inStr) {
+          if (esc) esc = false;
+          else if (d === "\\") esc = true;
+          else if (d === '"') {
+            inStr = false;
+            afterStr = true;
+          }
+          continue;
+        }
+        if (d === " " || d === "\t" || d === "\n" || d === "\r") continue;
+        if (d === '"') {
+          inStr = true;
+          afterStr = false;
+          continue;
+        }
+        if (d === ":" && afterStr) prop = true;
+        afterStr = false;
         if (d === "{" || d === "[") depth++;
         else if (d === "}" || d === "]") {
           depth--;
@@ -80,7 +103,7 @@ function scrubJson(text: string): string {
         }
       }
       const span = text.slice(i, j);
-      out += depth === 0 && span.includes('":') ? "…" : span;
+      out += depth === 0 && prop ? "…" : span;
       i = j;
     } else {
       out += c;

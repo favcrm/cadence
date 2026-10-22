@@ -185,8 +185,15 @@ for (const hostile of ["{".repeat(200_000), '{"a":'.repeat(40_000), " ".repeat(2
 // Pretty-printed and spaced JSON never reaches the strip; ordinary brackets do.
 equal(planOf('Result:\n{\n  "bytes": 9,\n  "digest": "d"\n}\nAll set.'), "Result:\n…\nAll set.", "multiline JSON goes");
 equal(planOf('Got {"a": 1, "b": 2} back'), "Got … back", "spaced compact JSON goes");
+equal(planOf('Result: {"text": "Use } here", "bytes": 9, "digest": "d"}'), "Result: …", "a } inside a string does not end the span");
+equal(planOf('Got {"a": "x ] y", "b": 1} ok'), "Got … ok", "a ] inside a string");
+equal(planOf('Got {"a": "x { y", "b": 1} ok'), "Got … ok", "a { inside a string");
+equal(planOf('Got {"a": "say \\"hi\\"", "b": 1} ok'), "Got … ok", "an escaped quote before the closing brace");
+equal(planOf('{\n  "bytes" : 9,\n  "digest" : "d"\n}'), "…", "spaces before the colon");
+equal(planOf('Got {"bytes"\t: 9} ok'), "Got … ok", "a tab before the colon");
+equal(planOf("See [note], {braces} and [1, 2, 3] here"), "See [note], {braces} and [1, 2, 3] here", "prose brackets stay");
 equal(planOf("Steps [1] and (2) done"), "Steps [1] and (2) done", "plain brackets stay");
-for (const hostile of ["{ ".repeat(100_000), '{"a": '.repeat(40_000), "[".repeat(200_000)]) {
+for (const hostile of ["{ ".repeat(100_000), '{"a": '.repeat(40_000), "[".repeat(200_000), '"{'.repeat(100_000), '\\"'.repeat(100_000), "{" + '"'.repeat(200_000)]) {
   const started = performance.now();
   planOf(hostile);
   if (performance.now() - started > 100) throw new Error("plan scrub is not linear");
