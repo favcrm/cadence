@@ -102,20 +102,25 @@ pub(crate) enum AppAction {
         #[arg(long)]
         json: bool,
     },
-    /// Run a fixture-only HMR preview from an explicitly trusted local
-    /// Cadence source checkout. This executes that checkout's known
-    /// development harness, not an installed app or its manifest.
+    /// Run the app's declared local preview. In a detached app repository,
+    /// `--package .` reads `package.json.cadence` and runs the app-owned
+    /// `dev` command with a scrubbed environment. The legacy `--source`
+    /// mode runs a trusted Cadence checkout's `scripts/app-dev.mjs`.
     Dev {
-        /// Preview directory name under app-previews/.
-        name: String,
-        /// Trusted source checkout containing scripts/app-dev.mjs.
-        #[arg(long)]
-        source: PathBuf,
+        /// Legacy preview directory name under app-previews/.
+        name: Option<String>,
+        /// Legacy trusted source checkout containing scripts/app-dev.mjs.
+        #[arg(long, conflicts_with = "package")]
+        source: Option<PathBuf>,
+        /// Detached app package root; reads its `package.json.cadence`
+        /// contract and runs the app-owned `dev` command.
+        #[arg(long, conflicts_with_all = ["name", "source"])]
+        package: Option<PathBuf>,
         #[arg(long, default_value_t = 3186, value_parser = clap::value_parser!(u16).range(3110..=3199))]
         port: u16,
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
-        /// Existing private tailnet hostname; required when sharing.
+        /// Legacy private tailnet hostname; refused with --package.
         #[arg(long)]
         allow_host: Vec<String>,
     },
@@ -2650,11 +2655,19 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
         AppAction::Dev {
             name,
             source,
+            package,
             port,
             host,
             allow_host,
         } => {
-            return run_dev(name, source, *port, host, allow_host);
+            return run_dev(
+                name.as_deref(),
+                source.as_deref(),
+                package.as_deref(),
+                *port,
+                host,
+                allow_host,
+            );
         }
         // CAD-1270: `check` is dispatched before org/state-dir
         // resolution — it never reaches the daemon path.
@@ -2743,12 +2756,40 @@ pub(super) fn run_check(source: &str, _json: bool) -> Result<i32> {
 
 /// No production state, PM, socket or app approval is accessed here.
 pub(super) fn run_dev(
-    name: &str,
-    source: &Path,
+    name: Option<&str>,
+    source: Option<&Path>,
+    package: Option<&Path>,
     port: u16,
     host: &str,
     allow_hosts: &[String],
 ) -> Result<i32> {
+    if let Some(package) = package {
+        if !allow_hosts.is_empty() {
+            return Err(Error::invalid(
+                "app_dev_allow_host",
+                "--allow-host is only available in legacy --source mode",
+            ));
+        }
+        if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
+            return Err(Error::invalid(
+                "app_dev_host",
+                "package previews must bind loopback",
+            ));
+        }
+        return run_package_dev(package, port, host);
+    }
+    let name = name.ok_or_else(|| {
+        Error::invalid(
+            "app_dev_mode",
+            "pass a preview name with --source, or --package <dir>",
+        )
+    })?;
+    let source = source.ok_or_else(|| {
+        Error::invalid(
+            "app_dev_mode",
+            "pass a preview name with --source, or --package <dir>",
+        )
+    })?;
     let source = source
         .canonicalize()
         .map_err(|e| Error::invalid("app_dev_source", format!("trusted source checkout: {e}")))?;
@@ -2771,6 +2812,115 @@ pub(super) fn run_dev(
     // The preview needs tools, not a native identity, state dir, provider
     // keys, browser cookies or the operator's daemon/session environment.
     command.env_clear();
+    copy_preview_env(&mut command);
+    let status = cadence_agent::reaper::status(&mut command)
+        .map_err(|e| Error::internal(format!("app development harness: {e}")))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+struct AppPackageContract {
+    app: String,
+    dev: String,
+    check: Option<String>,
+}
+
+/// An app-owned preview: the package's `package.json` declares the app
+/// name and the commands; Cadence only validates the package and runs
+/// them. No daemon, state dir, PM, socket or approval is read.
+fn run_package_dev(root: &Path, port: u16, host: &str) -> Result<i32> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| Error::invalid("app_dev_package", format!("package root: {e}")))?;
+    let contract = package_contract(&root)?;
+    if let Some(check) = contract.check.as_deref() {
+        let status = shell_status(check, &root, &contract.app, port, host)?;
+        if !status.success() {
+            return Ok(status.code().unwrap_or(1));
+        }
+    }
+    let status = shell_status(&contract.dev, &root, &contract.app, port, host)?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn package_contract(root: &Path) -> Result<AppPackageContract> {
+    let manifest = root.join("package.json");
+    let bytes = std::fs::read(&manifest).map_err(|e| {
+        Error::invalid(
+            "app_dev_package",
+            format!("read {}: {e}", manifest.display()),
+        )
+    })?;
+    let json: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::invalid("app_dev_package", format!("package.json: {e}")))?;
+    let cadence = json
+        .get("cadence")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            Error::invalid(
+                "app_dev_package",
+                "package.json needs a cadence object with app and dev",
+            )
+        })?;
+    let app = cadence
+        .get("app")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::invalid("app_dev_package", "cadence.app must be a string"))?;
+    cadence_agent::proto::identifier(app, "app name")?;
+    let dev = package_command(cadence.get("dev"), "cadence.dev")?;
+    let check = match cadence.get("check") {
+        Some(value) => Some(package_command(Some(value), "cadence.check")?),
+        None => None,
+    };
+    if !root.join("app/app.md").is_file() {
+        return Err(Error::invalid(
+            "app_dev_package",
+            "package needs app/app.md",
+        ));
+    }
+    Ok(AppPackageContract {
+        app: app.to_owned(),
+        dev,
+        check,
+    })
+}
+
+fn package_command(value: Option<&Value>, field: &str) -> Result<String> {
+    let text = value
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::invalid("app_dev_package", format!("{field} must be a string")))?;
+    if text.trim().is_empty() || text.len() > 4096 {
+        return Err(Error::invalid(
+            "app_dev_package",
+            format!("{field} must be 1..=4096 bytes"),
+        ));
+    }
+    Ok(text.to_owned())
+}
+
+fn shell_status(
+    command: &str,
+    root: &Path,
+    app: &str,
+    port: u16,
+    host: &str,
+) -> Result<std::process::ExitStatus> {
+    let mut child = std::process::Command::new("sh");
+    child
+        .arg("-c")
+        .arg(command)
+        .current_dir(root)
+        .env_clear()
+        .env("CADENCE_APP_ROOT", root)
+        .env("CADENCE_APP_NAME", app)
+        .env("CADENCE_APP_PORT", port.to_string())
+        .env("CADENCE_APP_HOST", host)
+        .env("CADENCE_APP_CONTRACT", "1");
+    copy_preview_env(&mut child);
+    cadence_agent::reaper::status(&mut child)
+        .map_err(|e| Error::internal(format!("app dev command: {e}")))
+}
+
+fn copy_preview_env(command: &mut std::process::Command) {
     for name in [
         "PATH",
         "HOME",
@@ -2778,19 +2928,122 @@ pub(super) fn run_dev(
         "TERM",
         "PNPM_HOME",
         "XDG_CACHE_HOME",
+        "TMPDIR",
     ] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
     }
-    let status = cadence_agent::reaper::status(&mut command)
-        .map_err(|e| Error::internal(format!("app development harness: {e}")))?;
-    Ok(status.code().unwrap_or(1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn package_dir(dev: &str, check: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app")).unwrap();
+        std::fs::write(
+            dir.path().join("app/app.md"),
+            "---\napp: fixture\ntitle: Fixture\nversion: 0.0.1\n---\n",
+        )
+        .unwrap();
+        let mut cadence = serde_json::json!({"app": "fixture", "dev": dev});
+        if let Some(check) = check {
+            cadence["check"] = serde_json::json!(check);
+        }
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::json!({"cadence": cadence}).to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn package_dev_runs_check_then_dev_with_the_contract_environment() {
+        let dir = package_dir(
+            "printf '%s' \"$CADENCE_APP_PORT\" > port.txt; \
+             printf '%s' \"$CADENCE_APP_ROOT\" > root.txt; \
+             printf '%s' \"$CADENCE_APP_NAME\" > name.txt; \
+             printf '%s' \"$CADENCE_APP_CONTRACT\" > contract.txt; \
+             printf dev > dev.txt",
+            Some("test ! -e dev.txt && printf checked > check.txt"),
+        );
+        let code = run_dev(None, None, Some(dir.path()), 3191, "127.0.0.1", &[]).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("check.txt")).unwrap(),
+            "checked"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("dev.txt")).unwrap(),
+            "dev"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("port.txt")).unwrap(),
+            "3191"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("root.txt")).unwrap(),
+            dir.path().canonicalize().unwrap().display().to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("name.txt")).unwrap(),
+            "fixture"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("contract.txt")).unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn package_dev_check_failure_does_not_spawn_dev() {
+        let dir = package_dir(
+            "printf dev > dev.txt",
+            Some("printf check > check.txt; exit 7"),
+        );
+        let code = run_dev(None, None, Some(dir.path()), 3191, "127.0.0.1", &[]).unwrap();
+        assert_eq!(code, 7);
+        assert!(dir.path().join("check.txt").is_file());
+        assert!(!dir.path().join("dev.txt").exists());
+    }
+
+    #[test]
+    fn package_dev_refuses_non_loopback_hosts_and_allow_host() {
+        let dir = package_dir("printf dev > dev.txt", None);
+        let error = run_dev(None, None, Some(dir.path()), 3191, "0.0.0.0", &[]).unwrap_err();
+        assert!(error.to_string().contains("loopback"), "{error}");
+        let error = run_dev(
+            None,
+            None,
+            Some(dir.path()),
+            3191,
+            "127.0.0.1",
+            &["example.invalid".into()],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--allow-host"), "{error}");
+        assert!(!dir.path().join("dev.txt").exists());
+    }
+
+    #[test]
+    fn package_dev_requires_the_app_manifest_and_dev_command() {
+        let dir = package_dir("printf dev > dev.txt", None);
+        std::fs::remove_file(dir.path().join("app/app.md")).unwrap();
+        let error = run_dev(None, None, Some(dir.path()), 3191, "127.0.0.1", &[]).unwrap_err();
+        assert!(error.to_string().contains("app/app.md"), "{error}");
+
+        let dir = package_dir("printf dev > dev.txt", None);
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::json!({"cadence": {"app": "fixture"}}).to_string(),
+        )
+        .unwrap();
+        let error = run_dev(None, None, Some(dir.path()), 3191, "127.0.0.1", &[]).unwrap_err();
+        assert!(error.to_string().contains("cadence.dev"), "{error}");
+    }
 
     #[test]
     fn app_run_inputs_reject_non_string_maps_without_echoing_content() {
