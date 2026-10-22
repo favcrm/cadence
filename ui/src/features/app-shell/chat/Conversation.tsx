@@ -375,7 +375,15 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const [creating, setCreating] = useState(false);
   // The thread stream's link: down means the turn bar shows its last known state.
   const [streamLink, setStreamLink] = useState<"live" | SseErrorState>("reconnecting");
-  const streamDown = streamLink !== "live";
+  const [streamRevision, setStreamRevision] = useState(0);
+  const onSnapshot = useCallback(() => setStreamRevision((revision) => revision + 1), []);
+  const operationScope = `${installId}\u0000${mode.contextId}`;
+  const [operationState, setOperationState] = useState<{ scope: string; revision: number | null; pending: boolean } | null>(null);
+  const onOperationState = useCallback((pending: boolean, revision: number | null) => {
+    setOperationState({ scope: operationScope, revision, pending });
+  }, [operationScope]);
+  const operationsCurrent = operationState?.scope === operationScope && operationState.revision === streamRevision;
+  const streamDown = streamLink !== "live" || !operationsCurrent;
   const [historyOpen, setHistoryOpen] = useState(false);
   // Client-side last-seen per conversation (CAD-1700). Opening a conversation
   // records its newest reply sequence; other tabs observe the seen write.
@@ -573,7 +581,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     setSendError(null);
     setComposerNotice(null);
     setCreating(false);
-    setStreamLink("live");
     setLimit(APP_WINDOW);
     setLoadingEarlier(false);
     follow.current = initialFollow();
@@ -591,6 +598,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     convId === null ? `/api/threads/${MASTER}/stream` : conversationStreamUrl(convId),
     usable && loaded && thread.data?.missing !== true && draftSubject === null,
     setStreamLink,
+    onSnapshot,
   );
 
   const items = threadItems(thread.data);
@@ -875,7 +883,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const entries = thread.data?.entries ?? [];
   const pendingMessages = (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message);
   const permissionPending = usePendingPermission(entries);
-  const [operationPending, setOperationPending] = useState(false);
   // Results older than this pane's view of the conversation are history.
   const liveSince = useMemo(() => Date.now(), [convId, installId]);
   const turnState = turnBarState(
@@ -883,7 +890,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       master: masterState.data,
       entries,
       pendingMessages,
-      awaitingApproval: permissionPending || operationPending,
+      awaitingApproval: permissionPending || (operationState?.scope === operationScope && operationState.pending),
       reconnecting: streamDown,
       liveSince,
       conversationName: (id) => {
@@ -911,43 +918,39 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     masterState.data,
     homeThread.data?.conversation,
   );
-  // Retry resends this conversation's own failed operator message; with no
-  // captured pending row the bar rebuilds one from the failed turn's own
-  // operator entry (same text, a fresh message id).
-  const failedSend = (thread.data?.pending ?? []).find((p) => p.state === "failed") ?? null;
+  // The bar retries the stored turn it displays with a fresh message id.
+  // Unrelated transport failures retain their own same-id row Retry.
   const failedEntry =
     turnState.kind === "failed" && turnState.message !== null
       ? entries.find((e) => e.message === turnState.message && e.role === "operator") ?? null
       : null;
   const retryAction =
-    failedSend !== null
-      ? () => retry(failedSend.message, failedSend.text)
-      : failedEntry !== null
-        ? () => {
-            const payload = failedEntry.payload ?? {};
-            const listOf = (key: string) => (Array.isArray(payload[key]) ? (payload[key] as unknown[]) : []);
-            const objects = <T,>(raw: unknown[], pick: (item: Record<string, unknown>) => T | null) =>
-              raw.flatMap((item) => {
-                const picked = item && typeof item === "object" ? pick(item as Record<string, unknown>) : null;
-                return picked === null ? [] : [picked];
-              });
-            const refs = objects(listOf("refs"), (r) =>
-              typeof r.kind === "string" && typeof r.id === "string" ? { kind: r.kind, id: r.id } : null,
-            );
-            const attachments = objects(listOf("attachments"), (a) => (typeof a.id === "string" ? { id: a.id } : null));
-            const mediaRefs = objects(listOf("media_refs"), (m) =>
-              typeof m.asset_id === "string" && typeof m.revision === "number" && typeof m.sha256 === "string"
-                ? { asset_id: m.asset_id, revision: m.revision, sha256: m.sha256 }
-                : null,
-            );
-            const rawApp = payload.app;
-            const app = rawApp !== null && typeof rawApp === "object" ? rawApp as Record<string, unknown> : null;
-            const originalApp = typeof app?.install_id === "string"
-              ? { install_id: app.install_id, ...(typeof app.context_id === "string" ? { context_id: app.context_id } : {}) }
-              : null;
-            void send(failedEntry.text, refs, attachments.length ? attachments : undefined, mediaRefs.length ? mediaRefs : undefined, originalApp);
-          }
-        : undefined;
+    failedEntry !== null
+      ? () => {
+          const payload = failedEntry.payload ?? {};
+          const listOf = (key: string) => (Array.isArray(payload[key]) ? (payload[key] as unknown[]) : []);
+          const objects = <T,>(raw: unknown[], pick: (item: Record<string, unknown>) => T | null) =>
+            raw.flatMap((item) => {
+              const picked = item && typeof item === "object" ? pick(item as Record<string, unknown>) : null;
+              return picked === null ? [] : [picked];
+            });
+          const refs = objects(listOf("refs"), (r) =>
+            typeof r.kind === "string" && typeof r.id === "string" ? { kind: r.kind, id: r.id } : null,
+          );
+          const attachments = objects(listOf("attachments"), (a) => (typeof a.id === "string" ? { id: a.id } : null));
+          const mediaRefs = objects(listOf("media_refs"), (m) =>
+            typeof m.asset_id === "string" && typeof m.revision === "number" && typeof m.sha256 === "string"
+              ? { asset_id: m.asset_id, revision: m.revision, sha256: m.sha256 }
+              : null,
+          );
+          const rawApp = payload.app;
+          const app = rawApp !== null && typeof rawApp === "object" ? rawApp as Record<string, unknown> : null;
+          const originalApp = typeof app?.install_id === "string"
+            ? { install_id: app.install_id, ...(typeof app.context_id === "string" ? { context_id: app.context_id } : {}) }
+            : null;
+          void send(failedEntry.text, refs, attachments.length ? attachments : undefined, mediaRefs.length ? mediaRefs : undefined, originalApp);
+        }
+      : undefined;
   const turnCommand = (command: "stop" | "cancel", message: string) => {
     const origin = { key: composerKey, visit: visitRef.current, frame: frameToken };
     void api
@@ -1283,7 +1286,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // selection or the route's current conversation: the envelope the
   // first send carried is the only legal resend (the daemon's
   // content check refuses anything else).
-  const retry = (message: string, body: string, refs?: ThreadRef[], attachments?: { id: string }[]) => {
+  const retry = (message: string) => {
     if (!canSend) return;
     // The row is rendered by the active store, so `store` is its own.
     const original = store.get().data?.pending.find((p) => p.message === message);
@@ -1297,9 +1300,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     // The binding captured on the pending row wins over the current
     // route; a captured ABSENCE (a legacy/no-binding send) stays absent
     // rather than being silently replaced by a later scope.
-    const bindingForRetry = original.app;
-    store.write((s) => addPending(s, message, body, Date.now(), refs, attachments, bindingForRetry));
-    void deliver(store, convId, message, body, refs, attachments, bindingForRetry);
+    store.write((s) => addPending(s, message, original.text, Date.now(), original.refs, original.attachments, original.app));
+    void deliver(store, convId, message, original.text, original.refs, original.attachments, original.app);
   };
   const discard = (message: string) => store.write((s) => discardPending(s, message));
 
@@ -1611,7 +1613,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           </li>
         ))}
       </ol>
-      <AssistantOperations key={`${installId}\u0000${mode.contextId}`} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} canDecide={viewer.operator === true && !viewer.readOnly} onPendingChange={setOperationPending} />
+      <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
       {unseen > 0 && (
         <button type="button" className="lnk text-label app-chat-jump" onClick={jumpToLatest} data-jump-to-latest>
           ↓ {jumpLabel(unseen, t)}

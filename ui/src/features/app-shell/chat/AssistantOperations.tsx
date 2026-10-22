@@ -436,6 +436,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
 
 interface AssistantData {
   scopeKey: string;
+  connectionRevision: number | null;
   actions: Action[];
   operations: Operation[];
   permissions: Permission[];
@@ -444,7 +445,7 @@ interface AssistantData {
   consent: boolean;
 }
 function emptyData(scopeKey: string): AssistantData {
-  return { scopeKey, actions: [], operations: [], permissions: [], error: null, consent: false };
+  return { scopeKey, connectionRevision: null, actions: [], operations: [], permissions: [], error: null, consent: false };
 }
 
 /** How a failed read settles. `none`: the app declares no assistant actions
@@ -465,19 +466,22 @@ interface Poller {
   refresh: () => Promise<void>;
 }
 
-export default function AssistantOperations({ installId, contextId, canDecide, appPath, onPendingChange }: {
+export default function AssistantOperations({ installId, contextId, canDecide, appPath, connectionRevision, onPendingChange }: {
   installId: string;
   contextId: string;
   canDecide: boolean;
   /** The verified canonical `/apps/<key>` path; resource links emit it. Null means no links. */
   appPath: string | null;
-  /** CAD-1700: an operation waits on the operator's permission decision (the turn bar's "Needs your approval"). */
-  onPendingChange?: (pending: boolean) => void;
+  /** The transcript snapshot this scope must reconcile before actions become live. */
+  connectionRevision: number;
+  onPendingChange: (pending: boolean, reconciledRevision: number | null) => void;
 }) {
   const t = useTranslate();
   const scopeKey = JSON.stringify([installId, contextId]);
   const contextReady = installId !== "" && contextId !== "";
   const poller = useRef<Poller | null>(null);
+  const connection = useRef(connectionRevision);
+  connection.current = connectionRevision;
   const [data, setData] = useState<AssistantData>(() => emptyData(scopeKey));
   const [busyState, setBusyState] = useState<{ scopeKey: string; id: string | null }>({ scopeKey, id: null });
   const [expanded, setExpanded] = useState(false);
@@ -488,9 +492,10 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
   const activeOperations = visible.operations.filter(isActiveOperation);
   const completedOperations = visible.operations.filter((operation) => !isActiveOperation(operation));
   const pendingDecision = activeOperations.some((operation) => operation.status === "pending_permission");
+  const reconciledRevision = contextReady ? visible.connectionRevision : connectionRevision;
   useEffect(() => {
-    onPendingChange?.(pendingDecision);
-  }, [pendingDecision, onPendingChange]);
+    onPendingChange(pendingDecision, reconciledRevision);
+  }, [pendingDecision, reconciledRevision, onPendingChange]);
 
   useEffect(() => {
     // An unresolved context owns no poller and sends no assistant requests.
@@ -509,6 +514,7 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
 
     const readOnce = async (): Promise<void> => {
       const startedAt = epoch;
+      const startedConnection = connection.current;
       try {
         // Wait for every sibling to settle: a failed read must not release the batch while others are in flight.
         const [actions, operations, permissions] = await Promise.allSettled([
@@ -529,6 +535,7 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
         }
         setData({
           scopeKey,
+          connectionRevision: startedConnection,
           actions: actionResponse.actions.map(parseAction).filter((v): v is Action => v !== null),
           operations: operationResponse.operations.map((row) => parseOperation(record(row)?.operation ?? row)).filter((v): v is Operation => v !== null),
           permissions: permissionResponse.permissions.map((row) => parsePermission(record(row)?.permission ?? row)).filter((v): v is Permission => v !== null),
@@ -540,9 +547,9 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
         if (epoch !== startedAt) { requeue = true; return; }
         const outcome = readFailure(e);
         if (outcome === "none") {
-          setData(emptyData(scopeKey));
+          setData({ ...emptyData(scopeKey), connectionRevision: startedConnection });
         } else if (outcome === "consent") {
-          setData({ ...emptyData(scopeKey), consent: true });
+          setData({ ...emptyData(scopeKey), connectionRevision: startedConnection, consent: true });
         } else {
           setData((previous) => ({
             ...(previous.scopeKey === scopeKey ? previous : emptyData(scopeKey)),
@@ -588,7 +595,6 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
     poller.current = handle;
     document.addEventListener("visibilitychange", resumeRead);
     const unsubscribeMaster = subscribeMasterChanged(resumeRead);
-    void poll();
     return () => {
       alive = false;
       document.removeEventListener("visibilitychange", resumeRead);
@@ -596,6 +602,11 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
       if (poller.current === handle) poller.current = null;
     };
   }, [installId, contextId, scopeKey, contextReady]);
+  useEffect(() => {
+    // Reconcile a new transcript snapshot through the existing write fence.
+    // Keep the scope's handle alive so in-flight decisions still settle.
+    void poller.current?.written();
+  }, [scopeKey, connectionRevision]);
 
   const runWrite = async (busyId: string, write: () => Promise<unknown>, failure: string) => {
     const handle = poller.current;

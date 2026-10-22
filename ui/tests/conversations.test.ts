@@ -1,6 +1,7 @@
 import { streamFixture } from "./streamFixture";
 /** CAD-1098 S3: per-app assistant conversations in the shell chat. */
 import type * as SeenModule from "../src/features/app-shell/chat/unreadSeen";
+import type * as ConversationModule from "../src/features/app-shell/chat/Conversation";
 declare function require(name: string): any;
 declare const process: { cwd(): string };
 export {};
@@ -67,6 +68,10 @@ let turn: any = null;
 // CAD-1700: the master queue in delivery order, and the board commands posted.
 let queue: { message: string; conversation: string | null }[] = [];
 let operations: unknown[] = [];
+let controlledTranscript = false;
+let holdReconnect = false;
+let disconnectTranscript: (() => void) | null = null;
+let heldOperations: Array<(response: Response) => void> | null = null;
 const commandPosts: unknown[] = [];
 // Set inside a check to hold one send in flight (pending state "sending").
 let deferSend: ((resolve: (r: Response) => void) => void) | null = null;
@@ -77,7 +82,19 @@ const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { sta
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const url = new URL(String(input), "http://localhost");
   const method = init?.method ?? "GET";
-  if (url.pathname.endsWith("/stream")) return streamFixture(url.href, { alias: "master", provider: "p", endpoint_kind: "k", live: true, turn, queue }, init?.signal);
+  if (url.pathname.endsWith("/stream")) {
+    if (!controlledTranscript || url.pathname !== "/api/threads/master/stream")
+      return streamFixture(url.href, { alias: "master", provider: "p", endpoint_kind: "k", live: true, turn, queue }, init?.signal);
+    if (holdReconnect) return new Response(null, { status: 503 });
+    let closed = false;
+    const body = new ReadableStream<Uint8Array>({ start(controller) {
+      controller.enqueue(new TextEncoder().encode(`event: master\ndata: ${JSON.stringify({ alias: "master", provider: "p", endpoint_kind: "k", live: true, turn, queue })}\n\n`));
+      const close = () => { if (!closed) { closed = true; controller.close(); } };
+      disconnectTranscript = close;
+      init?.signal?.addEventListener("abort", close, { once: true });
+    }, cancel() { closed = true; } });
+    return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
+  }
   // The CRM package's own descriptor, served pinned to the install's digest.
   if (url.pathname === "/api/app-installations/install-crm/chat-descriptor") {
     return json({ descriptor: JSON.parse(require("fs").readFileSync(require("path").join(process.cwd(), "..", "tests", "fixtures", "apps", "crm", "app-chat.json"), "utf8")), digest: "d", app: "crm" });
@@ -118,7 +135,8 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   if (url.pathname === "/api/crm-send/origin") return json({ unsubscribe_origin: null, stored: false });
   if (url.pathname === "/api/master/permissions") return json({ rules: [], requests: [{ id: "permission-old", status: "allowed_once", command: "old command", cwd: null, reason: "Previously decided", risk: "low", prefix: [] }] });
   if (url.pathname.endsWith("/assistant/actions")) return json({ actions: [] });
-  if (url.pathname.endsWith("/assistant/operations")) return json({ operations });
+  if (url.pathname.endsWith("/assistant/operations"))
+    return heldOperations === null ? json({ operations }) : new Promise<Response>((resolve) => heldOperations!.push(resolve));
   if (url.pathname.endsWith("/assistant/permissions")) return json({ permissions: [] });
   return json({ records: [], truncated: false, next_cursor: null, segments: [], exclusions: [], suppressions: [], contents: [], proposals: [], bindings: [] });
 }) as typeof fetch;
@@ -343,6 +361,13 @@ await pick("Spring launch");
   await settle();
   assert(barButton("Retry"), "the stored failed turn has a Retry action");
   await React.act(async () => {
+    conversationThread("c-gen").write((state) => ({ ...state!, pending: [...state!.pending, {
+      message: "m-older-transport-failure", text: "older failed transport brief", state: "failed", at: Date.now(),
+      refs: [{ kind: "issue", id: "CAD-A" }], attachments: [{ id: "file-a" }],
+      app: { install_id: "install-crm", context_id: "ctx-a" },
+    }] }));
+  });
+  await React.act(async () => {
     Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(box(), "later unsent draft");
     box().dispatchEvent(new Event("input", { bubbles: true }));
   });
@@ -351,7 +376,16 @@ await pick("Spring launch");
   equal(messagePosts.at(-1).app, { install_id: "install-crm", context_id: "ctx-a" }, "Retry uses the failed request's binding, never the current context or later draft");
   equal(messagePosts.at(-1).text, "retry the original request", "Retry transmits the stored request, not the later draft");
   equal(box().value, "later unsent draft", "Retry preserves the later draft");
-  threads["c-gen"].push(ent(6, "operator", "message", "retry the original request", messagePosts.at(-1).message));
+  const storedRetryMessage = messagePosts.at(-1).message;
+  const olderRow = Array.from(host.querySelectorAll(".app-chat-list li")).find((row) => row.textContent?.includes("older failed transport brief"));
+  const rowRetry = olderRow && Array.from(olderRow.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Retry");
+  assert(rowRetry, "the unrelated failed send retains its own row Retry");
+  await React.act(async () => { rowRetry.click(); });
+  await settle();
+  equal(messagePosts.at(-1).message, "m-older-transport-failure", "the row Retry alone resends its own original id");
+  equal(messagePosts.at(-1).refs, [{ kind: "issue", id: "CAD-A" }], "row Retry retains the captured references");
+  equal(messagePosts.at(-1).attachments, [{ id: "file-a" }], "row Retry retains the captured files");
+  threads["c-gen"].push(ent(6, "operator", "message", "retry the original request", storedRetryMessage));
   await React.act(async () => {
     await conversationThread("c-gen").refresh();
     Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(box(), "");
@@ -453,6 +487,62 @@ assert(box().disabled, "the composer (and so /new) is disabled read-only");
 await React.act(async () => { newButton().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 await settle();
 equal(createPosts.length, before, "no conversation is created read-only");
+
+// Context navigation cannot manufacture a successful network reconnect.
+const Conversation = (require("../src/features/app-shell/chat/Conversation") as typeof ConversationModule).default;
+const renderPane = async (contextId: string) => {
+  await React.act(async () => {
+    root.render(React.createElement(LocaleProvider, null, React.createElement(Conversation, {
+      mode: { kind: "app", installId: "install-crm", contextId, screen: null, recordOpen: false,
+        contextName: null, scopeLabel: "CRM", descriptor: null, conversationRequest: null,
+        contextProof: { status: "ready", contextId, error: null }, appPath: null,
+        fileUpload: { declared: false, available: false }, fileUploadLoading: false },
+      density: "compact", viewer: { operator: true, readOnly: false },
+      binding: { scope: { install_id: "install-crm", context_id: contextId }, error: null },
+      onFileUploadUnavailable: () => undefined, collapsed: false,
+      onCollapsed: () => undefined, onOpenView: () => undefined,
+    })));
+  });
+  await settle();
+};
+controlledTranscript = true;
+turn = { state: "working", message: "m-reconnect", conversation: "c-gen" };
+await renderPane("ctx-a");
+await pick("General");
+assert(barButton("Stop"), "the connected General pane has its own live turn");
+holdReconnect = true;
+await React.act(async () => { disconnectTranscript?.(); });
+await settle();
+assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "the actual stream disconnect hides turn actions");
+await renderPane("ctx-b");
+assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "a same-conversation context change must not declare the disconnected stream live");
+
+// A fresh snapshot is not actionable until this scope's operation read
+// has reconciled. A failed read remains stale, then a real Retry recovers.
+await React.act(async () => { root.render(null); });
+holdReconnect = false;
+heldOperations = [];
+await renderPane("ctx-a");
+assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "a turn snapshot cannot enable Stop before scoped approval reconciliation");
+// Settle the discarded pre-snapshot batch, then its fenced follow-up.
+for (let batch = 0; batch < 2; batch++) {
+  await React.act(async () => { heldOperations!.splice(0).forEach((resolve) => resolve(json({ error: "Unavailable" }, 503))); });
+  await settle();
+}
+assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "failed post-reconnect operation reads keep actions hidden");
+operations = [{
+  id: "op-reconnected", action_id: "customer.tags.update", status: "pending_permission", revision: 1,
+  summary: "Review the reconnected change", resource_refs: [],
+  permission_request: { reason: "This changes one customer", allow_always: true,
+    scope: { install_id: "install-crm", context_id: "ctx-a", action_id: "customer.tags.update", resource_id: "ada" },
+    preview: { customer_label: "Ada", before_tags: [], after_tags: ["vip"], expected_revision: 1 } },
+}];
+heldOperations = null;
+const retryActivity = Array.from(host.querySelectorAll(".app-assistant-activity button")).find((button) => button.textContent?.trim() === "Retry");
+assert(retryActivity, "the failed activity read offers its existing Retry");
+await React.act(async () => { (retryActivity as HTMLButtonElement).click(); });
+await settle();
+assert(!bar()?.dataset.stale && barButton("Review") && !barButton("Stop") && host.querySelector('[data-operation-status="pending_permission"]'), "reconciliation exposes the real approval card and Review, never a transient Stop");
 await React.act(async () => { root.unmount(); });
 console.log("conversations checks passed");
 }

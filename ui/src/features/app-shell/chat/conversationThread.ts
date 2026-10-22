@@ -26,6 +26,7 @@ export function useThreadStream(
   url: string | null,
   enabled: boolean,
   onLink: (state: "live" | SseErrorState) => void,
+  onSnapshot?: () => void,
 ): void {
   useEffect(() => {
     if (!enabled || url === null) {
@@ -37,6 +38,7 @@ export function useThreadStream(
       if (event.type === "master") {
         const snapshot = JSON.parse(event.data) as MasterState;
         resources.masterState.write(() => snapshot);
+        onSnapshot?.();
         onLink("live");
         return data ?? EMPTY_THREAD;
       }
@@ -52,7 +54,7 @@ export function useThreadStream(
       },
     });
     return () => sub.close();
-    // `onLink` is a state setter at both call sites; the stream must not
+    // Both callbacks are stable at the call sites; the stream must not
     // reopen when a parent re-renders.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [store, url, enabled]);

@@ -2338,9 +2338,11 @@ its bubble (CAD-1419/CAD-1462).
 The shared turn bar (CAD-1700) names the conversation actually ahead of a
 queued message, including Home's server-issued thread id. View opens that
 predecessor, not necessarily the running turn's app. Review skips decided
-permission history and reaches the pending actionable card. A stored
-failed request retries its original app/context binding, not the current
-workspace scope or a later draft.
+permission history and reaches the pending actionable card. Mounted cards
+refresh on pushed permission changes and ignore superseded reads. The bar
+retries the stored failure it displays with a fresh message id and its
+original content/app binding. An unrelated transport failure keeps its own
+same-id row Retry; neither action uses a later draft.
 
 The shell loads conversation replies on mount and observes them while their
 pane is offscreen: an app reply opens its exact conversation, and a Home
@@ -2357,10 +2359,11 @@ The shared board watcher samples the master stamp every 250 ms while other
 tracker/agent work keeps its one-second cadence. Master invalidations
 bypass the client's trailing legacy batch. Each connection to
 `/api/threads/master/stream` starts with an authoritative `master` state
-snapshot, before any resumed `entry` frame. The bar keeps actions hidden
-until that snapshot arrives; opening the socket alone does not make cached
-turn state live. `Last-Event-ID` takes precedence over the query cursor.
-
+snapshot, before any resumed `entry` frame. App actions additionally wait
+for the captured install/context operation reader to reconcile that
+connection; read errors keep the bar last-known. Opening the socket or
+switching context cannot make cached turn state live.
+`Last-Event-ID` takes precedence over the query cursor.
 
 A plan the thread mentions (or a `plan` row in Needs you) renders as a
 card — goal, tickets with size and acceptance, weighted progress, and

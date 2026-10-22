@@ -714,7 +714,9 @@ function MasterHome({
     master.data,
     homeConversation,
   );
-  const failedSend = (thread.data?.pending ?? []).find((p) => p.state === "failed") ?? null;
+  const failedEntry = turnBar.kind === "failed" && turnBar.message !== null
+    ? threadEntries.find((entry) => entry.role === "operator" && entry.message === turnBar.message) ?? null
+    : null;
   const serverTurn = master.data?.turn;
   // `turnState` retains the message id for working turns. For queued turns
   // it drops that id, so recover it only when its server-derived display
@@ -1203,30 +1205,33 @@ function MasterHome({
                 onStop: (message) => runTurnCommand("stop", message),
                 onCancel: (message) => runTurnCommand("cancel", message),
                 onRetry:
-                  failedSend !== null
-                    ? () => onRetrySend(failedSend.message, failedSend.text)
-                    : turnBar.kind === "failed" && turnBar.message !== null
-                      ? () => {
-                          const entry = threadEntries.find((e) => e.message === turnBar.message && e.role === "operator");
-                          if (!entry) return;
-                          engage();
-                          const payload = entry.payload ?? {};
-                          const list = (key: string) => (Array.isArray(payload[key]) ? (payload[key] as unknown[]) : []);
-                          const refs = list("refs").flatMap((item) => {
-                            const r = item as { kind?: unknown; id?: unknown };
-                            return typeof r.kind === "string" && typeof r.id === "string"
-                              ? [{ kind: r.kind, id: r.id }]
-                              : [];
-                          });
-                          const attachments = list("attachments").flatMap((item) => {
-                            const a = item as { id?: unknown };
-                            return typeof a.id === "string" ? [{ id: a.id }] : [];
-                          });
-                          const conversation =
-                            typeof payload.conversation === "string" ? payload.conversation : undefined;
-                          void sendToMaster(entry.text, newMessageId(), refs, attachments.length ? attachments : undefined, conversation);
-                        }
-                      : undefined,
+                  failedEntry !== null
+                    ? () => {
+                        engage();
+                        const payload = failedEntry.payload ?? {};
+                        const list = (key: string) => (Array.isArray(payload[key]) ? (payload[key] as unknown[]) : []);
+                        const refs = list("refs").flatMap((item) => {
+                          const r = item as { kind?: unknown; id?: unknown };
+                          return typeof r.kind === "string" && typeof r.id === "string"
+                            ? [{ kind: r.kind, id: r.id }]
+                            : [];
+                        });
+                        const attachments = list("attachments").flatMap((item) => {
+                          const a = item as { id?: unknown };
+                          return typeof a.id === "string" ? [{ id: a.id }] : [];
+                        });
+                        const mediaRefs = list("media_refs").flatMap((item) => {
+                          if (!item || typeof item !== "object") return [];
+                          const ref = item as Record<string, unknown>;
+                          return typeof ref.asset_id === "string" && typeof ref.revision === "number" && typeof ref.sha256 === "string"
+                            ? [{ asset_id: ref.asset_id, revision: ref.revision, sha256: ref.sha256 }]
+                            : [];
+                        });
+                        const conversation =
+                          typeof payload.conversation === "string" ? payload.conversation : undefined;
+                        void sendToMaster(failedEntry.text, newMessageId(), refs, attachments.length ? attachments : undefined, conversation, undefined, mediaRefs.length ? mediaRefs : undefined);
+                      }
+                    : undefined,
                 onView: turnBar.kind === "queued" && aheadHref !== null
                   ? aheadHref === "/" ? jumpToLatest : () => window.location.assign(aheadHref)
                   : undefined,

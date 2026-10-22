@@ -25,11 +25,13 @@ export function usePendingPermission(entries: ThreadEntry[]): boolean {
     }
     const wanted = new Set(key.split(","));
     let alive = true;
+    let revision = 0;
     const read = () => {
+      const current = ++revision;
       api
         .permissionRules()
         .then((out) => {
-          if (alive) setPending(out.requests.some((r) => wanted.has(r.id) && r.status === "pending"));
+          if (alive && current === revision) setPending(out.requests.some((r) => wanted.has(r.id) && r.status === "pending"));
         })
         .catch(() => undefined);
     };
