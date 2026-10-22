@@ -110,6 +110,7 @@ pub fn brief_agent(
     let dir = state_dir.join("briefings").join(root_alias);
     std::fs::create_dir_all(&dir)?;
     let file = client::briefing_path(state_dir, &agent["params"], alias);
+    let file_existed = file.exists();
     let instructions = match instructions {
         Some(text) => Some(text.to_string()),
         None => agent["instructions"]
@@ -178,15 +179,87 @@ pub fn brief_agent(
                 exposed_file.display()
             )
         };
-        client::rpc_relay(
+        let sent = client::rpc_relay(
             state_dir,
             "agent_send",
             json!({"alias": alias, "text": body,
                    "message": format!("bootstrap-{alias}"),
                    "source": "bootstrap"}),
-        )?;
+        );
+        if let Err(err) = sent {
+            // A briefing this call created must not outlive a kickoff
+            // that never queued; one that already existed is left alone.
+            if !file_existed {
+                let _ = std::fs::remove_file(&file);
+                let _ = std::fs::remove_file(&exposed_file);
+            }
+            return Err(err);
+        }
     }
     Ok(exposed_file)
+}
+
+/// Whether `alias` runs an actor that can read a briefing file. `None`
+/// when the agent cannot be read at all.
+fn briefable(state_dir: &Path, alias: &str) -> Option<(bool, bool)> {
+    let shown = client::rpc(state_dir, "agent_show", json!({"alias": alias, "limit": 0})).ok()?;
+    let provider = shown["agent"]["provider"].as_str().unwrap_or_default();
+    let kind = shown["agent"]["endpoint_kind"].as_str().unwrap_or_default();
+    let cloud = provider == "devin" && kind == "cloud";
+    Some((registry::has_actor(provider, kind), cloud))
+}
+
+/// CAD-1752: brief an agent the board just registered, as `cadence join`
+/// does: the briefing carries `instructions` and the durable kickoff is
+/// queued (it waits for the endpoint like any queued message). A failure
+/// never fails the register: `out["briefing"]` is the path or `{error}`.
+/// A mailbox has nothing to brief and gets no field.
+pub fn brief_registered(
+    state_dir: &Path,
+    alias: &str,
+    instructions: Option<&str>,
+    out: &mut Value,
+) {
+    if !matches!(briefable(state_dir, alias), Some((true, _))) {
+        return;
+    }
+    out["briefing"] = match brief_agent(state_dir, alias, true, instructions) {
+        Ok(path) => json!(path),
+        Err(err) => json!({"error": err.to_string()}),
+    };
+}
+
+/// CAD-1752: after `agent_instructions_set` succeeded, rewrite the
+/// briefing with the new text and queue one short message telling the
+/// agent to re-read it. The agent is never restarted. On success `out`
+/// gains `briefing` and `applies: "next_turn"`; on failure `briefing` is
+/// `{error}` and `applies` stays as the daemon reported it. A Devin cloud
+/// session cannot read host paths, so it keeps `next_launch`.
+pub fn deliver_job_update(state_dir: &Path, alias: &str, text: &str, out: &mut Value) {
+    match briefable(state_dir, alias) {
+        Some((true, false)) => {}
+        _ => return,
+    }
+    let result = brief_agent(state_dir, alias, false, Some(text)).and_then(|path| {
+        let digest = crate::delegation::sha256_hex(text.as_bytes());
+        client::rpc_relay(
+            state_dir,
+            "agent_send",
+            json!({"alias": alias,
+                   "text": format!(
+                       "Your job was updated by the operator \u{2014} re-read your briefing ({}) before your next step.",
+                       path.display()),
+                   "message": format!("job-update-{alias}-{}", &digest[..12])}),
+        )?;
+        Ok(path)
+    });
+    match result {
+        Ok(path) => {
+            out["briefing"] = json!(path);
+            out["applies"] = json!("next_turn");
+        }
+        Err(err) => out["briefing"] = json!({"error": err.to_string()}),
+    }
 }
 
 fn copy_briefing_as_agent(path: &Path, body: &[u8]) -> Result<()> {

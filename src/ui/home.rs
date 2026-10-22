@@ -901,10 +901,14 @@ pub(super) fn agent_action(
                     &format!("instructions takes the text only — '{extra}' is not accepted"),
                 );
             }
-            (
-                "agent_instructions_set",
-                json!({"alias": alias, "instructions": text}),
-            )
+            let params = json!({"alias": alias, "instructions": text});
+            return match client::rpc(state_dir, "agent_instructions_set", params) {
+                Ok(mut out) => {
+                    crate::briefing::deliver_job_update(state_dir, alias, text, &mut out);
+                    json_response(out)
+                }
+                Err(e) => rpc_err(&e, "agent_instructions_set"),
+            };
         }
         _ => return err_response(404, "no such agent route"),
     };

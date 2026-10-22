@@ -468,8 +468,21 @@ pub(crate) fn post_agent(request: &mut Request, state_dir: &Path) -> HttpResp {
             "instructions": req.instructions,
             "params": req.params,
         });
+        let instructions = match (&req.instructions, req.catalogue.as_deref()) {
+            (Some(text), _) => Some(text.clone()),
+            (None, Some(id)) => crate::agent_roles::find(id).map(|role| role.instructions()),
+            (None, None) => None,
+        };
         return match client::rpc(state_dir, "agent_register", params) {
-            Ok(out) => json_response(out),
+            Ok(mut out) => {
+                crate::briefing::brief_registered(
+                    state_dir,
+                    req.alias.trim(),
+                    instructions.as_deref(),
+                    &mut out,
+                );
+                json_response(out)
+            }
             Err(err) => super::home::rpc_err(&err, "agent_register"),
         };
     }
@@ -493,7 +506,16 @@ pub(crate) fn post_agent(request: &mut Request, state_dir: &Path) -> HttpResp {
         "params": req.params,
     });
     match client::rpc(state_dir, "agent_register", params) {
-        Ok(out) => json_response(out),
+        Ok(mut out) => {
+            // CAD-1752: brief a board-registered agent as `join` does.
+            crate::briefing::brief_registered(
+                state_dir,
+                req.alias.trim(),
+                req.instructions.as_deref(),
+                &mut out,
+            );
+            json_response(out)
+        }
         Err(err) => super::home::rpc_err(&err, "agent_register"),
     }
 }

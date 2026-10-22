@@ -909,11 +909,13 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
                 Some(&file),
                 cadence_agent::store::MAX_INSTRUCTIONS_BYTES as u64,
             )?;
-            client::rpc(
+            let mut out = client::rpc(
                 &state_dir,
                 "agent_instructions_set",
                 json!({"alias": alias, "instructions": text}),
-            )?
+            )?;
+            cadence_agent::briefing::deliver_job_update(&state_dir, &alias, &text, &mut out);
+            out
         }
         AgentAction::Remove { alias, force } => client::rpc(
             &state_dir,

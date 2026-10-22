@@ -2589,13 +2589,14 @@ impl Shared {
                         ))
                     }
                 };
+                // CAD-1752: a catalogue agent's stored job is read the same
+                // way a profile agent's is, under the same caller rule, so a
+                // refreshed briefing keeps it.
                 let profile_snapshot = include_profile_instructions
-                    && agent
-                        .params
-                        .as_ref()
-                        .and_then(|params| params.get("profile"))
-                        .and_then(Value::as_str)
-                        .is_some();
+                    && agent.params.as_ref().is_some_and(|params| {
+                        params.get("profile").and_then(Value::as_str).is_some()
+                            || params.get("catalogue").and_then(Value::as_str).is_some()
+                    });
                 if profile_snapshot {
                     self.authorize_agent_mutation(
                         params,
