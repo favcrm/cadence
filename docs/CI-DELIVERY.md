@@ -340,6 +340,15 @@ non-green latest execution, missing or ambiguous provenance, or a missing,
 expired or foreign-run artifact fails the aggregate instead of falling
 back to an older success.
 
+An indexed `queued`/`in_progress` shard row is reconciled once by immutable
+job ID (CAD-1758): a successful matrix dependency can precede publication
+of its terminal state in the jobs index. The current record must match
+the row's ID, run, attempt, head and name before the same provenance and
+latest-execution checks apply. Terminal indexed failures are never
+refreshed into success. An unreadable, malformed, foreign or still
+nonterminal record refuses the aggregate; there is no sleep, retry loop
+or fallback to older evidence.
+
 ## Why shards compile themselves (CAD-869)
 
 CAD-858 (#603) tried a serial `test-build` producer that archived the
