@@ -512,13 +512,34 @@ impl Shared {
                             Ok(Some(workdir)) => {
                                 let _ = self.store.requeue(&message.id);
                                 let _ = self.store.set_agent_state_if(alias, "idle", "busy");
-                                self.relaunch_for_lane(
+                                if let Err(error) = self.relaunch_for_lane(
                                     ctl,
                                     &mut agent,
                                     &mut adapter,
                                     &workdir,
                                     &message,
-                                )?;
+                                ) {
+                                    // The endpoint could not be reopened in the
+                                    // lane: settle this message once, with the
+                                    // reason, and fence the agent on the error.
+                                    // No second attempt, no fresh session, no
+                                    // wider grant.
+                                    let reason = format!(
+                                        "relaunch for {} failed: {error}",
+                                        message.issue.as_deref().unwrap_or("the task")
+                                    );
+                                    let failed = json!({"status": "failed", "text": "",
+                                                "error": reason});
+                                    self.store.finish(
+                                        &message,
+                                        "failed",
+                                        &failed,
+                                        Some(&reason),
+                                    )?;
+                                    self.notify_routed_target(&message, &failed);
+                                    self.wake();
+                                    return Err(error);
+                                }
                                 continue;
                             }
                             Err(Error::PreWrite(reason)) => {
