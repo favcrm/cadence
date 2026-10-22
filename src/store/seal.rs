@@ -71,9 +71,10 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// lineage. v51 (CAD-792) adds `app_run_artifact_fetches`, the worker
 /// dependency-fetch receipt. v52 (CAD-1548) adds `settings_authority`.
 /// v53 (CAD-804) adds `agents.gc_keep`; v54 (CAD-1239) adds the archive
-/// marker and triggers; v55 (CAD-1353) adds `messages.stall_secs`. None
-/// changes a latch or witness table, so the bound extends to 55.
-const PROTECTED_SCHEMA_MAX: i64 = 55;
+/// marker and triggers; v55 (CAD-1353) adds `messages.stall_secs`; v56
+/// (CAD-1726) adds the `artifacts` table. None
+/// changes a latch or witness table, so the bound extends to 56.
+const PROTECTED_SCHEMA_MAX: i64 = 56;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must

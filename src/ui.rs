@@ -42,6 +42,7 @@ mod app_screens;
 mod app_social_drafts;
 mod approvals;
 mod apps;
+mod artifacts;
 mod assist_route;
 mod business_templates;
 #[cfg(all(test, feature = "test-seam"))]

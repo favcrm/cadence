@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+use super::artifacts;
 use super::human_threads;
 use super::notify_service;
 use super::setup::{board_boot_agent_uid, setup_get, setup_refusal, WRITE_LOCK};
@@ -1160,6 +1161,17 @@ fn read_dispatch(
                 Err(error) => err_response(404, &error),
             }
         }
+        endpoints::RouteId::ArtifactRead => artifacts::read(
+            request,
+            state_dir,
+            bound.get("artifact").unwrap_or_default(),
+            bound.get("version").unwrap_or_default(),
+        ),
+        endpoints::RouteId::ArtifactVersions => artifacts::versions(
+            request,
+            state_dir,
+            bound.get("artifact").unwrap_or_default(),
+        ),
         endpoints::RouteId::ConversationsRead => {
             let install = bound.get("id").unwrap_or_default();
             threads::conversations(state_dir, crate::master::ALIAS, &|key: &str| {

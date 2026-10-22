@@ -382,6 +382,22 @@ const CATALOG: &[(&str, &[&str])] = &[
             "digest",
         ],
     ),
+    (
+        "artifacts",
+        &[
+            "id",
+            "version",
+            "kind",
+            "title",
+            "bytes",
+            "digest",
+            "scope",
+            "context_id",
+            "thread_id",
+            "created_by",
+            "created",
+        ],
+    ),
     ("assist_job_shares", &["job", "org", "shared_by", "created"]),
     (
         "assist_requests",
@@ -2330,7 +2346,7 @@ fn exclusions() -> Vec<String> {
         "live execution authority nulled: agents.generation, pid, pid_start, endpoint, thread_id, session_id, params; messages.turn_id; token-shaped values redacted by the existing scrub",
         "imported actors disabled: agents.enabled=0; monitors dispatch flags=0",
         "provenance purged: connection_metadata (source UUID recorded in the manifest only), model_defaults, settings_authority",
-        "business app data outside the coordination profile: app_*, crm_*, social_publish_intents, cloud_dispatch_outbox, chat_files (rows deleted from the private copy; declared omitted, not a full workspace)",
+        "business app data outside the coordination profile: app_*, crm_*, social_publish_intents, cloud_dispatch_outbox, chat_files, artifacts (rows deleted from the private copy; declared omitted, not a full workspace)",
         "local checkouts, process identity, sockets and runtime files: not included",
     ]
     .iter()

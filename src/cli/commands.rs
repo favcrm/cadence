@@ -1181,6 +1181,13 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: TopicAction,
     },
+    /// Put a file on the agent canvas (CAD-1726): `artifact put --kind md
+    /// --title T --file F`. Only the master's live turn may; the same
+    /// `--id` again adds a version.
+    Artifact {
+        #[command(subcommand)]
+        action: ArtifactAction,
+    },
     /// A retained chat attachment (CAD-1168): `attachment read <id>`
     /// returns its bounded text (txt/md/csv). The operator reads any
     /// retained id; the master reads only an id on its own running

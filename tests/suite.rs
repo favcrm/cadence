@@ -94,6 +94,7 @@ mod cad1624_omp_gate_refusal_acceptance;
 mod cad1638_guest_directory_refusal;
 mod cad1703_my_work_acceptance;
 mod cad1713_dev_provider_gate;
+mod cad1726_artifact_put_file_confinement;
 mod cad508_restart_window;
 mod cad832_sharing_refusal;
 mod cad848_lifecycle_serialization;

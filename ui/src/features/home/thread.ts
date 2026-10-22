@@ -16,7 +16,7 @@ import type { SseEvent } from "../../lib/sse";
  */
 
 export type ThreadRole = "operator" | "agent" | "system";
-export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result";
+export type ThreadKind = "message" | "assistant_text" | "tool_call" | "tool_result" | "turn_result" | "artifact";
 
 /** One stored entry (`thread_read` / the stream's `entry` frame). */
 export interface ThreadEntry {
@@ -212,6 +212,7 @@ export type ThreadItem =
   | { type: "commentary"; key: string; entry: ThreadEntry }
   | { type: "tools"; key: string; entries: ThreadEntry[] }
   | { type: "answer"; key: string; entry: ThreadEntry }
+  | { type: "artifact"; key: string; entry: ThreadEntry }
   | { type: "pending"; key: string; pending: PendingMessage };
 
 const TOOL_KINDS = new Set(["tool_call", "tool_result"]);
@@ -234,6 +235,9 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
       items.push({ type: "commentary", key, entry });
     } else if (entry.kind === "turn_result") {
       items.push({ type: "answer", key, entry });
+    } else if (entry.kind === "artifact") {
+      // CAD-1726: a card for a canvas artifact — metadata, never content.
+      items.push({ type: "artifact", key, entry });
     } else if (entry.role === "operator") {
       items.push({ type: "operator", key, entry });
     } else {

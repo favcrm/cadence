@@ -50,6 +50,9 @@ pub const KIND_ASSISTANT_TEXT: &str = "assistant_text";
 pub const KIND_TOOL_CALL: &str = "tool_call";
 pub const KIND_TOOL_RESULT: &str = "tool_result";
 pub const KIND_TURN_RESULT: &str = "turn_result";
+/// CAD-1726: a card for an agent-put canvas artifact — metadata only,
+/// never the content. Never returned to a member reader.
+pub const KIND_ARTIFACT: &str = "artifact";
 
 const ROLES: &[&str] = &[ROLE_OPERATOR, ROLE_AGENT, ROLE_SYSTEM, ROLE_MEMBER];
 const KINDS: &[&str] = &[
@@ -58,6 +61,7 @@ const KINDS: &[&str] = &[
     KIND_TOOL_CALL,
     KIND_TOOL_RESULT,
     KIND_TURN_RESULT,
+    KIND_ARTIFACT,
 ];
 
 /// Entry text cap. Queued messages are at most 48 000 bytes; a longer
@@ -1086,6 +1090,17 @@ impl Store {
             };
             Self::thread_write_in(tx, &thread, entry).map(Some)
         })
+    }
+
+    /// Append inside a caller's transaction to one thread by id.
+    pub(super) fn thread_write_by_id_in(
+        tx: &impl super::StoreConn,
+        thread_id: &str,
+        entry: NewEntry,
+    ) -> Result<i64> {
+        let thread = Self::thread_by_id_in(tx, thread_id)?
+            .ok_or_else(|| Error::rejected("Unknown conversation"))?;
+        Self::thread_write_in(tx, &thread, entry)
     }
 
     fn thread_write_in(

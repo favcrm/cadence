@@ -140,6 +140,7 @@ fn archive_expected_revs(params: &Value) -> Result<Vec<(String, i64)>> {
     Ok(out)
 }
 
+mod artifacts_rpc;
 #[cfg(test)]
 mod cad1210_acceptance;
 #[cfg(test)]
@@ -2768,6 +2769,9 @@ impl Shared {
             "thread_send" => self.rpc_thread_send(params, peer_pid),
             "chat_file_upload" => self.rpc_chat_file_upload(params, peer_pid),
             "chat_file_read" => self.rpc_chat_file_read(params, peer_pid),
+            "artifact_put" => self.rpc_artifact_put(params, peer_pid),
+            "artifact_read" => self.rpc_artifact_read(params, peer_pid),
+            "artifact_versions" => self.rpc_artifact_versions(params, peer_pid),
             "conversation_list" => self.rpc_conversation_list(params, peer_pid),
             "work_conversation_list" => self.rpc_work_conversation_list(params, peer_pid),
             "topic_create" => self.rpc_topic_create(params, peer_pid),

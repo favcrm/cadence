@@ -8233,3 +8233,135 @@ include!("cad1568_reviewer_acceptance.rs");
 include!("cad1568_master_recipient_acceptance.rs");
 include!("cad1584_selected_uid_lifecycle_acceptance.rs");
 include!("cad1584_master_http_acceptance.rs");
+
+/// CAD-1726 acceptance (reviewer-written, not the implementer's): "Hosted:
+/// ... a member sees no card in `MemberChat` and is refused by the read
+/// route." A real artifact card (written by the store's own put path) sits
+/// between two ordinary replies in the member's bound conversation. The
+/// operator's view of that thread holds the card (control); the member's
+/// `member_assist_history` returns both replies and never the card, on the
+/// forward branch and on both paged branches (`tail`, `before`). The
+/// member's assistant identity and a member envelope are refused by
+/// `artifact_read`.
+///
+/// Guards: `operator_only_entries_hidden` in `rpc_member_assist_history`
+/// (daemon/members_rpc.rs); `artifact_operator` + `reject_artifact_fields`
+/// (daemon/artifacts_rpc.rs).
+#[test]
+fn cad1726_member_history_never_carries_an_artifact_card() {
+    use crate::store::{ArtifactStore, LocalArtifacts, NewEntry, PutArtifact};
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    let rt = fx.member_runtime("sub-ana");
+    let reply = |text: &str| {
+        fx.shared
+            .store
+            .thread_append_to(
+                &rt.thread_id,
+                NewEntry {
+                    role: "agent",
+                    kind: "assistant_text",
+                    text,
+                    payload: None,
+                    message_id: None,
+                },
+            )
+            .unwrap()
+            .expect("the member's bound thread exists")
+    };
+    reply("visible reply one");
+    let card = LocalArtifacts {
+        store: &fx.shared.store,
+        state_dir: &fx.shared.state_dir,
+    }
+    .put(
+        PutArtifact {
+            id: None,
+            kind: "md",
+            title: "Operator-only canvas",
+            thread_id: &rt.thread_id,
+            scope: "home",
+            context_id: "",
+            created_by: "master",
+            message_id: "m-cad1726-member",
+        },
+        b"# operator only",
+    )
+    .unwrap();
+    let last = reply("visible reply two");
+
+    // Control: the operator's view of the same thread holds the card.
+    let all = fx
+        .shared
+        .store
+        .thread_entries_of(&rt.thread_id, 0, 100)
+        .unwrap();
+    assert!(
+        all.iter().any(|e| e.kind == "artifact"
+            && e.payload
+                .as_ref()
+                .is_some_and(|p| p["id"] == json!(card.id))),
+        "the card was not written to the member's thread"
+    );
+
+    let env = fx.member_envelope("sub-ana");
+    for (branch, params) in [
+        ("forward", json!({"member_envelope": env, "after": 0})),
+        ("tail", json!({"member_envelope": env, "tail": true})),
+        (
+            "before",
+            json!({"member_envelope": env, "before": last + 1}),
+        ),
+    ] {
+        let page = fx.op("member_assist_history", params);
+        assert_eq!(
+            page["conversation"]["id"],
+            json!(rt.thread_id),
+            "{branch}: {page}"
+        );
+        let entries = page["entries"].as_array().unwrap();
+        let texts: Vec<&str> = entries.iter().filter_map(|e| e["text"].as_str()).collect();
+        assert!(
+            texts.contains(&"visible reply one") && texts.contains(&"visible reply two"),
+            "{branch}: the member lost an ordinary entry: {page}"
+        );
+        assert!(
+            entries.iter().all(|e| e["kind"] != json!("artifact")),
+            "{branch}: a member received an artifact card: {page}"
+        );
+        let raw = page.to_string();
+        assert!(
+            !raw.contains(&card.id) && !raw.contains("Operator-only canvas"),
+            "{branch}: the card leaked into the member page: {raw}"
+        );
+    }
+
+    // The member is refused by the read route: as its assistant agent,
+    // and with its envelope on the operator channel.
+    let err = err_text(
+        fx.as_assistant(
+            &rt.alias,
+            "artifact_read",
+            json!({"id": card.id, "version": 1, "conversation": rt.thread_id}),
+        ),
+        "assistant artifact_read",
+    );
+    // The member boundary refuses first (the assist agent's surface is
+    // its own conversation); the artifact handler would refuse an agent too.
+    assert!(
+        err.contains("may not call 'artifact_read'") && err.contains("member boundary"),
+        "assistant artifact_read: {err}"
+    );
+    let err = err_text(
+        fx.op_err(
+            "artifact_read",
+            json!({"member_envelope": env, "id": card.id, "version": 1,
+                   "conversation": rt.thread_id}),
+        ),
+        "member envelope artifact_read",
+    );
+    assert!(
+        err.contains("'member_envelope' is not accepted"),
+        "member envelope artifact_read: {err}"
+    );
+}

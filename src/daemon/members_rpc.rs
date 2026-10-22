@@ -1699,6 +1699,7 @@ impl Shared {
                 .store
                 .thread_entries_before_of(&thread.id, before, limit)?;
             let cursor = entries.last().map(|e| e.seq).unwrap_or(0);
+            let entries = operator_only_entries_hidden(entries);
             return Ok(json!({
                 "conversation": thread.to_json(),
                 "entries": entries.iter().map(store::ThreadEntry::to_json).collect::<Vec<_>>(),
@@ -1711,7 +1712,10 @@ impl Shared {
             return Err(Error::rejected("history cursor must be nonnegative"));
         }
         let entries = self.store.thread_entries_of(&thread.id, after, limit)?;
+        // The cursor advances past hidden entries too, so a page that is
+        // all artifact cards never stalls the member's poll.
         let cursor = entries.last().map(|e| e.seq).unwrap_or(after);
+        let entries = operator_only_entries_hidden(entries);
         Ok(json!({
             "conversation": thread.to_json(),
             "entries": entries.iter().map(store::ThreadEntry::to_json).collect::<Vec<_>>(),
@@ -2579,4 +2583,13 @@ impl Shared {
         }
         Ok(Some(out))
     }
+}
+
+/// CAD-1726: artifact cards are the operator's; a member reader never sees
+/// one (an allowlist of what a member may read, not a hide list of titles).
+fn operator_only_entries_hidden(entries: Vec<store::ThreadEntry>) -> Vec<store::ThreadEntry> {
+    entries
+        .into_iter()
+        .filter(|e| e.kind != store::KIND_ARTIFACT)
+        .collect()
 }

@@ -36,27 +36,25 @@ Command rules — a hard guard enforces them before anything runs:
 - Long bash output spills to files under your own tmp dir; where your
   provider offers a file-read tool (Pi's `read`), it opens only paths
   inside that dir — re-read the spill instead of re-running the query.
-- Pi's `write` tool creates files only inside that same tmp dir. Use
-  it to stage anything a command reads with `--file`. No stdin, no
-  heredoc, no quotes. A refusal that names the tmp dir means: write
-  the file there, then pass `--file`.
-- A refusal names the rule it hit and the nearest allowed form. Take
-  the hint; anything else is denied without a prompt.
+- Pi's `write` tool creates files only inside that same tmp dir; use
+  it to stage what a command reads with `--file`. No stdin, heredoc or
+  quotes. A refusal naming the tmp dir: write the file there, pass `--file`.
+- A refusal names the rule it hit and the nearest allowed form; take
+  the hint.
 
 Look around (read-only):
 
 - `cadence help` — the command paths you may run; `cadence help
-  <command-path>` (e.g. `cadence help issue new`, `cadence help
-  project new`) prints that path's exact usage and your limits. Only
-  literal command paths: no flags, no argument values, never
-  `cadence --help` or `cadence help --all` — the guard refuses them.
+  <command-path>` prints that path's exact usage and your limits. Only
+  literal command paths: no flags or values, never `cadence --help`
+  or `cadence help --all`.
 - `cadence issue ls --summary --json` — the one-call status: per-project
   counts plus the P0/P1 items in doing/review. Reach for it first when
   asked how the projects stand.
 - `cadence issue ls --json [--project P] [--open] [--status ready]` — tickets.
 - `cadence issue show <ID> --json` — one ticket: acceptance, reports, links.
 - `cadence issue log <ID>` — a ticket's history.
-- `cadence issue epic ls --fields id,project,title,status,priority,owner,total,done_ratio,blocked,counts` — under the clip. `cadence issue epic show <ID>` — one epic; children: `cadence issue ls --epic <ID> --fields id,title,status --json`.
+- `cadence issue epic ls --fields id,project,title,status,priority,owner,total,done_ratio,blocked,counts` ; `cadence issue epic show <ID>` — one epic; children: `cadence issue ls --epic <ID> --fields id,title,status --json`.
 - `cadence issue project ls` — projects.
 - `cadence plan ls`, `cadence plan show <EPIC>` — plans: state, tickets,
   progress.
@@ -67,6 +65,8 @@ Look around (read-only):
   many agents are running"; never estimate it without it.
 - `cadence agent list [--all]`, `cadence agent show <alias>` —
   registered agents and one agent's record.
+- `cadence artifact put --kind md|pdf|html|image|csv --title <t> --file <f in master/tmp> [--id <id>]` —
+  show a result beside the chat; the same `--id` adds a version.
 - `cadence attachment read <id>` — one chat attachment your
   turn was sent (the id comes from your message's Attachments
   envelope, never anywhere else; output is JSON). Text kinds return

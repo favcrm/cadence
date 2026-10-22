@@ -3,6 +3,8 @@ import { useTranslate } from "../../lib/locale";
 import type { ThreadRef } from "../../lib/types";
 import Md from "../../ui/Md";
 import { attachMeta } from "../app-shell/chat/attach";
+import { askLabel } from "../canvas/askRefs";
+import ArtifactCard from "../canvas/ArtifactCard";
 import { ThreadPermission } from "./PermissionCard";
 import { stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
 
@@ -228,6 +230,8 @@ export function ThreadItemView({
       );
     case "tools":
       return <StepsGroup entries={item.entries} density={density} />;
+    case "artifact":
+      return <ArtifactCard entry={item.entry} />;
     case "answer": {
       // A failed turn carries its reason in payload.error and no text: say
       // why, instead of an empty bubble. No Retry here — the turn ran.
@@ -336,7 +340,7 @@ function RefChips({ refs, onOpenIssue }: { refs: ThreadRef[]; onOpenIssue?: (id:
           </span>
         ) : (
           <span key={`${r.kind}:${r.id}`} className="refchip num" title={`${r.kind}:${r.id}`}>
-            {r.kind}:{r.id}
+            {askLabel(r)}
           </span>
         ),
       )}

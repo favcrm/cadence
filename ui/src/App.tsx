@@ -25,6 +25,7 @@ import { issuePath, laneFollowsStream, refreshIssueIds } from "./features/issues
 import Epics from "./features/projects/Epics";
 import Milestones from "./features/projects/Milestones";
 import MasterPermissions from "./features/settings/MasterPermissions";
+import CanvasDrawer from "./features/canvas/CanvasDrawer";
 import Memory from "./features/settings/Memory";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
@@ -888,7 +889,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
 
       {/* Workspaces fill the dynamic viewport; their panes own scrolling.
           Other screens retain the natural document flow. */}
-      <div className={`min-w-0 flex flex-col ${fullHeight ? "h-full min-h-0" : ""}`}>
+      <div data-canvas-main className={`min-w-0 flex flex-col ${fullHeight ? "h-full min-h-0" : ""}`}>
         <header className="app-header sticky top-0 z-10 flex items-center gap-2 sm:gap-3 px-4 lg:px-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
           <button
             onClick={() => setMenuOpen((o) => !o)}
@@ -1325,6 +1326,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       )}
 
       <Toast msg={toast} />
+      <CanvasDrawer />
     </div>
     </WriteGate.Provider>
   );

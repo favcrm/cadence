@@ -170,6 +170,9 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     // sent — bounded text reads. The daemon resolves the live turn and
     // checks the id is on its envelope; this lets the master invoke it.
     "Bash(cadence attachment read *)",
+    // CAD-1726: put a canvas artifact on the live turn. The daemon binds
+    // the scope to that turn and refuses every other caller.
+    "Bash(cadence artifact put *)",
     // CAD-615: ask the operator to approve one plain command. The
     // decision verbs are not here — the master cannot approve itself.
     "Bash(cadence master ask-permission *)",
@@ -253,6 +256,7 @@ pub fn allowed_tools(profile: Profile) -> Vec<&'static str> {
             profile == Profile::Home
                 || t.starts_with("Bash(cadence app ")
                 || *t == "Bash(cadence attachment read *)"
+                || *t == "Bash(cadence artifact put *)"
         })
         .collect()
 }
@@ -1864,7 +1868,9 @@ mod tests {
             app.iter().all(|p| p == "app"
                 || p.starts_with("app ")
                 || p == "attachment"
-                || p.starts_with("attachment ")),
+                || p.starts_with("attachment ")
+                || p == "artifact"
+                || p.starts_with("artifact ")),
             "{app:?}"
         );
     }

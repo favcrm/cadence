@@ -1,4 +1,5 @@
 import { chatContext } from "../chatScreen";
+import { useCanvasFeed } from "../../canvas/feed";
 import {
   useCallback,
   useEffect,
@@ -833,6 +834,14 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     ((thread.data?.entries ?? []).some((e) => e.message === turnMessage) ||
       (thread.data?.pending ?? []).some((p) => p.message === turnMessage && p.state !== "failed"));
   const working = masterState.data?.turn?.state === "working" && turnOwned;
+  useCanvasFeed({
+    conversation: convId,
+    surface: "app",
+    composerKey,
+    items,
+    loaded: loaded && thread.data?.missing !== true,
+    running: working,
+  });
   const queuedOwn = masterState.data?.turn?.state === "queued" && turnOwned;
   // Keep feedback across POST acknowledgement; the daemon's proven turn wins.
   const sending = (thread.data?.pending ?? []).some((p) => p.state === "sending");
