@@ -34,8 +34,13 @@
 //!   the wrong reason) and
 //!   `cad1700_a_stale_stop_never_interrupts_a_newer_turn` (no refusal at all,
 //!   `left: None`). Sensitive as a pair.
-//! - **Cancel provenance** (`sender`/`sender_uid`) and **relay validation /
-//!   409 mapping**: not mutated in this pass; the reviewer must run them.
+//! - **Cancel provenance** (`sender` / `sender_uid` conditions dropped):
+//!   `cad1700_cancel_refuses_a_forged_operator_source` FAILS — the forged
+//!   `source: "operator"` message is cancelled (`ok: true`, state
+//!   `cancelled`), so the provenance rule is what refuses it. Sensitive.
+//! - **Relay refusal mapping** (`master_command_err` collapsed to the
+//!   shared mapping): `scoped_command_refusals_map_to_409` FAILS —
+//!   `turn_not_running maps to 409`, got 400. Sensitive.
 
 use super::*;
 use crate::adapter::Identity;
