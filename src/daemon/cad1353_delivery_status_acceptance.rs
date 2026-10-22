@@ -42,8 +42,10 @@ fn fx() -> Fx {
             model_policy: None,
         })
         .unwrap();
-    // A live idle actor: an endpoint exists, no turn is running, and the
-    // message below stays queued until a delivery loop claims it.
+    // A live idle actor: no turn is running and the message below stays
+    // queued until a delivery loop claims it. Fake/managed actors may
+    // carry no endpoint address; their state is the liveness signal, so
+    // the delivery view must not send the operator to `agent resume`.
     shared
         .store
         .set_identity_with_quota(
@@ -54,7 +56,7 @@ fn fx() -> Fx {
                 model: None,
                 effort: None,
                 pid: std::process::id(),
-                endpoint: Some("fake://w1".into()),
+                endpoint: None,
                 generation: None,
                 attach: None,
             },

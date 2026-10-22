@@ -480,12 +480,6 @@ pub(super) fn delivery_view(agent: &Agent, queued: i64, oldest: Option<f64>) -> 
             "operator",
             "the inbox has no actor — drain it with `cadence inbox <alias>`",
         )
-    } else if agent.endpoint.is_none() {
-        (
-            "no-endpoint",
-            "operator",
-            "the agent has no live endpoint — resume it to start an actor",
-        )
     } else if matches!(agent.state.as_str(), "starting" | "stopping") {
         (
             "lifecycle",
