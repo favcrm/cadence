@@ -56,8 +56,10 @@ function devBoardPort(): number {
  * emits `<file>.br`/`.gz` siblings in dist; the server answers them
  * when `Accept-Encoding` allows and falls back to the raw file
  * otherwise. Not part of rollup output — `build.rollupOptions` would
- * add them to the manifest and fingerprint them. Build only: at dev
- * shutdown `closeBundle` would read a dist dir that may not exist.
+ * add them to the manifest and fingerprint them. Compresses in
+ * `writeBundle` (after the output is on disk): `closeBundle` runs before
+ * rolldown writes in Vite 8, so a first build walked a missing `dist`
+ * and failed.
  */
 function precompress() {
   let outDir = "dist";
@@ -67,7 +69,7 @@ function precompress() {
     configResolved(config: { build: { outDir?: string }; root: string }) {
       outDir = resolve(config.root, config.build.outDir ?? "dist");
     },
-    closeBundle() {
+    writeBundle() {
       const SKIP = /\.(br|gz|woff2?|png|jpe?g|webp|ico|gif)$/;
       const walk = (dir: string): void => {
         for (const entry of readdirSync(dir)) {
