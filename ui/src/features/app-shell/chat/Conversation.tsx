@@ -1471,68 +1471,68 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
             </svg>
           </button>
         </div>
-      </div>
-      {historyOpen && active.state === "ready" && (
-        <div
-          ref={historyMenuRef}
-          className="app-chat-history"
-          role="menu"
-          aria-label={t("Conversations")}
-          data-chat-history
-        >
-          {active.conversations.map((c, i) => {
-            const unread = unreadSeen !== null && isUnread(unreadSeen, c.id, c.replySeq) && c.id !== convId;
-            return (
-              <button
-                key={c.id}
-                type="button"
-                role="menuitemradio"
-                aria-checked={c.id === convId}
-                className="app-chat-history-row"
-                data-unread={unread || undefined}
-                onClick={() => {
-                  selectConversation(installId, c.id);
-                  closeHistory();
-                }}
-              >
-                <span className="app-chat-history-mark" aria-hidden>
-                  {c.id === convId ? "✓" : ""}
-                </span>
-                <span className="app-chat-history-name">{conversationLabel(c, i, subjects, t)}</span>
-                {unread && (
-                  <span className="app-chat-history-new" aria-label={t("New reply")}>
-                    {t("new")}
-                  </span>
-                )}
-              </button>
-            );
-          })}
-          {active.selected !== null &&
-            !active.selected.isGeneral &&
-            binding.scope !== null &&
-            binding.error === null &&
-            binding.scope.install_id === installId &&
-            binding.scope.context_id !== "" &&
-            mode.contextProof?.status === "ready" &&
-            mode.contextProof.contextId === binding.scope.context_id &&
-            mode.appPath != null && (
-              <>
-                <div className="app-chat-history-divider" role="separator" />
-                <Link
-                  href={`${mode.appPath}?install=${encodeURIComponent(installId)}&ctx=${encodeURIComponent(binding.scope.context_id)}&conversation=${encodeURIComponent(active.selected.id)}`}
+        {historyOpen && active.state === "ready" && (
+          <div
+            ref={historyMenuRef}
+            className="app-chat-history"
+            role="menu"
+            aria-label={t("Conversations")}
+            data-chat-history
+          >
+            {active.conversations.map((c, i) => {
+              const unread = unreadSeen !== null && isUnread(unreadSeen, c.id, c.replySeq) && c.id !== convId;
+              return (
+                <button
+                  key={c.id}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={c.id === convId}
                   className="app-chat-history-row"
-                  role="menuitem"
-                  aria-label={t("Link to this conversation")}
-                  title={t("Shareable link to this conversation")}
-                  data-chat-conversation-link
+                  data-unread={unread || undefined}
+                  onClick={() => {
+                    selectConversation(installId, c.id);
+                    closeHistory();
+                  }}
                 >
-                  <span className="app-chat-history-mark" aria-hidden />
-                  <span className="app-chat-history-name">{t("Link to this conversation")}</span>
-                </Link>
-              </>
-            )}
-        </div>
-      )}
+                  <span className="app-chat-history-mark" aria-hidden>
+                    {c.id === convId ? "✓" : ""}
+                  </span>
+                  <span className="app-chat-history-name">{conversationLabel(c, i, subjects, t)}</span>
+                  {unread && (
+                    <span className="app-chat-history-new" aria-label={t("New reply")}>
+                      {t("new")}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+            {active.selected !== null &&
+              !active.selected.isGeneral &&
+              binding.scope !== null &&
+              binding.error === null &&
+              binding.scope.install_id === installId &&
+              binding.scope.context_id !== "" &&
+              mode.contextProof?.status === "ready" &&
+              mode.contextProof.contextId === binding.scope.context_id &&
+              mode.appPath != null && (
+                <>
+                  <div className="app-chat-history-divider" role="separator" />
+                  <Link
+                    href={`${mode.appPath}?install=${encodeURIComponent(installId)}&ctx=${encodeURIComponent(binding.scope.context_id)}&conversation=${encodeURIComponent(active.selected.id)}`}
+                    className="app-chat-history-row"
+                    role="menuitem"
+                    aria-label={t("Link to this conversation")}
+                    title={t("Shareable link to this conversation")}
+                    data-chat-conversation-link
+                  >
+                    <span className="app-chat-history-mark" aria-hidden />
+                    <span className="app-chat-history-name">{t("Link to this conversation")}</span>
+                  </Link>
+                </>
+              )}
+          </div>
+        )}
+      </div>
       {active.requestPending && (
         <p className="text-label text-ink-500" role="status" data-chat-link-pending>
           {t("Checking the linked conversation and its context…")}

@@ -2346,6 +2346,9 @@ refresh on pushed permission changes and ignore superseded reads. The bar
 retries the stored failure it displays with a fresh message id and its
 original content/app binding. An unrelated transport failure keeps its own
 same-id row Retry; neither action uses a later draft.
+The Conversations dropdown belongs to the positioned pane header, so it opens
+below the header rather than the page and keyboard focus does not scroll the
+workspace down to reach it.
 
 The shell loads conversation replies on mount and observes them while their
 pane is offscreen: an app reply opens its exact conversation, and a Home
