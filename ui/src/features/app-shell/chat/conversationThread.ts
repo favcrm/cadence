@@ -1,7 +1,9 @@
 import { useEffect } from "react";
 import type { Resource } from "../../../lib/cache";
 import { streamInto, type SseErrorState } from "../../../lib/sse";
-import { applyEarlier, fetchEarlier, lastSeq, reduceFrame, threadItems, type PageReader, type ThreadPageLike, type ThreadState } from "../../home/thread";
+import { resources } from "../../../lib/resources";
+import type { MasterState } from "../../../lib/types";
+import { EMPTY_THREAD, applyEarlier, fetchEarlier, lastSeq, reduceFrame, threadItems, type PageReader, type ThreadPageLike, type ThreadState } from "../../home/thread";
 
 /**
  * The one conversation thread engine Home and every app pane share
@@ -15,9 +17,9 @@ import { applyEarlier, fetchEarlier, lastSeq, reduceFrame, threadItems, type Pag
 /**
  * Stream `url` into `store` while `enabled`. Resumes after the store's
  * newest seq (never a replay); on reconnect `streamInto` resumes with
- * `?after=` and the reducer dedupes by seq. `onLink` reports `live` on
- * open and the error state otherwise, so the turn bar can say the stream
- * is down; a permanent stop re-reads the store to show why.
+ * `?after=` and the reducer dedupes by seq. The server's first `master`
+ * snapshot on every connection makes the bar live before replayed entries;
+ * TCP open alone cannot enable actions against a cached previous turn.
  */
 export function useThreadStream(
   store: Resource<ThreadState>,
@@ -26,18 +28,29 @@ export function useThreadStream(
   onLink: (state: "live" | SseErrorState) => void,
 ): void {
   useEffect(() => {
-    if (!enabled || url === null) return;
-    const sub = streamInto(store, reduceFrame, {
+    if (!enabled || url === null) {
+      onLink("live");
+      return;
+    }
+    onLink("reconnecting");
+    const sub = streamInto(store, (data, event) => {
+      if (event.type === "master") {
+        const snapshot = JSON.parse(event.data) as MasterState;
+        resources.masterState.write(() => snapshot);
+        onLink("live");
+        return data ?? EMPTY_THREAD;
+      }
+      return reduceFrame(data, event);
+    }, {
       url,
-      events: ["entry"],
+      events: ["master", "entry"],
       lastEventId: String(lastSeq(store.get().data) ?? 0),
-      onOpen: () => onLink("live"),
+      onOpen: () => onLink("reconnecting"),
       onError: (state) => {
         onLink(state);
         if (state === "stopped") void store.refresh();
       },
     });
-    onLink("live");
     return () => sub.close();
     // `onLink` is a state setter at both call sites; the stream must not
     // reopen when a parent re-renders.

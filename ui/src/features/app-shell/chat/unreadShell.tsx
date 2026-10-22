@@ -1,34 +1,41 @@
 import { useEffect } from "react";
-import { useResource } from "../../../lib/useResource";
+import { useQuery } from "../../../lib/useResource";
 import { useNotificationToast } from "../../threads/NotificationToast";
 import { conversationLabel, conversationList } from "../conversationClient";
 import { setAssistantUnread } from "./assistantUnread";
-import { visibleConversation, setKnownInstalls } from "./chatVisibility";
+import { visibleConversation, setKnownInstalls, useDocumentVisible } from "./chatVisibility";
 import { announceReply, isUnread, onSeenChanged, readSeen, writeSeen } from "./unreadSeen";
 
 /** Observe real reply watermarks for the shell's lifetime, even when the app
  * pane is unmounted. An operator send, tool step or empty conversation never
  * advances this watermark. List reads refresh on the existing master frames. */
 function UnreadProbe({ installId }: { installId: string }) {
-  const list = useResource(conversationList(installId));
+  const list = useQuery(conversationList(installId));
   const conversations = list.data?.legacy === false ? list.data.conversations : null;
   const toast = useNotificationToast();
+  const documentVisible = useDocumentVisible();
   useEffect(() => {
     if (conversations === null) return;
     const update = () => {
       const seen = readSeen(installId);
+      const foreground = documentVisible && document.visibilityState === "visible";
       const open = visibleConversation();
       let unread = false;
       conversations.forEach((conversation, index) => {
-        if (open?.installId === installId && open.conversation === conversation.id) {
+        const room = `assistant:${installId}:${conversation.id}`;
+        if (foreground && open?.installId === installId && open.conversation === conversation.id) {
+          toast.clear(room);
           writeSeen(installId, conversation.id, conversation.replySeq);
           return;
         }
-        if (!isUnread(seen, conversation.id, conversation.replySeq)) return;
+        if (!isUnread(seen, conversation.id, conversation.replySeq)) {
+          toast.clear(room);
+          return;
+        }
         unread = true;
-        if (announceReply(installId, conversation.id, conversation.replySeq)) {
+        if (foreground && announceReply(installId, conversation.id, conversation.replySeq)) {
           const query = new URLSearchParams({ conversation: conversation.id });
-          toast.show("Assistant replied", `assistant:${installId}:${conversation.id}`, {
+          toast.show("Assistant replied", room, {
             href: `/app-installations/${encodeURIComponent(installId)}?${query.toString()}`,
             note: conversationLabel(conversation, index),
           });
@@ -38,7 +45,7 @@ function UnreadProbe({ installId }: { installId: string }) {
     };
     update();
     return onSeenChanged(installId, update);
-  }, [conversations, installId, toast]);
+  }, [conversations, installId, toast, documentVisible]);
   return null;
 }
 

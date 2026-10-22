@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 export {};
 /** The actual App must prove the current session before mounting protected rules. */
 declare function require(name: string): any;
@@ -36,7 +37,7 @@ const metaRequests: { proof: boolean; id: string }[] = [];
 const pending: { resolve: (response: Response) => void; proof: boolean; id: string }[] = [];
 globalThis.fetch = async (input) => {
   const url = new URL(String(input), "http://localhost");
-  if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+  if (url.pathname.endsWith("/stream")) return streamFixture(url.href);
   if (url.pathname === "/api/meta") {
     const proof = url.searchParams.get("operator") === "1", id = current;
     metaRequests.push({ proof, id });

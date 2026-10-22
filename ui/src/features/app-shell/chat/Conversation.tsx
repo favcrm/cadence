@@ -96,7 +96,7 @@ import { usePendingPermission } from "./usePendingApproval";
 import { turnBarState } from "./turnBarState";
 import { TurnBar } from "./TurnBar";
 import { isUnread, onSeenChanged, readSeen, writeSeen, type SeenMap } from "./unreadSeen";
-import { setVisibleConversation } from "./chatVisibility";
+import { setVisibleConversation, useDocumentVisible } from "./chatVisibility";
 import { useConversationDestination } from "./conversationNavigation";
 import { earlierStep, useThreadStream } from "./conversationThread";
 
@@ -355,6 +355,7 @@ function AppRow({
 function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onMediaTarget }: AppPaneProps) {
   const { t, formatNumber } = useLocale();
   const { installId, descriptor } = mode;
+  const documentVisible = useDocumentVisible();
   const fileUpload = mode.fileUpload ?? { declared: false, available: false };
   const fileUploadLoading = mode.fileUploadLoading ?? true;
   const active = useActiveConversation(installId, mode.conversationRequest, mode.contextProof);
@@ -373,7 +374,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const [composerNotice, setComposerNotice] = useState<UiNotice | null>(null);
   const [creating, setCreating] = useState(false);
   // The thread stream's link: down means the turn bar shows its last known state.
-  const [streamLink, setStreamLink] = useState<"live" | SseErrorState>("live");
+  const [streamLink, setStreamLink] = useState<"live" | SseErrorState>("reconnecting");
   const streamDown = streamLink !== "live";
   const [historyOpen, setHistoryOpen] = useState(false);
   // Client-side last-seen per conversation (CAD-1700). Opening a conversation
@@ -386,10 +387,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const selectedId = active.state === "ready" ? (active.selected?.id ?? null) : null;
   const selectedReply = active.state === "ready" ? (active.selected?.replySeq ?? null) : null;
   useEffect(() => {
-    if (collapsed || selectedId === null || selectedReply === null) return;
+    if (!documentVisible || collapsed || selectedId === null || selectedReply === null) return;
     writeSeen(installId, selectedId, selectedReply);
     setUnreadSeen(readSeen(installId));
-  }, [selectedId, selectedReply, installId, collapsed]);
+  }, [selectedId, selectedReply, installId, collapsed, documentVisible]);
   // A real assistant reply elsewhere lights the Conversations button.
   const hasUnreadOther =
     active.state === "ready" && active.conversations.some((c) => c.id !== convId && isUnread(unreadSeen, c.id, c.replySeq));
@@ -551,9 +552,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // The shell's announcer reads this: the picker's selection is client state,
   // so the route alone cannot say whether a reply is already on screen.
   useLayoutEffect(() => {
-    setVisibleConversation(installId, collapsed ? null : convId);
+    setVisibleConversation(installId, collapsed || !documentVisible ? null : convId);
     return () => setVisibleConversation(installId, null);
-  }, [installId, convId, collapsed]);
+  }, [installId, convId, collapsed, documentVisible]);
 
   useEffect(() => setFailedFrames(new Set()), [installId, convId]);
   // A context or installation change drops the importer (its scope key
@@ -939,7 +940,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                 ? { asset_id: m.asset_id, revision: m.revision, sha256: m.sha256 }
                 : null,
             );
-            void send(failedEntry.text, refs, attachments.length ? attachments : undefined, mediaRefs.length ? mediaRefs : undefined);
+            const rawApp = payload.app;
+            const app = rawApp !== null && typeof rawApp === "object" ? rawApp as Record<string, unknown> : null;
+            const originalApp = typeof app?.install_id === "string"
+              ? { install_id: app.install_id, ...(typeof app.context_id === "string" ? { context_id: app.context_id } : {}) }
+              : null;
+            void send(failedEntry.text, refs, attachments.length ? attachments : undefined, mediaRefs.length ? mediaRefs : undefined, originalApp);
           }
         : undefined;
   const turnCommand = (command: "stop" | "cancel", message: string) => {
@@ -965,7 +971,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           : aheadHref !== null ? () => window.location.assign(aheadHref) : undefined,
     onReview: () => {
       const card = listRef.current?.parentElement?.querySelector<HTMLElement>(
-        "[data-permission-thread], .app-assistant-activity [data-operation-status='pending_permission']",
+        "[data-permission-status='pending'], .app-assistant-activity [data-operation-status='pending_permission']",
       );
       (card ?? listRef.current)?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });
     },
@@ -1174,7 +1180,13 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     });
   };
 
-  const send = (body: string, refs: ThreadRef[], attachments?: { id: string }[], mediaRefs?: { asset_id: string; revision: number; sha256: string }[]): Promise<void> => {
+  const send = (
+    body: string,
+    refs: ThreadRef[],
+    attachments?: { id: string }[],
+    mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
+    originalApp?: OutboxEnvelope["app"] | null,
+  ): Promise<void> => {
     if (!canSend) return Promise.reject(new Error("sending is unavailable"));
     if (parseSlash(body) === "new") {
       // A command, never a message: nothing is sent to the assistant.
@@ -1204,7 +1216,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     // first edit was made under, including a captured absence. Only an
     // intent with no captured origin at all falls back to the current
     // frame (the narrow window before the pane's registration effect).
-    const captured = composerScope(originKey);
+    const captured = originalApp === undefined ? composerScope(originKey) : originalApp;
     const envelope: OutboxEnvelope = {
       message,
       text: body,

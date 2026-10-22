@@ -1,4 +1,6 @@
+import { streamFixture } from "./streamFixture";
 /** CAD-1098 S3: per-app assistant conversations in the shell chat. */
+import type * as SeenModule from "../src/features/app-shell/chat/unreadSeen";
 declare function require(name: string): any;
 declare const process: { cwd(): string };
 export {};
@@ -12,6 +14,7 @@ function equal(a: unknown, e: unknown, why: string) {
 async function main() {
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/app-installations/install-crm?ctx=ctx-a" });
+Object.defineProperty(win.document, "visibilityState", { value: "visible", configurable: true });
 for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLSelectElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
   Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
 for (const name of ["addEventListener", "removeEventListener", "requestAnimationFrame", "cancelAnimationFrame"])
@@ -36,11 +39,13 @@ const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) =>
     React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(AppShellComponent, props) }));
 const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
 const { parseSlash, autoSelectCampaignConversation, conversationThread, conversationList } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
+const { readSeen } = require("../src/features/app-shell/chat/unreadSeen") as typeof SeenModule;
 
 equal([parseSlash("/new"), parseSlash(" /CLEAR "), parseSlash("/new now"), parseSlash("hello")], ["new", "new", null, null], "only the bare commands are commands");
 
 const inst = (id: string, name: string) => ({ install_id: id, title: name, name, version: "0.1.0", digest: "d", catalog_generation: "g", approved: true, approval: { state: "approved", epoch: 1 }, storage_kind: "workspace", files: [], capabilities: null, connection_slots: [] });
-const ctxs = (id: string) => ({ contexts: [{ id: "ctx-a", install_id: id, revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } }] });
+let crmContext = "ctx-a";
+const ctxs = (id: string) => ({ contexts: [{ id: id === "install-crm" ? crmContext : "ctx-a", install_id: id, revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } }] });
 const ent = (seq: number, role: string, kind: string, text: string, message: string) => ({ seq, role, kind, message, text, created: "2026-10-03T00:00:00Z", payload: null });
 const conv = (id: string, over: object = {}) => ({ id, title: null, subject: null, is_general: false, ...over });
 const convs: Record<string, any[]> = {
@@ -50,7 +55,10 @@ const convs: Record<string, any[]> = {
 };
 const threads: Record<string, any[]> = {
   "c-gen": [ent(1, "operator", "message", "general question", "m-gen"), ent(2, "agent", "turn_result", "general answer", "m-gen")],
-  "c-camp": [ent(1, "operator", "message", "campaign brief", "m-camp")],
+  "c-camp": [
+    ent(1, "operator", "message", "campaign brief", "m-camp"),
+    { ...ent(2, "system", "message", "Permission requested (permission-old, risk low): old command", "old-decision"), payload: { source: "permission" } },
+  ],
   "o-gen": [],
   "s-gen": [],
   "s-full": [ent(1, "operator", "message", "earlier question", "m-s")],
@@ -69,7 +77,7 @@ const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { sta
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const url = new URL(String(input), "http://localhost");
   const method = init?.method ?? "GET";
-  if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+  if (url.pathname.endsWith("/stream")) return streamFixture(url.href, { alias: "master", provider: "p", endpoint_kind: "k", live: true, turn, queue }, init?.signal);
   // The CRM package's own descriptor, served pinned to the install's digest.
   if (url.pathname === "/api/app-installations/install-crm/chat-descriptor") {
     return json({ descriptor: JSON.parse(require("fs").readFileSync(require("path").join(process.cwd(), "..", "tests", "fixtures", "apps", "crm", "app-chat.json"), "utf8")), digest: "d", app: "crm" });
@@ -108,6 +116,7 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   }
   if (url.pathname === "/api/crm-send/list") return json({ sends: [] });
   if (url.pathname === "/api/crm-send/origin") return json({ unsubscribe_origin: null, stored: false });
+  if (url.pathname === "/api/master/permissions") return json({ rules: [], requests: [{ id: "permission-old", status: "allowed_once", command: "old command", cwd: null, reason: "Previously decided", risk: "low", prefix: [] }] });
   if (url.pathname.endsWith("/assistant/actions")) return json({ actions: [] });
   if (url.pathname.endsWith("/assistant/operations")) return json({ operations });
   if (url.pathname.endsWith("/assistant/permissions")) return json({ permissions: [] });
@@ -119,9 +128,12 @@ document.body.append(host);
 const root = createRoot(host);
 const flush = () => React.act(async () => { await new Promise((r) => setTimeout(r, 0)); });
 const settle = async () => { for (let i = 0; i < 8; i++) await flush(); };
-async function mount(installId: string, viewer = { operator: true, readOnly: false }) {
-  history.pushState(null, "", `/app-installations/${installId}?ctx=ctx-a`);
-  await React.act(async () => { root.render(React.createElement(AppShell, { installId, viewer })); });
+async function mount(installId: string, viewer = { operator: true, readOnly: false }, context = "ctx-a") {
+  history.pushState(null, "", `/app-installations/${installId}?ctx=${context}`);
+  await React.act(async () => {
+    win.dispatchEvent(new win.PopStateEvent("popstate"));
+    root.render(React.createElement(AppShell, { installId, viewer }));
+  });
   await settle();
 }
 // CAD-1700: the header names the open conversation; the Conversations menu
@@ -282,12 +294,13 @@ await pick("Spring launch");
   assert(barButton("Review") !== null && barButton("Stop") === null, "a pushed operation permission replaces Stop with Review");
   const approval = host.querySelector('[data-operation-status="pending_permission"]') as HTMLElement;
   assert(approval, "the actionable app approval card is mounted");
-  let scrolled: HTMLElement | null = null;
+  assert(host.querySelector('[data-permission-thread="permission-old"] [data-permission-decided]'), "a decided historic permission precedes the current operation");
+  const scrolled = new Set<HTMLElement>();
   const originalScroll = HTMLElement.prototype.scrollIntoView;
-  HTMLElement.prototype.scrollIntoView = function () { scrolled = this; };
+  HTMLElement.prototype.scrollIntoView = function () { scrolled.add(this); };
   try {
     await React.act(async () => { barButton("Review")!.click(); });
-    assert(scrolled === approval, "Review reaches the operation approval card, not the transcript");
+    assert(scrolled.has(approval), "Review reaches the pending operation, not a historic decided permission");
   } finally {
     HTMLElement.prototype.scrollIntoView = originalScroll;
   }
@@ -305,6 +318,66 @@ await pick("Spring launch");
   await settle();
   await pick("Spring launch");
 }
+
+// A failed stored request retains its app binding even after a context
+// switch and a later draft capture another context in the same conversation.
+{
+  threads["c-gen"].push({
+    ...ent(3, "operator", "message", "retry the original request", "m-stored-failure"),
+    payload: { app: { install_id: "install-crm", context_id: "ctx-a" } },
+  });
+  await React.act(async () => { await conversationThread("c-gen").refresh(); });
+  await mount("install-other");
+  crmContext = "ctx-b";
+  await mount("install-crm", { operator: true, readOnly: false }, "ctx-b");
+  await pick("General");
+  await type("current-context probe");
+  equal(messagePosts.at(-1).app, { install_id: "install-crm", context_id: "ctx-b" }, "the mounted composer is now in context B");
+  threads["c-gen"].push(ent(4, "operator", "message", "current-context probe", messagePosts.at(-1).message));
+  await React.act(async () => { await conversationThread("c-gen").refresh(); });
+  threads["c-gen"].push({
+    ...ent(5, "agent", "turn_result", "Could not finish", "m-stored-failure"),
+    created: new Date().toISOString(), payload: { status: "failed", error: "Try again" },
+  });
+  await React.act(async () => { await conversationThread("c-gen").refresh(); });
+  await settle();
+  assert(barButton("Retry"), "the stored failed turn has a Retry action");
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(box(), "later unsent draft");
+    box().dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await React.act(async () => { barButton("Retry")!.click(); });
+  await settle();
+  equal(messagePosts.at(-1).app, { install_id: "install-crm", context_id: "ctx-a" }, "Retry uses the failed request's binding, never the current context or later draft");
+  equal(messagePosts.at(-1).text, "retry the original request", "Retry transmits the stored request, not the later draft");
+  equal(box().value, "later unsent draft", "Retry preserves the later draft");
+  threads["c-gen"].push(ent(6, "operator", "message", "retry the original request", messagePosts.at(-1).message));
+  await React.act(async () => {
+    await conversationThread("c-gen").refresh();
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(box(), "");
+    box().dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await mount("install-other");
+  crmContext = "ctx-a";
+  await mount("install-crm");
+}
+
+// A hidden but mounted pane must not clear another tab's unread state.
+await pick("General");
+await React.act(async () => {
+  Object.defineProperty(win.document, "visibilityState", { value: "hidden", configurable: true });
+  win.document.dispatchEvent(new win.Event("visibilitychange"));
+  convs["install-crm"].find((c) => c.id === "c-gen").reply_seq = 5;
+  await conversationList("install-crm").refresh();
+});
+await settle();
+assert((readSeen("install-crm")["c-gen"] ?? 0) < 5, "the mounted hidden pane leaves the reply unseen");
+await React.act(async () => {
+  Object.defineProperty(win.document, "visibilityState", { value: "visible", configurable: true });
+  win.document.dispatchEvent(new win.Event("visibilitychange"));
+});
+await settle();
+equal(readSeen("install-crm")["c-gen"], 5, "returning to the visible pane marks the displayed reply seen");
 
 // Collapse state is per app.
 await React.act(async () => { (host.querySelector(".app-chat-collapse") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });

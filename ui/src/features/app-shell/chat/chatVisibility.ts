@@ -1,3 +1,17 @@
+import { useSyncExternalStore } from "react";
+
+function subscribeVisibility(listener: () => void): () => void {
+  document.addEventListener("visibilitychange", listener);
+  return () => document.removeEventListener("visibilitychange", listener);
+}
+
+const documentVisible = () => document.visibilityState === "visible";
+
+/** A mounted conversation in a background tab has not been seen. */
+export function useDocumentVisible(): boolean {
+  return useSyncExternalStore(subscribeVisibility, documentVisible);
+}
+
 /**
  * CAD-1700: the conversation currently on screen, shared with the shell's
  * reply announcer. The picker's selection lives in client state (a default

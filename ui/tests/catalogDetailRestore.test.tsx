@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 /**
  * A successful legacy restore must leave one consistent installed state,
  * without retaining the removed state or offering another restore.
@@ -41,7 +42,7 @@ let card: Record<string, unknown> = {
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const url = new URL(String(typeof input === "string" ? input : (input as { url: string }).url), "http://localhost");
   const json = (v: unknown) => new Response(JSON.stringify(v), { status: 200, headers: { "Content-Type": "application/json" } });
-  if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+  if (url.pathname.endsWith("/stream")) return streamFixture(url.href);
   if (url.pathname.endsWith("/restore") && init?.method === "POST") return json({ restored: true, digest: "sha256:x" });
   if (url.pathname === "/api/app-installations") return json([]);
   if (url.pathname === "/api/public-apps/crm") return new Response(JSON.stringify({ ok: false, error: { code: "not_found" } }), { status: 404, headers: { "Content-Type": "application/json" } });

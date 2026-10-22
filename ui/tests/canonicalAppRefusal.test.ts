@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 export {};
 /**
  * CAD-1438 acceptance check — independently authored (not the implementer).
@@ -115,7 +116,7 @@ globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
   const url = new URL(path, "http://localhost");
   requested.push(url.pathname);
-  if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+  if (url.pathname.endsWith("/stream")) return streamFixture(path);
   if (path.startsWith("/api/meta")) {
     const role = operatorSession ? "operator" : "member";
     return json({ read_only: false, operator: operatorSession, signed_in: true, actor: `${role} (ui)`,

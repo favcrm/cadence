@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 import type * as HappyDom from "happy-dom";
 import type * as ReactModule from "react";
 import type * as ReactDOMClient from "react-dom/client";
@@ -89,7 +90,7 @@ async function main() {
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const path = String(input);
     const url = new URL(path, "http://localhost");
-    if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+    if (url.pathname.endsWith("/stream")) return streamFixture(path);
     if (url.pathname === "/api/meta") return json({ read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session: { id: "canonical-session", origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test" } });
     if (url.pathname === "/api/human-threads/notifications") {
       humanThreadsCalls++;

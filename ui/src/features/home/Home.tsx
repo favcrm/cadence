@@ -655,7 +655,7 @@ function MasterHome({
   // CAD-574: the rail's collapse is a layout concern — the grid column
   // narrows with it, so the state lives here and the rail renders it.
   const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
-  const [link, setLink] = useState<SseErrorState | "live" | null>(null);
+  const [link, setLink] = useState<SseErrorState | "live" | null>("reconnecting");
   const [limit, setLimit] = useState(WINDOW);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [cmds, setCmds] = useState<CmdResult[]>([]);
@@ -1231,7 +1231,7 @@ function MasterHome({
                   ? aheadHref === "/" ? jumpToLatest : () => window.location.assign(aheadHref)
                   : undefined,
                 onReview: () => {
-                  const card = scrollRef.current?.querySelector<HTMLElement>("[data-permission-thread]");
+                  const card = scrollRef.current?.querySelector<HTMLElement>("[data-permission-status='pending']");
                   card?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });
                 },
               }}

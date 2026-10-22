@@ -315,6 +315,131 @@ fn conversation_reply_watermark_ignores_non_reply_writes() {
     assert_eq!(reply(&list()), completed);
 }
 
+#[test]
+fn conversation_stream_snapshot_precedes_resume_and_master_changes_are_pushed() {
+    use std::io::{BufRead, BufReader};
+
+    fn next_event(reader: &mut impl BufRead) -> (String, Value, Option<i64>) {
+        let mut event = String::new();
+        let mut data = String::new();
+        let mut id = None;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(
+                reader.read_line(&mut line).unwrap() > 0,
+                "stream closed before an event"
+            );
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() && !data.is_empty() {
+                return (event, serde_json::from_str(&data).unwrap(), id);
+            }
+            if let Some(value) = line.strip_prefix("event: ") {
+                event = value.to_string();
+            } else if let Some(value) = line.strip_prefix("data: ") {
+                data.push_str(value);
+            } else if let Some(value) = line.strip_prefix("id: ") {
+                id = Some(value.parse().unwrap());
+            }
+        }
+    }
+
+    let fx = gx();
+    let conversation = fx.conversation(&fx.crm, &fx.crm_a, json!({}));
+    let append = |store: &store::Store, text: &str| {
+        store
+            .thread_append_to(
+                &conversation,
+                store::NewEntry {
+                    role: "agent",
+                    kind: "assistant_text",
+                    text,
+                    payload: None,
+                    message_id: None,
+                },
+            )
+            .unwrap()
+            .unwrap()
+    };
+    let seen = append(&fx.shared.store, "already seen");
+    let missed = append(&fx.shared.store, "missed reply");
+    let (board, state, _rest) = http::start(fx);
+    let store = store::Store::open(&crate::rollout::db_file(&state)).unwrap();
+    {
+        let url = format!(
+            "{}/api/threads/master/stream?conversation={conversation}&after={seen}",
+            board.base
+        );
+        let mut response = board
+            .decorate("operator", board.agent.get(&url))
+            .call()
+            .unwrap();
+        let mut reader = BufReader::new(response.body_mut().as_reader());
+        let (kind, snapshot, id) = next_event(&mut reader);
+        assert_eq!(
+            kind, "master",
+            "current turn state is the first event, before entry replay"
+        );
+        assert_eq!(
+            snapshot["alias"], "master",
+            "the first event is state, not an invalidation hint"
+        );
+        assert_eq!(
+            id, None,
+            "a state snapshot must not advance the transcript cursor"
+        );
+        let (kind, entry, id) = next_event(&mut reader);
+        assert_eq!(kind, "entry");
+        assert_eq!(id, Some(missed));
+        assert_eq!(entry["text"], "missed reply");
+    }
+    let after_disconnect = append(&store, "after disconnect");
+    {
+        let url = format!(
+            "{}/api/threads/master/stream?conversation={conversation}&after=0",
+            board.base
+        );
+        let mut response = board
+            .decorate("operator", board.agent.get(&url))
+            .header("Last-Event-ID", missed.to_string())
+            .call()
+            .unwrap();
+        let mut reader = BufReader::new(response.body_mut().as_reader());
+        assert_eq!(
+            next_event(&mut reader).0,
+            "master",
+            "every reconnect starts with current state"
+        );
+        let (kind, entry, id) = next_event(&mut reader);
+        assert_eq!(kind, "entry");
+        assert_eq!(
+            id,
+            Some(after_disconnect),
+            "Last-Event-ID wins over the older query cursor"
+        );
+        assert_eq!(entry["text"], "after disconnect");
+    }
+    let url = format!("{}/api/stream", board.base);
+    let mut response = board
+        .decorate("operator", board.agent.get(&url))
+        .call()
+        .unwrap();
+    let mut reader = BufReader::new(response.body_mut().as_reader());
+    assert_eq!(next_event(&mut reader).0, "hello");
+    append(&store, "pushed reply");
+    loop {
+        let (kind, data, _) = next_event(&mut reader);
+        if kind == "master" {
+            assert_eq!(data["resources"], json!(["master"]));
+            break;
+        }
+    }
+    drop(reader);
+    drop(response);
+    drop(store);
+    drop(board);
+}
+
 fn err_text(r: Result<Value>) -> String {
     r.expect_err("expected a refusal").to_string()
 }

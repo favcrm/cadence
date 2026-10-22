@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 export {};
 /**
  * CAD-1273: the To do rail and review drawer's safety behaviour, checked
@@ -66,7 +67,7 @@ let approval: unknown = { state: "missing" };
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { "Content-Type": "application/json" } });
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const url = new URL(String(input), "http://localhost");
-  if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+  if (url.pathname.endsWith("/stream")) return streamFixture(url.href);
   if ((init?.method ?? "GET") === "POST") {
     posts.push({ path: url.pathname, body: JSON.parse(String(init?.body ?? "{}")) });
     await (holds[url.pathname] as Promise<void> | undefined);

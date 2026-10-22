@@ -1,5 +1,7 @@
 import { LiveUpdates, patchRows } from "../src/lib/liveUpdates";
 import { Resource } from "../src/lib/cache";
+import type { MasterState } from "../src/lib/types";
+import { turnBarState } from "../src/features/app-shell/chat/turnBarState";
 function equal(a: unknown, b: unknown, what: string) { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`${what}: ${JSON.stringify(a)}`); }
 let now = 0;
 let timer: (() => void) | null = null;
@@ -95,10 +97,35 @@ async function startupGap(initialAlreadyLanded: boolean) {
   equal(replies.length, 2, "idle heartbeats cause no additional reads after startup reconciliation");
   updates.close();
 }
+async function masterDoesNotWaitForTheLegacyBatch() {
+  const state = (message: string): MasterState => ({
+    alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true,
+    turn: { state: "working", message, conversation: "current", position: null }, queue: [],
+  });
+  const master = new Resource(() => Promise.resolve(state("new-turn")));
+  master.write(() => state("old-turn"));
+  let scheduled: (() => void) | null = null;
+  const updates = new LiveUpdates({
+    invalidate: (key) => { if (key === "master") void master.invalidate(); },
+    patch: () => undefined,
+    resync: () => undefined,
+    schedule: (fn) => { scheduled = fn; return 1; },
+    cancel: () => { scheduled = null; },
+  });
+  updates.event({ type: "monitoring", data: JSON.stringify({ resources: ["overview"] }), id: null });
+  updates.event({ type: "master", data: JSON.stringify({ resources: ["master"] }), id: null });
+  for (let i = 0; i < 3; i++) await Promise.resolve();
+  const bar = turnBarState({ master: master.get().data, entries: [], pendingMessages: [], awaitingApproval: false, reconnecting: false }, "current");
+  equal(bar.kind === "working" ? bar.stopMessage : null, "new-turn", "master push updates the actionable turn before the unrelated legacy timer fires");
+  equal(scheduled !== null, true, "other resources retain their trailing batch");
+  updates.close();
+}
+
 async function main() {
   await race();
   await startupGap(true);
   await startupGap(false);
+  await masterDoesNotWaitForTheLegacyBatch();
   console.log("live updates checks passed");
 }
 main().catch((error) => { setTimeout(() => { throw error; }); });

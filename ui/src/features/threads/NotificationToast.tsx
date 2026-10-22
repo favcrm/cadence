@@ -15,8 +15,8 @@ interface Alert {
 export interface ToastApi {
   /** Announce a new message for `room` (a Threads room unless `target.href` says where Open goes). Deduplicated per room by the caller's seq. */
   show: (title: string, room: string, target?: { href: string; note: string }) => void;
-  /** Drop every pending alert (identity change). */
-  clear: () => void;
+  /** Drop one room's alert after it is seen, or every alert on identity change. */
+  clear: (room?: string) => void;
 }
 
 const ToastContext = createContext<ToastApi>({ show: () => undefined, clear: () => undefined });
@@ -42,7 +42,17 @@ export function NotificationToastProvider({ children }: { children: ReactNode })
     timers.current.clear();
   }, []);
 
-  const clear = useCallback(() => {
+  const clear = useCallback((room?: string) => {
+    if (room !== undefined) {
+      const id = pending.current.get(room);
+      if (id === undefined) return;
+      pending.current.delete(room);
+      const timer = timers.current.get(id);
+      if (timer !== undefined) window.clearTimeout(timer);
+      timers.current.delete(id);
+      setAlerts((cur) => cur.filter((alert) => alert.id !== id));
+      return;
+    }
     dropTimers();
     pending.current.clear();
     setAlerts([]);

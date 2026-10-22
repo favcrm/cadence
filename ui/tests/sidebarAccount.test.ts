@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 export {};
 /**
  * CAD-1033/CAD-1452: authenticated sidebar account controls and the
@@ -44,7 +45,7 @@ globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
   if (path.startsWith("/api/meta")) return meta === "hang" ? new Promise<Response>((resolve) => pendingMeta.push(resolve)) : json(meta);
   privateReads++;
-  if (new URL(path, "http://localhost").pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+  if (new URL(path, "http://localhost").pathname.endsWith("/stream")) return streamFixture(path);
   if (path === "/api/issues" || path.startsWith("/api/issues?")) return json({ issues: [] });
   if (path === "/api/projects") return json({ projects: [] });
   if (path === "/api/agents") return json({ daemon: "unreachable", agents: [], totals: null });

@@ -16,6 +16,7 @@ declare function require<T>(name: string): T;
 const { setImmediate: nextTurn } = require<{ setImmediate: () => Promise<void> }>("node:timers/promises");
 const { Window } = require<typeof HappyDOM>("happy-dom");
 const win = new Window({ url: "http://localhost/apps/crm" });
+Object.defineProperty(win.document, "visibilityState", { value: "visible", configurable: true });
 for (const name of ["window", "document", "navigator", "Node", "HTMLElement", "Event", "MouseEvent", "StorageEvent", "location", "history", "localStorage", "sessionStorage"] as const)
   Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
@@ -33,15 +34,15 @@ const { createRoot } = require<typeof ReactDOM>("react-dom/client");
 const { AssistantUnreadProbes } = require<typeof ShellUnread>("../src/features/app-shell/chat/unreadShell");
 const { useHomeUnread, noteHomeSeen } = require<typeof HomeUnread>("../src/features/app-shell/chat/homeUnread");
 const { useAssistantUnread } = require<typeof Unread>("../src/features/app-shell/chat/assistantUnread");
-const { seenKey, writeSeen } = require<typeof Seen>("../src/features/app-shell/chat/unreadSeen");
+const { seenKey, readSeen, writeSeen, announceReply } = require<typeof Seen>("../src/features/app-shell/chat/unreadSeen");
 const { setVisibleConversation } = require<typeof Visibility>("../src/features/app-shell/chat/chatVisibility");
 const { NotificationToastProvider } = require<typeof Toast>("../src/features/threads/NotificationToast");
 const { conversationList } = require<typeof Conversations>("../src/features/app-shell/conversationClient");
 const { noteMasterChanged } = require<typeof Changes>("../src/lib/masterChanged");
 const { resources } = require<typeof Resources>("../src/lib/resources");
 let updated = 100;
-let replySeq = 0;
-let homeEntries: ThreadEntry[] = [];
+let replySeq = 1;
+let homeEntries: ThreadEntry[] = [{ seq: 2, role: "agent", kind: "turn_result", text: "An existing unseen Home reply" }];
 const json = (body: unknown) => new Response(JSON.stringify(body), { headers: { "Content-Type": "application/json" } });
 globalThis.fetch = async (input) => {
   const url = new URL(String(input), "http://localhost");
@@ -79,12 +80,24 @@ async function main() {
   };
   const dots = () => host.querySelectorAll('nav [aria-label$="new reply"]').length;
   const notices = () => host.querySelectorAll(".notification-toast").length;
-  const dismiss = async () => {
+  const visibility = async (state: "visible" | "hidden") => {
     await React.act(async () => {
-      for (const button of host.querySelectorAll<HTMLButtonElement>('button[aria-label="Dismiss notification"]')) button.click();
+      Object.defineProperty(win.document, "visibilityState", { value: state, configurable: true });
+      win.document.dispatchEvent(new win.Event("visibilitychange"));
     });
+    await settle();
   };
   await render();
+  assert(dots() === 2 && notices() === 2, "initial offscreen app/Home replies load and notify without waiting for a master event");
+  await React.act(async () => { writeSeen("install-crm", "general", 1); });
+  await settle();
+  assert(notices() === 1 && host.querySelector(".notification-toast p")?.textContent === "Home", "seeing the app reply removes only its toast, preserving the unseen Home reply");
+  await React.act(async () => { noteHomeSeen(2); });
+  await settle();
+  assert(dots() === 0 && notices() === 0, "seeing Home clears its dot and toast");
+  replySeq = 0;
+  await React.act(async () => { await conversationList("install-crm").refresh(); });
+  await settle();
   assert(dots() === 0 && notices() === 0, "a newly created empty General conversation is not an unseen reply");
   updated = 200;
   await React.act(async () => { await conversationList("install-crm").refresh(); });
@@ -104,8 +117,7 @@ async function main() {
     win.dispatchEvent(new win.StorageEvent("storage", { key, newValue: JSON.stringify({ general: 7 }) }));
   });
   await settle();
-  assert(dots() === 0, "opening the app reply in another tab clears this nav dot");
-  await dismiss();
+  assert(dots() === 0 && notices() === 0, "opening the app reply in another tab clears its dot and toast");
   setVisibleConversation("install-crm", "general");
   writeSeen("install-crm", "general", 8);
   replySeq = 8;
@@ -113,6 +125,27 @@ async function main() {
   await React.act(async () => { await conversationList("install-crm").refresh(); });
   await settle();
   assert(dots() === 0 && notices() === 0, "a reply already visible in the pane is not announced");
+  await visibility("hidden");
+  replySeq = 9;
+  await React.act(async () => {
+    writeSeen("install-crm", "general", 9);
+    assert(!announceReply("install-crm", "general", 9), "a late callback in a hidden tab cannot reserve the foreground announcement");
+  });
+  await React.act(async () => { await conversationList("install-crm").refresh(); });
+  await settle();
+  assert(readSeen("install-crm").general === 8 && host.querySelector('[aria-label="CRM new reply"]'), "a selected app conversation in a hidden tab must remain unseen");
+  assert(notices() === 0, "a hidden tab does not consume an announcement that belongs in a foreground tab");
+  await visibility("visible");
+  assert(readSeen("install-crm").general === 9 && dots() === 0 && notices() === 0, "foregrounding the selected conversation marks its reply seen without a toast");
+  await visibility("hidden");
+  await render(true);
+  homeEntries.push({ seq: 10, role: "agent", kind: "turn_result", text: "A Home reply while its tab is hidden" });
+  await React.act(async () => { await resources.masterThread.refresh(); noteHomeSeen(10); });
+  await settle();
+  assert(readSeen("home").home === 2 && host.querySelector('[aria-label="Home new reply"]'), "Home's route and tail-seen writer cannot consume a reply in a hidden tab");
+  await visibility("visible");
+  assert(readSeen("home").home === 10 && dots() === 0 && notices() === 0, "foregrounding Home clears its unseen reply");
+  await render();
   homeEntries = [{ seq: 20, role: "system", kind: "tool_result", text: "A tool step", message: "home-work" }];
   await React.act(async () => { noteMasterChanged(); await resources.masterThread.refresh(); });
   await settle();

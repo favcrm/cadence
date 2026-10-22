@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 /** CAD-1051 / CAD-1046: the shell chat — rail, markdown, folded steps,
  *  directive cards and the one shared compact composer. */
 declare function require(name: string): any;
@@ -71,7 +72,7 @@ const json = (v: unknown) => new Response(JSON.stringify(v), { status: 200, head
 globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
   const url = new URL(path, "http://localhost");
-  if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+  if (url.pathname.endsWith("/stream")) return streamFixture(path);
   if (path === "/api/app-installations/install-crm") return json(crm);
   if (path === "/api/app-installations/install-crm/contexts") return json(ctxs);
   if (path.endsWith("/chat-descriptor")) return json({ descriptor: crmDescriptor, digest: crm.digest, app: "crm" });

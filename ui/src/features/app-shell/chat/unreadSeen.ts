@@ -40,6 +40,7 @@ export function readSeen(installId: string): SeenMap {
 }
 
 export function writeSeen(installId: string, id: string, seq: number): void {
+  if (document.visibilityState !== "visible") return;
   const key = seenKey(installId);
   if (advance(key, id, seq)) window.dispatchEvent(new Event(`${key}:changed`));
 }
@@ -50,6 +51,7 @@ export function isUnread(seen: SeenMap, id: string, replySeq: number): boolean {
 
 /** Reserve this reply's one browser-local announcement before showing it. */
 export function announceReply(installId: string, id: string, replySeq: number): boolean {
+  if (document.visibilityState !== "visible") return false;
   return advance(`${seenKey(installId)}.announced`, id, replySeq);
 }
 
