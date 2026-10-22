@@ -397,13 +397,21 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             app::AppAction::Dev {
                 name,
                 source,
+                package,
                 port,
                 host,
                 allow_host,
             },
     } = &cli.command
     {
-        return app::run_dev(name, source, *port, host, allow_host);
+        return app::run_dev(
+            name.as_deref(),
+            source.as_deref(),
+            package.as_deref(),
+            *port,
+            host,
+            allow_host,
+        );
     }
     // CAD-1270: `app check` is the offline byte validator — it resolves
     // no org or state dir, adopts no sandbox profile and never reaches
