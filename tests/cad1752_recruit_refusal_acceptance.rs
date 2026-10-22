@@ -1128,3 +1128,287 @@ fn cad1752_board_catalogue_hire_delivers_job_through_briefing() {
     assert_eq!(update[0][3].as_deref(), Some("operator"), "{update:?}");
     eprintln!("CAD-1752 job-update row (id, source, state, sender, sender_uid): {update:?}");
 }
+
+// ------------------------------------- stage 2: the project comes from the task
+//
+// Fixture: two tracker projects, `alpha` (prefix ALPHA, one repo checkout)
+// and `beta` (prefix BETA). A catalogue agent lives in a home dir that is
+// no repo. Dispatched work is a message row carrying `issue`, which only a
+// daemon dispatch writes (`agent_send` refuses a caller `issue`); the
+// fixture plants those rows straight into the store, with no actor running
+// for the seeded agents.
+
+const CATALOGUE: &str = r#"{"catalogue":"accountant","kind":"apps","look":"bookkeeper"}"#;
+
+/// `alpha` and `beta` in the tracker; returns alpha's repo checkout.
+fn stage2_projects(fx: &Fx) -> PathBuf {
+    let repo = fx.root.path().join("alpha-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let out = cadence_agent::reaper::output(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo),
+    )
+    .unwrap();
+    assert!(out.status.success(), "git init: {out:?}");
+    let repo = std::fs::canonicalize(&repo).unwrap();
+    for (key, prefix, repos) in [
+        (
+            "alpha",
+            "ALPHA",
+            format!("repos:\n  - path: {}\n", repo.display()),
+        ),
+        ("beta", "BETA", String::new()),
+    ] {
+        let dir = fx.pm().join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("project.yaml"),
+            format!("key: {key}\nprefix: {prefix}\n{repos}"),
+        )
+        .unwrap();
+    }
+    repo
+}
+
+impl Fx {
+    /// A store row with an explicit cwd and params (fixture population).
+    fn seed_at(&self, alias: &str, cwd: &std::path::Path, params: Option<&str>) {
+        std::fs::create_dir_all(cwd).unwrap();
+        let cwd = cwd.to_str().unwrap().to_string();
+        self.store()
+            .register_agent(&NewAgent {
+                alias,
+                provider: "claude",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: &cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap_or_else(|e| panic!("seed {alias}: {e}"));
+    }
+
+    /// A ticketless catalogue agent in its home dir under state.
+    fn seed_catalogue(&self, alias: &str) {
+        self.seed_at(alias, &self.home(alias), Some(CATALOGUE));
+    }
+
+    /// A message row as a dispatch leaves it: `issue` set, `state` given.
+    fn plant_message(&self, alias: &str, id: &str, state: &str, issue: Option<&str>) {
+        let conn = rusqlite::Connection::open(self.state().join("cadence.sqlite3")).unwrap();
+        conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        conn.execute(
+            "INSERT INTO messages(id, alias, body, source, state, created, issue) \
+             VALUES (?1, ?2, 'fixture turn', 'dispatch', ?3, ?4, ?5)",
+            rusqlite::params![
+                id,
+                alias,
+                state,
+                cadence_agent::issue::time::now_epoch() as f64,
+                issue
+            ],
+        )
+        .unwrap();
+    }
+
+    fn wiki_write(&self, who: &str, path: &str) -> cadence_agent::Result<Value> {
+        self.rpc(
+            Asserted::Agent(who.into()),
+            "wiki_write",
+            json!({"path": path, "text": format!("# {path}\n")}),
+        )
+    }
+
+    fn turn_project(&self, alias: &str) -> Value {
+        self.op("agent_show", json!({"alias": alias, "limit": 0}))["agent"]["turn_project"].clone()
+    }
+}
+
+/// The wiki's project-folder rule refused, naming the agent's project.
+fn assert_project_refusal(result: cadence_agent::Result<Value>, what: &str, project: &str) {
+    let err = result.expect_err(&format!("{what}: admitted"));
+    assert!(
+        matches!(err, cadence_agent::Error::Rejected(_)),
+        "{what}: not a stated rejection: {err:?}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains("agents write only their own project's folder")
+            && text.contains(&format!("this agent's project: {project}")),
+        "{what}: refused for a different reason: {text}"
+    );
+}
+
+/// Item 1. Guards: `turn_project` (`src/daemon/turn_project.rs`) gives a
+/// ticketless catalogue agent no project — not even when its cwd sits in
+/// a project's repo — and `wiki::allowed` (`src/wiki/mod.rs`, `projects`
+/// arm) refuses a projects/ write without the matching project.
+#[test]
+fn cad1752_ticketless_catalogue_agent_cannot_write_project_wiki() {
+    let fx = Fx::start(Board::None);
+    let repo = stage2_projects(&fx);
+    fx.seed_catalogue("acct-home");
+    // A catalogue agent the operator registered with a repo cwd: still
+    // no project without a task, because the catalogue never falls back
+    // to its cwd.
+    fx.seed_at("acct-repo", &repo, Some(CATALOGUE));
+    fx.op(
+        "wiki_write",
+        json!({"path": "global/handbook.md", "text": "# handbook\n"}),
+    );
+
+    for alias in ["acct-home", "acct-repo"] {
+        assert_eq!(fx.turn_project(alias), Value::Null, "{alias}: turn_project");
+        assert_project_refusal(
+            fx.wiki_write(alias, "projects/alpha/notes.md"),
+            alias,
+            "none",
+        );
+        // Positive: its own knowledge/ is writable and global/ readable.
+        let own = fx
+            .wiki_write(alias, &format!("agents/{alias}/knowledge/notes.md"))
+            .unwrap_or_else(|e| panic!("{alias}: own knowledge write refused: {e}"));
+        assert_eq!(own["committed"], true, "{own}");
+        let read = fx
+            .rpc(
+                Asserted::Agent(alias.into()),
+                "wiki_read",
+                json!({"path": "global/handbook.md"}),
+            )
+            .unwrap_or_else(|e| panic!("{alias}: global read refused: {e}"));
+        assert_eq!(read["text"], "# handbook\n");
+    }
+
+    // Control: the operator writes the same project page.
+    fx.op(
+        "wiki_write",
+        json!({"path": "projects/alpha/notes.md", "text": "# notes\n"}),
+    );
+}
+
+/// Item 2. Guards: `turn_project` takes the running dispatched task's
+/// project, and `wiki::allowed` holds the agent to that one project.
+#[test]
+fn cad1752_task_project_scopes_project_wiki_writes() {
+    let fx = Fx::start(Board::None);
+    stage2_projects(&fx);
+    fx.seed_catalogue("dev-2");
+    fx.plant_message("dev-2", "dispatch-alpha-1", "running", Some("ALPHA-1"));
+    assert_eq!(fx.turn_project("dev-2"), "alpha");
+
+    let ok = fx
+        .wiki_write("dev-2", "projects/alpha/notes.md")
+        .unwrap_or_else(|e| panic!("the running task's project write refused: {e}"));
+    assert_eq!(ok["committed"], true, "{ok}");
+    assert_project_refusal(
+        fx.wiki_write("dev-2", "projects/beta/notes.md"),
+        "a turn on alpha writing beta",
+        "alpha",
+    );
+    fx.op(
+        "wiki_write",
+        json!({"path": "projects/beta/notes.md", "text": "# beta\n"}),
+    );
+}
+
+/// Item 5a. Guard: `turn_project` never guesses between two queued
+/// projects when nothing is running.
+#[test]
+fn cad1752_two_queued_projects_give_no_project() {
+    let fx = Fx::start(Board::None);
+    stage2_projects(&fx);
+    fx.seed_catalogue("dev-3");
+    fx.plant_message("dev-3", "dispatch-alpha-2", "queued", Some("ALPHA-2"));
+    fx.plant_message("dev-3", "dispatch-beta-1", "queued", Some("BETA-1"));
+    assert_eq!(fx.turn_project("dev-3"), Value::Null, "a guess between two");
+    assert_project_refusal(
+        fx.wiki_write("dev-3", "projects/alpha/notes.md"),
+        "two queued projects",
+        "none",
+    );
+    // Control: one queued project is unambiguous.
+    fx.seed_catalogue("dev-4");
+    fx.plant_message("dev-4", "dispatch-alpha-3", "queued", Some("ALPHA-3"));
+    assert_eq!(fx.turn_project("dev-4"), "alpha");
+    let ok = fx.wiki_write("dev-4", "projects/alpha/notes.md").unwrap();
+    assert_eq!(ok["committed"], true);
+}
+
+/// Item 3. Guards: `default_account` (`src/daemon/effect_rpc.rs`, under
+/// `platform_call`) and `rpc_platform_check` (`src/daemon/platform_rpc.rs`)
+/// refuse a ticketless agent that names no account or project.
+#[test]
+fn cad1752_ticketless_agent_effect_needs_explicit_account() {
+    let fx = Fx::start(Board::None);
+    stage2_projects(&fx);
+    fx.seed_catalogue("acct-fx");
+    let no_project = "'acct-fx' has no project: no running task";
+    for (verb, params) in [
+        (
+            "platform_call",
+            json!({"platform": "demo", "tool": "demo.read"}),
+        ),
+        (
+            "platform_check",
+            json!({"platform": "demo", "scope": "demo.read"}),
+        ),
+    ] {
+        let err = fx
+            .rpc(Asserted::Agent("acct-fx".into()), verb, params.clone())
+            .expect_err(&format!("{verb}: a ticketless agent resolved an account"));
+        assert!(
+            matches!(err, cadence_agent::Error::Rejected(_))
+                && err.to_string().contains(no_project),
+            "{verb}: refused for a different reason: {err:?}"
+        );
+        // Positive: with an explicit account it gets past that check (and
+        // stops later, at the grant or adapter, for a different reason).
+        let mut explicit = params.clone();
+        explicit["account"] = json!("acct-1");
+        let later = fx.rpc(Asserted::Agent("acct-fx".into()), verb, explicit);
+        if let Err(err) = &later {
+            assert!(
+                !err.to_string().contains("has no project"),
+                "{verb}: an explicit account still hit the project rule: {err}"
+            );
+        }
+        // Positive: with a running task on alpha the project resolves.
+        if verb == "platform_check" {
+            fx.plant_message("acct-fx", "dispatch-fx-1", "running", Some("ALPHA-9"));
+        }
+    }
+    let err = fx
+        .rpc(
+            Asserted::Agent("acct-fx".into()),
+            "platform_check",
+            json!({"platform": "demo", "scope": "demo.read"}),
+        )
+        .expect_err("no grant exists in this fixture");
+    assert!(
+        !err.to_string().contains("has no project"),
+        "a running task on alpha still left no project: {err}"
+    );
+}
+
+/// Item 4 (agent_show) and 5b. `agent_show` carries the running task's
+/// project for a catalogue agent, nothing without a task, and a
+/// repo-joined agent with no task keeps its cwd's project.
+#[test]
+fn cad1752_agent_show_reports_the_turn_project() {
+    let fx = Fx::start(Board::None);
+    let repo = stage2_projects(&fx);
+    fx.seed_catalogue("acct-show");
+    assert_eq!(fx.turn_project("acct-show"), Value::Null);
+    fx.plant_message("acct-show", "dispatch-show-1", "running", Some("ALPHA-4"));
+    assert_eq!(fx.turn_project("acct-show"), "alpha");
+
+    fx.seed_at("joined", &repo, None);
+    assert_eq!(fx.turn_project("joined"), "alpha", "cwd fallback lost");
+    // A running task on beta outranks the joined agent's cwd.
+    fx.plant_message("joined", "dispatch-joined-1", "running", Some("BETA-2"));
+    assert_eq!(fx.turn_project("joined"), "beta");
+}
