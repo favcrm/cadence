@@ -68,9 +68,10 @@ function useFinishedTurn(turn: {
         message: turn.message ?? "",
         conversation: turn.conversation ?? null,
         install: turn.app_origin?.install_id ?? null,
-        // `position` is null only while the turn is WORKING: a queued
-        // message that is cancelled or becomes the head was never a reply.
-        working: turn.position === null,
+        // `position` is null (or omitted) only while the turn is WORKING: a
+        // queued message that is cancelled or becomes the head was never a
+        // reply.
+        working: turn.position == null,
       }
     : null;
   const before = previous.current;
@@ -107,10 +108,10 @@ export function AssistantUnreadProbes({ apps }: { apps: { installId: string }[] 
         ? null
         : (apps.find((app) => conversationList(app.installId).get().data?.conversations.some((c) => c.id === conversation))
             ?.installId ?? null));
-    const open = visibleConversation();
-    const routeOpen = new URLSearchParams(window.location.search).get("conversation");
-    const shown = open?.conversation !== null && open?.conversation === conversation;
-    if (install !== null && conversation !== null && !shown && conversation !== routeOpen) {
+    // The live pane selection is the only authority here: a URL query can be
+    // stale after the picker moved, and must not veto a real reply.
+    const shown = visibleConversation()?.conversation === conversation;
+    if (install !== null && conversation !== null && !shown) {
       setAssistantUnread(install, true);
       const params = new URLSearchParams({ conversation });
       toast.show("Assistant replied", `assistant:${install}:${conversation}`, {
