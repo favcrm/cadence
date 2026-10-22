@@ -1412,3 +1412,75 @@ fn cad1752_agent_show_reports_the_turn_project() {
     fx.plant_message("joined", "dispatch-joined-1", "running", Some("BETA-2"));
     assert_eq!(fx.turn_project("joined"), "beta");
 }
+
+impl Fx {
+    /// Move a planted message to `state` (a turn finishing or starting).
+    fn set_message_state(&self, id: &str, state: &str) {
+        let conn = rusqlite::Connection::open(self.state().join("cadence.sqlite3")).unwrap();
+        conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE messages SET state=?1 WHERE id=?2",
+                rusqlite::params![state, id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "message {id} not found");
+    }
+}
+
+/// Finding from the stage-2 probe. Rule: the turn in flight decides. A
+/// running turn with no issue (a ticketless chat) has no project, even
+/// while a dispatch on alpha waits in the queue.
+#[test]
+fn cad1752_running_ticketless_turn_ignores_queued_dispatch() {
+    let fx = Fx::start(Board::None);
+    stage2_projects(&fx);
+    fx.seed_catalogue("chat-1");
+    fx.plant_message("chat-1", "chat-running", "running", None);
+    fx.plant_message("chat-1", "dispatch-alpha-q", "queued", Some("ALPHA-7"));
+    assert_eq!(
+        fx.turn_project("chat-1"),
+        Value::Null,
+        "a ticketless running turn took the queued dispatch's project"
+    );
+    assert_project_refusal(
+        fx.wiki_write("chat-1", "projects/alpha/notes.md"),
+        "a ticketless running turn with alpha queued",
+        "none",
+    );
+
+    // Control: the chat turn ends and the alpha dispatch runs.
+    fx.set_message_state("chat-running", "completed");
+    fx.set_message_state("dispatch-alpha-q", "running");
+    assert_eq!(fx.turn_project("chat-1"), "alpha");
+    let ok = fx
+        .wiki_write("chat-1", "projects/alpha/notes.md")
+        .unwrap_or_else(|e| panic!("the running alpha dispatch's write refused: {e}"));
+    assert_eq!(ok["committed"], true, "{ok}");
+}
+
+/// A message in state `unknown` (delivery outcome not known) is not a
+/// running turn and must not by itself give the agent a project.
+#[test]
+fn cad1752_unknown_state_dispatch_gives_no_project() {
+    let fx = Fx::start(Board::None);
+    stage2_projects(&fx);
+    fx.seed_catalogue("dev-u");
+    fx.plant_message("dev-u", "dispatch-alpha-u", "unknown", Some("ALPHA-8"));
+    assert_eq!(
+        fx.turn_project("dev-u"),
+        Value::Null,
+        "an 'unknown' message alone gave a project"
+    );
+    assert_project_refusal(
+        fx.wiki_write("dev-u", "projects/alpha/notes.md"),
+        "an 'unknown' alpha dispatch",
+        "none",
+    );
+
+    // Control: the same dispatch running gives alpha.
+    fx.set_message_state("dispatch-alpha-u", "running");
+    assert_eq!(fx.turn_project("dev-u"), "alpha");
+    let ok = fx.wiki_write("dev-u", "projects/alpha/notes.md").unwrap();
+    assert_eq!(ok["committed"], true, "{ok}");
+}
