@@ -158,3 +158,5 @@ textarea.rc-text { min-height: 7.5rem; resize: vertical; line-height: 1.5; width
   .ap-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .ap-grid { grid-template-columns: minmax(0, 1fr); }
 }
+.ap-job-sum p { margin: 0 0 0.4rem; }
+.ap-job-sum .rc-does { font-size: var(--text-secondary); }

@@ -80,13 +80,16 @@ export function categoryLabel(payload: AgentRolesPayload | null, id: string): st
 }
 
 /** The catalogue role an agent was hired from, if it carries one. */
-export function roleOf(agent: Pick<Agent, "params">, payload: AgentRolesPayload | null): AgentRole | null {
-  const id = agent.params?.catalogue;
+export function roleOf(
+  agent: Pick<Agent, "params" | "catalogue">,
+  payload: AgentRolesPayload | null,
+): AgentRole | null {
+  const id = agent.catalogue ?? agent.params?.catalogue;
   return typeof id === "string" ? (payload?.roles.find((r) => r.id === id) ?? null) : null;
 }
 
-export function onTeamCount(role: AgentRole, agents: Pick<Agent, "params">[]): number {
-  return agents.filter((a) => a.params?.catalogue === role.id).length;
+export function onTeamCount(role: AgentRole, agents: Pick<Agent, "params" | "catalogue">[]): number {
+  return agents.filter((a) => (a.catalogue ?? a.params?.catalogue) === role.id).length;
 }
 
 export function matchesRole(role: AgentRole, category: string, query: string): boolean {
@@ -113,4 +116,18 @@ export function appliesText(applies: string): string {
   if (applies === "next_turn") return "Applies from its next turn";
   if (applies === "next_launch") return "Applies the next time it launches";
   return "Saved, but this agent does not read it yet";
+}
+
+/** "18 min", "45 s": a turn length in plain words; null when unknown. */
+export function durationText(secs: number | null | undefined): string {
+  if (secs === null || secs === undefined) return "—";
+  if (secs < 90) return `${Math.round(secs)} s`;
+  if (secs < 5400) return `${Math.round(secs / 60)} min`;
+  return `${(secs / 3600).toFixed(1)} h`;
+}
+
+/** "3 Oct", from epoch seconds; "—" when unknown. */
+export function hiredText(epochSecs: number | null | undefined): string {
+  if (epochSecs === null || epochSecs === undefined) return "—";
+  return new Date(epochSecs * 1000).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
 }

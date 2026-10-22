@@ -481,22 +481,42 @@ impl Shared {
         let picked = selection
             .and_then(|sel| sel.get("model"))
             .and_then(Value::as_str);
-        if let Some(model) = picked {
-            crate::pi_policy::require_allowed(policy.as_ref(), "worker", model)?;
-            let source = selection
-                .and_then(|sel| sel.get("source"))
-                .and_then(Value::as_str)
-                .unwrap_or("provider_default");
-            return Ok((model.to_string(), source.to_string()));
-        }
-        let (model, platform) =
-            crate::pi_policy::resolve_model_with_source(policy.as_ref(), "worker", None)?;
-        let source = if platform {
-            "platform_default"
-        } else {
-            "pi_policy_default"
+        let (model, source) = match picked {
+            Some(model) => {
+                let source = selection
+                    .and_then(|sel| sel.get("source"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider_default");
+                (model.to_string(), source.to_string())
+            }
+            None => {
+                let (model, platform) =
+                    crate::pi_policy::resolve_model_with_source(policy.as_ref(), "worker", None)?;
+                let source = if platform {
+                    "platform_default"
+                } else {
+                    "pi_policy_default"
+                };
+                (model, source.to_string())
+            }
         };
-        Ok((model, source.to_string()))
+        // The launch admits a worker only on the operator's allowlist - the
+        // platform fallback is exempt at register but not when Pi opens -
+        // and refuses Devin models for a confined worker. Apply both here
+        // so a role that would register and then fence shows its reason.
+        crate::pi_policy::require_allowed(policy.as_ref(), "worker", &model)?;
+        let confined = self
+            .pm_dir()
+            .ok()
+            .filter(|dir| dir.is_dir())
+            .map(|dir| crate::doctor::host::read_host_overrides(&dir))
+            .transpose()
+            .map_err(Error::rejected)?
+            .flatten()
+            .and_then(|overrides| overrides.confine_pi_workers)
+            == Some(true);
+        crate::adapter::pi::refuse_confined_devin("a catalogue hire", confined, &model)?;
+        Ok((model, source))
     }
 
     pub(super) fn rpc_events(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {

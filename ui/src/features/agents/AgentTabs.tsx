@@ -170,11 +170,32 @@ function EventRow({ e }: { e: AgentDetail["events"][number] }) {
   );
 }
 
+/** The job as the mockup shows it: its first paragraph, then the bullets. */
+function JobSummary({ text }: { text: string }) {
+  const lines = text.split("\n").map((line) => line.trimEnd());
+  const bullets = lines.filter((line) => line.startsWith("- ")).map((line) => line.slice(2));
+  const lead = lines.filter((line) => line.trim() !== "" && !line.startsWith("- "));
+  return (
+    <div className="ap-lead ap-job-sum">
+      {lead.map((line) => (
+        <p key={line}>{line}</p>
+      ))}
+      {bullets.length > 0 && (
+        <ul className="rc-does">
+          {bullets.map((line) => (
+            <li key={line}>{line}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function JobExcerpt({ c }: { c: TabContext }) {
   const t = useTranslate();
   const text = c.detail?.agent.instructions ?? c.role?.instructions ?? null;
   return text ? (
-    <p className="ap-lead ap-clamp">{text}</p>
+    <JobSummary text={text} />
   ) : (
     <p className="rc-note">{t("This agent has no role text on this board.")}</p>
   );
@@ -368,10 +389,10 @@ function History({ c }: { c: TabContext }) {
 function Job({ c }: { c: TabContext }) {
   const t = useTranslate();
   const writeBlock = useContext(WriteGate);
+  // The board serves the saved text to the operator only; anyone else sees
+  // the role's job line in the hero and no text box.
   const served = c.detail?.agent.instructions ?? null;
-  const known = served !== null || c.role !== null;
-  const start = served ?? c.role?.instructions ?? "";
-  const [text, setText] = useState(start);
+  const [text, setText] = useState(served ?? "");
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [applies, setApplies] = useState<string | null>(null);
@@ -391,9 +412,17 @@ function Job({ c }: { c: TabContext }) {
       setSaving(false);
     }
   };
-  if (!known) {
+  if (!c.detail) return <Note>{t("Loading agent details…")}</Note>;
+  if (served === null) {
     return (
-      <Note>{t("This agent's instructions are not shown by the board, so they cannot be edited here.")}</Note>
+      <Note>
+        {c.role
+          ? t("The job text is visible to the operator. This agent was hired as {role}.").replace(
+              "{role}",
+              () => c.role!.title,
+            )
+          : t("This agent's instructions are not shown by the board, so they cannot be edited here.")}
+      </Note>
     );
   }
   return (
@@ -416,9 +445,6 @@ function Job({ c }: { c: TabContext }) {
             : t("Edits change only this agent.")}
         </span>
       </label>
-      {served === null && (
-        <Note>{t("The saved text is not shown by this board yet; this is the role's starting text.")}</Note>
-      )}
       {operator ? (
         <div className="rc-sugs">
           <Button variant="primary" size="sm" disabled={saving} onClick={() => void save()}>

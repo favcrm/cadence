@@ -697,8 +697,12 @@ export interface Agent {
   provider: string;
   endpoint_kind: string;
   state: string;
-  /** Launch params; a catalogue hire carries `catalogue`, `look` and `kind`. */
+  /** Launch params; the detail read carries them. */
   params?: Record<string, unknown>;
+  /** CAD-1752: a hire's catalogue identity, served on every roster row. */
+  catalogue?: string | null;
+  look?: string | null;
+  kind?: string | null;
   role?: string | null;
   /** Model-preference role. Independent of runtime `role`. */
   team_role?: string | null;
@@ -901,6 +905,15 @@ export interface AgentDetail {
   };
   queued: number;
   unknown: number;
+  /** The agent page's figures; a null one is genuinely absent. */
+  stats?: {
+    hired_at: number | null;
+    tasks_done: number;
+    reports: number;
+    avg_turn_secs: number | null;
+    prs_merged: number | null;
+    drafts_sent: number | null;
+  } | null;
   running: {
     id: string;
     task?: string;

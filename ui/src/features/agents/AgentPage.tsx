@@ -7,7 +7,14 @@ import type { Agent, AgentDetail } from "../../lib/types";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
 import { RecoveryBlock } from "./AgentProfile";
 import AgentTabBody, { type TabContext } from "./AgentTabs";
-import { categoryLabel, roleOf, runsOnText, type RolesState } from "./agentRoles";
+import {
+  categoryLabel,
+  durationText,
+  hiredText,
+  roleOf,
+  runsOnText,
+  type RolesState,
+} from "./agentRoles";
 import { AGENT_TABS, type AgentTab } from "./agentTabModel";
 import {
   agentHoldsWorkButDead,
@@ -104,7 +111,9 @@ export default function AgentPage({
   const lifecycle = profile ? lifecycleOf(profile) : "normal";
   const deadHolding = profile ? agentHoldsWorkButDead(profile) : false;
   const params = (a?.params ?? observed?.params) as Record<string, unknown> | undefined;
-  const role = profile ? roleOf({ params: params ?? profile.params }, roles.data) : null;
+  const role = profile
+    ? roleOf({ params: params ?? profile.params, catalogue: observed?.catalogue }, roles.data)
+    : null;
   const hosted = roles.data?.install.hosted ?? false;
   const badge = profile ? lifecycleBadge(profile, t) : null;
   const where =
@@ -112,10 +121,22 @@ export default function AgentPage({
       ? t("a cloud sandbox")
       : t(runsOnText(hosted));
   const categoryText = role ? `${role.title} · ${t(categoryLabel(roles.data, role.category))}` : null;
-  const stats =
+  const figures = detail?.stats ?? null;
+  const count = (n: number | null | undefined) => (n === null || n === undefined ? "—" : String(n));
+  const stats: [string, string][] =
     role?.kind === "apps"
-      ? ["Reports", "Drafts sent", "Avg. turn", "Hired"]
-      : ["Tickets done", "PRs merged", "Avg. turn", "Hired"];
+      ? [
+          ["Reports", count(figures?.reports)],
+          ["Drafts sent", count(figures?.drafts_sent)],
+          ["Avg. turn", durationText(figures?.avg_turn_secs)],
+          ["Hired", hiredText(figures?.hired_at)],
+        ]
+      : [
+          ["Tickets done", count(figures?.tasks_done)],
+          ["PRs merged", count(figures?.prs_merged)],
+          ["Avg. turn", durationText(figures?.avg_turn_secs)],
+          ["Hired", hiredText(figures?.hired_at)],
+        ];
 
   const ctx: TabContext = {
     alias,
@@ -234,9 +255,13 @@ export default function AgentPage({
       )}
 
       <div className="ap-stats">
-        {stats.map((label) => (
-          <div key={label} className="ap-stat" title={t("Not reported by the daemon yet")}>
-            <b className="num">—</b>
+        {stats.map(([label, value]) => (
+          <div
+            key={label}
+            className="ap-stat"
+            title={value === "—" ? t("Not recorded for this agent") : undefined}
+          >
+            <b className="num">{value}</b>
             <small>{t(label)}</small>
           </div>
         ))}

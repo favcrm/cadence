@@ -1,4 +1,4 @@
-import { aliasProblem, appliesText, matchesRole, nextAlias, suggestedRoles } from "../src/features/agents/agentRoles";
+import { aliasProblem, appliesText, durationText, hiredText, matchesRole, nextAlias, roleOf, suggestedRoles } from "../src/features/agents/agentRoles";
 import { historyKind, parseAgentTab } from "../src/features/agents/agentTabModel";
 import { locationHref, readLocation } from "../src/lib/router";
 import type { AgentRole } from "../src/lib/types";
@@ -64,3 +64,12 @@ check(locationHref(plain, "") === "/agents/dev-1", "overview keeps a clean URL")
 const recruit = readLocation("/agents", "?recruit=1");
 check(recruit.route.screen === "agents" && recruit.route.recruit === true, "recruit view is read");
 check(locationHref(recruit, "") === "/agents?recruit=1", "recruit view is written back");
+
+// Figures: unknown stays a dash, known ones read in plain words.
+check(durationText(null) === "—" && durationText(45) === "45 s" && durationText(1080) === "18 min", "turn length wording");
+check(hiredText(null) === "—" && hiredText(1_792_000_000).length > 3, "hired date wording");
+
+// A roster row carries only the catalogue id; the role resolves from it.
+const payload = { categories: [], roles, install: { hosted: false, provider: "pi", endpoint_kind: "managed" } };
+check(roleOf({ catalogue: "developer" }, payload)?.id === "developer", "role from the served catalogue id");
+check(roleOf({}, payload) === null, "no catalogue id, no role");

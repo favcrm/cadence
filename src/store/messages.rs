@@ -2382,6 +2382,45 @@ impl Store {
 
     /// Count an agent's queued inbound messages (`cadence self` for an
     /// inbox reports this instead of a running turn).
+    /// CAD-1752: the agent page's figures, one bounded query each.
+    /// `tasks_done` counts its verified/done tasks, `reports` the
+    /// `task_reported` events on its stream, and `avg_turn_secs` the mean
+    /// of its last 100 completed turns (nudges excluded). `hired_at` is the
+    /// registration time. Figures the store cannot attribute to an agent
+    /// (merged PRs, drafts sent) stay null rather than being invented.
+    pub fn agent_stats(&self, alias: &str) -> Result<Value> {
+        let conn = self.conn();
+        let hired_at: Option<f64> = conn
+            .query_row("SELECT created FROM agents WHERE alias=?", [alias], |r| {
+                r.get(0)
+            })
+            .ok();
+        let tasks_done: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE assignee=? AND state IN ('verified','done')",
+            [alias],
+            |r| r.get(0),
+        )?;
+        let reports: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE alias=? AND kind='task_reported'",
+            [alias],
+            |r| r.get(0),
+        )?;
+        let avg_turn_secs: Option<f64> = conn.query_row(
+            "SELECT AVG(completed-started) FROM (
+                 SELECT started, completed FROM messages
+                 WHERE alias=? AND state='completed' AND source != 'nudge'
+                   AND started IS NOT NULL AND completed IS NOT NULL
+                 ORDER BY seq DESC LIMIT 100)",
+            [alias],
+            |r| r.get(0),
+        )?;
+        Ok(json!({
+            "hired_at": hired_at, "tasks_done": tasks_done, "reports": reports,
+            "avg_turn_secs": avg_turn_secs,
+            "prs_merged": Value::Null, "drafts_sent": Value::Null,
+        }))
+    }
+
     pub fn queued_count(&self, alias: &str) -> Result<i64> {
         let conn = self.conn();
         Ok(conn.query_row(

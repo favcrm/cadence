@@ -888,6 +888,11 @@ pub(crate) fn agents_payload_from(
             "endpoint_kind": agent["endpoint_kind"],
             "role": agent["role"],
             "team_role": agent["team_role"],
+            // CAD-1752: only the catalogue identity of a hire, never the
+            // whole params object - this list goes to every viewer.
+            "catalogue": agent["params"]["catalogue"],
+            "look": agent["params"]["look"],
+            "kind": agent["params"]["kind"],
             "model_selection": agent["model_selection"],
             "model_lookup_role": agent["model_lookup_role"],
             // Preserve provider evidence so the UI can distinguish a
@@ -938,11 +943,18 @@ pub(crate) fn agents_payload_from(
 /// `task_bindings` brings this alias's tasks with their issues from one
 /// join on this alias's rows. The fleet's `agent_list` and `job_list`
 /// are read only for a daemon that predates `task_bindings`.
-pub(crate) fn agent_detail(state_dir: &Path, alias: &str) -> std::result::Result<Value, String> {
+pub(crate) fn agent_detail(
+    state_dir: &Path,
+    alias: &str,
+    operator: bool,
+) -> std::result::Result<Value, String> {
+    // CAD-1752: the saved job text is the operator's to read; a member's
+    // detail never carries `instructions`.
     let show = client::rpc(
         state_dir,
         "agent_show",
-        json!({"alias": alias, "active_only": true}),
+        json!({"alias": alias, "active_only": true,
+               "include_profile_instructions": operator, "include_stats": true}),
     )
     .map_err(|e| e.to_string())?;
     let agent = &show["agent"];
@@ -980,6 +992,7 @@ pub(crate) fn agent_detail(state_dir: &Path, alias: &str) -> std::result::Result
         ),
         "tasks": tasks,
         "on": issues,
+        "stats": show["stats"],
     }))
 }
 
@@ -1156,7 +1169,10 @@ fn read_dispatch(
         }
         endpoints::RouteId::AgentDetail => {
             let alias = bound.get("alias").unwrap_or_default();
-            match agent_detail(state_dir, alias) {
+            // The viewer verdict the OperatorOnly reads use: only the
+            // operator's session (with peer proof) gets the saved job text.
+            let operator = operator::admit_operator_read(request, state_dir, opts).is_ok();
+            match agent_detail(state_dir, alias, operator) {
                 Ok(detail) => json_response(detail),
                 Err(error) => err_response(404, &error),
             }

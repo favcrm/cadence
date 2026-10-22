@@ -176,7 +176,7 @@ function AgentCard({
       <div className="top">
         <div className="avwrap">
           <AgentAvatar
-            slug={agentLook(a.alias, a.params)}
+            slug={agentLook(a.alias, { look: a.look ?? a.params?.look })}
             active={lifecycle === "active"}
             still={lifecycle !== "active"}
           />

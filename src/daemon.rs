@@ -2755,6 +2755,10 @@ impl Shared {
                     // `agent unfence` is the only exit.
                     "unknown": self.store.unknown_messages(&alias)?.len(),
                 });
+                // CAD-1752: the agent page's figures, only when asked.
+                if params.get("include_stats").and_then(Value::as_bool) == Some(true) {
+                    out["stats"] = self.store.agent_stats(&alias)?;
+                }
                 // CAD-1221: this alias's non-terminal tasks and their
                 // job's issue, in one agent-scoped join. The board's
                 // detail reads it instead of the fleet's agent and job lists.
