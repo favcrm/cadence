@@ -608,6 +608,10 @@ impl Shared {
                     if m.alias == alias
                         && m.source == "operator"
                         && m.sender.as_deref() == Some("operator")
+                        // An agent may literally be named `operator`; the
+                        // canonical uid is what tells it from the operator's
+                        // own chat (only the agent row has one).
+                        && m.sender_uid.is_none()
                         && m.reply_to.is_none() =>
                 {
                     m

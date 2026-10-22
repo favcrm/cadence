@@ -77,6 +77,7 @@ import { RESOURCE_NAMES } from "./lib/cache";
 import { noteThreadsChanged } from "./features/threads/threadsClient";
 import { noteMasterChanged } from "./lib/masterChanged";
 import { useHomeUnread } from "./features/app-shell/chat/homeUnread";
+import { useAssistantUnreadShell } from "./features/app-shell/chat/unreadShell";
 import { LiveUpdates, patchRows } from "./lib/liveUpdates";
 import type { Agent, AgentsPayload } from "./lib/types";
 import { cache, onIssueUnavailable, resources, type MyWorkList } from "./lib/resources";
@@ -764,6 +765,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     () => (installations.list ?? []).filter((i) => i.removed == null).map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })),
     [installations.list],
   );
+  useAssistantUnreadShell(installed);
   const keyInstallations = route.screen === "workspaceAppKey"
     ? (installations.list ?? []).filter((installation) => installation.name === route.appKey && installation.removed == null)
     : [];

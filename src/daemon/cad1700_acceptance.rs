@@ -112,7 +112,12 @@ fn fx() -> Fx {
         .set("CADENCE_HOME", dir.path().to_str().unwrap());
     let shared = Shared::new(dir.path(), &opts).unwrap();
     let cwd = dir.path().to_str().unwrap().to_string();
-    for (alias, provider, kind) in [("master", "pi", "managed"), ("w1", "fake", "fake")] {
+    for (alias, provider, kind) in [
+        ("master", "pi", "managed"),
+        ("w1", "fake", "fake"),
+        // A valid agent alias that collides with the operator's sender label.
+        ("operator", "fake", "fake"),
+    ] {
         shared
             .store
             .register_agent(&NewAgent {
@@ -383,4 +388,30 @@ fn cad1700_cancel_refuses_a_forged_operator_source() {
         "a message an agent sent is not the operator's own: {text}"
     );
     assert_eq!(fx.state("m-forged"), "queued", "it is not cancelled");
+
+    // An agent may literally be named `operator`: its row records that
+    // label too, but carries a canonical uid the operator's chat does not.
+    fx.call(
+        Asserted::Agent("operator".into()),
+        "agent_send",
+        json!({"alias": "master", "text": "collision", "message": "m-collide",
+               "source": "operator", "wait": 0}),
+    )
+    .unwrap();
+    assert!(
+        fx.shared
+            .store
+            .message("m-collide")
+            .unwrap()
+            .unwrap()
+            .sender_uid
+            .is_some(),
+        "the colliding agent's row carries a uid"
+    );
+    let (code, text) = refusal(fx.command("cancel", Some("m-collide")));
+    assert_eq!(
+        code, "message_not_cancellable",
+        "an agent named operator is still not the operator: {text}"
+    );
+    assert_eq!(fx.state("m-collide"), "queued", "it is not cancelled");
 }
