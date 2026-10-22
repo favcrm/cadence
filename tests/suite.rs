@@ -102,6 +102,7 @@ mod cad848_retention_refusal;
 mod cad848_review_lifecycle;
 mod cad864_app_views;
 mod cad913_wiki_envelope_upload;
+mod cadence_core_compat_unit;
 mod company_skill_install;
 mod pi_master_reset;
 mod reference_pack_templates;

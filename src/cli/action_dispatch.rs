@@ -302,6 +302,53 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         }
         _ => {}
     }
+    // Hosted metadata never needs local sandbox adoption, permission replay,
+    // daemon startup, or the generic native/container verb map. Refuse an
+    // absent/local hosted selection before any of those paths, including on
+    // client-only installations.
+    if matches!(
+        &cli.command,
+        Commands::Agent {
+            action: AgentAction::Directory { .. } | AgentAction::Notify { .. },
+        } | Commands::LocalAgent {
+            action: local_agent::LocalAgentAction::Directory { .. }
+                | local_agent::LocalAgentAction::Notify { .. },
+        }
+    ) {
+        let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), None)? {
+            org::Resolved::Remote(target) => target,
+            org::Resolved::Local(_) => {
+                return Err(Error::usage(
+                    "agent directory/notify require a selected hosted org; pass --org <logged-in-workspace>. Nothing was sent and no daemon was started",
+                ));
+            }
+        };
+        return remote::run(target, cli.command, cli.wake_timeout, cli.state_dir);
+    }
+    // Published app lifecycle is hosted-only and must refuse before local
+    // state/daemon startup, including on a client-only installation.
+    if matches!(
+        &cli.command,
+        Commands::App {
+            action: app::AppAction::Catalog {
+                action: app::CatalogAction::ReleaseCheck { .. }
+                    | app::CatalogAction::ReleaseInstall { .. }
+                    | app::CatalogAction::ReleaseUpdate { .. }
+                    | app::CatalogAction::ReleaseRevoke { .. }
+                    | app::CatalogAction::Operation { .. }
+                    | app::CatalogAction::Pending { .. }
+                    | app::CatalogAction::Reconcile { .. }
+            }
+        }
+    ) {
+        let target = match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), None)? {
+            org::Resolved::Remote(target) => target,
+            org::Resolved::Local(_) => return Err(Error::usage(
+                "published app lifecycle requires --org <logged-in-workspace>; no local daemon or hosted request was started",
+            )),
+        };
+        return remote::run(target, cli.command, cli.wake_timeout, cli.state_dir);
+    }
     // Hosted human team administration. A managed agent is refused before
     // org resolution, so a saved human login is never loaded. A local org
     // is a usage error and does not open a daemon. A remote org uses the

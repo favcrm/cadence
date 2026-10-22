@@ -5,6 +5,11 @@ Ordinary `cadence login` establishes the remote CLI/wiki session described in
 not need an owner-only login for routine collaboration. That session is not a
 provider billing or publishing credential.
 
+For the practical local-daemon/hosted-workspace setup, teammate wiki/ticket
+collaboration, explicit FYI registration and app lifecycle boundaries, start with
+[Hosted workspace](guides/hosted-workspace.md). The credential details below
+remain separate from agent registration or package consent.
+
 The separate CAD-539 provider credential import (`--token-stdin`) does not
 connect issue, message or team commands to hosted Cadence. Its
 `hosted_cadence: not_configured` result describes that provider import, not an
@@ -370,18 +375,19 @@ The selected row's UID is checked inside the enqueue transaction; removing
 or replacing that recipient before enqueue refuses the send rather than
 allowing a later generic lookup to redirect it.
 Personal assistants require separate assistant authority and local workers
-use the `local-agent`/local-assignment plane; both are unsupported
-remote-send recipient classes. Member-to-member remote coordination and
-the local-worker follow-up journey are explicitly deferred on the ticket —
-refused, not silently fulfilled. Agent/service envelopes cannot inherit
-their parent human's messaging or private readback authority.
+use the `local-agent`/local-assignment plane; neither is a remote-send recipient.
+Generic member-to-member `send` and the local-worker follow-up journey remain
+refused on this transport. Explicit directory-addressed FYIs use the separate
+[`agent notify` flow](guides/hosted-workspace.md#a-teammates-own-agent-collaboration-flow);
+they store notices, not execution instructions. Agent/service envelopes cannot
+inherit their parent human's messaging or private readback authority.
 Roll out the matching native-server authorization guard before exposing
 the upgraded CLI to a hosted workspace. A CLI upgrade alone does not
 establish these sender-ownership and private-readback guarantees.
 This feature does not authorize a production rollout.
 
 ```sh
-cadence login acme                                            # owner-approved hosted grant
+cadence login acme                                            # approve your own hosted grant
 cadence --org acme wiki put global/docs/kit.md --file kit.md  # stage inputs in the wiki
 cadence --org acme send master --message ask-42 --text \
   "Please coordinate review of the staged kit — see global/docs/kit.md."
@@ -642,11 +648,11 @@ anything.
 
 ## Remaining cloud contract
 
-Browser-based hosted consent, assignment delivery, active-channel revocation,
-durable sleep-safe application witness, and actual hosted Cadence command
-transport remain dependencies. Current device `read/draft/send` scopes belong
-to the issuer contract; they do not grant Cadence operator privileges. No board
-cookie authentication or assertion guard is weakened by this increment.
+The legacy enrollment flows above do not replace the current
+[hosted workspace bridge](guides/hosted-workspace.md). Its matching issuer,
+directory/event transport and native domain owners must be rolled out together;
+source support is not deployment evidence. Device `read/draft/send` scopes do not
+grant Cadence operator privileges, and no board cookie/assertion guard is weakened.
 
 ### Read-only diagnosis before repeated login (CAD-1434)
 

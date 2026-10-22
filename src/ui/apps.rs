@@ -407,6 +407,14 @@ fn merge_catalogue(params: &mut Value, extra: Value) {
     }
 }
 
+pub(super) fn hosted_operation_id(request: &Request) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("X-Cadence-Hosted-Operation-Id"))
+        .map(|header| header.value.as_str().to_owned())
+}
+
 /// Stage the validated file-map to a server-derived temp dir OUTSIDE the PM
 /// tracker (`workspace.rs` refuses a source inside `pm.dir` — the tracker is
 /// never its own source), then hand its absolute path to the unchanged
@@ -477,6 +485,11 @@ fn workspace_upload_with_mode(
     } else {
         "app_workspace_install"
     };
+    if !check_only {
+        if let Some(id) = hosted_operation_id(request) {
+            params["hosted_operation_id"] = json!(id);
+        }
+    }
     match client::rpc(state, method, params) {
         Ok(value) => {
             if check_only
@@ -1128,7 +1141,7 @@ pub(super) fn workspace(
     // caller used the legacy `source` transport (no staging) or another
     // method entirely.
     let mut _upgrade_staging: Option<tempfile::TempDir> = None;
-    let params = if matches!(
+    let mut params = if matches!(
         method,
         "app_workspace_upgrade" | "app_workspace_upgrade_check"
     ) {
@@ -1278,6 +1291,11 @@ pub(super) fn workspace(
     } else {
         json!({})
     };
+    if matches!(method, "app_workspace_install" | "app_workspace_upgrade") {
+        if let Some(id) = hosted_operation_id(request) {
+            params["hosted_operation_id"] = json!(id);
+        }
+    }
     match client::rpc(state, method, params) {
         Ok(value) => json_response(value),
         Err(error) => home::rpc_err(&error, method),

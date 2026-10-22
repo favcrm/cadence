@@ -715,9 +715,14 @@ impl Shared {
         peer_pid: u32,
     ) -> Result<Value> {
         let allowed: &[&str] = match method {
-            "app_local_install_approve" | "app_local_install_revoke" => {
-                &["install_id", "digest", "public_session"]
-            }
+            "app_local_install_revoke" => &[
+                "install_id",
+                "digest",
+                "public_session",
+                "expected_generation",
+                "hosted_operation_id",
+            ],
+            "app_local_install_approve" => &["install_id", "digest", "public_session"],
             // CAD-1365: create/start additionally admit the trusted
             // host's relayed session credential (token/key/origin) —
             // resolved natively before any run work, never a
@@ -843,7 +848,24 @@ impl Shared {
         match method {
             "app_local_install_approve" | "app_local_install_revoke" => {
                 let pm = self.pm_at(&self.pm_dir()?)?;
-                workspace::with_runtime_snapshot(
+                let generation = params
+                    .get("expected_generation")
+                    .map(|_| required_str(params, "expected_generation"))
+                    .transpose()?;
+                let hosted_operation_id = params
+                    .get("hosted_operation_id")
+                    .map(|_| required_str(params, "hosted_operation_id"))
+                    .transpose()?;
+                if let Some(id) = hosted_operation_id {
+                    crate::proto::identifier(id, "hosted operation ID")?;
+                    if generation.is_none() {
+                        return Err(Error::rejected(
+                            "hosted revoke requires a catalog generation",
+                        ));
+                    }
+                }
+                let mutation_started = std::cell::Cell::new(false);
+                let result = workspace::with_runtime_snapshot(
                     &pm,
                     required_str(params, "install_id")?,
                     |row, files| {
@@ -855,9 +877,17 @@ impl Shared {
                         if row["digest"].as_str() != Some(digest) {
                             return Err(Error::rejected("installation digest is stale"));
                         }
+                        // The snapshot and the SQLite decision share this held PM
+                        // lock, so another catalog writer cannot slip past the pin.
+                        if generation.is_some_and(|expected| {
+                            row["catalog_generation"].as_str() != Some(expected)
+                        }) {
+                            return Err(Error::rejected("workspace catalog generation is stale"));
+                        }
                         if method == "app_local_install_approve" {
                             local_execution_contract(files)?;
                         }
+                        mutation_started.set(true);
                         self.store.app_capability_decide_as(
                             required_str(params, "install_id")?,
                             digest,
@@ -865,6 +895,12 @@ impl Shared {
                             human,
                         )
                     },
+                );
+                workspace::hosted_mutation_outcome(
+                    result,
+                    mutation_started.get(),
+                    hosted_operation_id,
+                    "revoke",
                 )
             }
             "app_run_create" => self.create_app_run_as(params, None, None, human),

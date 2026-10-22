@@ -23,8 +23,8 @@
 //! these checks. The refused/accepted pairs below are the contract.
 #![cfg(feature = "test-seam")]
 
-use cadence_agent::issue::app::{
-    compat_host, parse_requires, Compat, HostContracts, SemVer, SUPPORTED_CONTRACTS,
+use cadence_core::app_compat::{
+    parse_requires, Compat, HostContracts, SemVer, SUPPORTED_CONTRACTS,
 };
 use serde_yaml::Value as Yaml;
 
@@ -268,38 +268,6 @@ fn malformed_requires_refuses_install_before_any_mutation() {
         assert!(
             std::fs::read_dir(&records_dir).unwrap().next().is_none(),
             "malformed requires left a record file"
-        );
-    }
-}
-
-/// A host the build cannot describe itself is never evaluated against
-/// an invented floor: `compat_host()` returns `Result` and must either
-/// report the real compiled-in version or fail — there is no silent
-/// `0.0.0` fallback that would satisfy every `>=` floor by default.
-/// This is the fail-closed contract PM asked to be pinned.
-#[test]
-fn host_descriptor_is_real_or_refused_never_invented() {
-    let host = compat_host().unwrap_or_else(|e| {
-        panic!("compat_host() must report this build's real version or fail, got: {e}")
-    });
-    // The reported version is the compiled-in literal, parsed — not a
-    // fabricated default. Prove it by comparing against the env var.
-    let literal = env!("CARGO_PKG_VERSION");
-    let parsed =
-        SemVer::parse(literal).unwrap_or_else(|_| panic!("CARGO_PKG_VERSION {literal} must parse"));
-    assert_eq!(
-        host.core.to_string(),
-        parsed.to_string(),
-        "host() reported a version that is not this build's own"
-    );
-    // And it is not the invented zero: a real build never reports
-    // 0.0.0-prerelease as a floor-satisfying identity unless that is
-    // genuinely its version.
-    if literal != "0.0.0" && literal != "0.0.0-prerelease" {
-        assert_ne!(
-            host.core.to_string(),
-            "0.0.0",
-            "host() invented a zero-version fallback"
         );
     }
 }

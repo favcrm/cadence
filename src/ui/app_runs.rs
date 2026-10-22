@@ -157,6 +157,8 @@ where
 #[serde(deny_unknown_fields)]
 struct Decision {
     digest: String,
+    #[serde(default)]
+    expected_generation: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -310,15 +312,29 @@ pub(super) fn handle_with_relay(
                 Ok(value) => value,
                 Err(response) => return response,
             };
+            if decision.expected_generation.is_some()
+                && !matches!(route, Route::InstallDecision(_, false))
+            {
+                return err_response(
+                    400,
+                    "expected_generation is only valid for installation revoke",
+                );
+            }
             match route {
                 Route::InstallDecision(_, true) => (
                     "app_local_install_approve",
                     json!({"install_id":id,"digest":decision.digest}),
                 ),
-                Route::InstallDecision(_, false) => (
-                    "app_local_install_revoke",
-                    json!({"install_id":id,"digest":decision.digest}),
-                ),
+                Route::InstallDecision(_, false) => {
+                    let mut params = json!({"install_id":id,"digest":decision.digest});
+                    if let Some(generation) = decision.expected_generation {
+                        params["expected_generation"] = json!(generation);
+                    }
+                    if let Some(operation_id) = super::apps::hosted_operation_id(request) {
+                        params["hosted_operation_id"] = json!(operation_id);
+                    }
+                    ("app_local_install_revoke", params)
+                }
                 _ => (
                     "app_run_approve",
                     json!({"run_id":id,"digest":decision.digest}),

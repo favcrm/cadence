@@ -24,6 +24,7 @@ pub mod cli_actor;
 pub mod client;
 pub mod confine;
 pub mod continuity;
+pub mod hosted_app_cli;
 pub mod notify_bridge;
 pub mod notify_host;
 pub mod web_push;

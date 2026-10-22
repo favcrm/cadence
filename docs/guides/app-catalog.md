@@ -7,10 +7,15 @@ execution contract passes validation. Install and update do not create worker
 grants or load custom app UI; run approvals and outward-effect permissions
 remain separate.
 
-All catalog commands, including reads, require a reachable daemon and an operator
+Local catalog commands, including reads, require a reachable daemon and an operator
 caller. They fail when the daemon is unavailable; there is no offline catalog
-fallback. Agent read permissions and Local/AgenticOS execution are future
-CAD-631/CAD-632 work. Custom app UI remains separate CAD-633 work.
+fallback. The selected-remote published-release journey below instead uses the
+saved renewable human login and live workspace owner authority.
+
+For the overall local/hosted setup, agent registration and notification boundaries,
+see [Hosted workspace](hosted-workspace.md). This guide retains the exact package
+and published-release command contract; installing a package does not connect an
+agent or migrate native business storage.
 
 ## Commands
 
@@ -32,6 +37,52 @@ installations retain their project metadata. A project link does not grant
 authority. Install and update are operator-only and record consent for the exact
 installed digest if it passes the local execution checks; `approve` and `revoke`
 remain available for explicit operator decisions about local capabilities.
+
+## Selected remote: immutable published releases
+
+With `--org <workspace>`, local paths and Git-source catalog install/update commands
+are refused: they never upload files or fall back to this machine's local install.
+The remote journey names an exact published listing/version/digest. Obtain these
+from the catalogue's `/public/apps/<listing>/versions` metadata, then:
+
+```sh
+cadence --org <workspace> app catalog release-check <listing> --version <version> --digest <sha256-digest> > review.json
+# Inspect the full review.json, including access, compatibility, warnings and readiness.
+cadence --org <workspace> app catalog release-install <listing> --version <version> --digest <sha256-digest> --operation-id <uuid> --review review.json
+cadence --org <workspace> app catalog ls
+cadence --org <workspace> app catalog show <install-id>
+```
+
+The `release-check` output is JSON. Preserve its full successful response in the
+review file; apply rechecks and compares the exact structured review. Consent
+never follows changed bytes, access, readiness, or installation generation.
+For update, check with `--install-id <id> --expected-digest <old-digest>
+--expected-generation <generation>`, then use `release-update <id> <listing>`
+with those old pins plus `--version`, `--digest`, `--operation-id` and `--review`.
+Use the `generation` returned by the hosted installation row, not a guessed value.
+
+`release-revoke <id> --digest <current-digest> --expected-generation <generation>
+--operation-id <uuid>` withdraws package approval using the native owner's revoke
+semantics; it does not delete business data or settle uncertain external effects.
+These hosted commands require a plain human shell with a saved login, not a
+managed agent spending its owner's credential. No browser cookies are copied.
+
+Retain the operation UUID printed on stderr, including after an error:
+
+```sh
+cadence --org <workspace> app catalog operation <uuid>
+cadence --org <workspace> app catalog pending <app-name>
+cadence --org <workspace> app catalog reconcile <uuid>
+```
+
+A current owner can discover/reconcile a pending operation even after its creator
+leaves. Recovery observes the native catalog or cancels an undispatched preparation;
+it never repeats a mutation. `prepared`/`dispatched` do not mean executed. Exit 5
+means unresolved; exit 3 means refusal/unavailable. A lost response does not
+authorize retrying with a new UUID. The same operation binds the same actor,
+release, old installation pins, and checked review; changed input conflicts.
+Installation grants no send/deploy, worker registration, or run approval.
+Native install/run/business records remain native-owned; this is not their migration.
 
 ## Offline byte validation: `cadence app check`
 
@@ -431,6 +482,14 @@ core range that excludes this host refuse validation. Install and upgrade
 validate requirements before writing catalog, journal, or record state. The
 install-check and upgrade-check receipts, and catalog show description, include
 the declaration and this host's core version and supported contract majors.
+
+These requirement rules are implemented once in `crates/cadence-core`, used
+directly by native validation and compiled to `wasm32-unknown-unknown` for a
+hosted adapter. The bounded JSON command and WASM ABI evaluate requirements;
+they do not install packages, grant consent, dispatch work or own business
+records. Each adapter supplies its real host version and supported contract
+profile. The hosted build pins the canonical native Git revision and verifies
+its source/artifact hashes rather than maintaining a second rule engine.
 
 ## Offline screen-frame previews and projection fixtures
 

@@ -11,6 +11,7 @@ pub struct BoardHttp {
     ledger: PathBuf,
     subject_id: Option<String>,
     issuer: Option<String>,
+    request_guard: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 impl BoardHttp {
     pub fn from_parts(
@@ -36,6 +37,7 @@ impl BoardHttp {
             ledger,
             subject_id,
             issuer,
+            request_guard: None,
         }
     }
 
@@ -118,6 +120,83 @@ impl BoardHttp {
         let audience = self.endpoint.clone();
         Coordinator::open(self, org_id, ledger, subject_id, issuer, audience)
     }
+    pub(super) fn set_request_guard(
+        &mut self,
+        guard: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) {
+        self.request_guard = Some(guard);
+    }
+
+    fn ensure_request_active(&self) -> Result<()> {
+        if self.request_guard.as_ref().is_some_and(|active| !active()) {
+            return Err(Error::busy_coded(
+                "binding_cancelled",
+                "workspace binding stopped or changed before the request",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Exact saved-login identity for daemon persistence; never resolve a
+    /// later global org selection or fill a missing claimant pin.
+    pub fn pinned_target(&self) -> Result<RemoteTarget> {
+        let subject_id = self
+            .subject_id
+            .clone()
+            .ok_or_else(|| Error::rejected("workspace member pin is missing"))?;
+        let issuer = self
+            .issuer
+            .clone()
+            .ok_or_else(|| Error::rejected("workspace issuer pin is missing"))?;
+        Ok(RemoteTarget {
+            org: self
+                .saved_target
+                .as_ref()
+                .map(|target| target.org.clone())
+                .unwrap_or_else(|| self.org_id.clone()),
+            org_id: self.org_id.clone(),
+            endpoint: self.endpoint.clone(),
+            identity: Some(remote_cli::CliIdentityPin { subject_id, issuer }),
+        })
+    }
+
+    pub fn events_socket(
+        &mut self,
+        after: u64,
+        runner: &str,
+    ) -> Result<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>>
+    {
+        use tungstenite::client::IntoClientRequest;
+        self.reload_saved_login()?;
+        self.ensure_request_active()?;
+        if !prefixed_id(runner, "lri_") {
+            return Err(Error::rejected("runner identity is invalid"));
+        }
+        let origin = self
+            .endpoint
+            .strip_prefix("https://")
+            .ok_or_else(|| Error::rejected("hosted events require the pinned HTTPS board"))?;
+        let url = format!(
+            "wss://{}{}/events?after={after}&runner_id={runner}",
+            origin.trim_end_matches('/'),
+            assignment_prefix(&self.org_id)
+        );
+        let mut request = url
+            .into_client_request()
+            .map_err(|_| Error::rejected("event endpoint is invalid"))?;
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", self.bearer)
+                .parse()
+                .map_err(|_| Error::rejected("event credential is invalid"))?,
+        );
+        let mut config = tungstenite::protocol::WebSocketConfig::default();
+        config.max_message_size = Some(16 * 1024);
+        config.max_frame_size = Some(16 * 1024);
+        config.max_write_buffer_size = 64 * 1024;
+        config.write_buffer_size = 0;
+        crate::issuer_transport::websocket(request, Some(config), Duration::from_secs(5))
+    }
 }
 
 impl BoardHttp {
@@ -146,18 +225,23 @@ impl BoardHttp {
         body: Option<&Value>,
         deadline: Option<Instant>,
     ) -> Result<Reply> {
+        // Credential renewal may have blocked while a configuration changed.
+        // Re-check at the transport boundary, not only before renewal.
+        self.ensure_request_active()?;
         if !valid_hct(&self.bearer) {
             return Err(Error::rejected("invalid remote credential"));
         }
         let prefix = assignment_prefix(&self.org_id);
+        let directory = format!("/__platform/hosted-cadence/{}/local-agents", self.org_id);
         let route = path.split_once('?').map_or(path, |(route, _)| route);
         if !hosted_id(&self.org_id)
-            || !(route == prefix
-                || route
-                    .strip_prefix(prefix.as_str())
-                    .is_some_and(|tail| tail.starts_with('/')))
+            || ![prefix.as_str(), directory.as_str()].iter().any(|prefix| {
+                route == *prefix
+                    || route
+                        .strip_prefix(*prefix)
+                        .is_some_and(|tail| tail.starts_with('/'))
+            })
             || path.contains("..")
-            || path.contains("local-agents")
             || path.contains("tool-exchange")
             || path.contains("/presence")
         {

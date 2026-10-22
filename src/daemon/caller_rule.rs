@@ -90,6 +90,9 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("health", Rule::Read),
     ("daemon_info", Rule::Read),
     ("shutdown", Rule::Shutdown),
+    ("hosted_local_agent_connect", Rule::Handler("operator_connection_on_agent: explicit workspace binding only")),
+    ("hosted_local_agent_disconnect", Rule::Handler("operator_connection_on_agent: original workspace binding only")),
+    ("hosted_local_agent_observe", Rule::Handler("operator_connection_on_agent: private hosted informational inbox")),
     // CAD-561: the update's drain gate is an operator action — an agent
     // can never stop the fleet's work to push a build. `update_status`
     // is the read side (the board's banner, `cadence update status`).

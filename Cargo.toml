@@ -11,6 +11,10 @@ autotests = false
 license = "MIT"
 description = "Local controller coordinating coding agents across terminals"
 
+[workspace]
+members = ["crates/cadence-core"]
+resolver = "2"
+
 [lib]
 name = "cadence_agent"
 path = "src/lib.rs"
@@ -111,8 +115,17 @@ path = "tests/cad848_deletion_refusal.rs"
 [[test]]
 name = "cad848_reclaim_enumeration_refusal"
 path = "tests/cad848_reclaim_enumeration_refusal.rs"
+# CAD-1739: the hosted app acceptance needs the caller-identity seam. Without
+# the entry `autotests = false` hides the file from `scripts/result-test-args`,
+# and without `required-features` a default `cargo test` lane would link a
+# target whose guard body only panics.
+[[test]]
+name = "cad1739_hosted_app_public_acceptance"
+path = "tests/cad1739_hosted_app_public_acceptance.rs"
+required-features = ["test-seam"]
 
 [dependencies]
+cadence-core = { path = "crates/cadence-core" }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 # Frozen app/agent identity receipts must survive production JSON reads.
@@ -133,7 +146,7 @@ tiny_http = "0.12"
 qrcode = { version = "0.14.1", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tungstenite = "0.26"
+tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tempfile = "3"
 toml = "0.8"
 # CAD-109 secret scan: the vendored gitleaks rule pack is RE2 syntax, which
