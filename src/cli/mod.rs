@@ -20,7 +20,7 @@ mod attach;
 mod attachment;
 mod audit;
 mod backup;
-mod briefing;
+use cadence_agent::briefing;
 mod build_slot;
 mod business_templates;
 #[cfg(all(test, feature = "test-seam"))]
@@ -181,7 +181,7 @@ use update::UpdateAction;
 #[cfg(test)]
 use update_args::{daemon_build_or_absent, fd_is_path};
 use update_args::{RealUpdateHost, UpdateArgs, UpdateSource, UpdateTargetArgs, UpgradeArgs};
-use util::{cli_verbs, create_worktree, git, parse_duration};
+use util::{cli_verbs, create_worktree, parse_duration};
 use uuid::Uuid;
 use web::WebAction;
 use workflow::WorkflowAction;

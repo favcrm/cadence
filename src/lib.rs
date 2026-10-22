@@ -18,6 +18,7 @@ pub mod assistant_actor;
 pub mod audit;
 pub mod backup;
 pub mod board_identity;
+pub mod briefing;
 pub mod board_membership;
 pub mod business_export;
 pub mod business_templates;
