@@ -72,17 +72,16 @@ export function useHomeUnread(onHome: boolean): void {
         return;
       }
       if (!foreground) return;
-      if (!(await announceReply(HOME, HOME, replySeq))) return;
-      const latestSeen = await readSeen(HOME);
-      if (!mounted.current) return;
-      if (!isUnread(latestSeen, HOME, replySeq)) {
-        // An obsolete run must not clear a newer run's toast.
-        if (current()) toast.clear("assistant:home");
-        return;
-      }
-      if (onHomeNow.current) return;
-      if (document.visibilityState !== "visible") return;
-      toast.show("Assistant replied", "assistant:home", { href: "/", note: "Home" });
+      // The store invokes this inside its serialized transaction after fresh
+      // seen/announced/visibility checks; no post-reservation yield remains.
+      const delivered = await announceReply(HOME, HOME, replySeq, () => {
+        if (!mounted.current) return null;
+        if (onHomeNow.current) return null;
+        if (document.visibilityState !== "visible") return null;
+        toast.show("Assistant replied", "assistant:home", { href: "/", note: "Home" });
+        return () => toast.clear("assistant:home");
+      });
+      if (!delivered) return;
     };
     const stop = onSeenChanged(HOME, () => { void update(); });
     return () => {

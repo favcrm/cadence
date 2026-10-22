@@ -148,7 +148,14 @@ async function main() {
   replySeq = 9;
   await React.act(async () => {
     await writeSeen("install-crm", "general", 9);
-    assert(!(await announceReply("install-crm", "general", 9)), "a late callback in a hidden tab cannot reserve the foreground announcement");
+    let reserved = false;
+    assert(
+      !(await announceReply("install-crm", "general", 9, () => {
+        reserved = true;
+        return () => undefined;
+      })) && !reserved,
+      "a late callback in a hidden tab cannot reserve the foreground announcement",
+    );
   });
   await React.act(async () => { await conversationList("install-crm").refresh(); });
   await settle();

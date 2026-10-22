@@ -56,25 +56,22 @@ function UnreadProbe({ installId }: { installId: string }) {
         }
         unread = true;
         if (!foreground) continue;
-        if (!(await announceReply(installId, conversation.id, conversation.replySeq))) continue;
-        const latestSeen = await readSeen(installId);
-        if (!mounted.current) return;
-        if (!isUnread(latestSeen, conversation.id, conversation.replySeq)) {
-          // A newer run owns the current room state: do not clear its toast
-          // from an obsolete run's stale seen snapshot.
-          if (current()) toast.clear(room);
-          continue;
-        }
-        if (document.visibilityState !== "visible") continue;
-        // The room may have opened while the reservation was in flight; the
-        // foreground pane then owns its seen state, so no stale toast.
-        const openNow = visibleConversation();
-        if (openNow?.installId === installId && openNow.conversation === conversation.id) continue;
-        const query = new URLSearchParams({ conversation: conversation.id });
-        toast.show("Assistant replied", room, {
-          href: `/app-installations/${encodeURIComponent(installId)}?${query.toString()}`,
-          note: conversationLabel(conversation, index),
+        // The store invokes this inside its serialized transaction after the
+        // fresh seen/announced/visibility checks; deciding and showing here
+        // leaves no async gap in which a reservation could be abandoned.
+        const delivered = await announceReply(installId, conversation.id, conversation.replySeq, () => {
+          if (!mounted.current) return null;
+          if (document.visibilityState !== "visible") return null;
+          const openNow = visibleConversation();
+          if (openNow?.installId === installId && openNow.conversation === conversation.id) return null;
+          const query = new URLSearchParams({ conversation: conversation.id });
+          toast.show("Assistant replied", room, {
+            href: `/app-installations/${encodeURIComponent(installId)}?${query.toString()}`,
+            note: conversationLabel(conversation, index),
+          });
+          return () => toast.clear(room);
         });
+        if (!delivered) continue;
       }
       if (current()) setAssistantUnread(installId, unread);
     };

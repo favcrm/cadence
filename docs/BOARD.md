@@ -2358,8 +2358,10 @@ operator/system entries and tool progress do not count. Home uses the
 complete thread watermark, even when its reply is older than the loaded
 200-entry tail. Seen and announced reply sequences live only in browser
 IndexedDB, not a server unread table. Readwrite transactions serialize
-cross-tab changes and announcement reservations; localStorage carries only
-change signals. Old browser-local timestamp and sequence maps are ignored.
+cross-tab changes and eligible toast delivery: an observer that cannot show
+the reply consumes no announcement, and an aborted write retracts its toast.
+localStorage carries only change signals. Old browser-local timestamp and
+sequence maps are ignored.
 
 The shared board watcher samples the master stamp every 250 ms while other
 tracker/agent work keeps its one-second cadence. Master invalidations

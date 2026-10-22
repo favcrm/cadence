@@ -88,14 +88,34 @@ export async function readSeen(installId: string): Promise<SeenMap> {
   });
 }
 
-type Change = (marks: Watermarks) => boolean;
+interface Mutation {
+  commit: boolean;
+  /** Undo a display if the transaction cannot commit. */
+  rollback?: () => void;
+}
 
-/** One read/modify/write transaction. `true` only when the put committed. */
-function commit(installId: string, change: Change): Promise<boolean> {
+type Change = (marks: Watermarks) => Mutation | null;
+
+/**
+ * One read/modify/write transaction. The change callback (and any delivery it
+ * performs synchronously) runs inside the transaction's request callback, so
+ * the decision is made on fresh state and no other connection can interleave.
+ * Returns true only when the put committed; abort/error/put failure runs the
+ * delivery's rollback and returns false.
+ */
+function transact(installId: string, change: Change): Promise<boolean> {
   return database().then((db) => {
     if (db === null) return false;
     return new Promise<boolean>((resolve) => {
       let written = false;
+      let rollback: (() => void) | null = null;
+      let finished = false;
+      const fail = () => {
+        if (finished) return;
+        finished = true;
+        rollback?.();
+        resolve(false);
+      };
       let transaction: IDBTransaction;
       try {
         transaction = db.transaction(STORE, "readwrite");
@@ -103,15 +123,37 @@ function commit(installId: string, change: Change): Promise<boolean> {
         resolve(false);
         return;
       }
-      transaction.oncomplete = () => resolve(written);
-      transaction.onerror = () => resolve(false);
-      transaction.onabort = () => resolve(false);
+      transaction.oncomplete = () => {
+        if (finished) return;
+        finished = true;
+        resolve(written);
+      };
+      transaction.onerror = fail;
+      transaction.onabort = fail;
       const store = transaction.objectStore(STORE);
       const request = store.get(installId);
       request.onsuccess = () => {
         const marks = normalize(request.result, installId);
-        if (!change(marks)) return;
-        store.put(marks);
+        let mutation: Mutation | null;
+        try {
+          mutation = change(marks);
+        } catch {
+          mutation = null;
+        }
+        if (mutation === null) return;
+        rollback = mutation.rollback ?? null;
+        if (!mutation.commit) return;
+        try {
+          store.put(marks);
+        } catch {
+          try {
+            transaction.abort();
+          } catch {
+            // The transaction is already aborting.
+          }
+          fail();
+          return;
+        }
         written = true;
       };
     });
@@ -162,35 +204,46 @@ function wake(installId: string): void {
  */
 export async function writeSeen(installId: string, conversation: string, seq: number): Promise<boolean> {
   if (!Number.isSafeInteger(seq) || seq <= 0) return false;
-  const advanced = await commit(installId, (marks) => {
-    if (document.visibilityState !== "visible") return false;
-    if ((marks.seen[conversation] ?? 0) >= seq) return false;
+  const advanced = await transact(installId, (marks) => {
+    if (document.visibilityState !== "visible") return { commit: false };
+    if ((marks.seen[conversation] ?? 0) >= seq) return { commit: false };
     marks.seen[conversation] = seq;
-    return true;
+    return { commit: true };
   });
   if (advanced) wake(installId);
   return advanced;
 }
 
+/** Synchronously shows the toast and returns its rollback, or returns null
+ * when the reply is no longer eligible (unmounted, room now foreground, …). */
+export type Announce = () => (() => void) | null;
+
 /**
- * Reserve this reply's one browser-local announcement before showing it.
- * Exactly one competing context commits; a reply at or below the seen
- * watermark is already seen and never announces. Reservations deliberately
- * do not wake seen observers: a wake here would retire the very observer
- * whose toast this reservation authorizes.
+ * Reserve and deliver this reply's one browser-local announcement.
+ *
+ * The delivery callback runs inside the same serialized readwrite transaction
+ * that checks fresh seen/announced state and document visibility, so there is
+ * no async yield in which an abandoned reservation could suppress another
+ * tab's toast. Only a delivered callback advances `announced`; returning null
+ * leaves no claim behind. If the put cannot commit, the callback's rollback
+ * removes the shown toast and the call resolves false. Reservations never
+ * wake seen observers.
  */
 export async function announceReply(
   installId: string,
   conversation: string,
   replySeq: number,
+  announce: Announce,
 ): Promise<boolean> {
   if (!Number.isSafeInteger(replySeq) || replySeq <= 0) return false;
-  return commit(installId, (marks) => {
-    if (document.visibilityState !== "visible") return false;
-    if ((marks.seen[conversation] ?? 0) >= replySeq) return false;
-    if ((marks.announced[conversation] ?? 0) >= replySeq) return false;
+  return transact(installId, (marks) => {
+    if (document.visibilityState !== "visible") return { commit: false };
+    if ((marks.seen[conversation] ?? 0) >= replySeq) return { commit: false };
+    if ((marks.announced[conversation] ?? 0) >= replySeq) return { commit: false };
+    const rollback = announce();
+    if (rollback === null) return { commit: false };
     marks.announced[conversation] = replySeq;
-    return true;
+    return { commit: true, rollback };
   });
 }
 

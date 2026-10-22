@@ -13,7 +13,8 @@ import type * as HappyDOM from "happy-dom";
 import type * as SeenModule from "../src/features/app-shell/chat/unreadSeen";
 declare function require<T>(name: string): T;
 
-const { indexedDB } = require<{ indexedDB: IDBFactory }>("fake-indexeddb");
+const { indexedDB, IDBObjectStore: FakeIDBObjectStore } =
+  require<{ indexedDB: IDBFactory; IDBObjectStore: typeof IDBObjectStore }>("fake-indexeddb");
 const { Window: BrowserWindow } = require<typeof HappyDOM>("happy-dom");
 const { setImmediate: nextTurn } = require<{ setImmediate: () => Promise<void> }>("node:timers/promises");
 
@@ -130,17 +131,26 @@ async function main(): Promise<void> {
     "one tab's seen write cannot erase another conversation's watermark",
   );
 
-  // One shared toast reservation across competing visible contexts.
+  // One shared toast reservation across competing visible contexts. Only the
+  // winning transaction may invoke its delivery callback.
   const reserved = new OriginStorage();
   useStorage(reserved);
+  let firstDeliveries = 0;
+  let secondDeliveries = 0;
   const outcomes = await overlap(
     reserved,
-    () => announceReply("install-reserve", "general", 7),
-    () => announceReply("install-reserve", "general", 7),
+    () => announceReply("install-reserve", "general", 7, () => {
+      firstDeliveries += 1;
+      return () => undefined;
+    }),
+    () => announceReply("install-reserve", "general", 7, () => {
+      secondDeliveries += 1;
+      return () => undefined;
+    }),
   );
   assert(
-    outcomes.filter((value) => value === true).length === 1,
-    "competing tabs reserve exactly one announcement for the same reply",
+    outcomes.filter((value) => value === true).length === 1 && firstDeliveries + secondDeliveries === 1,
+    "competing tabs deliver exactly one announcement for the same reply",
   );
 
   // Two real module instances model two JS contexts on one origin. A tab only
@@ -189,12 +199,17 @@ async function main(): Promise<void> {
   assert(regressed === false, "a lower sequence cannot regress a watermark");
   await writeSeen("install-mono", "general", 4);
   assert((await readSeen("install-mono")).general === 5, "the watermark stays at its maximum");
+  let seenDeliveries = 0;
+  const seenDelivery = () => {
+    seenDeliveries += 1;
+    return () => undefined;
+  };
   assert(
-    (await announceReply("install-mono", "general", 5)) === false,
+    (await announceReply("install-mono", "general", 5, seenDelivery)) === false && seenDeliveries === 0,
     "an already-seen reply is never announced",
   );
   assert(
-    (await announceReply("install-mono", "general", 4)) === false,
+    (await announceReply("install-mono", "general", 4, seenDelivery)) === false && seenDeliveries === 0,
     "an older reply than the seen watermark is never announced",
   );
 
@@ -216,16 +231,120 @@ async function main(): Promise<void> {
   );
 
   visibility("visible");
-  const hiddenAnnounce: unknown = announceReply("install-hidden-announce", "general", 9);
+  let hiddenDeliveries = 0;
+  const hiddenDelivery = () => {
+    hiddenDeliveries += 1;
+    return () => undefined;
+  };
+  const hiddenAnnounce: unknown = announceReply("install-hidden-announce", "general", 9, hiddenDelivery);
   visibility("hidden");
   assert(
-    (await hiddenAnnounce) === false,
-    "a tab hidden before the reservation commits does not reserve the toast",
+    (await hiddenAnnounce) === false && hiddenDeliveries === 0,
+    "a tab hidden before the transaction runs delivers nothing and reserves nothing",
   );
   visibility("visible");
   assert(
-    (await announceReply("install-hidden-announce", "general", 9)) === true,
-    "the foreground tab can still reserve the announcement",
+    (await announceReply("install-hidden-announce", "general", 9, hiddenDelivery)) === true &&
+      Number(hiddenDeliveries) === 1,
+    "the foreground tab can still deliver the announcement",
+  );
+
+  // The delivery callback is the final eligibility decision. An ineligible
+  // one (unmounted, or the room opened during the transaction) shows nothing
+  // and must leave the reservation available to a later eligible call.
+  visibility("visible");
+  let mounted = false;
+  let roomForeground = false;
+  let retryDeliveries = 0;
+  const deliverIfEligible = () => {
+    if (!mounted || roomForeground) return null;
+    retryDeliveries += 1;
+    return () => undefined;
+  };
+  assert(
+    (await announceReply("install-retry", "general", 4, deliverIfEligible)) === false &&
+      retryDeliveries === 0,
+    "an unmounted observer cannot consume the announcement",
+  );
+  mounted = true;
+  roomForeground = true;
+  assert(
+    (await announceReply("install-retry", "general", 4, deliverIfEligible)) === false &&
+      retryDeliveries === 0,
+    "a room that became foreground cannot receive an obsolete toast",
+  );
+  roomForeground = false;
+  assert(
+    (await announceReply("install-retry", "general", 4, deliverIfEligible)) === true &&
+      Number(retryDeliveries) === 1,
+    "a declined delivery leaves the announcement available",
+  );
+
+  // Storage unavailable fails closed before any callback runs.
+  const savedIndexedDB = globalThis.indexedDB;
+  let offlineDeliveries = 0;
+  try {
+    Object.defineProperty(globalThis, "indexedDB", { value: undefined, configurable: true });
+    const offline = freshSeen();
+    assert(
+      (await offline.announceReply("install-offline", "general", 1, () => {
+        offlineDeliveries += 1;
+        return () => undefined;
+      })) === false && offlineDeliveries === 0,
+      "unavailable storage never delivers an announcement",
+    );
+  } finally {
+    Object.defineProperty(globalThis, "indexedDB", { value: savedIndexedDB, configurable: true });
+  }
+
+  // A real put failure must run the delivery rollback and persist no claim.
+  // Aborting the watermarks transaction before the put makes the original
+  // put throw TransactionInactiveError, exercising the same abort path the
+  // store uses for quota/close errors.
+  const originalPut = FakeIDBObjectStore.prototype.put;
+  let outstanding = 0;
+  let abortDeliveries = 0;
+  try {
+    FakeIDBObjectStore.prototype.put = function (
+      this: IDBObjectStore,
+      value: unknown,
+      key?: IDBValidKey,
+    ): IDBRequest<IDBValidKey> {
+      const record = value as { install?: unknown } | null;
+      if (record?.install === "install-abort") {
+        try {
+          this.transaction.abort();
+        } catch {
+          // The transaction is already aborting/inactive.
+        }
+      }
+      return originalPut.call(this, value, key);
+    };
+    const delivered = await announceReply("install-abort", "general", 2, () => {
+      abortDeliveries += 1;
+      outstanding += 1;
+      return () => { outstanding -= 1; };
+    });
+    assert(
+      delivered === false && abortDeliveries === 1 && outstanding === 0,
+      "a failed put rolls back the delivered toast and commits no claim",
+    );
+  } finally {
+    FakeIDBObjectStore.prototype.put = originalPut;
+  }
+  assert(
+    (await announceReply("install-abort", "general", 2, () => {
+      abortDeliveries += 1;
+      return () => undefined;
+    })) === true && Number(abortDeliveries) === 2,
+    "a rolled-back announcement is available to a later delivery",
+  );
+  assert(
+    (await announceReply("install-abort", "general", 2, () => {
+      abortDeliveries += 1;
+      return () => undefined;
+    })) === false && Number(abortDeliveries) === 2,
+    "the recovered announcement is delivered only once",
   );
 
   // Observers receive the persisted snapshot asynchronously on subscribe and
@@ -241,7 +360,7 @@ async function main(): Promise<void> {
   );
   // A reservation is deduplicated in the store; it must not wake seen
   // observers (a self-inflicted wake would retire its own display).
-  await announceReply("install-observe", "announced-only", 3);
+  await announceReply("install-observe", "announced-only", 3, () => () => undefined);
   const beforeReservation = snapshots.length;
   await drain();
   assert(
