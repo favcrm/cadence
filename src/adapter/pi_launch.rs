@@ -258,6 +258,15 @@ pub(super) fn pi_worker_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
     Ok(state_dir.join("agents").join(alias))
 }
 
+/// CAD-1752: the working dir of an agent hired without a repo —
+/// `<state>/agents/<alias>/home`, created 0700. Only this subdir is the
+/// agent's cwd; the parent also holds its `pi/` login and session file.
+pub fn pi_agent_home(state_dir: &Path, alias: &str) -> Result<PathBuf> {
+    let home = pi_worker_dir(state_dir, alias)?.join("home");
+    ensure_private_dir(&home)?;
+    Ok(home)
+}
+
 /// The worker's private `PI_CODING_AGENT_DIR` (`<worker>/pi`) — created
 /// 0700 on open, holding its copied `auth.json`.
 pub(super) fn pi_worker_config_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
