@@ -333,7 +333,9 @@ export function drawerLayout(
   const main = viewport - (viewport >= 1024 ? SIDEBAR : 0);
   const need = surface === "home" ? CHAT_MIN : CHAT_MIN + 320 + 42;
   if (main - want >= need) return { mode: "push", width: want };
-  const cap = surface === "home" ? main - CHAT_MIN - 28 : chatRight === null ? 0 : viewport - chatRight - 12;
+  // Without a chat pane in the page (the operator navigated away from an app
+  // conversation) there is no edge to stop at: use the page-based cap.
+  const cap = surface === "app" && chatRight !== null ? viewport - chatRight - 12 : main - CHAT_MIN - 28;
   if (cap < MIN_WIDTH) return { mode: "sheet", width: viewport };
   return { mode: "cover", width: Math.min(want, cap) };
 }

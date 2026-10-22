@@ -93,6 +93,10 @@ equal(drawerLayout(900, 480, "app", 860).mode, "sheet", "app at 900 with a full-
 equal(drawerLayout(900, 480, "app", 500), { mode: "cover", width: 388 }, "app cover stops at the chat's right edge");
 equal(drawerLayout(1100, 660, "home", null), { mode: "cover", width: 544 }, "home cover keeps the chat's first 320px");
 equal(drawerLayout(375, 480, "home", null).mode, "sheet", "phone sheet");
+// No chat pane in the page (navigated away from the app): never a desktop sheet.
+equal(drawerLayout(1280, 480, "app", null), { mode: "cover", width: 480 }, "app, no chat pane, 1280 covers");
+equal(drawerLayout(900, 480, "app", null), { mode: "cover", width: 480 }, "app, no chat pane, 900 covers");
+equal(drawerLayout(1100, 660, "app", null), { mode: "cover", width: 544 }, "app, no chat pane, narrow room covers by the page rule");
 equal([clampWidth(100, 1440), clampWidth(2000, 1440), clampWidth(500, 1440)], [360, 864, 500], "width clamps to 360px..60%");
 
 // The feed reads cards and the live step from the thread, nothing else.
