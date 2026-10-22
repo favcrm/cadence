@@ -2094,6 +2094,20 @@ impl Shared {
             self.store
                 .event_public(&alias, "interrupt_requested", payload)
         };
+        // CAD-1700: a bound stop re-checks the running turn after every point
+        // it could wait (including the test pause above) and before the
+        // adapter is asked, so a turn that changed since the caller named it
+        // is refused and the newer turn is never interrupted.
+        if let Some(expected) = expected {
+            let still = self.store.running_message(&alias)?;
+            if still.as_ref().map(|m| m.id.as_str()) != Some(expected) {
+                let error = format!(
+                    "message {expected} is no longer the master's running turn — nothing was stopped"
+                );
+                record("refused", Some(&error))?;
+                return Err(Error::invalid("turn_not_running", error));
+            }
+        }
         let adapter = self
             .lifecycle
             .lock()
@@ -2111,19 +2125,6 @@ impl Shared {
             record("refused", Some(&error))?;
             return Err(Error::rejected(error));
         };
-        // CAD-1700: a bound stop re-checks the running turn after the last
-        // point it could wait, so a turn that changed since the caller named
-        // it is refused and the newer turn is never interrupted.
-        if let Some(expected) = expected {
-            let still = self.store.running_message(&alias)?;
-            if still.as_ref().map(|m| m.id.as_str()) != Some(expected) {
-                let error = format!(
-                    "message {expected} is no longer the master's running turn — nothing was stopped"
-                );
-                record("refused", Some(&error))?;
-                return Err(Error::invalid("turn_not_running", error));
-            }
-        }
         // The pane's settle: the guarded `interrupted` finish, run by the
         // adapter under its paste lock before any key is sent. A managed
         // endpoint never calls it — its turn result finishes the message.

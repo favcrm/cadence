@@ -599,7 +599,19 @@ impl Shared {
                 Err(Error::invalid(code, text))
             };
             let found = match self.store.message(id)? {
-                Some(m) if m.alias == alias && m.source == "operator" => m,
+                // CAD-1700: the source string alone is caller-supplied, so
+                // it is not provenance. The store's canonical sender label is
+                // the proof: only `Sender::OperatorChat` records `operator`;
+                // an agent records its alias (with a uid), a member or CLI
+                // principal its own label.
+                Some(m)
+                    if m.alias == alias
+                        && m.source == "operator"
+                        && m.sender.as_deref() == Some("operator")
+                        && m.reply_to.is_none() =>
+                {
+                    m
+                }
                 _ => {
                     return refuse(
                         "message_not_cancellable",

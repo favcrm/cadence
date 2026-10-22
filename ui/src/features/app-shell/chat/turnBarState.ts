@@ -1,15 +1,15 @@
 import type { MasterState } from "../../../lib/types";
-import type { ThreadEntry } from "../../home/thread";
+import { stepSummary, type ThreadEntry } from "../../home/thread";
 
 /** The turn bar's state, derived from the master state and this conversation's thread. */
 export type TurnBarState =
   | { kind: "idle" }
   | { kind: "sending" }
-  | { kind: "queued"; ahead: string; cancelMessage: string | null }
+  | { kind: "queued"; ahead: string; aheadConversation: string | null; cancelMessage: string | null }
   | { kind: "working"; step: string | null; since: number | null; stopMessage: string | null }
   | { kind: "writing"; since: number | null; stopMessage: string | null }
   | { kind: "approval" }
-  | { kind: "failed"; reason: string }
+  | { kind: "failed"; reason: string; message: string | null }
   | { kind: "stopped" }
   | { kind: "done"; seconds: number | null };
 
@@ -40,16 +40,20 @@ export function turnFailureReason(entry: ThreadEntry): string | null {
 /**
  * The bar's state for one conversation (`conversationId` null = Home).
  * Stop carries the running message only when that turn belongs to this
- * conversation; Cancel only this conversation's own queued message. The
- * daemon refuses a stop whose message is no longer the running turn, so a
- * stale click never reaches a newer turn.
+ * conversation. Cancel is offered only for a message THIS surface sent
+ * whose stored entry is the operator's own (a daemon notice or an agent
+ * send in the same thread is never cancellable). The daemon refuses a
+ * stop whose message is no longer the running turn, so a stale click
+ * never reaches a newer turn.
  */
 export function turnBarState(input: TurnBarInput, conversationId: string | null): TurnBarState {
   const { master, entries, pendingMessages, awaitingApproval, reconnecting } = input;
   const turn = master?.turn ?? null;
-  // Messages that belong to this conversation: streamed here, or sent from here.
+  // Messages whose stored entry this surface's operator wrote (or that it
+  // is still sending). Assistant turns, daemon notices and agent sends are
+  // somebody else's to stop or cancel.
   const own = new Set<string>(pendingMessages);
-  for (const e of entries) if (e.message) own.add(e.message);
+  for (const e of entries) if (e.message && e.role === "operator") own.add(e.message);
   const running = turn && turn.state === "working" ? turn : null;
   const runningHere =
     running !== null &&
@@ -63,7 +67,7 @@ export function turnBarState(input: TurnBarInput, conversationId: string | null)
     if (last && last.kind === "assistant_text" && last.message === running.message) {
       return { kind: "writing", since: running.since ?? null, stopMessage };
     }
-    return { kind: "working", step: running.summary ?? null, since: running.since ?? null, stopMessage };
+    return { kind: "working", step: liveStep(entries, running.message, running.summary), since: running.since ?? null, stopMessage };
   }
 
   // Queued: this conversation's own message waits in the master queue
@@ -81,6 +85,7 @@ export function turnBarState(input: TurnBarInput, conversationId: string | null)
     return {
       kind: "queued",
       ahead: ahead === undefined ? "" : aheadLabel(ahead, conversationId, input.conversationName),
+      aheadConversation: ahead ?? null,
       cancelMessage: reconnecting ? null : queue[ownIndex].message,
     };
   }
@@ -93,11 +98,28 @@ export function turnBarState(input: TurnBarInput, conversationId: string | null)
   const arrived = last?.created ? Date.parse(last.created) : NaN;
   if (last && last.kind === "turn_result" && !(arrived < (input.liveSince ?? 0))) {
     const reason = turnFailureReason(last);
-    if (reason !== null) return { kind: "failed", reason };
+    if (reason !== null) return { kind: "failed", reason, message: last.message ?? null };
     if (last.payload?.status === "interrupted" || last.payload?.status === "stopped") return { kind: "stopped" };
     return { kind: "done", seconds: turnDuration(entries, last) };
   }
   return { kind: "idle" };
+}
+
+/**
+ * The running turn's live step: its newest tool entry, else the request
+ * summary. `master_state`'s `summary` is the original operator body, so a
+ * tool frame alone would never change it without this.
+ */
+export function liveStep(entries: ThreadEntry[], message: string, fallback: string | null | undefined): string | null {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (e.message !== message) continue;
+    if (e.kind === "tool_call" || e.kind === "tool_result") {
+      const text = stepSummary(e.text ?? "");
+      if (text) return text;
+    }
+  }
+  return fallback ?? null;
 }
 
 /** What is ahead of a queued message: Home, a known conversation name, or a generic name. */

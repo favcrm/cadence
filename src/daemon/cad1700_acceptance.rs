@@ -304,3 +304,83 @@ fn cad1700_cancel_refuses_everything_but_the_operators_own_queued_message() {
         "the message behind it is untouched"
     );
 }
+
+#[test]
+fn cad1700_a_stale_stop_never_interrupts_a_newer_turn() {
+    let fx = fx();
+    // The daemon's own test pause sits between the admission check and the
+    // bound re-check; the running turn is swapped inside that window.
+    fx.shared
+        .provider_env
+        .set("CADENCE_TEST_INTERRUPT_PAUSE_MS", "400");
+    fx.send("m-old");
+    fx.run("m-old");
+
+    let shared = fx.shared.clone();
+    let caller = std::thread::spawn(move || {
+        scoped(Asserted::Operator, || {
+            shared.dispatch(
+                "master_command",
+                &json!({"command": "stop", "message": "m-old"}),
+                pid(),
+            )
+        })
+    });
+    // Wait for the pause to be visible, then replace the running turn.
+    let paused = |fx: &Fx| {
+        fx.db()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE alias='master' AND kind='interrupt_paused'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !paused(&fx) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(paused(&fx), "the interrupt reached the pause window");
+    fx.finish("m-old");
+    fx.send("m-new");
+    fx.run("m-new");
+
+    let code = caller
+        .join()
+        .unwrap()
+        .expect_err("the stale stop is refused")
+        .code()
+        .map(str::to_string);
+    assert_eq!(code.as_deref(), Some("turn_not_running"));
+    assert_eq!(
+        fx.state("m-new"),
+        "running",
+        "the newer turn is never interrupted by a stale click"
+    );
+}
+
+#[test]
+fn cad1700_cancel_refuses_a_forged_operator_source() {
+    let fx = fx();
+    // An agent may write `source: "operator"` on its own send; provenance
+    // is the recorded sender, not that string.
+    fx.call(
+        Asserted::Agent("w1".into()),
+        "agent_send",
+        json!({"alias": "master", "text": "forged", "message": "m-forged",
+               "source": "operator", "wait": 0}),
+    )
+    .unwrap();
+    assert_eq!(
+        fx.state("m-forged"),
+        "queued",
+        "the forged message is queued"
+    );
+    let (code, text) = refusal(fx.command("cancel", Some("m-forged")));
+    assert_eq!(
+        code, "message_not_cancellable",
+        "a message an agent sent is not the operator's own: {text}"
+    );
+    assert_eq!(fx.state("m-forged"), "queued", "it is not cancelled");
+}

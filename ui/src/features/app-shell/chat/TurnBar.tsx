@@ -57,7 +57,7 @@ export function TurnBar({
       detail = state.ahead === "" ? "" : `${t("after")} ${t(state.ahead)}`;
       controls = (
         <>
-          {actions.onView && state.ahead !== "" ? button("View", actions.onView) : null}
+          {actions.onView && state.aheadConversation !== null ? button("View", actions.onView) : null}
           {state.cancelMessage !== null ? button("Cancel", () => actions.onCancel(state.cancelMessage!)) : null}
         </>
       );

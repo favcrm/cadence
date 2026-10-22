@@ -55,6 +55,7 @@ import SinceCard from "./SinceCard";
 import {
   discardPending,
   lastSeq,
+  newMessageId,
   openStep,
   planAnchors,
   stepSummary,
@@ -1195,7 +1196,24 @@ function MasterHome({
               actions={{
                 onStop: (message) => runTurnCommand("stop", message),
                 onCancel: (message) => runTurnCommand("cancel", message),
-                onRetry: failedSend ? () => onRetrySend(failedSend.message, failedSend.text) : undefined,
+                onRetry:
+                  failedSend !== null
+                    ? () => onRetrySend(failedSend.message, failedSend.text)
+                    : turnBar.kind === "failed" && turnBar.message !== null
+                      ? () => {
+                          const entry = threadEntries.find((e) => e.message === turnBar.message && e.role === "operator");
+                          if (entry) {
+                            engage();
+                            void sendToMaster(entry.text, newMessageId());
+                          }
+                        }
+                      : undefined,
+                onView:
+                  turnBar.kind === "queued" && turnBar.aheadConversation === null
+                    ? undefined
+                    : turnBar.kind === "queued" && appOriginHref(turnOrigin, resolveAppPath) !== null
+                      ? () => window.location.assign(appOriginHref(turnOrigin, resolveAppPath)!)
+                      : undefined,
                 onReview: () => {
                   const card = scrollRef.current?.querySelector<HTMLElement>("[data-permission-thread]");
                   card?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });

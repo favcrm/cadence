@@ -576,8 +576,10 @@ export default function AssistantOperations({ installId, contextId, canDecide, a
       return start();
     };
     // Visibility resumes and `master` frames re-read; a hidden tab reads when shown.
+    // A frame invalidates reads begun before it (epoch + requeue), so a
+    // pre-change batch can never swallow the notification.
     const resumeRead = () => {
-      if (alive && !document.hidden) void poll();
+      if (alive && !document.hidden) void written();
     };
 
     const handle: Poller = { alive: () => alive, written, refresh: poll };

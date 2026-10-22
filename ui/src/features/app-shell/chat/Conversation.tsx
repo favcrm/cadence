@@ -554,15 +554,24 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // baselines (a reload is not news); later `master` frames refresh it.
   const toast = useNotificationToast();
   const announced = useRef<Map<string, number> | null>(null);
+  // A conversation is "replied to" only when the master's turn FINISHED on
+  // it: `updated` also moves for an operator send or a tool step, which is
+  // not a reply (CAD-1700 review).
+  const lastTurn = useRef<{ conversation: string | null } | null | undefined>(undefined);
   const conversationsNow = active.state === "ready" ? active.conversations : null;
   useEffect(() => {
+    const current = masterState.data?.turn ?? null;
+    const before = lastTurn.current;
+    lastTurn.current = current === null ? null : { conversation: current.conversation ?? null };
     if (conversationsNow === null) return;
+    const finished = before != null ? (before.conversation ?? null) : undefined;
     const first = announced.current === null;
     const known = announced.current ?? new Map<string, number>();
     conversationsNow.forEach((c, index) => {
-      const before = known.get(c.id);
+      const seen = known.get(c.id);
       known.set(c.id, c.updated);
-      if (first || c.id === convId || before === undefined || c.updated <= before) return;
+      if (first || c.id === convId || seen === undefined || c.updated <= seen) return;
+      if (finished !== c.id) return;
       if (!isUnread(readSeen(installId), c.id, c.updated)) return;
       const params = new URLSearchParams({ install: installId, conversation: c.id });
       toast.show(t("Assistant replied"), `assistant:${installId}:${c.id}`, {
@@ -571,7 +580,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       });
     });
     announced.current = known;
-  }, [conversationsNow, convId, installId, toast, t, mode.appPath, mode.scopeLabel, subjects]);
+  }, [conversationsNow, convId, installId, toast, t, mode.appPath, mode.scopeLabel, subjects, masterState.data]);
 
   useEffect(() => setFailedFrames(new Set()), [installId, convId]);
   // A context or installation change drops the importer (its scope key
@@ -923,8 +932,19 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         : null,
   });
   // Retry resends this conversation's own failed operator message; with no
-  // captured pending row there is no envelope to resend, so Retry is hidden.
+  // captured pending row the bar rebuilds one from the failed turn's own
+  // operator entry (same text, a fresh message id).
   const failedSend = (thread.data?.pending ?? []).find((p) => p.state === "failed") ?? null;
+  const failedEntry =
+    turnState.kind === "failed" && turnState.message !== null
+      ? entries.find((e) => e.message === turnState.message && e.role === "operator") ?? null
+      : null;
+  const retryAction =
+    failedSend !== null
+      ? () => retry(failedSend.message, failedSend.text)
+      : failedEntry !== null
+        ? () => void send(failedEntry.text, [])
+        : undefined;
   const turnCommand = (command: "stop" | "cancel", message: string) => {
     const origin = { key: composerKey, visit: visitRef.current, frame: frameToken };
     void api
@@ -939,7 +959,11 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const turnActions = {
     onStop: (message: string) => turnCommand("stop", message),
     onCancel: (message: string) => turnCommand("cancel", message),
-    onRetry: failedSend ? () => retry(failedSend.message, failedSend.text) : undefined,
+    onRetry: retryAction,
+    onView:
+      turnState.kind === "queued" && turnState.aheadConversation !== null
+        ? () => selectConversation(installId, turnState.aheadConversation!)
+        : undefined,
     onReview: () => {
       const card = listRef.current?.querySelector<HTMLElement>("[data-permission-thread], .app-assistant-activity");
       (card ?? listRef.current)?.scrollIntoView({ block: "center", behavior: motionBehavior(reducedMotion(), "jump") });

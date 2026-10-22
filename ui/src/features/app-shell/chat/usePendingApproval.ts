@@ -13,7 +13,7 @@ import type { ThreadEntry } from "../../home/thread";
  */
 export function usePendingPermission(entries: ThreadEntry[]): boolean {
   const ids = entries
-    .filter((e) => e.kind === "system" && e.payload?.source === "permission")
+    .filter((e) => e.role === "system" && e.payload?.source === "permission")
     .map((e) => permissionIdFromText(e.text))
     .filter((id): id is string => id !== null);
   const key = ids.join(",");

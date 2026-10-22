@@ -1280,4 +1280,27 @@ mod busy_status_tests {
             400
         );
     }
+
+    /// CAD-1700: the relay's mapping for the scoped stop/cancel refusals —
+    /// each daemon code answers 409, so the pane can show the reason, and an
+    /// unknown daemon failure keeps the shared mapping.
+    #[test]
+    fn scoped_command_refusals_map_to_409() {
+        for (code, status) in [
+            ("turn_not_running", 409),
+            ("message_running", 409),
+            ("message_not_queued", 409),
+            ("message_not_cancellable", 409),
+            ("message_required", 409),
+            ("message_not_allowed", 400),
+            ("message_invalid", 400),
+        ] {
+            let error = Error::invalid(code, "refused for the test");
+            assert_eq!(
+                master_command_err(&error).status_code().0,
+                status,
+                "{code} maps to {status}"
+            );
+        }
+    }
 }
