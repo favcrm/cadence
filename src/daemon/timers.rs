@@ -914,6 +914,7 @@ impl Shared {
     /// restart), a deleted cursor id resumes at its natural successor,
     /// and an error leaves it where it was.
     pub(super) fn reconcile_tick(&self, cursor: &mut Option<String>) {
+        crate::gh_guard::bind(&self.state_dir);
         let pm = match self.pm() {
             Ok(pm) => pm,
             Err(e) => {

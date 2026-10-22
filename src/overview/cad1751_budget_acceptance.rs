@@ -16,6 +16,8 @@ use super::github_cache::{
 };
 use super::now_epoch;
 
+/// Both checks share the process-wide repo memo and fetch counter.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static FETCHES: AtomicUsize = AtomicUsize::new(0);
 static ONE_REPO_FAILS: AtomicBool = AtomicBool::new(false);
 
@@ -53,6 +55,7 @@ fn fake_gh(dir: &Path) -> std::path::PathBuf {
 
 #[test]
 fn cad1751_overview_gh_rate_is_bounded_and_backs_off_at_the_limit() {
+    let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let slugs: Vec<String> = (1..=15).map(|n| format!("acme/repo{n:02}")).collect();
     let wait = Duration::from_secs(5);
@@ -129,4 +132,52 @@ fn cad1751_overview_gh_rate_is_bounded_and_backs_off_at_the_limit() {
         "{state}"
     );
     assert!(read_cache(&cache_file(dir.path())).is_some());
+}
+
+/// A board on an explicit state dir keeps its pause there: written there
+/// when `gh` reports the limit, read from there, and not taken from (or
+/// leaked into) the environment's or the default state dir.
+#[test]
+fn cad1751_pause_lives_in_the_boards_own_state_dir() {
+    let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let slugs = vec!["acme/repo01".to_string()];
+    let gh = fake_gh(dir.path());
+    let fetch = move |_: &str| -> Result<Value, String> {
+        let out = crate::gh_guard::run(
+            Command::new(&gh).args(["pr", "list"]),
+            Duration::from_secs(5),
+        )?;
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let wait = Duration::from_secs(5);
+    reset_repo_memo();
+    github_throttled_with(dir.path(), &slugs, wait, 60, fetch.clone());
+    assert!(
+        crate::gh_guard::paused_until(dir.path()).is_some(),
+        "the pause is written in the board's state dir"
+    );
+    if let Ok(env_dir) = crate::home::state_dir() {
+        if env_dir != dir.path() {
+            assert!(!env_dir.join("gh-rate-limit.json").exists());
+        }
+    }
+    let spent = std::fs::read_to_string(dir.path().join("gh-calls"))
+        .unwrap()
+        .lines()
+        .count();
+    reset_repo_memo();
+    expire(dir.path(), &slugs);
+    let (_, state) = github_throttled_with(dir.path(), &slugs, wait, 60, fetch);
+    assert!(
+        state["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("paused until")),
+        "{state}"
+    );
+    let after = std::fs::read_to_string(dir.path().join("gh-calls"))
+        .unwrap()
+        .lines()
+        .count();
+    assert_eq!(after, spent, "no gh call while paused");
 }

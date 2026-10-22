@@ -56,6 +56,7 @@ pub(super) fn write_cache(file: &Path, slugs: &[String], repos: &HashMap<String,
 }
 
 /// One repo's `gh` read — [`gh_repo`] in production, a stub in tests.
+#[cfg(test)]
 pub(super) type GhFetch = fn(&str) -> Result<Value, String>;
 
 /// gh refreshes in flight in this process, by cache file: while one
@@ -88,7 +89,11 @@ pub(super) fn reset_repo_memo() {
     REPO_MEMO.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
-fn memoized(slug: &str, every: Duration, fetch: GhFetch) -> Result<Value, String> {
+fn memoized(
+    slug: &str,
+    every: Duration,
+    fetch: impl Fn(&str) -> Result<Value, String>,
+) -> Result<Value, String> {
     let kept = {
         let memo = REPO_MEMO.lock().unwrap_or_else(|e| e.into_inner());
         memo.iter()
@@ -122,8 +127,9 @@ pub(super) fn github_throttled_with(
     slugs: &[String],
     wait: Duration,
     cache_secs: i64,
-    fetch: GhFetch,
+    fetch: impl Fn(&str) -> Result<Value, String> + Send + Sync + 'static,
 ) -> (HashMap<String, Value>, Value) {
+    crate::gh_guard::bind(state_dir);
     let floor = refresh_floor_secs(slugs.len());
     let every = Duration::from_secs(floor as u64);
     github_bounded_notify(
@@ -131,7 +137,7 @@ pub(super) fn github_throttled_with(
         slugs,
         wait,
         cache_secs.max(floor),
-        move |slug| memoized(slug, every, fetch),
+        move |slug| memoized(slug, every, &fetch),
         || {},
     )
 }

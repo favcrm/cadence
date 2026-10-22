@@ -82,7 +82,18 @@ fn record_pause(state_dir: &Path, reset: Option<i64>) -> i64 {
 /// error is the refusal text; a `gh` failure is returned as `Ok` for
 /// the caller to read as it always did.
 pub(crate) fn run(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
-    run_in(crate::home::state_dir().ok().as_deref(), cmd, timeout)
+    let dir = BOUND.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    run_in(dir.as_deref(), cmd, timeout)
+}
+
+/// The state dir this process's board or daemon runs on. The pause file
+/// lives there and nowhere else — never resolved from the environment,
+/// which an explicit `--state-dir` does not set. A process that never
+/// binds (a one-shot CLI) neither writes nor obeys a pause.
+static BOUND: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+pub(crate) fn bind(state_dir: &Path) {
+    *BOUND.lock().unwrap_or_else(|e| e.into_inner()) = Some(state_dir.to_path_buf());
 }
 
 pub(crate) fn run_in(
