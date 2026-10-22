@@ -40,6 +40,7 @@ pub mod devin_catalog;
 pub mod doctor;
 pub mod error;
 pub mod filter;
+pub mod gh_guard;
 pub mod home;
 mod ident;
 pub mod inbox;

@@ -196,18 +196,42 @@ const RUN_FIELDS: [&str; 9] = [
     "created_at",
 ];
 
+/// A repo's default branch, read once an hour: it changes about never,
+/// and re-reading it each refresh was a third of the overview's calls.
+static DEFAULT_BRANCHES: std::sync::Mutex<Vec<(String, std::time::Instant, String)>> =
+    std::sync::Mutex::new(Vec::new());
+const DEFAULT_BRANCH_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+fn default_branch(slug: &str) -> Result<String, String> {
+    let kept = DEFAULT_BRANCHES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(s, at, _)| s == slug && at.elapsed() < DEFAULT_BRANCH_TTL)
+        .map(|(_, _, b)| b.clone());
+    if let Some(b) = kept {
+        return Ok(b);
+    }
+    let repo = gh_text(&["api".into(), format!("repos/{slug}")])
+        .and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| format!("unreadable ({e})")))?;
+    match repo["default_branch"].as_str() {
+        Some(b) if is_plain_ref(b) => {
+            let mut kept = DEFAULT_BRANCHES.lock().unwrap_or_else(|e| e.into_inner());
+            kept.retain(|(s, _, _)| s != slug);
+            kept.push((slug.to_string(), std::time::Instant::now(), b.to_string()));
+            Ok(b.to_string())
+        }
+        _ => Err(format!("repos/{slug}: no readable default_branch")),
+    }
+}
+
 /// `{branch, runs}` for the repo's default branch: the newest
 /// [`CI_RUNS_PAGE`] `ci.yml` push runs. A repo without a `ci.yml`
 /// workflow is `{absent: true}` — no CI to read, not an error; any
 /// other failure is `{error}`.
 pub(super) fn gh_main_ci(slug: &str) -> Value {
-    let branch = match gh_text(&["api".into(), format!("repos/{slug}")])
-        .and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| format!("unreadable ({e})")))
-    {
-        Ok(repo) => match repo["default_branch"].as_str() {
-            Some(b) if is_plain_ref(b) => b.to_string(),
-            _ => return json!({"error": format!("repos/{slug}: no readable default_branch")}),
-        },
+    let branch = match default_branch(slug) {
+        Ok(b) => b,
         Err(e) => return json!({"error": e}),
     };
     let path = format!(

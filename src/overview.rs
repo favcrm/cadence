@@ -37,6 +37,8 @@ use crate::issue::line_times::LineTimes;
 use crate::issue::{board, project};
 
 mod assembly;
+#[cfg(test)]
+mod cad1751_budget_acceptance;
 mod commands;
 mod github;
 mod github_cache;
