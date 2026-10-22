@@ -475,11 +475,23 @@ pub(super) fn delivery_view(agent: &Agent, queued: i64, oldest: Option<f64>) -> 
             "the agent is disabled — enable or resume it to drain the queue",
         )
     } else if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
-        (
-            "inbox",
-            "operator",
-            "the inbox has no actor — drain it with `cadence inbox <alias>`",
-        )
+        // The durable mailbox is actorless by design. The cloud sandbox is
+        // also actorless, but it is a real dispatch backend: its queued
+        // kickoff is picked up by `run_cloud_dispatch`, not `cadence inbox`
+        // (which refuses every non-inbox provider/kind).
+        if agent.provider == "inbox" && agent.endpoint_kind == "inbox" {
+            (
+                "inbox",
+                "operator",
+                "the inbox has no actor — drain it with `cadence inbox <alias>`",
+            )
+        } else {
+            (
+                "cloud-dispatch",
+                "daemon",
+                "the queued kickoff is waiting for the cloud sandbox dispatch loop (`run_cloud_dispatch`)",
+            )
+        }
     } else if matches!(agent.state.as_str(), "starting" | "stopping") {
         (
             "lifecycle",

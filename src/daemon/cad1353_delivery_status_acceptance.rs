@@ -120,3 +120,48 @@ fn idle_agent_with_queued_work_reports_the_delivery_block() {
         .expect("w1 in agent_list");
     assert_delivery(row);
 }
+
+#[test]
+fn actorless_cloud_sandbox_is_not_named_an_inbox() {
+    let dir = tempfile::Builder::new()
+        .prefix("c1353-cloud")
+        .tempdir()
+        .unwrap();
+    let pm = dir.path().join("pm");
+    crate::issue::Pm::init(&pm).unwrap();
+    let opts = ServeOptions::default();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+    let shared = Shared::new(dir.path(), &opts).unwrap();
+    let cwd = dir.path().to_str().unwrap();
+    shared
+        .store
+        .register_agent(&NewAgent {
+            alias: "s1",
+            provider: "sandbox",
+            endpoint_kind: "sandbox",
+            role: "worker",
+            cwd,
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    shared
+        .store
+        .enqueue("s1", "cloud kickoff", None, "s1-kickoff", "test")
+        .unwrap();
+    let show = scoped(Asserted::Operator, || {
+        shared.dispatch("agent_show", &json!({"alias": "s1"}), std::process::id())
+    })
+    .unwrap();
+    let delivery = &show["agent"]["delivery"];
+    assert_eq!(delivery["queued"], 1, "{show}");
+    assert_eq!(delivery["state"], "cloud-dispatch", "{show}");
+    assert_eq!(delivery["blocker"]["owner"], "daemon", "{show}");
+    let reason = delivery["blocker"]["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("cloud"), "{show}");
+    assert!(!reason.contains("cadence inbox"), "{show}");
+}
