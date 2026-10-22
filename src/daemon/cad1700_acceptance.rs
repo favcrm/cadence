@@ -25,14 +25,14 @@
 //!   FAILS — the operator-layer refusal is replaced by
 //!   `interrupt refused: agent 'w1' cannot change another agent …`.
 //!   Sensitive.
-//! - **Running-turn invariant**, sharpened: each check now has its own
-//!   wording asserted, so they are individually observable.
+//! - **Running-turn invariant**, individually sensitive now that each check
+//!   has its own wording asserted:
 //!   `stop`'s running check disabled → `cad1700_stop_refuses_anything_but_the_current_running_turn`
-//!   FAILS (the re-check answers with `is no longer the master's running
-//!   turn`, not the asserted `is not …`). The pre-adapter re-check is pinned
-//!   by `cad1700_a_stale_stop_never_interrupts_a_newer_turn`'s wording
-//!   assertion; its individual re-run is pending. Neutralizing BOTH still
-//!   fails those two tests (wrong reason / no refusal at all).
+//!   FAILS (the re-check answers `is no longer …`, not the asserted
+//!   `is not …`); the pre-adapter re-check disabled →
+//!   `cad1700_a_stale_stop_never_interrupts_a_newer_turn` FAILS
+//!   (`left: None`, no refusal at all). Neutralizing both fails the same
+//!   two. Sensitive one at a time.
 //! - **Cancel provenance** (`sender` / `sender_uid` conditions dropped):
 //!   `cad1700_cancel_refuses_a_forged_operator_source` FAILS — the forged
 //!   `source: "operator"` message is cancelled (`ok: true`, state
