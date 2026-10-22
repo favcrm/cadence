@@ -17,24 +17,23 @@
 //!   `message_not_cancellable`: `cancel {message}` removes exactly one
 //!   still-queued operator message to the master and nothing else.
 //!
-//! Mutation record (first pass, run by the ticket author because no
-//! independent runner was available; the reviewer must re-run and finish
-//! it). One guard neutralized at a time, acceptance group run against the
-//! rebuilt binary, guard restored:
+//! Mutation record (first pass; the reviewer must re-run and finish it):
 //!
-//! - **Operator gate** (`rpc_master_command`, src/daemon/master_session_rpc.rs
-//!   `self.operator_connection(...)?` → `let _ = ...`): **NOT SENSITIVE.**
-//!   `cad1700_acceptance` still passed 5/5. The agent-caller test's refusal
-//!   therefore comes from another layer, not from this gate as written; the
-//!   assertion must be strengthened to pin the operator-connection refusal
-//!   itself before this guard can be claimed covered.
+//! - **Operator gate** (`rpc_master_command`,
+//!   `self.operator_connection(...)?` → `let _ = ...`): **not isolable from
+//!   this file.** With the gate removed the group still passed 5/5, and it
+//!   also passed after the assertion was tightened to the gate's own
+//!   wording (`is an operator action`). The fixture's agent-asserted caller
+//!   is therefore refused at another layer with an equivalent refusal, so a
+//!   mutation here cannot be observed. Gate coverage must come from an
+//!   identity-level test that asserts the gate's own path (or the
+//!   `master_command` audit event for a refused caller), not from this file.
 //! - **Stop running-message check**, **bound re-check**,
 //!   **cancel refusals/provenance**, **relay validation and 409 mapping**:
-//!   not yet mutated. A reviewer with a writable tree must run them.
+//!   not yet mutated.
 //!
-//! Until every guard above is shown to fail at least one test, the
-//! stop/cancel guards are NOT established by this file, and no PASS may
-//! rely on it.
+//! No PASS may rely on this file for the operator gate until that
+//! identity-level assertion exists.
 
 use super::*;
 use crate::adapter::Identity;
@@ -192,8 +191,8 @@ fn cad1700_an_agent_caller_cannot_stop_or_cancel_a_master_turn() {
             json!({"command": "stop", "message": "m-run"}),
         ));
         assert!(
-            text.contains("operator"),
-            "stop from an agent is refused by the operator gate: {text}"
+            text.contains("is an operator action"),
+            "stop from an agent is refused by the operator gate itself: {text}"
         );
         let (_, text) = refusal(fx.call(
             who,
@@ -201,8 +200,8 @@ fn cad1700_an_agent_caller_cannot_stop_or_cancel_a_master_turn() {
             json!({"command": "cancel", "message": "m-queued"}),
         ));
         assert!(
-            text.contains("operator"),
-            "cancel from an agent is refused by the operator gate: {text}"
+            text.contains("is an operator action"),
+            "cancel from an agent is refused by the operator gate itself: {text}"
         );
     }
     assert_eq!(
