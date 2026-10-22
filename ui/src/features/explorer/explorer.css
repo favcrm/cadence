@@ -44,6 +44,23 @@
 .apps-home .attn-head { display: flex; align-items: center; gap: 8px; color: var(--color-warn, #e5b567); font-weight: 500; margin-bottom: 8px; }
 .apps-home .attn-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; }
 .apps-home .attn-row .txt { flex: 1; font-size: var(--text-secondary); }
+@media (max-width: 479px) {
+  /* The action drops under the message instead of squeezing the app
+     name into a column at phone widths. */
+  .apps-home .attn-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    column-gap: 0.625rem;
+    row-gap: 0.375rem;
+    align-items: center;
+  }
+  .apps-home .attn-row .txt { min-width: 0; }
+  .apps-home .attn-row .btn,
+  .apps-home .attn-row .hint {
+    grid-column: 2;
+    justify-self: start;
+  }
+}
 .apps-home .favempty { display: flex; align-items: center; gap: 10px; color: var(--color-ink-400); padding: 18px; border: 1px dashed var(--color-ink-700, #333); border-radius: 12px; }
 .apps-home .sechead { flex-wrap: wrap; display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
 .apps-home .sechead h2 { font-size: var(--text-section); font-weight: 500; color: var(--color-ink-100); margin: 0; }
@@ -103,8 +120,39 @@
 .install-check .ic-digest { overflow-wrap: anywhere; font-size: 0.8em; }
 .install-check .ic-files { max-height: 10rem; overflow: auto; margin-top: 4px; }
 
-/* The Installed search stays usable at 390px: it wraps under the heading and grows, never shrinks to a stub. */
-.apps-home .sechead .search { flex: 1 1 160px; min-width: 140px; width: auto; }
-.apps-home .sechead .sort { flex: 0 1 auto; width: auto; max-width: 100%; }
+/* The Installed search stays usable at 390px: the search and its sort
+   share one row, and that row drops below the heading instead of
+   squeezing either control to a stub. */
+.apps-home .sechead .sec-tools {
+  display: flex;
+  flex: 0 1 22rem;
+  min-width: 0;
+  align-items: center;
+  gap: 0.5rem;
+}
+.apps-home .sechead .sec-tools .search {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
+}
+.apps-home .sechead .sec-tools .sort {
+  flex: 0 0 auto;
+  width: auto;
+  max-width: 45%;
+}
+@media (max-width: 639px) {
+  .apps-home .sechead .sec-tools {
+    flex-basis: 100%;
+  }
+  .apps-home .sechead .sec-tools .sort {
+    max-width: none;
+  }
+}
+@media (max-width: 359px) {
+  .apps-home .sechead .sec-tools {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
 
 

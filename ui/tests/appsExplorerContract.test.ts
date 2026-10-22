@@ -77,6 +77,12 @@ globalThis.fetch = async (input: any, init?: any) => {
     return json({});
   }
   if (path === "/api/app-home") return json(home);
+  if (path === "/api/apps") return json({ apps: [] });
+  if (path === "/api/overview") return json({ needs_me: [] });
+  if (path === "/api/app-installations") return json([
+    { install_id: "inst-a", name: "crm", title: "CRM", removed: null },
+    { install_id: "inst-b", name: "social-content", title: "Social Content", removed: null },
+  ]);
   if (path === "/api/app-favorites") return json(favorites);
   if (path === "/api/app-catalog") return json(catalog);
   if (path === "/api/app-requests") return json({ requests: [] });
@@ -121,7 +127,24 @@ async function main() {
       `the favourite the daemon saved (inst-a) is listed under Favorites; got: ${favSection.textContent}`,
     );
   });
-  // 2. Choosing another favorite preserves both it and the existing favorite after reload.
+  // 2. An installed card opens the app itself; the settings action opens Manage.
+  await check("installed card links", async () => {
+    await flush();
+    const grid = host.querySelector(".apps-grid");
+    assert(grid, "the installed gallery renders");
+    const crm = Array.from(grid.querySelectorAll(".app-card"))
+      .find((card) => card.textContent?.includes("CRM"));
+    assert(crm, `the CRM installed card renders; got: ${grid.textContent}`);
+    const open = crm.querySelector("a.app-card-link");
+    assert(open instanceof HTMLAnchorElement, "the card's main link renders");
+    assert(new URL(open.href).pathname === "/apps/crm",
+      `the card opens the app at /apps/<key>, got ${new URL(open.href).pathname}`);
+    const settings = crm.querySelector("a.app-card-settings");
+    assert(settings instanceof HTMLAnchorElement, "the operator's settings action renders");
+    assert(new URL(settings.href).pathname === "/apps/manage/inst-a",
+      `settings opens Manage, got ${new URL(settings.href).pathname}`);
+  });
+  // 3. Choosing another favorite preserves both it and the existing favorite after reload.
   await check("pin round-trip", async () => {
     const label = Array.from(host.querySelectorAll("label")).find((row) => row.textContent?.trim() === "Social Content");
     const summary = label?.closest("details")?.querySelector("summary");
@@ -137,7 +160,24 @@ async function main() {
     assert(saved?.querySelector("a[aria-label='Open CRM']") && saved.querySelector("a[aria-label='Open Social Content']"),
       "both the original and newly chosen favorite survive a fresh read");
   });
-  // 3. A published card is one link to native detail, not an inline install action.
+  // 4. A member opens the app but gets no operator settings action; an
+  //    empty project list adds no section of its own.
+  await check("member card links", async () => {
+    await React.act(() => root.render(React.createElement(Apps, { viewer: { readOnly: false, operator: false } })));
+    await flush();
+    const grid = host.querySelector(".apps-grid");
+    assert(grid, "the installed gallery renders for a member");
+    const crm = Array.from(grid.querySelectorAll(".app-card"))
+      .find((card) => card.textContent?.includes("CRM"));
+    assert(crm, "the CRM card renders for a member");
+    const open = crm.querySelector("a.app-card-link");
+    assert(open instanceof HTMLAnchorElement && new URL(open.href).pathname === "/apps/crm",
+      "a member's card opens the app at /apps/<key>");
+    assert(!crm.querySelector("a.app-card-settings"), "a member gets no operator settings action");
+    assert(!host.querySelector("section[aria-label='Project apps']"),
+      "a confirmed-empty project list adds no Project apps section");
+  });
+  // 5. A published card is one link to native detail, not an inline install action.
   await check("card opens detail", async () => {
     await React.act(() => root.render(React.createElement(Explorer, { viewer: operator })));
     await flush();
