@@ -42,6 +42,14 @@ threads-required = 'num-test-threads'
 filter = 'test(/cad811_missing_freeze/) or test(/cad811_public_owner_attribution/)'
 threads-required = 'num-test-threads'
 
+# CAD-1727: collapsing the integration targets changes nextest's hash
+# partition, so lib tests share a shard with different neighbours. This
+# fixture's probe-then-bind board raced on shard 2 ("fixture BLOCKED: board
+# could not bind"); reserve the worker pool like the CAD-1489 fixtures.
+[[profile.cadence.overrides]]
+filter = 'test(/cad1590_templates_and_broadcasts/)'
+threads-required = 'num-test-threads'
+
 [profile.cadence.junit]
 path = "junit.xml"
 report-skipped = "all"
