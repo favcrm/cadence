@@ -50,10 +50,7 @@ use crate::issue::model;
 use crate::issue::parse;
 use crate::issue::{app_view, board, plan, project, workflow, write, Pm};
 
-mod compat;
-pub use compat::{
-    host as compat_host, parse_requires, Compat, HostContracts, SemVer, SUPPORTED_CONTRACTS,
-};
+use cadence_core::app_compat::{self, Compat};
 
 /// `<pm>/<project>/apps/` — beside PROJECT.md and `workflows/`.
 pub const DIR: &str = "apps";
@@ -941,7 +938,8 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             Some(crate::issue::app_listing::parse(value, yaml_len, &slots)?)
         }
     };
-    let requires = compat::parse_requires(get("needs").and_then(serde_yaml::Value::as_mapping))?;
+    let requires =
+        app_compat::parse_requires(get("needs").and_then(serde_yaml::Value::as_mapping))?;
     Ok(Manifest {
         app,
         title,
@@ -1533,7 +1531,9 @@ fn validate_contents(
     if workflow_count == 0 && !has_tools_only_screen(&files, &manifest) {
         errors.push("workflows/ holds no *.md workflow".to_string());
     }
-    let compatibility = match compat::host().and_then(|host| manifest.requires.check(&host)) {
+    let compatibility = match app_compat::host(env!("CARGO_PKG_VERSION"))
+        .and_then(|host| manifest.requires.check(&host))
+    {
         Ok(receipt) => receipt,
         Err(error) => {
             errors.push(error.to_string());
@@ -3608,6 +3608,28 @@ mod nested_copy_acceptance;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Manifest admission retains supplied requirements and refuses malformed ones.
+    #[test]
+    fn manifest_wires_requires() {
+        let legacy = "---\napp: x\ntitle: t\nversion: '1'\nneeds:\n  connections: []\n---\n\nG\n";
+        let m = parse_manifest(legacy).unwrap();
+        assert!(!m.requires.declared(), "absent requires is legacy");
+
+        let declared = "---\napp: x\ntitle: t\nversion: '1'\nneeds:\n  requires: {core: \">=0.0.0\", contracts: {app-chat: [1]}}\n---\n\nG\n";
+        let m = parse_manifest(declared).unwrap();
+        assert!(m.requires.declared());
+        assert_eq!(m.requires.contracts["app-chat"], vec![1]);
+
+        let malformed = "---\napp: x\ntitle: t\nversion: '1'\nneeds:\n  requires: {contracts: {app-chat: [0]}}\n---\n\nG\n";
+        assert!(parse_manifest(malformed).is_err());
+        let nonmap = "---\napp: x\ntitle: t\nversion: '1'\nneeds:\n  requires: ''\n---\n\nG\n";
+        assert!(parse_manifest(nonmap).is_err());
+        let bad_ver = "---\napp: x\ntitle: t\nversion: '1'\nneeds:\n  requires: {core: '>=1.0.0-alpha..1'}\n---\n\nG\n";
+        assert!(parse_manifest(bad_ver).is_err());
+        let bad_build = "---\napp: x\ntitle: t\nversion: '1'\nneeds:\n  requires: {core: '>=1.0.0+'}\n---\n\nG\n";
+        assert!(parse_manifest(bad_build).is_err());
+    }
 
     #[test]
     fn cad692_publication_declaration_is_provider_neutral_and_bounded() {

@@ -42,6 +42,7 @@ mod events;
 mod export;
 mod guidance;
 mod help;
+mod hosted_app;
 mod idea;
 mod inbox;
 mod intake;

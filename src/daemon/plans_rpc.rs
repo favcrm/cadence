@@ -555,6 +555,7 @@ impl Shared {
                 "expected_digest",
                 "catalogue",
                 "catalogue_resolution",
+                "hosted_operation_id",
             ],
             "app_workspace_install_check" => &["source", "catalogue", "catalogue_resolution"],
             "app_workspace_upgrade" => &[
@@ -566,6 +567,7 @@ impl Shared {
                 "request_id",
                 "catalogue",
                 "catalogue_resolution",
+                "hosted_operation_id",
             ],
             "app_workspace_upgrade_check" => &[
                 "install_id",
@@ -585,6 +587,13 @@ impl Shared {
             .ok_or_else(|| Error::rejected("catalog parameters must be an object"))?;
         if object.keys().any(|key| !allowed.contains(&key.as_str())) {
             return Err(Error::rejected("unknown workspace catalog parameter"));
+        }
+        let hosted_operation_id = params
+            .get("hosted_operation_id")
+            .map(|_| required_str(params, "hosted_operation_id"))
+            .transpose()?;
+        if let Some(id) = hosted_operation_id {
+            crate::proto::identifier(id, "hosted operation ID")?;
         }
         let catalogue = if matches!(
             method,
@@ -621,12 +630,13 @@ impl Shared {
                             .ok_or_else(|| Error::rejected("expected_digest must be a string"))?,
                     ),
                 };
-                workspace::install(
+                workspace::install_with_outcome(
                     &pm,
                     &self.state_dir,
                     required_str(params, "source")?,
                     expected,
                     &catalogue,
+                    hosted_operation_id,
                 )
             }
             "app_workspace_install_check" => {
@@ -643,7 +653,7 @@ impl Shared {
             "app_workspace_upgrade" => {
                 let id = required_str(params, "install_id")?;
                 let expected_digest = required_str(params, "expected_digest")?;
-                workspace::upgrade(
+                workspace::upgrade_with_outcome(
                     &pm,
                     &workspace::UpgradeRequest {
                         id,
@@ -725,6 +735,7 @@ impl Shared {
                             &journal.bindings,
                         )
                     },
+                    hosted_operation_id,
                 )
             }
             "app_workspace_upgrade_recover" => workspace::upgrade_recover(

@@ -34,9 +34,12 @@ The Social Content **Settings → App package** panel remains available.
 
 `cadence app catalog upgrade-check` and `cadence app catalog upgrade` accept
 absolute source paths and Git URLs. The `builtin:<catalog_id>` source form is
-retired (CAD-1422) and refused. In a hosted
-AgenticOS container the remote CLI still has no app-management verbs, so the
-Manage page is the board path for operators updating any app there.
+retired (CAD-1422) and refused. On a selected hosted workspace those source-based
+CLI commands are refused rather than uploading or installing locally. The
+`release-check` / `release-update` journey supports exact immutable published
+releases with explicit review, digest, generation and operation pins; see
+[the app catalog guide](app-catalog.md#selected-remote-immutable-published-releases).
+The Manage page remains the board path for source-based updates there.
 
 ## Test a Git-sourced update
 
@@ -164,3 +167,33 @@ This transport currently handles the package bundle and Cadence-owned app
 metadata. Host-managed per-install SQLite storage and staged schema/data
 migrations belong to the separate App storage contract; they must be integrated
 before an app upgrade that changes its data schema is allowed.
+
+## Hosted lifecycle correlation (CAD-1739)
+
+Hosted installation, update and revoke requests still execute through the
+native installation owner. The hosted ledger records transport, exact package
+pins and consent/reconciliation metadata; it is not another installation,
+run, CRM or business-record writer. Installing a package does not register an
+agent or grant tool, send, deployment or run authority.
+
+The board relay signs and forwards `x-cadence-hosted-operation-id` with the
+request. This operation ID is correlation, never an operator credential.
+Native RPC and HTTP still require their existing operator proof. A hosted
+revoke also pins `expected_generation`, checked under the same catalog lock
+as the consent mutation; a stale generation cannot revoke a newer consent.
+Standalone revoke without hosted correlation keeps its existing behavior.
+
+Only a correlated `hosted-app-mutation.v1` refusal with `mutation:
+"not_started"` establishes that a native precondition prevented mutation.
+An error after entering the consent writer or staging the upgrade journal is
+not that evidence. A lost reply, generic refusal or post-staging failure
+retains an unresolved hosted operation: inspect the native installation and
+use the existing recovery path before another intent. Durable receipt never
+means execution, and no exactly-once external-effect guarantee is made.
+
+The independent `cad1739_hosted_app_public_acceptance` target exercises the
+actual scratch daemon RPC and authenticated loopback HTTP: stale generation,
+new active work, operation-ID privilege refusal, preserved consent/scopes,
+post-journal recovery and failure inside the consent writer. Its test-seam
+personas and injected scratch faults are not production authentication or
+deployed-provider proof.

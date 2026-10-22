@@ -1727,6 +1727,65 @@ pub(crate) enum AssistantAction {
 
 #[derive(Subcommand)]
 pub(crate) enum CatalogAction {
+    /// Selected hosted workspace only: inspect an immutable published release; never uploads local files.
+    ReleaseCheck {
+        listing: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long, requires_all = ["expected_digest", "expected_generation"])]
+        install_id: Option<String>,
+        #[arg(long, requires = "install_id")]
+        expected_digest: Option<String>,
+        #[arg(long, requires = "install_id")]
+        expected_generation: Option<String>,
+    },
+    /// Selected hosted workspace only: consent to the exact release-check JSON review.
+    ReleaseInstall {
+        listing: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        review: PathBuf,
+    },
+    /// Selected hosted workspace only: update exact old bytes/generation to a reviewed published release.
+    ReleaseUpdate {
+        install_id: String,
+        listing: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        expected_digest: String,
+        #[arg(long)]
+        expected_generation: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        review: PathBuf,
+    },
+    /// Selected hosted workspace only: revoke package approval, not business data or run recovery.
+    ReleaseRevoke {
+        install_id: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        expected_generation: String,
+        #[arg(long)]
+        operation_id: String,
+    },
+    /// Selected hosted workspace only: read a durable receipt; dispatched is not executed.
+    Operation { operation_id: String },
+    /// Selected hosted workspace only: discover the pending operation as a current owner.
+    Pending { app: String },
+    /// Selected hosted workspace only: observe/cancel preparation; never redispatch a mutation.
+    Reconcile { operation_id: String },
     /// Approve the exact installed digest for supported local artifact steps.
     Approve {
         install_id: String,
@@ -2374,6 +2433,15 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
         }
         AppAction::Catalog { action } => {
             let (method, params) = match action {
+                CatalogAction::ReleaseCheck { .. }
+                | CatalogAction::ReleaseInstall { .. }
+                | CatalogAction::ReleaseUpdate { .. }
+                | CatalogAction::ReleaseRevoke { .. }
+                | CatalogAction::Operation { .. }
+                | CatalogAction::Pending { .. }
+                | CatalogAction::Reconcile { .. } => {
+                    return Err(Error::usage("published-release lifecycle commands require a selected remote workspace (--org); local app/catalog commands are unchanged"));
+                }
                 CatalogAction::Approve { install_id, digest } => (
                     "app_local_install_approve",
                     json!({"install_id":install_id,"digest":digest}),

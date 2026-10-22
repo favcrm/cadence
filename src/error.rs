@@ -287,6 +287,15 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl From<cadence_core::Error> for Error {
+    fn from(error: cadence_core::Error) -> Self {
+        match error {
+            cadence_core::Error::Rejected(message) => Self::Rejected(message),
+            cadence_core::Error::Internal(message) => Self::Internal(message),
+        }
+    }
+}
+
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Self::Internal(format!("io: {e}"))

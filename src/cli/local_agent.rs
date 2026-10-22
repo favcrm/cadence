@@ -6,22 +6,48 @@
 //! A claim is not execution until the configured local actor accepts the
 //! issue note through the existing daemon send.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(test)]
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
+use cadence_agent::local_assignment::delivery::deliver_kickoff;
+#[cfg(test)]
+use cadence_agent::local_assignment::delivery::{
+    claimant_target, redact_secrets, require_context, write_note,
+};
 use cadence_agent::local_assignment::http::BoardHttp;
 use cadence_agent::local_assignment::{Coordinator, Kickoff};
-use cadence_agent::remote_cli::{self, RemoteAnswer, RemoteTarget};
+use cadence_agent::remote_cli::RemoteTarget;
 use clap::Subcommand;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use super::{print_json, Error, Result};
 
 #[derive(Subcommand)]
 pub(crate) enum LocalAgentAction {
+    /// List one hosted directory page with server-authored presence and registration state.
+    Directory {
+        /// Continue from the previous page's after_id; null means exhausted.
+        #[arg(long)]
+        after_id: Option<String>,
+    },
+    /// Store an FYI receipt only: never start inference, send work, or copy referenced content.
+    Notify {
+        /// Stable lag_<UUID> from the selected hosted workspace's directory.
+        agent_id: String,
+        /// Literal FYI body (1..4000 UTF-16 code units).
+        #[arg(long)]
+        text: String,
+        /// Explicit idempotency key (1..120 units). Retry identical content with this same key.
+        #[arg(long)]
+        operation_id: String,
+        /// Issue id pointer only; repeat up to 16 total references.
+        #[arg(long = "issue")]
+        issues: Vec<String>,
+        /// Wiki id/path pointer only; no file or page is read.
+        #[arg(long = "wiki")]
+        wiki: Vec<String>,
+    },
     /// Save this machine's local actor and claim queued work for you.
     Connect {
         /// Local daemon alias that will read the issue.
@@ -33,13 +59,21 @@ pub(crate) enum LocalAgentAction {
         /// Lane slug. Defaults to `work`.
         #[arg(long)]
         name: Option<String>,
+        /// Register this explicit agent for FYI only; preserve the assignment default.
+        #[arg(long)]
+        fyi_only: bool,
     },
-    /// Keep picking up later assignments until disconnected or interrupted.
+    /// Observe the daemon's durable workspace inbox; never claim work.
     Watch,
     /// Stop local pickup without stopping actors or cancelling their claims.
     Disconnect,
     /// Show this machine's alias and the assignments the board returned.
     Status,
+    /// Display durable FYI notices. --clear removes displayed informational notices only.
+    Inbox {
+        #[arg(long)]
+        clear: bool,
+    },
     /// Report a claim this machine already holds.
     Report {
         assignment: String,
@@ -76,69 +110,129 @@ fn coordinator(target: &RemoteTarget) -> Result<Coordinator<BoardHttp>> {
 pub(super) fn run(
     target: &RemoteTarget,
     action: &LocalAgentAction,
-    wake_timeout: u64,
+    _wake_timeout: u64,
     local_state: Option<PathBuf>,
 ) -> Result<i32> {
+    // These explicit hosted reads/writes need neither a coordinator ledger nor
+    // a running daemon. BoardHttp retains saved-login renewal and identity pins.
+    match action {
+        LocalAgentAction::Directory { after_id } => {
+            return finish(&cadence_agent::local_assignment::notifications::directory(
+                target,
+                after_id.as_deref(),
+            )?);
+        }
+        LocalAgentAction::Notify {
+            agent_id,
+            operation_id,
+            text,
+            issues,
+            wiki,
+        } => {
+            let value = cadence_agent::local_assignment::notifications::notify(
+                target,
+                agent_id,
+                operation_id,
+                text,
+                issues,
+                wiki,
+            )?;
+            print_json(&value);
+            return Ok(if value["status"] == "stored" { 0 } else { 5 });
+        }
+        _ => {}
+    }
     let mut coord = coordinator(target)?;
     let value = match action {
-        LocalAgentAction::Connect { repo, name, alias } => {
-            let mut deliver = |kickoff: &Kickoff| {
-                deliver_kickoff(target, local_state.clone(), kickoff, wake_timeout)
-            };
-            let value = coord.connect(
-                repo.as_deref(),
-                name.as_deref(),
-                alias.as_deref(),
-                &mut deliver,
-            )?;
-            if let Some(dir) = local_state
+        LocalAgentAction::Directory { .. } | LocalAgentAction::Notify { .. } => {
+            unreachable!("handled before opening the coordinator")
+        }
+        LocalAgentAction::Connect {
+            repo,
+            name,
+            alias,
+            fyi_only,
+        } => {
+            let state = local_state
                 .clone()
-                .or_else(|| cadence_agent::client::state_dir().ok())
-            {
-                ensure_report_driver(&dir);
-            }
-            value
+                .map(Ok)
+                .unwrap_or_else(cadence_agent::client::state_dir)?;
+            ensure_report_driver(&state);
+            let alias = alias
+                .clone()
+                .or(coord.configured_alias()?)
+                .ok_or_else(|| Error::usage("connect requires --alias <explicit local agent>"))?;
+            cadence_agent::client::rpc_timeout(
+                &state,
+                "hosted_local_agent_connect",
+                json!({
+                    "org": target.org, "organization_id": target.org_id, "endpoint": target.endpoint,
+                    "alias": alias, "repo": repo, "name": name, "fyi_only": fyi_only,
+                }),
+                std::time::Duration::from_secs(30),
+            )?
         }
         LocalAgentAction::Watch => {
-            let mut deliver = |kickoff: &Kickoff| {
-                deliver_kickoff(target, local_state.clone(), kickoff, wake_timeout)
-            };
-            let report_state = local_state
+            let state = local_state
                 .clone()
-                .or_else(|| cadence_agent::client::state_dir().ok());
-            if let Some(dir) = &report_state {
-                ensure_report_driver(dir);
-            }
-            // The coordinator stays open for the watch. Each later poll
-            // reloads the saved login in place; it does not resolve another org.
-            let mut previous = None;
+                .map(Ok)
+                .unwrap_or_else(cadence_agent::client::state_dir)?;
+            ensure_report_driver(&state);
+            let mut previous: Option<Value> = None;
             loop {
-                let value = match coord.pickup(None, false, &mut deliver) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        if error.code() == Some("config_required") {
-                            let status = coord.status()?;
-                            if status["configured"] == false {
-                                print_json(&status);
-                                return Ok(if previous.is_some() { 0 } else { 5 });
-                            }
-                        }
-                        return Err(error);
-                    }
-                };
-                if value.get("guidance").is_some() {
-                    print_json(&value);
-                    return Ok(5);
-                }
+                let value = cadence_agent::client::rpc_timeout(
+                    &state,
+                    "hosted_local_agent_observe",
+                    json!({
+                        "organization_id": target.org_id,
+                        "after": previous.as_ref().and_then(|value| value["cursor"].as_u64()),
+                        "wait": previous.is_some(),
+                    }),
+                    std::time::Duration::from_secs(35),
+                )?;
                 if previous.as_ref() != Some(&value) {
                     print_json(&value);
                     previous = Some(value);
                 }
-                std::thread::sleep(std::time::Duration::from_secs(5));
             }
         }
-        LocalAgentAction::Disconnect => coord.disconnect()?,
-        LocalAgentAction::Status => coord.status()?,
+        LocalAgentAction::Disconnect => {
+            let state = local_state
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(cadence_agent::client::state_dir)?;
+            ensure_report_driver(&state);
+            let value = cadence_agent::client::rpc(
+                &state,
+                "hosted_local_agent_disconnect",
+                json!({"organization_id": target.org_id}),
+            )?;
+            coord.disconnect()?;
+            value
+        }
+        LocalAgentAction::Status => {
+            let mut value = coord.status()?;
+            let state = local_state
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(cadence_agent::client::state_dir)?;
+            value["inbox"] =
+                cadence_agent::local_assignment::events::observe(&state, &target.org_id, false)?;
+            value
+        }
+        LocalAgentAction::Inbox { clear } => {
+            let state = local_state
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(cadence_agent::client::state_dir)?;
+            // Observation/clear never authorizes starting actors or pickup.
+            // A stopped daemon is reported by the observer RPC unchanged.
+            cadence_agent::client::rpc(
+                &state,
+                "hosted_local_agent_observe",
+                json!({"organization_id": target.org_id, "clear": clear}),
+            )?
+        }
         LocalAgentAction::Report {
             assignment,
             state,
@@ -205,298 +299,6 @@ fn finish(value: &Value) -> Result<i32> {
         return Ok(5);
     }
     Ok(0)
-}
-
-/// Destination for this kickoff's context and handoff.
-/// Org, endpoint, and workspace stay the invocation's original selection.
-/// The member pin is the claimant captured when the coordinator opened.
-/// A missing or one-sided pin is unavailable: the current saved login is
-/// never substituted.
-fn claimant_target(target: &RemoteTarget, kickoff: &Kickoff) -> Result<RemoteTarget> {
-    let Some(subject_id) = kickoff.subject_id.filter(|value| !value.is_empty()) else {
-        return Err(Error::rejected(
-            "hosted assignment has no original member; context was not read and the local agent was not messaged",
-        ));
-    };
-    let Some(issuer) = kickoff.issuer.filter(|value| !value.is_empty()) else {
-        return Err(Error::rejected(
-            "hosted assignment has no original issuer; context was not read and the local agent was not messaged",
-        ));
-    };
-    Ok(RemoteTarget {
-        org: target.org.clone(),
-        endpoint: target.endpoint.clone(),
-        org_id: target.org_id.clone(),
-        identity: Some(remote_cli::CliIdentityPin {
-            subject_id: subject_id.to_string(),
-            issuer: issuer.to_string(),
-        }),
-    })
-}
-
-/// Reload the saved login against the claimant pin before a handoff that
-/// does not itself open a remote verb. Renewal of that same member is
-/// allowed; a different member or issuer fails inside credential load,
-/// before any request is given that login's authority.
-fn reload_claimant(target: &RemoteTarget) -> Result<()> {
-    let dir = cadence_agent::remote_auth::auth_dir(None).map_err(|_| {
-        Error::rejected(
-            "remote credential directory is unavailable; the local agent was not messaged",
-        )
-    })?;
-    remote_cli::cli_material(&dir, target)?;
-    Ok(())
-}
-
-fn deliver_kickoff(
-    target: &RemoteTarget,
-    local_state: Option<PathBuf>,
-    kickoff: &Kickoff,
-    wake_timeout: u64,
-) -> Result<Value> {
-    let target = claimant_target(target, kickoff)?;
-    let state = match local_state {
-        Some(dir) => dir,
-        None => cadence_agent::client::state_dir()?,
-    };
-    let (text, note) = if let Some(text) =
-        cadence_agent::local_assignment::reporting::stored_kickoff_text(&state, kickoff)?
-    {
-        reload_claimant(&target)?;
-        (text, context_note_path(&state, kickoff))
-    } else {
-        let context = require_context(&target, kickoff, wake_timeout)?;
-        let note = write_note(&state, kickoff, &context)?;
-        let text = kickoff_line(kickoff, &note, &context)?;
-        cadence_agent::local_assignment::reporting::store_kickoff_binding(
-            &state,
-            &target.org,
-            &target.endpoint,
-            kickoff,
-            &text,
-        )?;
-        (text, note)
-    };
-    let mut params = json!({
-        "alias": kickoff.alias,
-        "text": text,
-        "message": kickoff.message_id,
-    });
-    if let Some(reply_to) = std::env::var("CADENCE_ALIAS")
-        .ok()
-        .filter(|alias| cadence_agent::proto::identifier(alias, "alias").is_ok())
-    {
-        params["reply_to"] = json!(reply_to);
-    }
-    let mut sent = cadence_agent::client::rpc(&state, "agent_send", params)?;
-    sent["note"] = json!(note.display().to_string());
-    Ok(sent)
-}
-
-fn require_context(target: &RemoteTarget, kickoff: &Kickoff, wake_timeout: u64) -> Result<Value> {
-    let context = issue_context(target, kickoff, wake_timeout);
-    if context.get("context_error").is_some() {
-        return Err(Error::rejected(
-            "hosted issue context was not read; the local agent was not messaged and the assignment was not left running",
-        ));
-    }
-    Ok(context)
-}
-
-// A reassignment must not rewrite a snapshot an older local actor can still read.
-fn context_note_path(dir: &Path, kickoff: &Kickoff) -> PathBuf {
-    dir.join("hosted-assignments")
-        .join(format!("{}.md", kickoff.message_id))
-}
-
-fn write_note(dir: &Path, kickoff: &Kickoff, context: &Value) -> Result<PathBuf> {
-    let message = kickoff.message_id;
-    if message.is_empty()
-        || message.contains('/')
-        || message.contains('\\')
-        || message.contains('\0')
-    {
-        return Err(Error::rejected(
-            "message id cannot name a local note; the actor was not messaged",
-        ));
-    }
-    let folder = dir.join("hosted-assignments");
-    fs::create_dir_all(&folder)?;
-    fs::set_permissions(&folder, fs::Permissions::from_mode(0o700))?;
-    let path = context_note_path(dir, kickoff);
-    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        return Err(Error::rejected(
-            "assignment note path is a symlink; the actor was not messaged",
-        ));
-    }
-    let serialized = serde_json::to_string_pretty(context).map_err(|error| {
-        Error::rejected(format!("hosted context could not be serialized: {error}"))
-    })?;
-    let body = redact_secrets(serialized);
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)?;
-        file.write_all(body.as_bytes())?;
-        file.sync_all()?;
-    }
-    Ok(path)
-}
-
-fn kickoff_line(kickoff: &Kickoff, note: &Path, context: &Value) -> Result<String> {
-    let title = context
-        .pointer("/issue/title")
-        .and_then(Value::as_str)
-        .unwrap_or("hosted issue");
-    let title: String = title
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .take(180)
-        .collect();
-    let line = format!(
-        "Hosted issue {} ({title}). Read {} for this assignment's issue, comments, and wiki index. Use its org selector explicitly for hosted ticket/wiki actions, verify organization_id and audience, and do not change global org selection. Worktree: {}. A managed endpoint ends its final answer with SHA:<40-or-64-lowercase-hex>. A PTY explicit reporter uses cadence message result {} --token <turn_id> --text '<summary>' --sha <40-or-64-lowercase-hex>.",
-        kickoff.issue_id,
-        note.display(),
-        kickoff.worktree,
-        kickoff.message_id
-    );
-    if line.chars().any(char::is_control) || line.len() > 4000 {
-        return Err(Error::rejected(
-            "local actor message was not a single safe line; nothing was sent",
-        ));
-    }
-    Ok(line)
-}
-
-fn issue_context(target: &RemoteTarget, kickoff: &Kickoff, wake_timeout: u64) -> Value {
-    let mut show_args = Map::new();
-    show_args.insert("id".into(), json!(kickoff.issue_id));
-    show_args.insert("json".into(), json!(true));
-    let mut history_args = Map::new();
-    history_args.insert("id".into(), json!(kickoff.issue_id));
-    history_args.insert("limit".into(), json!(20));
-    let mut wiki_args = Map::new();
-    wiki_args.insert("path".into(), json!(""));
-    // One budget covers the issue, its comments, and the wiki index. A later
-    // read cannot restart the wake clock after an earlier read used it up.
-    let Some(deadline) = Instant::now().checked_add(Duration::from_secs(wake_timeout)) else {
-        return json!({
-            "org": target.org,
-            "organization_id": kickoff.organization_id,
-            "audience": target.endpoint,
-            "assignment_id": kickoff.assignment_id,
-            "claim_id": kickoff.claim_id,
-            "generation": kickoff.generation,
-            "context_error": "invalid wake timeout; the local agent was not messaged"
-        });
-    };
-    let show = remote_cli::call_verb(
-        target,
-        "issue_show",
-        show_args,
-        deadline,
-        wake_timeout,
-        |_| {},
-    );
-    let history = remote_cli::call_verb(
-        target,
-        "issue_history",
-        history_args,
-        deadline,
-        wake_timeout,
-        |_| {},
-    );
-    let wiki = remote_cli::call_verb(
-        target,
-        "enumerate",
-        wiki_args,
-        deadline,
-        wake_timeout,
-        |_| {},
-    );
-    let (show_ok, issue) = outcome(show);
-    let (history_ok, history) = outcome(history);
-    let (wiki_ok, wiki) = outcome(wiki);
-    let mut context = json!({
-        "org": target.org,
-        "organization_id": kickoff.organization_id,
-        "audience": target.endpoint,
-        "assignment_id": kickoff.assignment_id,
-        "claim_id": kickoff.claim_id,
-        "generation": kickoff.generation,
-        "issue": issue,
-        "comments": history,
-        "wiki": wiki,
-        "report": {
-            "managed_endpoint": "end the final answer with SHA:<40-or-64-lowercase-hex>",
-            "pty": {
-                "command": "cadence message result",
-                "message": kickoff.message_id,
-                "token": "<turn_id>",
-                "sha": "<40-or-64-lowercase-hex>"
-            }
-        }
-    });
-    if !show_ok || !history_ok || !wiki_ok {
-        context["context_error"] = json!(
-            "issue, comments, or wiki context was not fully read; the local agent was not messaged"
-        );
-    }
-    context
-}
-
-fn outcome(answer: Result<RemoteAnswer>) -> (bool, Value) {
-    match answer {
-        Ok(RemoteAnswer::Ok(value)) => (true, value),
-        Ok(RemoteAnswer::Conflict(_)) => (
-            false,
-            json!({"context_error": "hosted context conflicted; the local agent was not messaged"}),
-        ),
-        Err(error) => (false, json!({"context_error": brief(&error)})),
-    }
-}
-
-fn brief(error: &Error) -> String {
-    let text: String = error
-        .to_string()
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .take(240)
-        .collect();
-    redact_secrets(text)
-}
-
-fn redact_secrets(text: String) -> String {
-    let mut out: Option<String> = None;
-    let mut copied = 0;
-    for (start, _) in text.match_indices("hct_") {
-        if start < copied {
-            continue;
-        }
-        let after = &text[start + 4..];
-        let length = after
-            .chars()
-            .take(43)
-            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
-            .count();
-        if length != 43 {
-            continue;
-        }
-        let output = out.get_or_insert_with(|| String::with_capacity(text.len()));
-        output.push_str(&text[copied..start]);
-        output.push_str("hct_[redacted]");
-        copied = start + 47;
-    }
-    match out {
-        Some(mut output) => {
-            output.push_str(&text[copied..]);
-            output
-        }
-        None => text,
-    }
 }
 
 #[cfg(test)]

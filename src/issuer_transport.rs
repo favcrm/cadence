@@ -52,6 +52,212 @@ pub(crate) fn jwks_agent(timeout: Duration) -> ureq::Agent {
     )
 }
 
+/// Outbound WSS uses the same WebPKI/fixture trust policy as issuer HTTP.
+/// Dial and resumable TLS/HTTP upgrade share one deadline; connected I/O stays
+/// interruptible so an unavailable peer cannot hold daemon shutdown.
+pub(crate) fn websocket(
+    request: tungstenite::http::Request<()>,
+    config: Option<tungstenite::protocol::WebSocketConfig>,
+    timeout: Duration,
+) -> crate::error::Result<
+    tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+> {
+    use crate::error::Error;
+    use std::net::TcpStream;
+    use std::time::Instant;
+    use tungstenite::handshake::HandshakeError;
+    use tungstenite::stream::MaybeTlsStream;
+    use ureq::unversioned::resolver::{DefaultResolver, Resolver};
+
+    let uri = request.uri();
+    if uri.scheme_str() != Some("wss")
+        || uri.authority().is_none()
+        || uri
+            .authority()
+            .is_some_and(|authority| authority.as_str().contains('@'))
+    {
+        return Err(Error::rejected(
+            "hosted event transport requires a WSS audience",
+        ));
+    }
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| Error::rejected("invalid hosted event connection timeout"))?;
+    let host = uri
+        .host()
+        .ok_or_else(|| Error::rejected("hosted event host is missing"))?;
+    let resolver = DefaultResolver::default();
+    let fixture = websocket_fixture(host)?;
+    let (addresses, tls) = if let Some(fixture) = fixture {
+        let mut addresses = resolver.empty();
+        addresses.push(fixture.connect);
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(fixture.ca_der))
+            .map_err(|_| Error::rejected("hosted event fixture CA is invalid"))?;
+        (addresses, websocket_tls(roots))
+    } else {
+        let https = ureq::http::Uri::builder()
+            .scheme("https")
+            .authority(uri.authority().expect("authority checked").clone())
+            .path_and_query("/")
+            .build()
+            .map_err(|_| Error::rejected("hosted event audience is invalid"))?;
+        let addresses = resolver
+            .resolve(
+                &https,
+                &ureq::config::Config::default(),
+                ureq::unversioned::transport::NextTimeout {
+                    after: websocket_remaining(deadline)?.into(),
+                    reason: ureq::Timeout::Global,
+                },
+            )
+            .map_err(|_| {
+                Error::invalid("network_unavailable", "hosted event DNS resolution failed")
+            })?;
+        static TLS: std::sync::LazyLock<std::sync::Arc<rustls::ClientConfig>> =
+            std::sync::LazyLock::new(|| {
+                websocket_tls(rustls::RootCertStore {
+                    roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+                })
+            });
+        let tls = std::sync::Arc::clone(&TLS);
+        (addresses, tls)
+    };
+    let mut connected = None;
+    for address in addresses.iter() {
+        if let Ok(socket) = TcpStream::connect_timeout(address, websocket_remaining(deadline)?) {
+            connected = Some(socket);
+            break;
+        }
+    }
+    let socket = connected
+        .ok_or_else(|| Error::invalid("network_unavailable", "hosted event connection failed"))?;
+    socket.set_nonblocking(true)?;
+    let mut handshake = tungstenite::client_tls_with_config(
+        request,
+        socket,
+        config,
+        Some(tungstenite::Connector::Rustls(tls)),
+    );
+    loop {
+        match handshake {
+            Ok((socket, _)) => {
+                let tcp = match socket.get_ref() {
+                    MaybeTlsStream::Rustls(stream) => &stream.sock,
+                    _ => return Err(Error::rejected("hosted event TLS transport is unavailable")),
+                };
+                tcp.set_nonblocking(false)?;
+                tcp.set_read_timeout(Some(Duration::from_millis(250)))?;
+                tcp.set_write_timeout(Some(Duration::from_millis(250)))?;
+                return Ok(socket);
+            }
+            Err(HandshakeError::Interrupted(progress)) => {
+                websocket_ready(progress.get_ref().get_ref(), deadline)?;
+                handshake = progress.handshake();
+            }
+            Err(HandshakeError::Failure(tungstenite::Error::Http(response)))
+                if matches!(response.status().as_u16(), 401 | 403) =>
+            {
+                return Err(Error::invalid(
+                    "unauthorized",
+                    "hosted event stream authorization was refused",
+                ));
+            }
+            Err(HandshakeError::Failure(_)) => {
+                return Err(Error::invalid(
+                    "network_unavailable",
+                    "hosted event TLS or upgrade failed",
+                ));
+            }
+        }
+    }
+}
+
+fn websocket_tls(roots: rustls::RootCertStore) -> std::sync::Arc<rustls::ClientConfig> {
+    std::sync::Arc::new(
+        rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default TLS protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    )
+}
+
+fn websocket_remaining(deadline: std::time::Instant) -> crate::error::Result<Duration> {
+    deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| {
+            crate::error::Error::invalid(
+                "network_unavailable",
+                "hosted event connection deadline exceeded",
+            )
+        })
+}
+
+fn websocket_ready(
+    stream: &tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
+    deadline: std::time::Instant,
+) -> crate::error::Result<()> {
+    use std::os::fd::AsRawFd;
+    let tungstenite::stream::MaybeTlsStream::Rustls(stream) = stream else {
+        return Err(crate::error::Error::rejected(
+            "hosted event TLS transport is unavailable",
+        ));
+    };
+    let mut descriptor = libc::pollfd {
+        fd: stream.sock.as_raw_fd(),
+        events: libc::POLLIN
+            | if stream.conn.wants_write() {
+                libc::POLLOUT
+            } else {
+                0
+            },
+        revents: 0,
+    };
+    loop {
+        let timeout = websocket_remaining(deadline)?
+            .as_millis()
+            .saturating_add(1)
+            .min(i32::MAX as u128) as i32;
+        // SAFETY: one live stack descriptor; poll neither retains nor aliases it.
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+        if result > 0 {
+            return Ok(());
+        }
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error.into());
+            }
+        }
+    }
+}
+
+struct WebSocketFixture {
+    connect: std::net::SocketAddr,
+    ca_der: Vec<u8>,
+}
+
+fn websocket_fixture(host: &str) -> crate::error::Result<Option<WebSocketFixture>> {
+    #[cfg(test)]
+    {
+        test_fixture::websocket_fixture(host)
+    }
+    #[cfg(all(not(test), feature = "test-seam"))]
+    {
+        env_fixture::websocket_fixture(host)
+    }
+    #[cfg(all(not(test), not(feature = "test-seam")))]
+    {
+        let _ = host;
+        Ok(None)
+    }
+}
+
 /// CAD-1568: the packaged-CLI acceptance runs the real `cadence` executable
 /// as a child process, so the thread-local `cfg(test)` fixture cannot reach
 /// it. In a non-test `test-seam` debug binary only, the explicit env pair
@@ -136,11 +342,11 @@ mod env_fixture {
             .unwrap_or_else(|_| panic!("{CA_ENV} certificate is not base64 DER"))
     }
 
-    pub(crate) fn agent(builder: ConfigBuilder<AgentScope>) -> ureq::Agent {
+    fn fixture() -> Option<super::WebSocketFixture> {
         let ca = std::env::var_os(CA_ENV);
         let connect = std::env::var_os(CONNECT_ENV);
         let (ca, connect) = match (ca, connect) {
-            (None, None) => return ureq::Agent::new_with_config(builder.build()),
+            (None, None) => return None,
             (Some(ca), Some(connect)) => (ca, connect),
             _ => panic!(
                 "{CA_ENV} and {CONNECT_ENV} arm the fixture transport together or not at all"
@@ -151,13 +357,36 @@ mod env_fixture {
             .and_then(|value| value.parse().ok())
             .filter(|addr: &SocketAddr| addr.ip().is_loopback())
             .unwrap_or_else(|| panic!("{CONNECT_ENV} must be a 127.0.0.1 socket address"));
-        let der = fixture_ca_der(Path::new(&ca));
-        let roots = RootCerts::new_with_certs(&[Certificate::from_der(&der).to_owned()]);
+        Some(super::WebSocketFixture {
+            connect,
+            ca_der: fixture_ca_der(Path::new(&ca)),
+        })
+    }
+
+    pub(super) fn websocket_fixture(
+        host: &str,
+    ) -> crate::error::Result<Option<super::WebSocketFixture>> {
+        let fixture = fixture();
+        if fixture.is_some() && host != super::CANONICAL_BOARD_HOST && host != ISSUER_HOST {
+            return Err(crate::error::Error::rejected(
+                "hosted event fixture host is not allowed",
+            ));
+        }
+        Ok(fixture)
+    }
+
+    pub(crate) fn agent(builder: ConfigBuilder<AgentScope>) -> ureq::Agent {
+        let Some(fixture) = fixture() else {
+            return ureq::Agent::new_with_config(builder.build());
+        };
+        let roots = RootCerts::new_with_certs(&[Certificate::from_der(&fixture.ca_der).to_owned()]);
         let tls = TlsConfig::builder().root_certs(roots).build();
         ureq::Agent::with_parts(
             builder.tls_config(tls).proxy(None).max_redirects(0).build(),
             DefaultConnector::default(),
-            EnvResolver { loopback: connect },
+            EnvResolver {
+                loopback: fixture.connect,
+            },
         )
     }
 }
@@ -319,6 +548,23 @@ pub(crate) mod test_fixture {
             addrs.push(target);
             Ok(addrs)
         }
+    }
+
+    pub(super) fn websocket_fixture(
+        host: &str,
+    ) -> crate::error::Result<Option<super::WebSocketFixture>> {
+        let fixture = FIXTURE.with(|slot| slot.borrow().clone()).ok_or_else(|| {
+            crate::error::Error::rejected("hosted event test requires an explicit TLS fixture")
+        })?;
+        if !fixture_maps(host) {
+            return Err(crate::error::Error::rejected(
+                "hosted event fixture host is not allowed",
+            ));
+        }
+        Ok(Some(super::WebSocketFixture {
+            connect: fixture.loopback,
+            ca_der: fixture.ca_der,
+        }))
     }
 
     pub(crate) fn agent(builder: ConfigBuilder<AgentScope>) -> ureq::Agent {

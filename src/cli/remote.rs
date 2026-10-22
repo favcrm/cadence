@@ -1312,6 +1312,9 @@ pub(super) fn run(
     if let Commands::LocalAgent { action } = &command {
         return local_agent::run(&target, action, wake_timeout, local_state);
     }
+    if let Commands::App { action } = &command {
+        return super::hosted_app::run(&target, action);
+    }
     if let Commands::Restore {
         source,
         repos,

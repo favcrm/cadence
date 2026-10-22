@@ -77,7 +77,10 @@ fn cad811_screen_startup_contract_and_refusal_acceptance() {
             .expect("valid app manifest");
     approved_metadata
         .requires
-        .check(&app::compat_host().expect("host contract registry"))
+        .check(
+            &cadence_core::app_compat::host(env!("CARGO_PKG_VERSION"))
+                .expect("host contract registry"),
+        )
         .expect("screen-startup feature is advertised by a ready host");
 
     // Legacy declarations without startup still run only client.js; an

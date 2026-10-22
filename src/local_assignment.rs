@@ -6,8 +6,8 @@
 //! row only for its own directory user, then hands the issue to the
 //! configured local actor. A worktree is the checkout, not execution.
 //! When that actor finishes the kickoff message, the originating claim
-//! is reported to the board. There is no local-agent registry, presence
-//! route, or tool-exchange.
+//! is reported to the board. The daemon multiplexes explicitly connected
+//! agents over one authenticated outbound workspace event stream.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -25,7 +25,10 @@ use crate::error::{Error, Result};
 use crate::remote_cli::{self, CliMaterial, RemoteTarget};
 use crate::worktree::{self, layout};
 
+pub mod delivery;
+pub mod events;
 pub mod http;
+pub mod notifications;
 pub mod reporting;
 mod wire;
 
@@ -127,6 +130,10 @@ struct Origin {
     message_id: String,
     organization_id: String,
     audience: String,
+    #[serde(default)]
+    subject_id: Option<String>,
+    #[serde(default)]
+    issuer: Option<String>,
     assignment_id: String,
     claim_id: String,
     generation: u64,
@@ -161,6 +168,9 @@ pub struct Coordinator<H> {
     /// Board audience recorded at login. Reports go here, not to whatever
     /// org a later process has selected.
     audience: String,
+    /// Daemon binding lifetime. Cancellation is not an execution failure and
+    /// must never turn a detached context read into a late blocked report.
+    delivery_guard: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Test seam: runs after the delivery check and before reservation,
     /// while the ledger lock is not held.
     #[cfg(test)]
@@ -542,13 +552,17 @@ impl Ledger {
             file.sync_all()?;
         }
         fs::rename(tmp, path)?;
+        File::open(dir)?.sync_all()?;
         Ok(())
     }
 }
 
-/// Drop delivery, lane, and worktree pointers for the claim we were on.
+/// Drop mutable custody, delivery, lane and worktree for the retired claim.
 /// Origins, binding files, old checkouts, and pending reassign operations stay.
 fn retire_current_claim(attempt: &mut Attempt) {
+    attempt.claim_id = None;
+    attempt.target = None;
+    attempt.state = "discovered".to_string();
     attempt.kickoff_message = None;
     attempt.kickoff_reserved = None;
     attempt.origin_claim_id = None;
@@ -639,6 +653,7 @@ impl<H: CoordHttp> Coordinator<H> {
             subject_id,
             issuer,
             audience,
+            delivery_guard: None,
             #[cfg(test)]
             before_reservation: None,
         })
@@ -672,8 +687,20 @@ impl<H: CoordHttp> Coordinator<H> {
     fn base(&self) -> String {
         assignment_prefix(&self.org_id)
     }
+    fn ensure_active(&self) -> Result<()> {
+        if self.delivery_guard.as_ref().is_some_and(|active| !active()) {
+            return Err(Error::busy_coded(
+                "binding_cancelled",
+                "the original local workspace binding is no longer active",
+            ));
+        }
+        Ok(())
+    }
 
     fn exchange(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
+        if method == "POST" {
+            self.ensure_active()?;
+        }
         let reply = self.http.send(method, path, body)?;
         if (300..400).contains(&reply.status) {
             return Err(Error::invalid(
@@ -715,6 +742,9 @@ impl<H: CoordHttp> Coordinator<H> {
 
     fn stored_alias(&self) -> Result<Option<String>> {
         self.with_ledger(|ledger| Ok(ledger.alias.clone()))
+    }
+    pub fn configured_alias(&self) -> Result<Option<String>> {
+        self.stored_alias()
     }
 
     pub fn bind_alias(&self, alias: &str) -> Result<String> {
@@ -825,6 +855,58 @@ impl<H: CoordHttp> Coordinator<H> {
             ));
         }
         rows.iter().map(|row| self.parse_owned(row)).collect()
+    }
+    /// Exhaust recovery before adopting its watermark. The ledger's original
+    /// generation and claim fences also apply to every snapshot observation.
+    fn snapshot(&mut self) -> Result<(u64, Vec<Assignment>)> {
+        let mut watermark = None;
+        let mut after: Option<String> = None;
+        let mut rows = Vec::new();
+        loop {
+            let mut path = format!("{}/snapshot", self.base());
+            if let (Some(after), Some(watermark)) = (&after, watermark) {
+                path.push_str(&format!("?after_id={after}&watermark={watermark}"));
+            }
+            let value = self.exchange("GET", &path, None)?;
+            let page_watermark = value["watermark"]
+                .as_u64()
+                .ok_or_else(|| Error::rejected("snapshot watermark is missing"))?;
+            if value["version"].as_str() != Some(events::VERSION)
+                || watermark.is_some_and(|prior| prior != page_watermark)
+            {
+                return Err(Error::rejected("snapshot contract or watermark changed"));
+            }
+            watermark = Some(page_watermark);
+            let page = value["assignments"]
+                .as_array()
+                .filter(|page| page.len() <= 50)
+                .ok_or_else(|| Error::rejected("snapshot page is invalid"))?;
+            for item in page {
+                let row = self.parse_owned(item)?;
+                if after
+                    .as_ref()
+                    .is_some_and(|after| row.assignment_id <= *after)
+                    || rows
+                        .last()
+                        .is_some_and(|prior: &Assignment| prior.assignment_id >= row.assignment_id)
+                {
+                    return Err(Error::rejected("snapshot did not advance"));
+                }
+                self.remember_discovered(&row)?;
+                rows.push(row);
+            }
+            match &value["after_id"] {
+                Value::Null => return Ok((page_watermark, rows)),
+                Value::String(next)
+                    if prefixed_id(next, "hla_")
+                        && after.as_ref().is_none_or(|prior| next > prior)
+                        && rows.last().is_some_and(|row| &row.assignment_id == next) =>
+                {
+                    after = Some(next.clone());
+                }
+                _ => return Err(Error::rejected("snapshot continuation is invalid")),
+            }
+        }
     }
 
     fn live_assignments(&mut self, resume_blocked: bool) -> Result<Vec<Assignment>> {
@@ -1018,12 +1100,17 @@ impl<H: CoordHttp> Coordinator<H> {
                 if origin.assignment_id != claimed.assignment_id
                     || origin.claim_id != claim_id
                     || origin.generation != claimed.generation
+                    || origin.organization_id != self.org_id || origin.audience != self.audience
+                    || origin.subject_id != self.subject_id || origin.issuer != self.issuer
                 {
                     return Err(Error::rejected(
                         "this claim is no longer active; a later generation was not messaged with its kickoff",
                     ));
                 }
                 return Ok(id);
+            }
+            if !fresh && self.subject_id.is_some() {
+                return Err(Error::rejected("reserved kickoff has no original member pin; it cannot inherit the current login"));
             }
             let (origin_claim, origin_generation) = if fresh {
                 (claim_id.clone(), claimed.generation)
@@ -1057,6 +1144,8 @@ impl<H: CoordHttp> Coordinator<H> {
                     message_id: id.clone(),
                     organization_id: organization_id.clone(),
                     audience: audience.clone(),
+                    subject_id: self.subject_id.clone(),
+                    issuer: self.issuer.clone(),
                     assignment_id: claimed.assignment_id.clone(),
                     claim_id: origin_claim,
                     generation: origin_generation,
@@ -1120,6 +1209,10 @@ impl<H: CoordHttp> Coordinator<H> {
                     "that kickoff has no originating claim; a later claim is not authority to report it",
                 )
             })?;
+            if origin.organization_id != self.org_id || origin.audience != self.audience
+                || origin.subject_id != self.subject_id || origin.issuer != self.issuer {
+                return Err(Error::rejected("kickoff belongs to its original workspace member and issuer"));
+            }
             Ok((
                 origin.assignment_id.clone(),
                 origin.claim_id.clone(),
@@ -1159,7 +1252,8 @@ impl<H: CoordHttp> Coordinator<H> {
                     "that assignment has no originating claim; a later claim is not authority to report it",
                 )
             })?;
-            if origin.assignment_id != assignment {
+            if origin.assignment_id != assignment || origin.organization_id != self.org_id
+                || origin.audience != self.audience || origin.subject_id != self.subject_id || origin.issuer != self.issuer {
                 return Err(Error::rejected(
                     "kickoff identity does not match that assignment",
                 ));
@@ -1168,9 +1262,12 @@ impl<H: CoordHttp> Coordinator<H> {
         })
     }
 
-    fn block_claim(&mut self, claimed: &Assignment, text: &str) {
+    fn block_claim(&mut self, claimed: &Assignment, text: &str) -> bool {
+        if self.ensure_active().is_err() {
+            return false;
+        }
         let Some(claim_id) = claimed.claim_id.as_deref() else {
-            return;
+            return false;
         };
         let Ok(text) = wire::bounded_report_text(
             &wire::ReportIdentity {
@@ -1183,16 +1280,35 @@ impl<H: CoordHttp> Coordinator<H> {
             &claimed.assignment_id,
             text,
         ) else {
-            return;
+            return false;
         };
-        let _ = self.report_claimed(
+        self.report_claimed(
             &claimed.assignment_id,
             claim_id,
             claimed.generation,
             "blocked",
             Some(&text),
             None,
-        );
+        )
+        .is_ok()
+    }
+
+    fn activation_failure(&mut self, claimed: &Assignment, error: Error) -> Error {
+        if let Err(cancelled) = self.ensure_active() {
+            return cancelled;
+        }
+        if error.code() == Some("binding_cancelled") {
+            return error;
+        }
+        let blocked = self.block_claim(claimed, &error.to_string());
+        if let Err(cancelled) = self.ensure_active() {
+            return cancelled;
+        }
+        if blocked {
+            Error::invalid("assignment_blocked", error.to_string())
+        } else {
+            error
+        }
     }
 
     /// Lane already stored for this claim, or a new one that does not
@@ -1275,6 +1391,7 @@ impl<H: CoordHttp> Coordinator<H> {
     where
         F: FnMut(&Kickoff) -> Result<Value>,
     {
+        self.ensure_active()?;
         let client_agent_id = self.client_agent_id()?;
         let claimed = if assignment.state == "blocked" {
             self.remember_discovered(assignment)?;
@@ -1323,8 +1440,7 @@ impl<H: CoordHttp> Coordinator<H> {
         let lane = match self.lane_for(&current, name) {
             Ok(lane) => lane,
             Err(error) => {
-                self.block_claim(&current, &error.to_string());
-                return Err(error);
+                return Err(self.activation_failure(&current, error));
             }
         };
         let pinned = self.with_ledger(|ledger| {
@@ -1344,8 +1460,7 @@ impl<H: CoordHttp> Coordinator<H> {
         let dir = match opened {
             Ok(dir) => dir,
             Err(error) => {
-                self.block_claim(&current, &error.to_string());
-                return Err(error);
+                return Err(self.activation_failure(&current, error));
             }
         };
         let path = dir.display().to_string();
@@ -1393,12 +1508,11 @@ impl<H: CoordHttp> Coordinator<H> {
                     if message != message_id
                         || crate::proto::identifier(&message, "actor message").is_err()
                     {
-                        self.block_claim(
+                        return Err(self.activation_failure(
                             &current,
-                            "the local actor receipt did not match the reserved message id; the assignment was not left running",
-                        );
-                        return Err(Error::rejected(
-                            "the local actor receipt did not match the reserved message id; the assignment was blocked",
+                            Error::rejected(
+                                "the local actor receipt did not match the reserved message id",
+                            ),
                         ));
                     }
                     self.mark_kickoff_delivered(&current.assignment_id, &message)?;
@@ -1412,8 +1526,7 @@ impl<H: CoordHttp> Coordinator<H> {
                     receipt
                 }
                 Err(error) => {
-                    self.block_claim(&current, &error.to_string());
-                    return Err(error);
+                    return Err(self.activation_failure(&current, error));
                 }
             }
         };
@@ -1656,19 +1769,32 @@ impl<H: CoordHttp> Coordinator<H> {
     where
         F: FnMut(&Kickoff) -> Result<Value>,
     {
-        slug(name)?;
-        if let Some(alias) = alias {
-            self.bind_alias(alias)?;
-        }
-        if let Some(repo) = repo {
-            let root = worktree::main_root(repo)?;
-            let stored = root.display().to_string();
-            self.with_ledger(|ledger| {
-                ledger.repo = Some(stored);
-                Ok(())
-            })?;
-        }
+        self.configure(repo, name, alias)?;
         self.pickup(name, true, deliver)
+    }
+
+    /// Persist explicit configuration without a second pickup owner.
+    pub fn configure(
+        &self,
+        repo: Option<&Path>,
+        name: Option<&str>,
+        alias: Option<&str>,
+    ) -> Result<()> {
+        slug(name)?;
+        let alias = alias.map(alias_name).transpose()?;
+        let repo = repo
+            .map(worktree::main_root)
+            .transpose()?
+            .map(|root| root.display().to_string());
+        self.with_ledger(|ledger| {
+            if let Some(alias) = alias {
+                ledger.alias = Some(alias);
+            }
+            if let Some(repo) = repo {
+                ledger.repo = Some(repo);
+            }
+            Ok(())
+        })
     }
 
     /// Consume configured local work. Background pickup leaves blocked work
@@ -1682,19 +1808,36 @@ impl<H: CoordHttp> Coordinator<H> {
     where
         F: FnMut(&Kickoff) -> Result<Value>,
     {
-        let Some(alias) = self.stored_alias()? else {
-            return Err(Error::invalid(
-                "config_required",
-                "pass --alias <local agent>. This command did not claim or message new work",
-            ));
+        let rows = self.live_assignments(resume_blocked)?;
+        self.pickup_rows(rows, name, resume_blocked, None, deliver)
+    }
+
+    fn pickup_rows<F>(
+        &mut self,
+        rows: Vec<Assignment>,
+        name: Option<&str>,
+        resume_blocked: bool,
+        bound_alias: Option<&str>,
+        deliver: &mut F,
+    ) -> Result<Value>
+    where
+        F: FnMut(&Kickoff) -> Result<Value>,
+    {
+        let alias = match bound_alias {
+            Some(alias) => alias_name(alias)?,
+            None => self.stored_alias()?.ok_or_else(|| {
+                Error::invalid(
+                    "config_required",
+                    "connect an explicit local assignment alias first",
+                )
+            })?,
         };
         let subject = self.subject_id.clone().ok_or_else(|| {
             Error::invalid(
                 "config_required",
-                "this workspace login has no directory subject; nothing was claimed",
+                "this workspace login has no directory subject",
             )
         })?;
-        let rows = self.live_assignments(resume_blocked)?;
         let client_agent_id = self.client_agent_id()?;
         let stored = self.with_ledger(|ledger| Ok(ledger.repo.clone()))?;
         let Some(stored) = stored else {
@@ -1714,6 +1857,9 @@ impl<H: CoordHttp> Coordinator<H> {
         let mut claimed = Vec::new();
         let mut refused = Vec::new();
         for row in rows {
+            if row.state == "blocked" && !resume_blocked {
+                continue;
+            }
             let mut row = row;
             if row.state == "waiting"
                 && row.target.is_none()

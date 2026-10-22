@@ -4,7 +4,30 @@ pub(crate) use super::catalogue::{CatalogueClaim, CatalogueDirectory};
 use super::*;
 use crate::issue::{app, app_view, workflow, write};
 use crate::store::Store;
+use cadence_core::app_compat;
 use serde_json::{json, Value};
+use std::cell::Cell;
+
+/// Only this source-owned marker proves a request failed before its first
+/// authoritative mutation. A transport status or an error string cannot do so.
+pub(crate) fn hosted_mutation_outcome(
+    result: Result<Value>,
+    mutation_started: bool,
+    operation_id: Option<&str>,
+    operation: &str,
+) -> Result<Value> {
+    match (result, operation_id) {
+        (Err(_), Some(id)) if !mutation_started => Ok(json!({
+            "version": "hosted-app-mutation.v1",
+            "operation_id": id,
+            "operation": operation,
+            "outcome": "refused",
+            "mutation": "not_started",
+            "code": "native_precondition_refused"
+        })),
+        (result, _) => result,
+    }
+}
 
 /// CAD-1194: the install-check source form that names a host built-in.
 const BUILTIN_SOURCE_PREFIX: &str = "builtin:";
@@ -714,7 +737,7 @@ fn check_refusal(mut report: Value, code: &str, error: &Error) -> Value {
 /// ran on. `compat::host` is the same descriptor `requires` checks
 /// against; there is no invented compatibility matrix.
 fn check_host_block() -> Result<Value> {
-    let host = app::compat_host()?;
+    let host = app_compat::host(env!("CARGO_PKG_VERSION"))?;
     Ok(json!({
         "core": host.core.to_string(),
         "contracts": host
@@ -873,7 +896,9 @@ pub fn check_offline(source: &str) -> Result<Value> {
                 .get("app.md")
                 .and_then(|text| app::parse_manifest(text).ok())
             {
-                report["compatibility"] = manifest.requires.report(&app::compat_host()?);
+                report["compatibility"] = manifest
+                    .requires
+                    .report(&app_compat::host(env!("CARGO_PKG_VERSION"))?);
             }
             Ok(check_refusal(report, CHECK_CONTENT, &error))
         }
@@ -897,6 +922,33 @@ pub(crate) fn install(
     )
 }
 
+pub(crate) fn install_with_outcome(
+    pm: &Pm,
+    state: &Path,
+    source: &str,
+    expected_digest: Option<&str>,
+    catalogue: &CatalogueClaim,
+    operation_id: Option<&str>,
+) -> Result<Value> {
+    if operation_id.is_none() {
+        return install(pm, state, source, expected_digest, catalogue);
+    }
+    let started = Cell::new(false);
+    let result = install_from_guarded(
+        pm,
+        state,
+        source,
+        expected_digest,
+        catalogue,
+        CatalogueDirectory::Configured,
+        &|| {
+            started.set(true);
+            Ok(())
+        },
+    );
+    hosted_mutation_outcome(result, started.get(), operation_id, "install")
+}
+
 pub(super) fn install_from(
     pm: &Pm,
     state: &Path,
@@ -904,6 +956,26 @@ pub(super) fn install_from(
     expected_digest: Option<&str>,
     catalogue: &CatalogueClaim,
     directory: CatalogueDirectory<'_>,
+) -> Result<Value> {
+    install_from_guarded(
+        pm,
+        state,
+        source,
+        expected_digest,
+        catalogue,
+        directory,
+        &|| Ok(()),
+    )
+}
+
+fn install_from_guarded(
+    pm: &Pm,
+    state: &Path,
+    source: &str,
+    expected_digest: Option<&str>,
+    catalogue: &CatalogueClaim,
+    directory: CatalogueDirectory<'_>,
+    guard: &dyn Fn() -> Result<()>,
 ) -> Result<Value> {
     let _ = state; // Caller must pass the daemon's connection-bound operator gate.
     let (files, validated, provenance) = resolved_bundle(pm, source)?;
@@ -931,7 +1003,7 @@ pub(super) fn install_from(
         provenance,
         expected_digest,
         decision.origin,
-        &|| Ok(()),
+        guard,
     )
 }
 
@@ -1120,6 +1192,37 @@ pub(crate) fn upgrade(
     ) -> Result<(Value, BTreeMap<String, Value>)>,
     deliver: impl FnOnce(&UpgradeJournal) -> Result<Vec<String>>,
 ) -> Result<Value> {
+    upgrade_tracked(pm, request, preflight, deliver, &Cell::new(false))
+}
+
+pub(crate) fn upgrade_with_outcome(
+    pm: &Pm,
+    request: &UpgradeRequest<'_>,
+    preflight: impl FnOnce(
+        &BTreeMap<String, String>,
+        &app::Manifest,
+    ) -> Result<(Value, BTreeMap<String, Value>)>,
+    deliver: impl FnOnce(&UpgradeJournal) -> Result<Vec<String>>,
+    operation_id: Option<&str>,
+) -> Result<Value> {
+    if operation_id.is_none() {
+        return upgrade(pm, request, preflight, deliver);
+    }
+    let started = Cell::new(false);
+    let result = upgrade_tracked(pm, request, preflight, deliver, &started);
+    hosted_mutation_outcome(result, started.get(), operation_id, "update")
+}
+
+fn upgrade_tracked(
+    pm: &Pm,
+    request: &UpgradeRequest<'_>,
+    preflight: impl FnOnce(
+        &BTreeMap<String, String>,
+        &app::Manifest,
+    ) -> Result<(Value, BTreeMap<String, Value>)>,
+    deliver: impl FnOnce(&UpgradeJournal) -> Result<Vec<String>>,
+    mutation_started: &Cell<bool>,
+) -> Result<Value> {
     let id = InstallationId::parse(request.id)?;
     let source = request.source;
     let expected_digest = request.expected_digest;
@@ -1277,6 +1380,7 @@ pub(crate) fn upgrade(
             "workspace upgrade journal exceeds its limit",
         ));
     }
+    mutation_started.set(true);
     root.mkdir(Path::new(".apps/upgrade-journals"))?;
     root.mkdir(&Path::new(".apps/upgrade-journals").join(&*id))?;
     root.put(&journal_path, &journal_text)?;
@@ -1732,7 +1836,7 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
         ));
     }
     catalog.require_current(root)?;
-    let compatibility = match app::compat_host() {
+    let compatibility = match app_compat::host(env!("CARGO_PKG_VERSION")) {
         Ok(host) => manifest.requires.report(&host),
         Err(error) => manifest.requires.unknown_report(&error.to_string()),
     };
@@ -2549,7 +2653,9 @@ pub(crate) fn restore_guarded(
             .get("app.md")
             .ok_or_else(|| Error::rejected("installed bundle has no manifest"))?,
     )?;
-    manifest.requires.check(&app::compat_host()?)?;
+    manifest
+        .requires
+        .check(&app_compat::host(env!("CARGO_PKG_VERSION"))?)?;
     // CAD-1374: fresh authority re-proved under the PM lock, before the first write.
     guard()?;
     record.removed = None;

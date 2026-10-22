@@ -35,6 +35,7 @@ mod app_image_jobs;
 mod app_media_rpc;
 mod app_record_actions_rpc;
 mod app_works_rpc;
+mod hosted_assignments;
 #[cfg(feature = "test-seam")]
 pub use app_image_jobs::test_probe as image_job_probe;
 mod app_records_rpc;
@@ -2570,6 +2571,9 @@ impl Shared {
                     )),
                 }
             }
+            "hosted_local_agent_connect"
+            | "hosted_local_agent_disconnect"
+            | "hosted_local_agent_observe" => self.rpc_hosted_local_agent(method, params, peer_pid),
             "agent_show" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
@@ -5087,23 +5091,12 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
-    // One process-lifetime reporter, after the listener exists. It reads
-    // kickoff bindings and the durable message store; shutdown does not join
-    // it, so an unreachable board cannot hold `stop_ctls`.
-    let _ = {
+    // Outcome/config events wake the reporter and explicit workspace bridge.
+    // Only pending obligations schedule retries; standalone opens no socket.
+    {
         let shared = Arc::clone(&shared);
-        thread::spawn(move || {
-            let driver = crate::local_assignment::reporting::ReportDriver::new(&shared.state_dir);
-            while !shared.closing.load(Ordering::SeqCst) {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                let _ = driver.tick(&shared.store, deadline);
-                let pause = Instant::now() + Duration::from_millis(250);
-                while Instant::now() < pause && !shared.closing.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(25));
-                }
-            }
-        })
-    };
+        thread::spawn(move || shared.run_hosted_assignments());
+    }
     // Signal-driven shutdown: set the same flag as the rpc. Installed
     // before actors launch so a signal during relaunch — or a relaunch
     // failure — still reaches `shutdown` below rather than exiting

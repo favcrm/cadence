@@ -1,12 +1,12 @@
 # Design contract: CAD-1019 remote CLI — login maps the org; allowlisted commands on the remote daemon
 
-Phase-1 contract for the remote CLI transport. No implementation is in this
-PR. Revised per PM direction: login rides the **hosted-cadence device grant**
-(`hcd_`/`hct_`, the AOS-76 owner-consent flow already implemented in
-`src/remote_enrollment.rs`), and remote calls go through AOS-128's
-`POST /__platform/cli/call` — the generalization of AOS-122's
-`/__platform/wiki/{authorize,call}` envelope proxy. CAD-913 (wiki) shares this
-transport rather than duplicating it.
+Historical phase-1 design for the remote CLI transport; the references and
+credential-lifetime questions below record that design stage, not the current
+deployment contract. For current login/renewal semantics see
+[REMOTE-AUTH](../REMOTE-AUTH.md); for explicit local-agent registration,
+WSS/FYI delivery and teammate collaboration see the
+[Hosted workspace guide](../guides/hosted-workspace.md). The current published
+app CLI is documented in [Workspace app catalog](../guides/app-catalog.md#selected-remote-immutable-published-releases).
 
 ## Evidence answers to the phase-1 questions (revised)
 
@@ -155,8 +155,9 @@ or replacement cannot redirect the request. No refusal silently reroutes or
 enqueues elsewhere. Personal-assistant and local-worker recipients are
 typed unsupported-class refusals: separate assistant authority or local
 assignments are required, never a reroute or generic container execution.
-Member-to-member remote coordination and the local-worker follow-up
-journey are deferred on the ticket — refused, not silently fulfilled.
+Generic member-to-member remote `send` and local-worker follow-up remain refused
+on this transport. The separate [directory-addressed FYI flow](../guides/hosted-workspace.md#a-teammates-own-agent-collaboration-flow)
+stores informational notices only; it does not extend this allowlist.
 Arguments are exactly `{alias, text, message}`
 — three strings. `message` is the caller-chosen stable id: required, the
 identifier grammar, never `sys-*`. It is the dedupe and reconciliation key —

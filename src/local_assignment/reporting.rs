@@ -129,6 +129,9 @@ fn write_kickoff_file(path: &Path, binding: &KickoffFile) -> Result<()> {
     fs::rename(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -145,6 +148,9 @@ fn create_kickoff_file(path: &Path, binding: &KickoffFile) -> Result<bool> {
     match fs::hard_link(&tmp, path) {
         Ok(()) => {
             let _ = fs::remove_file(&tmp);
+            if let Some(parent) = path.parent() {
+                File::open(parent)?.sync_all()?;
+            }
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -389,13 +395,13 @@ fn message_sha(message: &crate::store::Message) -> Option<String> {
 }
 
 const ATTEMPT_BUDGET: Duration = Duration::from_secs(5);
-const PASS_LIMIT: usize = 8;
 
 /// One background reporter for every hosted kickoff in a state dir.
 /// Obligations come from the immutable binding plus the durable message row.
 pub struct ReportDriver {
     state_dir: PathBuf,
     cursor: Mutex<String>,
+    deferred: std::sync::atomic::AtomicBool,
 }
 
 impl ReportDriver {
@@ -403,13 +409,34 @@ impl ReportDriver {
         Self {
             state_dir: state_dir.to_path_buf(),
             cursor: Mutex::new(String::new()),
+            deferred: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+    /// Retry timers exist only for actual durable terminal report obligations.
+    pub fn has_pending(&self) -> Result<bool> {
+        if self.deferred.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(true);
+        }
+        for path in self.pass_paths()? {
+            if let Some(binding) = read_kickoff_file(&path)? {
+                if binding.pending_state.is_some()
+                    && binding.reported_state.is_none()
+                    && !binding.settled
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// One fair pass. Local pending state is derived before any request.
     /// Each request's renewal and HTTP share one deadline, and that deadline
-    /// is also clipped to `deadline`. The pass stops when the budget is gone.
+    /// is also clipped to `deadline`. Local recovery continues after the HTTP
+    /// budget is gone; the fair cursor advances only for actual HTTP attempts.
     pub fn tick(&self, store: &crate::store::Store, deadline: Instant) -> Result<()> {
+        self.deferred
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let paths = self.pass_paths()?;
         for path in paths {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -425,8 +452,8 @@ impl ReportDriver {
         Ok(())
     }
 
-    /// At most [`PASS_LIMIT`] names, starting after the last visited file.
-    /// The cursor moves only after a visit, in `tick`.
+    /// Native outcome/config notifications trigger a complete local recovery
+    /// pass. Only pending reports schedule another timer.
     fn pass_paths(&self) -> Result<Vec<PathBuf>> {
         let dir = binding_dir(&self.state_dir);
         let entries = match fs::read_dir(&dir) {
@@ -453,7 +480,6 @@ impl ReportDriver {
             .position(|name| name.as_str() > start.as_str())
             .unwrap_or(0);
         names.rotate_left(rotate);
-        names.truncate(PASS_LIMIT);
         Ok(names.into_iter().map(|name| dir.join(name)).collect())
     }
 
@@ -465,8 +491,12 @@ impl ReportDriver {
         deadline: Instant,
     ) -> Result<bool> {
         let (visited, prepared) = prepare_pending(path, store, message_id)?;
+        if !visited {
+            self.deferred
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let Some(prepared) = prepared else {
-            return Ok(visited);
+            return Ok(false);
         };
         let attempt = Instant::now() + ATTEMPT_BUDGET;
         let attempt = if attempt < deadline {
@@ -475,7 +505,7 @@ impl ReportDriver {
             deadline
         };
         if Instant::now() >= attempt {
-            return Ok(true);
+            return Ok(false);
         }
         match post_report(&prepared, attempt) {
             Ok(ReportAck::Accepted) => mark_accepted(path, &prepared.pending_state)?,
@@ -967,48 +997,6 @@ mod tests {
         let row = store.message("unknown-1").unwrap().unwrap();
         assert_eq!(row.state, "completed");
         assert_eq!(row.result.as_ref().unwrap()["sha"], SHA);
-    }
-
-    #[test]
-    fn a_due_pass_prepares_eight_and_the_next_pass_prepares_the_rest() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store_message(dir.path());
-        register(&store, dir.path());
-        for index in 1..=16 {
-            let id = format!("m{index:02}");
-            bind(dir.path(), &id);
-            store.enqueue("worker", "work", None, &id, "user").unwrap();
-            let message = match store.take_queued("worker").unwrap() {
-                crate::store::Take::Message(message) => message,
-                _ => panic!("expected a claimed message"),
-            };
-            store.mark_running(&id, "turn").unwrap();
-            store
-                .finish(
-                    &message,
-                    "completed",
-                    &json!({"status": "completed", "text": "landed", "sha": SHA}),
-                    None,
-                )
-                .unwrap();
-        }
-        let driver = ReportDriver::new(dir.path());
-        driver.tick(&store, Instant::now()).unwrap();
-        for index in 1..=16 {
-            let pending = file(dir.path(), &format!("m{index:02}"))["pending_state"].clone();
-            if index <= 8 {
-                assert_eq!(pending, "result", "m{index:02}");
-            } else {
-                assert!(pending.is_null(), "m{index:02}");
-            }
-        }
-        driver.tick(&store, Instant::now()).unwrap();
-        for index in 9..=16 {
-            assert_eq!(
-                file(dir.path(), &format!("m{index:02}"))["pending_state"],
-                "result"
-            );
-        }
     }
 
     #[test]

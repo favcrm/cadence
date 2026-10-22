@@ -486,6 +486,39 @@ pub(crate) enum AgentAction {
         #[arg(long = "expect-rev")]
         expected: Vec<String>,
     },
+    /// List a hosted workspace directory page. Presence is observed, not execution capability.
+    Directory {
+        /// Previous page's after_id (lag_<UUID>); null means exhausted.
+        #[arg(long)]
+        after_id: Option<String>,
+    },
+    /// Store an informational FYI; never invokes agent_send or a model.
+    ///
+    /// Use the stable id from `agent directory`. A stored receipt does not mean
+    /// delivered, read or executed. Issue/wiki references are pointers only;
+    /// existing read/start/update authorization remains authoritative.
+    Notify {
+        /// Stable lag_<UUID> in the selected hosted workspace.
+        agent_id: String,
+        /// Literal text, 1..4000 UTF-16 code units.
+        #[arg(long)]
+        text: String,
+        /// Explicit retry key, 1..120 units. Keep workspace/member/agent/content identical on retry.
+        #[arg(long)]
+        operation_id: String,
+        /// Issue id pointer; repeatable, at most 16 references total.
+        #[arg(long = "issue")]
+        issues: Vec<String>,
+        /// Wiki id/path pointer; no content is read or uploaded.
+        #[arg(long = "wiki")]
+        wiki: Vec<String>,
+    },
+    /// Read the native daemon's durable FYI inbox; never claim or execute work.
+    Inbox {
+        /// Clear displayed FYI notices only, not claims or the hosted receipts.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Bind this machine's local actor to the selected hosted org and
     /// claim queued work. Local execution by definition; `--org` names
     /// the board, never the placement.
@@ -528,7 +561,25 @@ impl AgentAction {
                 alias: alias.clone(),
                 repo: repo.clone(),
                 name: name.clone(),
+                fyi_only: false,
             },
+            Self::Directory { after_id } => L::Directory {
+                after_id: after_id.clone(),
+            },
+            Self::Notify {
+                agent_id,
+                text,
+                operation_id,
+                issues,
+                wiki,
+            } => L::Notify {
+                agent_id: agent_id.clone(),
+                text: text.clone(),
+                operation_id: operation_id.clone(),
+                issues: issues.clone(),
+                wiki: wiki.clone(),
+            },
+            Self::Inbox { clear } => L::Inbox { clear: *clear },
             Self::Watch => L::Watch,
             Self::Assignments => L::Status,
             Self::Disconnect => L::Disconnect,
@@ -904,12 +955,15 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
         // Routed before this function by the caller; refused here so a
         // future routing bypass cannot claim locally.
         AgentAction::Connect { .. }
+        | AgentAction::Directory { .. }
+        | AgentAction::Notify { .. }
+        | AgentAction::Inbox { .. }
         | AgentAction::Watch
         | AgentAction::Assignments
         | AgentAction::Disconnect
         | AgentAction::Reassign { .. } => {
             return Err(Error::usage(
-                "agent connect/watch/assignments/disconnect/reassign coordinate a hosted org with this machine. Select that org, or switch back from `--org local`. Nothing was claimed.",
+                "agent connect/watch/assignments/disconnect/reassign/directory/notify/inbox require a selected hosted org. Nothing was sent or claimed.",
             ))
         }
     };
