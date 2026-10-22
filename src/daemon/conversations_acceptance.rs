@@ -56,11 +56,21 @@ fn gx() -> Gx {
 /// `social_context: false` leaves Social Content installed but with no
 /// context at all (an app before its first brand).
 fn gx_with(social_context: bool) -> Gx {
+    gx_deployed(social_context, None)
+}
+
+/// `gx_with` under trusted image metadata (`provider_deployments`), so a
+/// hosted admission is selected exactly as the daemon selects it.
+fn gx_deployed(
+    social_context: bool,
+    deployments: Option<crate::platform::deployments::DeploymentMetadata>,
+) -> Gx {
     let dir = tempfile::Builder::new().prefix("c98a").tempdir().unwrap();
     let pm = dir.path().join("pm");
     crate::issue::Pm::init(&pm).unwrap();
     let opts = ServeOptions {
         provider_env: crate::adapter::ProviderEnv::refusing_providers(),
+        provider_deployments: deployments,
         ..Default::default()
     };
     opts.provider_env
@@ -2874,4 +2884,534 @@ fn cad1726_artifact_put_read_control() {
         .operator("artifact_versions", json!({"id": id, "conversation": home}))
         .unwrap();
     assert_eq!(list["versions"].as_array().unwrap().len(), 2);
+}
+
+// ============================================================================
+// CAD-1726 refusal acceptance checks — written from the ticket by the
+// reviewer, not the implementer (AGENTS.md "Gates and security work").
+// Each refusal is asserted by its reason, and each test holds a positive
+// control on the same fixture so a harness that refuses everything fails.
+// ============================================================================
+
+/// A sentinel inside every artifact body: a refusal that leaks bytes
+/// would carry it.
+const CANVAS_SENTINEL: &str = "Zed Canvas Sentinel";
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn unb64(v: &Value) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(v.as_str().expect("base64 content"))
+        .unwrap()
+}
+
+impl Gx {
+    /// `artifact_put` on the master's own connection (the turn is the
+    /// daemon's to resolve; the request never names it).
+    fn master_put(&self, params: Value) -> Result<Value> {
+        self.call(Asserted::Agent("master".into()), "artifact_put", params)
+    }
+
+    /// `(artifact rows, artifact card entries, custody blobs)` — the
+    /// "nothing was stored" probe. A missing custody dir is zero blobs;
+    /// any other read failure fails the test.
+    fn artifact_state(&self) -> (i64, i64, usize) {
+        let dir = self.dir.path().join("artifacts");
+        let blobs = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries.count(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => panic!("read {}: {e}", dir.display()),
+        };
+        (
+            self.count("SELECT count(*) FROM artifacts"),
+            self.count("SELECT count(*) FROM thread_entries WHERE kind='artifact'"),
+            blobs,
+        )
+    }
+
+    fn artifact_cards(&self, thread: &str) -> Vec<Value> {
+        self.shared
+            .store
+            .thread_entries_of(thread, 0, 500)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "artifact")
+            .map(|e| e.payload.unwrap())
+            .collect()
+    }
+}
+
+fn no_canvas_bytes(what: &str, err: &str) {
+    assert!(
+        !err.contains(CANVAS_SENTINEL),
+        "{what}: a refusal exposed artifact bytes: {err}"
+    );
+}
+
+/// CAD-1726 acceptance: "The read route refuses an artifact from another
+/// conversation or workspace, and an agent caller." An artifact put on a
+/// Home turn and one put on a CRM app-conversation turn are each read by
+/// the operator in their own conversation (control), then refused when
+/// viewed from every other conversation: Home <-> app, another
+/// conversation of the same company, another company, another
+/// installation; a forged row whose stored scope names a different
+/// conversation than its thread is refused by the scope re-proof; and
+/// every non-operator caller is refused on both `artifact_read` and
+/// `artifact_versions`.
+///
+/// Guards: `rpc_artifact_read` / `rpc_artifact_versions` ->
+/// `artifact_operator` + `artifact_in_view` + `prove_artifact_scope`
+/// (daemon/artifacts_rpc.rs).
+#[test]
+fn cad1726_artifact_read_refuses_other_conversation_workspace_and_agents() {
+    let gx = gx();
+    let (crm, social) = (gx.crm.clone(), gx.social.clone());
+    let (crm_a, crm_b, social_ctx) = (gx.crm_a.clone(), gx.crm_b.clone(), gx.social_ctx.clone());
+    let home = gx.shared.store.ensure_thread("master").unwrap().id;
+
+    // A Home turn puts one artifact.
+    gx.send_home("m-home");
+    gx.run("m-home");
+    let home_art = gx
+        .master_put(json!({"kind": "html", "title": "Home report",
+            "content": b64(format!("<p>{CANVAS_SENTINEL} home</p>").as_bytes())}))
+        .unwrap();
+    gx.finish("m-home", 2.0);
+    // A CRM app-conversation turn puts another.
+    let conv_a = gx.conversation(&crm, &crm_a, json!({"general": true}));
+    gx.send("m-app", &crm, &crm_a, Some(&conv_a));
+    gx.run("m-app");
+    let app_art = gx
+        .master_put(json!({"kind": "md", "title": "App report",
+            "content": b64(format!("# {CANVAS_SENTINEL} app").as_bytes())}))
+        .unwrap();
+    gx.finish("m-app", 3.0);
+    let (home_id, app_id) = (
+        home_art["id"].as_str().unwrap().to_string(),
+        app_art["id"].as_str().unwrap().to_string(),
+    );
+    // Each card landed in its own turn's conversation, nowhere else.
+    let ids = |thread: &str| -> Vec<String> {
+        gx.artifact_cards(thread)
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(ids(&home), vec![home_id.clone()]);
+    assert_eq!(ids(&conv_a), vec![app_id.clone()]);
+
+    let conv_a2 = gx.conversation(&crm, &crm_a, json!({}));
+    let conv_b = gx.conversation(&crm, &crm_b, json!({}));
+    let conv_s = gx.general_of(&social, &social_ctx);
+    let distinct: std::collections::BTreeSet<&String> =
+        [&home, &conv_a, &conv_a2, &conv_b, &conv_s]
+            .into_iter()
+            .collect();
+    assert_eq!(distinct.len(), 5, "the fixture conversations must differ");
+
+    let read = |who: Asserted, id: &str, version: i64, conv: &str| {
+        gx.call(
+            who,
+            "artifact_read",
+            json!({"id": id, "version": version, "conversation": conv}),
+        )
+    };
+    let versions = |who: Asserted, id: &str, conv: &str| {
+        gx.call(
+            who,
+            "artifact_versions",
+            json!({"id": id, "conversation": conv}),
+        )
+    };
+
+    // ---- Control: the operator reads each in its own conversation. ----
+    for (id, conv) in [(&home_id, &home), (&app_id, &conv_a)] {
+        let got = read(Asserted::Operator, id, 1, conv).unwrap();
+        let text = String::from_utf8(unb64(&got["content"])).unwrap();
+        assert!(text.contains(CANVAS_SENTINEL), "control {id}: {text}");
+        let list = versions(Asserted::Operator, id, conv).unwrap();
+        assert_eq!(list["versions"].as_array().unwrap().len(), 1, "{list}");
+    }
+
+    // ---- Another conversation or workspace: refused. ----
+    let not_in_view = "artifact does not belong to the conversation in view";
+    let cases = [
+        (
+            "home artifact viewed from an app conversation",
+            &home_id,
+            &conv_a,
+        ),
+        ("app artifact viewed from Home", &app_id, &home),
+        (
+            "another conversation of the same company",
+            &app_id,
+            &conv_a2,
+        ),
+        ("another company of the installation", &app_id, &conv_b),
+        ("another installation", &app_id, &conv_s),
+    ];
+    for (what, id, conv) in cases {
+        let got = read(Asserted::Operator, id, 1, conv);
+        assert!(got.is_err(), "{what}: served {id} in {conv}: {got:?}");
+        let err = err_text(got);
+        assert!(err.contains(not_in_view), "{what} read: {err}");
+        no_canvas_bytes(what, &err);
+        let err = err_text(versions(Asserted::Operator, id, conv));
+        assert!(err.contains(not_in_view), "{what} versions: {err}");
+    }
+
+    // ---- A forged row: its thread is company B's conversation, its
+    // stored scope still names company A's. The scope re-proof refuses
+    // it even though thread and conversation agree. ----
+    let forged = gx
+        .db()
+        .execute(
+            "INSERT INTO artifacts(id,version,kind,title,bytes,digest,scope,context_id,
+                                   thread_id,created_by,created)
+             SELECT id,7,kind,title,bytes,digest,scope,context_id,?,created_by,created
+             FROM artifacts WHERE id=? AND version=1",
+            rusqlite::params![conv_b, app_id],
+        )
+        .unwrap();
+    assert_eq!(forged, 1);
+    let err = err_text(read(Asserted::Operator, &app_id, 7, &conv_b));
+    assert!(
+        err.contains("artifact scope does not match its conversation"),
+        "forged scope row: {err}"
+    );
+    no_canvas_bytes("forged scope row", &err);
+
+    // ---- No agent and no unproven caller reads, even in view. The
+    // master is stopped by its own call policy (an app turn's allowlist
+    // has no read verb), a worker by the handler's operator proof. ----
+    let agent_refused = |err: &str, verb: &str| {
+        err.contains("an agent may not read artifacts") || err.contains(&format!("not {verb};"))
+    };
+    for who in [
+        Asserted::Agent("master".into()),
+        Asserted::Agent("w1".into()),
+    ] {
+        let label = format!("{who:?}");
+        let err = err_text(read(who.clone(), &home_id, 1, &home));
+        assert!(agent_refused(&err, "artifact_read"), "{label} read: {err}");
+        no_canvas_bytes(&label, &err);
+        let err = err_text(versions(who, &home_id, &home));
+        assert!(
+            agent_refused(&err, "artifact_versions"),
+            "{label} versions: {err}"
+        );
+    }
+    let err = err_text(read(Asserted::Agent("w1".into()), &home_id, 1, &home));
+    assert!(
+        err.contains("an agent may not read artifacts"),
+        "w1 reaches the handler's proof: {err}"
+    );
+    let err = err_text(read(Asserted::Unproven, &home_id, 1, &home));
+    assert!(
+        err.contains("not provably the operator"),
+        "unproven read: {err}"
+    );
+    no_canvas_bytes("unproven", &err);
+    let err = err_text(versions(Asserted::Unproven, &home_id, &home));
+    assert!(
+        err.contains("not provably the operator"),
+        "unproven versions: {err}"
+    );
+}
+
+/// CAD-1726 acceptance, the board's HTTP peer of the read RPC (a board
+/// path is at least as strict as the RPC it relays): the operator's
+/// session reads the bytes in view, `nosniff` and a `sandbox` CSP on the
+/// HTML (control); an agent or unproven caller is refused on both rows;
+/// the operator naming another conversation, or none, is refused.
+///
+/// Guards: the `OperatorOnly` rows `ArtifactRead` / `ArtifactVersions`
+/// (ui/endpoints.rs) + the relayed `artifact_read` / `artifact_versions`
+/// proofs (ui/artifacts.rs -> daemon/artifacts_rpc.rs).
+#[test]
+fn cad1726_board_artifact_route_is_operator_only_and_conversation_bound() {
+    let gx = gx_with(true);
+    let home = gx.shared.store.ensure_thread("master").unwrap().id;
+    gx.send_home("m-home");
+    gx.run("m-home");
+    let html = format!("<p>{CANVAS_SENTINEL}</p><script>fetch('/api/session')</script>");
+    let art = gx
+        .master_put(json!({"kind": "html", "title": "Report", "content": b64(html.as_bytes())}))
+        .unwrap();
+    gx.finish("m-home", 2.0);
+    let id = art["id"].as_str().unwrap().to_string();
+    let conv_a = gx.conversation(&gx.crm.clone(), &gx.crm_a.clone(), json!({"general": true}));
+    let (board, _state, _rest) = http::start(gx);
+
+    struct Got {
+        status: u16,
+        nosniff: Option<String>,
+        csp: Option<String>,
+        body: Vec<u8>,
+    }
+    let get = |who: &str, path: &str| -> Got {
+        let url = format!("{}{path}", board.base);
+        let mut resp = board.decorate(who, board.agent.get(&url)).call().unwrap();
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let (nosniff, csp) = (
+            header("x-content-type-options"),
+            header("content-security-policy"),
+        );
+        Got {
+            status: resp.status().as_u16(),
+            nosniff,
+            csp,
+            body: resp.body_mut().read_to_vec().unwrap(),
+        }
+    };
+    let bytes_path = |conv: &str| format!("/api/artifacts/{id}/1?conversation={conv}");
+    let list_path = |conv: &str| format!("/api/artifacts/{id}?conversation={conv}");
+
+    // ---- Control: the operator's session, in view. ----
+    let got = get("operator", &bytes_path(&home));
+    assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+    assert_eq!(got.body, html.as_bytes());
+    assert_eq!(got.nosniff.as_deref(), Some("nosniff"));
+    assert!(
+        got.csp.as_deref().is_some_and(|c| c.starts_with("sandbox")),
+        "{:?}",
+        got.csp
+    );
+    let got = get("operator", &list_path(&home));
+    assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+    let list: Value = serde_json::from_slice(&got.body).unwrap();
+    assert_eq!(list["versions"].as_array().unwrap().len(), 1, "{list}");
+
+    // ---- Agents and an unproven caller: refused on both rows. ----
+    for who in ["agent:master", "agent:w1", "unproven"] {
+        for path in [bytes_path(&home), list_path(&home)] {
+            let got = get(who, &path);
+            let body = String::from_utf8_lossy(&got.body).into_owned();
+            assert!(
+                [401, 403].contains(&got.status),
+                "{who} {path}: {} {body}",
+                got.status
+            );
+            no_canvas_bytes(who, &body);
+        }
+    }
+
+    // ---- The operator, but another conversation or none: refused. ----
+    for path in [bytes_path(&conv_a), list_path(&conv_a)] {
+        let got = get("operator", &path);
+        let body = String::from_utf8_lossy(&got.body).into_owned();
+        assert_ne!(got.status, 200, "{path}: {body}");
+        assert!(
+            body.contains("artifact does not belong to the conversation in view"),
+            "{path}: {} {body}",
+            got.status
+        );
+        no_canvas_bytes(&path, &body);
+    }
+    for path in [
+        format!("/api/artifacts/{id}/1"),
+        format!("/api/artifacts/{id}"),
+    ] {
+        let got = get("operator", &path);
+        let body = String::from_utf8_lossy(&got.body).into_owned();
+        assert_eq!(got.status, 400, "{path}: {body}");
+        assert!(body.contains("conversation is required"), "{path}: {body}");
+    }
+}
+
+/// CAD-1726 acceptance for `artifact_put`: scope comes from the master's
+/// live turn, never the request. Under a LIVE app-conversation turn a
+/// request naming a conversation, thread, scope, context, installation,
+/// message, token or author is refused whole; an existing id from
+/// another conversation (the only request handle that names stored
+/// custody) is refused; the operator and a worker are refused. Then the
+/// same live turn puts in its own conversation (control). A put after the
+/// endpoint's generation rotated (a stale token) or after the turn
+/// finished is refused. No refusal stores a row, a card or a blob.
+///
+/// Guards: `reject_artifact_fields` + `artifact_turn`
+/// (daemon/artifacts_rpc.rs); the cross-conversation version check in
+/// `LocalArtifacts::put` (store/artifacts.rs).
+#[test]
+fn cad1726_artifact_put_refuses_forged_fields_foreign_ids_and_stale_turns() {
+    let gx = gx();
+    let (crm, social) = (gx.crm.clone(), gx.social.clone());
+    let (crm_a, crm_b) = (gx.crm_a.clone(), gx.crm_b.clone());
+    let home = gx.shared.store.ensure_thread("master").unwrap().id;
+    gx.send_home("m-home");
+    gx.run("m-home");
+    let home_art = gx
+        .master_put(json!({"kind": "md", "title": "Home", "content": b64(b"# home")}))
+        .unwrap();
+    let home_id = home_art["id"].as_str().unwrap().to_string();
+    gx.finish("m-home", 2.0);
+
+    let conv_a = gx.conversation(&crm, &crm_a, json!({"general": true}));
+    gx.send("m-app", &crm, &crm_a, Some(&conv_a));
+    let token = gx.run("m-app");
+    let body = |extra: Value| {
+        let mut p = json!({"kind": "md", "title": "Forged",
+                           "content": b64(b"# forged bytes")});
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        p
+    };
+    let before = gx.artifact_state();
+
+    // ---- Forged custody fields under a live turn: refused whole. ----
+    let forged: Vec<(&str, Value)> = vec![
+        ("conversation", json!(home)),
+        ("thread_id", json!(home)),
+        ("scope", json!("home")),
+        ("context_id", json!(crm_b)),
+        ("install_id", json!(social)),
+        ("app", json!({"install_id": social, "context_id": crm_b})),
+        ("message", json!("m-home")),
+        ("token", json!(token)),
+        ("created_by", json!("operator")),
+        ("by", json!("operator")),
+    ];
+    for (field, value) in forged {
+        let err = err_text(gx.master_put(body(json!({ field: value }))));
+        assert!(
+            err.contains(&format!("'{field}' is not accepted")),
+            "{field}: {err}"
+        );
+        assert_eq!(gx.artifact_state(), before, "{field}: a refused put stored");
+    }
+
+    // ---- An id of another conversation: refused, nothing kept (the
+    // blob of new bytes is written first, then pruned). ----
+    let err = err_text(gx.master_put(body(json!({"id": home_id}))));
+    assert!(
+        err.contains("artifact belongs to another conversation"),
+        "foreign id: {err}"
+    );
+    assert_eq!(
+        gx.artifact_state(),
+        before,
+        "foreign id: a refused put stored"
+    );
+
+    // ---- Not the master's turn: the operator and a worker. ----
+    let err = err_text(gx.call(Asserted::Operator, "artifact_put", body(json!({}))));
+    assert!(
+        err.contains("artifact put is the agent's"),
+        "operator: {err}"
+    );
+    let err = err_text(gx.call(
+        Asserted::Agent("w1".into()),
+        "artifact_put",
+        body(json!({})),
+    ));
+    assert!(err.contains("only the master puts artifacts"), "w1: {err}");
+    assert_eq!(gx.artifact_state(), before, "a refused caller stored");
+
+    // ---- Control: the same live turn puts into its own conversation. ----
+    let ok = gx.master_put(body(json!({}))).unwrap();
+    let cards = gx.artifact_cards(&conv_a);
+    assert_eq!(cards.len(), 1, "{cards:?}");
+    assert_eq!(cards[0]["id"], ok["id"]);
+    assert_eq!(gx.artifact_cards(&home).len(), 1, "Home gained a card");
+    let before = gx.artifact_state();
+
+    // ---- A stale token: the endpoint generation moved on under the
+    // still-running turn (forged in the row, so the daemon's own
+    // re-open fence does not end the turn first), and its minted token
+    // is no longer current. ----
+    let moved = gx
+        .db()
+        .execute(
+            "UPDATE agents SET generation='fedcba9876543210fedcba9876543210' WHERE alias='master'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(moved, 1);
+    let err = err_text(gx.master_put(body(json!({"title": "Stale"}))));
+    assert!(
+        err.contains("turn token is no longer current"),
+        "stale: {err}"
+    );
+    // ---- A finished turn: nothing is running any more. ----
+    gx.finish("m-app", 4.0);
+    let err = err_text(gx.master_put(body(json!({"title": "Late"}))));
+    assert!(err.contains("active assigned turn"), "finished: {err}");
+    assert_eq!(gx.artifact_state(), before, "a stale/finished put stored");
+}
+
+/// CAD-1726 acceptance, hosted half: "Storage follows the workspace ...
+/// hosted -> AgenticOS (AOS-346)". With the image-owned hosted admission
+/// selected (the business-documents tuple; no lease), a put on the
+/// master's genuine live turn and the operator's reads refuse with the
+/// AOS-346 reason, and nothing lands in the state dir's custody, the
+/// table or the thread. The turn proof still runs first (a worker is
+/// refused as a worker), and the same flow on a local fixture stores
+/// (control). Not covered here: the `hosted.lease` selector.
+///
+/// Guards: `Shared::with_artifact_store` (daemon/artifacts_rpc.rs) ->
+/// `HostedArtifacts` (store/artifacts.rs).
+#[test]
+fn cad1726_hosted_artifacts_refuse_aos346_and_write_nothing() {
+    let tuple = json!({"schema": 1, "providers": [{
+        "provider": "business_documents",
+        "origin": "http://api.internal",
+        "manifest_pin": "business-documents@1",
+        "transport": "hosted-business-documents@1"
+    }]});
+    let metadata =
+        crate::platform::deployments::DeploymentMetadata::parse(tuple.to_string().as_bytes())
+            .unwrap();
+    let gx = gx_deployed(false, Some(metadata));
+    assert!(gx.shared.hosted_business_documents.is_some());
+    assert!(gx.shared.lease.is_none());
+    let home = gx.shared.store.ensure_thread("master").unwrap().id;
+    gx.send_home("m-hosted");
+    gx.run("m-hosted");
+    let aos = "hosted artifact store unavailable (AOS-346)";
+    let put = json!({"kind": "md", "title": "Hosted",
+                     "content": b64(format!("# {CANVAS_SENTINEL}").as_bytes())});
+    let err = err_text(gx.master_put(put.clone()));
+    assert!(err.contains(aos), "hosted put: {err}");
+    let mut again = put.clone();
+    again["id"] = json!("art-0123456789abcdef");
+    let err = err_text(gx.master_put(again));
+    assert!(err.contains(aos), "hosted put with id: {err}");
+    let err = err_text(gx.operator(
+        "artifact_read",
+        json!({"id": "art-0123456789abcdef", "version": 1, "conversation": home}),
+    ));
+    assert!(err.contains(aos), "hosted read: {err}");
+    let err = err_text(gx.operator(
+        "artifact_versions",
+        json!({"id": "art-0123456789abcdef", "conversation": home}),
+    ));
+    assert!(err.contains(aos), "hosted versions: {err}");
+    // The caller proof still runs before the store is chosen.
+    let err = err_text(gx.call(Asserted::Agent("w1".into()), "artifact_put", put.clone()));
+    assert!(
+        err.contains("only the master puts artifacts"),
+        "hosted w1: {err}"
+    );
+    assert!(
+        !gx.dir.path().join("artifacts").exists(),
+        "hosted put created workspace custody"
+    );
+    assert_eq!(gx.artifact_state(), (0, 0, 0));
+
+    // Control: the identical flow on a local fixture stores.
+    let local = gx_with(false);
+    local.send_home("m-local");
+    local.run("m-local");
+    local.master_put(put).unwrap();
+    assert_eq!(local.artifact_state(), (1, 1, 1));
 }
