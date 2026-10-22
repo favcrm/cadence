@@ -114,6 +114,13 @@ impl Shared {
             obj.insert("kind".to_string(), json!(hire.role.kind));
             parsed = Value::Object(obj);
             defaulted = true;
+            // A hire that Pi would refuse at launch is refused here, with
+            // the reason `GET /api/agent-roles` shows, before any home dir or
+            // row exists. An explicit model in params takes the ordinary
+            // path below, which applies the allowlist itself.
+            if parsed.get("model").is_none() {
+                self.role_model(endpoint, caller_team_role.unwrap_or(hire.role.team_role))?;
+            }
         }
         // CAD-556: `pm.yaml [host] confine_pi_workers` is the pm-level
         // default a bare `join … pi` picks up — an explicit `confine`
