@@ -427,7 +427,6 @@ fn cloud_restart_during_a_hold_fences_for_reconcile() {
     let restarted = Shared::new(dir.path(), &ServeOptions::default()).unwrap();
     devin_env(&restarted, &base);
     relaunch_agents(&restarted).unwrap();
-    thread::sleep(Duration::from_millis(300));
 
     let agent = restarted.store.agent("cloud-1").unwrap();
     assert_eq!(agent.state, "attention", "{:?}", agent.error);

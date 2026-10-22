@@ -27,10 +27,10 @@ What it proves (the ticket's publisher guards):
   IDENTICAL RETRY — the same publish re-run with IDENTICAL inputs must
     succeed idempotently and the stored catalogue record must keep the
     FIRST write's metadata (recordedAt above all) rather than stamping
-    the retry's clock and conflicting on its own output. The check
-    sleeps between runs so a fresh per-invocation `recordedAt` is
-    OBSERVABLY different. RED at baseline: at frozen dbe the script
-    generates a fresh `recordedAt` every invocation and byte-compares
+    the retry's clock and conflicting on its own output. The check injects
+    distinct clocks into the real publisher subprocess so a fresh per-invocation
+    `recordedAt` is observably different without sleeping. RED at baseline:
+    the script generates a fresh `recordedAt` every invocation and byte-compares
     the entry, so an identical replay across a changed clock reports
     `conflict` — the exact identical-retry violation the ticket names.
 
@@ -58,7 +58,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -164,7 +163,7 @@ class PublishCase(unittest.TestCase):
         e.pop("AWS_PROFILE", None)
         return e
 
-    def publish(self, *extra, artifacts=None):
+    def publish(self, *extra, artifacts=None, recorded_at=None):
         args = [sys.executable, str(PUBLISHER),
                 "--endpoint", ENDPOINT, "--bucket", BUCKET,
                 "--product", "cadence", "--profile", "operator-host",
@@ -176,6 +175,16 @@ class PublishCase(unittest.TestCase):
         for spec in specs:
             args += ["--artifact", spec]
         args += list(extra)
+        if recorded_at is not None:
+            # Execute the real entrypoint, replacing only its clock in this
+            # isolated subprocess. Storage, parsing and guards remain real.
+            clock_runner = (
+                "import runpy,sys; path=sys.argv.pop(1); stamp=sys.argv.pop(1); "
+                "module=runpy.run_path(path); "
+                "module['main'].__globals__['_utcnow']=lambda: stamp; "
+                "sys.exit(module['main']())"
+            )
+            args[1:2] = ["-c", clock_runner, str(PUBLISHER), recorded_at]
         return subprocess.run(args, env=self.env(), capture_output=True, text=True)
 
     def ckey(self):
@@ -235,12 +244,11 @@ class PublishCase(unittest.TestCase):
 
     # IDENTICAL RETRY --------------------------------------------------
     def test_identical_retry_preserves_first_metadata(self):
-        r1 = self.publish()
+        r1 = self.publish(recorded_at="2033-05-18T03:33:20Z")
         self.assertEqual(r1.returncode, 0, f"first publish failed: {r1.stderr}")
         first = self.stored(self.ckey())
         first_entry = json.loads(first)
-        time.sleep(1.1)  # a changed clock between identical invocations
-        r2 = self.publish()
+        r2 = self.publish(recorded_at="2033-05-18T03:33:21Z")
         self.assertEqual(r2.returncode, 0,
                          "an identical replay must be an idempotent success, not a "
                          f"conflict (exit {r2.returncode}): {r2.stderr}")

@@ -6,7 +6,6 @@ use cadence_agent::issue::Pm;
 use cadence_agent::store::NewAgent;
 use cadence_agent::test_seam::{scoped, Asserted};
 use serde_json::{json, Value};
-use std::time::Duration;
 
 #[test]
 fn cad1353_reviewer_a6_queue_changes_both_public_agent_views() {
@@ -54,7 +53,15 @@ fn cad1353_reviewer_a6_queue_changes_both_public_agent_views() {
             "test",
         )
         .unwrap();
-    std::thread::sleep(Duration::from_millis(1100));
+    // Seed an already-aged delivery; wall-clock progression is not the behavior
+    // under test, and no monitor/provider is needed for this durable snapshot.
+    rusqlite::Connection::open(root.path().join("cadence.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE messages SET created=created-2 WHERE id='a6-first'",
+            [],
+        )
+        .unwrap();
     shared
         .store
         .enqueue(

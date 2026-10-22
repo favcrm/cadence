@@ -451,6 +451,8 @@ impl RecordStore {
         loop {
             match Self::open_once(state_dir, install_id) {
                 Err(error) if is_transient_open_error(&error) && attempt < 40 => {
+                    #[cfg(test)]
+                    super::wait_probe::waiting();
                     attempt += 1;
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
@@ -533,6 +535,8 @@ impl RecordStore {
         })?;
         conn.busy_timeout(BUSY_TIMEOUT)
             .map_err(|e| Error::internal(e.to_string()))?;
+        #[cfg(test)]
+        super::wait_probe::configure(&conn).map_err(|e| Error::internal(e.to_string()))?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| {
                 busy_or(

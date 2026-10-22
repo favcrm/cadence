@@ -1778,7 +1778,16 @@ pub fn run(opts: &Options) -> Result<i32> {
     report["duration_ms"] = json!(started.elapsed().as_millis());
 
     // Reports under the state dir — never inside the repo.
-    let stamp = time::basic(time::now_epoch());
+    let report_epoch = time::now_epoch();
+    #[cfg(feature = "test-seam")]
+    let report_epoch = std::env::var("CADENCE_TEST_REVIEW_REPORT_EPOCH")
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .expect("invalid review report test epoch")
+        })
+        .unwrap_or(report_epoch);
+    let stamp = time::basic(report_epoch);
     let base_name = format!(
         "review-{}-pr{}-{}",
         lock_slug(&slug, &root),

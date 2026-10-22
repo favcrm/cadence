@@ -529,7 +529,14 @@ mod tests {
         // A blocking writer parked on the full pipe.
         let writer = Arc::clone(&adapter);
         let blocked = std::thread::spawn(move || writer.send(json!({"big": "x".repeat(1 << 16)})));
-        std::thread::sleep(Duration::from_millis(200));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while adapter.stdin.try_lock().is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "writer never acquired the full pipe"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let t = Instant::now();
         assert!(adapter.try_send(frame.clone()).is_err());
         adapter.interrupt(); // the SIGINT fallback: child lock only

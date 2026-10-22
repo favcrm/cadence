@@ -610,6 +610,8 @@ mod tests {
         );
         s.lock().next_due = None;
         let gate = Arc::new(Barrier::new(8));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let done_rx = Arc::new(Mutex::new(done_rx));
         let handles: Vec<_> = (0..8)
             .map(|i| {
                 let (s, runs, live, peak, gate) = (
@@ -619,6 +621,8 @@ mod tests {
                     peak.clone(),
                     gate.clone(),
                 );
+                let done_tx = done_tx.clone();
+                let done_rx = done_rx.clone();
                 std::thread::spawn(move || {
                     gate.wait();
                     let trigger = if i % 2 == 0 {
@@ -626,20 +630,37 @@ mod tests {
                     } else {
                         Trigger::PageView
                     };
-                    s.tick(trigger, || {
+                    let result = s.tick(trigger, || {
                         runs.fetch_add(1, Ordering::SeqCst);
                         let now = live.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.fetch_max(now, Ordering::SeqCst);
-                        std::thread::sleep(Duration::from_millis(300));
+                        // Keep the winner in flight until every competing
+                        // trigger has returned, not for an assumed overlap.
+                        for _ in 0..7 {
+                            done_rx
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(5))
+                                .expect(
+                                    "competing triggers did not return while a pass was in flight",
+                                );
+                        }
                         live.fetch_sub(1, Ordering::SeqCst);
                         Pass::Synced(1)
-                    })
+                    });
+                    done_tx.send(()).unwrap();
+                    result
                 })
             })
             .collect();
+        let mut completed = 0;
         for h in handles {
-            h.join().unwrap();
+            if let Some(pass) = h.join().unwrap() {
+                assert_eq!(pass, Pass::Synced(1), "the elected pass did not complete");
+                completed += 1;
+            }
         }
+        assert_eq!(completed, 1, "one completed pass, seven dropped triggers");
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         assert_eq!(peak.load(Ordering::SeqCst), 1);
         // The in-flight flag is released: the next due pass runs.

@@ -292,7 +292,10 @@ fn b_cadence_dev_copy_starts_a_board_that_dev_down_stops() {
         board[0],
         text(&down)
     );
-    std::thread::sleep(SETTLE);
+    assert!(
+        wait_until(SETTLE, || procs_under(host.root.path()).is_empty()),
+        "processes did not exit after `dev down`"
+    );
     let left = procs_under(host.root.path());
     assert!(left.is_empty(), "orphans after `dev down`: {left:?}");
     drop(c);

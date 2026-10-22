@@ -1279,8 +1279,12 @@ mod tests {
         let out = sweep(&rig, false, &no_gh, &no_view);
         assert_eq!(out["rows"][0]["outcome"], json!("error"), "{out}");
         assert_eq!(status(&rig, &id), "doing");
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        super::super::pmlock::WAITING.with(|observer| *observer.borrow_mut() = Some(waiting_tx));
         let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(700));
+            waiting_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("close never contended");
             drop(held);
         });
         let out = run_inner(

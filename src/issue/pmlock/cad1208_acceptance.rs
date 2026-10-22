@@ -93,9 +93,17 @@ fn cad1208_a_same_version_crash_still_blames_a_new_untracked_leftover() {
     let (_d, pm) = tracker();
     drop(pm.lock().unwrap());
     let mut lock = pm.lock().unwrap();
-    std::thread::sleep(Duration::from_millis(30));
+    let after_snapshot = std::fs::metadata(pm.dir.join(".git").join(DIRTY_FILE))
+        .unwrap()
+        .modified()
+        .unwrap()
+        + Duration::from_secs(1);
     std::fs::create_dir_all(pm.dir.join("cadence/CAD-9")).unwrap();
     std::fs::write(pm.dir.join("cadence/CAD-9/issue.md"), "half\n").unwrap();
+    std::fs::File::open(pm.dir.join("cadence/CAD-9/issue.md"))
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(after_snapshot))
+        .unwrap();
     lock.armed = false;
     drop(lock);
     assert!(pm.dir.join(".git").join(DIRTY_FILE).exists());

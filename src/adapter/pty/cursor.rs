@@ -1614,7 +1614,16 @@ mod tests {
             ])
             .spawn()
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !std::fs::read(format!("/proc/{}/cmdline", other.id()))
+            .is_ok_and(|argv| argv.ends_with(b"--resume\0chat-not-mine\0"))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "negative argv fixture never exec'd"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert_eq!(argv_chat(other.id()), None);
         let _ = holder.kill();
         let _ = other.kill();

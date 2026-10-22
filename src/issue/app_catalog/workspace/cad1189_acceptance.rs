@@ -181,6 +181,7 @@ fn cad1189_legacy_remove_waits_for_running_admission() {
 
     let inside = Arc::new(Barrier::new(2));
     let admission_done = Arc::new(Mutex::new(None::<Instant>));
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
     let admission = {
         let (pm_dir, id, inside, admission_done) = (
             pm.dir.clone(),
@@ -194,7 +195,9 @@ fn cad1189_legacy_remove_waits_for_running_admission() {
                 inside.wait();
                 // Stands in for the callback's store write (binding,
                 // consent, run) against this installation.
-                std::thread::sleep(Duration::from_millis(1500));
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("remove neither contended nor returned");
                 *admission_done.lock().unwrap() = Some(Instant::now());
                 Ok(())
             })
@@ -202,8 +205,12 @@ fn cad1189_legacy_remove_waits_for_running_admission() {
         })
     };
     inside.wait();
+    crate::issue::pmlock::WAITING
+        .with(|observer| *observer.borrow_mut() = Some(release_tx.clone()));
     let removed = app::remove(&pm, "legacy", "legacy-app", state.path(), "accept");
     let remove_done = Instant::now();
+    crate::issue::pmlock::WAITING.with(|observer| observer.borrow_mut().take());
+    let _ = release_tx.send(());
     admission.join().unwrap();
     let admission_done = admission_done.lock().unwrap().expect("admission finished");
     assert!(

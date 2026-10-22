@@ -111,14 +111,40 @@ constraint.
 
 ## 5. Fixed waits vs. deadline bounds
 
-`thread::sleep(30s)` inside a poll loop with a deadline is a contract proof,
-not a fixed wait. The clean-ups were:
+A deadline is a failure bound, not a duration to spend. For example,
+nextest's `slow-timeout = 60s` with `terminate-after = 3` permits up to
+180s before termination; a test completing in 26s does not wait another 154s.
 
-- CAD-1480: replaced `sleep(until some state)` loops with condition-signals
-  where the state was observable.
-- What stayed: bounded poll-loops (`while Instant::now() < deadline { sleep;
-  check }`) and interval-proofs like `cad1119:1021` `sleep(2300)` — waiting
-  two monitor ticks *is* the contract. Deleting it weakens the proof.
+Synchronize on the operation being proved:
+
+- Readiness and cleanup: wait for health, socket/pipe readiness, process exit,
+  or the relevant durable state; short sleeps inside these loops only throttle
+  observation. A fixed sleep before inspecting state is not completion evidence.
+- Background work: use fixture-scoped completion events. The test-seam
+  `daemon::test_events` subscriptions are registered before the triggering action;
+  worker exit is observed after registry cleanup and the respawn decision.
+  Monitor events follow completed revalidation, never merely a started pass.
+  When proving fresh passes, discard one that might already have been in flight.
+- Interleavings: park at an explicit barrier and release it after the competing
+  operation, rather than hoping a 3s pause covers the race.
+- Contention: wait for the first failed native flock/SQLite acquisition,
+  not a contender thread starting. Unit-test observers are thread-local and
+  compiled out of normal builds. The opt-in SQLite observer keeps the native
+  lock and the existing busy bound; ordinary connections keep their handler.
+- Shared fetches: park the chosen fetch, observe its actual joiners, perform
+  the competing write/subscription, then release it. Fixture mtimes advance
+  explicitly when the behavior depends on filesystem timestamp ordering.
+- Logical age and timestamp boundaries: seed aged records or advance an
+  isolated test clock. Review report naming has a `test-seam`-only
+  `CADENCE_TEST_REVIEW_REPORT_EPOCH`; the publisher acceptance injects its clock
+  only inside its isolated Python subprocess.
+- Keep real elapsed/deadline assertions and bounded negative-observation
+  windows. Late detached spawns, unsolicited worker restarts, held locks and
+  slow socket traffic need an exclusion interval; deleting it would weaken
+  the claim. A response channel can fail immediately if the forbidden event
+  arrives. Never replace completion with a global counter from another fixture.
+
+These are synchronization changes, not evidence of a whole-CI speedup.
 
 ## 6. agenticos-v2 specifics
 

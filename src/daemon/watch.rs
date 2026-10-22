@@ -428,12 +428,20 @@ impl Shared {
             // CAD-1380 R4: drain pending assist-job notices. Outside any store
             // transaction; a failure logs only and the intents stay pending.
             if assist_notices_routed.is_none_or(|at| at.elapsed() >= ASSIST_NOTICE_EVERY) {
-                match self.route_assist_job_notifications() {
+                let drained = self.route_assist_job_notifications();
+                match &drained {
                     Ok(0) => {}
                     Ok(n) => eprintln!("assist notice watch: queued {n} notice(s)"),
                     Err(e) => eprintln!("assist notice watch: {e}"),
                 }
                 assist_notices_routed = Some(Instant::now());
+                #[cfg(feature = "test-seam")]
+                if drained.is_ok() {
+                    super::test_events::completed(
+                        &self.state_dir,
+                        super::test_events::Event::AssistNoticesDrained,
+                    );
+                }
             }
             // CAD-199: off unless configured; sweeps at most hourly.
             self.agent_gc_tick();

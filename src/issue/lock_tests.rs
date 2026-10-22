@@ -407,8 +407,14 @@ fn a_tripped_lease_stops_a_writer_waiting_for_the_lock() {
     let held = pm.lock().unwrap();
     let start = Instant::now();
     let e = std::thread::scope(|s| {
-        let w = s.spawn(|| pm.lock().err().map(|e| e.to_string()));
-        std::thread::sleep(Duration::from_millis(300));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let w = s.spawn(|| {
+            pmlock::WAITING.with(|observer| *observer.borrow_mut() = Some(waiting_tx));
+            pm.lock().err().map(|e| e.to_string())
+        });
+        waiting_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer never contended");
         ctl.fence().trip("lease lost while waiting");
         w.join().unwrap()
     });
@@ -458,8 +464,14 @@ fn a_waiting_writer_is_admitted_when_the_holder_dies() {
     let (_tmp, pm) = tracker();
     let (child, _) = spawn_writer(&pm, "hold", false);
     let got = std::thread::scope(|s| {
-        let w = s.spawn(|| pm.lock_for(Duration::from_secs(10)).is_ok());
-        std::thread::sleep(Duration::from_millis(300));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let w = s.spawn(|| {
+            pmlock::WAITING.with(|observer| *observer.borrow_mut() = Some(waiting_tx));
+            pm.lock_for(Duration::from_secs(10)).is_ok()
+        });
+        waiting_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer never contended");
         sigkill(child);
         w.join().unwrap()
     });
@@ -1121,12 +1133,16 @@ fn a_tripped_lease_stops_a_scoped_writer_waiting_for_the_lock() {
     let start = Instant::now();
     let scope = pm.dir.clone();
     let e = std::thread::scope(|s| {
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
         let w = s.spawn(|| {
+            pmlock::WAITING.with(|observer| *observer.borrow_mut() = Some(waiting_tx));
             pm.lock_for_paths(std::slice::from_ref(&scope))
                 .err()
                 .map(|e| e.to_string())
         });
-        std::thread::sleep(Duration::from_millis(300));
+        waiting_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("scoped writer never contended");
         ctl.fence().trip("lease lost while waiting");
         w.join().unwrap()
     });

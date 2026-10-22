@@ -3698,8 +3698,7 @@ mod tests {
         // Sender; the parked call waits on the Receiver.
         let (release_tx, parked_rx) = std::sync::mpsc::channel::<()>();
         let ctl = std::thread::spawn(move || {
-            // Controller side: after a beat, release the parked call.
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            // The channel retains the release even before the waiter parks.
             let _ = release_tx.send(());
         });
         let out = test_pause::wait_for_release(&parked_rx, std::time::Duration::from_secs(60));
