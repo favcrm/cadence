@@ -1211,7 +1211,18 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             issues={issuesState}
             project={project}
             open={route.alias}
+            tab={route.tab ?? "overview"}
+            recruit={route.recruit === true}
             onOpenAgent={openAgent}
+            onTab={(tab) =>
+              update((c) => ({
+                ...c,
+                route: { screen: "agents", alias: route.alias, ...(tab === "overview" ? {} : { tab }) },
+              }))
+            }
+            onRecruit={(on) =>
+              update((c) => ({ ...c, route: { screen: "agents", alias: null, ...(on ? { recruit: true } : {}) } }))
+            }
             onOpenIssue={openIssue}
             onRetry={() => void resources.agents.refresh()}
             onRetryAssignments={() => void resources.issues.refresh()}

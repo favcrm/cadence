@@ -180,6 +180,8 @@ const loaded = <T>(data: T): import("../src/lib/cache").ResourceState<T> => ({
 });
 let project = "all";
 let open: string | null = null;
+let tab: import("../src/features/agents/agentTabs").AgentTab = "overview";
+let recruiting = false;
 let openedIssue: string | null = null;
 let assignmentRetries = 0;
 let state = loaded<import("../src/lib/types").AgentsPayload>({
@@ -201,8 +203,17 @@ async function render() {
         issues: issueState,
         project,
         open,
+        tab,
+        recruit: recruiting,
         onOpenAgent: (alias) => {
           open = alias;
+          tab = "overview";
+        },
+        onTab: (next) => {
+          tab = next;
+        },
+        onRecruit: (on) => {
+          recruiting = on;
         },
         onOpenIssue: (id) => {
           openedIssue = id;
@@ -314,13 +325,12 @@ async function main() {
   );
   project = "all";
   await render();
-  const trigger = button("Open agent blocked");
-  trigger.focus();
   await click("Open agent blocked");
   await render();
   assert(
-    host.querySelector("dialog[open][aria-labelledby='agent-detail-title']"),
-    "native labeled modal opens",
+    host.querySelector("main.agents-page h1")?.textContent === "blocked" &&
+      host.querySelector("[role='tablist']"),
+    "the agent page opens at its alias with its tabs",
   );
   assert(
     host
@@ -328,7 +338,9 @@ async function main() {
       ?.textContent?.includes("Detail unavailable"),
     "detail failure is explicit",
   );
-  const text = host.querySelector("dialog")!.textContent!;
+  tab = "settings";
+  await render();
+  const text = host.querySelector("main.agents-page")!.textContent!;
   for (const evidence of [
     agents[1].recovery!,
     agents[1].resume!,
@@ -351,20 +363,20 @@ async function main() {
   failDetail = false;
   await click("Retry details");
   assert(
-    host.querySelector("dialog")?.textContent?.includes("session-blocked") &&
+    host.querySelector("main.agents-page")?.textContent?.includes("session-blocked") &&
       !host.querySelector("[role='alert']"),
     "retry replaces failure with details",
   );
   await React.act(() =>
-    host
-      .querySelector("dialog")!
-      .dispatchEvent(new Event("cancel", { cancelable: true })),
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+    ),
   );
-  assert(open === null, "native Escape cancel invokes close");
+  assert(open === null, "Escape leaves the agent page");
   await render();
   assert(
-    document.activeElement === trigger,
-    "closing returns focus to opening control",
+    button("Open agent blocked") && host.querySelector(".agents-grid"),
+    "leaving the page returns to the roster",
   );
   holdDetail = true;
   await click("Open agent dev");
@@ -376,17 +388,18 @@ async function main() {
     "detail loading is announced",
   );
   open = "stopped";
+  tab = "settings";
   holdDetail = false;
   await render();
   assert(
-    host.querySelector("dialog h2")?.textContent === "stopped",
-    "switching alias resets drawer identity",
+    host.querySelector("main.agents-page h1")?.textContent === "stopped",
+    "switching alias resets the page identity",
   );
   await React.act(async () => releaseDetail!());
   await flush();
   assert(
-    host.querySelector("dialog")?.textContent?.includes("session-stopped") &&
-      !host.querySelector("dialog")?.textContent?.includes("session-dev"),
+    host.querySelector("main.agents-page")?.textContent?.includes("session-stopped") &&
+      !host.querySelector("main.agents-page")?.textContent?.includes("session-dev"),
     "late old detail cannot cross into another alias",
   );
   open = null;

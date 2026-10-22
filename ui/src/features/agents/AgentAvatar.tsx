@@ -178,14 +178,27 @@ function Prop({ slug, p }: { slug: AvatarLook; p: Palette }) {
   }
 }
 
+/** A hired agent's pinned look (`params.look`), else the alias-hashed one. */
+export function agentLook(alias: string, params?: Record<string, unknown> | null): AvatarLook {
+  const pinned = params?.look;
+  return isLook(pinned) ? pinned : lookFor(alias);
+}
+
+function isLook(value: unknown): value is AvatarLook {
+  return typeof value === "string" && (AVATAR_LOOKS as readonly string[]).includes(value);
+}
+
 export default function AgentAvatar({
-  slug,
+  slug: aliasSlug,
+  look,
   active = false,
   still = false,
   size = 58,
   title,
 }: {
   slug: AvatarLook;
+  /** CAD-1752: a pinned look (`params.look`); wins over the alias-hashed `slug`. */
+  look?: string;
   /** Livelier bob for a working agent. */
   active?: boolean;
   /** Freeze blink/bob/accessories for a dead or parked agent. */
@@ -194,6 +207,7 @@ export default function AgentAvatar({
   /** Accessible label when the avatar carries meaning on its own. */
   title?: string;
 }) {
+  const slug = isLook(look) ? look : aliasSlug;
   const p = PAL[slug] ?? PAL.custom;
   const raw = useId().replace(/[^a-zA-Z0-9]/g, "");
   const blinkDelay = [...slug].reduce((n, c) => n + c.charCodeAt(0), 0);

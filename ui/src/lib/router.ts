@@ -1,4 +1,5 @@
 import { parseIssueTab, type IssueTab } from "../features/issues/model";
+import { parseAgentTab, type AgentTab } from "../features/agents/agentTabs";
 import { readFilters, writeFilters, NO_FILTERS, type BoardFilters } from "./filters";
 import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
 import { MY_WORK_URL_KEYS, readMyWorkView, writeMyWorkView, type MyWorkView } from "./myWorkQuery";
@@ -20,7 +21,7 @@ import { MY_WORK_URL_KEYS, readMyWorkView, writeMyWorkView, type MyWorkView } fr
  *   /app-installations/<id>    retired (CAD-1438): compatibility redirect
  *                              to the same install's `/apps/<key>`, or a
  *                              clear retired page when no unique mapping
- *   /agents[/:alias]           agents, optionally one agent's drawer
+ *   /agents[/:alias]           agents, optionally one agent's page (CAD-1752); `?tab=` picks a section, `?recruit=1` the catalogue
  *   /threads                   Threads: agent, operator and group conversations (CAD-818); `?c=<id>` opens one
  *   /wiki[/<path>]             the wiki: folder tree + page (CAD-581)
  *   /wiki/edit|history|upload/<path>   its modes for one path
@@ -67,7 +68,7 @@ export type Route =
   | { screen: "appsManage"; installId: string }
   | { screen: "workspaceApp"; installId: string }
   | { screen: "workspaceAppKey"; appKey: string }
-  | { screen: "agents"; alias: string | null }
+  | { screen: "agents"; alias: string | null; tab?: AgentTab; recruit?: boolean }
   | { screen: "threads" }
   /** CAD-1703: the tab, search and filters, from the query (`?tab=done&search=…`). */
   | { screen: "myWork"; view?: MyWorkView }
@@ -393,6 +394,15 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
   if (route.screen === "projects" && route.section === "overview" && q.has("view")) {
     route = { ...route, section: "issues" };
   }
+  if (route.screen === "agents") {
+    const tab = parseAgentTab(q.get("tab"));
+    route = {
+      screen: "agents",
+      alias: route.alias,
+      ...(route.alias && tab !== "overview" ? { tab } : {}),
+      ...(!route.alias && q.get("recruit") === "1" ? { recruit: true } : {}),
+    };
+  }
   if (route.screen === "myWork") {
     const view = readMyWorkView(q);
     route = Object.keys(view).length ? { screen: "myWork", view } : { screen: "myWork" };
@@ -443,7 +453,7 @@ export function locationHref(loc: AppLocation, search = ""): string {
   // an app page's too (CAD-1040: the operator's back door to native
   // controls instead of the mounted app screen); it never carries over to
   // another installation.
-  for (const key of ["tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page"]) q.delete(key);
+  for (const key of ["tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page", "recruit"]) q.delete(key);
   // CAD-1703: My work's view belongs to its own route.
   for (const key of MY_WORK_URL_KEYS) q.delete(key);
   writeFilters(q, NO_FILTERS);
@@ -456,6 +466,10 @@ export function locationHref(loc: AppLocation, search = ""): string {
     if (route.tab !== "overview") q.set("tab", route.tab);
     const issueSearch = q.toString();
     return routePath(route) + (issueSearch ? `?${issueSearch}` : "");
+  }
+  if (route.screen === "agents") {
+    if (route.alias && route.tab) q.set("tab", route.tab);
+    if (!route.alias && route.recruit) q.set("recruit", "1");
   }
   if (route.screen === "projects") {
     if (route.section === "issues") {

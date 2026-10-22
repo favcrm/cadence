@@ -11,12 +11,29 @@ import { agentsEmptyCopy } from "../../lib/uxCopy";
 import { useTranslate } from "../../lib/locale";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { IconSearch } from "../../ui/icons";
+import { navigate } from "../../lib/useLocation";
+import { resources } from "../../lib/resources";
+import { useQuery } from "../../lib/useResource";
+import { setComposerDraft } from "../app-shell/chat/composerStore";
 import Button from "../../ui/Button";
 import { WriteGate } from "../auth/WriteGate";
 import { activeTasks, AgentActivity, WorkBlock } from "./AgentBlocks";
-import AgentAvatar, { lookFor } from "./AgentAvatar";
-import AgentDrawer from "./AgentDrawer";
+import AgentAvatar, { agentLook } from "./AgentAvatar";
+import AgentPage from "./AgentPage";
+import { FirstJobs } from "./AgentTabs";
+import HireSheet from "./HireSheet";
 import NewAgentDialog from "./NewAgentDialog";
+import Recruit from "./Recruit";
+import { HireGate, RoleCard } from "./RecruitCards";
+import {
+  nextAlias,
+  onTeamCount,
+  roleOf,
+  runsOnText,
+  suggestedRoles,
+  useAgentRoles,
+} from "./agentRoles";
+import type { AgentTab } from "./agentTabs";
 import {
   AGENT_FILTERS,
   agentHoldsWorkButDead,
@@ -30,7 +47,8 @@ import {
   type AgentFilter,
 } from "./agentView";
 import "./agents.css";
-import type { Agent, AgentsPayload, IssueCard } from "../../lib/types";
+import "./recruit.css";
+import type { Agent, AgentRole, AgentsPayload, IssueCard } from "../../lib/types";
 
 /** Exact assigned/owned issue links not already shown with current work. */
 function RelatedIssues({
@@ -130,11 +148,18 @@ function CardWork({
 function AgentCard({
   agent: a,
   index,
+  roleTitle,
+  hosted,
+  isNew,
   onOpen,
   onOpenIssue,
 }: {
   agent: Agent;
   index: IssueIndex;
+  /** The catalogue role this agent was hired as, if any. */
+  roleTitle?: string;
+  hosted: boolean;
+  isNew?: boolean;
   onOpen: () => void;
   onOpenIssue: (id: string) => void;
 }) {
@@ -145,13 +170,13 @@ function AgentCard({
   const badge = lifecycleBadge(a, t);
   return (
     <article
-      className={`agent-card tone-${tone}`}
+      className={`agent-card tone-${tone}${isNew ? " rc-new" : ""}`}
       aria-label={t("Agent {alias}").replace("{alias}", () => a.alias)}
     >
       <div className="top">
         <div className="avwrap">
           <AgentAvatar
-            slug={lookFor(a.alias)}
+            slug={agentLook(a.alias, a.params)}
             active={lifecycle === "active"}
             still={lifecycle !== "active"}
           />
@@ -177,8 +202,16 @@ function AgentCard({
             {agentLocation(a) === "cloud" ? t("Cloud") : t("Local")}
           </span>
           <p className="meta break-words">
-            {a.role ?? t("Agent")} · {a.provider} ·{" "}
-            {a.group_root ? t("root") : a.group}
+            {roleTitle ? (
+              <>
+                {roleTitle} · {hosted ? t("workspace") : t("this computer")}
+              </>
+            ) : (
+              <>
+                {a.role ?? t("Agent")} · {a.provider} ·{" "}
+                {a.group_root ? t("root") : a.group}
+              </>
+            )}
           </p>
         </div>
       </div>
@@ -260,7 +293,11 @@ export default function Agents({
   issues: issuesState,
   project,
   open,
+  tab,
+  recruit,
   onOpenAgent: setOpen,
+  onTab,
+  onRecruit,
   onOpenIssue,
   onRetry,
   onRetryAssignments,
@@ -269,7 +306,11 @@ export default function Agents({
   issues: ResourceState<IssueCard[]>;
   project: string;
   open: string | null;
+  tab: AgentTab;
+  recruit: boolean;
   onOpenAgent: (alias: string | null) => void;
+  onTab: (tab: AgentTab) => void;
+  onRecruit: (on: boolean) => void;
   onOpenIssue: (id: string) => void;
   onRetry: () => void;
   onRetryAssignments: () => void;
@@ -278,6 +319,10 @@ export default function Agents({
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<AgentFilter>("current");
   const [creating, setCreating] = useState(false);
+  const [picked, setPicked] = useState<AgentRole | null>(null);
+  const [joined, setJoined] = useState<{ alias: string; role: AgentRole } | null>(null);
+  const roles = useAgentRoles();
+  const installed = useQuery(resources.apps);
   const writeBlock = useContext(WriteGate);
   const payload = state.data;
   const scopeUnavailable = project !== "all" && issuesState.data === null;
@@ -299,7 +344,10 @@ export default function Agents({
         agentMatchesSearch(a, query, issueProjects),
     )
     .sort(
-      (a, b) => agentOrder(a) - agentOrder(b) || a.alias.localeCompare(b.alias),
+      (a, b) =>
+        Number(b.alias === joined?.alias) - Number(a.alias === joined?.alias) ||
+        agentOrder(a) - agentOrder(b) ||
+        a.alias.localeCompare(b.alias),
     );
   const sections = LIFECYCLE_SECTIONS.map((section) => ({
     ...section,
@@ -328,6 +376,44 @@ export default function Agents({
         ? t("No current agents. Select All, Stopped, or Mailboxes to see the full roster.")
       : t("No agents match these filters.");
   const agent = allAgents.find((a) => a.alias === open);
+  const hosted = roles.data?.install.hosted ?? false;
+  const suggestion = suggestedRoles(installed.data ?? [], roles.data?.roles ?? []);
+  const taken = allAgents.map((a) => a.alias);
+  const askMaster = () => {
+    // Never sends: the prompt waits in Master's composer.
+    setComposerDraft("home", "I need someone to ");
+    navigate("/");
+  };
+  const hired = (alias: string, role: AgentRole) => {
+    setPicked(null);
+    setJoined({ alias, role });
+    onRecruit(false);
+    onRetry();
+  };
+  const placeholder = joined !== null && !allAgents.some((a) => a.alias === joined.alias);
+  const tile = (
+    <button
+      key="recruit-tile"
+      type="button"
+      className="rc-tile"
+      onClick={() => onRecruit(true)}
+    >
+      <span className="plus" aria-hidden="true">＋</span>
+      {t("Recruit a role")}
+      <small>{t("Developer, Accountant, Support…")}</small>
+    </button>
+  );
+  const sheet = picked && roles.data && (
+    <HireSheet
+      key={picked.id}
+      role={picked}
+      payload={roles.data}
+      alias={nextAlias(picked.id, taken)}
+      taken={taken}
+      onClose={() => setPicked(null)}
+      onHired={hired}
+    />
+  );
   const summary = !payload
     ? state.status === "failed"
       ? t("Agents unavailable")
@@ -345,25 +431,89 @@ export default function Agents({
               : t("{count} total in {project}").replace("{count}", String(scoped.length)).replace("{project}", () => project),
           );
 
+  if (open) {
+    return (
+      <AgentPage
+        key={open}
+        alias={open}
+        observed={agent}
+        roles={roles}
+        tab={tab}
+        onTab={onTab}
+        onBack={() => setOpen(null)}
+        onOpenIssue={onOpenIssue}
+      />
+    );
+  }
+  if (recruit) {
+    return (
+      <>
+        <Recruit
+          roles={roles}
+          agents={allAgents}
+          writeBlock={writeBlock}
+          onBack={() => onRecruit(false)}
+          onPick={setPicked}
+          onAskMaster={askMaster}
+          onBlank={() => setCreating(true)}
+        />
+        {sheet}
+        {creating && (
+          <NewAgentDialog
+            onClose={() => setCreating(false)}
+            onCreated={() => {
+              onRetry();
+              onRecruit(false);
+            }}
+          />
+        )}
+      </>
+    );
+  }
+
   return (
     <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
       <div className="flex flex-wrap items-center gap-3 mb-2">
         <h1 className="text-section font-semibold text-ink-100">{t("Agents")}</h1>
         <span className="text-label text-ink-500">{summary}</span>
         <StaleChip state={state} />
-        <Button
-          size="sm"
-          className="ml-auto"
-          disabled={writeBlock !== null}
-          title={writeBlock ?? t("Create a local or cloud agent")}
-          onClick={() => setCreating(true)}
-        >
-          {t("New agent")}
-        </Button>
+        <span className="ml-auto flex gap-2">
+          <Button size="sm" onClick={askMaster}>
+            {t("Ask Master")}
+          </Button>
+          <Button
+            size="sm"
+            variant="primary"
+            onClick={() => onRecruit(true)}
+            title={writeBlock ?? t("Recruit an agent from a ready-made role")}
+          >
+            ＋ {t("Recruit")}
+          </Button>
+        </span>
       </div>
       <p className="text-label text-ink-400 mb-5">
-        {t("Current work, agent status, and recent activity.")}
+        {t("Your team. Recruit a ready-made role, or ask Master to find one.")}
       </p>
+      <HireGate reason={writeBlock} />
+      {joined && (
+        <div className="rc-nudge" role="status">
+          <AgentAvatar slug="custom" look={joined.role.look} size={48} active />
+          <div>
+            <div className="t">
+              {t("{name} joined as {role}")
+                .replace("{name}", () => joined.alias)
+                .replace("{role}", () => joined.role.title)}
+            </div>
+            <div className="s">
+              {t("Starting on {where}. Give a first job — it opens a thread.").replace(
+                "{where}",
+                () => t(runsOnText(hosted)),
+              )}
+            </div>
+            <FirstJobs alias={joined.alias} tasks={joined.role.first_tasks} />
+          </div>
+        </div>
+      )}
 
       {project !== "all" &&
         issuesState.data !== null &&
@@ -474,12 +624,32 @@ export default function Agents({
               </Button>
             </div>
           )}
-          {agents.length === 0 ? (
-            <div className="card py-10 px-5 text-center text-label text-ink-500">
-              {emptyCopy}
+          {placeholder && joined && (
+            <div className="agents-grid mb-3">
+              <div className="rc-seat new" aria-label={t("Agent {alias}").replace("{alias}", () => joined.alias)}>
+                <AgentAvatar slug="custom" look={joined.role.look} size={44} active />
+                <div>
+                  <div className="t">{joined.alias}</div>
+                  <div className="s">
+                    {joined.role.title} · {hosted ? t("workspace") : t("this computer")}
+                  </div>
+                </div>
+                <div className="st">
+                  <span className="rc-dot" style={{ "--c": "var(--color-warn)" } as React.CSSProperties} />
+                  {t("Starting…")}
+                </div>
+              </div>
             </div>
+          )}
+          {agents.length === 0 ? (
+            <>
+              <div className="card py-10 px-5 text-center text-label text-ink-500">
+                {emptyCopy}
+              </div>
+              <div className="agents-grid mt-3">{tile}</div>
+            </>
           ) : (
-            sections.map((section) => (
+            sections.map((section, index) => (
               <section key={section.key}>
                 <div className="agents-sec">
                   <h2>{t(section.title)}</h2>
@@ -492,13 +662,38 @@ export default function Agents({
                       key={a.alias}
                       agent={a}
                       index={issueProjects}
+                      roleTitle={roleOf(a, roles.data)?.title}
+                      hosted={hosted}
+                      isNew={a.alias === joined?.alias}
                       onOpen={() => setOpen(a.alias)}
                       onOpenIssue={onOpenIssue}
                     />
                   ))}
+                  {index === sections.length - 1 && tile}
                 </div>
               </section>
             ))
+          )}
+          {roles.data && suggestion.roles.length > 0 && (
+            <>
+              <div className="rc-sec">
+                <h2>{t("Suggested for you")}</h2>
+                <span>
+                  {t("based on your apps: {apps}").replace("{apps}", () => suggestion.labels.join(", "))}
+                </span>
+              </div>
+              <div className="rc-grid">
+                {suggestion.roles.map((role) => (
+                  <RoleCard
+                    key={role.id}
+                    role={role}
+                    payload={roles.data!}
+                    onTeam={onTeamCount(role, allAgents)}
+                    onPick={setPicked}
+                  />
+                ))}
+              </div>
+            </>
           )}
           {project !== "all" &&
             issuesState.data !== null &&
@@ -531,16 +726,11 @@ export default function Agents({
           onCreated={() => onRetry()}
         />
       )}
-      {open && (
-        <AgentDrawer
-          key={open}
-          alias={open}
-          observed={agent}
-          onClose={() => setOpen(null)}
-          onOpenIssue={(id) => {
-            setOpen(null);
-            onOpenIssue(id);
-          }}
+      {sheet}
+      {creating && (
+        <NewAgentDialog
+          onClose={() => setCreating(false)}
+          onCreated={() => onRetry()}
         />
       )}
     </main>

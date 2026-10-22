@@ -638,9 +638,13 @@ export interface UsageLimit {
  * `local` sends the existing provider and endpoint kind plus cwd. No
  * per-issue location exists.
  */
+/** CAD-1752: a hire from the built-in role catalogue sends `catalogue` and
+ *  no location, provider or endpoint kind — the install picks the runtime. */
 export interface AgentRegisterBody {
   alias: string;
-  location: "local" | "cloud";
+  location?: "local" | "cloud";
+  catalogue?: string;
+  look?: string;
   provider?: string;
   endpoint_kind?: string;
   role?: string;
@@ -652,11 +656,49 @@ export interface AgentRegisterBody {
   params?: string;
 }
 
+/** One role of `GET /api/agent-roles`. */
+export interface AgentRole {
+  id: string;
+  category: string;
+  title: string;
+  look: string;
+  team_role: string;
+  kind: "tickets" | "apps";
+  job: string;
+  does: string[];
+  skills: string[];
+  tools: string[];
+  first_tasks: string[];
+  /** The text a hire stores as the agent's instructions. */
+  instructions: string;
+  /** The model a hire would launch on, or why none resolves. */
+  model: { id: string; source: string } | { error: string };
+}
+
+export interface AgentRolesPayload {
+  categories: { id: string; label: string }[];
+  roles: AgentRole[];
+  install: { hosted: boolean; provider: string; endpoint_kind: string };
+}
+
+/** `POST /api/agents/<alias>/instructions` reply. `applies` says when the
+ *  agent sees the new text. */
+export interface InstructionsResult {
+  alias: string;
+  state: string;
+  applies: "next_turn" | "next_launch" | "not_delivered";
+  briefing?: string | { error: string };
+  old_sha256?: string | null;
+  new_sha256?: string;
+}
+
 export interface Agent {
   alias: string;
   provider: string;
   endpoint_kind: string;
   state: string;
+  /** Launch params; a catalogue hire carries `catalogue`, `look` and `kind`. */
+  params?: Record<string, unknown>;
   role?: string | null;
   /** Model-preference role. Independent of runtime `role`. */
   team_role?: string | null;
@@ -851,6 +893,11 @@ export interface AgentDetail {
     stalled?: boolean;
     capabilities?: Record<string, unknown> | null;
     tasks?: string[];
+    /** CAD-1752: the project of the task this agent is running now. */
+    turn_project?: string | null;
+    /** The stored job, when the board serves it. */
+    instructions?: string | null;
+    team_role?: string | null;
   };
   queued: number;
   unknown: number;

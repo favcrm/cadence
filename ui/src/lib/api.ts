@@ -14,6 +14,8 @@ import {
 import type {
   AgentDetail,
   AgentRegisterBody,
+  AgentRolesPayload,
+  InstructionsResult,
   AgentsPayload,
   AppDetail,
   AppOutputsPayload,
@@ -794,6 +796,13 @@ export const api = {
    * endpoint kind to `sandbox`.
    */
   registerAgent: (body: AgentRegisterBody) => post<Record<string, unknown>>("/api/agents", body),
+  /** `GET /api/agent-roles` (CAD-1752) — the role catalogue, the install's
+   *  runtime and the model each role would launch on. Any signed-in viewer. */
+  agentRoles: () => get<AgentRolesPayload>("/api/agent-roles"),
+  /** `POST /api/agents/<alias>/instructions` (CAD-1752) — replace the
+   *  agent's standing instructions. Operator only. */
+  setAgentInstructions: (alias: string, instructions: string) =>
+    post<InstructionsResult>(`/api/agents/${encodeURIComponent(alias)}/instructions`, { instructions }),
   /** `POST /api/plans/<epic>/approve|reject` — operator-only (CAD-328). */
   decidePlan: (epic: string, verb: "approve" | "reject", reason?: string) => {
     let req: ReturnType<typeof planDecision>;
