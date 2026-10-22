@@ -161,6 +161,13 @@ for (const leak of [
   const plan = planOf(leak) ?? "";
   if (/\/|~|\.local|master/.test(plan)) throw new Error(`plan leaks: ${plan}`);
 }
+// Scrubbing stays linear: long runs of `:` or `a=` finish at once.
+for (const hostile of [":".repeat(200_000), "a=".repeat(100_000)]) {
+  const started = performance.now();
+  planOf(hostile);
+  if (performance.now() - started > 100) throw new Error("plan scrub is not linear");
+}
+equal(planOf("a:b:c/d and x=1:2"), "… and x=1:2", "key=value without a path is kept");
 equal(planOf("Pulling the Q3 numbers, then summarising and/or charting them."), "Pulling the Q3 numbers, then summarising and/or charting them.", "a normal sentence survives intact");
 equal(plainStep("Bash: cadence artifact put --kind md --id art-a --file ./../tmp/r.md"), "Putting it in the canvas", "a put reads plainly");
 

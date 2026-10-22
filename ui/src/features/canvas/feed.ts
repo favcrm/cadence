@@ -50,7 +50,7 @@ export function plainStep(text: string): string {
 /** A word that names a filesystem path: it starts with `/`, `~/`, `./` or
  *  `../` (after any opening punctuation), has a `/` after `=` or `:`, or
  *  names the master's tmp or the state dir. */
-const PATHISH = /^[("'`[{<]*(?:\/|~\/|\.\/|\.\.\/)|[=:][^\s]*\/|master\/tmp|\.local\/state/;
+const PATHISH = /^[("'`[{<]*(?:\/|~\/|\.\/|\.\.\/)|[=:][^\s=:]*\/|master\/tmp|\.local\/state/;
 
 /** The agent's own words with every path-like word replaced by an ellipsis. */
 function plainWords(text: string): string {
