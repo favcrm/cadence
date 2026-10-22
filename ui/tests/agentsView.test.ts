@@ -180,7 +180,7 @@ const loaded = <T>(data: T): import("../src/lib/cache").ResourceState<T> => ({
 });
 let project = "all";
 let open: string | null = null;
-let tab: import("../src/features/agents/agentTabs").AgentTab = "overview";
+let tab: import("../src/features/agents/agentTabModel").AgentTab = "overview";
 let recruiting = false;
 let openedIssue: string | null = null;
 let assignmentRetries = 0;

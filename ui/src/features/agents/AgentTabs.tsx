@@ -17,7 +17,7 @@ import {
   historyKind,
   type AgentTab,
   type HistoryFilter,
-} from "./agentTabs";
+} from "./agentTabModel";
 import { agentLocation } from "./agentView";
 import "./recruit.css";
 

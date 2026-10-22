@@ -1,5 +1,5 @@
 import { parseIssueTab, type IssueTab } from "../features/issues/model";
-import { parseAgentTab, type AgentTab } from "../features/agents/agentTabs";
+import { parseAgentTab, type AgentTab } from "../features/agents/agentTabModel";
 import { readFilters, writeFilters, NO_FILTERS, type BoardFilters } from "./filters";
 import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
 import { MY_WORK_URL_KEYS, readMyWorkView, writeMyWorkView, type MyWorkView } from "./myWorkQuery";

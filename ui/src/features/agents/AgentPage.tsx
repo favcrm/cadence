@@ -8,7 +8,7 @@ import AgentAvatar, { agentLook } from "./AgentAvatar";
 import { RecoveryBlock } from "./AgentProfile";
 import AgentTabBody, { type TabContext } from "./AgentTabs";
 import { categoryLabel, roleOf, runsOnText, type RolesState } from "./agentRoles";
-import { AGENT_TABS, type AgentTab } from "./agentTabs";
+import { AGENT_TABS, type AgentTab } from "./agentTabModel";
 import {
   agentHoldsWorkButDead,
   agentLocation,

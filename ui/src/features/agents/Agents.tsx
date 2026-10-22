@@ -33,7 +33,7 @@ import {
   suggestedRoles,
   useAgentRoles,
 } from "./agentRoles";
-import type { AgentTab } from "./agentTabs";
+import type { AgentTab } from "./agentTabModel";
 import {
   AGENT_FILTERS,
   agentHoldsWorkButDead,
