@@ -1484,3 +1484,690 @@ fn cad1752_unknown_state_dispatch_gives_no_project() {
     let ok = fx.wiki_write("dev-u", "projects/alpha/notes.md").unwrap();
     assert_eq!(ok["committed"], true, "{ok}");
 }
+
+// ------------------------------- stage 2b/2c: relaunch per ticket (confined)
+//
+// A real daemon runs real Pi worker actors through the real `cadence
+// confine` launcher; only `pi` itself is a stand-in (FAKE_PI below). The
+// stand-in journals its argv and cwd into `<cwd>/pi-rpc.jsonl`, keeps a
+// session file like Pi (header `cwd`, `--fork` makes a new file in
+// `--session-dir`) and reports it as `sessionFile`, and holds any prompt
+// containing HOLD until `<cwd>/release` exists. Dispatched messages and
+// the daemon's dispatch record (`<state>/dispatches.json`) are planted:
+// both are daemon-written in production.
+
+const FAKE_PI: &str = r#"#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+def opt(name):
+    return args[args.index(name) + 1] if name in args else None
+cwd = os.getcwd()
+def journal(obj):
+    obj["cwd"] = cwd
+    with open(os.path.join(cwd, "pi-rpc.jsonl"), "a") as f:
+        f.write(json.dumps(obj) + "\n")
+journal({"argv": args})
+try:
+    with open(os.path.join(cwd, "..", "alpha-2", "escape"), "w") as f:
+        f.write("escaped")
+    journal({"escape": "written"})
+except OSError as e:
+    journal({"escape": type(e).__name__})
+session = opt("--session")
+if opt("--fork"):
+    src = opt("--fork")
+    with open(src) as f:
+        lines = f.read().splitlines()
+    header = json.loads(lines[0]) if lines else {}
+    header.update({"cwd": cwd, "parentSession": src, "id": opt("--session-id")})
+    session = os.path.join(opt("--session-dir"),
+                           "%d_%s.jsonl" % (int(time.time() * 1000), opt("--session-id")))
+    with open(session, "w") as f:
+        f.write("\n".join([json.dumps(header)] + lines[1:]) + "\n")
+elif session and not os.path.exists(session):
+    with open(session, "w") as f:
+        f.write(json.dumps({"type": "session", "cwd": cwd}) + "\n")
+model = opt("--model") or "fake/model-1"
+provider, _, model_id = model.partition("/")
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    req = json.loads(line)
+    kind, rid = req.get("type"), req.get("id")
+    reply = {"type": "response", "id": rid, "command": kind, "success": True}
+    if kind == "get_state":
+        reply["data"] = {"sessionId": "fake", "sessionFile": session,
+                         "thinkingLevel": "medium",
+                         "model": {"provider": provider, "id": model_id}}
+    if kind != "prompt":
+        emit(reply)
+        continue
+    text = req.get("message", "")
+    journal({"rpc": "prompt", "hold": "HOLD" in text})
+    emit(reply)
+    while "HOLD" in text and not os.path.exists(os.path.join(cwd, "release")):
+        time.sleep(0.05)
+    emit({"type": "message_end", "message": {"role": "assistant",
+          "content": [{"type": "text", "text": "done"}], "stopReason": "stop"}})
+    emit({"type": "agent_settled"})
+"#;
+
+struct LaneFx {
+    root: tempfile::TempDir,
+    stop: Arc<AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    env: cadence_agent::adapter::ProviderEnv,
+    /// Opened before the daemon: reopening a Store runs crash recovery.
+    store: Store,
+}
+
+impl Drop for LaneFx {
+    fn drop(&mut self) {
+        self.stop.store(true, SeqCst);
+        for thread in self.threads.drain(..).rev() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = cadence_agent::reaper::output(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=c1752",
+                "-c",
+                "user.email=c1752@example.test",
+            ])
+            .args(args),
+    )
+    .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+impl LaneFx {
+    fn start() -> Self {
+        let root = tempfile::Builder::new()
+            .prefix("c1752l-")
+            .tempdir()
+            .unwrap();
+        let path = |p: &str| root.path().join(p);
+        for dir in ["h", "outside", "s"] {
+            std::fs::create_dir_all(path(dir)).unwrap();
+        }
+        let pm = path("pm");
+        cadence_agent::issue::Pm::init(&pm).unwrap();
+        let yaml = pm.join("pm.yaml");
+        let mut text = std::fs::read_to_string(&yaml).unwrap();
+        text.push_str(PI_BLOCK);
+        std::fs::write(&yaml, text).unwrap();
+        // alpha: a repo with two lane worktrees and a symlink lane that
+        // points outside; other: a repo no project declares.
+        for repo in ["alpha-repo", "other-repo"] {
+            std::fs::create_dir_all(path(repo)).unwrap();
+            git(&path(repo), &["init", "-q"]);
+            git(
+                &path(repo),
+                &["commit", "-q", "--allow-empty", "-m", "init"],
+            );
+            std::fs::create_dir_all(path(repo).join(".cadence/wt")).unwrap();
+        }
+        for lane in ["alpha-1", "alpha-2"] {
+            git(
+                &path("alpha-repo"),
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    lane,
+                    &format!(".cadence/wt/{lane}"),
+                ],
+            );
+        }
+        git(
+            &path("other-repo"),
+            &["worktree", "add", "-q", "-b", "x", ".cadence/wt/x"],
+        );
+        std::os::unix::fs::symlink(path("outside"), path("alpha-repo/.cadence/wt/evil")).unwrap();
+        let repo = std::fs::canonicalize(path("alpha-repo")).unwrap();
+        std::fs::create_dir_all(pm.join("alpha")).unwrap();
+        std::fs::write(
+            pm.join("alpha/project.yaml"),
+            format!(
+                "key: alpha\nprefix: ALPHA\nrepos:\n  - path: {}\n",
+                repo.display()
+            ),
+        )
+        .unwrap();
+        let fake = path("fake-pi.py");
+        std::fs::write(&fake, FAKE_PI).unwrap();
+
+        let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
+        env.set("CADENCE_PM_DIR", pm.to_str().unwrap());
+        env.set("HOME", path("h").to_str().unwrap());
+        env.set("CADENCE_PI_COMMAND", format!("python3 {}", fake.display()));
+        env.set("CADENCE_CONFINE_COMMAND", env!("CARGO_BIN_EXE_cadence"));
+        env.set(
+            cadence_agent::adapter::pi::CONFINE_WORKER_EXTRA_READ_ENV,
+            fake.to_str().unwrap(),
+        );
+        let store = Store::open(&path("s").join("cadence.sqlite3")).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let opts = daemon::ServeOptions {
+            provider_env: env.clone(),
+            stop: Some(stop.clone()),
+            test_seam: true,
+            slots: Some(Default::default()),
+            lease: Some(Default::default()),
+            auto_stop: Some(daemon::AutoStopSetting::off()),
+            agent_gc: Some(Default::default()),
+            report_router: Some(0),
+            checkup: Some(0),
+            ..Default::default()
+        };
+        let state = path("s");
+        let threads = vec![std::thread::spawn(move || {
+            daemon::serve_with(&state, opts).unwrap();
+        })];
+        let fx = Self {
+            root,
+            stop,
+            threads,
+            env,
+            store,
+        };
+        fx.until("daemon", || {
+            client::rpc_timeout(&fx.state(), "health", json!({}), Duration::from_secs(2)).is_ok()
+                && Seam::token_at(&fx.state()).is_some()
+        });
+        fx
+    }
+
+    fn path(&self, p: &str) -> PathBuf {
+        std::fs::canonicalize(self.root.path()).unwrap().join(p)
+    }
+    fn state(&self) -> PathBuf {
+        self.root.path().join("s")
+    }
+    fn lane(&self, name: &str) -> PathBuf {
+        self.path("alpha-repo/.cadence/wt").join(name)
+    }
+
+    fn until(&self, what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}: timed out");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn rpc(&self, who: Asserted, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        let state = self.state();
+        scoped(who, || client::rpc(&state, method, params))
+    }
+    fn op(&self, method: &str, params: Value) -> Value {
+        self.rpc(Asserted::Operator, method, params)
+            .unwrap_or_else(|e| panic!("operator {method}: {e}"))
+    }
+    fn show(&self, alias: &str) -> Value {
+        self.op("agent_show", json!({"alias": alias, "limit": 0}))["agent"].clone()
+    }
+
+    /// Register a pi worker as the operator and wait for its endpoint.
+    fn hire(&self, params: Value) -> String {
+        let alias = params["alias"].as_str().unwrap().to_string();
+        self.op("agent_register", params);
+        self.until(&format!("{alias} idle"), || {
+            let shown = self.show(&alias);
+            assert_ne!(
+                shown["state"],
+                "attention",
+                "{alias} failed to open: {shown}; log: {}",
+                std::fs::read_to_string(self.state().join(format!("agents/{alias}.provider.log")))
+                    .unwrap_or_default()
+            );
+            shown["state"] == "idle" && shown["pid"].is_number()
+        });
+        alias
+    }
+
+    fn record_dispatch(&self, issue: &str, worktree: &std::path::Path) {
+        let path = self.state().join("dispatches.json");
+        let mut all: Value = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_else(|| json!({}));
+        all[issue] = json!({"issue": issue, "pm": "operator", "worker": "x",
+                            "worktree": worktree.to_string_lossy(), "message": "k"});
+        std::fs::write(&path, all.to_string()).unwrap();
+    }
+
+    fn plant(
+        &self,
+        alias: &str,
+        id: &str,
+        issue: Option<&str>,
+        worktree: Option<&std::path::Path>,
+    ) {
+        let conn = rusqlite::Connection::open(self.state().join("cadence.sqlite3")).unwrap();
+        conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        conn.execute(
+            "INSERT INTO messages(id, alias, body, source, state, created, issue, worktree) \
+             VALUES (?1, ?2, 'fixture turn', 'dispatch', 'queued', ?3, ?4, ?5)",
+            rusqlite::params![
+                id,
+                alias,
+                cadence_agent::issue::time::now_epoch() as f64,
+                issue,
+                worktree.map(|w| w.to_string_lossy().into_owned())
+            ],
+        )
+        .unwrap();
+    }
+
+    /// An operator send: queues a ticketless turn and wakes the actor.
+    fn send(&self, alias: &str, id: &str, text: &str) {
+        self.op(
+            "agent_send",
+            json!({"alias": alias, "text": text, "message": id}),
+        );
+    }
+
+    fn message(&self, id: &str) -> (String, Option<String>) {
+        let conn = rusqlite::Connection::open_with_flags(
+            self.state().join("cadence.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        conn.query_row("SELECT state, error FROM messages WHERE id=?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    }
+
+    fn settled(&self, id: &str) -> (String, Option<String>) {
+        let mut out = (String::new(), None);
+        self.until(&format!("message {id} settles"), || {
+            out = self.message(id);
+            matches!(out.0.as_str(), "completed" | "failed")
+        });
+        out
+    }
+
+    fn relaunches(&self, alias: &str) -> Vec<Value> {
+        let conn = rusqlite::Connection::open_with_flags(
+            self.state().join("cadence.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT payload FROM events WHERE alias=?1 AND kind='relaunched_for_lane' ORDER BY seq")
+            .unwrap();
+        stmt.query_map([alias], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|p| serde_json::from_str(&p.unwrap()).unwrap())
+            .collect()
+    }
+
+    fn journal(&self, dir: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(dir.join("pi-rpc.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+}
+
+fn confined_hire(alias: &str) -> Value {
+    json!({"alias": alias, "catalogue": "developer", "params": r#"{"confine":true}"#})
+}
+
+/// Items 1 and the positive relaunch. Guards: `lane_workdir_needed` and
+/// `grantable_lane` (`src/daemon/lane_relaunch.rs`) pick the recorded lane;
+/// `launch_workdir` (`src/adapter/pi_confine.rs`) feeds the worker grant,
+/// which then covers that lane, its git common dir and the agent's own
+/// dir — and no other lane, no repo checkout root, no $HOME.
+#[test]
+fn cad1752_confined_hire_relaunches_into_the_recorded_lane_only() {
+    let fx = LaneFx::start();
+    let alias = fx.hire(confined_hire("dev-c"));
+    let home = std::fs::canonicalize(fx.show(&alias)["cwd"].as_str().unwrap()).unwrap();
+    let lane = fx.lane("alpha-1");
+    fx.record_dispatch("ALPHA-1", &lane);
+    fx.plant(&alias, "dispatch-alpha-1", Some("ALPHA-1"), Some(&lane));
+    fx.send(&alias, "after-1", "ticketless follow-up");
+    let (state, error) = fx.settled("dispatch-alpha-1");
+    assert_eq!(state, "completed", "lane turn: {error:?}");
+    fx.settled("after-1");
+
+    let events = fx.relaunches(&alias);
+    assert!(
+        events.first().is_some_and(
+            |e| e["issue"] == "ALPHA-1" && e["workdir"] == lane.to_string_lossy().as_ref()
+        ),
+        "no relaunch into the recorded lane: {events:?}"
+    );
+    // The stand-in ran in the lane for the dispatch, then back home.
+    let starts = |dir: &std::path::Path| {
+        fx.journal(dir)
+            .into_iter()
+            .filter(|j| j.get("argv").is_some())
+            .collect::<Vec<_>>()
+    };
+    let in_lane = starts(&lane);
+    assert_eq!(in_lane.len(), 1, "lane launches: {in_lane:?}");
+    // Live Landlock: the lane launch cannot write the sibling lane.
+    let escape: Vec<Value> = fx
+        .journal(&lane)
+        .into_iter()
+        .filter_map(|j| j.get("escape").cloned())
+        .collect();
+    assert_eq!(
+        escape,
+        vec![json!("PermissionError")],
+        "sibling-lane write: {escape:?}"
+    );
+    assert!(
+        !fx.lane("alpha-2").join("escape").exists(),
+        "escaped into alpha-2"
+    );
+    eprintln!("CAD-1752 lane launch argv: {}", in_lane[0]["argv"]);
+    assert!(
+        events
+            .iter()
+            .any(|e| e["workdir"] == home.to_string_lossy().as_ref()),
+        "the ticketless follow-up did not relaunch home: {events:?}"
+    );
+
+    // The grant a lane launch builds, from the same function and env.
+    let mut agent = fx.store.agent(&alias).unwrap();
+    agent.params.as_mut().unwrap()["launch_workdir"] = json!(lane.to_string_lossy());
+    let (_, policy) =
+        cadence_agent::adapter::pi::pi_worker_confinement(&fx.env, &fx.state(), &agent);
+    let write = &policy.write;
+    eprintln!("CAD-1752 lane write set: {write:?}");
+    let covered = |p: &std::path::Path| write.iter().any(|w| p.starts_with(w));
+    let common = fx.path("alpha-repo/.git");
+    assert!(write.contains(&lane), "lane not granted: {write:?}");
+    assert!(covered(&common), "git common dir not granted: {write:?}");
+    assert!(
+        covered(&fx.state().join("agents").join(&alias))
+            || covered(
+                &std::fs::canonicalize(fx.state())
+                    .unwrap()
+                    .join("agents")
+                    .join(&alias)
+            ),
+        "agent dir not granted: {write:?}"
+    );
+    for (what, path) in [
+        ("another lane", fx.lane("alpha-2")),
+        ("the repo checkout root", fx.path("alpha-repo/README")),
+        ("$HOME", fx.path("h")),
+        ("the outside dir", fx.path("outside")),
+        (
+            "an undeclared repo's lane",
+            fx.path("other-repo/.cadence/wt/x"),
+        ),
+    ] {
+        assert!(
+            !covered(&path),
+            "{what} ({}) is writable: {write:?}",
+            path.display()
+        );
+    }
+}
+
+/// Item 2. Guard: `grantable_lane` refuses every lane that is not the
+/// daemon-recorded worktree of a declared repo, failing the message with a
+/// stated reason and relaunching nothing.
+#[test]
+fn cad1752_lane_relaunch_refusals_grant_nothing() {
+    let fx = LaneFx::start();
+    let alias = fx.hire(confined_hire("dev-r"));
+    let pid = fx.show(&alias)["pid"].clone();
+    let missing = fx.path("alpha-repo/.cadence/wt/gone");
+    let evil = fx.path("alpha-repo/.cadence/wt/evil");
+    let foreign = fx.path("other-repo/.cadence/wt/x");
+    // ALPHA-11 has a valid record; only its message carries no worktree.
+    fx.record_dispatch("ALPHA-11", &fx.lane("alpha-1"));
+    fx.record_dispatch("ALPHA-12", &missing);
+    fx.record_dispatch("ALPHA-13", &fx.lane("alpha-1"));
+    fx.record_dispatch("ALPHA-14", &evil);
+    fx.record_dispatch("ALPHA-15", &foreign);
+    let cases: [(&str, &str, Option<PathBuf>, &str); 5] = [
+        (
+            "no-wt",
+            "ALPHA-11",
+            None,
+            "the dispatch recorded no worktree",
+        ),
+        (
+            "missing",
+            "ALPHA-12",
+            Some(missing.clone()),
+            "is missing or deleted",
+        ),
+        (
+            "other-lane",
+            "ALPHA-13",
+            Some(fx.lane("alpha-2")),
+            "is not the worktree recorded for ALPHA-13's dispatch",
+        ),
+        (
+            "symlink",
+            "ALPHA-14",
+            Some(evil.clone()),
+            "is not a lane worktree (.cadence/wt/)",
+        ),
+        (
+            "foreign",
+            "ALPHA-15",
+            Some(foreign.clone()),
+            "is not a lane worktree (.cadence/wt/)",
+        ),
+    ];
+    for (id, issue, wt, _) in &cases {
+        fx.plant(&alias, id, Some(issue), wt.as_deref());
+    }
+    fx.send(&alias, "wake-r", "ticketless");
+    let mut wrong = Vec::new();
+    for (id, issue, _, why) in &cases {
+        let (state, error) = fx.settled(id);
+        let error = error.unwrap_or_default();
+        if state != "failed"
+            || !error.contains(&format!("relaunch for {issue} refused, nothing granted"))
+            || !error.contains(why)
+        {
+            wrong.push(format!("{id}: {state}: {error}"));
+        }
+    }
+    assert_eq!(fx.settled("wake-r").0, "completed");
+    assert!(wrong.is_empty(), "lanes not refused as stated: {wrong:#?}");
+    assert!(
+        fx.relaunches(&alias).is_empty(),
+        "{:?}",
+        fx.relaunches(&alias)
+    );
+    let shown = fx.show(&alias);
+    assert!(
+        shown["params"]
+            .get("launch_workdir")
+            .is_none_or(Value::is_null),
+        "{shown}"
+    );
+    assert_eq!(shown["pid"], pid, "the endpoint was relaunched");
+    assert!(fx.journal(&fx.path("outside")).is_empty(), "ran outside");
+
+    // Control: the recorded lane, same agent, same state.
+    fx.record_dispatch("ALPHA-16", &fx.lane("alpha-1"));
+    fx.plant(
+        &alias,
+        "ok-lane",
+        Some("ALPHA-16"),
+        Some(&fx.lane("alpha-1")),
+    );
+    fx.send(&alias, "wake-ok", "ticketless");
+    assert_eq!(fx.settled("ok-lane").0, "completed");
+    assert!(
+        fx.relaunches(&alias)
+            .iter()
+            .any(|e| e["issue"] == "ALPHA-16"),
+        "{:?}",
+        fx.relaunches(&alias)
+    );
+}
+
+/// Item 3. Guards: `rpc_register` and `rpc_set` refuse a caller-set
+/// `params.launch_workdir` — for the operator as well.
+#[test]
+fn cad1752_caller_cannot_set_launch_workdir() {
+    let fx = Fx::start(Board::None);
+    fx.seed("pm-root", None, None);
+    let lane = fx.root.path().join("lane");
+    std::fs::create_dir_all(&lane).unwrap();
+    let forged = json!({"launch_workdir": lane.to_string_lossy()}).to_string();
+    let mut wrong: Vec<String> = Vec::new();
+    for (what, params) in [
+        (
+            "catalogue hire",
+            json!({"alias": "lw-1", "catalogue": "developer", "params": forged}),
+        ),
+        (
+            "start blank",
+            json!({"alias": "lw-1", "provider": "pi", "cwd": fx.root.path().to_string_lossy(),
+                   "params": forged}),
+        ),
+    ] {
+        match fx.rpc(Asserted::Operator, "agent_register", params) {
+            Err(err)
+                if err
+                    .to_string()
+                    .contains("params 'launch_workdir' is set by the daemon") => {}
+            other => wrong.push(format!("register {what}: {other:?}")),
+        }
+        if fx.agent("lw-1").is_some() {
+            wrong.push(format!("register {what}: row created"));
+            fx.op("agent_remove", json!({"alias": "lw-1", "force": true}));
+        }
+    }
+    fx.op(
+        "agent_register",
+        json!({"alias": "lw-1", "catalogue": "developer"}),
+    );
+    for (what, who) in [
+        ("the operator", Asserted::Operator),
+        ("the agent itself", Asserted::Agent("lw-1".into())),
+    ] {
+        for next_launch in [false, true] {
+            let err = fx
+                .rpc(
+                    who.clone(),
+                    "agent_set",
+                    json!({"alias": "lw-1", "next_launch": next_launch,
+                           "patch": {"launch_workdir": lane.to_string_lossy()}}),
+                )
+                .err();
+            if err.is_none() {
+                wrong.push(format!("{what} (next_launch={next_launch}): admitted"));
+            }
+            eprintln!(
+                "CAD-1752 agent_set launch_workdir by {what} (next_launch={next_launch}): {err:?}"
+            );
+        }
+    }
+    match fx.rpc(
+        Asserted::Operator,
+        "agent_set",
+        json!({"alias": "lw-1", "patch": {"launch_workdir": lane.to_string_lossy()}}),
+    ) {
+        Err(err)
+            if err
+                .to_string()
+                .contains("params 'launch_workdir' is set by the daemon") => {}
+        other => wrong.push(format!("operator agent set: {other:?}")),
+    }
+    if fx
+        .agent("lw-1")
+        .unwrap()
+        .params
+        .unwrap()
+        .get("launch_workdir")
+        .is_some()
+    {
+        wrong.push("agent set stored launch_workdir".into());
+    }
+    assert!(wrong.is_empty(), "launch_workdir not refused: {wrong:#?}");
+    // Control: an ordinary patch from the operator applies.
+    fx.op(
+        "agent_set",
+        json!({"alias": "lw-1", "next_launch": true, "patch": {"effort": "high"}}),
+    );
+}
+
+/// Item 4. Guards: the actor checks `lane_workdir_needed` only when it
+/// takes the next message (never mid-turn), and only a confined
+/// catalogue Pi worker is subject to it.
+#[test]
+fn cad1752_no_relaunch_mid_turn_or_for_others() {
+    let fx = LaneFx::start();
+    let lane = fx.lane("alpha-1");
+    fx.record_dispatch("ALPHA-21", &lane);
+    fx.record_dispatch("ALPHA-22", &lane);
+    fx.record_dispatch("ALPHA-23", &lane);
+
+    // Mid-turn: a held ticketless turn, with the dispatch queued behind it.
+    let alias = fx.hire(confined_hire("dev-m"));
+    let home = std::fs::canonicalize(fx.show(&alias)["cwd"].as_str().unwrap()).unwrap();
+    fx.send(&alias, "held", "HOLD this turn");
+    fx.until("held turn running", || fx.message("held").0 == "running");
+    fx.plant(&alias, "queued-lane", Some("ALPHA-21"), Some(&lane));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(fx.relaunches(&alias).is_empty(), "relaunched mid-turn");
+    assert_eq!(fx.message("held").0, "running");
+    std::fs::write(home.join("release"), b"").unwrap();
+    assert_eq!(fx.settled("held").0, "completed");
+    fx.send(&alias, "wake-m", "ticketless");
+    assert_eq!(fx.settled("queued-lane").0, "completed");
+    assert!(
+        fx.relaunches(&alias)
+            .iter()
+            .any(|e| e["issue"] == "ALPHA-21"),
+        "control: the queued lane turn did not relaunch after the held turn"
+    );
+
+    // An unconfined catalogue agent and a non-catalogue confined worker.
+    let open = fx.hire(json!({"alias": "dev-open", "catalogue": "developer",
+                              "params": r#"{"confine":false}"#}));
+    let cli = fx.hire(json!({"alias": "dev-cli", "provider": "pi",
+                             "cwd": fx.path("alpha-repo").to_string_lossy(),
+                             "params": r#"{"confine":true}"#}));
+    let mut wrong = Vec::new();
+    for (who, issue, id) in [
+        (&open, "ALPHA-22", "open-lane"),
+        (&cli, "ALPHA-23", "cli-lane"),
+    ] {
+        fx.plant(who, id, Some(issue), Some(&lane));
+        fx.send(who, &format!("{id}-wake"), "ticketless");
+        let state = fx.settled(id).0;
+        let shown = fx.show(who);
+        if state != "completed"
+            || !fx.relaunches(who).is_empty()
+            || !shown["params"]
+                .get("launch_workdir")
+                .is_none_or(Value::is_null)
+        {
+            wrong.push(format!(
+                "{who}: {state}; relaunches {:?}",
+                fx.relaunches(who)
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "relaunched outside the rule: {wrong:#?}");
+}
