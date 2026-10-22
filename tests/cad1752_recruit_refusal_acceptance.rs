@@ -2249,3 +2249,240 @@ fn cad1752_failed_lane_relaunch_fails_the_message_once() {
         "launch_workdir widened: {stored}"
     );
 }
+
+// ------------------------------------------- stage 3: what the board serves
+
+/// Every object key named `key`, anywhere in `value`.
+fn keys_named(value: &Value, key: &str, path: &str, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                let here = format!("{path}.{k}");
+                if k == key {
+                    out.push(here.clone());
+                }
+                keys_named(v, key, &here, out);
+            }
+        }
+        Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                keys_named(v, key, &format!("{path}[{i}]"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+const SAVED_JOB: &str = "Chase the c1752 saved-job-needle invoices every Friday.";
+
+/// A catalogue hire with a saved job, registered and edited by the operator.
+fn hire_with_saved_job(fx: &Fx, alias: &str) {
+    fx.op(
+        "agent_register",
+        json!({"alias": alias, "catalogue": "accountant"}),
+    );
+    fx.op(
+        "agent_instructions_set",
+        json!({"alias": alias, "instructions": SAVED_JOB}),
+    );
+}
+
+/// The job is absent: no `instructions` key and no job text anywhere.
+fn assert_no_job(reply: &Reply, who: &str) {
+    let mut found = Vec::new();
+    keys_named(&reply.body, "instructions", "$", &mut found);
+    assert!(found.is_empty(), "{who}: instructions served at {found:?}");
+    assert!(
+        !reply.raw.contains("saved-job-needle"),
+        "{who}: the saved job text is in the payload"
+    );
+}
+
+/// Guard: `admit_operator_read` decides `operator` for the detail route
+/// (`src/ui/serve.rs`, `RouteId::AgentDetail`), which `agent_detail` passes
+/// as `include_profile_instructions`.
+#[test]
+fn cad1752_board_agent_detail_hides_job_from_non_operator() {
+    // Public board: the owner reads the job, a member does not.
+    let fx = Fx::start(Board::Public);
+    hire_with_saved_job(&fx, "acct-d");
+    let route = "/api/agents/acct-d";
+    let member = fx.platform_cookie("member");
+    let reply = fx.http(&Asserted::Operator, "GET", route, None, Some(&member), None);
+    assert_eq!(reply.status, 200, "member detail: {}", reply.raw);
+    assert_eq!(reply.body["agent"]["alias"], "acct-d", "{}", reply.raw);
+    assert_no_job(&reply, "member");
+    let mut params = Vec::new();
+    keys_named(&reply.body, "params", "$", &mut params);
+    eprintln!(
+        "CAD-1752 member detail params: {:?} {}",
+        params, reply.body["agent"]["params"]
+    );
+    let owner = fx.platform_cookie("owner");
+    let reply = fx.http(&Asserted::Operator, "GET", route, None, Some(&owner), None);
+    assert_eq!(reply.status, 200, "owner detail: {}", reply.raw);
+    assert_eq!(reply.body["agent"]["instructions"], SAVED_JOB, "owner");
+    drop(fx);
+
+    // Loopback board: the operator's session reads it, an agent does not.
+    let fx = Fx::start(Board::Loopback);
+    hire_with_saved_job(&fx, "acct-d");
+    fx.seed("peer-1", None, None);
+    let (cookie, key) = fx.operator_session();
+    for who in ["acct-d", "peer-1"] {
+        let reply = fx.http(&Asserted::Agent(who.into()), "GET", route, None, None, None);
+        eprintln!("CAD-1752 agent {who} detail status: {}", reply.status);
+        assert_no_job(&reply, who);
+    }
+    let reply = fx.http(
+        &Asserted::Operator,
+        "GET",
+        route,
+        None,
+        Some(&cookie),
+        Some(&key),
+    );
+    assert_eq!(reply.status, 200, "operator detail: {}", reply.raw);
+    assert_eq!(reply.body["agent"]["instructions"], SAVED_JOB, "operator");
+}
+
+/// Guard: `agents_payload_from` (`src/ui/serve.rs`) copies only
+/// `catalogue`/`look`/`kind` from a hire's params into the roster row.
+#[test]
+fn cad1752_board_agent_list_serves_only_role_identity() {
+    let fx = Fx::start(Board::Public);
+    fx.seed("pm-root", None, None);
+    fx.seed(
+        "acct-l",
+        Some(
+            r#"{"catalogue":"accountant","look":"bookkeeper","kind":"apps","upstream":"pm-root","launch_workdir":"/c1752/secret-lane-needle","profile":"secret-profile-needle"}"#,
+        ),
+        None,
+    );
+    let member = fx.platform_cookie("member");
+    let mut row = Value::Null;
+    let mut raw = String::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while row.is_null() {
+        assert!(Instant::now() < deadline, "acct-l never listed: {raw}");
+        let reply = fx.http(
+            &Asserted::Operator,
+            "GET",
+            "/api/agents",
+            None,
+            Some(&member),
+            None,
+        );
+        assert_eq!(reply.status, 200, "member list: {}", reply.raw);
+        row = reply.body["agents"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|r| r["alias"] == "acct-l").cloned())
+            .unwrap_or(Value::Null);
+        raw = reply.raw;
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Positive: the role identity is served.
+    assert_eq!(row["catalogue"], "accountant", "{row}");
+    assert_eq!(row["look"], "bookkeeper", "{row}");
+    assert_eq!(row["kind"], "apps", "{row}");
+    // Nothing else of params.
+    let mut wrong = Vec::new();
+    for key in ["params", "launch_workdir", "profile", "upstream"] {
+        keys_named(&row, key, "$", &mut wrong);
+    }
+    assert!(
+        wrong.is_empty(),
+        "params keys in the roster row: {wrong:?} {row}"
+    );
+    let text = row.to_string();
+    for needle in ["secret-lane-needle", "secret-profile-needle"] {
+        assert!(!text.contains(needle), "{needle} served in {row}");
+    }
+    eprintln!("CAD-1752 roster group for acct-l: {}", row["group"]);
+}
+
+/// FAILING FIRST. A catalogue hire whose role model would not launch (not
+/// on the Pi allowlist) is refused by `agent_register` with the reason
+/// `agent_roles` shows; nothing is left behind. Control: once the model is
+/// allowlisted for workers, the same hire registers.
+#[test]
+fn cad1752_catalogue_register_refuses_unlaunchable_model() {
+    let fx = Fx::start(Board::None);
+    let snapshot = fx.op("agent_settings_get", json!({}));
+    eprintln!("CAD-1752 settings config: {}", snapshot["config"]);
+    let allowed = snapshot["config"].clone();
+    // Two ways a role's model cannot launch for a worker:
+    // - its role default is master-scoped;
+    // - no role default, so the Pi policy's own fallback picks a model
+    //   that is not on the worker allowlist.
+    let mut master_scoped = allowed.clone();
+    master_scoped["scope"]["fake/model-1"] = json!("master");
+    let mut no_default = master_scoped.clone();
+    no_default["roleDefaults"]["worker"] = json!("");
+    let mut revision = snapshot["revision"].clone();
+    let mut wrong = Vec::new();
+    for (what, alias, config) in [
+        ("master-scoped role default", "acct-m", master_scoped),
+        ("policy fallback off the allowlist", "acct-n", no_default),
+    ] {
+        let saved = fx.op(
+            "agent_settings_set",
+            json!({"expected_revision": revision, "config": config}),
+        );
+        revision = saved["revision"].clone();
+        let roles = fx.op("agent_roles", json!({}));
+        let role = roles["roles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "accountant")
+            .cloned()
+            .unwrap();
+        let Some(reason) = role["model"]["error"].as_str().map(str::to_string) else {
+            wrong.push(format!(
+                "{what}: agent_roles resolves a launchable model: {role}"
+            ));
+            continue;
+        };
+        eprintln!("CAD-1752 {what}: agent_roles error: {reason}");
+        match fx.rpc(
+            Asserted::Operator,
+            "agent_register",
+            json!({"alias": alias, "catalogue": "accountant"}),
+        ) {
+            Err(err)
+                if matches!(err, cadence_agent::Error::Rejected(_))
+                    && err.to_string().contains(&reason) => {}
+            other => wrong.push(format!(
+                "{what}: register answered {other:?}, not agent_roles' reason ({reason})"
+            )),
+        }
+        if fx.agent(alias).is_some() {
+            wrong.push(format!("{what}: row created"));
+        }
+        if fx.home(alias).exists() {
+            wrong.push(format!("{what}: home dir left behind"));
+        }
+        if client::briefing_path(&fx.state(), &json!({}), alias).exists() {
+            wrong.push(format!("{what}: briefing written"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "unlaunchable hires not refused: {wrong:#?}"
+    );
+    let saved = json!({"revision": revision});
+
+    // Control: allowlist the model for workers again; the same hire works.
+    let mut restored = allowed;
+    restored["scope"]["fake/model-1"] = json!("worker");
+    fx.op(
+        "agent_settings_set",
+        json!({"expected_revision": saved["revision"], "config": restored}),
+    );
+    fx.op(
+        "agent_register",
+        json!({"alias": "acct-ok", "catalogue": "accountant"}),
+    );
+    assert!(fx.agent("acct-ok").is_some());
+}
