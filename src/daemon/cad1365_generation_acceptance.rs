@@ -706,3 +706,38 @@ fn cad1365_generation_app_run_start_keeps_the_team_floor_for_agent_workflows() {
         "the team floor must refuse before any provider work: {seen:?}"
     );
 }
+
+/// CAD-1258: the legacy host-run provider call (the real adapter submit) runs
+/// with the PM lock free, and the lock-2 record point is reachable.
+#[test]
+fn cad1258_host_run_provider_call_runs_outside_the_pm_lock() {
+    let fx = Fx::new();
+    let expected = json!({"image": fx.quote()});
+    let pm_dir = fx._dir.path().join("pm");
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let log = seen.clone();
+    crate::issue::lockseam::set_hook(Some(Box::new(move |point| {
+        let free = crate::issue::Pm::at(&pm_dir)
+            .unwrap()
+            .try_lock()
+            .unwrap()
+            .is_some();
+        assert!(free, "PM lock held during {point}");
+        log.borrow_mut().push(point.to_string());
+    })));
+    let run = fx.start(
+        "create-image",
+        json!({"subject": "Customer follow-up",
+            "source": "Acme CRM helps small teams track customers",
+            "image_prompt": "Use a calm editorial palette"}),
+        expected,
+        "run-1258-host",
+    );
+    crate::issue::lockseam::set_hook(None);
+    let run = run.expect("host run");
+    assert_eq!(run["state"], "succeeded", "{run}");
+    assert_eq!(
+        *seen.borrow(),
+        ["app-host-provider-call", "app-host-before-record"]
+    );
+}

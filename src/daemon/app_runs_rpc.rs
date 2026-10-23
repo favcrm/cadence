@@ -1306,48 +1306,78 @@ impl Shared {
             None
         };
         let pm = self.pm_at(&self.pm_dir()?)?;
-        // Preserve the entire legacy critical section for runs without account
-        // slots. Mixed runs release only at the necessary account boundaries.
-        let execute_legacy = |legacy_slots: &[String], finish: bool| {
-            let execute = |bundle: &Value,
-                           files: &std::collections::BTreeMap<String, String>,
-                           producer: Option<(
-                &Value,
-                &std::collections::BTreeMap<String, String>,
-            )>| {
-                let _custody = self
-                    .platform_custody_lock
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let _release = self
-                    .app_release_lock
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+        // CAD-1258: per legacy slot, lock 1 verifies and claims, the provider
+        // call runs with NO PM lock, and lock 2 re-verifies the same authority
+        // before the result is retained. Mixed runs release only at the
+        // necessary account boundaries.
+        let execute_legacy = |legacy_slots: &[String], finish: bool| -> Result<()> {
+            type Files = std::collections::BTreeMap<String, String>;
+            type Held<'a> = Option<(&'a Value, &'a Files)>;
+            let snap = |f: &mut dyn FnMut(&Value, &Files, Held) -> Result<()>| -> Result<()> {
                 if let Some(original) = &reference_original {
-                    let (producer_bundle, producer_files) = producer.ok_or_else(|| {
-                        Error::rejected("reference producer snapshot is unavailable")
-                    })?;
-                    self.app_binding_receipt_library_source(
+                    workspace::with_runtime_snapshot_pair(
+                        &pm,
+                        install,
                         &original.install_id,
-                        original.context_id.as_deref(),
-                        &original.slot,
-                        &original.proof,
-                        producer_bundle,
-                        producer_files,
-                    )?;
-                    if self.store.app_capability_status(
-                        &original.install_id,
-                        required_str(producer_bundle, "digest")?,
-                    )?["state"]
-                        != "approved"
-                    {
-                        return Err(Error::rejected(
-                            "reference producing installation is not approved",
-                        ));
-                    }
+                        |(bundle, files), producer| f(bundle, files, Some(producer)),
+                    )
+                } else {
+                    workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+                        f(bundle, files, None)
+                    })
                 }
-                self.app_run_binding_current(run, bundle, files)?;
-                for slot in legacy_slots {
+            };
+            // Called with the custody and release guards held.
+            let current =
+                |bundle: &Value, files: &Files, producer: Option<(&Value, &Files)>| -> Result<()> {
+                    if let Some(original) = &reference_original {
+                        let (producer_bundle, producer_files) = producer.ok_or_else(|| {
+                            Error::rejected("reference producer snapshot is unavailable")
+                        })?;
+                        self.app_binding_receipt_library_source(
+                            &original.install_id,
+                            original.context_id.as_deref(),
+                            &original.slot,
+                            &original.proof,
+                            producer_bundle,
+                            producer_files,
+                        )?;
+                        if self.store.app_capability_status(
+                            &original.install_id,
+                            required_str(producer_bundle, "digest")?,
+                        )?["state"]
+                            != "approved"
+                        {
+                            return Err(Error::rejected(
+                                "reference producing installation is not approved",
+                            ));
+                        }
+                    }
+                    self.app_run_binding_current(run, bundle, files)
+                };
+            for slot in legacy_slots {
+                let input = json!({});
+                let input_digest = app_runs::material_digest(&input);
+                let request = format!("host-{run_id}-{slot}");
+                let call_id = format!(
+                    "app-call-{}",
+                    uuid::Uuid::new_v5(
+                        &uuid::Uuid::NAMESPACE_OID,
+                        format!("{run_id}:{slot}").as_bytes(),
+                    )
+                    .simple()
+                );
+                let mut prepared = None;
+                snap(&mut |bundle, files, producer| {
+                    let _custody = self
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    current(bundle, files, producer)?;
                     let proof = self
                         .app_binding_live(install, run["context_id"].as_str(), slot, bundle, files)?
                         .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
@@ -1383,17 +1413,6 @@ impl Shared {
                             "bound app capability is not a current read/draft action",
                         ));
                     }
-                    let input = json!({});
-                    let input_digest = app_runs::material_digest(&input);
-                    let request = format!("host-{run_id}-{slot}");
-                    let call_id = format!(
-                        "app-call-{}",
-                        uuid::Uuid::new_v5(
-                            &uuid::Uuid::NAMESPACE_OID,
-                            format!("{run_id}:{slot}").as_bytes(),
-                        )
-                        .simple()
-                    );
                     let mut authority = json!({
                         "schema":1,"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
                         "install_id":install,"context_id":run["context_id"],
@@ -1444,7 +1463,7 @@ impl Shared {
                         .app_capability_result_for_slot(run_id, slot)?
                         .is_some()
                     {
-                        continue;
+                        return Ok(());
                     }
                     let credential = self.app_capability_credential(config)?;
                     let newly_claimed = self.store.app_capability_claim(
@@ -1480,41 +1499,93 @@ impl Shared {
                     {
                         self.fresh_run_human(sealed)?;
                     }
-                    let output = match adapter.execute_app_capability_outcome(
-                        &credential,
-                        &authority,
-                        &input,
-                        &call_id,
-                    ) {
-                        Ok(output) => output,
-                        Err(error) => {
-                            let message = if crate::platform::refuse_leak(
-                                "app capability failure",
-                                error.reason(),
-                                &credential,
+                    prepared = Some((std::sync::Arc::clone(adapter), credential, authority, proof));
+                    Ok(())
+                })?;
+                let Some((adapter, credential, authority, proof)) = prepared else {
+                    continue;
+                };
+                crate::issue::lockseam::outside_lock("app-host-provider-call");
+                let output = match adapter.execute_app_capability_outcome(
+                    &credential,
+                    &authority,
+                    &input,
+                    &call_id,
+                ) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let message = if crate::platform::refuse_leak(
+                            "app capability failure",
+                            error.reason(),
+                            &credential,
+                        )
+                        .is_ok()
+                        {
+                            error.reason().chars().take(250).collect::<String>()
+                        } else {
+                            "Provider failure details were withheld because they matched credential custody.".into()
+                        };
+                        self.store.app_run_host_step_failed(
+                            run_id,
+                            &step_id,
+                            error.kind(),
+                            &message,
+                        )?;
+                        return Err(match error {
+                            crate::platform::AppCapabilityError::Refused(_) => {
+                                Error::provider(message)
+                            }
+                            crate::platform::AppCapabilityError::Uncertain(_) => {
+                                Error::unknown(message)
+                            }
+                        });
+                    }
+                };
+                // CAD-1258 interleaving point: a revoke or upgrade may land here.
+                crate::issue::lockseam::outside_lock("app-host-before-record");
+                let uncertain = |reason: &str| -> Error {
+                    let _ =
+                        self.store
+                            .app_run_host_step_failed(run_id, &step_id, "uncertain", reason);
+                    Error::unknown(reason)
+                };
+                let entered = std::cell::Cell::new(false);
+                let recorded = snap(&mut |bundle, files, producer| {
+                    entered.set(true);
+                    let _custody = self
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let live = self.store.app_run_show(run_id)?;
+                    let unchanged = current(bundle, files, producer).is_ok()
+                        && self
+                            .app_binding_live(
+                                install,
+                                run["context_id"].as_str(),
+                                slot,
+                                bundle,
+                                files,
                             )
-                            .is_ok()
-                            {
-                                error.reason().chars().take(250).collect::<String>()
-                            } else {
-                                "Provider failure details were withheld because they matched credential custody.".into()
-                            };
-                            self.store.app_run_host_step_failed(
-                                run_id,
-                                &step_id,
-                                error.kind(),
-                                &message,
-                            )?;
-                            return Err(match error {
-                                crate::platform::AppCapabilityError::Refused(_) => {
-                                    Error::provider(message)
-                                }
-                                crate::platform::AppCapabilityError::Uncertain(_) => {
-                                    Error::unknown(message)
-                                }
+                            .ok()
+                            .flatten()
+                            .is_some_and(|now| now.digest == proof.digest)
+                        && live["snapshot_digest"] == run["snapshot_digest"]
+                        && live["approval"]["human"] == run["approval"]["human"]
+                        && self
+                            .store
+                            .app_capability_status(install, required_str(bundle, "digest")?)
+                            .is_ok_and(|status| {
+                                status["state"] == "approved" && status["epoch"] == live["epoch"]
                             });
-                        }
-                    };
+                    if !unchanged {
+                        return Err(uncertain(
+                            "App authority changed while the provider call ran; the result was not retained and no automatic retry was made.",
+                        ));
+                    }
                     if crate::platform::refuse_leak(
                         "app capability result",
                         &output.result.to_string(),
@@ -1530,60 +1601,63 @@ impl Shared {
                             .is_err()
                         })
                     {
-                        let reason = "Provider output could not be safely retained; the outcome is uncertain and no automatic retry was made.";
-                        self.store.app_run_host_step_failed(
-                            run_id,
-                            &step_id,
-                            "uncertain",
-                            reason,
-                        )?;
-                        return Err(Error::unknown(reason));
+                        return Err(uncertain(
+                            "Provider output could not be safely retained; the outcome is uncertain and no automatic retry was made.",
+                        ));
                     }
-                    if let Err(_error) = self.store.app_capability_record(
-                        crate::store::app_capabilities::AppCapabilityRecord {
-                            id: &call_id,
-                            run: run_id,
-                            step: &step_id,
-                            message: "",
-                            turn: "",
-                            slot,
-                            request: &request,
-                            binding_digest: &proof.digest,
-                            input_digest: &input_digest,
-                            result: &output.result,
-                            asset: output
-                                .asset
-                                .as_ref()
-                                .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
-                        },
-                    ) {
-                        let reason = "Provider returned a result that could not be durably retained; the outcome is uncertain and no automatic retry was made.";
-                        self.store.app_run_host_step_failed(
-                            run_id,
-                            &step_id,
-                            "uncertain",
-                            reason,
-                        )?;
-                        return Err(Error::unknown(reason));
+                    if self
+                        .store
+                        .app_capability_record(
+                            crate::store::app_capabilities::AppCapabilityRecord {
+                                id: &call_id,
+                                run: run_id,
+                                step: &step_id,
+                                message: "",
+                                turn: "",
+                                slot,
+                                request: &request,
+                                binding_digest: &proof.digest,
+                                input_digest: &input_digest,
+                                result: &output.result,
+                                asset: output.asset.as_ref().map(|asset| {
+                                    (asset.media_type.as_str(), asset.bytes.as_slice())
+                                }),
+                            },
+                        )
+                        .is_err()
+                    {
+                        return Err(uncertain(
+                            "Provider returned a result that could not be durably retained; the outcome is uncertain and no automatic retry was made.",
+                        ));
                     }
+                    Ok(())
+                });
+                match recorded {
+                    Err(_) if !entered.get() => {
+                        // The snapshot itself refused (removed or changed install).
+                        return Err(uncertain(
+                            "App authority changed while the provider call ran; the result was not retained and no automatic retry was made.",
+                        ));
+                    }
+                    other => other?,
                 }
-                if finish {
-                    self.store.app_run_host_step_succeeded(run_id, &step_id)?;
-                }
-                Ok(())
-            };
-            if let Some(original) = &reference_original {
-                workspace::with_runtime_snapshot_pair(
-                    &pm,
-                    install,
-                    &original.install_id,
-                    |(bundle, files), producer| execute(bundle, files, Some(producer)),
-                )
-            } else {
-                workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
-                    execute(bundle, files, None)
-                })
             }
+            if finish {
+                snap(&mut |bundle, files, producer| {
+                    let _custody = self
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    current(bundle, files, producer)?;
+                    self.store.app_run_host_step_succeeded(run_id, &step_id)?;
+                    Ok(())
+                })?;
+            }
+            Ok(())
         };
         if account_slots.is_empty() {
             return execute_legacy(&slots, true);

@@ -1366,14 +1366,22 @@ impl Shared {
             }))
     }
 
+    /// CAD-1258: lock 1 (PM → custody → release) verifies the frozen release
+    /// and takes the exactly-once claim; the credential-bearing provider call
+    /// and read-back run with NO lock held; lock 2 re-verifies the same
+    /// authority and only then records the outcome. A release whose authority
+    /// changed meanwhile is recorded as uncertain (reconcile), never as
+    /// released, and the claim keeps the provider from being called twice.
     fn execute_app_artifact(&self, id: &str, digest: &str) -> Result<Value> {
         let frozen = self.store.app_effect_show(id)?;
         let authority = &frozen["effect"]["authority"];
         let pm = self.pm_at(&self.pm_dir()?)?;
-        workspace::with_completed_bundle_snapshot(
+        let install = required_str(authority, "install_id")?;
+        let bundle_digest = required_str(authority, "bundle_digest")?;
+        let claimed = workspace::with_completed_bundle_snapshot(
             &pm,
-            required_str(authority, "install_id")?,
-            required_str(authority, "bundle_digest")?,
+            install,
+            bundle_digest,
             |bundle, files| {
                 let _custody = self
                     .platform_custody_lock
@@ -1395,10 +1403,6 @@ impl Shared {
                     account,
                 )?;
                 let envelope = publication_smtp_envelope(legacy_smtp, &bytes)?;
-                let secret = envelope.as_ref().map_or(
-                    bytes.as_slice(),
-                    crate::platform::smtp::SmtpEnvelope::secret,
-                );
                 let row = self
                     .store
                     .app_effect_claim(id, digest, |conn, current| {
@@ -1421,99 +1425,134 @@ impl Shared {
                     .as_ref()
                     .is_some_and(|gate| !gate(&row))
                 {
-                    return self.store.app_effect_show(id);
+                    return Ok(None);
                 }
                 let adapter = self
                     .platforms
                     .get(provider)
                     .ok_or_else(|| Error::rejected("publication adapter unavailable"))?;
-                let result = adapter.execute_app_artifact(
-                    &bytes,
-                    &row.tool,
-                    &row.input,
-                    id,
-                    row.source_hash.as_deref(),
-                );
-                let verified = adapter.read_back(&row.tool, &row.input);
-                let (ok, uncertain, outcome) = match result {
-                    Ok(value) => {
-                        let outcome = json!({"kind":"released","result":value,"verified":verified});
-                        if publication_refuse_leak(
-                            legacy_smtp,
-                            "app release outcome",
-                            &outcome["result"].to_string(),
-                            secret,
-                        )
-                        .is_err()
-                        {
-                            let verified = if legacy_smtp {
-                                crate::contract_fixture::Verified::Unknown
-                            } else {
-                                verified
-                            };
-                            (
-                                false,
-                                true,
-                                json!({"kind":"uncertain","error":"provider outcome withheld","verified":verified}),
-                            )
-                        } else {
-                            (true, false, outcome)
-                        }
-                    }
-                    Err(error) if legacy_smtp => {
-                        let (uncertain, error) = match error {
-                            crate::platform::AppArtifactError::Refused(error) => (false, error),
-                            crate::platform::AppArtifactError::Uncertain(error) => (true, error),
-                        };
-                        let outcome = json!({"kind":if uncertain { "uncertain" } else { "refused" },"error":error,"verified":verified});
-                        if publication_refuse_leak(
-                            legacy_smtp,
-                            "app release error",
-                            outcome["error"].as_str().unwrap(),
-                            secret,
-                        )
-                        .is_err()
-                            || publication_refuse_leak(
-                                legacy_smtp,
-                                "app release error",
-                                &outcome["error"].to_string(),
-                                secret,
-                            )
-                            .is_err()
-                        {
-                            (
-                                false,
-                                true,
-                                json!({"kind":"uncertain","error":"provider error withheld","verified":crate::contract_fixture::Verified::Unknown}),
-                            )
-                        } else {
-                            (false, uncertain, outcome)
-                        }
-                    }
-                    Err(error) => {
-                        let (uncertain, error) = match error {
-                            crate::platform::AppArtifactError::Refused(error) => (false, error),
-                            crate::platform::AppArtifactError::Uncertain(error) => (true, error),
-                        };
-                        let error =
-                            if crate::platform::refuse_leak("app release error", &error, &bytes)
-                                .is_err()
-                            {
-                                "provider error withheld".to_string()
-                            } else {
-                                error
-                            };
-                        (
-                            false,
-                            uncertain,
-                            json!({"kind":if uncertain { "uncertain" } else { "refused" },"error":error,"verified":verified}),
-                        )
-                    }
+                Ok(Some((
+                    row,
+                    Arc::clone(adapter),
+                    bytes,
+                    envelope,
+                    legacy_smtp,
+                )))
+            },
+        )?;
+        let Some((row, adapter, bytes, envelope, legacy_smtp)) = claimed else {
+            return self.store.app_effect_show(id);
+        };
+        let secret = envelope.as_ref().map_or(
+            bytes.as_slice(),
+            crate::platform::smtp::SmtpEnvelope::secret,
+        );
+        crate::issue::lockseam::outside_lock("app-release-provider-call");
+        let result = adapter.execute_app_artifact(
+            &bytes,
+            &row.tool,
+            &row.input,
+            id,
+            row.source_hash.as_deref(),
+        );
+        let verified = adapter.read_back(&row.tool, &row.input);
+        let (ok, uncertain, outcome) = match result {
+            Ok(value) => {
+                let outcome = json!({"kind":"released","result":value,"verified":verified});
+                if publication_refuse_leak(
+                    legacy_smtp,
+                    "app release outcome",
+                    &outcome["result"].to_string(),
+                    secret,
+                )
+                .is_err()
+                {
+                    let verified = if legacy_smtp {
+                        crate::contract_fixture::Verified::Unknown
+                    } else {
+                        verified
+                    };
+                    (
+                        false,
+                        true,
+                        json!({"kind":"uncertain","error":"provider outcome withheld","verified":verified}),
+                    )
+                } else {
+                    (true, false, outcome)
+                }
+            }
+            Err(error) if legacy_smtp => {
+                let (uncertain, error) = match error {
+                    crate::platform::AppArtifactError::Refused(error) => (false, error),
+                    crate::platform::AppArtifactError::Uncertain(error) => (true, error),
                 };
+                let outcome = json!({"kind":if uncertain { "uncertain" } else { "refused" },"error":error,"verified":verified});
+                if publication_refuse_leak(
+                    legacy_smtp,
+                    "app release error",
+                    outcome["error"].as_str().unwrap(),
+                    secret,
+                )
+                .is_err()
+                    || publication_refuse_leak(
+                        legacy_smtp,
+                        "app release error",
+                        &outcome["error"].to_string(),
+                        secret,
+                    )
+                    .is_err()
+                {
+                    (
+                        false,
+                        true,
+                        json!({"kind":"uncertain","error":"provider error withheld","verified":crate::contract_fixture::Verified::Unknown}),
+                    )
+                } else {
+                    (false, uncertain, outcome)
+                }
+            }
+            Err(error) => {
+                let (uncertain, error) = match error {
+                    crate::platform::AppArtifactError::Refused(error) => (false, error),
+                    crate::platform::AppArtifactError::Uncertain(error) => (true, error),
+                };
+                let error =
+                    if crate::platform::refuse_leak("app release error", &error, &bytes).is_err() {
+                        "provider error withheld".to_string()
+                    } else {
+                        error
+                    };
+                (
+                    false,
+                    uncertain,
+                    json!({"kind":if uncertain { "uncertain" } else { "refused" },"error":error,"verified":verified}),
+                )
+            }
+        };
+        // CAD-1258 interleaving point: a revoke or upgrade may land here.
+        crate::issue::lockseam::outside_lock("app-release-before-record");
+        let entered = std::cell::Cell::new(false);
+        let recorded = workspace::with_completed_bundle_snapshot(
+            &pm,
+            install,
+            bundle_digest,
+            |bundle, files| {
+                entered.set(true);
+                let _custody = self
+                    .platform_custody_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if self.app_release_current(authority, bundle, files).is_err() {
+                    return Ok(None);
+                }
                 if uncertain {
                     let effect = self.store.app_effect_uncertain(id, &outcome)?;
                     self.wake();
-                    return Ok(effect);
+                    return Ok(Some(effect));
                 }
                 self.store.effect_outcome(
                     id,
@@ -1526,9 +1565,22 @@ impl Shared {
                     },
                 )?;
                 self.wake();
-                self.store.app_effect_show(id)
+                Ok(Some(self.store.app_effect_show(id)?))
             },
-        )
+        );
+        match recorded {
+            Ok(Some(effect)) => Ok(effect),
+            Err(error) if entered.get() => Err(error),
+            // The snapshot refused (removed or changed install) or the
+            // re-check did: the call already happened, so leave an honest
+            // reconcile record, never a release or a silent drop.
+            _ => {
+                let outcome = json!({"kind":"uncertain","error":"app release authority changed during the provider call; outcome not recorded as released","verified":crate::contract_fixture::Verified::Unknown});
+                let effect = self.store.app_effect_uncertain(id, &outcome)?;
+                self.wake();
+                Ok(effect)
+            }
+        }
     }
 }
 
