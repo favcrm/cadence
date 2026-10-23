@@ -1579,3 +1579,143 @@ fn cad1767_member_agent_detail_events_carry_no_master_home_text() {
         "master Home text in a member's agent detail: {wrong:#?}"
     );
 }
+
+// ------------------------------- G2 round 4: no message bodies in the detail
+
+/// Every JSON path in `value` whose string contains `needle`.
+fn paths_with(value: &Value, needle: &str, path: &str, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) if s.contains(needle) => out.push(path.to_string()),
+        Value::Object(map) => {
+            for (k, v) in map {
+                paths_with(v, needle, &format!("{path}.{k}"), out);
+            }
+        }
+        Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                paths_with(v, needle, &format!("{path}[{i}]"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+const BODY_QUEUED: &str = "queued-body-needle-a";
+const BODY_RUNNING: &str = "running-body-needle-b";
+const RESULT_DONE: &str = "finished-result-needle-c";
+
+/// Queue `id` with `body` to `alias` as the operator (thread_send for the
+/// master, agent_send otherwise) and optionally make it run or finish.
+fn turn(fx: &Fx, store: &Store, alias: &str, id: &str, body: &str, to: &str, result: Option<&str>) {
+    let verb = if alias == "master" {
+        "thread_send"
+    } else {
+        "agent_send"
+    };
+    fx.op(verb, json!({"alias": alias, "text": body, "message": id}));
+    if to == "queued" {
+        return;
+    }
+    let token = cadence_agent::adapter::registry::PI_MANAGED_TURN_TOKENS
+        .mint("0123456789abcdef0123456789abcdef");
+    rusqlite::Connection::open(fx.state().join("cadence.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE messages SET state='submitting', started=1.0 WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+    store.mark_running(id, &token).unwrap();
+    if let Some(text) = result {
+        let message = store.message(id).unwrap().unwrap();
+        store
+            .finish(
+                &message,
+                "completed",
+                &json!({"status": "completed", "text": text}),
+                None,
+            )
+            .unwrap();
+    }
+}
+
+/// Needle → JSON paths in a detail payload.
+fn body_paths(body: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for needle in [BODY_QUEUED, BODY_RUNNING, RESULT_DONE] {
+        let mut paths = Vec::new();
+        paths_with(body, needle, "$", &mut paths);
+        out.extend(paths.into_iter().map(|p| format!("{needle} @ {p}")));
+    }
+    out
+}
+
+/// A member's agent detail of the master carries no message body or turn
+/// result anywhere, also through the native ids; the owner's carries them.
+#[test]
+fn cad1767_member_agent_detail_carries_no_message_bodies() {
+    let fx = Fx::start(Board::Public);
+    let (store, _home) = master_with_home(&fx);
+    turn(
+        &fx,
+        &store,
+        "master",
+        "m-done",
+        "asked before",
+        "running",
+        Some(RESULT_DONE),
+    );
+    turn(
+        &fx,
+        &store,
+        "master",
+        "m-run",
+        BODY_RUNNING,
+        "running",
+        None,
+    );
+    turn(
+        &fx,
+        &store,
+        "master",
+        "m-queued",
+        BODY_QUEUED,
+        "queued",
+        None,
+    );
+    let owner = fx.platform_cookie("owner");
+    let member = fx.platform_cookie("member");
+    let mut wrong = Vec::new();
+    for name in ["master", NATIVE_THREAD, NATIVE_SESSION] {
+        let route = format!("/api/agents/{name}");
+        let op = fx.http(&Asserted::Operator, "GET", &route, None, Some(&owner), None);
+        let op_paths = body_paths(&op.body);
+        eprintln!("CAD-1767 owner {route}: {op_paths:?}");
+        if name == "master" {
+            for needle in [BODY_RUNNING, RESULT_DONE] {
+                if !op_paths.iter().any(|p| p.starts_with(needle)) {
+                    wrong.push(format!("control {route}: owner lacks {needle}"));
+                }
+            }
+        }
+        let m = fx.http(
+            &Asserted::Operator,
+            "GET",
+            &route,
+            None,
+            Some(&member),
+            None,
+        );
+        let paths = body_paths(&m.body);
+        if m.status == 200 && !paths.is_empty() {
+            wrong.push(format!("{route}: member payload carries {paths:?}"));
+        }
+        if m.status != 200 && m.raw.contains("needle") {
+            wrong.push(format!("{route}: member error carries a body: {}", m.raw));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "message bodies in a member's agent detail: {wrong:#?}"
+    );
+}
