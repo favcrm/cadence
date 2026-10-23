@@ -97,6 +97,7 @@ mod cad1713_dev_provider_gate;
 mod cad1726_artifact_put_file_confinement;
 mod cad1752_recruit_refusal_acceptance;
 mod cad1767_followup_acceptance;
+mod cad1772_recruit_page_acceptance;
 mod cad508_restart_window;
 mod cad832_sharing_refusal;
 mod cad848_lifecycle_serialization;
