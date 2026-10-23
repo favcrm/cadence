@@ -1546,10 +1546,27 @@ impl Shared {
                 let failed = std::cell::Cell::new(false);
                 let uncertain = |reason: &str| -> Error {
                     failed.set(true);
-                    let _ =
-                        self.store
-                            .app_run_host_step_failed(run_id, &step_id, "uncertain", reason);
-                    Error::unknown(reason)
+                    // The normal record reads the run's snapshot; if that read
+                    // is what failed, fall back to raw columns. If both
+                    // writes fail, say so rather than claim a record.
+                    let recorded = self
+                        .store
+                        .app_run_host_step_failed(run_id, &step_id, "uncertain", reason)
+                        .map(|_| ())
+                        .or_else(|_| {
+                            self.store.app_run_host_step_failed_unreadable(
+                                run_id,
+                                &step_id,
+                                "uncertain",
+                                reason,
+                            )
+                        });
+                    match recorded {
+                        Ok(()) => Error::unknown(reason),
+                        Err(error) => Error::unknown(format!(
+                            "{reason} (the failure could not be recorded: {error})"
+                        )),
+                    }
                 };
                 let recorded = snap(&mut |bundle, files, producer| {
                     let _custody = self
@@ -1605,30 +1622,28 @@ impl Shared {
                             "Provider output could not be safely retained; the outcome is uncertain and no automatic retry was made.",
                         ));
                     }
-                    if self
-                        .store
-                        .app_capability_record(
-                            crate::store::app_capabilities::AppCapabilityRecord {
-                                id: &call_id,
-                                run: run_id,
-                                step: &step_id,
-                                message: "",
-                                turn: "",
-                                slot,
-                                request: &request,
-                                binding_digest: &proof.digest,
-                                input_digest: &input_digest,
-                                result: &output.result,
-                                asset: output.asset.as_ref().map(|asset| {
-                                    (asset.media_type.as_str(), asset.bytes.as_slice())
-                                }),
-                            },
-                        )
-                        .is_err()
-                    {
-                        return Err(uncertain(
-                            "Provider returned a result that could not be durably retained; the outcome is uncertain and no automatic retry was made.",
-                        ));
+                    if let Err(error) = self.store.app_capability_record(
+                        crate::store::app_capabilities::AppCapabilityRecord {
+                            id: &call_id,
+                            run: run_id,
+                            step: &step_id,
+                            message: "",
+                            turn: "",
+                            slot,
+                            request: &request,
+                            binding_digest: &proof.digest,
+                            input_digest: &input_digest,
+                            result: &output.result,
+                            asset: output
+                                .asset
+                                .as_ref()
+                                .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
+                        },
+                    ) {
+                        let cause = super::app_effects_rpc::lock2_cause(&error, &credential);
+                        return Err(uncertain(&format!(
+                            "Provider returned a result that could not be durably retained ({cause}); the outcome is uncertain and no automatic retry was made."
+                        )));
                     }
                     Ok(())
                 });

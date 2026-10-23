@@ -1030,24 +1030,25 @@ impl Shared {
                             &credential,
                         )?;
                     }
-                    self.store.app_capability_record(
-                        crate::store::app_capabilities::AppCapabilityRecord {
-                            id: &call_id,
-                            run: &run_id,
-                            step: &step,
-                            message,
-                            turn,
-                            slot: &slot,
-                            request: &request,
-                            binding_digest: &proof.digest,
-                            input_digest: &input_digest,
-                            result: &output.result,
-                            asset: output
-                                .asset
-                                .as_ref()
-                                .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
-                        },
-                    )
+                    self.store
+                        .app_capability_record(
+                            crate::store::app_capabilities::AppCapabilityRecord {
+                                id: &call_id,
+                                run: &run_id,
+                                step: &step,
+                                message,
+                                turn,
+                                slot: &slot,
+                                request: &request,
+                                binding_digest: &proof.digest,
+                                input_digest: &input_digest,
+                                result: &output.result,
+                                asset: output.asset.as_ref().map(|asset| {
+                                    (asset.media_type.as_str(), asset.bytes.as_slice())
+                                }),
+                            },
+                        )
+                        .map_err(|error| Error::internal(error.to_string()))
                 });
                 if let Err(error) = &recorded {
                     // The provider answered but lock 2 refused or could not
