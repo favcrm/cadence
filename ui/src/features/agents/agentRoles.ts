@@ -52,7 +52,7 @@ export function aliasProblem(alias: string, taken: Iterable<string>): string | n
 
 /** Known app ids → the roles that work in them. */
 const APP_ROLE_HINTS: { match: RegExp; label: string; roles: string[] }[] = [
-  { match: /crm/i, label: "CRM", roles: ["quotation", "sales"] },
+  { match: /crm/i, label: "CRM", roles: ["quotation", "support"] },
   { match: /invoice/i, label: "Invoices", roles: ["accountant"] },
 ];
 
@@ -69,6 +69,10 @@ export function suggestedRoles(
     labels.push(hint.label);
     for (const id of hint.roles) if (!ids.includes(id)) ids.push(id);
   }
+  // The approved order: Quotation, Accountant, Support; any other role after.
+  const order = ["quotation", "accountant", "support"];
+  const rank = (id: string) => (order.includes(id) ? order.indexOf(id) : order.length);
+  ids.sort((a, b) => rank(a) - rank(b));
   return {
     roles: ids.flatMap((id) => roles.filter((role) => role.id === id)),
     labels,

@@ -3,6 +3,7 @@ import { useTranslate } from "../../lib/locale";
 import { navigate } from "../../lib/useLocation";
 import { resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
+import Md from "../../ui/Md";
 import Button from "../../ui/Button";
 import { HireBlock } from "../auth/WriteGate";
 import type { ThreadEntry } from "../home/thread";
@@ -48,7 +49,11 @@ export default function HireProposalCard({
   }
   return (
     <div className="rc-proposal" data-kind="hire-proposal">
-      {reason && <p className="rc-proposal-why">{reason}</p>}
+      {reason && (
+        <div className="rc-proposal-why">
+          <Md text={reason} />
+        </div>
+      )}
       <RoleCard role={role} payload={roles.data} onPick={() => setOpen(true)} />
       <HireGate reason={hireBlock} />
       {hired ? (
