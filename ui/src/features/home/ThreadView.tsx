@@ -220,6 +220,8 @@ export function ThreadItemView({
         </Bubble>
       );
     }
+    case "thinking":
+      return <ThinkingNote entry={item.entry} />;
     case "commentary":
       return (
         <div
@@ -281,6 +283,41 @@ export function ThreadItemView({
       );
     }
   }
+}
+
+/**
+ * CAD-1782: the assistant's reasoning, collapsed. The answer follows as its
+ * own row, so reasoning is context rather than part of the reply.
+ */
+function ThinkingNote({ entry }: { entry: ThreadEntry }) {
+  const t = useTranslate();
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="steps thinknote min-w-0" data-kind="thinking" data-open={open || undefined}>
+      <button
+        type="button"
+        className="steps-head"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <span className="steps-caret num shrink-0" aria-hidden>
+          ›
+        </span>
+        <span className="shrink-0">{t("Thinking")}</span>
+        <span className="num truncate min-w-0 text-ink-500">· {stepSummary(entry.text)}</span>
+      </button>
+      <div className="steps-body">
+        <div className="steps-inner">
+          <div
+            className="text-secondary text-ink-400 italic whitespace-pre-wrap break-words min-w-0"
+            data-thinking-body
+          >
+            {entry.text}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /**
