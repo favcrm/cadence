@@ -4,7 +4,7 @@ import { navigate } from "../../lib/useLocation";
 import { resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
 import Button from "../../ui/Button";
-import { WriteGate } from "../auth/WriteGate";
+import { HireBlock } from "../auth/WriteGate";
 import type { ThreadEntry } from "../home/thread";
 import type { AgentRole } from "../../lib/types";
 import HireSheet from "./HireSheet";
@@ -23,7 +23,7 @@ export default function HireProposalCard({
   reason: string | null;
 }) {
   const t = useTranslate();
-  const writeBlock = useContext(WriteGate);
+  const writeBlock = useContext(HireBlock);
   const roles = useAgentRoles();
   const roster = useQuery(resources.agents);
   const [open, setOpen] = useState(false);

@@ -6,7 +6,7 @@ import { navigate } from "../../lib/useLocation";
 import { setComposerDraft } from "../app-shell/chat/composerStore";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
-import { WriteGate } from "../auth/WriteGate";
+import { HireBlock, WriteGate } from "../auth/WriteGate";
 import type { Agent, AgentDetail, AgentRole } from "../../lib/types";
 import { AgentActivity, AgentQueue, WorkBlock } from "./AgentBlocks";
 import { ProfileBlock } from "./AgentProfile";
@@ -387,7 +387,7 @@ function History({ c }: { c: TabContext }) {
 
 function Job({ c }: { c: TabContext }) {
   const t = useTranslate();
-  const writeBlock = useContext(WriteGate);
+  const writeBlock = useContext(HireBlock);
   // The board serves the saved text to the operator only; anyone else sees
   // the role's job line in the hero and no text box.
   const served = c.detail?.agent.instructions ?? null;

@@ -3,7 +3,7 @@ import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
-import { WriteGate } from "../auth/WriteGate";
+import { HireBlock } from "../auth/WriteGate";
 import type { AgentRole, AgentRolesPayload } from "../../lib/types";
 import AgentAvatar from "./AgentAvatar";
 import { HireGate } from "./RecruitCards";
@@ -40,7 +40,7 @@ export default function HireSheet({
   onHired: (alias: string, role: AgentRole) => void;
 }) {
   const t = useTranslate();
-  const writeBlock = useContext(WriteGate);
+  const writeBlock = useContext(HireBlock);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [alias, setAlias] = useState(suggested);
   const [job, setJob] = useState(startJob ?? role.instructions);

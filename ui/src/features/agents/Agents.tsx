@@ -16,7 +16,7 @@ import { resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
 import { setComposerDraft } from "../app-shell/chat/composerStore";
 import Button from "../../ui/Button";
-import { WriteGate } from "../auth/WriteGate";
+import { HireBlock, WriteGate } from "../auth/WriteGate";
 import { activeTasks, AgentActivity, WorkBlock } from "./AgentBlocks";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
 import AgentPage from "./AgentPage";
@@ -322,7 +322,7 @@ export default function Agents({
   const [joined, setJoined] = useState<{ alias: string; role: AgentRole } | null>(null);
   const roles = useAgentRoles();
   const installed = useQuery(resources.apps);
-  const writeBlock = useContext(WriteGate);
+  const writeBlock = useContext(HireBlock);
   const payload = state.data;
   const scopeUnavailable = project !== "all" && issuesState.data === null;
   const issueProjects = issueIndex(issuesState.data ?? []);

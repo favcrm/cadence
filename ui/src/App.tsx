@@ -62,8 +62,8 @@ import Setup from "./features/setup/Setup";
 import SetupNudge from "./features/setup/SetupNudge";
 import AuthBoundary from "./features/auth/AuthBoundary";
 import SignIn from "./features/auth/SignIn";
-import { kickoffBlock as operatorKickoffBlock, writeBlock } from "./features/auth/gate";
-import { WriteGate } from "./features/auth/WriteGate";
+import { hireBlock, kickoffBlock as operatorKickoffBlock, writeBlock } from "./features/auth/gate";
+import { HireBlock, WriteGate } from "./features/auth/WriteGate";
 import { sessionHeaders } from "./lib/sessionKey";
 import { onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration, withPrivateOperation } from "./lib/privateSession";
 import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
@@ -857,6 +857,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         ? "The access check could not confirm this session — writes stay off until it answers."
         : "Checking write access…"
       : block}>
+    <HireBlock.Provider value={meta === null
+      ? metaUnavailable
+        ? "The access check could not confirm this session — hiring stays off until it answers."
+        : "Checking write access…"
+      : hireBlock(meta)}>
     <div
       data-app-shell
       className={`grid lg:grid-cols-[208px_minmax(0,1fr)] bg-ink-900 ${
@@ -1340,6 +1345,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       <Toast msg={toast} />
       <CanvasDrawer />
     </div>
+    </HireBlock.Provider>
     </WriteGate.Provider>
   );
 }
