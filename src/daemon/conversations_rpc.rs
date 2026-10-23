@@ -61,7 +61,8 @@ fn campaign_of(subject: &str) -> Result<&str> {
 }
 
 /// A conversation's identity for the session-switch rule: every home
-/// message (or one with no thread) is one key.
+/// message (or one with no thread) is one key. The Recruit conversation
+/// keeps its own key: it runs as Home but never shares Home's session.
 fn session_key(thread: Option<&store::Thread>) -> String {
     match thread {
         Some(t) if !t.is_home() => t.id.clone(),
@@ -139,7 +140,7 @@ impl Shared {
             None => None,
         };
         let profile = match &target {
-            Some(t) if !t.is_home() && !t.is_recruit() => master::Profile::App,
+            Some(t) if !t.runs_as_home() => master::Profile::App,
             _ => master::Profile::Home,
         };
         // Same conversation as the last delivered message AND a session

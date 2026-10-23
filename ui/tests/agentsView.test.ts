@@ -273,9 +273,8 @@ async function main() {
     "a working seat names its issue in the one-line status",
   );
   assert(
-    Array.from(host.querySelectorAll(".rc-seat")).find((row) => row.textContent?.includes("blocked"))?.textContent?.includes("Fenced — holding work") === false ||
-      Array.from(host.querySelectorAll(".rc-seat")).find((row) => row.textContent?.includes("blocked"))?.textContent?.includes("Fenced"),
-    "a fenced seat says so in its status line",
+    Array.from(host.querySelectorAll(".rc-seat")).find((row) => row.textContent?.includes("blocked"))?.textContent?.includes("Attention"),
+    "a fenced seat reads Attention in its status line",
   );
   await click("All6");
   assert(aliases().length === 6, "All keeps stopped workers and mailboxes discoverable");

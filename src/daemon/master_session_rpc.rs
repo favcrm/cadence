@@ -210,8 +210,7 @@ impl Shared {
         };
         if thread.alias != alias
             || thread.archived
-            || thread.is_home()
-            || thread.is_recruit()
+            || thread.runs_as_home()
             || thread.id.is_empty()
             || thread.subject.is_some()
         {
@@ -255,8 +254,7 @@ impl Shared {
             if current_thread.id != conversation_id
                 || current_thread.alias != alias
                 || current_thread.archived
-                || current_thread.is_home()
-                || current_thread.is_recruit()
+                || current_thread.runs_as_home()
                 || current_thread.subject.is_some()
                 || current_thread.install_id.as_deref() != Some(install)
             {

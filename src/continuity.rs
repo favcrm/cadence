@@ -311,7 +311,7 @@ pub fn gather_for(
         Some(thread) => store.continuity_entries_of(&thread.id, current, SOURCE_ENTRIES)?,
         None => (Vec::new(), 0),
     };
-    let plan_scope = thread.is_none_or(|t| t.is_home());
+    let plan_scope = thread.is_none_or(|t| t.runs_as_home());
     let (plans, plan_error) = match pm_dir.filter(|_| plan_scope) {
         Some(dir) => match plan_state(dir, alias, crate::master::is_master(alias)) {
             Ok(plans) => (plans, None),

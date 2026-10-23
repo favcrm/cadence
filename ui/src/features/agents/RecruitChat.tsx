@@ -7,6 +7,8 @@ import Button from "../../ui/Button";
 import AgentAvatar from "./AgentAvatar";
 import HireProposalCard from "./HireProposalCard";
 import { addPending, loadThread, newMessageId, settlePending, threadItems, type ThreadItem, type ThreadState } from "../home/thread";
+import { useThreadStream } from "../app-shell/chat/conversationThread";
+import Md from "../../ui/Md";
 import { HireGate } from "./RecruitCards";
 
 /** The master's Recruit conversation store (CAD-1772), one per conversation id. */
@@ -75,9 +77,14 @@ function Chat({ conversation }: { conversation: string }) {
   const thread = useResource(store);
   useEffect(() => {
     void store.revalidate();
-    const timer = setInterval(() => void store.refresh(), 3000);
-    return () => clearInterval(timer);
   }, [store]);
+  // Live entries over the thread stream, as Home does - no polling.
+  useThreadStream(
+    store,
+    `/api/threads/master/stream?conversation=${encodeURIComponent(conversation)}`,
+    thread.data !== null,
+    () => {},
+  );
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const send = useCallback(
     (text: string, message = newMessageId()) => {
@@ -131,7 +138,7 @@ function Chat({ conversation }: { conversation: string }) {
         const next = items[index + 1];
         return (
           <Master key={item.key}>
-            {item.entry.text}
+            <Md text={item.entry.text} />
             {next?.type === "hire" && !next.reason && <HireProposalCard entry={next.entry} reason={null} />}
           </Master>
         );

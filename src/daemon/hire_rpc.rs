@@ -36,7 +36,7 @@ impl Shared {
             .ok_or_else(|| {
                 Error::rejected("hire propose: the turn's conversation cannot be resolved")
             })?;
-        if !(thread.is_home() || thread.is_recruit()) {
+        if !thread.runs_as_home() {
             return Err(Error::rejected(
                 "hire propose is made in the master's Home or Recruit conversation",
             ));
