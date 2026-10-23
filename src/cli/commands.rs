@@ -86,6 +86,31 @@ pub(crate) enum Commands {
         #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
         settings: bool,
     },
+    /// Create a hosted workspace in the browser and approve this CLI. Opens
+    /// the AgenticOS registration page, waits for email OTP, workspace
+    /// creation and owner consent, then saves the issued credential. The
+    /// terminal never asks for an OTP, password, API key or payment detail.
+    Register {
+        /// Optional workspace name to prefill on the registration page.
+        #[arg(long)]
+        name: Option<String>,
+        /// Optional workspace slug to prefill on the registration page.
+        #[arg(long)]
+        slug: Option<String>,
+        /// AgenticOS HTTPS issuer origin (no path). Defaults to the hosted
+        /// issuer; a custom origin needs the operator-pinned trusted issuer.
+        #[arg(long)]
+        issuer: Option<String>,
+        /// Select the new workspace as the saved default.
+        #[arg(long = "use")]
+        use_: bool,
+        /// Print the registration/consent URL without opening a browser.
+        #[arg(long)]
+        no_open: bool,
+        /// Isolated credential directory; defaults to XDG_CONFIG_HOME/cadence/remote-auth.
+        #[arg(long)]
+        auth_dir: Option<PathBuf>,
+    },
     /// Inspect or remove local AgenticOS credentials.
     Auth {
         #[command(subcommand)]

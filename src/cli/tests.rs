@@ -133,6 +133,18 @@ fn remote_auth_cli_supports_hosted_portal_and_never_accepts_token_argv() {
     );
     assert!(Cli::try_parse_from(["cadence", "login", "--token", "secret"]).is_err());
     assert!(Cli::try_parse_from(["cadence", "login", "--token-stdin"]).is_err());
+    assert!(Cli::try_parse_from(["cadence", "register"]).is_ok());
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "register",
+        "--name",
+        "Acme Labs",
+        "--slug",
+        "acme-labs",
+        "--use",
+        "--no-open"
+    ])
+    .is_ok());
     assert!(Cli::try_parse_from([
         "cadence",
         "auth",

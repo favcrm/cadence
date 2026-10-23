@@ -13,21 +13,32 @@ mod providers;
 
 fn show_login_code(url: &str, code: &str, no_open: bool) -> Result<()> {
     eprintln!("Approve hosted Cadence access at: {url}\nCode: {code}");
-    if !no_open {
-        let program = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        let mut opener = std::process::Command::new(program);
-        opener
-            .arg(url)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let _ = cadence_agent::reaper::spawn(&mut opener);
-    }
+    open_login_url(url, no_open);
     Ok(())
+}
+
+fn show_register_code(url: &str, code: &str, no_open: bool) -> Result<()> {
+    eprintln!("Complete registration and approve this CLI at: {url}\nDevice code: {code}");
+    open_login_url(url, no_open);
+    Ok(())
+}
+
+fn open_login_url(url: &str, no_open: bool) {
+    if no_open {
+        return;
+    }
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let mut opener = std::process::Command::new(program);
+    opener
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _ = cadence_agent::reaper::spawn(&mut opener);
 }
 
 pub(crate) fn run() -> Result<i32> {
@@ -204,6 +215,38 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     }
     // Remote credentials are independent of local daemon state and sandbox adoption.
     match &cli.command {
+        Commands::Register {
+            name,
+            slug,
+            issuer,
+            use_,
+            no_open,
+            auth_dir,
+        } => {
+            let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
+            let issuer = issuer
+                .as_deref()
+                .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
+            let grant = cadence_agent::remote_enrollment::register_portal(
+                issuer,
+                name.as_deref(),
+                slug.as_deref(),
+                &dir,
+                |url, code| show_register_code(url, code, *no_open),
+            )?;
+            org::record_remote(
+                &grant.slug,
+                &grant.endpoint,
+                &grant.organization_id,
+                *use_,
+                || grant.save_credential(&dir),
+            )?;
+            println!(
+                "Registered and signed in to {} ({})",
+                grant.slug, grant.endpoint
+            );
+            return Ok(0);
+        }
         Commands::Login {
             hint,
             issuer,
@@ -511,6 +554,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
 pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
     match command {
         Commands::Remote { .. }
+        | Commands::Register { .. }
         | Commands::Login { .. }
         | Commands::Auth { .. }
         | Commands::Web { .. } => {
