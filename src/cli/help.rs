@@ -123,6 +123,7 @@ const ADVANCED: &[&str] = &[
     "monitor",
     "overview",
     "project",
+    "register",
     "remote",
     "report",
     "resume",

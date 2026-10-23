@@ -96,8 +96,20 @@ For imported tokens, expiry is unknown locally and checked by the issuer.
 ## Hosted login and remote org transport (CAD-1019, CAD-1329)
 
 For a first login, run `cadence login`. The CLI opens the trusted hosted
-AgenticOS portal, where you choose a workspace and approve access. To
-preselect a workspace, use `cadence login <slug>`; the issuer verifies
+AgenticOS portal, where you choose a workspace and approve access.
+
+To create a workspace, run `cadence register` (optionally with `--name`
+and `--slug` to prefill the browser form). It starts the same hosted device
+grant, opens the AgenticOS registration page, and waits while you complete
+email OTP, workspace terms and owner consent. After registration the page
+continues to the consent screen, and the CLI saves the credential and
+records the new remote org exactly like `cadence login`. The terminal never
+asks for an OTP, password, API key or payment detail. Use `--use` to select
+the new workspace as the saved default, `--no-open` to print the
+registration URL instead of opening a browser, and `--json` for
+machine-readable success or failure state.
+
+To preselect a workspace, use `cadence login <slug>`; the issuer verifies
 that selection and returns the authoritative workspace ID and slug. The
 CLI validates the returned slug and canonical audience before recording
 the remote org and credential. Re-running `cadence login <slug>` after the

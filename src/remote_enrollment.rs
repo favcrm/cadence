@@ -2680,6 +2680,114 @@ pub fn login_portal_scoped(
     )
 }
 
+/// Start a hosted login device grant from the CLI registration entry point.
+/// The browser first completes workspace registration at `/register`, then
+/// continues to the normal hosted consent page. No credential is issued by
+/// the registration page itself; the existing device token exchange remains
+/// the only bearer-issuing step.
+pub fn register_portal(
+    issuer: &str,
+    name: Option<&str>,
+    workspace_slug: Option<&str>,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+) -> Result<LoginGrant> {
+    register_portal_with(
+        issuer,
+        name,
+        workspace_slug,
+        dir,
+        show_code,
+        &mut RealLoginRuntime,
+    )
+}
+
+fn register_portal_with(
+    issuer: &str,
+    name: Option<&str>,
+    workspace_slug: Option<&str>,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+    runtime: &mut dyn LoginRuntime,
+) -> Result<LoginGrant> {
+    let issuer = origin(issuer, cfg!(test))?;
+    if let Some(name) = name {
+        if name.is_empty() || name.len() > 80 || name.chars().any(char::is_control) {
+            return Err(reject("Invalid workspace name"));
+        }
+    }
+    if let Some(slug_value) = workspace_slug {
+        if !slug(slug_value) {
+            return Err(reject("Invalid workspace slug"));
+        }
+    }
+    login_device_flow(
+        &issuer,
+        None,
+        None,
+        dir,
+        |verification, code| {
+            let registration = registration_url(verification, name, workspace_slug)?;
+            show_code(&registration, code)
+        },
+        runtime,
+        LoginScope::Wiki,
+    )
+}
+
+/// Build the `/register` handoff from the issuer's device consent URL. The
+/// `after` value is the consent URL's path and query; validation keeps the
+/// browser on the issuer's HTTPS origin.
+fn registration_url(
+    verification: &str,
+    name: Option<&str>,
+    workspace_slug: Option<&str>,
+) -> Result<String> {
+    let uri: ureq::http::Uri = verification
+        .parse()
+        .map_err(|_| reject("Invalid registration handoff URL"))?;
+    let authority = uri
+        .authority()
+        .ok_or_else(|| reject("Registration handoff URL must be absolute"))?;
+    if uri.scheme_str() != Some("https")
+        || authority.as_str().contains('@')
+        || uri.path().is_empty()
+        || uri.path() == "/"
+        || verification.contains('#')
+    {
+        return Err(reject("Registration handoff URL must be HTTPS"));
+    }
+    let after = match uri.query() {
+        Some(query) => format!("{}?{query}", uri.path()),
+        None => uri.path().to_owned(),
+    };
+    let mut query = vec![format!("after={}", query_encode(&after))];
+    if let Some(name) = name {
+        query.push(format!("name={}", query_encode(name)));
+    }
+    if let Some(slug) = workspace_slug {
+        query.push(format!("slug={}", query_encode(slug)));
+    }
+    Ok(format!(
+        "https://{}/register?{}",
+        authority,
+        query.join("&")
+    ))
+}
+
+fn query_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 fn login_browser_with(
     issuer: &str,
     org: &str,
@@ -2980,6 +3088,65 @@ mod tests {
             Some("0b2e1f4a-7c3d-4e5f-8a9b-1c2d3e4f5a6g")
         )
         .is_none());
+    }
+
+    #[test]
+    fn registration_handoff_keeps_the_consent_path_and_encodes_intent() {
+        let url = super::registration_url(
+            "https://app.agenticos.hk/device/hosted-cadence?code=K7PM-2QNF",
+            Some("Acme Labs"),
+            Some("acme-labs"),
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://app.agenticos.hk/register?after=%2Fdevice%2Fhosted-cadence%3Fcode%3DK7PM-2QNF&name=Acme%20Labs&slug=acme-labs"
+        );
+        assert_eq!(
+            super::registration_url(
+                "https://app.agenticos.hk/device/hosted-cadence?code=K7PM-2QNF",
+                None,
+                None,
+            )
+            .unwrap(),
+            "https://app.agenticos.hk/register?after=%2Fdevice%2Fhosted-cadence%3Fcode%3DK7PM-2QNF"
+        );
+    }
+
+    #[test]
+    fn registration_handoff_refuses_non_https_and_fragments() {
+        assert!(super::registration_url(
+            "http://app.agenticos.hk/device/hosted-cadence?code=K7PM-2QNF",
+            None,
+            None,
+        )
+        .is_err());
+        assert!(
+            super::registration_url("https://app.agenticos.hk/device#fragment", None, None,)
+                .is_err()
+        );
+        assert!(super::registration_url("https://app.agenticos.hk/", None, None).is_err());
+    }
+
+    #[test]
+    fn register_portal_refuses_unsafe_intent_before_network() {
+        let dir = std::path::Path::new("/nonexistent");
+        assert!(super::register_portal(
+            "https://api.example.com",
+            Some("bad\nname"),
+            None,
+            dir,
+            |_, _| Ok(())
+        )
+        .is_err());
+        assert!(super::register_portal(
+            "https://api.example.com",
+            Some("Acme"),
+            Some("Not_A_Slug"),
+            dir,
+            |_, _| Ok(())
+        )
+        .is_err());
     }
 
     use super::*;
@@ -4813,6 +4980,46 @@ mod tests {
             assert!(out.is_err(), "{audience}");
             assert_nothing_stored(&dir);
         }
+    }
+
+    #[test]
+    fn register_portal_flows_through_the_hosted_device_grant() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("fresh-home/auth");
+        let mut grant = login_grant_body();
+        grant["organization_slug"] = json!("acme");
+        let mut runtime = PortalAcceptanceRuntime {
+            issuer: HOSTED_LOGIN_ISSUER.to_string(),
+            grant: Some(grant),
+            requests: Vec::new(),
+            baseline: Instant::now(),
+            elapsed: 0,
+            requested: vec!["cli.read", "cli.write", "wiki.read", "wiki.write"],
+        };
+        let mut shown = None;
+        let out = register_portal_with(
+            HOSTED_LOGIN_ISSUER,
+            Some("Acme Labs"),
+            Some("acme"),
+            &dir,
+            |url, code| {
+                shown = Some((url.to_owned(), code.to_owned()));
+                Ok(())
+            },
+            &mut runtime,
+        );
+        let grant = out.unwrap();
+        assert_eq!(grant.slug, "acme");
+        assert_eq!(grant.endpoint, LOGIN_ENDPOINT);
+        let (url, code) = shown.unwrap();
+        assert_eq!(
+            url,
+            "https://app.agenticos.test/register?after=%2Fdevice%2Fhosted-cadence%3Fcode%3DK7PM-2QNF&name=Acme%20Labs&slug=acme"
+        );
+        assert_eq!(code, "K7PM-2QNF");
+        assert!(runtime.requests[0].1.get("organization_slug").is_none());
+        assert_eq!(runtime.requests.len(), 2);
+        assert_nothing_stored(&dir);
     }
 
     #[test]
