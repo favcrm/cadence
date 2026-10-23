@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslate } from "../../lib/locale";
 import Md from "../../ui/Md";
 import { artifactBytes } from "./artifactClient";
-import { CSV_MAX_ROWS, parseCsv } from "./csv";
+import { CSV_MAX_COLS, CSV_MAX_ROWS, parseCsv } from "./csv";
 import type { ArtifactKind } from "./canvasStore";
 
 export interface Loaded {
@@ -84,7 +84,7 @@ function CsvView({ text, contentRef }: { text: string; contentRef: React.RefObje
           <thead>
             <tr>
               {table.header.map((h, i) => (
-                <th key={i} scope="col">{h}</th>
+                <th key={i} scope="col" title={h}>{h}</th>
               ))}
             </tr>
           </thead>
@@ -92,7 +92,7 @@ function CsvView({ text, contentRef }: { text: string; contentRef: React.RefObje
             {table.rows.map((r, i) => (
               <tr key={i}>
                 {r.map((c, j) => (
-                  <td key={j}>{c}</td>
+                  <td key={j} title={c}>{c}</td>
                 ))}
               </tr>
             ))}
@@ -102,6 +102,11 @@ function CsvView({ text, contentRef }: { text: string; contentRef: React.RefObje
       {table.total > CSV_MAX_ROWS ? (
         <p className="num text-micro text-ink-500">
           {t("showing first")} {CSV_MAX_ROWS} {t("of")} {table.total}
+        </p>
+      ) : null}
+      {table.columns > CSV_MAX_COLS ? (
+        <p className="num text-micro text-ink-500">
+          {t("showing first")} {CSV_MAX_COLS} {t("of")} {table.columns} {t("columns")}
         </p>
       ) : null}
     </div>

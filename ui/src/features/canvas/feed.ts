@@ -113,23 +113,51 @@ function scrubJson(text: string): string {
   return out;
 }
 
-/** The agent's own words: command lines (`bash:`, `$ `) dropped, and every
- *  path-like or inline-JSON word replaced by an ellipsis. Linear: one pass per
- *  line, one anchored test per word. */
+/** A word that opens a quoted command: a quote or backtick, then `cadence`. */
+const QUOTED_CMD = /^[("'`]+(?:\S*\/)?cadence$/i;
+/** A word that closes a quote or backtick span. */
+const CLOSES_QUOTE = /["'`)]$/;
+
+/** Elide a command quoted mid-sentence (`run "cadence artifact put …" now`):
+ *  from the quoted `cadence` to the closing quote, or the end of the line. */
+function elideQuotedCommands(words: string[]): string[] {
+  const out: string[] = [];
+  let eliding = false;
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (eliding) {
+      if (w.trim() !== "" && CLOSES_QUOTE.test(w)) eliding = false;
+      continue;
+    }
+    if (QUOTED_CMD.test(w) && words[i + 2] !== undefined) {
+      out.push("…");
+      eliding = true;
+      continue;
+    }
+    out.push(w);
+  }
+  return out;
+}
+
+/** The agent's own words: command lines (`bash:`, `$ `) dropped, a command
+ *  quoted mid-sentence elided, and every path-like or inline-JSON word
+ *  replaced by an ellipsis. Linear: one pass per line, one anchored test per
+ *  word. */
 function plainWords(text: string): string {
   return scrubJson(text)
     .split("\n")
     .filter((line) => !/^\s*(?:bash:|\$ )/i.test(line))
     .map((line) =>
-      line
-        .split(/(\s+)/)
+      elideQuotedCommands(line.split(/(\s+)/))
         .map((w) => (PATHISH.test(w) || ((w[0] === "{" || w[0] === "[") && w.includes('":')) ? "…" : w))
         .join(""),
     )
     .join("\n");
 }
 
-/** Artifact ids a tool call asks to add a version to: `artifact put … --id art-x`. */
+/** Artifact ids a tool call asks to add a version to: `artifact put … --id art-x`
+ *  (the thread keeps only the first 160 characters of a command, so the
+ *  master gives `--id` first). */
 function putTargets(text: string): string[] {
   if (!isArtifactPutCall(text)) return [];
   const m = /--id[ =](art-[A-Za-z0-9]+)/.exec(text);
@@ -188,7 +216,9 @@ export function feedParts(items: ThreadItem[], liveAfter: number, running: strin
       if (item.type === "tools") {
         for (const s of toolSteps(item.entries.filter((x) => own(x.message)))) {
           steps.push({ text: plainStep(s.call.text), raw: s.summary, done: s.done });
-          for (const id of putTargets(s.call.text)) updating.add(id);
+          // Only a put still waiting for its result is "updating"; a landed one
+          // reads "updated to vN" from the tab itself.
+          if (!s.done) for (const id of putTargets(s.call.text)) updating.add(id);
         }
       }
     }

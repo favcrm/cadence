@@ -286,17 +286,28 @@ export function selectVersion(id: string, version: number): void {
 const WIDTH_KEY = "cadence.canvas.width";
 export const MIN_WIDTH = 360;
 
-export function clampWidth(px: number, viewport: number): number {
-  const max = Math.max(MIN_WIDTH, Math.floor(viewport * 0.6));
-  return Math.min(max, Math.max(MIN_WIDTH, Math.round(px)));
+/** `floor` lifts the minimum (a kind's default floor), and with it the cap
+ *  when 60% of a narrow viewport would sit under that floor. */
+export function clampWidth(px: number, viewport: number, floor = MIN_WIDTH): number {
+  const max = Math.max(floor, Math.floor(viewport * 0.6));
+  return Math.min(max, Math.max(floor, Math.round(px)));
 }
 
 /** The width when the operator has not dragged one: it scales with the
  *  viewport, wider for kinds that are read as a page. */
 export function defaultWidth(kind: ArtifactKind, viewport: number): number {
-  const wide = kind === "html" || kind === "csv" || kind === "pdf";
-  const [share, lo, hi] = wide ? [0.55, 560, 960] : [0.45, 480, 760];
+  const [share, lo, hi] = defaultRange(kind);
   return Math.min(hi, Math.max(lo, Math.round(viewport * share)));
+}
+
+function defaultRange(kind: ArtifactKind): [number, number, number] {
+  return kind === "html" || kind === "csv" || kind === "pdf" ? [0.55, 560, 960] : [0.45, 480, 760];
+}
+
+/** The default width, held to its kind's floor even where 60% of the
+ *  viewport is smaller (a 900px window keeps a document at 560px). */
+export function defaultWidthFor(kind: ArtifactKind, viewport: number): number {
+  return clampWidth(defaultWidth(kind, viewport), viewport, defaultRange(kind)[1]);
 }
 
 /** The width the operator dragged to, or null (it wins over the default). */
@@ -323,8 +334,11 @@ export function writeWidth(px: number): void {
 export type CanvasMode = "push" | "cover" | "sheet";
 export const SHEET_BELOW = 640;
 export const CHAT_MIN = 320;
-/** What the chat keeps on Home when the canvas is expanded: a narrow strip. */
-export const CHAT_STRIP = 64;
+/** The least an expand must add to be worth it (else it covers the chat). */
+const EXPAND_GAIN = 96;
+/** What the chat keeps when the canvas is expanded: a narrow strip. The chat
+ *  panel is inset 32px, so 96px leaves about 64px of it showing. */
+export const CHAT_STRIP = 96;
 const SIDEBAR = 208;
 /** The app chat pane's right edge on a tablet with the canvas open: 1rem page
  *  padding + the 22rem column `app-shell.css` gives it. */
@@ -353,10 +367,13 @@ export function drawerLayout(
   if (viewport < SHEET_BELOW) return { mode: "sheet", width: viewport };
   const main = viewport - (viewport >= 1024 ? SIDEBAR : 0);
   if (expanded) {
-    // Expand: cover, taking most of the page. Home keeps a narrow strip of
-    // chat; the app shell stops at the chat pane's right edge, as cover does.
+    // Expand: cover, taking most of the page, leaving a narrow strip of chat.
+    // The app shell stops at the chat pane's right edge while that is wider
+    // than the drawer already is; when it is not, expand would do nothing,
+    // so it covers the chat down to the strip as Home does.
     const edge = surface === "app" && viewport < 1024 ? APP_TABLET_CHAT_RIGHT : chatRight;
-    const room = surface === "app" && edge !== null ? viewport - edge - 12 : main - CHAT_STRIP;
+    const edgeRoom = surface === "app" && edge !== null ? viewport - edge - 12 : main - CHAT_STRIP;
+    const room = edgeRoom >= drawerLayout(viewport, want, surface, chatRight).width + EXPAND_GAIN ? edgeRoom : main - CHAT_STRIP;
     return room < MIN_WIDTH ? { mode: "sheet", width: viewport } : { mode: "cover", width: room };
   }
   const need = surface === "home" ? CHAT_MIN : CHAT_MIN + 320 + 42;

@@ -13,7 +13,7 @@ pub(crate) enum ArtifactAction {
         /// md, pdf, html, image or csv.
         #[arg(long)]
         kind: String,
-        /// Shown on the card and the tab. Several words may follow with no
+        /// Shown on the canvas tab and the thread card. Several words may follow with no
         /// quotes (`--title Weekly summary`): the master's command guard
         /// splits on spaces and refuses quotes.
         #[arg(long, num_args = 1.., required = true)]
@@ -22,7 +22,8 @@ pub(crate) enum ArtifactAction {
         /// master/tmp first.
         #[arg(long)]
         file: PathBuf,
-        /// An artifact id from an earlier put, to add a version.
+        /// An artifact id from an earlier put, to add a version. Give it
+        /// first: the thread keeps only 160 characters of the command.
         #[arg(long)]
         id: Option<String>,
     },

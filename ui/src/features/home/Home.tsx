@@ -160,7 +160,14 @@ export function activityAnchor(items: ThreadItem[], message: string | undefined 
   if (typeof message !== "string" || message === "") return null;
   let found: string | null = null;
   let answerKey: string | null = null;
+  let cardKey: string | null = null;
   for (const item of items) {
+    // An artifact card sits after the run that put it (or between two runs'
+    // cards): the header never rides on one while the run itself is there.
+    if (item.type === "artifact") {
+      if (item.entry.message === message) cardKey = item.key;
+      continue;
+    }
     const entries =
       item.type === "tools"
         ? item.entries
@@ -174,7 +181,7 @@ export function activityAnchor(items: ThreadItem[], message: string | undefined 
   }
   // An answer bubble carries the indicator on its own timestamped name
   // row — prefer it over in-progress steps/commentary of the same turn.
-  return answerKey ?? found;
+  return answerKey ?? found ?? cardKey;
 }
 
 /** The dock's one-line turn status (CAD-551, placed in `chatdock` by
