@@ -52,24 +52,6 @@ def timestamp(value, label):
     return result
 
 
-def is_carried(job):
-    """Whether this row reports an execution that happened before it existed.
-
-    GitHub's carried rows keep the original execution's timestamps but take
-    the rerun's `created_at`; a real execution is always created before it
-    starts. Rows without that evidence are treated as executions and still
-    have to bind their own attempt's artifact.
-    """
-    if job.get("status") != "completed" or job.get("created_at") is None:
-        return False
-    created = timestamp(job["created_at"], "job creation")
-    for field in ("started_at", "completed_at"):
-        value = job.get(field)
-        if value is not None and created > timestamp(value, field):
-            return True
-    return False
-
-
 def execution(job):
     """The identity of the execution a row reports, independent of the row."""
     runner = job.get("runner_id")
@@ -167,7 +149,7 @@ def select(jobs, artifacts, run_id, sha, attempt, detail):
                 actual.append(job)
                 continue
             created, started, completed = execution_provenance(job, shard)
-            if is_carried(job):
+            if created > started or created > completed:
                 carried.append(job)
             elif created <= started <= completed:
                 actual.append(job)
