@@ -1574,7 +1574,16 @@ impl Shared {
             Err(error) => lock2_failure_reason(&error, &[secret, bytes.as_slice()]),
         };
         let outcome = json!({"kind":"uncertain","error":reason,"verified":crate::contract_fixture::Verified::Unknown});
-        let effect = self.store.app_effect_uncertain(id, &outcome)?;
+        let effect = self
+            .store
+            .app_effect_uncertain(id, &outcome)
+            .map_err(|error| {
+                Error::unknown(format!(
+                    "{} (the failure could not be recorded: {})",
+                    outcome["error"].as_str().unwrap_or_default(),
+                    lock2_cause(&error, &[secret, bytes.as_slice()])
+                ))
+            })?;
         self.wake();
         Ok(effect)
     }

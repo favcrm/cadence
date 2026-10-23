@@ -1064,9 +1064,13 @@ impl Shared {
                             .app_run_call_failed(&run_id, &step, "uncertain", &reason)
                     {
                         return Err(Error::unknown(format!(
-                            "{reason} (the failure could not be recorded: {write})"
+                            "{reason} (the failure could not be recorded: {})",
+                            super::app_effects_rpc::lock2_cause(&write, &[credential.as_slice()])
                         )));
                     }
+                    // The caller gets the same screened reason, never the raw
+                    // lock-2 error text.
+                    return Err(Error::unknown(reason));
                 }
                 recorded
             }

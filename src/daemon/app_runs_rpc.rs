@@ -1564,7 +1564,8 @@ impl Shared {
                     match recorded {
                         Ok(()) => Error::unknown(reason),
                         Err(error) => Error::unknown(format!(
-                            "{reason} (the failure could not be recorded: {error})"
+                            "{reason} (the failure could not be recorded: {})",
+                            super::app_effects_rpc::lock2_cause(&error, &[credential.as_slice()])
                         )),
                     }
                 };

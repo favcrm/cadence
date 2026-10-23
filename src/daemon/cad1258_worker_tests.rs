@@ -424,3 +424,40 @@ fn cad1778_worker_unreadable_snapshot_still_records_the_failure() {
     assert!(rows.1.iter().all(|x| x == "failed"), "{rows:?}");
     assert_eq!(rows.2, 1);
 }
+
+/// CAD-1778: when receipt retention fails AND the failure record fails too,
+/// neither storage error reaches the worker RPC response unscreened.
+#[test]
+fn cad1778_second_storage_error_is_withheld_from_the_worker_response() {
+    // The loopback fixture's custody credential.
+    const CREDENTIAL: &str = "synthetic-cad1365-gen-token";
+    let mut s = setup();
+    let shared = s.fx.shared.clone();
+    crate::issue::lockseam::set_hook(Some(Box::new(move |point| {
+        if point == "app-capability-before-record" {
+            shared
+                .store
+                .fixture_write(|c| {
+                    c.execute_batch(&format!(
+                        "CREATE TRIGGER c1778_a BEFORE INSERT ON app_capability_results BEGIN SELECT RAISE(ABORT,'first {CREDENTIAL}'); END;
+                         CREATE TRIGGER c1778_b BEFORE INSERT ON app_run_failures BEGIN SELECT RAISE(ABORT,'second {CREDENTIAL}'); END;"
+                    ))?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+    })));
+    let body = json!({"message":s.message,"token":s.token,"slot":"image",
+        "request_id":"c1778-second","input":{}});
+    let result = s.worker.call(s.fx.shared.clone(), &body);
+    crate::issue::lockseam::set_hook(None);
+    let error = result.expect_err("must fail").to_string();
+    assert!(error.contains("could not be recorded"), "{error}");
+    assert!(error.contains("details withheld"), "{error}");
+    for fragment in CREDENTIAL.as_bytes().windows(8) {
+        assert!(
+            !error.contains(std::str::from_utf8(fragment).unwrap()),
+            "response carries credential text (withheld from assertion)"
+        );
+    }
+}
