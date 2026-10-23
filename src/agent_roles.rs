@@ -377,4 +377,19 @@ mod tests {
             assert!(ROLES[i + 1..].iter().all(|other| other.id != role.id));
         }
     }
+
+    /// CAD-1767: an article before a vowel, and refusals can name the ids.
+    #[test]
+    fn instructions_use_the_right_article_and_ids_list_every_role() {
+        assert!(find("accountant")
+            .unwrap()
+            .instructions()
+            .starts_with("You are an Accountant."));
+        assert!(find("developer")
+            .unwrap()
+            .instructions()
+            .starts_with("You are a Developer."));
+        let ids = ids();
+        assert!(ROLES.iter().all(|r| ids.contains(r.id)));
+    }
 }

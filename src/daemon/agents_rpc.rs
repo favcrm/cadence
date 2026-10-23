@@ -1712,7 +1712,7 @@ fn catalogue_hire(params: &Value, id: &str) -> Result<CatalogueHire> {
     }
     let role = crate::agent_roles::find(id).ok_or_else(|| {
         Error::rejected(format!(
-            "unknown catalogue role '{id}' - one of: {}",
+            "Unknown catalogue role '{id}' - one of: {}",
             crate::agent_roles::ids()
         ))
     })?;

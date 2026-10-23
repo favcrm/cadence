@@ -23,17 +23,21 @@ export default function HireProposalCard({
   reason: string | null;
 }) {
   const t = useTranslate();
-  const writeBlock = useContext(HireBlock);
+  const hireBlock = useContext(HireBlock);
   const roles = useAgentRoles();
   const roster = useQuery(resources.agents);
   const [open, setOpen] = useState(false);
-  const [hired, setHired] = useState<string | null>(null);
+  const [hiredNow, setHiredNow] = useState<string | null>(null);
   const proposal = entry.payload ?? {};
   const roleId = typeof proposal.role === "string" ? proposal.role : "";
   const role: AgentRole | undefined = roles.data?.roles.find((r) => r.id === roleId);
   const taken = (roster.data?.agents ?? []).map((a) => a.alias);
   const name = typeof proposal.name === "string" && proposal.name ? proposal.name : null;
   const job = typeof proposal.job === "string" ? proposal.job : undefined;
+
+  // Already hired: this session's hire, or the proposed name is on the roster
+  // (a reload, or another tab) - never offer a second Review and hire.
+  const hired = hiredNow ?? (name !== null && taken.includes(name) ? name : null);
 
   if (!role || !roles.data) {
     return (
@@ -46,7 +50,7 @@ export default function HireProposalCard({
     <div className="rc-proposal" data-kind="hire-proposal">
       {reason && <p className="rc-proposal-why">{reason}</p>}
       <RoleCard role={role} payload={roles.data} onPick={() => setOpen(true)} />
-      <HireGate reason={writeBlock} />
+      <HireGate reason={hireBlock} />
       {hired ? (
         <p className="ap-saved" role="status">
           {t("Hired {name}.").replace("{name}", () => hired)}{" "}
@@ -59,8 +63,8 @@ export default function HireProposalCard({
           <Button
             variant="primary"
             size="sm"
-            disabled={writeBlock !== null}
-            title={writeBlock ?? t("Opens the hire sheet; nothing is hired until you press Hire")}
+            disabled={hireBlock !== null}
+            title={hireBlock ?? t("Opens the hire sheet; nothing is hired until you press Hire")}
             onClick={() => setOpen(true)}
           >
             {t("Review and hire")}
@@ -80,7 +84,7 @@ export default function HireProposalCard({
           onClose={() => setOpen(false)}
           onHired={(alias) => {
             setOpen(false);
-            setHired(alias);
+            setHiredNow(alias);
             void resources.agents.refresh();
           }}
         />

@@ -10,7 +10,7 @@ import { categoryLabel, matchesRole, onTeamCount, type RolesState } from "./agen
 export default function Recruit({
   roles,
   agents,
-  writeBlock,
+  hireBlock,
   onBack,
   onPick,
   onAskMaster,
@@ -18,7 +18,7 @@ export default function Recruit({
 }: {
   roles: RolesState;
   agents: Agent[];
-  writeBlock: string | null;
+  hireBlock: string | null;
   onBack: () => void;
   onPick: (role: AgentRole) => void;
   onAskMaster: () => void;
@@ -48,7 +48,7 @@ export default function Recruit({
           </p>
         </div>
       </div>
-      <HireGate reason={writeBlock} />
+      <HireGate reason={hireBlock} />
       {!payload && !roles.error && (
         <p role="status" className="text-label text-ink-500">
           {t("Loading the catalogue…")}

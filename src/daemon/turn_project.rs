@@ -7,6 +7,11 @@
 //! such task falls back to its cwd, so an agent joined inside a repo behaves
 //! as before; a catalogue agent never falls back to a
 //! cwd and, with no task, has no project.
+//!
+//! The resolver also moves the default platform account of an agent that a PM
+//! dispatched a ticket to: while it runs that ticket, the account comes from the
+//! dispatched issue's project, not from the agent's cwd. That is intended (CAD-1767):
+//! the project comes from the task.
 
 use std::path::Path;
 

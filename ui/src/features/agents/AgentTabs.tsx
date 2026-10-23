@@ -6,6 +6,7 @@ import { navigate } from "../../lib/useLocation";
 import { setComposerDraft } from "../app-shell/chat/composerStore";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
+import { OPERATOR_HIRE_REASON } from "../auth/gate";
 import { HireBlock, WriteGate } from "../auth/WriteGate";
 import type { Agent, AgentDetail, AgentRole } from "../../lib/types";
 import { AgentActivity, AgentQueue, WorkBlock } from "./AgentBlocks";
@@ -387,7 +388,9 @@ function History({ c }: { c: TabContext }) {
 
 function Job({ c }: { c: TabContext }) {
   const t = useTranslate();
-  const writeBlock = useContext(HireBlock);
+  const hireBlock = useContext(HireBlock);
+  // The job is edited over the same operator-only route; say so in its own words.
+  const jobBlock = hireBlock === OPERATOR_HIRE_REASON ? "Only the operator can edit the job." : hireBlock;
   // The board serves the saved text to the operator only; anyone else sees
   // the role's job line in the hero and no text box.
   const served = c.detail?.agent.instructions ?? null;
@@ -395,7 +398,7 @@ function Job({ c }: { c: TabContext }) {
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [applies, setApplies] = useState<string | null>(null);
-  const operator = writeBlock === null;
+  const operator = hireBlock === null;
   const save = async () => {
     if (!operator || saving) return;
     setSaving(true);
@@ -456,7 +459,7 @@ function Job({ c }: { c: TabContext }) {
           )}
         </div>
       ) : (
-        <Note>{writeBlock}</Note>
+        <Note>{jobBlock}</Note>
       )}
       {applies && (
         <p className="ap-saved" role="status">
@@ -602,7 +605,6 @@ function Tools({ c }: { c: TabContext }) {
 function Settings({ c }: { c: TabContext }) {
   const t = useTranslate();
   const a = c.detail?.agent;
-  const writeBlock = useContext(WriteGate);
   const identity: [string, unknown][] = a
     ? [
         ["thread", a.thread_id],
@@ -618,7 +620,6 @@ function Settings({ c }: { c: TabContext }) {
   const shown = (v: unknown) => v !== null && v !== undefined && v !== "";
   const profile = c.profile;
   const lifecycle = c.lifecycle;
-  void writeBlock;
   return (
     <div className="ap-body">
       <Panel title="Model, effort & usage" onTab={c.onTab}>
@@ -650,7 +651,9 @@ function Settings({ c }: { c: TabContext }) {
                   <dd title={String(v)}>{String(v)}</dd>
                 </div>
               ))}
-            {Object.entries(a.params ?? {}).map(([k, v]) => (
+            {Object.entries(a.params ?? {})
+              .filter(([k]) => k !== "catalogue")
+              .map(([k, v]) => (
               <div key={k} className="contents">
                 <dt title={`param ${k}`}>{k}</dt>
                 <dd title={typeof v === "string" ? v : JSON.stringify(v)}>

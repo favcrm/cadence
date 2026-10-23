@@ -46,7 +46,7 @@ impl Shared {
         let role_id = required_str(params, "role")?;
         let role = crate::agent_roles::find(role_id).ok_or_else(|| {
             Error::rejected(format!(
-                "unknown catalogue role '{role_id}' - one of: {}",
+                "Unknown catalogue role '{role_id}' - one of: {}",
                 crate::agent_roles::ids()
             ))
         })?;

@@ -56,13 +56,15 @@ export function kickoffBlock(meta: Meta | null): string | null {
 /** Why hiring (and editing an agent's job) is disabled, or null when this
  *  session may. Both go over operator-only routes, so a signed-in member
  *  (`operator: false`) passes [`writeBlock`] but is still refused. */
+export const OPERATOR_HIRE_REASON = "Only the operator can hire.";
+
 export function hireBlock(meta: Meta | null): string | null {
   const writes = writeBlock(meta);
   if (writes) return writes;
   if (meta?.operator === null) {
     return "Only the operator can hire — the board could not confirm whether this session is the operator's. It is re-checking; retry in a moment.";
   }
-  if (meta?.operator !== true) return "Only the operator can hire.";
+  if (meta?.operator !== true) return OPERATOR_HIRE_REASON;
   return null;
 }
 
