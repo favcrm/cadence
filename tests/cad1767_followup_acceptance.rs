@@ -1801,3 +1801,279 @@ fn cad1767_member_ordinary_agent_detail_carries_no_message_bodies() {
         "message bodies in a member's ordinary agent detail: {wrong:#?}"
     );
 }
+
+// ------------------------------------------------ round 5: member route sweep
+//
+// Operator decision (CAD-1767): a non-operator never receives operator
+// message text or operator-only content, for any agent. Instead of one
+// route at a time, sweep every board GET route the source names.
+
+const SWEEP_NEEDLES: &[&str] = &[
+    HOME_CHAT,                // master Home: operator message and reply
+    "artifact-card-needle",   // artifact card title
+    "proposal-needle",        // hire proposal
+    "sweep-master-queued-n1", // queued operator message to the master
+    "sweep-master-running-n2",
+    "sweep-master-result-n3",
+    "sweep-helper-queued-n4", // operator messages to an ordinary agent
+    "sweep-helper-running-n5",
+    "sweep-helper-result-n6",
+    "sweep-saved-job-n7", // a catalogue agent's saved job
+];
+
+/// Every `/api/...` route the board's source names, expanded with the
+/// fixture's ids. Derived from the code at test time, not a hand list:
+/// each string literal starting `/api/` in `src/ui/*.rs`, with `{param}`,
+/// `<param>` and `*` segments filled in, and each `strip_prefix("/api/...")`
+/// family extended by every fixture id.
+fn swept_routes(ids: &[String], home: &str) -> (Vec<String>, Vec<String>) {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+    let mut literals = std::collections::BTreeSet::new();
+    let mut prefixes = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if !name.ends_with(".rs")
+            || name.contains("test")
+            || name.contains("refusal")
+            || name.contains("acceptance")
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut rest = text.as_str();
+        while let Some(i) = rest.find("\"/api/") {
+            let tail = &rest[i + 1..];
+            let end = tail.find('"').unwrap_or(0);
+            let lit = &tail[..end];
+            if !lit.contains(char::is_whitespace) && !lit.is_empty() {
+                let before = &rest[..i];
+                if before.ends_with("strip_prefix(") {
+                    prefixes.insert(lit.to_string());
+                }
+                literals.insert(lit.to_string());
+            }
+            rest = &tail[end.max(1)..];
+        }
+    }
+    let excluded = |r: &str| r.contains("logout") || r.contains("/update") || r.contains("/device");
+    let mut routes = std::collections::BTreeSet::new();
+    let mut skipped = Vec::new();
+    let fill = |lit: &str, id: &str| -> String {
+        lit.split('/')
+            .map(|seg| {
+                if seg == "*"
+                    || (seg.starts_with('{') && seg.ends_with('}'))
+                    || (seg.starts_with('<') && seg.ends_with('>'))
+                {
+                    id.to_string()
+                } else {
+                    seg.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    for lit in &literals {
+        let lit = lit.trim_end_matches('?');
+        if excluded(lit) {
+            skipped.push(format!("{lit} (excluded: side effect or network)"));
+            continue;
+        }
+        if lit.contains('*') || lit.contains('{') || lit.contains('<') {
+            for id in ids {
+                routes.insert(fill(lit, id));
+            }
+        } else {
+            routes.insert(lit.to_string());
+        }
+    }
+    for p in &prefixes {
+        let base = p.trim_end_matches('/');
+        for id in ids {
+            routes.insert(format!("{base}/{id}"));
+        }
+    }
+    for id in ids {
+        routes.insert(format!("/api/threads/{id}?tail=1"));
+        routes.insert(format!("/api/threads/{id}?conversation={home}"));
+        routes.insert(format!("/api/threads/{id}/stream"));
+    }
+    routes.insert("/api/master/summary?since=0".into());
+    (routes.into_iter().collect(), skipped)
+}
+
+impl Fx {
+    /// A bounded GET for the sweep: `(status, raw body)`. Streams are read
+    /// for a short window; a timeout is status 0.
+    fn sweep_get(&self, path: &str, cookie: &str) -> (u16, String) {
+        let token = Seam::token_at(&self.state()).unwrap();
+        let request = format!(
+            "GET {path} HTTP/1.0\r\nHost: {host}\r\nX-Cadence-Board: 1\r\n\
+             Origin: http://{host}\r\nSec-Fetch-Site: same-origin\r\n\
+             {AS_HEADER}: operator\r\n{TOKEN_HEADER}: {token}\r\nCookie: {cookie}\r\n\r\n",
+            host = self.host,
+        );
+        let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", self.port)) else {
+            return (0, String::new());
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        if stream.write_all(request.as_bytes()).is_err() {
+            return (0, String::new());
+        }
+        let window = if path.contains("stream") {
+            Duration::from_millis(1500)
+        } else {
+            Duration::from_secs(8)
+        };
+        let until = Instant::now() + window;
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 16384];
+        while Instant::now() < until {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&raw).to_string();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = text
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        (status, body)
+    }
+}
+
+/// Where each needle sits in a body: JSON paths when it parses, else the
+/// raw text (SSE frames are scanned per `data:` line as JSON too).
+fn needle_hits(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let docs: Vec<Value> = match serde_json::from_str::<Value>(body) {
+        Ok(v) => vec![v],
+        Err(_) => body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data:"))
+            .filter_map(|d| serde_json::from_str(d.trim()).ok())
+            .collect(),
+    };
+    for needle in SWEEP_NEEDLES {
+        let mut paths = Vec::new();
+        for (i, doc) in docs.iter().enumerate() {
+            paths_with(doc, needle, &format!("$[{i}]"), &mut paths);
+        }
+        if paths.is_empty() && body.contains(needle) {
+            paths.push("raw".into());
+        }
+        out.extend(paths.into_iter().map(|p| format!("{needle} @ {p}")));
+    }
+    out
+}
+
+/// Round 5. A member receives no operator text on any board GET route.
+#[test]
+fn cad1767_member_route_sweep_carries_no_operator_text() {
+    let fx = Fx::start(Board::Public);
+    let (store, home) = master_with_home(&fx);
+    fx.seed("helper", None, None);
+    let helper_thread = store.ensure_thread("helper").unwrap().id;
+    let art = fx.artifact_card(&store, &helper_thread, "helper");
+    let n = |i: usize| SWEEP_NEEDLES[i];
+    turn(
+        &fx,
+        &store,
+        "master",
+        "s-mf",
+        "asked",
+        "running",
+        Some(n(5)),
+    );
+    turn(&fx, &store, "master", "s-mr", n(4), "running", None);
+    turn(&fx, &store, "master", "s-mq", n(3), "queued", None);
+    turn(
+        &fx,
+        &store,
+        "helper",
+        "s-hf",
+        "asked",
+        "running",
+        Some(n(8)),
+    );
+    turn(&fx, &store, "helper", "s-hr", n(7), "running", None);
+    turn(&fx, &store, "helper", "s-hq", n(6), "queued", None);
+    fx.op(
+        "agent_register",
+        json!({"alias": "acct-job", "catalogue": "accountant"}),
+    );
+    fx.op(
+        "agent_instructions_set",
+        json!({"alias": "acct-job", "instructions": n(9)}),
+    );
+    let ids: Vec<String> = [
+        "master",
+        "helper",
+        "acct-job",
+        NATIVE_THREAD,
+        NATIVE_SESSION,
+        home.as_str(),
+        art.as_str(),
+        "1",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let (routes, skipped) = swept_routes(&ids, &home);
+    let owner = fx.platform_cookie("owner");
+    let member = fx.platform_cookie("member");
+
+    let mut leaks = Vec::new();
+    let mut admitted = Vec::new();
+    let mut owner_seen = std::collections::BTreeSet::new();
+    for route in &routes {
+        let (status, body) = fx.sweep_get(route, &member);
+        if status == 200 {
+            admitted.push(route.clone());
+            let hits = needle_hits(&body);
+            if !hits.is_empty() {
+                leaks.push(format!("{route}: {hits:?}"));
+            }
+        }
+        let (ostatus, obody) = fx.sweep_get(route, &owner);
+        if ostatus == 200 {
+            for hit in needle_hits(&obody) {
+                owner_seen.insert(hit.split(" @ ").next().unwrap().to_string());
+            }
+        }
+    }
+    eprintln!(
+        "CAD-1767 sweep: {} routes tried, {} answered 200 to the member",
+        routes.len(),
+        admitted.len()
+    );
+    eprintln!("CAD-1767 sweep member-200 routes: {admitted:#?}");
+    eprintln!("CAD-1767 sweep skipped: {skipped:#?}");
+    eprintln!("CAD-1767 sweep owner saw: {owner_seen:?}");
+    // Control: the owner sees the operator text where the operator should.
+    let mut wrong: Vec<String> = [n(0), n(1), n(2), n(4), n(5), n(7), n(8), n(9)]
+        .iter()
+        .filter(|needle| !owner_seen.contains(**needle))
+        .map(|needle| format!("control: the owner never saw {needle}"))
+        .collect();
+    wrong.extend(leaks);
+    assert!(
+        wrong.is_empty(),
+        "operator text reached a member: {wrong:#?}"
+    );
+}
