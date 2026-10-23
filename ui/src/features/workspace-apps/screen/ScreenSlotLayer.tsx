@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 
 function RecordConfirmation({ view, card, onTap, onCancel }: {
   view: SlotView; card: RecordCard;
@@ -62,7 +62,7 @@ export default function ScreenSlotLayer({ view, link, onTap, onCancel, onDismiss
   const layer = useRef<HTMLDivElement>(null);
   const pressed = useRef(0);
   const [size, setSize] = useState({ w: 0, h: 0 });
-  useEffect(() => {
+  useLayoutEffect(() => {
     const node = layer.current;
     if (!node) return;
     const measure = () => setSize({ w: node.clientWidth, h: node.clientHeight });
@@ -73,15 +73,28 @@ export default function ScreenSlotLayer({ view, link, onTap, onCancel, onDismiss
     return () => observer.disconnect();
   }, []);
   const box = view && !view.card && !view.recordCard ? slotBox(view.anchor, size.w, size.h) : null;
+  // Choose the growth direction from the anchor, not the rendered label height,
+  // so wrapping never causes a second reposition after the approval is visible.
+  const growsUp = !!box && (box.footer || box.y + box.h / 2 > size.h / 2);
+  const approvalWidth = box ? Math.min(Math.max(box.w, 320), size.w) : 0;
+  const approvalLeft = box ? Math.min(box.x, Math.max(0, size.w - approvalWidth)) : 0;
+  const approvalHeight = box ? (growsUp ? box.y + box.h : size.h - box.y) : 0;
   return (
     <div ref={layer} className="screen-slot-layer" style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 5 }}>
       {view && box && (
-        <div data-host-slot={view.token.slice(0, 8)} style={{ position: "absolute", left: box.x, top: box.y, width: box.w, height: box.h,
-          pointerEvents: "auto", display: "flex", alignItems: "center", justifyContent: "center",
+        <div data-host-slot={view.token.slice(0, 8)} style={{ position: "absolute", left: approvalLeft,
+          top: growsUp ? undefined : box.y, bottom: growsUp ? size.h - box.y - box.h : undefined,
+          width: approvalWidth, maxHeight: approvalHeight, boxSizing: "border-box",
+          pointerEvents: box.footer ? "auto" : "none", display: "flex", alignItems: "flex-start",
+          justifyContent: box.footer ? "center" : approvalLeft < box.x ? "flex-end" : "flex-start",
           padding: box.footer ? "8px 16px" : 0, background: box.footer ? "var(--surface, var(--ink-900, #111))" : "transparent",
           borderTop: box.footer ? "1px solid var(--line, rgba(128,128,128,.3))" : undefined }}>
           <button type="button" className="btn btn-primary" disabled={view.pending} aria-busy={view.pending}
-            style={{ width: box.footer ? "min(100%, 320px)" : "100%", height: box.footer ? 40 : "100%", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+            style={{ width: box.footer ? "min(100%, 320px)" : "max-content", maxWidth: "100%",
+              height: "auto", minHeight: Math.min(box.footer ? 40 : box.h, Math.max(0, approvalHeight - (box.footer ? 17 : 0))),
+              maxHeight: Math.max(0, approvalHeight - (box.footer ? 17 : 0)), minWidth: box.footer ? 0 : Math.min(box.w, 320),
+              boxSizing: "border-box", pointerEvents: "auto", flexShrink: 0, display: "block",
+              padding: "8px 12px", lineHeight: 1.4, textAlign: "center", overflowY: "auto", whiteSpace: "normal" }}
             onPointerDown={event => { pressed.current = event.timeStamp; }}
             onClick={event => {
               // Keyboard activation has no pointerdown: it counts as pressed now.
@@ -89,7 +102,7 @@ export default function ScreenSlotLayer({ view, link, onTap, onCancel, onDismiss
               pressed.current = 0;
               onTap(view.token, event.isTrusted, at);
             }}>
-            {view.pending ? "Working…" : view.label}
+            <span style={{ minWidth: 0, overflowWrap: "anywhere", whiteSpace: "normal" }}>{view.pending ? "Working…" : view.label}</span>
           </button>
         </div>
       )}

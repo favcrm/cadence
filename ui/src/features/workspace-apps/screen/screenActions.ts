@@ -337,7 +337,7 @@ async function planSavePublishSettings(ctx: ActionContext, args: Record<string, 
     const body = { destination_id: chosen.destination_id, timezone: args.timezone,
       ...(ctx.contextId ? { context_id: ctx.contextId } : {}),
       ...(binding ? { expected_revision: binding.revision } : { request_id: randomRequest() }) };
-    return { label: `Use ${accountLabel(chosen.label || chosen.destination_id)} · ${args.timezone}`, run: async (): Promise<ActionResult> => {
+    return { label: `Save time zone · ${accountLabel(chosen.label || chosen.destination_id)} · ${args.timezone}`, run: async (): Promise<ActionResult> => {
       try {
         await workspaceApps.useDestination(ctx.installId, body);
         await ctx.onChanged();
