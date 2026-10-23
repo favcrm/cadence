@@ -4,6 +4,9 @@
 //! handle_conn on the test thread (the lockseam hook is thread-local).
 #![cfg(all(test, unix, feature = "test-seam"))]
 
+#[path = "cad1778_failure_record_acceptance.rs"]
+mod cad1778_failure_record_acceptance;
+
 use super::Fx as HostFx;
 use crate::daemon::Shared;
 use serde_json::{json, Value};
