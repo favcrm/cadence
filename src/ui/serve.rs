@@ -654,6 +654,19 @@ pub(crate) fn running_json(m: &Value) -> Value {
     })
 }
 
+/// CAD-1767: a running message as a non-operator may see it - an
+/// ALLOWLIST of non-content fields (id, state, task id, created). No
+/// `summary` and nothing else, so a field added to the daemon's message
+/// later is dropped by default.
+pub(crate) fn member_running_json(m: &Value) -> Value {
+    json!({
+        "id": m["id"],
+        "state": "running",
+        "task": m["task_id"],
+        "created": m["created"],
+    })
+}
+
 pub(crate) fn agent_activity_seconds(value: &Value) -> Option<f64> {
     let seconds = if let Some(seconds) = value.as_f64() {
         seconds
@@ -1019,7 +1032,15 @@ pub(crate) fn agent_detail(
         .unwrap_or_default()
         .iter()
         .filter(|m| m["state"].as_str() == Some("running"))
-        .map(running_json)
+        // The operator keeps the bounded description; anyone else (fail
+        // closed) gets ids, state and timing only.
+        .map(|m| {
+            if operator {
+                running_json(m)
+            } else {
+                member_running_json(m)
+            }
+        })
         .collect();
     let fenced =
         show["unknown"].as_i64().unwrap_or(0) > 0 || agent["state"].as_str() == Some("attention");
