@@ -1500,6 +1500,33 @@ impl Store {
         })
     }
 
+    /// CAD-1258: a worker capability call that reached the provider but could
+    /// not retain its result (or failed after the claim) fails the run with a
+    /// durable reason. The claim stays, so nothing is ever sent twice.
+    pub fn app_run_call_failed(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        kind: &str,
+        reason: &str,
+    ) -> Result<()> {
+        if !matches!(kind, "refused" | "uncertain") || reason.is_empty() || reason.len() > 1024 {
+            return Err(Error::rejected("capability failure record is invalid"));
+        }
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let run = Self::app_run_show_in(tx, run_id)?;
+            if run["state"] != "running" {
+                return Ok(());
+            }
+            tx.execute(
+                "INSERT INTO app_run_failures(run_id,step_id,kind,reason,created) VALUES(?,?,?,?,?)",
+                params![run_id, step_id, kind, reason, now()],
+            )?;
+            self.app_run_invalidate_in(&tx, run_id, reason)
+        })
+    }
+
     pub fn app_run_dispatch(&self, id: &str, current_bundle: &str) -> Result<Value> {
         self.app_run_dispatch_as(id, current_bundle, None, None)
     }

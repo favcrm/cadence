@@ -37,7 +37,7 @@ pub mod hooks;
 pub mod idea;
 pub mod line_times;
 pub mod lint;
-mod lockseam;
+pub(crate) mod lockseam;
 pub mod model;
 pub mod notes;
 pub mod parse;

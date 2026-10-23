@@ -807,7 +807,9 @@ impl Shared {
                     );
                 }
                 let pm = self.pm_at(&self.pm_dir()?)?;
-                workspace::with_runtime_snapshot(&pm, &install, |bundle, files| {
+                // CAD-1258: lock 1 verifies and claims; the provider call runs
+                // with NO lock; lock 2 re-verifies and records.
+                let prepared = workspace::with_runtime_snapshot(&pm, &install, |bundle, files| {
                     let _custody = self
                         .platform_custody_lock
                         .lock()
@@ -872,7 +874,7 @@ impl Shared {
                                 "approved run capability slot already has its one result",
                             ));
                         }
-                        return Ok(existing);
+                        return Ok(std::ops::ControlFlow::Break(existing));
                     }
                     let call_id = format!(
                         "app-call-{}",
@@ -882,7 +884,10 @@ impl Shared {
                         )
                         .simple()
                     );
-                    self.store.app_capability_claim(
+                    // The claim is the exactly-once gate: a second identical
+                    // request makes no provider call and must not fail the run
+                    // (the first call may still be in flight).
+                    if !self.store.app_capability_claim(
                         crate::store::app_capabilities::AppCapabilityClaim {
                             run: &run_id,
                             step: &step,
@@ -894,7 +899,9 @@ impl Shared {
                             input_digest: &input_digest,
                             call_id: &call_id,
                         },
-                    )?;
+                    )? {
+                        return Err(Error::unknown("A prior provider call has no retained receipt; its outcome is uncertain and no automatic retry was made."));
+                    }
                     let authority = json!({
                         "schema":1,"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
                         "install_id":install,"context_id":run["context_id"],
@@ -929,9 +936,81 @@ impl Shared {
                             "capability approval or turn changed before the external call",
                         ));
                     }
-                    let output = adapter
-                        .execute_app_capability(&credential, &authority, input, &call_id)
-                        .map_err(Error::rejected)?;
+                    Ok(std::ops::ControlFlow::Continue((
+                        std::sync::Arc::clone(adapter),
+                        credential,
+                        authority,
+                        call_id,
+                        input_digest,
+                        step,
+                        proof,
+                        sealed_human,
+                    )))
+                })?;
+                let (
+                    adapter,
+                    credential,
+                    authority,
+                    call_id,
+                    input_digest,
+                    step,
+                    proof,
+                    sealed_human,
+                ) = match prepared {
+                    std::ops::ControlFlow::Continue(prepared) => prepared,
+                    std::ops::ControlFlow::Break(existing) => return Ok(existing),
+                };
+                crate::issue::lockseam::outside_lock("app-capability-provider-call");
+                let output = adapter
+                    .execute_app_capability(&credential, &authority, input, &call_id)
+                    .map_err(|error| {
+                        let reason = if crate::platform::refuse_leak(
+                            "app capability failure",
+                            &error,
+                            &credential,
+                        )
+                        .is_ok()
+                        {
+                            error.chars().take(250).collect::<String>()
+                        } else {
+                            "Provider failure details were withheld because they matched credential custody.".into()
+                        };
+                        let _ = self
+                            .store
+                            .app_run_call_failed(&run_id, &step, "refused", &reason);
+                        Error::rejected(error)
+                    })?;
+                // CAD-1258 interleaving point: a revoke or upgrade may land here.
+                crate::issue::lockseam::outside_lock("app-capability-before-record");
+                let recorded = workspace::with_runtime_snapshot(&pm, &install, |bundle, files| {
+                    let _custody = self
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    self.app_run_binding_current(
+                        &self.store.app_run_show(&run_id)?,
+                        bundle,
+                        files,
+                    )?;
+                    let (current, current_step, current_proof) = self.store.app_capability_turn(
+                        &alias,
+                        message,
+                        turn,
+                        &slot,
+                        required_str(bundle, "digest")?,
+                    )?;
+                    if current["approval"]["human"] != sealed_human
+                        || current_step != step
+                        || current_proof.digest != proof.digest
+                    {
+                        return Err(Error::rejected(
+                            "capability approval or turn changed during the external call",
+                        ));
+                    }
                     crate::platform::refuse_leak(
                         "app capability result",
                         &output.result.to_string(),
@@ -962,7 +1041,19 @@ impl Shared {
                                 .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
                         },
                     )
-                })
+                });
+                if recorded.is_err() {
+                    // The provider answered but lock 2 refused or could not
+                    // retain it: leave a durable uncertain failure, never a
+                    // silent drop. The claim blocks any resend.
+                    let _ = self.store.app_run_call_failed(
+                        &run_id,
+                        &step,
+                        "uncertain",
+                        "App authority changed while the provider call ran; the result was not retained and no automatic retry was made.",
+                    );
+                }
+                recorded
             }
             "app_run_capability_results"
             | "app_run_capability_result"
