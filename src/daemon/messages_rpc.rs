@@ -1989,6 +1989,19 @@ impl Shared {
     /// default 30, max 120) bounds how long the answer waits for the
     /// message to settle.
     pub(super) fn rpc_interrupt(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.rpc_interrupt_bound(params, peer_pid, None)
+    }
+
+    /// CAD-1700: `rpc_interrupt`, optionally bound to one message. With
+    /// `expected`, the turn must still be that exact running message when
+    /// the interrupt is about to reach the adapter; otherwise the call is
+    /// refused, so a stale click never stops a newer turn.
+    pub(super) fn rpc_interrupt_bound(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+        expected: Option<&str>,
+    ) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let agent = self.store.agent(&alias)?;
         // Read once: the turn the caller is authorized for is the one
@@ -2081,6 +2094,20 @@ impl Shared {
             self.store
                 .event_public(&alias, "interrupt_requested", payload)
         };
+        // CAD-1700: a bound stop re-checks the running turn after every point
+        // it could wait (including the test pause above) and before the
+        // adapter is asked, so a turn that changed since the caller named it
+        // is refused and the newer turn is never interrupted.
+        if let Some(expected) = expected {
+            let still = self.store.running_message(&alias)?;
+            if still.as_ref().map(|m| m.id.as_str()) != Some(expected) {
+                let error = format!(
+                    "message {expected} is no longer the master's running turn — nothing was stopped"
+                );
+                record("refused", Some(&error))?;
+                return Err(Error::invalid("turn_not_running", error));
+            }
+        }
         let adapter = self
             .lifecycle
             .lock()

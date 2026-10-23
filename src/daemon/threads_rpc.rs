@@ -148,12 +148,19 @@ impl Shared {
                 None => self.store.thread_entries_before(&alias, before, limit)?,
             };
             let cursor = entries.last().map(|e| e.seq).unwrap_or(0);
+            // CAD-1700: the complete watermark of the authorized thread,
+            // never just this (bounded) page or the cursor's window.
+            let reply_seq = match &thread {
+                Some(thread) => self.store.thread_reply_seq(&thread.id)?,
+                None => 0,
+            };
             return Ok(json!({
                 "alias": alias,
                 "thread": thread.as_ref().map(store::Thread::to_json),
                 "entries": self.entries_json(&alias, &entries)?,
                 "cursor": cursor,
                 "more_before": more,
+                "reply_seq": reply_seq,
             }));
         }
         let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
@@ -172,11 +179,18 @@ impl Shared {
                 || self.closing.load(Ordering::SeqCst)
             {
                 let cursor = entries.last().map(|e| e.seq).unwrap_or(after);
+                // CAD-1700: the same complete watermark whatever the
+                // cursor — a cold tail or a long catch-up page carries it.
+                let reply_seq = match &thread {
+                    Some(thread) => self.store.thread_reply_seq(&thread.id)?,
+                    None => 0,
+                };
                 return Ok(json!({
                     "alias": alias,
                     "thread": thread.as_ref().map(store::Thread::to_json),
                     "entries": self.entries_json(&alias, &entries)?,
                     "cursor": cursor,
+                    "reply_seq": reply_seq,
                 }));
             }
             let step = deadline.min(Instant::now() + Duration::from_secs(1));
@@ -292,5 +306,214 @@ impl Shared {
             .map(store::Thread::to_json)
             .unwrap_or(Value::Null);
         Ok(receipt)
+    }
+}
+
+#[cfg(test)]
+mod cad1700_projection_tests {
+    use super::*;
+    use crate::store::{
+        ConversationKind, NewAgent, NewEntry, KIND_ASSISTANT_TEXT, KIND_MESSAGE, KIND_TOOL_CALL,
+        KIND_TURN_RESULT, ROLE_AGENT, ROLE_OPERATOR, ROLE_SYSTEM,
+    };
+    use crate::test_seam::{scoped, Asserted};
+
+    fn fixture() -> (tempfile::TempDir, Arc<Shared>) {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ServeOptions {
+            provider_env: crate::adapter::ProviderEnv::refusing_providers(),
+            ..Default::default()
+        };
+        opts.provider_env
+            .set("CADENCE_PM_DIR", dir.path().join("no-pm").to_str().unwrap());
+        let shared = Shared::new(dir.path(), &opts).unwrap();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        for (alias, provider, kind) in [("master", "pi", "managed"), ("w1", "fake", "fake")] {
+            shared
+                .store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider,
+                    endpoint_kind: kind,
+                    role: "worker",
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params: None,
+                    team_role: None,
+                    model_policy: None,
+                })
+                .unwrap();
+        }
+        // `thread_append` writes the alias's existing home thread; it
+        // never creates one (the send path does).
+        for alias in ["master", "w1"] {
+            shared.store.ensure_thread(alias).unwrap();
+        }
+        (dir, shared)
+    }
+
+    fn append(shared: &Arc<Shared>, alias: &str, role: &str, kind: &str, text: &str) -> i64 {
+        shared
+            .store
+            .thread_append(
+                alias,
+                NewEntry {
+                    role,
+                    kind,
+                    text,
+                    payload: None,
+                    message_id: None,
+                },
+            )
+            .unwrap()
+            .expect("the entry is stored")
+    }
+
+    fn read(shared: &Arc<Shared>, params: Value) -> Value {
+        scoped(Asserted::Operator, || {
+            shared.dispatch("thread_read", &params, std::process::id())
+        })
+        .expect("thread_read answers")
+    }
+
+    /// The newest page is bounded: after 210 non-reply rows the last real
+    /// assistant reply is off it, so a client recomputing the unread
+    /// watermark from the page loses it. `reply_seq` must be the complete,
+    /// authorized thread watermark regardless of the tail/forward/older
+    /// cursor, and non-reply, blank and foreign rows must not advance it.
+    /// Red before CAD-1700 P2: the page had no `reply_seq` at all.
+    #[test]
+    fn cad1700_thread_read_tail_keeps_the_complete_reply_watermark() {
+        let (_dir, shared) = fixture();
+        append(
+            &shared,
+            "master",
+            ROLE_OPERATOR,
+            KIND_MESSAGE,
+            "Please review",
+        );
+        append(&shared, "master", ROLE_AGENT, KIND_TOOL_CALL, "git status");
+        let reply = append(
+            &shared,
+            "master",
+            ROLE_AGENT,
+            KIND_ASSISTANT_TEXT,
+            "The review is ready",
+        );
+        append(
+            &shared,
+            "master",
+            ROLE_SYSTEM,
+            KIND_TURN_RESULT,
+            "A system notice is not a reply",
+        );
+        append(
+            &shared,
+            "master",
+            ROLE_OPERATOR,
+            KIND_ASSISTANT_TEXT,
+            "An operator note is not a reply",
+        );
+        for blank in ["", " \t\r\n", "\u{00a0}\u{2003}\u{feff}"] {
+            append(&shared, "master", ROLE_AGENT, KIND_ASSISTANT_TEXT, blank);
+            append(&shared, "master", ROLE_AGENT, KIND_TURN_RESULT, blank);
+        }
+        // Another agent's real reply belongs to that agent's own thread.
+        append(
+            &shared,
+            "w1",
+            ROLE_AGENT,
+            KIND_ASSISTANT_TEXT,
+            "A foreign reply",
+        );
+        for i in 0..210 {
+            append(
+                &shared,
+                "master",
+                ROLE_AGENT,
+                KIND_TOOL_CALL,
+                &format!("step {i}"),
+            );
+        }
+        let tail = read(
+            &shared,
+            json!({"alias": "master", "tail": true, "limit": 200}),
+        );
+        let entries = tail["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 200, "the page itself stays bounded");
+        assert!(
+            entries[0]["seq"].as_i64().unwrap() > reply,
+            "the real reply is off the newest page"
+        );
+        assert_eq!(
+            tail["reply_seq"],
+            json!(reply),
+            "a cold tail page still reports the complete reply watermark"
+        );
+        let forward = read(&shared, json!({"alias": "master", "after": 0, "limit": 5}));
+        assert_eq!(
+            forward["reply_seq"],
+            json!(reply),
+            "a forward page reports the same complete watermark"
+        );
+        let older = read(
+            &shared,
+            json!({"alias": "master", "before": reply + 1, "limit": 200}),
+        );
+        assert_eq!(
+            older["reply_seq"],
+            json!(reply),
+            "an older page reports the same complete watermark"
+        );
+    }
+
+    /// `reply_seq` is the watermark of the thread the read authorized,
+    /// never another conversation's or another alias's reply.
+    #[test]
+    fn cad1700_thread_read_reply_seq_is_scoped_to_the_read_thread() {
+        let (_dir, shared) = fixture();
+        let home_reply = append(
+            &shared,
+            "master",
+            ROLE_AGENT,
+            KIND_ASSISTANT_TEXT,
+            "Home reply",
+        );
+        let (conversation, _) = shared
+            .store
+            .conversation_create("master", "install-fixture", None, ConversationKind::Fresh)
+            .unwrap();
+        let conv_reply = shared
+            .store
+            .thread_append_to(
+                &conversation.id,
+                NewEntry {
+                    role: ROLE_AGENT,
+                    kind: KIND_ASSISTANT_TEXT,
+                    text: "Conversation reply",
+                    payload: None,
+                    message_id: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(conv_reply > home_reply, "the conversation reply is newer");
+        let conv = read(
+            &shared,
+            json!({"alias": "master", "conversation": conversation.id,
+                   "tail": true, "limit": 200}),
+        );
+        assert_eq!(conv["reply_seq"], json!(conv_reply));
+        assert_eq!(conv["thread"]["id"], json!(conversation.id));
+        let home = read(
+            &shared,
+            json!({"alias": "master", "tail": true, "limit": 200}),
+        );
+        assert_eq!(
+            home["reply_seq"],
+            json!(home_reply),
+            "another conversation's reply never advances Home"
+        );
     }
 }

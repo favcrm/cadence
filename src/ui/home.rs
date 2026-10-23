@@ -978,12 +978,40 @@ pub(super) fn master_models(
 /// is asked, so a poisoned page can never smuggle a provider command
 /// through the relay.
 const BOARD_COMMANDS: &[&str] = &[
-    "state", "stats", "models", "model", "levels", "effort", "compact", "new", "stop",
+    "state", "stats", "models", "model", "levels", "effort", "compact", "new", "stop", "cancel",
 ];
 
-/// `POST /api/master/command` `{"command": "…", "arg": "…"}` —
+/// CAD-1700: the relay's accepted fields and its `message` rule — a known
+/// field list (so a poisoned page cannot smuggle one through) and a
+/// non-empty id of at most 128 characters. Runs before the daemon is asked.
+fn command_message(body: &Value) -> Result<Option<&str>, HttpResp> {
+    let known = ["command", "arg", "wait", "message"];
+    if let Some(key) = body
+        .as_object()
+        .and_then(|o| o.keys().find(|k| !known.contains(&k.as_str())))
+    {
+        return Err(err_response(400, &format!("unknown field '{key}'")));
+    }
+    match body.get("message") {
+        None => Ok(None),
+        Some(message) => match message.as_str() {
+            Some(id) if !id.is_empty() && id.chars().count() <= 128 => Ok(Some(id)),
+            _ => Err(coded_response(
+                400,
+                "message_invalid",
+                "message must be a non-empty string of at most 128 characters",
+                None,
+            )),
+        },
+    }
+}
+
+/// `POST /api/master/command` `{"command": "…", "arg": "…", "message": "…"}` —
 /// operator-only (`operator::WRITE_ROUTES`), relayed to the daemon's
 /// `master_command`; `/stop` lands on the daemon's `interrupt` path.
+/// CAD-1700: `message` (a message id, ≤128 chars) scopes `/stop` to one
+/// running turn and names the queued message `/cancel` removes; the
+/// daemon's refusal codes map to 409 so the board can show the reason.
 pub(super) fn master_command(request: &mut Request, state_dir: &std::path::Path) -> HttpResp {
     let bytes = match read_body(request, BODY_CAP) {
         Ok(bytes) => bytes,
@@ -993,16 +1021,12 @@ pub(super) fn master_command(request: &mut Request, state_dir: &std::path::Path)
         Ok(v) => v,
         Err(_) => return err_response(400, "body must be a JSON object"),
     };
-    // Only `command`, `arg` and `wait` cross the relay — anything else
-    // is refused whole, so an identity-shaped or unexpected field never
-    // silently reaches the daemon.
-    let known = ["command", "arg", "wait"];
-    if let Some(key) = body
-        .as_object()
-        .and_then(|o| o.keys().find(|k| !known.contains(&k.as_str())))
-    {
-        return err_response(400, &format!("unknown field '{key}'"));
-    }
+    // Only `command`, `arg`, `wait` and `message` cross the relay, and the
+    // id is bounded — checked before the daemon is asked.
+    let message = match command_message(&body) {
+        Ok(message) => message,
+        Err(resp) => return resp,
+    };
     let command = body.get("command").and_then(Value::as_str).unwrap_or("");
     if !BOARD_COMMANDS.contains(&command) {
         return coded_response(
@@ -1030,9 +1054,29 @@ pub(super) fn master_command(request: &mut Request, state_dir: &std::path::Path)
     if let Some(wait) = body.get("wait") {
         params["wait"] = wait.clone();
     }
+    if let Some(message) = message {
+        params["message"] = json!(message);
+    }
     match client::rpc(state_dir, "master_command", params) {
         Ok(out) => json_response(out),
-        Err(e) => rpc_err(&e, "master_command"),
+        Err(e) => master_command_err(&e),
+    }
+}
+
+/// CAD-1700: the daemon's scoped `/stop` and `/cancel` refusals are
+/// conflicts with the master's live state (the turn ended, the message is
+/// not queued), so they answer 409 with the reason; everything else falls
+/// through to the shared mapping.
+fn master_command_err(e: &Error) -> HttpResp {
+    match e.code() {
+        Some(
+            code @ ("turn_not_running"
+            | "message_running"
+            | "message_not_queued"
+            | "message_not_cancellable"
+            | "message_required"),
+        ) => coded_response(409, code, &e.to_string(), None),
+        _ => rpc_err(e, "master_command"),
     }
 }
 
@@ -1243,5 +1287,50 @@ mod busy_status_tests {
                 .0,
             400
         );
+    }
+
+    /// CAD-1700: the relay's mapping for the scoped stop/cancel refusals —
+    /// each daemon code answers 409, so the pane can show the reason, and an
+    /// unknown daemon failure keeps the shared mapping.
+    #[test]
+    fn scoped_command_refusals_map_to_409() {
+        for (code, status) in [
+            ("turn_not_running", 409),
+            ("message_running", 409),
+            ("message_not_queued", 409),
+            ("message_not_cancellable", 409),
+            ("message_required", 409),
+            ("message_not_allowed", 400),
+            ("message_invalid", 400),
+        ] {
+            let error = Error::invalid(code, "refused for the test");
+            assert_eq!(
+                master_command_err(&error).status_code().0,
+                status,
+                "{code} maps to {status}"
+            );
+        }
+    }
+
+    /// CAD-1700: the relay's `message` validation — an unknown field, a
+    /// non-string or an over-long id is refused before the daemon is asked;
+    /// a valid id passes through.
+    #[test]
+    fn scoped_command_message_is_validated_before_the_relay() {
+        let body = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        assert!(
+            command_message(&body(r#"{"command":"cancel","message":"m-1","extra":1}"#)).is_err()
+        );
+        assert!(command_message(&body(r#"{"command":"cancel","message":7}"#)).is_err());
+        let long = format!(r#"{{"command":"cancel","message":"{}"}}"#, "x".repeat(129));
+        assert!(command_message(&body(&long)).is_err());
+        assert!(matches!(
+            command_message(&body(r#"{"command":"cancel","message":"m-1"}"#)),
+            Ok(Some("m-1"))
+        ));
+        assert!(matches!(
+            command_message(&body(r#"{"command":"cancel"}"#)),
+            Ok(None)
+        ));
     }
 }

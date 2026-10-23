@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 import type * as HappyDom from "happy-dom";
 import type * as ReactModule from "react";
 import type * as ReactDOMClient from "react-dom/client";
@@ -89,7 +90,7 @@ async function main() {
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const path = String(input);
     const url = new URL(path, "http://localhost");
-    if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+    if (url.pathname.endsWith("/stream")) return streamFixture(path);
     if (url.pathname === "/api/meta") return json({ read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session: { id: "canonical-session", origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test" } });
     if (url.pathname === "/api/human-threads/notifications") {
       humanThreadsCalls++;
@@ -129,11 +130,15 @@ async function main() {
     }
     if (url.pathname.startsWith("/api/app-installations/")) {
       const id = decodeURIComponent(url.pathname.slice("/api/app-installations/".length).split("/")[0]);
-      appReads.push({ id, path: url.pathname });
       const install = id === A.install_id ? A : id === B.install_id ? B : null;
+      // The shell observes reply summaries for every verified installation,
+      // even when no workspace is mounted. These reads do not select an app;
+      // detail/context/action reads below still prove route confinement.
+      if (install && url.pathname === `/api/app-installations/${id}/conversations` && (init?.method ?? "GET") === "GET")
+        return json({ alias: "crm", install_id: id, general: null, conversations: [] });
+      appReads.push({ id, path: url.pathname });
       if (install && url.pathname === `/api/app-installations/${id}`) return json(install);
       if (install && url.pathname === `/api/app-installations/${id}/contexts`) return json({ contexts: [context(id)] });
-      if (install && url.pathname.endsWith("/conversations")) return json({ alias: "crm", install_id: id, general: null, conversations: [] });
       if (url.pathname.endsWith("/bindings")) return json({ bindings: [] });
       if (url.pathname.endsWith("/effects")) return json({ effects: [] });
       return json({ error: "not found" }, 404);

@@ -40,6 +40,7 @@ export const RESOURCE_NAMES = [
   "app_outputs",
   "outbox",
   "threads",
+  "master",
 ] as const;
 export type ResourceName = (typeof RESOURCE_NAMES)[number];
 

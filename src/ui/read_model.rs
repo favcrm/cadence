@@ -47,6 +47,9 @@ use crate::overview;
 
 /// The shared stream watcher's poll period.
 const WATCH_EVERY: Duration = Duration::from_secs(1);
+/// Turn changes leave headroom for the HTTP read and render after the push;
+/// unrelated tracker/agent work retains WATCH_EVERY.
+const MASTER_WATCH_EVERY: Duration = Duration::from_millis(250);
 /// While the watcher runs, reads serve its last kept daemon snapshot
 /// whatever its age (`snapshot_age_secs` says how old) — the watcher's
 /// next fetch replaces it, and a read never waits on a slow fetch. Past
@@ -774,6 +777,9 @@ struct Watch {
     monitoring: Option<u64>,
     /// CAD-818: the Threads stamp (newest topic/pair change), fingerprinted.
     threads: Option<u64>,
+    /// CAD-1700: the master push stamp (running/queued turns, master thread
+    /// entries, app assistant and permission revision), fingerprinted.
+    master: Option<u64>,
     /// id → fingerprint of the card as the client would render it.
     cards: HashMap<String, u64>,
     plans: HashMap<String, u64>,
@@ -1406,6 +1412,7 @@ impl Model {
                 agents: snap.agents_fp,
                 monitoring: self.monitoring_fp(),
                 threads: self.threads_fp(),
+                master: self.master_fp(),
                 cards: fps(&cards),
                 plans: fps(&plans),
                 rows: fps(&agent_rows(&snap)),
@@ -1426,6 +1433,12 @@ impl Model {
     /// daemon RPC (the same pattern as `monitoring_fp`).
     fn threads_fp(&self) -> Option<u64> {
         client::rpc(&self.state_dir, "threads_stamp", json!({}))
+            .ok()
+            .map(|l| value_fp(&l))
+    }
+
+    fn master_fp(&self) -> Option<u64> {
+        client::rpc(&self.state_dir, "master_stamp", json!({}))
             .ok()
             .map(|l| value_fp(&l))
     }
@@ -1483,8 +1496,10 @@ impl Model {
 
     fn watch(self: Arc<Self>, mut w: Watch) {
         let _reset = self.reset_hub_on_panic();
+        let mut next_watch = Instant::now() + WATCH_EVERY;
+        let mut frames = Vec::new();
         loop {
-            std::thread::sleep(WATCH_EVERY);
+            std::thread::sleep(MASTER_WATCH_EVERY);
             {
                 // Nobody left — stop polling. `subscribe` checks
                 // `running` under the same lock, so a racing subscriber
@@ -1495,8 +1510,20 @@ impl Model {
                     return;
                 }
             }
-            let mut frames = vec![Arc::<str>::from(HEARTBEAT)];
-            self.tick(&mut w, &mut frames);
+            frames.clear();
+            if Instant::now() >= next_watch {
+                frames.push(Arc::<str>::from(HEARTBEAT));
+                self.tick(&mut w, &mut frames);
+                next_watch = Instant::now() + WATCH_EVERY;
+            }
+            let master_fp = self.master_fp();
+            if master_fp.is_some() && master_fp != w.master {
+                w.master = master_fp;
+                frames.push(legacy_frame("master"));
+            }
+            if frames.is_empty() {
+                continue;
+            }
             let mut hub = lock(&self.hub);
             hub.subs
                 .retain(|tx| frames.iter().all(|f| tx.send(f.clone()).is_ok()));
@@ -1683,6 +1710,7 @@ mod tests {
             agents: None,
             monitoring: None,
             threads: None,
+            master: None,
             cards: HashMap::new(),
             plans: HashMap::new(),
             rows: HashMap::new(),
@@ -1904,6 +1932,7 @@ mod tests {
             agents: None,
             monitoring: None,
             threads: None,
+            master: None,
             cards: HashMap::new(),
             plans: HashMap::new(),
             rows: HashMap::new(),

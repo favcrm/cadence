@@ -1,6 +1,7 @@
 import { useCallback, useLayoutEffect, useRef, useSyncExternalStore } from "react";
 import { api, ApiError } from "../../lib/api";
 import { cache, resources } from "../../lib/resources";
+import { subscribeMasterChanged } from "../../lib/masterChanged";
 import { useQuery } from "../../lib/useResource";
 import type { Resource } from "../../lib/cache";
 import { beginPrivateOperation, onPrivateReadsPaused, onPrivateSessionReset, withPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
@@ -15,7 +16,7 @@ import { EMPTY_THREAD, loadThread, type PageReader, type ThreadEntry, type Threa
  * Wire (the daemon's final shapes):
  * - `GET  /api/app-installations/<install>/conversations`
  *     -> `{ alias, install_id, general, conversations: [{ id, title, subject,
- *        context_id, is_general, archived, created, updated }] }`
+ *        context_id, is_general, archived, created, updated, reply_seq }] }`
  *     The list always carries the install's General conversation (the
  *     daemon ensures it). An unknown install is 404.
  * - `POST /api/app-installations/<install>/conversations`
@@ -23,6 +24,8 @@ import { EMPTY_THREAD, loadThread, type PageReader, type ThreadEntry, type Threa
  *     (operator-only; idempotent per subject; none = always new; the daemon
  *     proves install, context and campaign).
  * - `GET  /api/threads/master?conversation=<id>` and the stream take the id.
+ *   The master stream sends a `master` state snapshot first on every
+ *   connection, then resumable `entry` frames whose ids remain entry seqs.
  * - `POST /api/threads/master/messages` body `conversation: <id>` — a selector
  *   only; the daemon resolves install, subject and scope.
  * - A 404 on the list means the daemon predates conversations: the chat
@@ -34,6 +37,8 @@ export interface Conversation {
   title: string | null;
   subject: string | null;
   isGeneral: boolean;
+  /** Sequence of the newest visible assistant reply; zero before any reply. */
+  replySeq: number;
 }
 
 export interface ConversationList {
@@ -55,6 +60,7 @@ function parseConversation(raw: unknown): Conversation | null {
     title: typeof v.title === "string" && v.title !== "" ? v.title : null,
     subject: typeof v.subject === "string" ? v.subject : null,
     isGeneral: v.is_general === true,
+    replySeq: typeof v.reply_seq === "number" && Number.isSafeInteger(v.reply_seq) && v.reply_seq >= 0 ? v.reply_seq : 0,
   };
 }
 
@@ -110,6 +116,10 @@ const listFamily = cache.family<string, ConversationList>("conversations", async
   }
 });
 export const conversationList = (installId: string): Resource<ConversationList> => listFamily(installId);
+// A `master` frame means a conversation may have changed (a reply, a tool
+// step, a new conversation): refresh the observed lists. A conversation's
+// list in another install is marked and refetches when its screen revalidates.
+subscribeMasterChanged(() => cache.invalidate("conversations"));
 
 interface InflightCreate {
   promise: Promise<Conversation>;

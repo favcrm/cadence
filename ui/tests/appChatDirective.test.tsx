@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 /**
  * CAD-1108 acceptance check (ticket author's, CAD-1110 comment): a directive
  * naming an undeclared action, or carrying a forged identity, renders as text
@@ -68,7 +69,7 @@ const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { sta
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const url = new URL(String(input), "http://localhost");
   fetched.push({ url: url.pathname, method: init?.method ?? "GET" });
-  if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+  if (url.pathname.endsWith("/stream")) return streamFixture(url.href, { alias: "master", provider: "p", endpoint_kind: "k", live: true, turn: null }, init?.signal);
   // The generic descriptor route, serving the approved package's file.
   if (url.pathname === `/api/app-installations/${INSTALL}/chat-descriptor`) return json({ descriptor, digest: DIGEST, app: "notes" });
   if (url.pathname === `/api/app-installations/${INSTALL}/conversations`) {

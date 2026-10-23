@@ -3,6 +3,23 @@
 use super::*;
 
 impl Shared {
+    /// CAD-1700: `master_stamp` — the board's `master` push frame reads
+    /// this cheaply (indexed SQL, no provider call). It changes whenever
+    /// the master's running/queued turns, any master thread entry, or the
+    /// app assistant / master permission revision (`master_rev`) changes.
+    pub(super) fn rpc_master_stamp(&self) -> Result<Value> {
+        let alias = crate::master::ALIAS;
+        let (live_seq, running, queued, entries, transition_ms) = self.store.master_stamp(alias)?;
+        Ok(json!({
+            "live": live_seq,
+            "running": running,
+            "queued": queued,
+            "entries": entries,
+            "transition_ms": transition_ms,
+            "rev": self.master_rev.load(std::sync::atomic::Ordering::Acquire),
+        }))
+    }
+
     /// `master_state` (CAD-551) — what the board's master header shows:
     /// the provider, the live session's model/effort/context (when the
     /// provider answers — Pi's `get_state`/`get_session_stats`), the
@@ -108,6 +125,17 @@ impl Shared {
                 .unwrap_or(Value::Null)
         };
         let running = self.store.running_message(alias)?;
+        // CAD-1700: the complete ordered queue behind the board's master
+        // pane, as routing metadata only — never message bodies, never a
+        // 20-row page. `queued_metadata` uses `queued_head`'s delivery
+        // order, so the head is position 1.
+        let queued = self.store.queued_metadata(alias)?;
+        // Only a queued turn needs the head's body and start time; one row
+        // read, never the whole queue's.
+        let head = match &running {
+            Some(_) => None,
+            None => self.store.queued_head(alias)?,
+        };
         let turn = match &running {
             Some(m) => json!({
                 "state": "working",
@@ -117,18 +145,32 @@ impl Shared {
                 "summary": m.body,
                 "since": m.started.unwrap_or(m.created),
             }),
-            None => match self.store.queued_head(alias)? {
-                Some(m) => json!({
-                    "state": "queued",
-                    "message": m.id,
-                    "conversation": conversation_of(&m.id),
-                    "app_origin": self.master_turn_app_origin(&m.id),
-                    "summary": m.body,
-                    "since": m.created,
-                }),
+            None => match &head {
+                Some(m) => {
+                    let conversation = match queued.iter().find(|(id, _)| id == &m.id) {
+                        Some((_, Some(thread))) => json!(thread),
+                        Some((_, None)) => Value::Null,
+                        // The head left the queue between the two reads:
+                        // report its own conversation, never a neighbour's.
+                        None => conversation_of(&m.id),
+                    };
+                    json!({
+                        "state": "queued",
+                        "message": m.id,
+                        "conversation": conversation,
+                        "app_origin": self.master_turn_app_origin(&m.id),
+                        "summary": m.body,
+                        "since": m.created,
+                        "position": 1,
+                    })
+                }
                 None => Value::Null,
             },
         };
+        let queue = queued
+            .iter()
+            .map(|(id, conversation)| json!({"message": id, "conversation": conversation}))
+            .collect::<Vec<_>>();
         Ok(json!({
             "alias": alias,
             "provider": agent.provider,
@@ -141,6 +183,7 @@ impl Shared {
             "session": session_json,
             "commands": commands,
             "turn": turn,
+            "queue": queue,
             "queued": self.store.queued_count(alias)?,
         }))
     }
@@ -481,6 +524,28 @@ impl Shared {
             }
             let _ = self.store.event_public(alias, "master_command", payload);
         };
+        // CAD-1700: `message` scopes `stop` and `cancel` to one master turn.
+        // It is refused on every other verb, so it cannot widen one. Each
+        // refusal leaves a `master_command` event, like every other call.
+        let message = match params.get("message") {
+            None => None,
+            Some(value) => {
+                if command != "stop" && command != "cancel" {
+                    let error =
+                        format!("'/{command}' takes no message - only /stop and /cancel do");
+                    audit("refused", Some(&error));
+                    return Err(Error::invalid("message_not_allowed", error));
+                }
+                match value.as_str() {
+                    Some(id) if !id.is_empty() && id.chars().count() <= 128 => Some(id),
+                    _ => {
+                        let error = "message must be a non-empty string of at most 128 characters";
+                        audit("refused", Some(error));
+                        return Err(Error::invalid("message_invalid", error));
+                    }
+                }
+            }
+        };
         if command == "help" {
             audit("ok", None);
             return Ok(json!({"command": command, "ok": true,
@@ -503,17 +568,104 @@ impl Shared {
         if command == "stop" {
             // The daemon's interrupt path: same authorization, audit and
             // stale-turn protection `cadence interrupt` has. `wait`
-            // bounds how long the answer waits for the settle.
+            // bounds how long the answer waits for the settle. With a
+            // `message`, the stop is bound to that exact running turn (CAD-1700).
             let mut p = json!({"alias": alias});
             if let Some(wait) = params.get("wait") {
                 p["wait"] = wait.clone();
             }
-            let out = self.rpc_interrupt(&p, peer_pid);
+            let out = match message {
+                Some(message) => {
+                    let running = self.store.running_message(alias);
+                    if running
+                        .as_ref()
+                        .ok()
+                        .and_then(|m| m.as_ref())
+                        .map(|m| m.id.as_str())
+                        != Some(message)
+                    {
+                        let error = format!(
+                            "message {message} is not the master's running turn — nothing was stopped"
+                        );
+                        audit("refused", Some(&error));
+                        return Err(Error::invalid("turn_not_running", error));
+                    }
+                    self.rpc_interrupt_bound(&p, peer_pid, Some(message))
+                }
+                None => self.rpc_interrupt(&p, peer_pid),
+            };
             match &out {
                 Ok(_) => audit("ok", None),
                 Err(e) => audit("refused", Some(&e.to_string())),
             }
             return out.map(|v| json!({"command": command, "ok": true, "result": v}));
+        }
+        if command == "cancel" {
+            // CAD-1700: cancel exactly one still-queued operator message to the
+            // master. A running or submitting turn is never cancelled here.
+            let Some(id) = message else {
+                audit("refused", Some("message_required"));
+                return Err(Error::invalid(
+                    "message_required",
+                    "cancel needs the queued message id - `message` is required",
+                ));
+            };
+            let refuse = |code: &'static str, text: String| {
+                audit("refused", Some(&text));
+                Err(Error::invalid(code, text))
+            };
+            let found = match self.store.message(id)? {
+                // CAD-1700: the source string alone is caller-supplied, so
+                // it is not provenance. The store's canonical sender label is
+                // the proof: only `Sender::OperatorChat` records `operator`;
+                // an agent records its alias (with a uid), a member or CLI
+                // principal its own label.
+                Some(m)
+                    if m.alias == alias
+                        && m.source == "operator"
+                        && m.sender.as_deref() == Some("operator")
+                        // An agent may literally be named `operator`; the
+                        // canonical uid is what tells it from the operator's
+                        // own chat (only the agent row has one).
+                        && m.sender_uid.is_none()
+                        && m.reply_to.is_none() =>
+                {
+                    m
+                }
+                _ => {
+                    return refuse(
+                        "message_not_cancellable",
+                        format!("message {id} is not an operator message queued to the master"),
+                    )
+                }
+            };
+            match found.state.as_str() {
+                "queued" => {}
+                "running" | "submitting" => {
+                    return refuse(
+                        "message_running",
+                        format!("message {id} is already running - use Stop"),
+                    )
+                }
+                other => {
+                    return refuse(
+                        "message_not_queued",
+                        format!(
+                            "message {id} is '{other}' - only a queued message can be cancelled"
+                        ),
+                    )
+                }
+            }
+            let cancelled = self
+                .store
+                .cancel(id, "operator", Some("cancelled from the board"))?;
+            if let Some(result) = cancelled.result.clone() {
+                self.notify_routed_target(&cancelled, &result);
+            }
+            audit("ok", None);
+            self.wake();
+            return Ok(json!({"command": command, "ok": true,
+                             "result": {"message": cancelled.to_json()}}));
         }
         let agent = match self.store.agent(alias) {
             Ok(a) => a,
@@ -589,7 +741,8 @@ impl Shared {
 /// runs the `interrupt` path; `help` answers the list itself; the rest
 /// are adapter verbs.
 const MASTER_COMMANDS: &[&str] = &[
-    "state", "stats", "models", "model", "levels", "effort", "compact", "new", "stop", "help",
+    "state", "stats", "models", "model", "levels", "effort", "compact", "new", "stop", "cancel",
+    "help",
 ];
 
 /// The one-line `system` thread note a `master_command` mutation
@@ -616,5 +769,96 @@ fn master_command_line(command: &str, result: &Value) -> Option<String> {
         "compact" => Some("Session context compacted".to_string()),
         "new" => Some("Provider session restarted".to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod cad1700_projection_tests {
+    use super::*;
+    use crate::store::NewAgent;
+    use crate::test_seam::{scoped, Asserted};
+
+    fn fixture() -> (tempfile::TempDir, Arc<Shared>) {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ServeOptions {
+            provider_env: crate::adapter::ProviderEnv::refusing_providers(),
+            ..Default::default()
+        };
+        opts.provider_env
+            .set("CADENCE_PM_DIR", dir.path().join("no-pm").to_str().unwrap());
+        let shared = Shared::new(dir.path(), &opts).unwrap();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "master",
+                provider: "pi",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: &cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        (dir, shared)
+    }
+
+    /// The master pane looks for its own queued message and what is ahead
+    /// of it in `master_state.queue`. The queue is complete in exact
+    /// delivery order, so the 21st queued message and its predecessor are
+    /// still represented, and the head row keeps its turn semantics
+    /// (state, message, summary, since, position). Red before CAD-1700 P2:
+    /// the projection stopped at 20 rows.
+    #[test]
+    fn cad1700_master_state_queue_is_complete_past_twenty() {
+        let (_dir, shared) = fixture();
+        let pid = std::process::id();
+        // Send admission (launch/model gates) is not under test: seed the
+        // canonical rows a Home send produces. `enqueue` itself writes the
+        // operator thread note when the alias has a home thread (the same
+        // `thread_note_enqueued` path every queued message takes), and that
+        // note carries the message id, so each row resolves its home
+        // conversation.
+        shared.store.ensure_thread("master").unwrap();
+        for i in 1..=25 {
+            let id = format!("m{i}");
+            shared
+                .store
+                .enqueue("master", &format!("hi {id}"), None, &id, "operator")
+                .unwrap();
+        }
+        let state = scoped(Asserted::Operator, || {
+            shared.dispatch("master_state", &json!({}), pid)
+        })
+        .unwrap();
+        let queue = state["queue"].as_array().unwrap();
+        let ids = queue
+            .iter()
+            .map(|row| row["message"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        let expected = (1..=25).map(|i| format!("m{i}")).collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the queue is complete and in delivery order"
+        );
+        assert_eq!(state["queued"], json!(25));
+        assert!(ids.contains(&"m20"), "the 20th message is represented");
+        assert!(ids.contains(&"m21"), "the 21st message is represented");
+        assert_eq!(state["turn"]["state"], json!("queued"));
+        assert_eq!(state["turn"]["message"], json!("m1"));
+        assert_eq!(state["turn"]["summary"], json!("hi m1"));
+        assert_eq!(state["turn"]["position"], json!(1));
+        let home = shared.store.thread("master").unwrap().unwrap().id;
+        for row in queue {
+            assert_eq!(
+                row["conversation"],
+                json!(home),
+                "each row's conversation comes from the one projection"
+            );
+        }
     }
 }

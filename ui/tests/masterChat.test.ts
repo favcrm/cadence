@@ -11,6 +11,8 @@ import {
   turnState,
 } from "../src/features/home/master";
 import {
+  mergeEntries,
+  mergePage,
   openStep,
   stepSummary,
   toolSteps,
@@ -263,5 +265,68 @@ ok(longKey[0].length > 20, "the long key reaches the label cell whole — CSS wr
 equal(kvRows("done"), [], "a string is not a field list");
 equal(kvRows(null), [], "null is not a field list");
 equal(kvRows({}), [], "an empty object is not a field list");
+
+// ---- CAD-1700: the reply watermark folds live replies and pages ----
+const emptyThread = { exists: true, entries: [], pending: [] };
+const agentReply = (
+  seq: number,
+  text: string,
+  kind = "assistant_text",
+): ThreadEntry => ({ seq, role: "agent", kind, text, message: "m1", created: null });
+
+// A streamed visible reply advances the watermark immediately — no page
+// re-read is needed for Home to see it.
+const live = mergeEntries(emptyThread, [agentReply(9, "the answer")]);
+equal(live.replySeq, 9, "a live assistant_text reply advances the watermark");
+equal(
+  mergeEntries(live, [agentReply(12, "done", "turn_result")]).replySeq,
+  12,
+  "a live turn_result reply advances it",
+);
+equal(
+  mergeEntries(live, [agentReply(13, "  \t\n\u00a0")]).replySeq,
+  9,
+  "a blank agent reply never advances it (JS trim whitespace)",
+);
+equal(
+  mergeEntries(live, [entry(14, "tool_call", "Bash: ls")]).replySeq,
+  9,
+  "tool progress never advances it",
+);
+equal(
+  mergeEntries(live, [
+    { seq: 15, role: "operator", kind: "assistant_text", text: "not a reply", message: "m1", created: null },
+  ]).replySeq,
+  9,
+  "an operator row never advances it",
+);
+
+// The RPC page carries the COMPLETE thread's watermark: it can raise the
+// fold beyond the loaded window, and an older/bounded page never lowers it.
+const paged = mergePage(live, { thread: null, entries: [], reply_seq: 40 });
+equal(paged.replySeq, 40, "a complete page watermark raises the fold");
+equal(
+  mergePage(paged, { thread: null, entries: [], reply_seq: 4 }).replySeq,
+  40,
+  "an older/bounded page never lowers it",
+);
+equal(
+  mergePage(paged, { thread: null, entries: [], reply_seq: 44 }).replySeq,
+  44,
+  "a newer complete page raises it",
+);
+equal(
+  mergePage(paged, { thread: null, entries: [] }).replySeq,
+  40,
+  "a page without the field leaves it intact",
+);
+// The cold-tail case: 200+ non-reply rows fit, the real reply does not,
+// but the page's watermark still reports it.
+const coldTail = mergePage(null, {
+  thread: null,
+  entries: [entry(300, "tool_call", "step")],
+  reply_seq: 7,
+});
+equal(coldTail.replySeq, 7, "a cold bounded tail keeps a reply outside the page");
 
 console.log("masterChat.test.ts: all assertions passed");

@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 import {
   FORBIDDEN_BODY_KEYS,
   hostActions,
@@ -200,7 +201,7 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const path = String(input);
   reads.push(path);
   if (new URL(path, "http://localhost").pathname.endsWith("/stream")) {
-    return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+    return streamFixture(path);
   }
   if (init?.method === "POST") {
     const body = JSON.parse(String(init.body));

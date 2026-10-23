@@ -1,4 +1,8 @@
+import "fake-indexeddb/auto";
+import { streamFixture } from "./streamFixture";
 /** CAD-1098 S3: per-app assistant conversations in the shell chat. */
+import type * as SeenModule from "../src/features/app-shell/chat/unreadSeen";
+import type * as ConversationModule from "../src/features/app-shell/chat/Conversation";
 declare function require(name: string): any;
 declare const process: { cwd(): string };
 export {};
@@ -12,6 +16,7 @@ function equal(a: unknown, e: unknown, why: string) {
 async function main() {
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/app-installations/install-crm?ctx=ctx-a" });
+Object.defineProperty(win.document, "visibilityState", { value: "visible", configurable: true });
 for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLSelectElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "ResizeObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"])
   Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
 for (const name of ["addEventListener", "removeEventListener", "requestAnimationFrame", "cancelAnimationFrame"])
@@ -36,11 +41,13 @@ const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) =>
     React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(AppShellComponent, props) }));
 const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
 const { parseSlash, autoSelectCampaignConversation, conversationThread, conversationList } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
+const { readSeen } = require("../src/features/app-shell/chat/unreadSeen") as typeof SeenModule;
 
 equal([parseSlash("/new"), parseSlash(" /CLEAR "), parseSlash("/new now"), parseSlash("hello")], ["new", "new", null, null], "only the bare commands are commands");
 
 const inst = (id: string, name: string) => ({ install_id: id, title: name, name, version: "0.1.0", digest: "d", catalog_generation: "g", approved: true, approval: { state: "approved", epoch: 1 }, storage_kind: "workspace", files: [], capabilities: null, connection_slots: [] });
-const ctxs = (id: string) => ({ contexts: [{ id: "ctx-a", install_id: id, revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } }] });
+let crmContext = "ctx-a";
+const ctxs = (id: string) => ({ contexts: [{ id: id === "install-crm" ? crmContext : "ctx-a", install_id: id, revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } }] });
 const ent = (seq: number, role: string, kind: string, text: string, message: string) => ({ seq, role, kind, message, text, created: "2026-10-03T00:00:00Z", payload: null });
 const conv = (id: string, over: object = {}) => ({ id, title: null, subject: null, is_general: false, ...over });
 const convs: Record<string, any[]> = {
@@ -50,12 +57,23 @@ const convs: Record<string, any[]> = {
 };
 const threads: Record<string, any[]> = {
   "c-gen": [ent(1, "operator", "message", "general question", "m-gen"), ent(2, "agent", "turn_result", "general answer", "m-gen")],
-  "c-camp": [ent(1, "operator", "message", "campaign brief", "m-camp")],
+  "c-camp": [
+    ent(1, "operator", "message", "campaign brief", "m-camp"),
+    { ...ent(2, "system", "message", "Permission requested (permission-old, risk low): old command", "old-decision"), payload: { source: "permission" } },
+  ],
   "o-gen": [],
   "s-gen": [],
   "s-full": [ent(1, "operator", "message", "earlier question", "m-s")],
 };
 let turn: any = null;
+// CAD-1700: the master queue in delivery order, and the board commands posted.
+let queue: { message: string; conversation: string | null }[] = [];
+let operations: unknown[] = [];
+let controlledTranscript = false;
+let holdReconnect = false;
+let disconnectTranscript: (() => void) | null = null;
+let heldOperations: Array<(response: Response) => void> | null = null;
+const commandPosts: unknown[] = [];
 // Set inside a check to hold one send in flight (pending state "sending").
 let deferSend: ((resolve: (r: Response) => void) => void) | null = null;
 const messagePosts: any[] = [];
@@ -65,7 +83,19 @@ const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { sta
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const url = new URL(String(input), "http://localhost");
   const method = init?.method ?? "GET";
-  if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+  if (url.pathname.endsWith("/stream")) {
+    if (!controlledTranscript || url.pathname !== "/api/threads/master/stream")
+      return streamFixture(url.href, { alias: "master", provider: "p", endpoint_kind: "k", live: true, turn, queue }, init?.signal);
+    if (holdReconnect) return new Response(null, { status: 503 });
+    let closed = false;
+    const body = new ReadableStream<Uint8Array>({ start(controller) {
+      controller.enqueue(new TextEncoder().encode(`event: master\ndata: ${JSON.stringify({ alias: "master", provider: "p", endpoint_kind: "k", live: true, turn, queue })}\n\n`));
+      const close = () => { if (!closed) { closed = true; controller.close(); } };
+      disconnectTranscript = close;
+      init?.signal?.addEventListener("abort", close, { once: true });
+    }, cancel() { closed = true; } });
+    return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
+  }
   // The CRM package's own descriptor, served pinned to the install's digest.
   if (url.pathname === "/api/app-installations/install-crm/chat-descriptor") {
     return json({ descriptor: JSON.parse(require("fs").readFileSync(require("path").join(process.cwd(), "..", "tests", "fixtures", "apps", "crm", "app-chat.json"), "utf8")), digest: "d", app: "crm" });
@@ -95,11 +125,20 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   }
   if (url.pathname === "/api/threads/master") {
     const id = url.searchParams.get("conversation") ?? "";
-    return json({ entries: threads[id] ?? [], more_before: false });
+    return json({ thread: { id: id || "home-thread", alias: "master" }, entries: threads[id] ?? [], more_before: false });
   }
-  if (url.pathname === "/api/master/state") return json({ alias: "master", provider: "p", endpoint_kind: "k", live: true, turn });
+  if (url.pathname === "/api/master/state") return json({ alias: "master", provider: "p", endpoint_kind: "k", live: true, turn, queue });
+  if (url.pathname === "/api/master/command") {
+    commandPosts.push(JSON.parse(String(init!.body)));
+    return json({ command: "x", ok: true, result: {} });
+  }
   if (url.pathname === "/api/crm-send/list") return json({ sends: [] });
   if (url.pathname === "/api/crm-send/origin") return json({ unsubscribe_origin: null, stored: false });
+  if (url.pathname === "/api/master/permissions") return json({ rules: [], requests: [{ id: "permission-old", status: "allowed_once", command: "old command", cwd: null, reason: "Previously decided", risk: "low", prefix: [] }] });
+  if (url.pathname.endsWith("/assistant/actions")) return json({ actions: [] });
+  if (url.pathname.endsWith("/assistant/operations"))
+    return heldOperations === null ? json({ operations }) : new Promise<Response>((resolve) => heldOperations!.push(resolve));
+  if (url.pathname.endsWith("/assistant/permissions")) return json({ permissions: [] });
   return json({ records: [], truncated: false, next_cursor: null, segments: [], exclusions: [], suppressions: [], contents: [], proposals: [], bindings: [] });
 }) as typeof fetch;
 
@@ -108,28 +147,32 @@ document.body.append(host);
 const root = createRoot(host);
 const flush = () => React.act(async () => { await new Promise((r) => setTimeout(r, 0)); });
 const settle = async () => { for (let i = 0; i < 8; i++) await flush(); };
-async function mount(installId: string, viewer = { operator: true, readOnly: false }) {
-  history.pushState(null, "", `/app-installations/${installId}?ctx=ctx-a`);
-  await React.act(async () => { root.render(React.createElement(AppShell, { installId, viewer })); });
+async function mount(installId: string, viewer = { operator: true, readOnly: false }, context = "ctx-a") {
+  history.pushState(null, "", `/app-installations/${installId}?ctx=${context}`);
+  await React.act(async () => {
+    win.dispatchEvent(new win.PopStateEvent("popstate"));
+    root.render(React.createElement(AppShell, { installId, viewer }));
+  });
   await settle();
 }
-// CAD-1326: the select is gone; the history button lists conversations and
-// the scope row names the open one (or the unsaved draft).
-const histBtn = () => host.querySelector('[aria-label="Conversation history"]') as HTMLButtonElement;
-const rows = () => Array.from(host.querySelectorAll("[data-chat-history] .app-chat-history-row")) as HTMLButtonElement[];
+// CAD-1700: the header names the open conversation; the Conversations menu
+// (history icon) lists them, the current one checked.
+const histBtn = () => host.querySelector('[aria-label="Conversations"]') as HTMLButtonElement;
+const rows = () => Array.from(host.querySelectorAll('[data-chat-history] [role="menuitemradio"]')) as HTMLButtonElement[];
 async function openHistory() {
   if (!host.querySelector("[data-chat-history]")) {
     await React.act(async () => { histBtn().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
   }
 }
-const optionLabels = async () => { await openHistory(); return rows().map((r) => r.textContent); };
+const rowName = (r: Element) => r.querySelector(".app-chat-history-name")?.textContent ?? null;
+const optionLabels = async () => { await openHistory(); return rows().map(rowName); };
 const openLabel = () => host.querySelector("[data-chat-conv-label]")?.textContent?.replace(/^·\s*/, "") ?? null;
 const pane = () => (host.querySelector("[data-chat-pane]") as HTMLElement).textContent ?? "";
 const box = () => host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement;
 const newButton = () => host.querySelector("[data-chat-new]") as HTMLButtonElement;
 async function pick(label: string) {
   await openHistory();
-  const row = rows().find((r) => r.textContent === label);
+  const row = rows().find((r) => rowName(r) === label);
   assert(row, `history lists ${label}`);
   await React.act(async () => { row!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
   await settle();
@@ -152,7 +195,7 @@ assert(newButton().closest(".app-chat-head-tools") && newButton().nextElementSib
 assert(!host.querySelector('select[aria-label="Conversation"], [data-chat-home-link], [data-chat-conversations]'), "no conversation select, row or Home link");
 equal(openLabel(), "General", "General is the default and the scope row names it");
 await optionLabels();
-equal(rows()[0].getAttribute("aria-current"), "true", "history marks General as the open one");
+equal(rows()[0].getAttribute("aria-checked"), "true", "the Conversations menu checks General as the open one");
 assert(pane().includes("general answer") && !pane().includes("campaign brief"), "General shows only its own thread");
 await pick("Spring launch");
 assert(pane().includes("campaign brief") && !pane().includes("general answer"), "the campaign conversation shows only its own thread");
@@ -168,6 +211,7 @@ await type("/new");
 equal(messagePosts.length, 1, "/new is not sent as a message");
 equal(createPosts, [{ install: "install-crm", body: { context_id: "ctx-a" } }], "/new creates one conversation with no subject");
 assert(openLabel() !== null, "the fresh conversation has an open-conversation label");
+await openHistory(); // CAD-1700: the shareable link lives in the Conversations menu.
 const newConversationLink = host.querySelector("[data-chat-conversation-link]") as HTMLAnchorElement | null;
 assert(newConversationLink, "the fresh conversation has a shareable link");
 equal(new URL(newConversationLink.href).searchParams.get("conversation"), "new-1", "the fresh conversation is the selected conversation");
@@ -196,61 +240,190 @@ equal(createPosts.map((p) => p.body), [{ context_id: "ctx-a" }, { context_id: "c
   equal(messagePosts[messagePosts.length - 1].conversation, `new-${created}`, "sent to the id the create returned");
 }
 
-// Queued notice: the master is on another conversation's message while this one waits.
+// CAD-1700: the turn bar. Another conversation's running turn shows nothing
+// here; this conversation's own queued message reads "Queued after …".
+const bar = () => host.querySelector("[data-turn-bar]") as HTMLElement | null;
+const barButton = (label: string) =>
+  Array.from(bar()?.querySelectorAll("button") ?? []).find((b) => b.textContent === label) ?? null;
 await pick("Spring launch");
-turn = { state: "working", message: "m-gen-elsewhere" };
+turn = { state: "working", message: "m-gen-elsewhere", conversation: "c-gen" };
 await React.act(async () => { await resources.masterState.refresh(); });
 await settle();
-assert(pane().includes("Assistant is finishing another task — your message is queued"), "queued notice shows while the master is busy elsewhere");
-turn = { state: "working", message: "m-camp" };
-await React.act(async () => { await resources.masterState.refresh(); });
-await settle();
-assert(!pane().includes("your message is queued"), "no notice when the running message is this conversation's own");
+assert(bar()?.dataset.state !== "working" && bar()?.dataset.state !== "queued", `another conversation's running turn never shows Working or Queued here (got ${bar()?.dataset.state})`);
 turn = null;
 await React.act(async () => { await resources.masterState.refresh(); });
 await settle();
 
-// CAD-1168 follow-up: the selected conversation's own in-flight turn reads as
-// a compact status — Sending… while its POST is in flight, Queued… when the
-// daemon reports this conversation's message as the queue head. Neither bleeds
-// into another conversation, and only the owned working turn offers Stop.
+// The selected conversation's own turn: Sending while its POST is in flight;
+// Queued (with Cancel, never Stop) once the daemon queues it behind another
+// conversation's turn; Working with Stop carrying this exact message once it
+// runs. Nothing bleeds into another conversation.
 await pick("Spring launch");
 {
   let resolveSend: ((r: Response) => void) | null = null;
   deferSend = (r) => { resolveSend = r; };
   await type("queued brief update");
   assert(resolveSend !== null, "the send is still in flight");
-  assert(host.querySelector('[data-chat-status="sending"]') !== null, "an in-flight send shows Sending…");
+  equal(bar()?.dataset.state, "sending", "an in-flight send shows Sending");
   await React.act(async () => { resolveSend!(json({ message: "x", state: "queued", duplicate: false })); });
   await settle();
   deferSend = null;
-  assert(host.querySelector('[data-chat-status="waiting"]') !== null, "send acknowledgement keeps a status until the daemon turn arrives");
 
   const sentMessage = messagePosts[messagePosts.length - 1].message;
-  turn = { state: "queued", message: sentMessage };
+  turn = { state: "working", message: "m-gen-elsewhere", conversation: "c-gen" };
+  queue = [{ message: sentMessage, conversation: "c-camp" }];
   await React.act(async () => { await resources.masterState.refresh(); });
   await settle();
-  assert(host.querySelector('[data-chat-status="queued"]') !== null, "an owned queued turn shows Queued…");
-  assert(host.querySelector("[data-chat-stop]") === null, "a queued turn offers no Stop");
+  equal(bar()?.dataset.state, "queued", "an owned queued message shows Queued");
+  assert(bar()!.textContent!.includes("after General"), `Queued names what is ahead; got ${bar()?.textContent}`);
+  assert(barButton("Stop") === null, "a queued message offers no Stop");
+  turn = { state: "working", message: "m-home", conversation: "home-thread" };
+  await React.act(async () => {
+    await resources.masterThread.refresh();
+    await resources.masterState.refresh();
+  });
+  await settle();
+  assert(bar()!.textContent!.includes("after Home"), "the real Home thread ID is labelled Home");
+  assert(barButton("View") !== null, "a Home predecessor has a View action");
+  await React.act(async () => { barButton("Cancel")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await settle();
+  equal(commandPosts.at(-1), { command: "cancel", message: sentMessage }, "Cancel names exactly this conversation's queued message");
 
-  // Once SSE/page reconciliation drops the pending row, the owned queue head
-  // must keep polling: thread entries do not refresh the master projection.
   threads["c-camp"].push(ent(3, "operator", "message", "queued brief update", sentMessage));
   await React.act(async () => { await conversationThread("c-camp").refresh(); });
+  // The server note retires the optimistic row before the owned message
+  // reaches the queue head. Position 21 must still be tracked from metadata.
+  queue = [
+    ...Array.from({ length: 20 }, (_, index) => ({ message: `ahead-${index}`, conversation: "c-gen" })),
+    { message: sentMessage, conversation: "c-camp" },
+  ];
+  await React.act(async () => { await resources.masterState.refresh(); });
   await settle();
-  turn = { state: "working", message: sentMessage };
-  await React.act(async () => { await new Promise((r) => setTimeout(r, 6_100)); });
+  equal(bar()?.dataset.state, "queued", "position 21 stays Queued after optimistic retirement");
+  assert(bar()!.textContent!.includes("after General"), "position 21 names its immediate predecessor, not the running Home turn");
+  assert(barButton("View") && barButton("Cancel") && !barButton("Stop"), "position 21 retains View and Cancel, never Stop");
+  turn = { state: "working", message: sentMessage, conversation: "c-camp", summary: "customers.search" };
+  queue = [];
+  // No timer: a `master` stream frame invalidates the state (CAD-1700).
+  await React.act(async () => { await resources.masterState.invalidate(); });
   await settle();
-  assert(host.querySelector("[data-chat-stop]") !== null, "the owned working turn still offers Stop");
-  assert(pane().includes("Working…"), "the working row still shows");
+  equal(bar()?.dataset.state, "working", "the owned running turn shows Working after a master frame");
+  assert(bar()!.textContent!.includes("customers.search"), "Working names the live step");
+  operations = [{
+    id: "op-tags", action_id: "customer.tags.update", status: "pending_permission", revision: 1,
+    summary: "Tag the selected customer", resource_refs: [],
+    permission_request: {
+      reason: "This changes one customer", allow_always: true,
+      scope: { install_id: "install-crm", context_id: "ctx-a", action_id: "customer.tags.update", resource_id: "ada" },
+      preview: { customer_label: "Ada", before_tags: [], after_tags: ["vip"], expected_revision: 1 },
+    },
+  }];
+  const { noteMasterChanged } = require("../src/lib/masterChanged");
+  await React.act(async () => { noteMasterChanged(); });
+  await settle();
+  assert(barButton("Review") !== null && barButton("Stop") === null, "a pushed operation permission replaces Stop with Review");
+  const approval = host.querySelector('[data-operation-status="pending_permission"]') as HTMLElement;
+  assert(approval, "the actionable app approval card is mounted");
+  assert(host.querySelector('[data-permission-thread="permission-old"] [data-permission-decided]'), "a decided historic permission precedes the current operation");
+  const scrolled = new Set<HTMLElement>();
+  const originalScroll = HTMLElement.prototype.scrollIntoView;
+  HTMLElement.prototype.scrollIntoView = function () { scrolled.add(this); };
+  try {
+    await React.act(async () => { barButton("Review")!.click(); });
+    assert(scrolled.has(approval), "Review reaches the pending operation, not a historic decided permission");
+  } finally {
+    HTMLElement.prototype.scrollIntoView = originalScroll;
+  }
+  operations = [];
+  await React.act(async () => { noteMasterChanged(); });
+  await settle();
+  await React.act(async () => { barButton("Stop")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await settle();
+  equal(commandPosts.at(-1), { command: "stop", message: sentMessage }, "Stop names exactly this conversation's running turn");
 
   await pick("General");
-  assert(host.querySelector("[data-chat-status]") === null, "the status does not bleed into another conversation");
+  assert(bar() === null, "the turn does not bleed into another conversation");
   turn = null;
   await React.act(async () => { await resources.masterState.refresh(); });
   await settle();
   await pick("Spring launch");
 }
+
+// A failed stored request retains its app binding even after a context
+// switch and a later draft capture another context in the same conversation.
+{
+  threads["c-gen"].push({
+    ...ent(3, "operator", "message", "retry the original request", "m-stored-failure"),
+    payload: { app: { install_id: "install-crm", context_id: "ctx-a" } },
+  });
+  await React.act(async () => { await conversationThread("c-gen").refresh(); });
+  await mount("install-other");
+  crmContext = "ctx-b";
+  await mount("install-crm", { operator: true, readOnly: false }, "ctx-b");
+  await pick("General");
+  await type("current-context probe");
+  equal(messagePosts.at(-1).app, { install_id: "install-crm", context_id: "ctx-b" }, "the mounted composer is now in context B");
+  threads["c-gen"].push(ent(4, "operator", "message", "current-context probe", messagePosts.at(-1).message));
+  await React.act(async () => { await conversationThread("c-gen").refresh(); });
+  threads["c-gen"].push({
+    ...ent(5, "agent", "turn_result", "Could not finish", "m-stored-failure"),
+    created: new Date().toISOString(), payload: { status: "failed", error: "Try again" },
+  });
+  await React.act(async () => { await conversationThread("c-gen").refresh(); });
+  await settle();
+  assert(barButton("Retry"), "the stored failed turn has a Retry action");
+  await React.act(async () => {
+    conversationThread("c-gen").write((state) => ({ ...state!, pending: [...state!.pending, {
+      message: "m-older-transport-failure", text: "older failed transport brief", state: "failed", at: Date.now(),
+      refs: [{ kind: "issue", id: "CAD-A" }], attachments: [{ id: "file-a" }],
+      app: { install_id: "install-crm", context_id: "ctx-a" },
+    }] }));
+  });
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(box(), "later unsent draft");
+    box().dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await React.act(async () => { barButton("Retry")!.click(); });
+  await settle();
+  equal(messagePosts.at(-1).app, { install_id: "install-crm", context_id: "ctx-a" }, "Retry uses the failed request's binding, never the current context or later draft");
+  equal(messagePosts.at(-1).text, "retry the original request", "Retry transmits the stored request, not the later draft");
+  equal(box().value, "later unsent draft", "Retry preserves the later draft");
+  const storedRetryMessage = messagePosts.at(-1).message;
+  const olderRow = Array.from(host.querySelectorAll(".app-chat-list li")).find((row) => row.textContent?.includes("older failed transport brief"));
+  const rowRetry = olderRow && Array.from(olderRow.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Retry");
+  assert(rowRetry, "the unrelated failed send retains its own row Retry");
+  await React.act(async () => { rowRetry.click(); });
+  await settle();
+  equal(messagePosts.at(-1).message, "m-older-transport-failure", "the row Retry alone resends its own original id");
+  equal(messagePosts.at(-1).refs, [{ kind: "issue", id: "CAD-A" }], "row Retry retains the captured references");
+  equal(messagePosts.at(-1).attachments, [{ id: "file-a" }], "row Retry retains the captured files");
+  threads["c-gen"].push(ent(6, "operator", "message", "retry the original request", storedRetryMessage));
+  await React.act(async () => {
+    await conversationThread("c-gen").refresh();
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(box(), "");
+    box().dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await mount("install-other");
+  crmContext = "ctx-a";
+  await mount("install-crm");
+}
+
+// A hidden but mounted pane must not clear another tab's unread state.
+await pick("General");
+await React.act(async () => {
+  Object.defineProperty(win.document, "visibilityState", { value: "hidden", configurable: true });
+  win.document.dispatchEvent(new win.Event("visibilitychange"));
+  convs["install-crm"].find((c) => c.id === "c-gen").reply_seq = 5;
+  await conversationList("install-crm").refresh();
+});
+await settle();
+assert(((await readSeen("install-crm"))["c-gen"] ?? 0) < 5, "the mounted hidden pane leaves the reply unseen");
+await React.act(async () => {
+  Object.defineProperty(win.document, "visibilityState", { value: "visible", configurable: true });
+  win.document.dispatchEvent(new win.Event("visibilitychange"));
+});
+await settle();
+equal((await readSeen("install-crm"))["c-gen"], 5, "returning to the visible pane marks the displayed reply seen");
 
 // Collapse state is per app.
 await React.act(async () => { (host.querySelector(".app-chat-collapse") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
@@ -326,6 +499,74 @@ assert(box().disabled, "the composer (and so /new) is disabled read-only");
 await React.act(async () => { newButton().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 await settle();
 equal(createPosts.length, before, "no conversation is created read-only");
+await pick("General");
+turn = { state: "working", message: "m-gen", conversation: "c-gen" };
+await React.act(async () => { await resources.masterState.refresh(); });
+await settle();
+assert(bar() && !barButton("Stop"), "a read-only pane observes its working turn without offering a mutating Stop");
+turn = { state: "working", message: "m-elsewhere", conversation: "c-camp" };
+queue = [{ message: "m-gen", conversation: "c-gen" }];
+await React.act(async () => { await resources.masterState.refresh(); });
+await settle();
+assert(bar()?.dataset.state === "queued" && !barButton("Cancel"), "a read-only pane observes its queue without offering a mutating Cancel");
+assert(barButton("View"), "read-only mode retains non-mutating predecessor navigation");
+queue = [];
+
+// Context navigation cannot manufacture a successful network reconnect.
+const Conversation = (require("../src/features/app-shell/chat/Conversation") as typeof ConversationModule).default;
+const renderPane = async (contextId: string) => {
+  await React.act(async () => {
+    root.render(React.createElement(LocaleProvider, null, React.createElement(Conversation, {
+      mode: { kind: "app", installId: "install-crm", contextId, screen: null, recordOpen: false,
+        contextName: null, scopeLabel: "CRM", descriptor: null, conversationRequest: null,
+        contextProof: { status: "ready", contextId, error: null }, appPath: null,
+        fileUpload: { declared: false, available: false }, fileUploadLoading: false },
+      density: "compact", viewer: { operator: true, readOnly: false },
+      binding: { scope: { install_id: "install-crm", context_id: contextId }, error: null },
+      onFileUploadUnavailable: () => undefined, collapsed: false,
+      onCollapsed: () => undefined, onOpenView: () => undefined,
+    })));
+  });
+  await settle();
+};
+controlledTranscript = true;
+turn = { state: "working", message: "m-reconnect", conversation: "c-gen" };
+await renderPane("ctx-a");
+await pick("General");
+assert(barButton("Stop"), "the connected General pane has its own live turn");
+holdReconnect = true;
+await React.act(async () => { disconnectTranscript?.(); });
+await settle();
+assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "the actual stream disconnect hides turn actions");
+await renderPane("ctx-b");
+assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "a same-conversation context change must not declare the disconnected stream live");
+
+// A fresh snapshot is not actionable until this scope's operation read
+// has reconciled. A failed read remains stale, then a real Retry recovers.
+await React.act(async () => { root.render(null); });
+holdReconnect = false;
+heldOperations = [];
+await renderPane("ctx-a");
+assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "a turn snapshot cannot enable Stop before scoped approval reconciliation");
+// Settle the discarded pre-snapshot batch, then its fenced follow-up.
+for (let batch = 0; batch < 2; batch++) {
+  await React.act(async () => { heldOperations!.splice(0).forEach((resolve) => resolve(json({ error: "Unavailable" }, 503))); });
+  await settle();
+}
+assert(bar()?.dataset.stale === "true" && !barButton("Stop"), "failed post-reconnect operation reads keep actions hidden");
+operations = [{
+  id: "op-reconnected", action_id: "customer.tags.update", status: "pending_permission", revision: 1,
+  summary: "Review the reconnected change", resource_refs: [],
+  permission_request: { reason: "This changes one customer", allow_always: true,
+    scope: { install_id: "install-crm", context_id: "ctx-a", action_id: "customer.tags.update", resource_id: "ada" },
+    preview: { customer_label: "Ada", before_tags: [], after_tags: ["vip"], expected_revision: 1 } },
+}];
+heldOperations = null;
+const retryActivity = Array.from(host.querySelectorAll(".app-assistant-activity button")).find((button) => button.textContent?.trim() === "Retry");
+assert(retryActivity, "the failed activity read offers its existing Retry");
+await React.act(async () => { (retryActivity as HTMLButtonElement).click(); });
+await settle();
+assert(!bar()?.dataset.stale && barButton("Review") && !barButton("Stop") && host.querySelector('[data-operation-status="pending_permission"]'), "reconciliation exposes the real approval card and Review, never a transient Stop");
 await React.act(async () => { root.unmount(); });
 console.log("conversations checks passed");
 }

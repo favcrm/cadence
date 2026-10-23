@@ -829,7 +829,11 @@ export interface MasterState {
     summary?: string | null;
     /** Epoch seconds the message started (working) or was created (queued). */
     since?: number | null;
+    /** 1-based queue position of a queued message; null while working. */
+    position?: number | null;
   } | null;
+  /** Queued master messages in delivery order (max 20). */
+  queue?: { message: string; conversation?: string | null }[];
   queued?: number;
 }
 

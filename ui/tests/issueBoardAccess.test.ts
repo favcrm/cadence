@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 /** A new issue cannot be offered before the board knows this tab's access. */
 declare function require(name: string): any;
 const { Window } = require("happy-dom");
@@ -29,7 +30,7 @@ let releaseMeta!: (response: Response) => void;
 let failMeta!: (error: Error) => void;
 globalThis.fetch = async (input) => {
   const path = new URL(String(input), "http://localhost").pathname;
-  if (path.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+  if (path.endsWith("/stream")) return streamFixture(path);
   if (path === "/api/meta") return new Promise<Response>((resolve, reject) => { releaseMeta = resolve; failMeta = reject; });
   if (path === "/api/health") return json({ daemon: "reachable" });
   if (path === "/api/issues") return json({ issues: [{

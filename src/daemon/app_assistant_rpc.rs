@@ -149,7 +149,23 @@ pub(super) fn public_operation(mut op: Value) -> Value {
 }
 
 impl Shared {
+    /// CAD-1700: the agent assistant entry. The master push revision is
+    /// bumped AFTER the call, on success and failure alike, so a watcher
+    /// that reads the new stamp always sees the rows the call wrote.
     pub(super) fn rpc_app_assistant_agent(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let out = self.rpc_app_assistant_agent_inner(method, params, peer_pid);
+        if method == "app_assistant_invoke" {
+            self.bump_master_rev();
+        }
+        out
+    }
+
+    fn rpc_app_assistant_agent_inner(
         self: &Arc<Self>,
         method: &str,
         params: &Value,
@@ -588,7 +604,29 @@ impl Shared {
         }
     }
 
+    /// CAD-1700: the operator assistant entry. The master push revision is
+    /// bumped AFTER the call for the three write methods, on success and
+    /// failure alike, so a watcher that reads the new stamp sees the rows
+    /// the call wrote.
     pub(super) fn rpc_app_assistant_operator(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let out = self.rpc_app_assistant_operator_inner(method, params, peer_pid);
+        if matches!(
+            method,
+            "app_assistant_decision"
+                | "app_assistant_permission_revoke"
+                | "app_assistant_permission_block"
+        ) {
+            self.bump_master_rev();
+        }
+        out
+    }
+
+    fn rpc_app_assistant_operator_inner(
         self: &Arc<Self>,
         method: &str,
         params: &Value,

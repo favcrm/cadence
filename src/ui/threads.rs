@@ -325,6 +325,20 @@ pub(super) fn stream(
         let _ = request.respond(rpc_err(&e));
         return;
     }
+    // The same private read as GET /api/master/state. Put the authoritative
+    // turn on this connection before any resumed entries, not on a racing
+    // board stream whose asynchronous refresh may still hold the old turn.
+    let master = if alias == "master" {
+        match budget.read(state_dir, "master_state", json!({})) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                let _ = request.respond(rpc_err(&e));
+                return;
+            }
+        }
+    } else {
+        None
+    };
     if !admission.still_live(state_dir) {
         return;
     }
@@ -335,7 +349,16 @@ pub(super) fn stream(
     let frame = |w: &mut dyn Write, bytes: &[u8]| -> bool {
         w.write_all(bytes).and_then(|_| w.flush()).is_ok()
     };
-    if !frame(&mut w, head.as_bytes()) || !frame(&mut w, b": ping\n\n") {
+    if !frame(&mut w, head.as_bytes()) {
+        return;
+    }
+    if let Some(master) = master {
+        let bytes = format!("event: master\ndata: {master}\n\n");
+        if !frame(&mut w, bytes.as_bytes()) {
+            return;
+        }
+    }
+    if !frame(&mut w, b": ping\n\n") {
         return;
     }
     loop {

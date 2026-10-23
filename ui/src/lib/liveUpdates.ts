@@ -1,8 +1,8 @@
 import { invalidatedBy, type ResourceName } from "./cache";
 import type { SseEvent } from "./sse";
 
-/** One trailing batch for legacy resource invalidations; entity patches are
- * synchronous, so a later fetch cannot silently overwrite newer data.
+/** Master changes invalidate immediately; other legacy resource invalidations
+ * share a trailing batch. Entity patches apply synchronously.
  */
 export class LiveUpdates {
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -49,7 +49,10 @@ export class LiveUpdates {
       if (event.type === "agent_meta") this.queue("lane");
       return;
     }
-    for (const key of invalidatedBy(event.data)) this.queue(key);
+    for (const key of invalidatedBy(event.data)) {
+      if (key === "master") this.opts.invalidate(key);
+      else this.queue(key);
+    }
   };
   private queue(key: ResourceName | string) {
     this.pending.add(key);

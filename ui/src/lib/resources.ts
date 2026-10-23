@@ -196,7 +196,7 @@ export const resources = {
    * fetch and the header falls back to the agents row. Home revalidates
    * it when `agents` moves and after a `masterCommand`.
    */
-  masterState: cache.resource<MasterState>("masterState", () => api.masterState()),
+  masterState: cache.resource<MasterState>("master", () => api.masterState()),
   /** `GET /api/issues/<id>` — one drawer's detail (and a plan card's epic). */
   issue: cache.family<string, IssueDetail>("issue", (id) => api.issue(id), (id) => ({
     discardOnError: unavailablePrivateRecord,

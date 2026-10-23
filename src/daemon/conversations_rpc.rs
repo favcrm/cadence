@@ -298,13 +298,16 @@ impl Shared {
         self.known_install(install)?;
         // General always exists once an installation is proven.
         self.store.conversation_ensure_general(&alias, install)?;
-        let rows = self.store.conversation_list(&alias, install)?;
-        let general = rows.iter().find(|t| t.is_general).map(|t| t.id.clone());
+        let rows = self.store.conversation_summaries(&alias, install)?;
+        let general = rows
+            .iter()
+            .find(|row| row["is_general"] == true)
+            .and_then(|row| row["id"].as_str());
         Ok(json!({
             "alias": alias,
             "install_id": install,
             "general": general,
-            "conversations": rows.iter().map(store::Thread::to_json).collect::<Vec<_>>(),
+            "conversations": rows,
         }))
     }
 

@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 import type * as HappyDomModule from "happy-dom";
 import type * as ReactModule from "react";
 import type * as ReactDomModule from "react-dom/client";
@@ -168,22 +169,6 @@ function assertCreateBody(raw: string, why: string): void {
   assert(field(record, "subject") === SUBJECT, `${why}: subject`);
 }
 
-function openStream(signal: AbortSignal | null | undefined): Response {
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      const close = () => {
-        try {
-          controller.close();
-        } catch {
-          // The reader may already have canceled this body.
-        }
-      };
-      if (signal?.aborted) close();
-      else signal?.addEventListener("abort", close, { once: true });
-    },
-  });
-  return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
-}
 
 globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url, "http://localhost");
@@ -211,7 +196,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (method === "GET" && path === "/api/threads/master") {
     return json({ entries: [], more_before: false, thread: null });
   }
-  if (method === "GET" && path === "/api/threads/master/stream") return openStream(init?.signal);
+  if (method === "GET" && path === "/api/threads/master/stream") return streamFixture(path, { alias: "master", provider: "pi", endpoint_kind: "pi", live: false, turn: null }, init?.signal);
   if (method === "GET" && path === "/api/master/state") {
     return json({ alias: "master", provider: "pi", endpoint_kind: "pi", live: false, turn: null });
   }

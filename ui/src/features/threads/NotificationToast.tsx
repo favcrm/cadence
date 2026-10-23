@@ -9,13 +9,14 @@ interface Alert {
   id: number;
   title: string;
   href: string;
+  note: string;
 }
 
 export interface ToastApi {
-  /** Announce a new message for `room`. Deduplicated per room by the caller's seq. */
-  show: (title: string, room: string) => void;
-  /** Drop every pending alert (identity change). */
-  clear: () => void;
+  /** Announce a new message for `room` (a Threads room unless `target.href` says where Open goes). Deduplicated per room by the caller's seq. */
+  show: (title: string, room: string, target?: { href: string; note: string }) => void;
+  /** Drop one room's alert after it is seen, or every alert on identity change. */
+  clear: (room?: string) => void;
 }
 
 const ToastContext = createContext<ToastApi>({ show: () => undefined, clear: () => undefined });
@@ -41,23 +42,34 @@ export function NotificationToastProvider({ children }: { children: ReactNode })
     timers.current.clear();
   }, []);
 
-  const clear = useCallback(() => {
+  const clear = useCallback((room?: string) => {
+    if (room !== undefined) {
+      const id = pending.current.get(room);
+      if (id === undefined) return;
+      pending.current.delete(room);
+      const timer = timers.current.get(id);
+      if (timer !== undefined) window.clearTimeout(timer);
+      timers.current.delete(id);
+      setAlerts((cur) => cur.filter((alert) => alert.id !== id));
+      return;
+    }
     dropTimers();
     pending.current.clear();
     setAlerts([]);
   }, [dropTimers]);
 
   const show = useCallback(
-    (title: string, room: string) => {
+    (title: string, room: string, target?: { href: string; note: string }) => {
       if (retired.current || !privateReadsAllowed()) return;
       const existing = pending.current.get(room);
       const id = ++seq.current;
       pending.current.set(room, id);
-      const href = `/threads?h=${encodeURIComponent(room)}`;
+      const href = target?.href ?? `/threads?h=${encodeURIComponent(room)}`;
+      const note = target?.note ?? "Unread until you open it.";
       setAlerts((cur) => {
         if (retired.current || !privateReadsAllowed()) return cur;
         const rest = cur.filter((a) => !(a.href === href && a.id === existing));
-        return [...rest, { id, title, href }].slice(-3);
+        return [...rest, { id, title, href, note }].slice(-3);
       });
       const timer = window.setTimeout(() => {
         timers.current.delete(id);
@@ -95,7 +107,7 @@ export function NotificationToastProvider({ children }: { children: ReactNode })
           <div key={a.id} className="notification-toast" role="status">
             <div>
               <strong>{a.title}</strong>
-              <p>Unread until you open it.</p>
+              <p>{a.note}</p>
               <button type="button" className="lnk" onClick={() => { dismiss(a.id); navigate(a.href); }}>Open</button>
             </div>
             <Button variant="ghost" size="sm" aria-label="Dismiss notification" icon={<IconClose />} onClick={() => dismiss(a.id)} />

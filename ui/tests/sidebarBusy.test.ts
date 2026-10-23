@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 export {};
 /**
  * CAD-1189: a failed or busy refresh of the installed-app list keeps the
@@ -48,7 +49,7 @@ let listCalls = 0;
 globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
   const url = new URL(path, "http://localhost");
-  if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+  if (url.pathname.endsWith("/stream")) return streamFixture(path);
   if (path.startsWith("/api/meta") && metaUnavailable) return json({ error: "Verification unavailable" }, 503);
   if (path.startsWith("/api/meta")) return json({ read_only: false, operator, signed_in: true, actor: "operator (ui)", session: { id: "sidebar-session", origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test" } });
   if (path === "/api/issues" || path.startsWith("/api/issues?")) return json({ issues: [] });

@@ -1,3 +1,4 @@
+import { streamFixture } from "./streamFixture";
 import {
   AppViewContractError,
   FORBIDDEN_DESCRIPTOR_KEYS,
@@ -335,7 +336,7 @@ const shellBase = {
 };
 globalThis.fetch = (async (input: unknown) => {
   const url = String(input);
-  if (new URL(url, "http://localhost").pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+  if (new URL(url, "http://localhost").pathname.endsWith("/stream")) return streamFixture(url);
   if (url.endsWith("/conversations")) return new Response("{}", { status: 404 });
   const receipt = url === "/api/app-installations/install-b/contexts"
     ? { contexts: [{ id: "ctx-b", install_id: "install-b", revision: 1, state: "active", digest: "cb", config: { schema: 1, label: "General", input_defaults: {} } }] }

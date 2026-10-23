@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, ApiError, type MasterPermissionRequest } from "../../lib/api";
 import { useTranslate } from "../../lib/locale";
 import { resources } from "../../lib/resources";
+import { subscribeMasterChanged } from "../../lib/masterChanged";
 
 const listeners = new Set<() => void>();
 
@@ -235,25 +236,37 @@ export function ThreadPermission({ text, readOnly }: { text: string; readOnly: b
   const id = permissionIdFromText(text);
   const [card, setCard] = useState<PermissionCardData | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const load = () => {
-    if (!id) return;
-    api
-      .permissionRules()
-      .then((out) => {
+  useEffect(() => {
+    let alive = true;
+    let revision = 0;
+    setCard(null);
+    setError(null);
+    const load = () => {
+      if (!id) return;
+      const current = ++revision;
+      void api.permissionRules().then((out) => {
+        if (!alive || current !== revision) return;
         const req = out.requests.find((r) => r.id === id);
         setCard(req ? cardFromRequest(req) : null);
-      })
-      .catch((e: ApiError) => setError(e.message ?? String(e)));
-  };
-  useEffect(() => {
+        setError(null);
+      }).catch((e: ApiError) => {
+        if (alive && current === revision) setError(e.message ?? String(e));
+      });
+    };
     load();
-    return subscribePermission(load);
+    const offLocal = subscribePermission(load);
+    const offMaster = subscribeMasterChanged(load);
+    return () => {
+      alive = false;
+      offLocal();
+      offMaster();
+    };
   }, [id]);
   if (!id) return <p className="text-micro text-ink-400 whitespace-pre-wrap break-words">{text}</p>;
   return (
     <div className="card px-3 py-2 ml-8 min-w-0" data-permission-thread={id}>
       {card ? (
-        <PermissionCard card={card} readOnly={readOnly} onDone={() => load()} compact />
+        <PermissionCard card={card} readOnly={readOnly} onDone={() => setError(null)} compact />
       ) : (
         <p className="text-micro text-ink-400 whitespace-pre-wrap break-words">{text}</p>
       )}
