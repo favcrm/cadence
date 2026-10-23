@@ -176,6 +176,8 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     // CAD-1752: propose hiring a catalogue role for the operator to review.
     // The daemon binds it to the live turn; it registers nothing.
     "Bash(cadence agent propose-hire *)",
+    // CAD-1772: the catalogue's role ids, so a proposal names a real one.
+    "Bash(cadence agent roles)",
     // CAD-615: ask the operator to approve one plain command. The
     // decision verbs are not here — the master cannot approve itself.
     "Bash(cadence master ask-permission *)",
@@ -1863,6 +1865,7 @@ mod tests {
         assert!(home.contains(&"wiki put".to_string()));
         // CAD-1752: the master may propose a hire; an app session may not.
         assert!(home.contains(&"agent propose-hire".to_string()));
+        assert!(home.contains(&"agent roles".to_string()));
         assert!(home.contains(&"app audience segment-assistant-ls".to_string()));
         assert!(home.contains(&"app".to_string()));
         assert!(!home.iter().any(|p| p == "help" || p.starts_with("help ")));

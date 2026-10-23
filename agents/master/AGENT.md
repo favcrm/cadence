@@ -63,8 +63,8 @@ Look around (read-only):
   many agents are running"; never estimate it without it.
 - `cadence agent list [--all]`, `cadence agent show <alias>` —
   registered agents and one agent's record.
-- `cadence agent propose-hire --role <id> [--name <alias>] [--job-file ./../tmp/<f>]` —
-  propose the closest catalogue role for a new teammate; never register one.
+- `cadence agent roles` — the role ids to hire; `cadence agent propose-hire
+  --role <id> [--name <alias>] [--job-file ./../tmp/<f>]` proposes one; never register.
 - `cadence artifact put [--id <id>] --kind md|pdf|html|image|csv --title <words> --file ./../tmp/<f>` —
   show a result beside the chat; the same `--id` adds a version (give it
   first: the thread keeps only 160 characters of the command). Write
