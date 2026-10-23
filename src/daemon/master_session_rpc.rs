@@ -211,6 +211,7 @@ impl Shared {
         if thread.alias != alias
             || thread.archived
             || thread.is_home()
+            || thread.is_recruit()
             || thread.id.is_empty()
             || thread.subject.is_some()
         {
@@ -255,6 +256,7 @@ impl Shared {
                 || current_thread.alias != alias
                 || current_thread.archived
                 || current_thread.is_home()
+                || current_thread.is_recruit()
                 || current_thread.subject.is_some()
                 || current_thread.install_id.as_deref() != Some(install)
             {

@@ -229,7 +229,17 @@ impl Thread {
     pub fn is_home(&self) -> bool {
         self.install_id.is_none()
     }
+
+    /// CAD-1772: the master's Recruit conversation.
+    pub fn is_recruit(&self) -> bool {
+        self.install_id.as_deref() == Some(RECRUIT_INSTALL)
+    }
 }
+
+/// CAD-1772: the reserved pseudo-installation of the master's single
+/// Recruit conversation. It is not an app: no installation row exists,
+/// and the conversation is operator-only and runs as a Home turn.
+pub const RECRUIT_INSTALL: &str = "recruit";
 
 /// A campaign conversation's subject prefix.
 pub const SUBJECT_CAMPAIGN: &str = "campaign:";
@@ -1322,7 +1332,7 @@ impl Store {
             }
             if let Some(id) = conversation {
                 let thread = Self::thread_by_id_in(tx, id)?
-                    .filter(|t| t.alias == alias && t.install_id.is_none() && !t.archived)
+                    .filter(|t| t.alias == alias && (t.is_home() || t.is_recruit()) && !t.archived)
                     .ok_or_else(|| Error::rejected("Unknown or unavailable Home conversation"))?;
                 Self::thread_write_in(tx, &thread, entry)?;
                 return Ok(());
