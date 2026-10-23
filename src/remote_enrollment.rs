@@ -2757,11 +2757,10 @@ fn registration_url(
     {
         return Err(reject("Registration handoff URL must be HTTPS"));
     }
-    let after = match uri.query() {
-        Some(query) => format!("{}?{query}", uri.path()),
-        None => uri.path().to_owned(),
-    };
-    let mut query = vec![format!("after={}", query_encode(&after))];
+    let after = uri
+        .path_and_query()
+        .map_or(uri.path(), |value| value.as_str());
+    let mut query = vec![format!("after={}", query_encode(after))];
     if let Some(name) = name {
         query.push(format!("name={}", query_encode(name)));
     }
@@ -3131,22 +3130,28 @@ mod tests {
     #[test]
     fn register_portal_refuses_unsafe_intent_before_network() {
         let dir = std::path::Path::new("/nonexistent");
-        assert!(super::register_portal(
+        let error = match super::register_portal(
             "https://api.example.com",
             Some("bad\nname"),
             None,
             dir,
-            |_, _| Ok(())
-        )
-        .is_err());
-        assert!(super::register_portal(
+            |_, _| Ok(()),
+        ) {
+            Ok(_) => panic!("unsafe workspace name was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "Invalid workspace name");
+        let error = match super::register_portal(
             "https://api.example.com",
             Some("Acme"),
             Some("Not_A_Slug"),
             dir,
-            |_, _| Ok(())
-        )
-        .is_err());
+            |_, _| Ok(()),
+        ) {
+            Ok(_) => panic!("unsafe workspace slug was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "Invalid workspace slug");
     }
 
     use super::*;
