@@ -962,23 +962,30 @@ impl Shared {
                 };
                 crate::issue::lockseam::outside_lock("app-capability-provider-call");
                 let output = adapter
-                    .execute_app_capability(&credential, &authority, input, &call_id)
+                    .execute_app_capability_outcome(&credential, &authority, input, &call_id)
                     .map_err(|error| {
                         let reason = if crate::platform::refuse_leak(
                             "app capability failure",
-                            &error,
+                            error.reason(),
                             &credential,
                         )
                         .is_ok()
                         {
-                            error.chars().take(250).collect::<String>()
+                            error.reason().chars().take(250).collect::<String>()
                         } else {
                             "Provider failure details were withheld because they matched credential custody.".into()
                         };
                         let _ = self
                             .store
-                            .app_run_call_failed(&run_id, &step, "refused", &reason);
-                        Error::rejected(error)
+                            .app_run_call_failed(&run_id, &step, error.kind(), &reason);
+                        match error {
+                            crate::platform::AppCapabilityError::Refused(_) => {
+                                Error::provider(reason)
+                            }
+                            crate::platform::AppCapabilityError::Uncertain(_) => {
+                                Error::unknown(reason)
+                            }
+                        }
                     })?;
                 // CAD-1258 interleaving point: a revoke or upgrade may land here.
                 crate::issue::lockseam::outside_lock("app-capability-before-record");
@@ -991,25 +998,25 @@ impl Shared {
                         .app_release_lock
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    self.app_run_binding_current(
-                        &self.store.app_run_show(&run_id)?,
-                        bundle,
-                        files,
-                    )?;
-                    let (current, current_step, current_proof) = self.store.app_capability_turn(
-                        &alias,
-                        message,
-                        turn,
-                        &slot,
-                        required_str(bundle, "digest")?,
-                    )?;
+                    self.app_run_binding_current(&self.store.app_run_show(&run_id)?, bundle, files)
+                        .map_err(super::app_effects_rpc::lock2_authority)?;
+                    let (current, current_step, current_proof) = self
+                        .store
+                        .app_capability_turn(
+                            &alias,
+                            message,
+                            turn,
+                            &slot,
+                            required_str(bundle, "digest")?,
+                        )
+                        .map_err(super::app_effects_rpc::lock2_authority)?;
                     if current["approval"]["human"] != sealed_human
                         || current_step != step
                         || current_proof.digest != proof.digest
                     {
-                        return Err(Error::rejected(
+                        return Err(super::app_effects_rpc::lock2_authority(Error::rejected(
                             "capability approval or turn changed during the external call",
-                        ));
+                        )));
                     }
                     crate::platform::refuse_leak(
                         "app capability result",
@@ -1023,35 +1030,47 @@ impl Shared {
                             &credential,
                         )?;
                     }
-                    self.store.app_capability_record(
-                        crate::store::app_capabilities::AppCapabilityRecord {
-                            id: &call_id,
-                            run: &run_id,
-                            step: &step,
-                            message,
-                            turn,
-                            slot: &slot,
-                            request: &request,
-                            binding_digest: &proof.digest,
-                            input_digest: &input_digest,
-                            result: &output.result,
-                            asset: output
-                                .asset
-                                .as_ref()
-                                .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
-                        },
-                    )
+                    self.store
+                        .app_capability_record(
+                            crate::store::app_capabilities::AppCapabilityRecord {
+                                id: &call_id,
+                                run: &run_id,
+                                step: &step,
+                                message,
+                                turn,
+                                slot: &slot,
+                                request: &request,
+                                binding_digest: &proof.digest,
+                                input_digest: &input_digest,
+                                result: &output.result,
+                                asset: output.asset.as_ref().map(|asset| {
+                                    (asset.media_type.as_str(), asset.bytes.as_slice())
+                                }),
+                            },
+                        )
+                        .map_err(|error| Error::internal(error.to_string()))
                 });
-                if recorded.is_err() {
+                if let Err(error) = &recorded {
                     // The provider answered but lock 2 refused or could not
-                    // retain it: leave a durable uncertain failure, never a
-                    // silent drop. The claim blocks any resend.
-                    let _ = self.store.app_run_call_failed(
-                        &run_id,
-                        &step,
-                        "uncertain",
-                        "App authority changed while the provider call ran; the result was not retained and no automatic retry was made.",
+                    // retain it: leave a durable uncertain failure naming
+                    // the cause, never a silent drop. The claim blocks any
+                    // resend. If that write fails too, say so.
+                    let reason = super::app_effects_rpc::lock2_failure_reason(
+                        error,
+                        &[credential.as_slice()],
                     );
+                    if let Err(write) =
+                        self.store
+                            .app_run_call_failed(&run_id, &step, "uncertain", &reason)
+                    {
+                        return Err(Error::unknown(format!(
+                            "{reason} (the failure could not be recorded: {})",
+                            super::app_effects_rpc::lock2_cause(&write, &[credential.as_slice()])
+                        )));
+                    }
+                    // The caller gets the same screened reason, never the raw
+                    // lock-2 error text.
+                    return Err(Error::unknown(reason));
                 }
                 recorded
             }

@@ -508,8 +508,10 @@ impl Store {
     }
 
     /// Eligibility and the exactly-one claim share a transaction. A caller
-    /// must hold the daemon release lock until provider commit/readback;
-    /// this method drops SQLite before any adapter is called.
+    /// holds PM, custody and the release lock only across this claim; the
+    /// provider call and read-back run with none held and lock 2 re-checks
+    /// authority before recording (CAD-1258). This method drops SQLite before
+    /// any adapter is called.
     pub(crate) fn app_effect_claim<F>(
         &self,
         id: &str,

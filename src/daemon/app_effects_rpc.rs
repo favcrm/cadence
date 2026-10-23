@@ -1531,13 +1531,11 @@ impl Shared {
         };
         // CAD-1258 interleaving point: a revoke or upgrade may land here.
         crate::issue::lockseam::outside_lock("app-release-before-record");
-        let entered = std::cell::Cell::new(false);
         let recorded = workspace::with_completed_bundle_snapshot(
             &pm,
             install,
             bundle_digest,
             |bundle, files| {
-                entered.set(true);
                 let _custody = self
                     .platform_custody_lock
                     .lock()
@@ -1568,20 +1566,75 @@ impl Shared {
                 Ok(Some(self.store.app_effect_show(id)?))
             },
         );
-        match recorded {
-            Ok(Some(effect)) => Ok(effect),
-            Err(error) if entered.get() => Err(error),
-            // The snapshot refused (removed or changed install) or the
-            // re-check did: the call already happened, so leave an honest
-            // reconcile record, never a release or a silent drop.
-            _ => {
-                let outcome = json!({"kind":"uncertain","error":"app release authority changed during the provider call; outcome not recorded as released","verified":crate::contract_fixture::Verified::Unknown});
-                let effect = self.store.app_effect_uncertain(id, &outcome)?;
-                self.wake();
-                Ok(effect)
-            }
-        }
+        let reason = match recorded {
+            Ok(Some(effect)) => return Ok(effect),
+            // The re-check refused: the call already happened, so leave an
+            // honest reconcile record, never a release or a silent drop.
+            Ok(None) => "App authority changed while the provider call ran; the release outcome was not recorded as released and no automatic retry was made.".to_string(),
+            Err(error) => lock2_failure_reason(&error, &[secret, bytes.as_slice()]),
+        };
+        let outcome = json!({"kind":"uncertain","error":reason,"verified":crate::contract_fixture::Verified::Unknown});
+        let effect = self
+            .store
+            .app_effect_uncertain(id, &outcome)
+            .map_err(|error| {
+                Error::unknown(format!(
+                    "{} (the failure could not be recorded: {})",
+                    outcome["error"].as_str().unwrap_or_default(),
+                    lock2_cause(&error, &[secret, bytes.as_slice()])
+                ))
+            })?;
+        self.wake();
+        Ok(effect)
     }
+}
+
+/// CAD-1778: the positive marker a lock-2 closure puts on a refused
+/// authority re-check. Nothing else is called an authority change: a
+/// `Rejected` error may equally be the tracker's interrupted-write fence.
+pub(super) const LOCK2_AUTHORITY_CHANGED: &str = "app_lock2_authority_changed";
+
+/// CAD-1778: mark a refused re-check as an authority change; any error that
+/// is not a plain refusal (a busy PM, a read failure) keeps its own class.
+pub(super) fn lock2_authority(error: Error) -> Error {
+    match error {
+        Error::Rejected(message) => Error::invalid(LOCK2_AUTHORITY_CHANGED, message),
+        other => other,
+    }
+}
+
+/// CAD-1778: the screened, capped text of a lock-2 error.
+/// Every form of the credential the caller holds is screened (for SMTP: the
+/// decoded secret AND the serialized custody document).
+pub(super) fn lock2_cause(error: &Error, secrets: &[&[u8]]) -> String {
+    let cause = error.to_string();
+    if secrets
+        .iter()
+        .all(|secret| crate::platform::refuse_leak("app lock-2 failure", &cause, secret).is_ok())
+    {
+        cause.chars().take(200).collect()
+    } else {
+        "details withheld".into()
+    }
+}
+
+/// CAD-1778: the reason recorded when lock 2 could not retain a provider
+/// outcome. Only an install that changed during admission, or a re-check
+/// refusal marked by `lock2_authority`, says "App authority changed". Every
+/// other error (PM busy, the interrupted-write fence, which is also
+/// `Rejected`, a leak, an occupied receipt slot, a storage error) names its
+/// own cause. The outcome is uncertain either way and the claim blocks a
+/// resend.
+pub(super) fn lock2_failure_reason(error: &Error, secrets: &[&[u8]]) -> String {
+    const TAIL: &str = "the result was not retained and no automatic retry was made.";
+    let authority = matches!(error, Error::Structured(s)
+        if s.code == crate::issue::app_catalog::ADMISSION_CHANGED
+            || s.code == LOCK2_AUTHORITY_CHANGED);
+    if authority {
+        return format!("App authority changed while the provider call ran; {TAIL}");
+    }
+    let cause = lock2_cause(error, secrets);
+    format!("The provider call finished but its outcome could not be re-checked under current authority ({cause}); {TAIL}")
 }
 
 // ACCEPTANCE-CHECK SLOT (CAD-1291). Reserved for the independent acceptance
@@ -1675,5 +1728,29 @@ mod grant_tests {
             .and_then(|rest| rest.split("fn publish_social_draft_now").next())
             .expect("stage function present");
         assert!(!stage.contains("\"grant_id\""), "staging froze a grant id");
+    }
+}
+
+#[cfg(test)]
+mod cad1778_screen_tests {
+    use super::*;
+
+    /// A secret with a quote and a backslash is escaped in its serialized
+    /// custody document, so screening against the document alone misses it.
+    #[test]
+    fn lock2_reason_screens_the_decoded_secret_not_only_its_document() {
+        let secret = b"a\"b\\c\"d\\e\"f\\g\"h\\i".as_slice();
+        let document =
+            serde_json::to_vec(&json!({"password": String::from_utf8_lossy(secret)})).unwrap();
+        assert!(!String::from_utf8_lossy(&document).contains("a\"b\\c"));
+        let error = Error::internal("storage said a\"b\\c\"d\\e\"f\\g\"h\\i");
+        let leaked = lock2_failure_reason(&error, &[document.as_slice()]);
+        assert!(
+            leaked.contains("a\"b"),
+            "premise: document-only screening misses it"
+        );
+        let screened = lock2_failure_reason(&error, &[secret, document.as_slice()]);
+        assert!(!screened.contains("a\"b"), "{screened}");
+        assert!(screened.contains("details withheld"), "{screened}");
     }
 }

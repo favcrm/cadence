@@ -4,8 +4,12 @@
 //! handle_conn on the test thread (the lockseam hook is thread-local).
 #![cfg(all(test, unix, feature = "test-seam"))]
 
+#[path = "cad1778_failure_record_acceptance.rs"]
+mod cad1778_failure_record_acceptance;
+
 use super::Fx as HostFx;
 use crate::daemon::Shared;
+use crate::store::StoreConn;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -271,10 +275,189 @@ fn cad1258_worker_second_identical_request_makes_no_provider_call() {
     let body = json!({"message":s.message,"token":s.token,"slot":"image",
         "request_id":"c1258-dup","input":{}});
     let result = s.worker.call(s.fx.shared.clone(), &body);
-    assert!(result.is_err(), "second request must be refused");
+    let error = result.expect_err("second request must be refused");
+    assert_eq!(error.kind(), "unknown", "{error}");
+    assert!(
+        error.to_string().contains("no automatic retry was made"),
+        "{error}"
+    );
     assert_eq!(posts(&s.fx), 0, "no provider call for the second request");
     let run = s.fx.shared.store.app_run_show(&s.run_id).unwrap();
     assert_eq!(run["state"], "running", "{run}");
     assert!(run["failure"].is_null(), "{run}");
     let _ = s.install;
+}
+
+/// CAD-1778: a worker call that failed after its claim marks its own step
+/// failed; the still-running worker message must still close, whichever way
+/// it ends.
+#[test]
+fn cad1778_message_closes_after_a_failed_worker_call() {
+    for how in ["completed", "failed", "unknown", "expire"] {
+        let s = setup();
+        let (_, step, _) =
+            s.fx.shared
+                .store
+                .app_capability_turn("lock2-writer", &s.message, &s.token, "image", &s.bundle)
+                .unwrap();
+        s.fx.shared
+            .store
+            .app_run_call_failed(&s.run_id, &step, "uncertain", "boom")
+            .unwrap();
+        if how == "expire" {
+            assert!(s
+                .fx
+                .shared
+                .store
+                .expire_awaiting_report(&s.message, None, "timed out")
+                .unwrap());
+        } else {
+            let done = s.fx.shared.store.finish_running(
+                &s.message,
+                how,
+                &json!({"status":how,"text":""}),
+                None,
+            );
+            assert!(matches!(done, Ok(Ok(_))), "{how}: {done:?}");
+        }
+        let message = s.fx.shared.store.message(&s.message).unwrap().unwrap();
+        assert_ne!(message.state, "running", "{how}");
+    }
+}
+
+/// CAD-1778: the tracker's interrupted-write fence is a `Rejected` error too.
+/// At lock 2 it is recorded uncertain naming the fence, never as an
+/// authority change.
+#[test]
+fn cad1778_fence_at_lock_two_is_not_an_authority_change() {
+    let mut s = setup();
+    let dir = s.fx.shared.pm_dir().unwrap();
+    crate::issue::lockseam::set_hook(Some(Box::new(move |point| {
+        if point != "app-capability-before-record" {
+            return;
+        }
+        // A writer that crashed mid-write: the CAD-852 helper (this test
+        // binary re-executed) takes the lock, leaves an untracked file and
+        // is SIGKILLed.
+        let ready = std::env::temp_dir().join(format!("c1778-ready-{}", std::process::id()));
+        let _ = std::fs::remove_file(&ready);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "issue::lock_tests::lock_helper", "--nocapture"])
+            .env("CAD852_ROLE", "hold_untracked")
+            .env("CAD852_PM", &dir)
+            .env("CAD852_READY", &ready)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(start.elapsed().as_secs() < 20, "writer not ready");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+    })));
+    let body = json!({"message":s.message,"token":s.token,"slot":"image",
+        "request_id":"c1778-fence","input":{}});
+    let result = s.worker.call(s.fx.shared.clone(), &body);
+    crate::issue::lockseam::set_hook(None);
+    assert!(result.is_err(), "{result:?}");
+    let run = s.fx.shared.store.app_run_show(&s.run_id).unwrap();
+    assert_eq!(run["state"], "failed", "{run}");
+    let failure = run["failure"].to_string();
+    assert!(failure.contains("uncertain"), "{failure}");
+    assert!(failure.contains("interrupted"), "{failure}");
+    assert!(
+        !failure.to_lowercase().contains("authority changed"),
+        "{failure}"
+    );
+}
+
+/// CAD-1778: a worker lock-2 snapshot read failure still ends with a durable
+/// failure and a terminal step.
+#[test]
+fn cad1778_worker_unreadable_snapshot_still_records_the_failure() {
+    let mut s = setup();
+    let (shared, run) = (s.fx.shared.clone(), s.run_id.clone());
+    crate::issue::lockseam::set_hook(Some(Box::new(move |point| {
+        if point == "app-capability-before-record" {
+            shared
+                .store
+                .fixture_write(|c| {
+                    c.execute(
+                        "UPDATE app_runs SET snapshot='cad1778 malformed snapshot' WHERE id=?",
+                        [&run],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+    })));
+    let body = json!({"message":s.message,"token":s.token,"slot":"image",
+        "request_id":"c1778-unreadable","input":{}});
+    let result = s.worker.call(s.fx.shared.clone(), &body);
+    crate::issue::lockseam::set_hook(None);
+    assert!(result.is_err(), "{result:?}");
+    let rows: (String, Vec<String>, i64) =
+        s.fx.shared
+            .store
+            .read_tx(|c| {
+                let state: String =
+                    c.query_row("SELECT state FROM app_runs WHERE id=?", [&s.run_id], |r| {
+                        r.get(0)
+                    })?;
+                let steps: Vec<String> = c.query_vec(
+                    "SELECT state FROM app_run_steps WHERE run_id=?",
+                    [&s.run_id],
+                    |r| r.get(0),
+                )?;
+                let failures: i64 = c.query_row(
+                    "SELECT count(*) FROM app_run_failures WHERE run_id=?",
+                    [&s.run_id],
+                    |r| r.get(0),
+                )?;
+                Ok((state, steps, failures))
+            })
+            .unwrap();
+    assert_eq!(rows.0, "failed");
+    assert!(rows.1.iter().all(|x| x == "failed"), "{rows:?}");
+    assert_eq!(rows.2, 1);
+}
+
+/// CAD-1778: when receipt retention fails AND the failure record fails too,
+/// neither storage error reaches the worker RPC response unscreened.
+#[test]
+fn cad1778_second_storage_error_is_withheld_from_the_worker_response() {
+    // The loopback fixture's custody credential.
+    const CREDENTIAL: &str = "synthetic-cad1365-gen-token";
+    let mut s = setup();
+    let shared = s.fx.shared.clone();
+    crate::issue::lockseam::set_hook(Some(Box::new(move |point| {
+        if point == "app-capability-before-record" {
+            shared
+                .store
+                .fixture_write(|c| {
+                    c.execute_batch(&format!(
+                        "CREATE TRIGGER c1778_a BEFORE INSERT ON app_capability_results BEGIN SELECT RAISE(ABORT,'first {CREDENTIAL}'); END;
+                         CREATE TRIGGER c1778_b BEFORE INSERT ON app_run_failures BEGIN SELECT RAISE(ABORT,'second {CREDENTIAL}'); END;"
+                    ))?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+    })));
+    let body = json!({"message":s.message,"token":s.token,"slot":"image",
+        "request_id":"c1778-second","input":{}});
+    let result = s.worker.call(s.fx.shared.clone(), &body);
+    crate::issue::lockseam::set_hook(None);
+    let error = result.expect_err("must fail").to_string();
+    assert!(error.contains("could not be recorded"), "{error}");
+    assert!(error.contains("details withheld"), "{error}");
+    for fragment in CREDENTIAL.as_bytes().windows(8) {
+        assert!(
+            !error.contains(std::str::from_utf8(fragment).unwrap()),
+            "response carries credential text (withheld from assertion)"
+        );
+    }
 }

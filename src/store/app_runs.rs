@@ -1500,6 +1500,54 @@ impl Store {
         })
     }
 
+    /// CAD-1778: the fallback for `app_run_host_step_failed` when the run's
+    /// persisted snapshot cannot be read. It checks only raw columns (the run
+    /// is running and approved, the step is dispatched) and never parses the
+    /// snapshot, so an unreadable run still ends with a durable failure.
+    pub fn app_run_host_step_failed_unreadable(
+        &self,
+        run_id: &str,
+        step_id: &str,
+        kind: &str,
+        reason: &str,
+    ) -> Result<()> {
+        if !matches!(kind, "refused" | "uncertain") || reason.is_empty() || reason.len() > 1024 {
+            return Err(Error::rejected("host failure record is invalid"));
+        }
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let task_id: String = tx
+                .query_row(
+                    "SELECT s.task_id FROM app_run_steps s JOIN app_runs r ON r.id=s.run_id WHERE s.run_id=? AND s.step_id=? AND s.state='dispatched' AND r.state='running' AND r.approved_digest IS NOT NULL",
+                    params![run_id, step_id],
+                    |r| r.get(0),
+                )
+                .map_err(|_| Error::rejected("host step is not dispatched"))?;
+            let now = now();
+            tx.execute(
+                "INSERT INTO app_run_failures(run_id,step_id,kind,reason,created) VALUES(?,?,?,?,?)",
+                params![run_id, step_id, kind, reason, now],
+            )?;
+            tx.execute(
+                "UPDATE app_run_steps SET state='failed' WHERE run_id=? AND step_id=? AND state='dispatched'",
+                params![run_id, step_id],
+            )?;
+            tx.execute(
+                "UPDATE tasks SET state='failed',error=?,updated=? WHERE id=?",
+                params![reason, now, task_id],
+            )?;
+            tx.execute(
+                "UPDATE app_runs SET state='failed',approved_digest=NULL,updated=? WHERE id=? AND state='running'",
+                params![now, run_id],
+            )?;
+            tx.execute(
+                "UPDATE jobs SET state='failed',updated=? WHERE id=?",
+                params![now, run_id],
+            )?;
+            Ok(())
+        })
+    }
+
     /// CAD-1258: a worker capability call that reached the provider but could
     /// not retain its result (or failed after the claim) fails the run with a
     /// durable reason. The claim stays, so nothing is ever sent twice.
@@ -1515,13 +1563,25 @@ impl Store {
         }
         self.write_tx(|conn| {
             let tx = &mut *conn;
-            let run = Self::app_run_show_in(tx, run_id)?;
-            if run["state"] != "running" {
+            // Raw column, not `app_run_show_in`: the failure must record even
+            // when the persisted snapshot is what could not be read.
+            let state: String = tx.query_row(
+                "SELECT state FROM app_runs WHERE id=?",
+                [run_id],
+                |r| r.get(0),
+            )?;
+            if state != "running" {
                 return Ok(());
             }
             tx.execute(
                 "INSERT INTO app_run_failures(run_id,step_id,kind,reason,created) VALUES(?,?,?,?,?)",
                 params![run_id, step_id, kind, reason, now()],
+            )?;
+            // The failed call's own step is terminal even though its worker
+            // message is still running (invalidate keeps that association).
+            tx.execute(
+                "UPDATE app_run_steps SET state='failed' WHERE run_id=? AND step_id=? AND state='dispatched'",
+                params![run_id, step_id],
             )?;
             self.app_run_invalidate_in(&tx, run_id, reason)
         })
@@ -2044,6 +2104,15 @@ impl Store {
                     "operator reconciliation preserves transport history, not material success",
                 )
                 .map(|_| true);
+        }
+        // CAD-1778: a worker call that failed after its claim already marked
+        // its own step failed (`app_run_call_failed`); the message that owns
+        // it may still close.
+        if state == "failed"
+            && message_id.as_deref() == Some(&message.id)
+            && message.source == "app_run_dispatch"
+        {
+            return Ok(true);
         }
         // Reconciliation is transport history only, never material authority.
         if state != "dispatched"
