@@ -56,6 +56,8 @@ const APP_ROLE_HINTS: { match: RegExp; label: string; roles: string[] }[] = [
   { match: /invoice/i, label: "Invoices", roles: ["accountant"] },
 ];
 
+const SUGGESTED_RANK = new Map(["quotation", "accountant", "support"].map((id, i) => [id, i]));
+
 /** Roles suggested by the installed apps, with the app labels that matched. */
 export function suggestedRoles(
   apps: Pick<AppRow, "name" | "title">[],
@@ -70,8 +72,7 @@ export function suggestedRoles(
     for (const id of hint.roles) if (!ids.includes(id)) ids.push(id);
   }
   // The approved order: Quotation, Accountant, Support; any other role after.
-  const order = ["quotation", "accountant", "support"];
-  const rank = (id: string) => (order.includes(id) ? order.indexOf(id) : order.length);
+  const rank = (id: string) => SUGGESTED_RANK.get(id) ?? SUGGESTED_RANK.size;
   ids.sort((a, b) => rank(a) - rank(b));
   return {
     roles: ids.flatMap((id) => roles.filter((role) => role.id === id)),

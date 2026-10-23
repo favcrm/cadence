@@ -35,6 +35,8 @@ export function seatStatus(a: Agent, t: (english: string) => string): { text: st
   }
   // The master at rest reads "Ready" (mockup), like a seat that can take work.
   if (a.alias === MASTER && badge.label === t("idle")) return { text: t("Ready"), tone: "ok" };
+  // A plain Idle is grey like the mockup; the shared badge keeps its green.
+  if (badge.label === t("idle")) return { text: first(badge.label), tone: "ink" };
   return { text: first(badge.label), tone: badge.tone };
 }
 

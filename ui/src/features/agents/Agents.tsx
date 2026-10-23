@@ -97,6 +97,7 @@ export default function Agents({
     .filter((a) => agentMatchesFilter(a, filter) && agentMatchesSearch(a, query, issueIndexed))
     .sort(
       (a, b) =>
+        Number(b.alias === MASTER) - Number(a.alias === MASTER) ||
         Number(b.alias === joined?.alias) - Number(a.alias === joined?.alias) ||
         agentOrder(a) - agentOrder(b) ||
         a.alias.localeCompare(b.alias),

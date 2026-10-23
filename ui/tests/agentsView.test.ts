@@ -43,6 +43,7 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } =
   require("react-dom/client") as typeof import("react-dom/client");
+const { seatStatus } = require("../src/features/agents/SeatCard") as typeof import("../src/features/agents/SeatCard");
 const Agents = (
   require("../src/features/agents/Agents") as typeof import("../src/features/agents/Agents")
 ).default;
@@ -260,6 +261,14 @@ async function main() {
     aliases().join() === "blocked,owner,dev,foreign",
     "current agents list attention first, then working, in one flat grid",
   );
+  // CAD-1772: a plain Idle is grey; the master reads Ready (green) and always leads the roster.
+  assert(seatStatus({ ...base, alias: "idler" }, (x: string) => x).tone === "ink", "plain Idle is the ink tone");
+  assert(seatStatus({ ...base, alias: "master" }, (x: string) => x).text === "Ready", "the master at rest is Ready");
+  state = loaded({ daemon: "reachable", agents: [...agents, { ...base, alias: "master" }], totals: null });
+  await render();
+  assert(aliases()[0] === "master", "the master is always the first seat");
+  state = loaded({ daemon: "reachable", agents, totals: null });
+  await render();
   // CAD-1772: compact seat cards, no stat tiles, no project scope.
   assert(host.querySelectorAll(".agents-triage-cell").length === 0, "the five stat tiles are gone");
   assert(host.querySelector(".ag-toolbar .ag-seg") && host.querySelector(".ag-toolbar .ag-search"), "one compact toolbar row");
