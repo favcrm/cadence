@@ -10,6 +10,8 @@ import Button from "../../ui/Button";
 import { HireBlock } from "../auth/WriteGate";
 import AgentAvatar from "./AgentAvatar";
 import SeatCard from "./SeatCard";
+import { MASTER } from "../home/master";
+import { ROLES } from "../settings/ModelDefaults";
 import RecruitChat from "./RecruitChat";
 import AgentPage from "./AgentPage";
 import { FirstJobs } from "./AgentTabs";
@@ -39,11 +41,13 @@ import type { Agent, AgentRole, AgentsPayload, IssueCard } from "../../lib/types
 /** The toolbar's segmented filters, in the order they read. */
 const TOOLBAR_FILTERS: AgentFilter[] = ["current", "attention", "working", "idle", "stopped", "inbox", "all"];
 
-/** "Developer · this computer"; an agent not hired from the catalogue shows
- *  its team role (else its role) and provider. */
+/** "Accountant · this computer": the catalogue title, else "Master", else the
+ *  team role's label (never the raw id or the provider), then where it runs. */
 function roleLine(a: Agent, roleTitle: string | undefined, hosted: boolean, t: (s: string) => string): string {
-  if (roleTitle) return `${roleTitle} · ${hosted ? t("workspace") : t("this computer")}`;
-  return `${a.team_role ?? a.role ?? t("Agent")} · ${a.provider}`;
+  const label = (id: string | null | undefined) => ROLES.find(([key]) => key === id)?.[1];
+  const title =
+    roleTitle ?? (a.alias === MASTER ? t("Master") : (label(a.team_role) ?? label(a.role) ?? t("Agent")));
+  return `${title} · ${hosted ? t("workspace") : t("this computer")}`;
 }
 
 export default function Agents({
@@ -153,7 +157,6 @@ export default function Agents({
       <RecruitChat
         hireBlock={hireBlock}
         onBack={() => setOpen(null)}
-        onOpenIssue={onOpenIssue}
       />
     );
   }

@@ -1,3 +1,4 @@
+import { MASTER } from "../home/master";
 import { useTranslate } from "../../lib/locale";
 import type { Agent } from "../../lib/types";
 import AgentAvatar, { agentLook } from "./AgentAvatar";
@@ -32,6 +33,8 @@ export function seatStatus(a: Agent, t: (english: string) => string): { text: st
       tone: "ok",
     };
   }
+  // The master at rest reads "Ready" (mockup), like a seat that can take work.
+  if (a.alias === MASTER && badge.label === t("idle")) return { text: t("Ready"), tone: "ok" };
   return { text: first(badge.label), tone: badge.tone };
 }
 

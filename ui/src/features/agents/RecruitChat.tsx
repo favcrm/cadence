@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { api } from "../../lib/api";
 import { cache } from "../../lib/resources";
 import { useTranslate } from "../../lib/locale";
 import { useResource } from "../../lib/useResource";
-import Conversation from "../app-shell/chat/Conversation";
-import SharedComposer from "../app-shell/chat/Composer";
-import { addPending, loadThread, newMessageId, settlePending, threadItems, type ThreadState } from "../home/thread";
+import Button from "../../ui/Button";
+import AgentAvatar from "./AgentAvatar";
+import HireProposalCard from "./HireProposalCard";
+import { addPending, loadThread, newMessageId, settlePending, threadItems, type ThreadItem, type ThreadState } from "../home/thread";
 import { HireGate } from "./RecruitCards";
 
 /** The master's Recruit conversation store (CAD-1772), one per conversation id. */
@@ -27,11 +28,9 @@ const recruitThread = cache.family<string, ThreadState>("recruitThread", (key) =
 export default function RecruitChat({
   hireBlock,
   onBack,
-  onOpenIssue,
 }: {
   hireBlock: string | null;
   onBack: () => void;
-  onOpenIssue: (id: string) => void;
 }) {
   const t = useTranslate();
   const [conversation, setConversation] = useState<string | null>(null);
@@ -65,12 +64,12 @@ export default function RecruitChat({
           {error}
         </div>
       )}
-      {conversation && !hireBlock && <Chat key={conversation} conversation={conversation} onOpenIssue={onOpenIssue} />}
+      {conversation && !hireBlock && <Chat key={conversation} conversation={conversation} />}
     </main>
   );
 }
 
-function Chat({ conversation, onOpenIssue }: { conversation: string; onOpenIssue: (id: string) => void }) {
+function Chat({ conversation }: { conversation: string }) {
   const t = useTranslate();
   const store = recruitThread(`${conversation}:`);
   const thread = useResource(store);
@@ -98,29 +97,93 @@ function Chat({ conversation, onOpenIssue }: { conversation: string; onOpenIssue
       store.write((s) => ({ ...(s ?? { exists: true, entries: [], pending: [] }), pending: (s?.pending ?? []).filter((p) => p.message !== message) })),
     [store],
   );
+  const [draft, setDraft] = useState("");
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const text = draft.trim();
+    if (!text) return;
+    setDraft("");
+    send(text);
+  };
+  const bubble = (item: ThreadItem, index: number) => {
+    switch (item.type) {
+      case "operator":
+        return <Me key={item.key} text={item.entry.text} />;
+      case "pending":
+        return (
+          <Me key={item.key} text={item.pending.text}>
+            {item.pending.state === "failed" && (
+              <span className="text-micro text-fail">
+                {item.pending.error}{" "}
+                <button type="button" className="lnk" onClick={() => onRetry(item.pending.message, item.pending.text)}>
+                  {t("Retry")}
+                </button>{" "}
+                <button type="button" className="lnk" onClick={() => onDiscard(item.pending.message)}>
+                  {t("Discard")}
+                </button>
+              </span>
+            )}
+          </Me>
+        );
+      case "answer":
+      case "commentary": {
+        // Master's reasoning and its proposal card share one bubble (mockup).
+        const next = items[index + 1];
+        return (
+          <Master key={item.key}>
+            {item.entry.text}
+            {next?.type === "hire" && !next.reason && <HireProposalCard entry={next.entry} reason={null} />}
+          </Master>
+        );
+      }
+      case "hire":
+        if (items[index - 1] && ["answer", "commentary"].includes(items[index - 1].type) && !item.reason) return null;
+        return (
+          <Master key={item.key}>
+            <HireProposalCard entry={item.entry} reason={item.reason} />
+          </Master>
+        );
+      default:
+        return null;
+    }
+  };
   return (
-    <div className="rc-chat" data-chat-panel>
-      <Conversation
-        mode={{ kind: "home" }}
-        items={items}
-        readOnly={false}
-        liveAfter={Number.MAX_SAFE_INTEGER}
-        onOpenIssue={onOpenIssue}
-        onRetry={onRetry}
-        onDiscard={onDiscard}
-      />
-      <SharedComposer
-        density="full"
-        storeKey={`recruit:${conversation}`}
-        block={null}
-        onSend={({ body }) => send(body)}
-        refocusAfterSend
-        attach={false}
-        className="card p-2.5 relative"
-        placeholder={t("Describe who you need…")}
-        ariaLabel={t("Message to Master")}
-        formProps={{ "data-composer": "" }}
-      />
+    <div className="rc-chat chat" data-chat-panel>
+      <div role="log" aria-live="polite" aria-label={t("messages")} className="chat">
+        {items.map(bubble)}
+      </div>
+      <form className="compose" onSubmit={submit} data-composer="">
+        <input
+          className="field"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder={t("Describe who you need…")}
+          aria-label={t("Message to Master")}
+        />
+        <Button type="submit" size="sm" disabled={!draft.trim()}>
+          {t("Send")}
+        </Button>
+      </form>
+    </div>
+  );
+}
+
+function Me({ text, children }: { text: string; children?: ReactNode }) {
+  return (
+    <div className="msg me">
+      <div className="bub">
+        {text}
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function Master({ children }: { children: ReactNode }) {
+  return (
+    <div className="msg">
+      <AgentAvatar slug="robot" size={32} still />
+      <div className="bub">{children}</div>
     </div>
   );
 }
