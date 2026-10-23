@@ -83,6 +83,12 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                     if let Some(e) = row["evidence"].as_str() {
                         line.push_str(&format!(" — {e}"));
                     }
+                    // CAD-1759: a pr-state-unverified hold names the refs
+                    // it could not verify.
+                    if let Some(refs) = row["detail"]["unverified"].as_array() {
+                        let refs: Vec<&str> = refs.iter().filter_map(|r| r.as_str()).collect();
+                        line.push_str(&format!(" [unverified: {}]", refs.join(", ")));
+                    }
                     println!("{line}");
                 }
                 // CAD-1377: cleanup rows and refusals must be visible
