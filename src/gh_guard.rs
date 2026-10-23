@@ -72,14 +72,44 @@ fn reset_from(body: &str) -> Option<i64> {
 }
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Longest a pause write waits for another writer before recording anyway.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// An exclusive `flock` on a sidecar file, so the read -> max -> rename
+/// below is one transaction across processes. Bounded: on timeout or
+/// error the caller records the pause unlocked rather than drop it.
+fn lock_pause(state_dir: &Path) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state_dir.join("gh-rate-limit.json.lock"))
+        .ok()?;
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        // SAFETY: flock on an fd this function owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Some(file);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 fn record_pause(state_dir: &Path, reset: Option<i64>) -> i64 {
     let at = now();
     let until = reset
         .unwrap_or(at + FALLBACK_PAUSE_SECS)
         .clamp(at + MIN_PAUSE_SECS, at + MAX_PAUSE_SECS);
-    // Two processes can hit the limit at once: never shorten a pause
-    // already recorded, and write through a name only this call uses.
+    // Two processes can hit the limit at once. The lock is held from the
+    // read of the recorded pause to the rename, so a pause is never
+    // shortened by a writer that read older state; the temp name is
+    // unique per call. Without the lock (timeout) the pause is still
+    // written, never dropped.
+    let _lock = lock_pause(state_dir);
     let until = paused_until(state_dir).map_or(until, |held| held.max(until));
     let file = pause_file(state_dir);
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -213,5 +243,23 @@ mod tests {
         assert!(is_rate_limited(
             "You have triggered an abuse detection mechanism"
         ));
+    }
+
+    #[test]
+    fn concurrent_writers_never_shorten_the_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = now() + 3000;
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let d = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    record_pause(&d, Some(if i == 3 { long } else { now() + 100 + i }))
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(paused_until(dir.path()).unwrap() >= long);
     }
 }
