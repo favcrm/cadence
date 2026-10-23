@@ -114,7 +114,7 @@ function scrubJson(text: string): string {
 }
 
 /** A word that opens a quoted command: a quote or backtick, then `cadence`. */
-const QUOTED_CMD = /^[("'`]+(?:\S*\/)?cadence$/i;
+const QUOTED_CMD = /^[("'`]{1,3}(?:\S*\/)?cadence$/i;
 /** A word that closes a quote or backtick span. */
 const CLOSES_QUOTE = /["'`)]$/;
 

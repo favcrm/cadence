@@ -107,9 +107,9 @@ equal(drawerLayout(1100, 660, "app", null), { mode: "cover", width: 544 }, "app,
 // Default widths scale with the viewport, wider for html/csv/pdf, within their clamps.
 equal([defaultWidth("md", 1835), defaultWidth("md", 1000), defaultWidth("md", 800)], [760, 480, 480], "default width 45%, 480..760");
 equal([defaultWidth("html", 1835), defaultWidth("csv", 1280), defaultWidth("pdf", 900)], [960, 704, 560], "document kinds 55%, 560..960");
-// Expand: cover taking most of the page; Home keeps a 64px chat strip, the app shell stops at the chat pane.
+// Expand: cover taking most of the page, leaving a ~64px chat strip. The app shell keeps the chat pane's edge when that gains 96px or more; otherwise it covers the pane down to the strip.
 equal(drawerLayout(1440, 480, "home", null, true), { mode: "cover", width: 1136 }, "home expands beside a chat strip");
-equal(drawerLayout(1440, 480, "app", 700, true), { mode: "cover", width: 728 }, "app expand never covers the chat pane");
+equal(drawerLayout(1440, 480, "app", 700, true), { mode: "cover", width: 728 }, "app expand keeps the chat pane edge when it gains 96px or more");
 equal(drawerLayout(900, 480, "app", 860, true).mode, "cover", "app expand at 900 stays beside the narrowed chat");
 equal(drawerLayout(500, 480, "home", null, true).mode, "sheet", "a phone is a sheet either way");
 // Expand never does nothing: where the chat pane's edge leaves no more room than cover has, it covers the chat down to the strip.
@@ -283,7 +283,7 @@ const quoted: ThreadState = {
 equal(feedParts(threadItems(quoted), 0, "m1").working?.plan, "Next I will run … and then … for counts.", "quoted commands are elided");
 // Linear on 200k-character runs (a quadratic regex would not finish).
 const probeStart = Date.now();
-const longRuns = ["plan show ".repeat(20000), "plan show " + "A".repeat(200000), `plan show ${"x ".repeat(100000)}`, "cadence " + "--a ".repeat(50000) + "artifact put", `"cadence ${"a ".repeat(100000)}`];
+const longRuns = ["\"".repeat(200000), "\"".repeat(100000) + "/".repeat(100000), "`".repeat(100000) + "cadence x", "(".repeat(100000), "/".repeat(200000), "=".repeat(200000), "plan show ".repeat(20000), "plan show " + "A".repeat(200000), `plan show ${"x ".repeat(100000)}`, "cadence " + "--a ".repeat(50000) + "artifact put", `"cadence ${"a ".repeat(100000)}`];
 for (const run of longRuns) {
   planRef({ ...e(1, "agent", "tool_call", run, "m1") });
   isArtifactPutCall(run);
