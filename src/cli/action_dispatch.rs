@@ -23,6 +23,21 @@ fn show_register_code(url: &str, code: &str, no_open: bool) -> Result<()> {
     Ok(())
 }
 
+fn report_register_error(error: &Error, json: bool) {
+    if !json {
+        return;
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "registered": false,
+            "authenticated": false,
+            "code": error.code(),
+            "message": error.to_string()
+        })
+    );
+}
+
 fn open_login_url(url: &str, no_open: bool) {
     if no_open {
         return;
@@ -228,49 +243,22 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             let issuer = issuer
                 .as_deref()
                 .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
-            let grant = match cadence_agent::remote_enrollment::register_portal(
+            let grant = cadence_agent::remote_enrollment::register_portal(
                 issuer,
                 name.as_deref(),
                 slug.as_deref(),
                 &dir,
                 |url, code| show_register_code(url, code, *no_open),
-            ) {
-                Ok(grant) => grant,
-                Err(error) => {
-                    if *json {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "registered": false,
-                                "authenticated": false,
-                                "code": error.code(),
-                                "message": error.to_string()
-                            })
-                        );
-                    }
-                    return Err(error);
-                }
-            };
-            if let Err(error) = org::record_remote(
+            )
+            .inspect_err(|error| report_register_error(error, *json))?;
+            org::record_remote(
                 &grant.slug,
                 &grant.endpoint,
                 &grant.organization_id,
                 *use_,
                 || grant.save_credential(&dir),
-            ) {
-                if *json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "registered": false,
-                            "authenticated": false,
-                            "code": error.code(),
-                            "message": error.to_string()
-                        })
-                    );
-                }
-                return Err(error);
-            }
+            )
+            .inspect_err(|error| report_register_error(error, *json))?;
             if *json {
                 println!(
                     "{}",
