@@ -139,16 +139,16 @@ pub(crate) fn stream_hello(entities: bool) -> String {
     format!("event: hello\ndata: {data}\n\n")
 }
 
-/// One `event: agent` frame with its row's running-message text removed.
-fn redact_agent_frame(frame: &str) -> String {
-    let Some((head, tail)) = frame.split_once("\ndata: ") else {
-        return frame.to_string();
-    };
-    let Ok(mut data) = serde_json::from_str::<Value>(tail.trim()) else {
-        return frame.to_string();
-    };
-    super::serve::redact_agent_row(&mut data["agent"]);
-    format!("{head}\ndata: {data}\n\n")
+/// One `event: agent` frame for a non-operator: the row rebuilt from the
+/// allowlist. Fail closed - a frame that cannot be parsed and rebuilt is
+/// dropped, never forwarded whole. A delete frame (no row) passes as is.
+fn redact_agent_frame(frame: &str) -> Option<String> {
+    let (head, tail) = frame.split_once("\ndata: ")?;
+    let mut data: Value = serde_json::from_str(tail.trim()).ok()?;
+    if let Some(row) = data.get_mut("agent") {
+        *row = super::serve::member_agent_row(row);
+    }
+    Some(format!("{head}\ndata: {data}\n\n"))
 }
 
 pub(super) fn stream_events(
@@ -209,8 +209,13 @@ pub(super) fn stream_events(
                 // text; a non-operator's copy is redacted first.
                 let redacted;
                 let f: &str = if !operator && f.starts_with("event: agent\n") {
-                    redacted = redact_agent_frame(&f);
-                    &redacted
+                    match redact_agent_frame(&f) {
+                        Some(frame) => {
+                            redacted = frame;
+                            &redacted
+                        }
+                        None => continue,
+                    }
                 } else {
                     &f
                 };
