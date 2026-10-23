@@ -1514,7 +1514,9 @@ fn app_turn(fx: &Fx, store: &Store, id: &str) {
 }
 
 fn mark_running(fx: &Fx, store: &Store, id: &str) {
-    let token = cadence_agent::adapter::registry::PI_MANAGED_TURN_TOKENS
+    // The fixture master is a `claude`/`managed` row (Fx::seed), so its
+    // turn tokens are minted under that endpoint's scheme.
+    let token = cadence_agent::adapter::registry::CLAUDE_MANAGED_TURN_TOKENS
         .mint("0123456789abcdef0123456789abcdef");
     rusqlite::Connection::open(fx.state().join("cadence.sqlite3"))
         .unwrap()
@@ -1631,4 +1633,273 @@ fn cad1772_master_can_list_roles_and_app_turns_cannot() {
         )),
     }
     assert!(wrong.is_empty(), "agent roles: {wrong:#?}");
+}
+
+// -------------------------------------- round 2: the reserved install id
+
+const APP_CHAT: &str = "real-recruit-app-chat-needle";
+
+/// Spec REVISE on PR #1295: the Recruit conversation is recognised by the
+/// pseudo-install id `recruit`, which is also a valid real install id. A
+/// real app install named `recruit` must stay an app: either the id is
+/// refused when the install/context/conversation is made, or its
+/// conversation runs with the APP profile and members get the ordinary
+/// app-conversation view. The real Recruit conversation still behaves as
+/// Recruit (control).
+#[test]
+fn cad1772_real_install_named_recruit_is_not_the_recruit_conversation() {
+    use cadence_agent::store::app_contexts::ContextConfig;
+    let fx = Fx::start(Board::Public);
+    let (store, _home) = master_with_home(&fx);
+    // A live endpoint generation, so the minted turn tokens are current
+    // (hire_propose checks the token).
+    store
+        .set_identity_with_quota(
+            "master",
+            &cadence_agent::adapter::Identity {
+                thread_id: NATIVE_THREAD.into(),
+                session_id: NATIVE_SESSION.into(),
+                model: None,
+                effort: None,
+                pid: std::process::id(),
+                endpoint: None,
+                generation: Some("0123456789abcdef0123456789abcdef".into()),
+                attach: None,
+            },
+            None,
+        )
+        .unwrap();
+    let owner = fx.platform_cookie("owner");
+    let member = fx.platform_cookie("member");
+    let mut wrong = Vec::new();
+    let reserved = |what: &str, e: &cadence_agent::Error| {
+        eprintln!("CAD-1772 a real install named recruit refused at {what}: {e}");
+        matches!(e, cadence_agent::Error::Rejected(_)) && e.to_string().contains("recruit")
+    };
+
+    // An app installation named `recruit`, landing in the store the way an
+    // app's first context does (the store's own context path).
+    let made = (|| -> Result<Option<(String, String)>, String> {
+        let ctx = match store.app_context_create(
+            "recruit",
+            &ContextConfig::new("Recruit Ltd", Default::default()).unwrap(),
+            "req-c1772-real-recruit",
+        ) {
+            Ok(out) => out["context"]["id"].as_str().unwrap().to_string(),
+            Err(e) if reserved("context create", &e) => return Ok(None),
+            Err(e) => return Err(format!("context create failed otherwise: {e}")),
+        };
+        match fx.rpc(
+            Asserted::Operator,
+            "conversation_create",
+            json!({"alias": "master", "install_id": "recruit", "context_id": ctx}),
+        ) {
+            Ok(out) => Ok(Some((
+                ctx,
+                out["conversation"]["id"].as_str().unwrap().to_string(),
+            ))),
+            Err(e) if reserved("conversation create", &e) => Ok(None),
+            Err(e) => Err(format!("conversation create failed otherwise: {e}")),
+        }
+    })();
+    match made {
+        Err(e) => wrong.push(e),
+        Ok(None) => {} // the id is reserved: nothing can be confused with Recruit
+        Ok(Some((ctx, conv))) => {
+            fx.append(&store, &conv, "agent", "assistant_text", APP_CHAT);
+            fx.op(
+                "thread_send",
+                json!({"alias": "master", "text": "app turn", "message": "real-recruit-turn",
+                       "app": {"install_id": "recruit", "context_id": ctx},
+                       "conversation": conv}),
+            );
+            mark_running(&fx, &store, "real-recruit-turn");
+            // The APP profile: non-app verbs, hire_propose and agent roles
+            // are refused like on any app turn.
+            for (verb, params) in [
+                ("issue_list", json!({})),
+                ("agent_roles", json!({})),
+                ("hire_propose", json!({"role": "accountant"})),
+            ] {
+                match fx.rpc(Asserted::Agent("master".into()), verb, params) {
+                    Err(e) if e.to_string().contains("app conversation") => {}
+                    other => wrong.push(format!(
+                        "{verb} on a real `recruit` app turn ran as Home: {other:?}"
+                    )),
+                }
+            }
+            finish(&fx, "real-recruit-turn");
+            // A member gets the ordinary app-conversation view.
+            let route = format!("/api/threads/master?conversation={conv}");
+            for (who, cookie) in [("owner", &owner), ("member", &member)] {
+                let reply = fx.http(&Asserted::Operator, "GET", &route, None, Some(cookie), None);
+                if reply.status != 200 || !reply.raw.contains(APP_CHAT) {
+                    wrong.push(format!(
+                        "{who}: the real `recruit` app conversation was stripped like \
+                         Recruit/Home ({}): {}",
+                        reply.status, reply.raw
+                    ));
+                }
+            }
+        }
+    }
+
+    // Control: the real Recruit conversation still runs as Recruit.
+    let recruit = fx.op(
+        "conversation_create",
+        json!({"alias": "master", "kind": "recruit"}),
+    )["conversation"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fx.append(
+        &store,
+        &recruit,
+        "agent",
+        "assistant_text",
+        RECRUIT_NEEDLES[1],
+    );
+    fx.op(
+        "thread_send",
+        json!({"alias": "master", "text": "recruit turn", "message": "recruit-turn",
+               "conversation": recruit}),
+    );
+    mark_running(&fx, &store, "recruit-turn");
+    match fx.rpc(
+        Asserted::Agent("master".into()),
+        "hire_propose",
+        json!({"role": "accountant"}),
+    ) {
+        Ok(out) if out["state"] == "proposed" => {}
+        other => wrong.push(format!(
+            "control: hire_propose on the Recruit turn: {other:?}"
+        )),
+    }
+    let route = format!("/api/threads/master?conversation={recruit}");
+    let m = fx.http(
+        &Asserted::Operator,
+        "GET",
+        &route,
+        None,
+        Some(&member),
+        None,
+    );
+    if m.raw.contains(RECRUIT_NEEDLES[1]) {
+        wrong.push(format!(
+            "control: a member read the Recruit conversation: {}",
+            m.raw
+        ));
+    }
+    assert!(wrong.is_empty(), "a real install named recruit: {wrong:#?}");
+}
+
+/// Only the operator makes the Recruit conversation: a member, an agent
+/// (the master itself included) and an unproven caller are refused on the
+/// daemon RPC and on `POST /api/threads/master/conversations`.
+#[test]
+fn cad1772_recruit_create_refuses_non_operators() {
+    let mut wrong = Vec::new();
+    let body = json!({"kind": "recruit"});
+    let route = "/api/threads/master/conversations";
+
+    // Daemon RPC and loopback board: agents and an unproven caller.
+    let fx = Fx::start(Board::Loopback);
+    fx.seed("master", None, None);
+    fx.seed("helper", None, None);
+    let params = json!({"alias": "master", "kind": "recruit"});
+    for who in [
+        Asserted::Agent("master".into()),
+        Asserted::Agent("helper".into()),
+        Asserted::Unproven,
+    ] {
+        match fx.rpc(who.clone(), "conversation_create", params.clone()) {
+            Err(e) => eprintln!("CAD-1772 RPC create as {}: {e}", who.as_str()),
+            Ok(out) => wrong.push(format!("RPC {}: admitted {out}", who.as_str())),
+        }
+    }
+    let (cookie, key) = fx.operator_session();
+    for alias in ["master", "helper"] {
+        let reply = fx.http(
+            &Asserted::Agent(alias.into()),
+            "POST",
+            route,
+            Some(&body),
+            None,
+            None,
+        );
+        if reply.status != 403 {
+            wrong.push(format!(
+                "board as agent {alias}: {} {}",
+                reply.status, reply.raw
+            ));
+        }
+    }
+    let reply = fx.http(
+        &Asserted::Unproven,
+        "POST",
+        route,
+        Some(&body),
+        Some(&cookie),
+        Some(&key),
+    );
+    if reply.status != 403 {
+        wrong.push(format!("board unproven: {} {}", reply.status, reply.raw));
+    }
+    // Control: the operator, on both.
+    let reply = fx.http(
+        &Asserted::Operator,
+        "POST",
+        route,
+        Some(&body),
+        Some(&cookie),
+        Some(&key),
+    );
+    if reply.status != 200 || reply.body["conversation"]["id"].as_str().is_none() {
+        wrong.push(format!(
+            "control: operator board create: {} {}",
+            reply.status, reply.raw
+        ));
+    }
+    if fx
+        .rpc(Asserted::Operator, "conversation_create", params)
+        .is_err()
+    {
+        wrong.push("control: operator RPC create refused".into());
+    }
+    drop(fx);
+
+    // Public board: a member is refused; the owner is the control.
+    let fx = Fx::start(Board::Public);
+    fx.seed("master", None, None);
+    let member = fx.platform_cookie("member");
+    let reply = fx.http(
+        &Asserted::Operator,
+        "POST",
+        route,
+        Some(&body),
+        Some(&member),
+        None,
+    );
+    if reply.status != 403 {
+        wrong.push(format!("board member: {} {}", reply.status, reply.raw));
+    }
+    let owner = fx.platform_cookie("owner");
+    let reply = fx.http(
+        &Asserted::Operator,
+        "POST",
+        route,
+        Some(&body),
+        Some(&owner),
+        None,
+    );
+    if reply.status != 200 {
+        wrong.push(format!(
+            "control: owner board create: {} {}",
+            reply.status, reply.raw
+        ));
+    }
+    assert!(
+        wrong.is_empty(),
+        "Recruit create by a non-operator: {wrong:#?}"
+    );
 }
