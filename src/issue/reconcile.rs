@@ -1061,6 +1061,9 @@ fn run_inner_with_selected(
 mod cad1241_acceptance;
 
 #[cfg(test)]
+mod cad1755_unverified_ref_refusal_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::issue::model::{Claim, Front, Ref};
