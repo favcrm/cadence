@@ -998,25 +998,25 @@ impl Shared {
                         .app_release_lock
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    self.app_run_binding_current(
-                        &self.store.app_run_show(&run_id)?,
-                        bundle,
-                        files,
-                    )?;
-                    let (current, current_step, current_proof) = self.store.app_capability_turn(
-                        &alias,
-                        message,
-                        turn,
-                        &slot,
-                        required_str(bundle, "digest")?,
-                    )?;
+                    self.app_run_binding_current(&self.store.app_run_show(&run_id)?, bundle, files)
+                        .map_err(super::app_effects_rpc::lock2_authority)?;
+                    let (current, current_step, current_proof) = self
+                        .store
+                        .app_capability_turn(
+                            &alias,
+                            message,
+                            turn,
+                            &slot,
+                            required_str(bundle, "digest")?,
+                        )
+                        .map_err(super::app_effects_rpc::lock2_authority)?;
                     if current["approval"]["human"] != sealed_human
                         || current_step != step
                         || current_proof.digest != proof.digest
                     {
-                        return Err(Error::rejected(
+                        return Err(super::app_effects_rpc::lock2_authority(Error::rejected(
                             "capability approval or turn changed during the external call",
-                        ));
+                        )));
                     }
                     crate::platform::refuse_leak(
                         "app capability result",
@@ -1054,13 +1054,19 @@ impl Shared {
                     // The provider answered but lock 2 refused or could not
                     // retain it: leave a durable uncertain failure naming
                     // the cause, never a silent drop. The claim blocks any
-                    // resend.
-                    let _ = self.store.app_run_call_failed(
-                        &run_id,
-                        &step,
-                        "uncertain",
-                        &super::app_effects_rpc::lock2_failure_reason(error, &credential),
+                    // resend. If that write fails too, say so.
+                    let reason = super::app_effects_rpc::lock2_failure_reason(
+                        error,
+                        &[credential.as_slice()],
                     );
+                    if let Err(write) =
+                        self.store
+                            .app_run_call_failed(&run_id, &step, "uncertain", &reason)
+                    {
+                        return Err(Error::unknown(format!(
+                            "{reason} (the failure could not be recorded: {write})"
+                        )));
+                    }
                 }
                 recorded
             }

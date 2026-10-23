@@ -1640,7 +1640,8 @@ impl Shared {
                                 .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
                         },
                     ) {
-                        let cause = super::app_effects_rpc::lock2_cause(&error, &credential);
+                        let cause =
+                            super::app_effects_rpc::lock2_cause(&error, &[credential.as_slice()]);
                         return Err(uncertain(&format!(
                             "Provider returned a result that could not be durably retained ({cause}); the outcome is uncertain and no automatic retry was made."
                         )));
@@ -1656,7 +1657,7 @@ impl Shared {
                     }
                     return Err(uncertain(&super::app_effects_rpc::lock2_failure_reason(
                         &error,
-                        &credential,
+                        &[credential.as_slice()],
                     )));
                 }
             }

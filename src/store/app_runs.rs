@@ -1563,8 +1563,14 @@ impl Store {
         }
         self.write_tx(|conn| {
             let tx = &mut *conn;
-            let run = Self::app_run_show_in(tx, run_id)?;
-            if run["state"] != "running" {
+            // Raw column, not `app_run_show_in`: the failure must record even
+            // when the persisted snapshot is what could not be read.
+            let state: String = tx.query_row(
+                "SELECT state FROM app_runs WHERE id=?",
+                [run_id],
+                |r| r.get(0),
+            )?;
+            if state != "running" {
                 return Ok(());
             }
             tx.execute(
@@ -2098,6 +2104,15 @@ impl Store {
                     "operator reconciliation preserves transport history, not material success",
                 )
                 .map(|_| true);
+        }
+        // CAD-1778: a worker call that failed after its claim already marked
+        // its own step failed (`app_run_call_failed`); the message that owns
+        // it may still close.
+        if state == "failed"
+            && message_id.as_deref() == Some(&message.id)
+            && message.source == "app_run_dispatch"
+        {
+            return Ok(true);
         }
         // Reconciliation is transport history only, never material authority.
         if state != "dispatched"
