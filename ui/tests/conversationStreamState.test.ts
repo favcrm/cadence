@@ -58,6 +58,12 @@ function Harness() {
 }
 function assert(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason); }
 async function main() {
+  const unthreaded = snapshot("m-unthreaded");
+  unthreaded.turn!.conversation = null;
+  const draftInput = { master: unthreaded, entries: [], pendingMessages: [], awaitingApproval: false, reconnecting: false };
+  assert(turnBarState(draftInput, null).kind === "idle", "an unresolved draft cannot claim an unthreaded running message");
+  const ownPending = turnBarState({ ...draftInput, pendingMessages: ["m-unthreaded"] }, null);
+  assert(ownPending.kind === "working" && ownPending.stopMessage === "m-unthreaded", "an unresolved draft retains controls for its own pending message");
   const host = document.createElement("div"); document.body.append(host);
   const root = createRoot(host);
   const settle = async () => { for (let i = 0; i < 6; i++) await React.act(async () => { await nextTurn(); }); };

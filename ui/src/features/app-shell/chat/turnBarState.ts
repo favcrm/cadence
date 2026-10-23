@@ -39,6 +39,7 @@ export function turnFailureReason(entry: ThreadEntry): string | null {
 
 /**
  * The bar's state for one conversation (Home uses its server-issued thread id).
+ * An unresolved id never proves ownership; this surface's own message ids can.
  * Stop carries the running message only when that turn belongs to this
  * conversation. Cancel is offered only for a message THIS surface sent
  * whose stored entry is the operator's own (a daemon notice or an agent
@@ -57,7 +58,7 @@ export function turnBarState(input: TurnBarInput, conversationId: string | null)
   const running = turn && turn.state === "working" ? turn : null;
   const runningHere =
     running !== null &&
-    ((running.conversation ?? null) === conversationId || own.has(running.message));
+    ((conversationId !== null && running.conversation === conversationId) || own.has(running.message));
 
   if (runningHere && running) {
     if (awaitingApproval) return { kind: "approval" };

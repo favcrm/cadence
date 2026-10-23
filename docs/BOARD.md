@@ -2346,6 +2346,8 @@ refresh on pushed permission changes and ignore superseded reads. The bar
 retries the stored failure it displays with a fresh message id and its
 original content/app binding. An unrelated transport failure keeps its own
 same-id row Retry; neither action uses a later draft.
+An unresolved conversation id never claims an unthreaded running turn;
+the surface can still identify its own pending or stored operator message.
 The Conversations dropdown belongs to the positioned pane header, so it opens
 below the header rather than the page and keyboard focus does not scroll the
 workspace down to reach it.
