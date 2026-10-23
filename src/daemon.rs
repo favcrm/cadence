@@ -2631,10 +2631,11 @@ impl Shared {
                         }
                     };
                 let catalogue_snapshot = include_catalogue_instructions
-                    && agent.params.as_ref().is_some_and(|params| {
-                        params.get("catalogue").and_then(Value::as_str).is_some()
-                            && params.get("profile").is_none()
-                    });
+                    && crate::agent_roles::is_catalogue_hire(agent.params.as_ref())
+                    && agent
+                        .params
+                        .as_ref()
+                        .is_some_and(|params| params.get("profile").is_none());
                 if profile_snapshot || catalogue_snapshot {
                     self.authorize_agent_mutation(
                         params,

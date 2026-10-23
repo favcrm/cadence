@@ -40,7 +40,7 @@ export default function HireSheet({
   onHired: (alias: string, role: AgentRole) => void;
 }) {
   const t = useTranslate();
-  const writeBlock = useContext(HireBlock);
+  const hireBlock = useContext(HireBlock);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [alias, setAlias] = useState(suggested);
   const [job, setJob] = useState(startJob ?? role.instructions);
@@ -49,7 +49,7 @@ export default function HireSheet({
   const hosted = payload.install.hosted;
   const modelError = "error" in role.model ? role.model.error : null;
   const problem = aliasProblem(alias, taken);
-  const blocked = writeBlock !== null || modelError !== null || problem !== null;
+  const blocked = hireBlock !== null || modelError !== null || problem !== null;
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -84,7 +84,7 @@ export default function HireSheet({
     }
   };
 
-  const why = writeBlock !== null ? t("Only the operator can hire.") : t("Nothing runs until you hire.");
+  const why = hireBlock !== null ? t("Only the operator can hire.") : t("Nothing runs until you hire.");
   return (
     <dialog
       ref={dialogRef}
@@ -119,7 +119,7 @@ export default function HireSheet({
         </Button>
       </div>
       <div className="rc-sheet-b">
-        <HireGate reason={writeBlock} />
+        <HireGate reason={hireBlock} />
         <div className="rc-blk">
           <h4>{t("What it does")}</h4>
           <ul className="rc-does">
@@ -251,7 +251,7 @@ export default function HireSheet({
         <Button
           variant="primary"
           disabled={blocked || saving}
-          title={writeBlock ?? modelError ?? undefined}
+          title={hireBlock ?? modelError ?? undefined}
           onClick={() => void hire()}
         >
           {saving ? t("Hiring…") : t("Hire {name}").replace("{name}", () => alias.trim())}

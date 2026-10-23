@@ -26,10 +26,7 @@ impl Shared {
         agent: &Agent,
         message: &store::Message,
     ) -> Result<Option<PathBuf>> {
-        let is_hire = agent
-            .params
-            .as_ref()
-            .is_some_and(|p| p.get("catalogue").is_some());
+        let is_hire = crate::agent_roles::is_catalogue_hire(agent.params.as_ref());
         if !is_hire
             || !adapter::registry::pi_family_managed(&agent.provider, &agent.endpoint_kind)
             || !adapter::pi::worker_confined(agent)

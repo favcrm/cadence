@@ -133,7 +133,7 @@ export function WorkBlock({
       .join(" · ");
     return (
       <span className="text-info" title={summaries || ids || t("ad-hoc running")}>
-        {summaries || ids || t("Running without an issue")}
+        {summaries || (ids ? t("Working on a message") : t("Running without an issue"))}
       </span>
     );
   }

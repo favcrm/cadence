@@ -8365,3 +8365,6 @@ fn cad1726_member_history_never_carries_an_artifact_card() {
         "member envelope artifact_read: {err}"
     );
 }
+
+// CAD-1767 G2: the member-assist-history half (check author, failing first).
+include!("cad1767_member_history_acceptance.rs");

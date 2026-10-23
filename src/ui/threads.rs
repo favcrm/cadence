@@ -225,11 +225,42 @@ fn cursor_arg(raw: Option<String>, what: &str) -> std::result::Result<i64, HttpR
     }
 }
 
-/// `GET /api/threads/<alias>` — one page after `after`.
+/// CAD-1767: what a non-operator reader of a thread page may see. Members
+/// read agent threads, but never the operator-only entries
+/// (`store::operator_only_kind`: artifact cards, hire proposals) and never
+/// the master's Home conversation. Fail closed: only a proven operator
+/// gets the page whole. Whether this is the master's Home is decided from the
+/// DAEMON's reply (the resolved `alias` and the thread's `install_id`), never
+/// from the URL's spelling: an absent field counts as Home. It edits `page`
+/// in place; the stream collects the page's seqs itself so its cursor still
+/// advances past what was hidden.
+fn member_view(page: &mut Value) {
+    let resolved_master = page["alias"].as_str().is_none_or(crate::master::is_master);
+    let home = resolved_master
+        && page["thread"]
+            .as_object()
+            .is_none_or(|t| t.get("install_id").is_none_or(Value::is_null));
+    if let Some(entries) = page["entries"].as_array_mut() {
+        entries.retain(|e| {
+            !home
+                && !e["kind"]
+                    .as_str()
+                    .is_some_and(crate::store::operator_only_kind)
+        });
+    }
+    if home {
+        page["thread"] = Value::Null;
+    }
+}
+
+/// `GET /api/threads/<alias>` — one page after `after`. `operator` is the
+/// board's proven-operator verdict for this request; anything else gets the
+/// member view ([`member_view`]).
 pub(super) fn read(
     state_dir: &std::path::Path,
     alias: &str,
     query: &dyn Fn(&str) -> Option<String>,
+    operator: bool,
 ) -> HttpResp {
     if !valid_alias(alias) {
         return err_response(400, "bad agent alias");
@@ -277,7 +308,12 @@ pub(super) fn read(
         params["conversation"] = Value::String(conversation);
     }
     match client::rpc(state_dir, "thread_read", params) {
-        Ok(page) => json_response(page),
+        Ok(mut page) => {
+            if !operator {
+                member_view(&mut page);
+            }
+            json_response(page)
+        }
         Err(e) => rpc_err(&e),
     }
 }
@@ -293,6 +329,7 @@ pub(super) fn stream(
     alias: &str,
     query: &dyn Fn(&str) -> Option<String>,
     mut admission: super::operator::ReadAdmission,
+    operator: bool,
 ) {
     if !valid_alias(alias) {
         let _ = request.respond(err_response(400, "bad agent alias"));
@@ -317,20 +354,34 @@ pub(super) fn stream(
     // Fail before the stream opens when the alias or daemon is wrong —
     // a 404/501/503 beats an event stream that only ever errors.
     let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
-    if let Err(e) = budget.read(
+    let first = match budget.read(
         state_dir,
         "thread_read",
         with_conversation(json!({"alias": alias, "after": cursor, "limit": 1})),
     ) {
-        let _ = request.respond(rpc_err(&e));
-        return;
-    }
+        Ok(page) => page,
+        Err(e) => {
+            let _ = request.respond(rpc_err(&e));
+            return;
+        }
+    };
     // The same private read as GET /api/master/state. Put the authoritative
     // turn on this connection before any resumed entries, not on a racing
     // board stream whose asynchronous refresh may still hold the old turn.
-    let master = if alias == "master" {
+    // Whether this IS the master is the daemon's answer (the resolved
+    // alias), not the URL's spelling.
+    let master = if first["alias"]
+        .as_str()
+        .is_some_and(crate::master::is_master)
+    {
         match budget.read(state_dir, "master_state", json!({})) {
-            Ok(state) => Some(state),
+            Ok(mut state) => {
+                // CAD-1767: a non-operator never gets the operator's turn text.
+                if !operator {
+                    super::home::redact_master_state(&mut state);
+                }
+                Some(state)
+            }
             Err(e) => {
                 let _ = request.respond(rpc_err(&e));
                 return;
@@ -374,10 +425,22 @@ pub(super) fn stream(
             return;
         }
         match page {
-            Ok(page) => {
+            Ok(mut page) => {
+                // The cursor follows the whole page, hidden entries included,
+                // so a page that is all operator-only never stalls the poll.
+                let seqs: Vec<i64> = page["entries"]
+                    .as_array()
+                    .map(|rows| rows.iter().filter_map(|e| e["seq"].as_i64()).collect())
+                    .unwrap_or_default();
+                if !operator {
+                    member_view(&mut page);
+                }
                 let entries = page["entries"].as_array().cloned().unwrap_or_default();
                 if entries.is_empty() && !frame(&mut w, b": ping\n\n") {
                     return;
+                }
+                if let Some(top) = seqs.iter().max() {
+                    cursor = cursor.max(*top);
                 }
                 for entry in entries {
                     let Some(seq) = entry["seq"].as_i64() else {

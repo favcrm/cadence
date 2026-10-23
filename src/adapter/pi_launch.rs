@@ -291,16 +291,45 @@ fn pi_session_pointer(state_dir: &Path, alias: &str) -> Result<PathBuf> {
     Ok(pi_worker_dir(state_dir, alias)?.join("session.current"))
 }
 
+/// Is `path` a real file inside `dir`? Both sides are canonicalized, so a
+/// `..` segment or a symlink that resolves outside `dir` does not pass.
+fn real_file_inside(dir: &Path, path: &Path) -> bool {
+    match (dir.canonicalize(), path.canonicalize()) {
+        (Ok(dir), Ok(path)) => path.starts_with(dir) && path.is_file(),
+        _ => false,
+    }
+}
+
 pub(super) fn pi_current_session(state_dir: &Path, alias: &str) -> Result<PathBuf> {
     let dir = pi_worker_dir(state_dir, alias)?;
-    let pointed = std::fs::read_to_string(pi_session_pointer(state_dir, alias)?)
-        .ok()
-        .map(|t| PathBuf::from(t.trim()))
-        .filter(|p| p.starts_with(&dir) && p.is_file());
-    match pointed {
-        Some(path) => Ok(path),
-        None => pi_worker_session(state_dir, alias),
+    let pointer = pi_session_pointer(state_dir, alias)?;
+    if let Ok(text) = std::fs::read_to_string(&pointer) {
+        let pointed = PathBuf::from(text.trim());
+        if real_file_inside(&dir, &pointed) {
+            return Ok(pointed);
+        }
+        // CAD-1767: a pointer that leaves the worker's own dir (`..` or a
+        // symlink) or names nothing is never used; say why where the
+        // provider's own log lives.
+        let line = format!(
+            "cadence: session.current points to {} which is not a file inside {} - \
+             ignored, launching from session.jsonl\n",
+            pointed.display(),
+            dir.display()
+        );
+        if let Some(parent) = dir.parent() {
+            use std::io::Write;
+            if let Ok(mut log) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(parent.join(format!("{alias}.provider.log")))
+            {
+                let _ = log.write_all(line.as_bytes());
+            }
+        }
+        eprint!("{line}");
     }
+    pi_worker_session(state_dir, alias)
 }
 
 /// Record Pi's reported session file as current, if it is inside the
@@ -311,7 +340,7 @@ pub(super) fn record_current_session(state_dir: &Path, alias: &str, reported: &s
         return;
     };
     let path = PathBuf::from(reported);
-    if !path.starts_with(&dir) || !path.is_file() {
+    if !real_file_inside(&dir, &path) {
         return;
     }
     let Ok(pointer) = pi_session_pointer(state_dir, alias) else {
@@ -354,10 +383,7 @@ fn fork_session_id(alias: &str, workdir: &Path, source: &Path) -> String {
 pub(super) fn worker_session_args(state_dir: &Path, agent: &Agent) -> Result<Vec<String>> {
     let current = pi_current_session(state_dir, &agent.alias)?;
     let resume = |path: &Path| vec!["--session".to_string(), path.to_string_lossy().to_string()];
-    let is_hire = agent
-        .params
-        .as_ref()
-        .is_some_and(|p| p.get("catalogue").is_some());
+    let is_hire = crate::agent_roles::is_catalogue_hire(agent.params.as_ref());
     let workdir = launch_workdir(agent);
     let same = |a: &Path, b: &Path| {
         a.canonicalize().unwrap_or_else(|_| a.to_path_buf())

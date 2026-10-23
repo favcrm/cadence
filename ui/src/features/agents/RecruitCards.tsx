@@ -2,9 +2,11 @@ import type { ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
 import type { AgentRole, AgentRolesPayload } from "../../lib/types";
 import AgentAvatar from "./AgentAvatar";
+import { OPERATOR_HIRE_REASON } from "../auth/gate";
 import { categoryLabel } from "./agentRoles";
 
-/** The operator-only banner shown to a viewer who cannot hire. */
+/** The banner shown to a viewer who cannot hire: the gate's own reason
+ *  (operator-only, read-only, still checking), never fixed text. */
 export function HireGate({ reason }: { reason: string | null }) {
   const t = useTranslate();
   if (reason === null) return null;
@@ -12,8 +14,10 @@ export function HireGate({ reason }: { reason: string | null }) {
     <div className="rc-gate" role="status">
       <span aria-hidden="true">🔒</span>
       <div>
-        <b>{t("Only the operator can hire agents.")}</b>{" "}
-        {t("You can browse the catalogue and ask the operator to recruit one.")}
+        <b>{t(reason)}</b>
+        {reason === OPERATOR_HIRE_REASON && (
+          <> {t("You can browse the catalogue and ask the operator to recruit one.")}</>
+        )}
       </div>
     </div>
   );

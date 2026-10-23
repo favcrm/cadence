@@ -47,7 +47,15 @@ impl Role {
     /// The text a hire stores as the agent's instructions: the job line
     /// plus the `does` bullets.
     pub fn instructions(&self) -> String {
-        let mut text = format!("You are a {}. {}\n\nWhat you do:\n", self.title, self.job);
+        let article = if self.title.starts_with(['A', 'E', 'I', 'O', 'U']) {
+            "an"
+        } else {
+            "a"
+        };
+        let mut text = format!(
+            "You are {article} {}. {}\n\nWhat you do:\n",
+            self.title, self.job
+        );
         for line in self.does {
             text.push_str("- ");
             text.push_str(line);
@@ -68,12 +76,27 @@ impl Role {
     }
 }
 
+/// The valid role ids, for refusals that name them.
+pub fn ids() -> String {
+    ROLES.iter().map(|r| r.id).collect::<Vec<_>>().join(", ")
+}
+
 pub fn find(id: &str) -> Option<&'static Role> {
     ROLES.iter().find(|role| role.id == id)
 }
 
+/// The catalogue's own spelling of a look, if it is one.
+pub fn canonical_look(look: &str) -> Option<&'static str> {
+    LOOKS.iter().copied().find(|known| *known == look)
+}
+
 pub fn valid_look(look: &str) -> bool {
-    LOOKS.contains(&look)
+    canonical_look(look).is_some()
+}
+
+/// Is this agent a catalogue hire? Its launch params carry `catalogue`.
+pub fn is_catalogue_hire(params: Option<&Value>) -> bool {
+    params.is_some_and(|p| p.get("catalogue").is_some())
 }
 
 pub const ROLES: &[Role] = &[
@@ -353,5 +376,20 @@ mod tests {
             assert!(role.instructions().len() <= crate::store::MAX_INSTRUCTIONS_BYTES);
             assert!(ROLES[i + 1..].iter().all(|other| other.id != role.id));
         }
+    }
+
+    /// CAD-1767: an article before a vowel, and refusals can name the ids.
+    #[test]
+    fn instructions_use_the_right_article_and_ids_list_every_role() {
+        assert!(find("accountant")
+            .unwrap()
+            .instructions()
+            .starts_with("You are an Accountant."));
+        assert!(find("developer")
+            .unwrap()
+            .instructions()
+            .starts_with("You are a Developer."));
+        let ids = ids();
+        assert!(ROLES.iter().all(|r| ids.contains(r.id)));
     }
 }

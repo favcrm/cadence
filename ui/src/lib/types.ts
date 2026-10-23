@@ -924,6 +924,8 @@ export interface AgentDetail {
     created?: string;
     summary?: string | null;
   }[];
+  /** Why `events` is empty when the daemon's event read failed. */
+  events_error?: string | null;
   events: {
     seq: number;
     alias: string;

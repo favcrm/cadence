@@ -322,7 +322,7 @@ export default function Agents({
   const [joined, setJoined] = useState<{ alias: string; role: AgentRole } | null>(null);
   const roles = useAgentRoles();
   const installed = useQuery(resources.apps);
-  const writeBlock = useContext(HireBlock);
+  const hireBlock = useContext(HireBlock);
   const payload = state.data;
   const scopeUnavailable = project !== "all" && issuesState.data === null;
   const issueProjects = issueIndex(issuesState.data ?? []);
@@ -450,7 +450,7 @@ export default function Agents({
         <Recruit
           roles={roles}
           agents={allAgents}
-          writeBlock={writeBlock}
+          hireBlock={hireBlock}
           onBack={() => onRecruit(false)}
           onPick={setPicked}
           onAskMaster={askMaster}
@@ -484,7 +484,7 @@ export default function Agents({
             size="sm"
             variant="primary"
             onClick={() => onRecruit(true)}
-            title={writeBlock ?? t("Recruit an agent from a ready-made role")}
+            title={hireBlock ?? t("Recruit an agent from a ready-made role")}
           >
             ＋ {t("Recruit")}
           </Button>
@@ -493,7 +493,7 @@ export default function Agents({
       <p className="text-label text-ink-400 mb-5">
         {t("Your team. Recruit a ready-made role, or ask Master to find one.")}
       </p>
-      <HireGate reason={writeBlock} />
+      <HireGate reason={hireBlock} />
       {joined && (
         <div className="rc-nudge" role="status">
           <AgentAvatar slug="custom" look={joined.role.look} size={48} active />

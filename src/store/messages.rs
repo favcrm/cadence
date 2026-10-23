@@ -2380,8 +2380,6 @@ impl Store {
         })
     }
 
-    /// Count an agent's queued inbound messages (`cadence self` for an
-    /// inbox reports this instead of a running turn).
     /// CAD-1752: the agent page's figures, one bounded query each.
     /// `tasks_done` counts its verified/done tasks, `reports` the
     /// `task_reported` events on its stream, and `avg_turn_secs` the mean
@@ -2421,6 +2419,8 @@ impl Store {
         }))
     }
 
+    /// Count an agent's queued inbound messages (`cadence self` for an
+    /// inbox reports this instead of a running turn).
     pub fn queued_count(&self, alias: &str) -> Result<i64> {
         let conn = self.conn();
         Ok(conn.query_row(

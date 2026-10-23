@@ -654,6 +654,132 @@ pub(crate) fn running_json(m: &Value) -> Value {
     })
 }
 
+/// CAD-1767: a running message as a non-operator may see it - ONE
+/// allowlist of non-content fields (id, state, task id, created), applied
+/// to a raw daemon message (`task_id`) and to an already-reduced item
+/// (`task`) alike. No `summary` and nothing else, so a field added to the
+/// message later is dropped by default.
+pub(crate) fn member_running_item(item: &Value) -> Value {
+    json!({
+        "id": item["id"],
+        "state": "running",
+        "task": if item["task"].is_null() { &item["task_id"] } else { &item["task"] },
+        "created": item["created"],
+    })
+}
+
+/// The fleet-row fields a non-operator keeps: identity, runtime state,
+/// counts, model and effort facts, ids and timing - what the roster, the
+/// cards and the agent page read. Any field not named here is dropped, so a
+/// field added to the row later stays hidden from members by default.
+const MEMBER_ROW_FIELDS: &[&str] = &[
+    "alias",
+    "provider",
+    "endpoint_kind",
+    "role",
+    "team_role",
+    "catalogue",
+    "look",
+    "kind",
+    "model_selection",
+    "model_lookup_role",
+    "model",
+    "model_reported",
+    "model_configured",
+    "model_source",
+    "effort",
+    "effort_reported",
+    "effort_source",
+    "effort_applicable",
+    "quota",
+    "usage_limit",
+    "state",
+    "group",
+    "group_root",
+    "running",
+    "queued",
+    "unread",
+    "oldest_unread_age_secs",
+    "unknown",
+    "parked",
+    "fenced",
+    "on",
+    "recovery",
+    "resume",
+    "resume_hint",
+    "dead",
+    "inbox",
+    "last_activity",
+    "silent_secs",
+    "stalled",
+    "state_label",
+    "event_cursor",
+];
+
+/// A bound task as a non-operator sees it: ids, states and titles, with
+/// its running kickoff reduced to the one running-item allowlist.
+const MEMBER_TASK_FIELDS: &[&str] = &[
+    "task",
+    "task_state",
+    "title",
+    "issue",
+    "job",
+    "job_title",
+    "job_state",
+];
+
+fn member_message(item: &Value) -> Value {
+    if item.is_object() {
+        member_running_item(item)
+    } else {
+        Value::Null
+    }
+}
+
+/// CAD-1767: one fleet row rebuilt for a non-operator from the allowlists
+/// above - never patched from the full row.
+pub(crate) fn member_agent_row(row: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for key in MEMBER_ROW_FIELDS {
+        if let Some(value) = row.get(*key) {
+            out.insert((*key).to_string(), value.clone());
+        }
+    }
+    out.insert("message".to_string(), member_message(&row["message"]));
+    if let Some(items) = row["running_messages"].as_array() {
+        out.insert(
+            "running_messages".to_string(),
+            Value::Array(items.iter().map(member_running_item).collect()),
+        );
+    }
+    if let Some(tasks) = row["tasks"].as_array() {
+        let rebuilt: Vec<Value> = tasks
+            .iter()
+            .map(|task| {
+                let mut t = serde_json::Map::new();
+                for key in MEMBER_TASK_FIELDS {
+                    if let Some(value) = task.get(*key) {
+                        t.insert((*key).to_string(), value.clone());
+                    }
+                }
+                t.insert("message".to_string(), member_message(&task["message"]));
+                Value::Object(t)
+            })
+            .collect();
+        out.insert("tasks".to_string(), Value::Array(rebuilt));
+    }
+    Value::Object(out)
+}
+
+/// The fleet payload for a non-operator: every row rebuilt.
+pub(crate) fn redact_agents_payload(payload: &mut Value) {
+    if let Some(rows) = payload["agents"].as_array_mut() {
+        for row in rows.iter_mut() {
+            *row = member_agent_row(row);
+        }
+    }
+}
+
 pub(crate) fn agent_activity_seconds(value: &Value) -> Option<f64> {
     let seconds = if let Some(seconds) = value.as_f64() {
         seconds
@@ -695,21 +821,81 @@ pub(crate) fn agent_activity_seconds(value: &Value) -> Option<f64> {
     (seconds.is_finite() && seconds > 0.0 && seconds <= 8.64e12).then_some(seconds)
 }
 
-/// The tail of an agent's event log for the drawer — the last `n`
-/// events via the same `events` RPC the CLI long-polls.
-pub(crate) fn agent_events_tail(state_dir: &Path, alias: &str, cursor: i64, n: i64) -> Vec<Value> {
+/// The tail of an agent's event log for the agent page — the last `n`
+/// events via the daemon's `agent_events` RPC (the one the CLI long-polls).
+/// An RPC error is returned, not swallowed: the caller serves `[]` plus an
+/// `events_error` so an empty history is never silently a failed read.
+pub(crate) fn agent_events_tail(
+    state_dir: &Path,
+    alias: &str,
+    cursor: i64,
+    n: i64,
+) -> std::result::Result<Vec<Value>, String> {
     let after = (cursor - n).max(0);
-    client::rpc(state_dir, "events", json!({"alias": alias, "after": after}))
-        .map(|r| {
-            r["events"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|e| e["seq"].as_i64().unwrap_or(0) > cursor - n)
-                .collect()
-        })
+    let reply = client::rpc(
+        state_dir,
+        "agent_events",
+        json!({"alias": alias, "after": after}),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(reply["events"]
+        .as_array()
+        .cloned()
         .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e["seq"].as_i64().unwrap_or(0) > cursor - n)
+        .collect())
+}
+
+/// CAD-1767: what a non-operator may see of one event - an ALLOWLIST, so
+/// anything a payload gains later is dropped by default. Top level: the
+/// ids, kind and time. Payload: only these scalar fields; every other one
+/// (`result`, `text`, `body`, `before`/`after`, …) is dropped.
+const MEMBER_EVENT_FIELDS: &[&str] = &["seq", "alias", "kind", "job_id", "task_id", "at"];
+const MEMBER_EVENT_PAYLOAD: &[&str] = &[
+    "message",
+    "turn_id",
+    "state",
+    "status",
+    "disposition",
+    "reason",
+    "error",
+];
+
+/// A short machine code (`snake_case`, no spaces): the only form of
+/// `error` / `reason` a non-operator keeps. Free text - a provider's own
+/// message, a sentence - is dropped, because it can quote message content.
+fn is_machine_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b':' | b'-')
+        })
+}
+
+pub(crate) fn member_event(event: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for key in MEMBER_EVENT_FIELDS {
+        if let Some(value) = event.get(*key) {
+            out.insert((*key).to_string(), value.clone());
+        }
+    }
+    let mut payload = serde_json::Map::new();
+    if let Some(fields) = event["payload"].as_object() {
+        for key in MEMBER_EVENT_PAYLOAD {
+            match fields.get(*key) {
+                Some(value) if value.is_object() || value.is_array() => {}
+                Some(Value::String(text))
+                    if matches!(*key, "error" | "reason") && !is_machine_code(text) => {}
+                Some(value) => {
+                    payload.insert((*key).to_string(), value.clone());
+                }
+                None => {}
+            }
+        }
+    }
+    out.insert("payload".to_string(), Value::Object(payload));
+    Value::Object(out)
 }
 
 /// What the board needs from the daemon — agent rows enriched with the
@@ -959,7 +1145,12 @@ pub(crate) fn agent_detail(
     .map_err(|e| e.to_string())?;
     let agent = &show["agent"];
     let cursor = show["event_cursor"].as_i64().unwrap_or(0);
-    let events = agent_events_tail(state_dir, alias, cursor, 20);
+    let (events, events_error) = match agent_events_tail(state_dir, alias, cursor, 20) {
+        Ok(events) if operator => (events, None),
+        // A non-operator (fail closed) gets only the allowlisted fields.
+        Ok(events) => (events.iter().map(member_event).collect(), None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
     let provider = agent["provider"].as_str().unwrap_or_default();
     let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
     let running: Vec<Value> = show["messages"]
@@ -968,7 +1159,15 @@ pub(crate) fn agent_detail(
         .unwrap_or_default()
         .iter()
         .filter(|m| m["state"].as_str() == Some("running"))
-        .map(running_json)
+        // The operator keeps the bounded description; anyone else (fail
+        // closed) gets ids, state and timing only.
+        .map(|m| {
+            if operator {
+                running_json(m)
+            } else {
+                member_running_item(m)
+            }
+        })
         .collect();
     let fenced =
         show["unknown"].as_i64().unwrap_or(0) > 0 || agent["state"].as_str() == Some("attention");
@@ -982,6 +1181,7 @@ pub(crate) fn agent_detail(
         "unknown": show["unknown"],
         "running": running,
         "events": events,
+        "events_error": events_error,
         "fenced": fenced,
         "recovery": if fenced { agent["error"].clone() } else { Value::Null },
         "resume": registry::resume_command(
@@ -2030,10 +2230,16 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             request,
             stages::milestones(state_dir, pm_dir, query("project").as_deref()),
         ),
-        "/api/agents" => send(
-            request,
-            json_response(read_model::get(state_dir, pm_dir).agents()),
-        ),
+        "/api/agents" => {
+            // CAD-1767: running-message text is the operator's; anyone else
+            // (fail closed) gets the allowlisted rows.
+            let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
+            let mut payload = read_model::get(state_dir, pm_dir).agents();
+            if !operator {
+                redact_agents_payload(&mut payload);
+            }
+            send(request, json_response(payload))
+        }
         // CAD-546: the `local` platform's outbox — an operator-only
         // read, the same proof the board's operator write routes take.
         "/api/outbox" => {
@@ -2118,7 +2324,8 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     );
                     return;
                 }
-                stream_events(request, state_dir, pm_dir, admission);
+                let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
+                stream_events(request, state_dir, pm_dir, admission, operator);
             }
         }
         _ => {
@@ -2438,7 +2645,9 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             }
             // `/api/master/state` — the header chips + turn state (CAD-551).
             if path == "/api/master/state" {
-                send(request, home::master_state(state_dir));
+                // CAD-1767: only a proven operator reads the turn's text.
+                let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
+                send(request, home::master_state(state_dir, operator));
                 return;
             }
             // CAD-819: the cross-agent work conversation view (read-only).
@@ -2468,8 +2677,11 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             }
             // `/api/threads/<alias>[/stream]` — an agent's chat (CAD-319).
             if let Some((alias, sub)) = threads::route(&path) {
+                // CAD-1767: only a proven operator reads a thread whole; every
+                // other reader gets the member view (fail closed).
+                let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
                 match sub {
-                    None => send(request, threads::read(state_dir, alias, &query)),
+                    None => send(request, threads::read(state_dir, alias, &query, operator)),
                     Some("stream") if head_only => {
                         send(request, err_response(405, "stream is GET only"))
                     }
@@ -2479,6 +2691,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                         alias,
                         &query,
                         read_admission.expect("private stream admission"),
+                        operator,
                     ),
                     Some(_) => send(request, err_response(404, "no such thread route")),
                 }

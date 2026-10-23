@@ -939,10 +939,37 @@ pub(super) fn master_summary(
 /// chips (model/effort/context) and in-flight turn. A plain read like
 /// `/api/threads/<alias>`; a daemon without `master_state` answers 501
 /// and the UI falls back to the agents payload.
-pub(super) fn master_state(state_dir: &std::path::Path) -> HttpResp {
+pub(super) fn master_state(state_dir: &std::path::Path, operator: bool) -> HttpResp {
     match client::rpc(state_dir, "master_state", json!({})) {
-        Ok(out) => json_response(out),
+        Ok(mut out) => {
+            if !operator {
+                redact_master_state(&mut out);
+            }
+            json_response(out)
+        }
         Err(e) => rpc_err(&e, "master_state"),
+    }
+}
+
+/// CAD-1767: what a non-operator may see of the master's state: the state,
+/// queue counts and routing metadata, but never the text of the operator's
+/// turn. The turn is REBUILT from an allowlist, so a field added later is
+/// dropped by default.
+pub(super) fn redact_master_state(state: &mut Value) {
+    const TURN_FIELDS: &[&str] = &[
+        "state",
+        "message",
+        "conversation",
+        "app_origin",
+        "since",
+        "position",
+    ];
+    if let Some(turn) = state.get("turn").and_then(Value::as_object) {
+        let kept: serde_json::Map<String, Value> = TURN_FIELDS
+            .iter()
+            .filter_map(|k| turn.get(*k).map(|v| ((*k).to_string(), v.clone())))
+            .collect();
+        state["turn"] = Value::Object(kept);
     }
 }
 

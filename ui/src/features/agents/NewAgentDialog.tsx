@@ -3,7 +3,7 @@ import { api } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { IconClose } from "../../ui/icons";
 import Button from "../../ui/Button";
-import { WriteGate } from "../auth/WriteGate";
+import { HireBlock } from "../auth/WriteGate";
 import { useTranslate } from "../../lib/locale";
 import { buildBody } from "./agentSetup";
 
@@ -15,7 +15,7 @@ export default function NewAgentDialog({
   onCreated: () => void;
 }) {
   const t = useTranslate();
-  const writeBlock = useContext(WriteGate);
+  const hireBlock = useContext(HireBlock);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [alias, setAlias] = useState("");
   const [provider, setProvider] = useState("");
@@ -43,7 +43,7 @@ export default function NewAgentDialog({
   }, []);
 
   const save = async () => {
-    if (writeBlock !== null || saving) return;
+    if (hireBlock !== null || saving) return;
     // The runtime follows the install; Start blank is the local form.
     const built = buildBody("local", {
       alias,
@@ -147,13 +147,13 @@ export default function NewAgentDialog({
             {err}
           </p>
         )}
-        {writeBlock && <p className="text-label text-ink-500">{writeBlock}</p>}
+        {hireBlock && <p className="text-label text-ink-500">{hireBlock}</p>}
 
         <div className="flex justify-end gap-2">
           <Button variant="ghost" size="sm" onClick={onClose}>
             {t("Cancel")}
           </Button>
-          <Button type="submit" variant="primary" size="sm" disabled={writeBlock !== null || saving} title={writeBlock ?? undefined}>
+          <Button type="submit" variant="primary" size="sm" disabled={hireBlock !== null || saving} title={hireBlock ?? undefined}>
             {saving ? t("Saving…") : t("Create agent")}
           </Button>
         </div>
