@@ -1719,3 +1719,85 @@ fn cad1767_member_agent_detail_carries_no_message_bodies() {
         "message bodies in a member's agent detail: {wrong:#?}"
     );
 }
+
+/// Operator decision (CAD-1767): for EVERY agent, a non-operator's agent
+/// detail carries running items as ids/state only, never message text. An
+/// ordinary agent with operator-sent finished, running and queued turns:
+/// a member's `GET /api/agents/helper` carries no body or result anywhere;
+/// the owner's carries the running body and the finished result.
+#[test]
+fn cad1767_member_ordinary_agent_detail_carries_no_message_bodies() {
+    let fx = Fx::start(Board::Public);
+    fx.seed("helper", None, None);
+    let store = fx.store();
+    turn(
+        &fx,
+        &store,
+        "helper",
+        "h-done",
+        "asked before",
+        "running",
+        Some(RESULT_DONE),
+    );
+    turn(
+        &fx,
+        &store,
+        "helper",
+        "h-run",
+        BODY_RUNNING,
+        "running",
+        None,
+    );
+    turn(
+        &fx,
+        &store,
+        "helper",
+        "h-queued",
+        BODY_QUEUED,
+        "queued",
+        None,
+    );
+    let owner = fx.platform_cookie("owner");
+    let member = fx.platform_cookie("member");
+    let route = "/api/agents/helper";
+    let op = fx.http(&Asserted::Operator, "GET", route, None, Some(&owner), None);
+    let op_paths = body_paths(&op.body);
+    let mut wrong = Vec::new();
+    if !op_paths
+        .iter()
+        .any(|p| p == &format!("{BODY_RUNNING} @ $.running[0].summary"))
+    {
+        wrong.push(format!(
+            "control: owner lacks the running body: {op_paths:?}"
+        ));
+    }
+    if !op_paths
+        .iter()
+        .any(|p| p.starts_with(RESULT_DONE) && p.contains("$.events["))
+    {
+        wrong.push(format!(
+            "control: owner lacks the finished result: {op_paths:?}"
+        ));
+    }
+    let m = fx.http(&Asserted::Operator, "GET", route, None, Some(&member), None);
+    let paths = body_paths(&m.body);
+    if m.status != 200 {
+        wrong.push(format!("member detail answered {}: {}", m.status, m.raw));
+    }
+    if !paths.is_empty() {
+        wrong.push(format!("member payload carries {paths:?}"));
+    }
+    if m.body["running"].as_array().is_none_or(|rows| {
+        rows.iter()
+            .all(|r| r["id"].is_null() && r["message"].is_null())
+    }) {
+        wrong.push(format!(
+            "member detail lost the running item ids/state: {}",
+            m.body["running"]
+        ));
+    }
+    assert!(
+        wrong.is_empty(),
+        "message bodies in a member's ordinary agent detail: {wrong:#?}"
+    );
+}
