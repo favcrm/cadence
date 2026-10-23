@@ -8,6 +8,7 @@ import HireProposalCard from "../agents/HireProposalCard";
 import ArtifactCard from "../canvas/ArtifactCard";
 import { ThreadPermission } from "./PermissionCard";
 import { isArtifactPutCall, stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
+import { carriesSecret } from "../app-shell/chat/directive";
 
 /**
  * The one renderer for master-thread entries (CAD-1029). Home renders at
@@ -292,6 +293,11 @@ export function ThreadItemView({
 function ThinkingNote({ entry }: { entry: ThreadEntry }) {
   const t = useTranslate();
   const [open, setOpen] = useState(false);
+  // Guard 10 applies to what is shown, not only to what is interpreted: a
+  // reasoning block carrying `confirm_token`/`request_id` is withheld whole,
+  // in the app pane and on Home alike.
+  const withheld = carriesSecret(entry.text);
+  const shown = withheld ? t("Reasoning withheld — it contained a request token.") : entry.text;
   return (
     <div className="steps thinknote min-w-0" data-kind="thinking" data-open={open || undefined}>
       <button
@@ -304,7 +310,7 @@ function ThinkingNote({ entry }: { entry: ThreadEntry }) {
           ›
         </span>
         <span className="shrink-0">{t("Thinking")}</span>
-        <span className="num truncate min-w-0 text-ink-500">· {stepSummary(entry.text)}</span>
+        <span className="num truncate min-w-0 text-ink-500">· {stepSummary(shown)}</span>
       </button>
       <div className="steps-body">
         <div className="steps-inner">
@@ -312,7 +318,7 @@ function ThinkingNote({ entry }: { entry: ThreadEntry }) {
             className="text-secondary text-ink-400 italic whitespace-pre-wrap break-words min-w-0"
             data-thinking-body
           >
-            {entry.text}
+            {shown}
           </div>
         </div>
       </div>
