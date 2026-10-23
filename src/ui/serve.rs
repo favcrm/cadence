@@ -695,21 +695,67 @@ pub(crate) fn agent_activity_seconds(value: &Value) -> Option<f64> {
     (seconds.is_finite() && seconds > 0.0 && seconds <= 8.64e12).then_some(seconds)
 }
 
-/// The tail of an agent's event log for the drawer — the last `n`
-/// events via the same `events` RPC the CLI long-polls.
-pub(crate) fn agent_events_tail(state_dir: &Path, alias: &str, cursor: i64, n: i64) -> Vec<Value> {
+/// The tail of an agent's event log for the agent page — the last `n`
+/// events via the daemon's `agent_events` RPC (the one the CLI long-polls).
+/// An RPC error is returned, not swallowed: the caller serves `[]` plus an
+/// `events_error` so an empty history is never silently a failed read.
+pub(crate) fn agent_events_tail(
+    state_dir: &Path,
+    alias: &str,
+    cursor: i64,
+    n: i64,
+) -> std::result::Result<Vec<Value>, String> {
     let after = (cursor - n).max(0);
-    client::rpc(state_dir, "events", json!({"alias": alias, "after": after}))
-        .map(|r| {
-            r["events"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|e| e["seq"].as_i64().unwrap_or(0) > cursor - n)
-                .collect()
-        })
+    let reply = client::rpc(
+        state_dir,
+        "agent_events",
+        json!({"alias": alias, "after": after}),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(reply["events"]
+        .as_array()
+        .cloned()
         .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e["seq"].as_i64().unwrap_or(0) > cursor - n)
+        .collect())
+}
+
+/// CAD-1767: what a non-operator may see of one event - an ALLOWLIST, so
+/// anything a payload gains later is dropped by default. Top level: the
+/// ids, kind and time. Payload: only these scalar fields; every other one
+/// (`result`, `text`, `body`, `before`/`after`, …) is dropped.
+const MEMBER_EVENT_FIELDS: &[&str] = &["seq", "alias", "kind", "job_id", "task_id", "at"];
+const MEMBER_EVENT_PAYLOAD: &[&str] = &[
+    "message",
+    "turn_id",
+    "state",
+    "status",
+    "disposition",
+    "reason",
+    "error",
+];
+
+pub(crate) fn member_event(event: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for key in MEMBER_EVENT_FIELDS {
+        if let Some(value) = event.get(*key) {
+            out.insert((*key).to_string(), value.clone());
+        }
+    }
+    let mut payload = serde_json::Map::new();
+    if let Some(fields) = event["payload"].as_object() {
+        for key in MEMBER_EVENT_PAYLOAD {
+            match fields.get(*key) {
+                Some(value) if !value.is_object() && !value.is_array() => {
+                    payload.insert((*key).to_string(), value.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    out.insert("payload".to_string(), Value::Object(payload));
+    Value::Object(out)
 }
 
 /// What the board needs from the daemon — agent rows enriched with the
@@ -959,7 +1005,12 @@ pub(crate) fn agent_detail(
     .map_err(|e| e.to_string())?;
     let agent = &show["agent"];
     let cursor = show["event_cursor"].as_i64().unwrap_or(0);
-    let events = agent_events_tail(state_dir, alias, cursor, 20);
+    let (events, events_error) = match agent_events_tail(state_dir, alias, cursor, 20) {
+        Ok(events) if operator => (events, None),
+        // A non-operator (fail closed) gets only the allowlisted fields.
+        Ok(events) => (events.iter().map(member_event).collect(), None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
     let provider = agent["provider"].as_str().unwrap_or_default();
     let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
     let running: Vec<Value> = show["messages"]
@@ -982,6 +1033,7 @@ pub(crate) fn agent_detail(
         "unknown": show["unknown"],
         "running": running,
         "events": events,
+        "events_error": events_error,
         "fenced": fenced,
         "recovery": if fenced { agent["error"].clone() } else { Value::Null },
         "resume": registry::resume_command(

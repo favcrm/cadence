@@ -365,6 +365,11 @@ function History({ c }: { c: TabContext }) {
           {t("last {count} events").replace("{count}", String(detail.events.length))}
         </p>
       )}
+      {detail?.events_error && (
+        <p role="alert" className="text-label text-fail">
+          {t("The event history could not be read:")} {detail.events_error}
+        </p>
+      )}
       {rows.length ? (
         <Rows>
           {rows.map((r) => (
