@@ -1543,15 +1543,15 @@ impl Shared {
                 };
                 // CAD-1258 interleaving point: a revoke or upgrade may land here.
                 crate::issue::lockseam::outside_lock("app-host-before-record");
+                let failed = std::cell::Cell::new(false);
                 let uncertain = |reason: &str| -> Error {
+                    failed.set(true);
                     let _ =
                         self.store
                             .app_run_host_step_failed(run_id, &step_id, "uncertain", reason);
                     Error::unknown(reason)
                 };
-                let entered = std::cell::Cell::new(false);
                 let recorded = snap(&mut |bundle, files, producer| {
-                    entered.set(true);
                     let _custody = self
                         .platform_custody_lock
                         .lock()
@@ -1632,14 +1632,17 @@ impl Shared {
                     }
                     Ok(())
                 });
-                match recorded {
-                    Err(_) if !entered.get() => {
-                        // The snapshot itself refused (removed or changed install).
-                        return Err(uncertain(
-                            "App authority changed while the provider call ran; the result was not retained and no automatic retry was made.",
-                        ));
+                // Any lock-2 error not already recorded (snapshot refused,
+                // PM busy, `app_run_show` or digest read failed) still
+                // leaves the step failed uncertain, naming its cause.
+                if let Err(error) = recorded {
+                    if failed.get() {
+                        return Err(error);
                     }
-                    other => other?,
+                    return Err(uncertain(&super::app_effects_rpc::lock2_failure_reason(
+                        &error,
+                        &credential,
+                    )));
                 }
             }
             if finish {

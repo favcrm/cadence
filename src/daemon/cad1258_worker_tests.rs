@@ -271,7 +271,12 @@ fn cad1258_worker_second_identical_request_makes_no_provider_call() {
     let body = json!({"message":s.message,"token":s.token,"slot":"image",
         "request_id":"c1258-dup","input":{}});
     let result = s.worker.call(s.fx.shared.clone(), &body);
-    assert!(result.is_err(), "second request must be refused");
+    let error = result.expect_err("second request must be refused");
+    assert_eq!(error.kind(), "unknown", "{error}");
+    assert!(
+        error.to_string().contains("no automatic retry was made"),
+        "{error}"
+    );
     assert_eq!(posts(&s.fx), 0, "no provider call for the second request");
     let run = s.fx.shared.store.app_run_show(&s.run_id).unwrap();
     assert_eq!(run["state"], "running", "{run}");

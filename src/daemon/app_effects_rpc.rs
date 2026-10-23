@@ -1531,13 +1531,11 @@ impl Shared {
         };
         // CAD-1258 interleaving point: a revoke or upgrade may land here.
         crate::issue::lockseam::outside_lock("app-release-before-record");
-        let entered = std::cell::Cell::new(false);
         let recorded = workspace::with_completed_bundle_snapshot(
             &pm,
             install,
             bundle_digest,
             |bundle, files| {
-                entered.set(true);
                 let _custody = self
                     .platform_custody_lock
                     .lock()
@@ -1568,20 +1566,42 @@ impl Shared {
                 Ok(Some(self.store.app_effect_show(id)?))
             },
         );
-        match recorded {
-            Ok(Some(effect)) => Ok(effect),
-            Err(error) if entered.get() => Err(error),
-            // The snapshot refused (removed or changed install) or the
-            // re-check did: the call already happened, so leave an honest
-            // reconcile record, never a release or a silent drop.
-            _ => {
-                let outcome = json!({"kind":"uncertain","error":"app release authority changed during the provider call; outcome not recorded as released","verified":crate::contract_fixture::Verified::Unknown});
-                let effect = self.store.app_effect_uncertain(id, &outcome)?;
-                self.wake();
-                Ok(effect)
-            }
-        }
+        let reason = match recorded {
+            Ok(Some(effect)) => return Ok(effect),
+            // The re-check refused: the call already happened, so leave an
+            // honest reconcile record, never a release or a silent drop.
+            Ok(None) => "app release authority changed during the provider call; outcome not recorded as released".to_string(),
+            Err(error) => lock2_failure_reason(&error, &bytes),
+        };
+        let outcome = json!({"kind":"uncertain","error":reason,"verified":crate::contract_fixture::Verified::Unknown});
+        let effect = self.store.app_effect_uncertain(id, &outcome)?;
+        self.wake();
+        Ok(effect)
     }
+}
+
+/// CAD-1778: the reason recorded when lock 2 could not retain a provider
+/// outcome. A `rejected` refusal or an install that changed during admission
+/// is an authority change and says so; any other failure (PM busy, the
+/// interrupted-write fence, a leak or record error) names its own cause. The
+/// outcome is uncertain either way and the claim blocks a resend.
+pub(super) fn lock2_failure_reason(error: &Error, secret: &[u8]) -> String {
+    const TAIL: &str = "the result was not retained and no automatic retry was made.";
+    let authority = match error {
+        Error::Rejected(_) => true,
+        Error::Structured(s) => s.code == crate::issue::app_catalog::ADMISSION_CHANGED,
+        _ => false,
+    };
+    if authority {
+        return format!("App authority changed while the provider call ran; {TAIL}");
+    }
+    let cause = error.to_string();
+    let cause = if crate::platform::refuse_leak("app lock-2 failure", &cause, secret).is_ok() {
+        cause.chars().take(200).collect::<String>()
+    } else {
+        "details withheld".into()
+    };
+    format!("The provider call finished but its outcome could not be re-checked under current authority ({cause}); {TAIL}")
 }
 
 // ACCEPTANCE-CHECK SLOT (CAD-1291). Reserved for the independent acceptance

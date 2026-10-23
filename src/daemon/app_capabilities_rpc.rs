@@ -962,23 +962,30 @@ impl Shared {
                 };
                 crate::issue::lockseam::outside_lock("app-capability-provider-call");
                 let output = adapter
-                    .execute_app_capability(&credential, &authority, input, &call_id)
+                    .execute_app_capability_outcome(&credential, &authority, input, &call_id)
                     .map_err(|error| {
                         let reason = if crate::platform::refuse_leak(
                             "app capability failure",
-                            &error,
+                            error.reason(),
                             &credential,
                         )
                         .is_ok()
                         {
-                            error.chars().take(250).collect::<String>()
+                            error.reason().chars().take(250).collect::<String>()
                         } else {
                             "Provider failure details were withheld because they matched credential custody.".into()
                         };
                         let _ = self
                             .store
-                            .app_run_call_failed(&run_id, &step, "refused", &reason);
-                        Error::rejected(error)
+                            .app_run_call_failed(&run_id, &step, error.kind(), &reason);
+                        match error {
+                            crate::platform::AppCapabilityError::Refused(_) => {
+                                Error::provider(reason)
+                            }
+                            crate::platform::AppCapabilityError::Uncertain(_) => {
+                                Error::unknown(reason)
+                            }
+                        }
                     })?;
                 // CAD-1258 interleaving point: a revoke or upgrade may land here.
                 crate::issue::lockseam::outside_lock("app-capability-before-record");
@@ -1042,15 +1049,16 @@ impl Shared {
                         },
                     )
                 });
-                if recorded.is_err() {
+                if let Err(error) = &recorded {
                     // The provider answered but lock 2 refused or could not
-                    // retain it: leave a durable uncertain failure, never a
-                    // silent drop. The claim blocks any resend.
+                    // retain it: leave a durable uncertain failure naming
+                    // the cause, never a silent drop. The claim blocks any
+                    // resend.
                     let _ = self.store.app_run_call_failed(
                         &run_id,
                         &step,
                         "uncertain",
-                        "App authority changed while the provider call ran; the result was not retained and no automatic retry was made.",
+                        &super::app_effects_rpc::lock2_failure_reason(error, &credential),
                     );
                 }
                 recorded
