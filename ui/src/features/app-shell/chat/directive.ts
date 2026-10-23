@@ -88,7 +88,7 @@ const SECRET_KEYS = new Set(["confirm_token", "request_id"]);
 /** Guard 10: a JSON object carrying `confirm_token` or `request_id` at any
  *  depth. Bounded walk: an adversarially deep or wide body is treated as
  *  carrying one (it is never printed raw). */
-function carriesSecret(text: string): boolean {
+export function carriesSecret(text: string): boolean {
   const body = text.trim();
   if (!body.startsWith("{")) return false;
   let parsed: unknown;

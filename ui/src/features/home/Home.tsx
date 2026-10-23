@@ -429,6 +429,7 @@ const ThreadList = memo(function ThreadList({
   liveAfter,
   onRetry,
   working,
+  stale,
 }: {
   items: ThreadItem[];
   limit: number;
@@ -448,6 +449,8 @@ const ThreadList = memo(function ThreadList({
   /** The live turn: its own `message` id picks the row the activity
    *  belongs to; `since` drives the elapsed clock. Null otherwise. */
   working: { message: string; since: number | null } | null;
+  /** CAD-1782: the thread stream is down, so these rows are a snapshot. */
+  stale: boolean;
 }) {
   const t = useTranslate();
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
@@ -481,6 +484,18 @@ const ThreadList = memo(function ThreadList({
   if (items.length === 0) return null;
   return (
     <>
+      {stale && (
+        <div
+          className="flex items-center justify-between gap-3 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-micro text-warn"
+          role="status"
+          data-kind="stale"
+        >
+          <span>{t("Reconnecting — this conversation may be out of date.")}</span>
+          <button className="lnk" onClick={() => window.location.reload()}>
+            {t("Refresh")}
+          </button>
+        </div>
+      )}
       {(hidden > 0 || moreBefore) && (
         <div className="flex justify-center">
           <button className="lnk text-label disabled:opacity-50" disabled={loadingEarlier} onClick={onEarlier}>
@@ -1190,6 +1205,7 @@ function MasterHome({
               liveAfter={liveAfter.current ?? 0}
               onRetry={onRetrySend}
               working={workingActivity}
+              stale={link !== null && link !== "live"}
             />
             {cmds.map((c) => (
               <CmdCard key={c.id} cmd={c} onOpenIssue={onOpenIssue} />

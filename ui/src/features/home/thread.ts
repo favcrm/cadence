@@ -254,6 +254,7 @@ export function discardPending(state: ThreadState | null, message: string): Thre
 export type ThreadItem =
   | { type: "operator"; key: string; entry: ThreadEntry }
   | { type: "system"; key: string; entry: ThreadEntry }
+  | { type: "thinking"; key: string; entry: ThreadEntry }
   | { type: "commentary"; key: string; entry: ThreadEntry }
   | { type: "tools"; key: string; entries: ThreadEntry[] }
   | { type: "answer"; key: string; entry: ThreadEntry }
@@ -290,6 +291,8 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
       const last = items[items.length - 1];
       if (last?.type === "tools") last.entries.push(entry);
       else items.push({ type: "tools", key, entries: [entry] });
+    } else if (entry.kind === "thinking") {
+      items.push({ type: "thinking", key, entry });
     } else if (entry.kind === "assistant_text") {
       items.push({ type: "commentary", key, entry });
     } else if (entry.kind === "turn_result") {
