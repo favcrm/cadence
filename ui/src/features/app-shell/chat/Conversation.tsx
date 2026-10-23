@@ -227,6 +227,10 @@ function visibleQuestion(items: ThreadItem[], index: number): string {
   return "";
 }
 
+/** Text an app directive may be read from. A thinking entry is deliberately
+ *  absent: reasoning is the model's private text, never an operator message, so
+ *  it can never open a confirm/frame directive. Its ids are still redacted by
+ *  `hidden()` because the block is visible when expanded. */
 const itemText = (item: ThreadItem): string | null =>
   item.type === "operator" || item.type === "answer" || item.type === "commentary"
     ? item.entry.text
@@ -240,6 +244,7 @@ function hidden(item: ThreadItem): ThreadItem {
     case "operator":
     case "answer":
     case "commentary":
+    case "thinking":
       return { ...item, entry: { ...item.entry, text: hideIds(item.entry.text) } };
     case "pending":
       return { ...item, pending: { ...item.pending, text: hideIds(item.pending.text) } };
