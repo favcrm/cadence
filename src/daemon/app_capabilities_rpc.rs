@@ -884,7 +884,10 @@ impl Shared {
                         )
                         .simple()
                     );
-                    self.store.app_capability_claim(
+                    // The claim is the exactly-once gate: a second identical
+                    // request makes no provider call and must not fail the run
+                    // (the first call may still be in flight).
+                    if !self.store.app_capability_claim(
                         crate::store::app_capabilities::AppCapabilityClaim {
                             run: &run_id,
                             step: &step,
@@ -896,7 +899,9 @@ impl Shared {
                             input_digest: &input_digest,
                             call_id: &call_id,
                         },
-                    )?;
+                    )? {
+                        return Err(Error::unknown("A prior provider call has no retained receipt; its outcome is uncertain and no automatic retry was made."));
+                    }
                     let authority = json!({
                         "schema":1,"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
                         "install_id":install,"context_id":run["context_id"],

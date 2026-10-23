@@ -54,6 +54,8 @@
 
 #[path = "cad1258_lock2_refusal_acceptance.rs"]
 mod cad1258_lock2_refusal_acceptance;
+#[path = "cad1258_worker_tests.rs"]
+mod cad1258_worker_tests;
 
 use super::*;
 use crate::platform::{agenticos_external, Custody, Key};
