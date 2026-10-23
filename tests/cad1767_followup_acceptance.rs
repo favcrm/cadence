@@ -949,15 +949,17 @@ fn cad1767_register_refuses_look_without_catalogue() {
     std::fs::create_dir_all(&cwd).unwrap();
     let agents_before = fx.store().agents().unwrap().len();
     let mut wrong = Vec::new();
-    for (what, params) in [
+    for (what, alias, params) in [
         (
             "start blank with look",
+            "look-1",
             json!({"alias": "look-1", "provider": "claude", "endpoint_kind": "managed",
                    "cwd": cwd.to_string_lossy(), "look": "guard"}),
         ),
         (
             "mailbox with look",
-            json!({"alias": "look-1", "provider": "inbox", "endpoint_kind": "inbox",
+            "look-m",
+            json!({"alias": "look-m", "provider": "inbox", "endpoint_kind": "inbox",
                    "look": "guard"}),
         ),
     ] {
@@ -967,9 +969,11 @@ fn cad1767_register_refuses_look_without_catalogue() {
                     && err.to_string().contains("look") => {}
             other => wrong.push(format!("{what}: {other:?}")),
         }
-        if fx.agent("look-1").is_some() {
+        if fx.agent(alias).is_some() {
             wrong.push(format!("{what}: row created"));
-            fx.op("agent_remove", json!({"alias": "look-1", "force": true}));
+        }
+        if fx.home(alias).exists() {
+            wrong.push(format!("{what}: home dir created"));
         }
     }
     assert!(wrong.is_empty(), "look without catalogue: {wrong:#?}");
@@ -978,7 +982,6 @@ fn cad1767_register_refuses_look_without_catalogue() {
         agents_before,
         "rows written"
     );
-    assert!(!fx.home("look-1").exists());
 
     // Control: look with catalogue still works.
     fx.op(
@@ -986,4 +989,278 @@ fn cad1767_register_refuses_look_without_catalogue() {
         json!({"alias": "look-2", "catalogue": "accountant", "look": "guard"}),
     );
     assert_eq!(fx.agent("look-2").unwrap().params.unwrap()["look"], "guard");
+}
+
+// ----------------------------------------- G2 (operator decision, 2026-10-23)
+//
+// Members MAY read agent threads, but every member read of
+// `/api/threads/<alias>` (plain, tail, before, conversation=, /stream)
+// strips operator-only content: artifact cards, hire proposals, and the
+// master's Home conversation. The operator still gets the full thread.
+
+const HELPER_CHAT: &str = "helper-ordinary-needle";
+const HOME_CHAT: &str = "master-home-secret-needle";
+
+impl Fx {
+    fn append(&self, store: &Store, thread: &str, role: &str, kind: &str, text: &str) -> i64 {
+        store
+            .thread_append_to(
+                thread,
+                cadence_agent::store::NewEntry {
+                    role,
+                    kind,
+                    text,
+                    payload: None,
+                    message_id: None,
+                },
+            )
+            .unwrap()
+            .expect("thread exists")
+    }
+
+    /// An artifact card written by the store's own put path.
+    fn artifact_card(&self, store: &Store, thread: &str, by: &str) -> String {
+        use cadence_agent::store::{ArtifactStore, LocalArtifacts, PutArtifact};
+        LocalArtifacts {
+            store,
+            state_dir: &self.state(),
+        }
+        .put(
+            PutArtifact {
+                id: None,
+                kind: "md",
+                title: "artifact-card-needle",
+                thread_id: thread,
+                scope: "home",
+                context_id: "",
+                created_by: by,
+                message_id: "m-c1767-art",
+            },
+            b"# operator only",
+        )
+        .unwrap()
+        .id
+    }
+
+    fn proposal(&self, store: &Store, thread: &str) {
+        store
+            .hire_proposal_put(
+                thread,
+                "m-c1767-hp",
+                "Proposed hire: Accountant as proposal-needle",
+                json!({"role": "accountant", "title": "Accountant", "name": "proposal-needle",
+                       "job": "Chase invoices.", "digest": "c1767b"}),
+            )
+            .unwrap();
+    }
+
+    /// A bounded read of an SSE route: the `data:` JSON events that arrive
+    /// within `window`.
+    fn sse(&self, path: &str, cookie: &str, window: Duration) -> (u16, Vec<Value>) {
+        let token = Seam::token_at(&self.state()).unwrap();
+        let request = format!(
+            "GET {path} HTTP/1.0\r\nHost: {host}\r\nX-Cadence-Board: 1\r\n\
+             Origin: http://{host}\r\nSec-Fetch-Site: same-origin\r\n\
+             {AS_HEADER}: operator\r\n{TOKEN_HEADER}: {token}\r\nCookie: {cookie}\r\n\r\n",
+            host = self.host,
+        );
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let until = Instant::now() + window;
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 8192];
+        while Instant::now() < until {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("sse read: {e}"),
+            }
+        }
+        let text = String::from_utf8_lossy(&raw).to_string();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let events = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data:"))
+            .filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
+            .collect();
+        (status, events)
+    }
+}
+
+/// Operator-only content found in a list of entries.
+fn operator_only(entries: &[Value], home: Option<&str>) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| {
+            e["kind"] == "artifact"
+                || e["kind"] == "hire_proposal"
+                || home.is_some_and(|h| e["thread"] == h)
+                || e.to_string().contains(HOME_CHAT)
+                || e.to_string().contains("artifact-card-needle")
+                || e.to_string().contains("proposal-needle")
+        })
+        .map(|e| format!("{} {}", e["kind"], e["text"]))
+        .collect()
+}
+
+fn entries_of(page: &Value) -> Vec<Value> {
+    page["entries"].as_array().cloned().unwrap_or_default()
+}
+
+/// G2.1. A non-master agent's thread: members keep its ordinary chat but
+/// never get the artifact card or the hire proposal; the owner gets all.
+#[test]
+fn cad1767_member_agent_thread_reads_strip_operator_only_entries() {
+    let fx = Fx::start(Board::Public);
+    fx.seed("helper", None, None);
+    let store = fx.store();
+    let thread = store.ensure_thread("helper").unwrap().id;
+    fx.append(&store, &thread, "operator", "message", HELPER_CHAT);
+    fx.artifact_card(&store, &thread, "helper");
+    fx.proposal(&store, &thread);
+    let last = fx.append(&store, &thread, "agent", "assistant_text", HELPER_CHAT);
+    let routes = [
+        "/api/threads/helper".to_string(),
+        "/api/threads/helper?tail=1".to_string(),
+        format!("/api/threads/helper?before={}", last + 1),
+        format!("/api/threads/helper?conversation={thread}"),
+        format!("/api/threads/helper?conversation={thread}&tail=1"),
+    ];
+    let owner = fx.platform_cookie("owner");
+    let member = fx.platform_cookie("member");
+    let mut wrong = Vec::new();
+    for route in &routes {
+        let op = fx.http(&Asserted::Operator, "GET", route, None, Some(&owner), None);
+        let kinds: Vec<Value> = entries_of(&op.body)
+            .iter()
+            .map(|e| e["kind"].clone())
+            .collect();
+        if op.status != 200
+            || !kinds.contains(&json!("artifact"))
+            || !kinds.contains(&json!("hire_proposal"))
+        {
+            wrong.push(format!("control {route}: owner {} {kinds:?}", op.status));
+        }
+        let m = fx.http(&Asserted::Operator, "GET", route, None, Some(&member), None);
+        let entries = entries_of(&m.body);
+        let ordinary = entries.iter().filter(|e| e["text"] == HELPER_CHAT).count();
+        if m.status != 200 || ordinary != 2 {
+            wrong.push(format!(
+                "{route}: member lost ordinary chat ({} {ordinary}/2): {}",
+                m.status, m.raw
+            ));
+        }
+        let leaked = operator_only(&entries, None);
+        if !leaked.is_empty() {
+            wrong.push(format!("{route}: member got {leaked:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "member agent-thread reads: {wrong:#?}");
+}
+
+/// G2.2. The master's thread: a member gets none of the operator's Home
+/// conversation, on every variant; the owner gets it.
+#[test]
+fn cad1767_member_master_reads_carry_no_home_entries() {
+    let fx = Fx::start(Board::Public);
+    fx.seed("master", None, None);
+    let store = fx.store();
+    let home = store.ensure_thread("master").unwrap().id;
+    fx.append(&store, &home, "operator", "message", HOME_CHAT);
+    let last = fx.append(&store, &home, "agent", "assistant_text", HOME_CHAT);
+    let routes = [
+        "/api/threads/master".to_string(),
+        "/api/threads/master?tail=1".to_string(),
+        format!("/api/threads/master?before={}", last + 1),
+        format!("/api/threads/master?conversation={home}"),
+        format!("/api/threads/master?conversation={home}&tail=1"),
+    ];
+    let owner = fx.platform_cookie("owner");
+    let member = fx.platform_cookie("member");
+    let mut wrong = Vec::new();
+    for route in &routes {
+        let op = fx.http(&Asserted::Operator, "GET", route, None, Some(&owner), None);
+        if op.status != 200 || !op.raw.contains(HOME_CHAT) {
+            wrong.push(format!(
+                "control {route}: owner {} lacks Home chat",
+                op.status
+            ));
+        }
+        let m = fx.http(&Asserted::Operator, "GET", route, None, Some(&member), None);
+        eprintln!("CAD-1767 member {route}: {}", m.status);
+        let leaked = operator_only(&entries_of(&m.body), Some(&home));
+        if !leaked.is_empty() || m.raw.contains(HOME_CHAT) {
+            wrong.push(format!("{route}: member got Home entries {leaked:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "member master reads: {wrong:#?}");
+}
+
+/// G2.3. `/stream`: a member's event stream carries no artifact card, no
+/// hire proposal and no master Home entry; the owner's stream does.
+#[test]
+fn cad1767_member_thread_stream_strips_operator_only_entries() {
+    let fx = Fx::start(Board::Public);
+    fx.seed("helper", None, None);
+    fx.seed("master", None, None);
+    let store = fx.store();
+    let thread = store.ensure_thread("helper").unwrap().id;
+    fx.append(&store, &thread, "operator", "message", HELPER_CHAT);
+    fx.artifact_card(&store, &thread, "helper");
+    fx.proposal(&store, &thread);
+    let home = store.ensure_thread("master").unwrap().id;
+    fx.append(&store, &home, "operator", "message", HOME_CHAT);
+    fx.artifact_card(&store, &home, "master");
+    fx.proposal(&store, &home);
+    let owner = fx.platform_cookie("owner");
+    let member = fx.platform_cookie("member");
+    let window = Duration::from_secs(3);
+    let mut wrong = Vec::new();
+    for (alias, path, home_id) in [
+        ("helper", "/api/threads/helper/stream".to_string(), None),
+        (
+            "master",
+            "/api/threads/master/stream".to_string(),
+            Some(home.as_str()),
+        ),
+        (
+            "master",
+            format!("/api/threads/master/stream?conversation={home}"),
+            Some(home.as_str()),
+        ),
+    ] {
+        let (status, events) = fx.sse(&path, &owner, window);
+        let kinds: Vec<Value> = events.iter().map(|e| e["kind"].clone()).collect();
+        if status != 200
+            || !kinds.contains(&json!("artifact"))
+            || !kinds.contains(&json!("hire_proposal"))
+        {
+            wrong.push(format!("control {path}: owner {status} {kinds:?}"));
+        }
+        let (status, events) = fx.sse(&path, &member, window);
+        eprintln!(
+            "CAD-1767 member stream {path}: {status}, {} events",
+            events.len()
+        );
+        let leaked = operator_only(&events, home_id);
+        if !leaked.is_empty() {
+            wrong.push(format!("{path}: member stream got {leaked:?}"));
+        }
+        if alias == "helper" && status == 200 && !events.iter().any(|e| e["text"] == HELPER_CHAT) {
+            wrong.push(format!("{path}: member stream lost the ordinary chat"));
+        }
+    }
+    assert!(wrong.is_empty(), "member streams: {wrong:#?}");
 }
