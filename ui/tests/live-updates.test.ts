@@ -32,6 +32,14 @@ for (let i = 0; i < 20; i++) emit("aggregates", { resources: ["projects", "overv
 equal(invalidations, [], "burst waits for one batch");
 flush();
 equal(invalidations, ["projects", "overview"], "20 events cause two resource requests");
+// CAD-1773: a busy agent emits an `agents` frame about once a second; none refetches the app list.
+for (let i = 0; i < 20; i++) emit("agents", { resources: ["overview", "outbox", "apps", "app"] });
+flush();
+equal(invalidations.slice(2), ["overview", "outbox", "app"], "agent frames do not refetch the installed-app list");
+emit("issues", { resources: ["apps"] });
+flush();
+equal(invalidations.slice(5), ["apps"], "an issues frame still refetches the installed-app list");
+invalidations.length = 2;
 emit("issue", { id: "CAD-1", rev: "1", op: "upsert", issue: { id: "CAD-1" } });
 emit("issue", { id: "CAD-1", rev: "2", op: "delete" });
 flush();

@@ -50,6 +50,12 @@ export class LiveUpdates {
       return;
     }
     for (const key of invalidatedBy(event.data)) {
+      // CAD-1773: an agent row moves on every daemon event (`event_cursor`),
+      // and the `agents` frame names `apps` for the app detail's checks. The
+      // installed-app list (`GET /api/apps`) holds no agent state, so an
+      // agent change must not refetch it once a second; installs still
+      // arrive on the `issues` frame.
+      if (key === "apps" && event.type === "agents") continue;
       if (key === "master") this.opts.invalidate(key);
       else this.queue(key);
     }
