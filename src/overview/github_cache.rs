@@ -154,7 +154,7 @@ pub(super) fn github(state_dir: &Path, slugs: &[String]) -> (HashMap<String, Val
 
 /// The GitHub block with a bounded wait (CAD-249). Returns the repos
 /// map plus `{state: ok|cached|stale|unavailable, as_of, error?}` —
-/// `as_of` is when the rows were fetched. A fresh cache answers at
+/// `as_of` is when the rows were fetched (null when none are served). A fresh cache answers at
 /// once; otherwise a refresh starts (every slug concurrently) and the
 /// caller waits at most `wait` for it. Past that, the last good body
 /// for this slug set is served as `stale` while the refresh finishes
@@ -240,8 +240,8 @@ pub(super) fn github_bounded_notify(
     )
 }
 
-/// The last good rows for this slug set, untimed — better stale rows
-/// than blank ones. `unavailable` when the cache covers none of them.
+/// The last good rows for this slug set, stamped `as_of` the cache's own
+/// fetch time — better stale rows than blank ones. `unavailable` when the cache covers none of them.
 fn stale_github(
     cached: Option<GhCache>,
     slugs: &[String],
