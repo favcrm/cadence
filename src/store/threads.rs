@@ -57,6 +57,13 @@ pub const KIND_ARTIFACT: &str = "artifact";
 /// card the operator reviews. It registers nothing.
 pub const KIND_HIRE_PROPOSAL: &str = "hire_proposal";
 
+/// CAD-1767: thread entry kinds only the operator reads - artifact cards
+/// and hire proposals. The one list every member-facing thread path
+/// (`member_assist_history`, the board's member thread reads) filters by.
+pub fn operator_only_kind(kind: &str) -> bool {
+    matches!(kind, KIND_ARTIFACT | KIND_HIRE_PROPOSAL)
+}
+
 const ROLES: &[&str] = &[ROLE_OPERATOR, ROLE_AGENT, ROLE_SYSTEM, ROLE_MEMBER];
 const KINDS: &[&str] = &[
     KIND_MESSAGE,

@@ -538,7 +538,9 @@ impl Shared {
                                     )?;
                                     self.notify_routed_target(&message, &failed);
                                     self.wake();
-                                    return Err(error);
+                                    // The fence carries the stated reason, not
+                                    // the closed-connection error underneath.
+                                    return Err(Error::provider(reason));
                                 }
                                 continue;
                             }

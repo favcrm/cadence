@@ -21,10 +21,7 @@ impl Shared {
     pub(super) fn turn_project(&self, agent: &Agent) -> Option<TurnProject> {
         let pm_dir = self.pm_dir().ok()?;
         let messages = self.store.active_messages(&agent.alias).unwrap_or_default();
-        let hire = agent
-            .params
-            .as_ref()
-            .is_some_and(|params| params.get("catalogue").is_some());
+        let hire = crate::agent_roles::is_catalogue_hire(agent.params.as_ref());
         let key_of = |issue: &str| crate::issue::project::key_for_issue(&pm_dir, issue);
         // The turn in flight decides: a running (or submitting) message's
         // own issue, and a ticketless one has no project however much is
@@ -57,11 +54,7 @@ impl Shared {
                 return None;
             }
         }
-        if agent
-            .params
-            .as_ref()
-            .is_some_and(|params| params.get("catalogue").is_some())
-        {
+        if hire {
             return None;
         }
         crate::issue::project::key_for_cwd(&pm_dir, Path::new(&agent.cwd))

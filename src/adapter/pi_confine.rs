@@ -372,7 +372,7 @@ pub(super) fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
 /// registration and `agent set` refuse it from callers.
 pub fn launch_workdir(agent: &Agent) -> PathBuf {
     let params = agent.params.as_ref();
-    let is_hire = params.is_some_and(|p| p.get("catalogue").is_some());
+    let is_hire = crate::agent_roles::is_catalogue_hire(params);
     match params
         .and_then(|p| p.get("launch_workdir"))
         .and_then(Value::as_str)

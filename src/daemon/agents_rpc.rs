@@ -29,6 +29,11 @@ impl Shared {
             }
             None => None,
         };
+        if hired.is_none() && !matches!(params.get("look"), None | Some(Value::Null)) {
+            return Err(Error::rejected(
+                "'look' only applies to a catalogue hire - send 'catalogue' with it",
+            ));
+        }
         let provider = match &hired {
             Some(_) => "pi",
             None => required_str(params, "provider")?,
@@ -425,8 +430,14 @@ impl Shared {
         }
         let audit = json!({"by": "operator", "by_kind": "operator", "caller_pid": peer_pid});
         let (old, new) = self.store.set_instructions_by(&alias, text, &audit)?;
-        // Only some adapters read the stored row, and only when a session
-        // opens; nothing here restarts the agent.
+        // `applies` here is what the DAEMON alone does: only codex and Devin
+        // cloud read the stored row, and only when a session opens
+        // (`next_launch`); every other provider is `not_delivered` by this RPC.
+        // The CLI verb and the board route then rewrite the agent's briefing and
+        // queue a re-read notice (`briefing::deliver_job_update`) and, on
+        // success, report `next_turn` instead - the two-step split is
+        // deliberate, so the raw RPC never promises what only a wrapper does.
+        // Nothing here restarts the agent.
         let applies = match (agent.provider.as_str(), agent.endpoint_kind.as_str()) {
             ("codex", _) | ("devin", "cloud") => "next_launch",
             _ => "not_delivered",
@@ -1701,15 +1712,13 @@ fn catalogue_hire(params: &Value, id: &str) -> Result<CatalogueHire> {
     }
     let role = crate::agent_roles::find(id).ok_or_else(|| {
         Error::rejected(format!(
-            "Unknown catalogue role '{id}' — see GET /api/agent-roles"
+            "unknown catalogue role '{id}' - one of: {}",
+            crate::agent_roles::ids()
         ))
     })?;
     let look = match optional_text(params, "look")? {
         None => role.look,
-        Some(look) => crate::agent_roles::LOOKS
-            .iter()
-            .copied()
-            .find(|known| *known == look)
+        Some(look) => crate::agent_roles::canonical_look(look)
             .ok_or_else(|| Error::rejected(format!("Unknown look '{look}'")))?,
     };
     Ok(CatalogueHire {

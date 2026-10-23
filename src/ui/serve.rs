@@ -2468,8 +2468,11 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             }
             // `/api/threads/<alias>[/stream]` — an agent's chat (CAD-319).
             if let Some((alias, sub)) = threads::route(&path) {
+                // CAD-1767: only a proven operator reads a thread whole; every
+                // other reader gets the member view (fail closed).
+                let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
                 match sub {
-                    None => send(request, threads::read(state_dir, alias, &query)),
+                    None => send(request, threads::read(state_dir, alias, &query, operator)),
                     Some("stream") if head_only => {
                         send(request, err_response(405, "stream is GET only"))
                     }
@@ -2479,6 +2482,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                         alias,
                         &query,
                         read_admission.expect("private stream admission"),
+                        operator,
                     ),
                     Some(_) => send(request, err_response(404, "no such thread route")),
                 }

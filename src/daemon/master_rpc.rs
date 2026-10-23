@@ -367,6 +367,23 @@ impl Shared {
         // narrowed to `MASTER_APP_ALLOWED`.
         let scope = self.master_turn_scope();
         if scope != MasterScope::Home {
+            // CAD-1767: say what is actually missing for a hire proposal -
+            // a live Home turn - instead of the app-conversation rule.
+            if method == "hire_propose" {
+                return Err(Error::invalid(
+                    "master_refused",
+                    match scope {
+                        MasterScope::App(_) => {
+                            "hire propose is made in the master's Home conversation, \
+                             not in an app conversation"
+                        }
+                        _ => {
+                            "hire propose needs the master's live assigned turn in its \
+                             Home conversation - none is running"
+                        }
+                    },
+                ));
+            }
             if !master_app_may_call(method) {
                 return Err(Error::invalid(
                     "master_refused",

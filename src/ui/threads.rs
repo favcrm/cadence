@@ -225,11 +225,38 @@ fn cursor_arg(raw: Option<String>, what: &str) -> std::result::Result<i64, HttpR
     }
 }
 
-/// `GET /api/threads/<alias>` — one page after `after`.
+/// CAD-1767: what a non-operator reader of a thread page may see. Members
+/// read agent threads, but never the operator-only entries
+/// (`store::operator_only_kind`: artifact cards, hire proposals) and never
+/// the master's Home conversation. Fail closed: only a proven operator
+/// gets the page whole. Returns the seqs the unfiltered page covered so a
+/// stream's cursor still advances past what was hidden.
+fn member_view(page: &mut Value, alias: &str) {
+    let home = crate::master::is_master(alias)
+        && page["thread"]
+            .as_object()
+            .is_none_or(|t| t.get("install_id").is_none_or(Value::is_null));
+    if let Some(entries) = page["entries"].as_array_mut() {
+        entries.retain(|e| {
+            !home
+                && !e["kind"]
+                    .as_str()
+                    .is_some_and(crate::store::operator_only_kind)
+        });
+    }
+    if home {
+        page["thread"] = Value::Null;
+    }
+}
+
+/// `GET /api/threads/<alias>` — one page after `after`. `operator` is the
+/// board's proven-operator verdict for this request; anything else gets the
+/// member view ([`member_view`]).
 pub(super) fn read(
     state_dir: &std::path::Path,
     alias: &str,
     query: &dyn Fn(&str) -> Option<String>,
+    operator: bool,
 ) -> HttpResp {
     if !valid_alias(alias) {
         return err_response(400, "bad agent alias");
@@ -277,7 +304,12 @@ pub(super) fn read(
         params["conversation"] = Value::String(conversation);
     }
     match client::rpc(state_dir, "thread_read", params) {
-        Ok(page) => json_response(page),
+        Ok(mut page) => {
+            if !operator {
+                member_view(&mut page, alias);
+            }
+            json_response(page)
+        }
         Err(e) => rpc_err(&e),
     }
 }
@@ -293,6 +325,7 @@ pub(super) fn stream(
     alias: &str,
     query: &dyn Fn(&str) -> Option<String>,
     mut admission: super::operator::ReadAdmission,
+    operator: bool,
 ) {
     if !valid_alias(alias) {
         let _ = request.respond(err_response(400, "bad agent alias"));
@@ -374,10 +407,22 @@ pub(super) fn stream(
             return;
         }
         match page {
-            Ok(page) => {
+            Ok(mut page) => {
+                // The cursor follows the whole page, hidden entries included,
+                // so a page that is all operator-only never stalls the poll.
+                let seqs: Vec<i64> = page["entries"]
+                    .as_array()
+                    .map(|rows| rows.iter().filter_map(|e| e["seq"].as_i64()).collect())
+                    .unwrap_or_default();
+                if !operator {
+                    member_view(&mut page, alias);
+                }
                 let entries = page["entries"].as_array().cloned().unwrap_or_default();
                 if entries.is_empty() && !frame(&mut w, b": ping\n\n") {
                     return;
+                }
+                if let Some(top) = seqs.iter().max() {
+                    cursor = cursor.max(*top);
                 }
                 for entry in entries {
                     let Some(seq) = entry["seq"].as_i64() else {

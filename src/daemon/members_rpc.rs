@@ -2585,11 +2585,12 @@ impl Shared {
     }
 }
 
-/// CAD-1726: artifact cards are the operator's; a member reader never sees
-/// one (an allowlist of what a member may read, not a hide list of titles).
+/// CAD-1726 / CAD-1767: artifact cards and hire proposals are the
+/// operator's; a member reader never sees one (`store::operator_only_kind`
+/// is the one list, shared with the board's member thread reads).
 fn operator_only_entries_hidden(entries: Vec<store::ThreadEntry>) -> Vec<store::ThreadEntry> {
     entries
         .into_iter()
-        .filter(|e| e.kind != store::KIND_ARTIFACT)
+        .filter(|e| !store::operator_only_kind(&e.kind))
         .collect()
 }
