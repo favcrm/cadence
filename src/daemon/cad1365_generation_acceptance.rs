@@ -52,6 +52,9 @@
 
 #![cfg(all(test, feature = "test-seam"))]
 
+#[path = "cad1258_lock2_refusal_acceptance.rs"]
+mod cad1258_lock2_refusal_acceptance;
+
 use super::*;
 use crate::platform::{agenticos_external, Custody, Key};
 use crate::store::StoreConn;
