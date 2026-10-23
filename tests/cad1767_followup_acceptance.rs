@@ -1264,3 +1264,222 @@ fn cad1767_member_thread_stream_strips_operator_only_entries() {
     }
     assert!(wrong.is_empty(), "member streams: {wrong:#?}");
 }
+
+// ------------------------------- G2 round 2: bypasses of the member view
+//
+// From the Spec/security REVISE on PR #1290: the member view must hold for
+// every spelling the daemon resolves to the master (its native thread or
+// session id), and the master's live turn state must not carry the
+// operator's message body to a member.
+
+const NATIVE_THREAD: &str = "c1767a00-0000-4000-8000-00000000a001";
+const NATIVE_SESSION: &str = "c1767a00-0000-4000-8000-00000000a002";
+
+/// The master row with native ids and a Home thread holding operator chat,
+/// an artifact card and a hire proposal.
+fn master_with_home(fx: &Fx) -> (Store, String) {
+    fx.seed("master", None, None);
+    let store = fx.store();
+    store
+        .set_identity_with_quota(
+            "master",
+            &cadence_agent::adapter::Identity {
+                thread_id: NATIVE_THREAD.into(),
+                session_id: NATIVE_SESSION.into(),
+                model: None,
+                effort: None,
+                pid: std::process::id(),
+                endpoint: None,
+                generation: None,
+                attach: None,
+            },
+            None,
+        )
+        .unwrap();
+    let home = store.ensure_thread("master").unwrap().id;
+    fx.append(&store, &home, "operator", "message", HOME_CHAT);
+    fx.artifact_card(&store, &home, "master");
+    fx.proposal(&store, &home);
+    fx.append(&store, &home, "agent", "assistant_text", HOME_CHAT);
+    (store, home)
+}
+
+/// G2 round 2, item 1. Every name the daemon resolves to the master gets
+/// the member view: no Home chat, no artifact card, no hire proposal.
+#[test]
+fn cad1767_member_view_holds_for_every_master_spelling() {
+    let fx = Fx::start(Board::Public);
+    let (_store, home) = master_with_home(&fx);
+    // Which spellings does the daemon resolve to the master?
+    let mut spellings = Vec::new();
+    for name in [NATIVE_THREAD, NATIVE_SESSION, "MASTER", "Master", "master."] {
+        let read = fx.rpc(
+            Asserted::Operator,
+            "thread_read",
+            json!({"alias": name, "after": 0, "limit": 5}),
+        );
+        eprintln!(
+            "CAD-1767 thread_read '{name}': {}",
+            match &read {
+                Ok(page) => format!("ok alias={}", page["alias"]),
+                Err(e) => format!("err {e}"),
+            }
+        );
+        if read.is_ok_and(|page| page.to_string().contains(HOME_CHAT)) {
+            spellings.push(name.to_string());
+        }
+    }
+    assert!(
+        spellings.iter().any(|s| s == NATIVE_THREAD),
+        "fixture: the native thread id does not resolve to the master: {spellings:?}"
+    );
+    let owner = fx.platform_cookie("owner");
+    let member = fx.platform_cookie("member");
+    let mut wrong = Vec::new();
+    for name in &spellings {
+        for route in [
+            format!("/api/threads/{name}"),
+            format!("/api/threads/{name}?tail=1"),
+            format!("/api/threads/{name}?before=99"),
+            format!("/api/threads/{name}?conversation={home}"),
+        ] {
+            let op = fx.http(&Asserted::Operator, "GET", &route, None, Some(&owner), None);
+            if op.status != 200 || !op.raw.contains(HOME_CHAT) {
+                wrong.push(format!("control {route}: owner {}", op.status));
+            }
+            let m = fx.http(
+                &Asserted::Operator,
+                "GET",
+                &route,
+                None,
+                Some(&member),
+                None,
+            );
+            let leaked = operator_only(&entries_of(&m.body), Some(&home));
+            if !leaked.is_empty() || m.raw.contains(HOME_CHAT) {
+                wrong.push(format!("{route}: member got {leaked:?}"));
+            }
+        }
+        let path = format!("/api/threads/{name}/stream");
+        let (status, events) = fx.sse(&path, &owner, Duration::from_secs(2));
+        if status != 200 || !events.iter().any(|e| e.to_string().contains(HOME_CHAT)) {
+            wrong.push(format!("control {path}: owner {status}"));
+        }
+        let (_, events) = fx.sse(&path, &member, Duration::from_secs(2));
+        let leaked = operator_only(&events, Some(&home));
+        if !leaked.is_empty() {
+            wrong.push(format!("{path}: member stream got {leaked:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "member view bypassed: {wrong:#?}");
+}
+
+const LIVE_TURN: &str = "live-turn-body-secret-needle";
+
+impl Fx {
+    /// The first `event: master` frame of a stream, as raw text.
+    fn master_frame(&self, path: &str, cookie: &str) -> Option<String> {
+        let token = Seam::token_at(&self.state()).unwrap();
+        let request = format!(
+            "GET {path} HTTP/1.0\r\nHost: {host}\r\nX-Cadence-Board: 1\r\n\
+             Origin: http://{host}\r\nSec-Fetch-Site: same-origin\r\n\
+             {AS_HEADER}: operator\r\n{TOKEN_HEADER}: {token}\r\nCookie: {cookie}\r\n\r\n",
+            host = self.host,
+        );
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 8192];
+        while Instant::now() < until {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+                Err(_) => {}
+            }
+        }
+        let text = String::from_utf8_lossy(&raw).to_string();
+        let start = text.find("event: master")?;
+        let rest = &text[start..];
+        Some(rest[..rest.find("\n\n").unwrap_or(rest.len())].to_string())
+    }
+}
+
+/// G2 round 2, item 2. While the operator's Home message is queued and
+/// while it runs, a member's `GET /api/master/state` and the stream's
+/// first `event: master` frame never carry its body; the owner's do.
+#[test]
+fn cad1767_member_master_state_hides_the_operators_turn() {
+    let fx = Fx::start(Board::Public);
+    fx.seed("master", None, None);
+    let store = fx.store();
+    fx.op(
+        "thread_send",
+        json!({"alias": "master", "text": LIVE_TURN, "message": "live-1"}),
+    );
+    let owner = fx.platform_cookie("owner");
+    let member = fx.platform_cookie("member");
+    let mut wrong = Vec::new();
+    let check = |phase: &str, wrong: &mut Vec<String>| {
+        let op = fx.http(
+            &Asserted::Operator,
+            "GET",
+            "/api/master/state",
+            None,
+            Some(&owner),
+            None,
+        );
+        if op.status != 200 || !op.raw.contains(LIVE_TURN) {
+            wrong.push(format!(
+                "control {phase}: owner state {} {}",
+                op.status, op.raw
+            ));
+        }
+        let m = fx.http(
+            &Asserted::Operator,
+            "GET",
+            "/api/master/state",
+            None,
+            Some(&member),
+            None,
+        );
+        eprintln!("CAD-1767 member master/state ({phase}): {}", m.status);
+        if m.raw.contains(LIVE_TURN) {
+            wrong.push(format!(
+                "{phase}: member /api/master/state carries the body: {}",
+                m.raw
+            ));
+        }
+        match fx.master_frame("/api/threads/master/stream", &owner) {
+            Some(frame) if frame.contains(LIVE_TURN) => {}
+            other => wrong.push(format!("control {phase}: owner master frame {other:?}")),
+        }
+        if let Some(frame) = fx.master_frame("/api/threads/master/stream", &member) {
+            if frame.contains(LIVE_TURN) {
+                wrong.push(format!(
+                    "{phase}: member master frame carries the body: {frame}"
+                ));
+            }
+        }
+    };
+    check("queued", &mut wrong);
+    // The same message, now the running turn.
+    let token = cadence_agent::adapter::registry::PI_MANAGED_TURN_TOKENS
+        .mint("0123456789abcdef0123456789abcdef");
+    rusqlite::Connection::open(fx.state().join("cadence.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE messages SET state='submitting', started=1.0 WHERE id='live-1'",
+            [],
+        )
+        .unwrap();
+    store.mark_running("live-1", &token).unwrap();
+    check("running", &mut wrong);
+    assert!(
+        wrong.is_empty(),
+        "the operator's turn reached a member: {wrong:#?}"
+    );
+}
