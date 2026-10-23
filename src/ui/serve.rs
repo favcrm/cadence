@@ -954,7 +954,7 @@ pub(crate) fn agent_detail(
         state_dir,
         "agent_show",
         json!({"alias": alias, "active_only": true,
-               "include_profile_instructions": operator, "include_stats": true}),
+               "include_catalogue_instructions": operator, "include_stats": true}),
     )
     .map_err(|e| e.to_string())?;
     let agent = &show["agent"];

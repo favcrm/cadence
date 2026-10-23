@@ -2595,15 +2595,32 @@ impl Shared {
                         ))
                     }
                 };
-                // CAD-1752: a catalogue agent's stored job is read the same
-                // way a profile agent's is, under the same caller rule, so a
-                // refreshed briefing keeps it.
                 let profile_snapshot = include_profile_instructions
+                    && agent
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("profile"))
+                        .and_then(Value::as_str)
+                        .is_some();
+                // CAD-1752: a catalogue agent's stored job (a hire without a
+                // profile) has its own flag, so `include_profile_instructions`
+                // keeps exactly its meaning. Same caller rule as a profile's.
+                let include_catalogue_instructions =
+                    match params.get("include_catalogue_instructions") {
+                        None | Some(Value::Null) => false,
+                        Some(Value::Bool(include)) => *include,
+                        Some(_) => {
+                            return Err(Error::rejected(
+                                "include_catalogue_instructions must be a boolean",
+                            ))
+                        }
+                    };
+                let catalogue_snapshot = include_catalogue_instructions
                     && agent.params.as_ref().is_some_and(|params| {
-                        params.get("profile").and_then(Value::as_str).is_some()
-                            || params.get("catalogue").and_then(Value::as_str).is_some()
+                        params.get("catalogue").and_then(Value::as_str).is_some()
+                            && params.get("profile").is_none()
                     });
-                if profile_snapshot {
+                if profile_snapshot || catalogue_snapshot {
                     self.authorize_agent_mutation(
                         params,
                         peer_pid,
@@ -2645,7 +2662,7 @@ impl Shared {
                     self.store.messages(&alias)?
                 };
                 let mut agent_json = agent.to_json();
-                if profile_snapshot {
+                if profile_snapshot || catalogue_snapshot {
                     agent_json["instructions"] = json!(agent.instructions);
                 }
                 // CAD-1752: the project of the task this agent is running

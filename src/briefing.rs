@@ -91,6 +91,7 @@ pub fn brief_agent(
         "agent_show",
         json!({
             "alias": alias, "limit": 0, "include_profile_instructions": true,
+            "include_catalogue_instructions": true,
         }),
     )?["agent"]
         .clone();
