@@ -38,6 +38,7 @@ import Outbox from "./features/outbox/Outbox";
 import ThreadsPage from "./features/threads/ThreadsPage";
 import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
+import DecisionsPanel from "./features/decisions/DecisionsPanel";
 import MyWork from "./features/home/MyWork";
 import { useHomeCount } from "./features/home/todoLocal";
 import Context from "./features/projects/Context";
@@ -929,6 +930,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <HeaderSearch issues={issuesState} route={route} navHref={hrefFor} />
 
           <div className="ml-auto flex items-center gap-1 shrink-0">
+            {screen === "home" && meta?.signed_in === true && <DecisionsPanel />}
             {humanThreadsAvailable(meta) && <NotificationInbox authEpoch={authEpoch} />}
             <StatusChips
               variant="header"
