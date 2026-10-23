@@ -325,8 +325,9 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
     let mut merged_at: Option<i64> = None;
     let mut saw_unmerged = false;
     let mut saw_not_started = false;
-    let mut gh_failed = false;
-    let mut gh_checked = false;
+    // Every ref whose GitHub probe could not answer (CAD-1755): one
+    // successful probe never vouches for another ref's PR state.
+    let mut unverified: Vec<String> = Vec::new();
 
     for (branch, root) in &p.lanes {
         let into = finish::default_ref(root);
@@ -367,11 +368,10 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
         match pr_list(root, branch) {
             GhProbe::NoRemote => row["prs"] = json!("no-remote"),
             GhProbe::Unreachable => {
-                gh_failed = true;
+                unverified.push(branch.clone());
                 row["prs"] = json!("unreachable");
             }
             GhProbe::Ok(prs) => {
-                gh_checked = true;
                 row["prs"] = json!(prs
                     .iter()
                     .map(|pr| json!({"number": pr.number, "state": pr.state}))
@@ -407,7 +407,6 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
         });
         match pr_view(&cwd, url) {
             GhProbe::Ok(prs) => {
-                gh_checked = true;
                 for pr in prs {
                     match pr.state.as_str() {
                         "open" => {
@@ -427,20 +426,24 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
                     }
                 }
             }
-            GhProbe::Unreachable => gh_failed = true,
+            GhProbe::Unreachable => unverified.push(url.clone()),
             GhProbe::NoRemote => {}
         }
     }
 
-    let detail = json!({"lanes": detail_lanes});
+    let mut detail = json!({"lanes": detail_lanes});
+    if !unverified.is_empty() {
+        detail["unverified"] = json!(unverified);
+    }
     let verdict = match merged {
         Some((how, lane, pr, _)) => {
             if open_pr.is_some() {
                 Verdict::Held("open-pr")
-            } else if gh_failed && !gh_checked {
-                // Local evidence says merged but GitHub is unverifiable
-                // — an open PR or closed-unmerged PR could change the
-                // verdict. Never close on a guess.
+            } else if !unverified.is_empty() {
+                // Merge evidence exists but some ref's PR state is
+                // unverifiable — an open follow-up PR or a
+                // closed-unmerged PR there could change the verdict.
+                // Never close on a guess; `detail.unverified` names them.
                 Verdict::Held("pr-state-unverified")
             } else if let Some(claim) = p.claim_at {
                 match merged_at {
@@ -1056,6 +1059,9 @@ fn run_inner_with_selected(
 
 #[cfg(test)]
 mod cad1241_acceptance;
+
+#[cfg(test)]
+mod cad1755_unverified_ref_refusal_acceptance;
 
 #[cfg(test)]
 mod tests {
