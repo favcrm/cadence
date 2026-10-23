@@ -221,30 +221,75 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             issuer,
             use_,
             no_open,
+            json,
             auth_dir,
         } => {
             let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
             let issuer = issuer
                 .as_deref()
                 .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
-            let grant = cadence_agent::remote_enrollment::register_portal(
+            let grant = match cadence_agent::remote_enrollment::register_portal(
                 issuer,
                 name.as_deref(),
                 slug.as_deref(),
                 &dir,
                 |url, code| show_register_code(url, code, *no_open),
-            )?;
-            org::record_remote(
+            ) {
+                Ok(grant) => grant,
+                Err(error) => {
+                    if *json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "registered": false,
+                                "authenticated": false,
+                                "code": error.code(),
+                                "message": error.to_string()
+                            })
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            if let Err(error) = org::record_remote(
                 &grant.slug,
                 &grant.endpoint,
                 &grant.organization_id,
                 *use_,
                 || grant.save_credential(&dir),
-            )?;
-            println!(
-                "Registered and signed in to {} ({})",
-                grant.slug, grant.endpoint
-            );
+            ) {
+                if *json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "registered": false,
+                            "authenticated": false,
+                            "code": error.code(),
+                            "message": error.to_string()
+                        })
+                    );
+                }
+                return Err(error);
+            }
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "registered": true,
+                        "authenticated": true,
+                        "slug": grant.slug,
+                        "endpoint": grant.endpoint,
+                        "organization_id": grant.organization_id,
+                        "expires_at": grant.expires_at,
+                        "credential_stored": true
+                    })
+                );
+            } else {
+                println!(
+                    "Registered and signed in to {} ({})",
+                    grant.slug, grant.endpoint
+                );
+            }
             return Ok(0);
         }
         Commands::Login {

@@ -107,6 +107,9 @@ pub(crate) enum Commands {
         /// Print the registration/consent URL without opening a browser.
         #[arg(long)]
         no_open: bool,
+        /// Print machine-readable registration state.
+        #[arg(long)]
+        json: bool,
         /// Isolated credential directory; defaults to XDG_CONFIG_HOME/cadence/remote-auth.
         #[arg(long)]
         auth_dir: Option<PathBuf>,

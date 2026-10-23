@@ -142,7 +142,8 @@ fn remote_auth_cli_supports_hosted_portal_and_never_accepts_token_argv() {
         "--slug",
         "acme-labs",
         "--use",
-        "--no-open"
+        "--no-open",
+        "--json"
     ])
     .is_ok());
     assert!(Cli::try_parse_from([

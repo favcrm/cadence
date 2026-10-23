@@ -105,8 +105,9 @@ email OTP, workspace terms and owner consent. After registration the page
 continues to the consent screen, and the CLI saves the credential and
 records the new remote org exactly like `cadence login`. The terminal never
 asks for an OTP, password, API key or payment detail. Use `--use` to select
-the new workspace as the saved default, and `--no-open` to print the
-registration URL instead of opening a browser.
+the new workspace as the saved default, `--no-open` to print the
+registration URL instead of opening a browser, and `--json` for
+machine-readable success or failure state.
 
 To preselect a workspace, use `cadence login <slug>`; the issuer verifies
 that selection and returns the authoritative workspace ID and slug. The

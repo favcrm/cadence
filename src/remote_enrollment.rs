@@ -2692,6 +2692,24 @@ pub fn register_portal(
     dir: &Path,
     show_code: impl FnOnce(&str, &str) -> Result<()>,
 ) -> Result<LoginGrant> {
+    register_portal_with(
+        issuer,
+        name,
+        workspace_slug,
+        dir,
+        show_code,
+        &mut RealLoginRuntime,
+    )
+}
+
+fn register_portal_with(
+    issuer: &str,
+    name: Option<&str>,
+    workspace_slug: Option<&str>,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+    runtime: &mut dyn LoginRuntime,
+) -> Result<LoginGrant> {
     let issuer = origin(issuer, cfg!(test))?;
     if let Some(name) = name {
         if name.is_empty() || name.len() > 80 || name.chars().any(char::is_control) {
@@ -2712,7 +2730,7 @@ pub fn register_portal(
             let registration = registration_url(verification, name, workspace_slug)?;
             show_code(&registration, code)
         },
-        &mut RealLoginRuntime,
+        runtime,
         LoginScope::Wiki,
     )
 }
@@ -4962,6 +4980,46 @@ mod tests {
             assert!(out.is_err(), "{audience}");
             assert_nothing_stored(&dir);
         }
+    }
+
+    #[test]
+    fn register_portal_flows_through_the_hosted_device_grant() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("fresh-home/auth");
+        let mut grant = login_grant_body();
+        grant["organization_slug"] = json!("acme");
+        let mut runtime = PortalAcceptanceRuntime {
+            issuer: HOSTED_LOGIN_ISSUER.to_string(),
+            grant: Some(grant),
+            requests: Vec::new(),
+            baseline: Instant::now(),
+            elapsed: 0,
+            requested: vec!["cli.read", "cli.write", "wiki.read", "wiki.write"],
+        };
+        let mut shown = None;
+        let out = register_portal_with(
+            HOSTED_LOGIN_ISSUER,
+            Some("Acme Labs"),
+            Some("acme"),
+            &dir,
+            |url, code| {
+                shown = Some((url.to_owned(), code.to_owned()));
+                Ok(())
+            },
+            &mut runtime,
+        );
+        let grant = out.unwrap();
+        assert_eq!(grant.slug, "acme");
+        assert_eq!(grant.endpoint, LOGIN_ENDPOINT);
+        let (url, code) = shown.unwrap();
+        assert_eq!(
+            url,
+            "https://app.agenticos.test/register?after=%2Fdevice%2Fhosted-cadence%3Fcode%3DK7PM-2QNF&name=Acme%20Labs&slug=acme"
+        );
+        assert_eq!(code, "K7PM-2QNF");
+        assert!(runtime.requests[0].1.get("organization_slug").is_none());
+        assert_eq!(runtime.requests.len(), 2);
+        assert_nothing_stored(&dir);
     }
 
     #[test]
