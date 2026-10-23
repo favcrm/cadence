@@ -365,6 +365,24 @@ pub(super) fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
     Some(dir.canonicalize().unwrap_or(dir))
 }
 
+/// CAD-1752: the directory a Pi launch starts in. `agent.cwd` is the
+/// agent's identity (a catalogue hire's home dir); a catalogue agent that
+/// was relaunched for a ticket carries the daemon-validated lane worktree
+/// in `params.launch_workdir`. Nobody else's launch reads that key, and
+/// registration and `agent set` refuse it from callers.
+pub fn launch_workdir(agent: &Agent) -> PathBuf {
+    let params = agent.params.as_ref();
+    let is_hire = params.is_some_and(|p| p.get("catalogue").is_some());
+    match params
+        .and_then(|p| p.get("launch_workdir"))
+        .and_then(Value::as_str)
+        .filter(|_| is_hire)
+    {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(&agent.cwd),
+    }
+}
+
 /// The confining binary and policy for a pi WORKER (CAD-556) — the
 /// same `cadence confine` launcher as the master, a wider but still
 /// enumerated set. A worker edits, builds, commits and reports:
@@ -449,7 +467,7 @@ pub fn pi_worker_confinement(
     let path = env.var("PATH");
     let home = env.var("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
     let command = pi_command(env);
-    let cwd = PathBuf::from(&agent.cwd);
+    let cwd = launch_workdir(agent);
 
     let mut read: Vec<PathBuf> = crate::master::CONFINE_SYSTEM_READ
         .iter()

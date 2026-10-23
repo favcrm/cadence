@@ -213,14 +213,14 @@ impl Shared {
         Ok(json!({"platforms": out}))
     }
 
-    /// The caller's project, from the same cwd rule `default_account` uses.
+    /// The caller's project, from the same turn rule `default_account` uses.
     /// An operator has no agent identity, so no implicit project.
     fn caller_project(&self, peer_pid: u32) -> Option<String> {
         let super::identity::Caller::Agent(verified) = self.caller_identity(peer_pid).ok()? else {
             return None;
         };
         let agent = self.store.agent(&verified.agent.alias).ok()?;
-        crate::issue::project::key_for_cwd(&self.pm_dir().ok()?, std::path::Path::new(&agent.cwd))
+        self.turn_project(&agent).map(|turn| turn.key)
     }
 
     fn default_account(&self, agent: &str, platform: &str, params: &Value) -> Result<String> {
@@ -228,16 +228,14 @@ impl Shared {
             Some(p) => identifier(p, "Project")?,
             None => {
                 let agent_row = self.store.agent(agent)?;
-                crate::issue::project::key_for_cwd(
-                    &self.pm_dir()?,
-                    std::path::Path::new(&agent_row.cwd),
-                )
-                .ok_or_else(|| {
-                    Error::rejected(format!(
-                        "'{agent}'s cwd resolves to no project — pass 'account' \
-                         or 'project'"
-                    ))
-                })?
+                self.turn_project(&agent_row)
+                    .map(|turn| turn.key)
+                    .ok_or_else(|| {
+                        Error::rejected(format!(
+                            "'{agent}' has no project: no running task and its cwd is \
+                             in no project — pass 'account' or 'project'"
+                        ))
+                    })?
             }
         };
         match self.store.platform_default(&project, platform)? {

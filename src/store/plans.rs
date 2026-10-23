@@ -462,6 +462,29 @@ impl Store {
         })
     }
 
+    /// CAD-1752: the issue ids of each assignee's non-terminal tasks (a
+    /// task's job binds the issue), for `agent list --project`.
+    pub fn open_task_issues_by_assignee(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        self.read_tx(|conn| {
+            let rows = conn.query_vec(
+                "SELECT t.assignee, j.issue_id FROM tasks t JOIN jobs j ON j.id = t.job_id
+                 WHERE t.assignee IS NOT NULL AND COALESCE(j.issue_id,'') != ''
+                 AND t.state NOT IN ('verified','done','cancelled','failed')
+                 ORDER BY t.updated",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?;
+            let mut by_assignee: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for (assignee, issue) in rows {
+                by_assignee.entry(assignee).or_default().push(issue);
+            }
+            Ok(by_assignee)
+        })
+    }
+
     /// An alias's non-terminal task assignments (the same rows as
     /// [`Self::tasks_for_assignee`], same order) each with its job's issue
     /// and job title/state, in one join over this alias's tasks. The

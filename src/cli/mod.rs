@@ -20,7 +20,7 @@ mod attach;
 mod attachment;
 mod audit;
 mod backup;
-mod briefing;
+use cadence_agent::briefing;
 mod build_slot;
 mod business_templates;
 #[cfg(all(test, feature = "test-seam"))]
@@ -181,7 +181,7 @@ use update::UpdateAction;
 #[cfg(test)]
 use update_args::{daemon_build_or_absent, fd_is_path};
 use update_args::{RealUpdateHost, UpdateArgs, UpdateSource, UpdateTargetArgs, UpgradeArgs};
-use util::{cli_verbs, create_worktree, git, parse_duration};
+use util::{cli_verbs, create_worktree, parse_duration};
 use uuid::Uuid;
 use web::WebAction;
 use workflow::WorkflowAction;
@@ -773,9 +773,14 @@ pub(crate) fn list_agents(
         }
         if let Some(agents) = list["agents"].as_array_mut() {
             agents.retain(|a| {
-                a["project"]
-                    .as_str()
-                    .is_some_and(|p| projects.iter().any(|want| want == p))
+                let wanted = |p: &str| projects.iter().any(|want| want == p);
+                a["project"].as_str().is_some_and(wanted)
+                    || a["work_projects"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|p| p.as_str())
+                        .any(wanted)
             });
         }
     }
@@ -827,11 +832,42 @@ fn count_live_agents(list: &Value) -> usize {
 pub(crate) fn stamp_agent_projects(list: &mut Value) -> Result<()> {
     use cadence_agent::issue::{self, project};
     let pm = issue::Pm::open_default()?;
+    // CAD-1752: the board's rule — projects of the issues an agent is
+    // dispatched on, or owns in doing/review — beside the cwd's project.
+    let mut owned: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let issues = issue::board::load_all(&pm.dir, None).unwrap_or_default();
+    for v in issue::board::views(&pm.config.notes_dir(), issues) {
+        if matches!(v.status.as_str(), "doing" | "review") {
+            if let Some(owner) = &v.issue.front.owner {
+                owned
+                    .entry(owner.clone())
+                    .or_default()
+                    .push(v.issue.project.clone());
+            }
+        }
+    }
     if let Some(agents) = list["agents"].as_array_mut() {
         for a in agents.iter_mut() {
             let cwd = a["cwd"].as_str().unwrap_or_default();
             let key = project::key_for_cwd(&pm.dir, Path::new(cwd));
+            let mut work: Vec<String> = a["lane_issues"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|id| id.as_str())
+                .filter_map(|id| project::key_for_issue(&pm.dir, id))
+                .collect();
+            work.extend(
+                owned
+                    .get(a["alias"].as_str().unwrap_or_default())
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            work.sort();
+            work.dedup();
             a["project"] = json!(key);
+            a["work_projects"] = json!(work);
         }
     }
     Ok(())

@@ -606,16 +606,14 @@ impl Shared {
                     Some(p) => identifier(p, "Project")?,
                     None => {
                         let agent_row = self.store.agent(&agent)?;
-                        crate::issue::project::key_for_cwd(
-                            &self.pm_dir()?,
-                            std::path::Path::new(&agent_row.cwd),
-                        )
-                        .ok_or_else(|| {
-                            Error::rejected(format!(
-                                "'{agent}'s cwd resolves to no project — pass 'account' \
-                                 or 'project'"
-                            ))
-                        })?
+                        self.turn_project(&agent_row)
+                            .map(|turn| turn.key)
+                            .ok_or_else(|| {
+                                Error::rejected(format!(
+                                    "'{agent}' has no project: no running task and its cwd \
+                                     is in no project — pass 'account' or 'project'"
+                                ))
+                            })?
                     }
                 };
                 match self.store.platform_default(&project, &platform)? {

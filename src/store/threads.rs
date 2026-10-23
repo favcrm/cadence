@@ -53,6 +53,9 @@ pub const KIND_TURN_RESULT: &str = "turn_result";
 /// CAD-1726: a card for an agent-put canvas artifact — metadata only,
 /// never the content. Never returned to a member reader.
 pub const KIND_ARTIFACT: &str = "artifact";
+/// CAD-1752: the master's inert proposal to hire a catalogue role - the
+/// card the operator reviews. It registers nothing.
+pub const KIND_HIRE_PROPOSAL: &str = "hire_proposal";
 
 const ROLES: &[&str] = &[ROLE_OPERATOR, ROLE_AGENT, ROLE_SYSTEM, ROLE_MEMBER];
 const KINDS: &[&str] = &[
@@ -62,6 +65,7 @@ const KINDS: &[&str] = &[
     KIND_TOOL_RESULT,
     KIND_TURN_RESULT,
     KIND_ARTIFACT,
+    KIND_HIRE_PROPOSAL,
 ];
 
 /// Entry text cap. Queued messages are at most 48 000 bytes; a longer
@@ -1089,6 +1093,57 @@ impl Store {
                 return Ok(None);
             };
             Self::thread_write_in(tx, &thread, entry).map(Some)
+        })
+    }
+
+    /// CAD-1752: record the master's hire proposal on its conversation.
+    /// One entry per (turn, digest): proposing the same hire twice on one
+    /// turn is refused, so a replayed call cannot stack cards. It writes
+    /// only this thread entry - never an agent row.
+    pub fn hire_proposal_put(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+        text: &str,
+        payload: Value,
+    ) -> Result<i64> {
+        let digest = payload["digest"].as_str().unwrap_or_default().to_string();
+        let role = payload["role"].as_str().unwrap_or_default().to_string();
+        let name = payload["name"].as_str().unwrap_or_default().to_string();
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let dup: Option<i64> = tx
+                .query_row(
+                    "SELECT seq FROM thread_entries WHERE thread_id=? AND kind=? AND message_id=?
+                       AND json_extract(payload,'$.digest')=? AND json_extract(payload,'$.role')=?
+                       AND COALESCE(json_extract(payload,'$.name'),'')=?",
+                    params![
+                        thread_id,
+                        KIND_HIRE_PROPOSAL,
+                        message_id,
+                        digest,
+                        role,
+                        name
+                    ],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if dup.is_some() {
+                return Err(Error::rejected(
+                    "this turn already proposed exactly this hire",
+                ));
+            }
+            Self::thread_write_by_id_in(
+                tx,
+                thread_id,
+                NewEntry {
+                    role: ROLE_AGENT,
+                    kind: KIND_HIRE_PROPOSAL,
+                    text,
+                    payload: Some(payload),
+                    message_id: Some(message_id),
+                },
+            )
         })
     }
 

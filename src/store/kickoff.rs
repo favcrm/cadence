@@ -343,6 +343,10 @@ pub fn job_kickoff(
     if !scope.is_empty() {
         scope.pop(); // trailing comma
         scope = format!(" Scope:{}.", scope);
+        // CAD-1752: an agent hired without a repo starts in its home dir.
+        if task.worktree.is_some() {
+            scope += " Do the work inside that worktree (cd there first).";
+        }
     }
     let acceptance = task
         .acceptance

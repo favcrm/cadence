@@ -203,7 +203,7 @@ impl Shared {
     }
 
     /// Open/adopt and enroll the endpoint before any queued turn can run.
-    fn open_actor_adapter(
+    pub(super) fn open_actor_adapter(
         self: &Arc<Self>,
         alias: &str,
         ctl: &Arc<AgentCtl>,
@@ -320,7 +320,7 @@ impl Shared {
     }
 
     fn actor_inner(self: &Arc<Self>, alias: &str, ctl: &Arc<AgentCtl>) -> Result<()> {
-        let agent = self.store.agent(alias)?;
+        let mut agent = self.store.agent(alias)?;
         // CAD-1380: the exact snapshot about to open must be the principal's
         // canonical root before any adapter grant is built.
         if let Some(binding) = self.store.assistant_for_alias(alias)? {
@@ -330,7 +330,7 @@ impl Shared {
         // process. Finish the message unknown and keep the actor and
         // endpoint; do not fence.
         let hold_cloud = agent.provider == "devin" && agent.endpoint_kind == "cloud";
-        let adapter = self.open_actor_adapter(alias, ctl, &agent)?;
+        let mut adapter = self.open_actor_adapter(alias, ctl, &agent)?;
         let retry_base = self.pty_retry_base();
         let mut gate_notice: Option<String> = None;
         let mut gate_waits: u32 = 0;
@@ -501,6 +501,58 @@ impl Shared {
                     if unrendered_message.as_deref() != Some(message.id.as_str()) {
                         unrendered = 0;
                         unrendered_message = Some(message.id.clone());
+                    }
+                    // CAD-1752: a confined catalogue agent runs each ticket
+                    // in that ticket's lane worktree, by relaunching between
+                    // turns - never mid-turn, never unconfined. The message
+                    // goes back to the queue while the endpoint is swapped.
+                    if !message.is_nudge() {
+                        match self.lane_workdir_needed(&agent, &message) {
+                            Ok(None) => {}
+                            Ok(Some(workdir)) => {
+                                let _ = self.store.requeue(&message.id);
+                                let _ = self.store.set_agent_state_if(alias, "idle", "busy");
+                                if let Err(error) = self.relaunch_for_lane(
+                                    ctl,
+                                    &mut agent,
+                                    &mut adapter,
+                                    &workdir,
+                                    &message,
+                                ) {
+                                    // The endpoint could not be reopened in the
+                                    // lane: settle this message once, with the
+                                    // reason, and fence the agent on the error.
+                                    // No second attempt, no fresh session, no
+                                    // wider grant.
+                                    let reason = format!(
+                                        "relaunch for {} failed: {error}",
+                                        message.issue.as_deref().unwrap_or("the task")
+                                    );
+                                    let failed = json!({"status": "failed", "text": "",
+                                                "error": reason});
+                                    self.store.finish(
+                                        &message,
+                                        "failed",
+                                        &failed,
+                                        Some(&reason),
+                                    )?;
+                                    self.notify_routed_target(&message, &failed);
+                                    self.wake();
+                                    return Err(error);
+                                }
+                                continue;
+                            }
+                            Err(Error::PreWrite(reason)) => {
+                                let failed = json!({"status": "failed", "text": "",
+                                            "error": reason});
+                                self.store
+                                    .finish(&message, "failed", &failed, Some(&reason))?;
+                                self.notify_routed_target(&message, &failed);
+                                self.wake();
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                     let started_id = message.id.clone();
                     let shared = Arc::clone(self);

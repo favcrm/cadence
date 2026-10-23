@@ -224,11 +224,14 @@ mod dispatch_rpc;
 mod effect_rpc;
 #[cfg(all(test, feature = "test-seam"))]
 mod explorer_acceptance;
+mod hire_rpc;
 mod idea_rpc;
 mod identity;
 #[cfg(target_os = "linux")]
 mod installer_client;
 mod installer_enrollment_wire;
+mod lane_relaunch;
+mod turn_project;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRecord;
 mod bootstrap_files;
@@ -2413,6 +2416,8 @@ impl Shared {
                 }))
             }
             "agent_register" => self.rpc_register(params, peer_pid),
+            "agent_roles" => self.rpc_agent_roles(),
+            "agent_instructions_set" => self.rpc_instructions_set(params, peer_pid),
             "model_defaults_get" => self.rpc_model_defaults_get(),
             "model_defaults_set" => self.rpc_model_defaults_set(params, peer_pid),
             "agent_settings_get" => {
@@ -2437,6 +2442,8 @@ impl Shared {
                 // CAD-1266: one pass over `tasks` for the whole fleet, not
                 // one query per agent.
                 let mut open_tasks = self.store.open_task_ids_by_assignee()?;
+                // CAD-1752: the issues those tasks serve, for `--project`.
+                let mut lane_issues = self.store.open_task_issues_by_assignee()?;
                 let deliveries = self.store.open_delivery_summary()?;
                 let listed_agents = self.store.agents()?;
                 let aliases: Vec<String> = listed_agents.iter().map(|a| a.alias.clone()).collect();
@@ -2466,6 +2473,7 @@ impl Shared {
                     // The alias's current non-terminal task assignments —
                     // derived from tasks.assignee, never stored.
                     j["tasks"] = json!(open_tasks.remove(&agent.alias).unwrap_or_default());
+                    j["lane_issues"] = json!(lane_issues.remove(&agent.alias).unwrap_or_default());
                     j["capabilities"] =
                         registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
                     j["native_turn_steering_enabled"] = json!(
@@ -2594,7 +2602,25 @@ impl Shared {
                         .and_then(|params| params.get("profile"))
                         .and_then(Value::as_str)
                         .is_some();
-                if profile_snapshot {
+                // CAD-1752: a catalogue agent's stored job (a hire without a
+                // profile) has its own flag, so `include_profile_instructions`
+                // keeps exactly its meaning. Same caller rule as a profile's.
+                let include_catalogue_instructions =
+                    match params.get("include_catalogue_instructions") {
+                        None | Some(Value::Null) => false,
+                        Some(Value::Bool(include)) => *include,
+                        Some(_) => {
+                            return Err(Error::rejected(
+                                "include_catalogue_instructions must be a boolean",
+                            ))
+                        }
+                    };
+                let catalogue_snapshot = include_catalogue_instructions
+                    && agent.params.as_ref().is_some_and(|params| {
+                        params.get("catalogue").and_then(Value::as_str).is_some()
+                            && params.get("profile").is_none()
+                    });
+                if profile_snapshot || catalogue_snapshot {
                     self.authorize_agent_mutation(
                         params,
                         peer_pid,
@@ -2636,9 +2662,12 @@ impl Shared {
                     self.store.messages(&alias)?
                 };
                 let mut agent_json = agent.to_json();
-                if profile_snapshot {
+                if profile_snapshot || catalogue_snapshot {
                     agent_json["instructions"] = json!(agent.instructions);
                 }
+                // CAD-1752: the project of the task this agent is running
+                // (else its cwd's); the briefing's memory section reads it.
+                agent_json["turn_project"] = json!(self.turn_project(&agent).map(|t| t.key));
                 agent_json["capabilities"] =
                     registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
                 agent_json["native_turn_steering_enabled"] = json!(
@@ -2744,6 +2773,10 @@ impl Shared {
                     // `agent unfence` is the only exit.
                     "unknown": self.store.unknown_messages(&alias)?.len(),
                 });
+                // CAD-1752: the agent page's figures, only when asked.
+                if params.get("include_stats").and_then(Value::as_bool) == Some(true) {
+                    out["stats"] = self.store.agent_stats(&alias)?;
+                }
                 // CAD-1221: this alias's non-terminal tasks and their
                 // job's issue, in one agent-scoped join. The board's
                 // detail reads it instead of the fleet's agent and job lists.
@@ -2774,6 +2807,7 @@ impl Shared {
             "chat_file_upload" => self.rpc_chat_file_upload(params, peer_pid),
             "chat_file_read" => self.rpc_chat_file_read(params, peer_pid),
             "artifact_put" => self.rpc_artifact_put(params, peer_pid),
+            "hire_propose" => self.rpc_hire_propose(params, peer_pid),
             "artifact_read" => self.rpc_artifact_read(params, peer_pid),
             "artifact_versions" => self.rpc_artifact_versions(params, peer_pid),
             "conversation_list" => self.rpc_conversation_list(params, peer_pid),

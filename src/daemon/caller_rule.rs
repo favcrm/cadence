@@ -107,6 +107,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
             "authorize_register: agent callers by CAD-149; an unattributed caller needs proven_operator (CAD-431)",
         ),
     ),
+    // CAD-1752: the static role catalogue plus the settings-derived model
+    // per role — a read, like `model_defaults_get`.
+    ("agent_roles", Rule::Read),
+    (
+        "agent_instructions_set",
+        Rule::Handler("operator_connection_on_agent: the operator only; no agent, not even the target or its PM (CAD-1752)"),
+    ),
     ("model_defaults_get", Rule::Read),
     (
         "model_defaults_set",
@@ -209,6 +216,12 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "artifact_put",
         Rule::Handler("the master's live assigned turn; scope from the turn, never the request (CAD-1726)"),
+    ),
+    // CAD-1752: the master's inert proposal to hire a catalogue role -
+    // the same live-turn binding as `artifact_put`; nothing is registered.
+    (
+        "hire_propose",
+        Rule::Handler("the master's live assigned turn, in its Home conversation; refuses every other caller; records one inert thread entry (CAD-1752)"),
     ),
     (
         "artifact_read",

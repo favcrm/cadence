@@ -51,7 +51,7 @@ existing authority recheck and absolute deadline.
 |---|---|
 | [src/main.rs](../src/main.rs) | Binary entry point, process error/exit handling; delegates commands to CLI. |
 | [src/cli/mod.rs](../src/cli/mod.rs), [src/cli/](../src/cli/) | CLI definitions, routing and launch composition; command behavior split into verb modules. |
-| [src/cli/briefing.rs](../src/cli/briefing.rs) | Briefing modes, document and cloud bootstrap rendering, role carry-forward and opt-in AGENTS.md block. |
+| [src/briefing.rs](../src/briefing.rs) | Briefing modes, document and cloud bootstrap rendering, role carry-forward and opt-in AGENTS.md block. |
 | [src/client.rs](../src/client.rs), [src/proto.rs](../src/proto.rs) | Local RPC client and protocol vocabulary. |
 | [src/remote_auth.rs](../src/remote_auth.rs), [src/remote_enrollment.rs](../src/remote_enrollment.rs), [src/remote_result_outbox.rs](../src/remote_result_outbox.rs), [src/cli/remote_result.rs](../src/cli/remote_result.rs) | Distinct issuer sign-in, protected hosted child enrollment, immutable offline result custody and explicit sender CLI. The sender uses the issuer-bound record and original outbox pin; it does not enable a production gateway or grant daemon authority. See [issuer/enrollment contract](REMOTE-AUTH.md). |
 | [src/daemon.rs](../src/daemon.rs), [src/daemon/](../src/daemon/) | Shared runtime coordination and central dispatch; area RPC handlers, identity, timers and actor lifecycle. |
@@ -204,7 +204,7 @@ provider operation or completion of CAD-225's full acceptance.
 ## Memory implementation boundaries
 
 `src/issue/dispatch.rs` matches accepted project memories, writes a bounded
-lessons file and records included and withheld IDs. `src/cli/briefing.rs` adds accepted
+lessons file and records included and withheld IDs. `src/briefing.rs` adds accepted
 project-wide rules to generated briefings. `--job` kickoffs are
 daemon-templated and carry no lessons (CAD-194); do not assume every entry point
 shares this retrieval behavior.

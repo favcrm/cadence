@@ -1,18 +1,31 @@
 //! Launch/bootstrap briefing policy, document rendering and opt-in AGENTS.md.
 
-use super::git;
-use cadence_agent::adapter::pty;
-use cadence_agent::adapter::registry::{self, Reporting};
-use cadence_agent::client;
-use cadence_agent::error::{Error, Result};
+use crate::adapter::pty;
+use crate::adapter::registry::{self, Reporting};
+use crate::client;
+use crate::error::{Error, Result};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// Run a git subcommand in `dir`, returning stdout.
+fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = crate::reaper::output(Command::new("git").arg("-C").arg(dir).args(args))
+        .map_err(|_| Error::rejected("`git` is required and was not found on PATH"))?;
+    if !out.status.success() {
+        return Err(Error::rejected(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// What a launch writes for the agent's ambient briefing.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BriefMode {
+pub enum BriefMode {
     /// `--no-bootstrap` — nothing is written or enqueued.
     Off,
     /// Briefing file + AGENTS.md block only (standalone default).
@@ -23,7 +36,7 @@ pub(crate) enum BriefMode {
 }
 
 impl BriefMode {
-    pub(super) fn standalone(no_bootstrap: bool, bootstrap: bool) -> Self {
+    pub fn standalone(no_bootstrap: bool, bootstrap: bool) -> Self {
         if no_bootstrap {
             Self::Off
         } else if bootstrap {
@@ -35,17 +48,17 @@ impl BriefMode {
 }
 
 /// Marker pair delimiting the cadence block inside a repo's AGENTS.md.
-pub(crate) const AGENTS_BEGIN: &str = "<!-- cadence:begin -->";
+pub const AGENTS_BEGIN: &str = "<!-- cadence:begin -->";
 
-pub(crate) const AGENTS_END: &str = "<!-- cadence:end -->";
+pub const AGENTS_END: &str = "<!-- cadence:end -->";
 
 /// Marker pair around the role instructions inside a briefing.
-pub(crate) const ROLE_BEGIN: &str = "<!-- cadence:role-instructions:begin -->";
+pub const ROLE_BEGIN: &str = "<!-- cadence:role-instructions:begin -->";
 
-pub(crate) const ROLE_END: &str = "<!-- cadence:role-instructions:end -->";
+pub const ROLE_END: &str = "<!-- cadence:role-instructions:end -->";
 
 /// The role instructions an existing briefing carries, if any.
-pub(crate) fn role_instructions(briefing: &str) -> Option<&str> {
+pub fn role_instructions(briefing: &str) -> Option<&str> {
     let start = briefing.find(ROLE_BEGIN)? + ROLE_BEGIN.len();
     let end = briefing.rfind(ROLE_END)?;
     (start <= end).then(|| briefing[start..end].trim_matches('\n'))
@@ -67,7 +80,7 @@ pub(crate) fn role_instructions(briefing: &str) -> Option<&str> {
 /// already holds.
 /// Returns the briefing path. `agent_show` on the alias propagates the
 /// usual unknown-name rejection.
-pub(crate) fn brief_agent(
+pub fn brief_agent(
     state_dir: &Path,
     alias: &str,
     enqueue: bool,
@@ -78,6 +91,7 @@ pub(crate) fn brief_agent(
         "agent_show",
         json!({
             "alias": alias, "limit": 0, "include_profile_instructions": true,
+            "include_catalogue_instructions": true,
         }),
     )?["agent"]
         .clone();
@@ -97,6 +111,7 @@ pub(crate) fn brief_agent(
     let dir = state_dir.join("briefings").join(root_alias);
     std::fs::create_dir_all(&dir)?;
     let file = client::briefing_path(state_dir, &agent["params"], alias);
+    let file_existed = file.exists();
     let instructions = match instructions {
         Some(text) => Some(text.to_string()),
         None => agent["instructions"]
@@ -111,7 +126,7 @@ pub(crate) fn brief_agent(
     .filter(|text| !text.trim().is_empty());
     let body = briefing_body(state_dir, &agent, root_alias, instructions.as_deref());
     std::fs::write(&file, &body)?;
-    let exposed_file = if cadence_agent::agent_uid::config::configured_uid(state_dir)?.is_some()
+    let exposed_file = if crate::agent_uid::config::configured_uid(state_dir)?.is_some()
         && agent["endpoint_kind"].as_str() == Some("pty")
     {
         let cwd = agent["cwd"]
@@ -165,19 +180,91 @@ pub(crate) fn brief_agent(
                 exposed_file.display()
             )
         };
-        client::rpc_relay(
+        let sent = client::rpc_relay(
             state_dir,
             "agent_send",
             json!({"alias": alias, "text": body,
                    "message": format!("bootstrap-{alias}"),
                    "source": "bootstrap"}),
-        )?;
+        );
+        if let Err(err) = sent {
+            // A briefing this call created must not outlive a kickoff
+            // that never queued; one that already existed is left alone.
+            if !file_existed {
+                let _ = std::fs::remove_file(&file);
+                let _ = std::fs::remove_file(&exposed_file);
+            }
+            return Err(err);
+        }
     }
     Ok(exposed_file)
 }
 
+/// Whether `alias` runs an actor that can read a briefing file. `None`
+/// when the agent cannot be read at all.
+fn briefable(state_dir: &Path, alias: &str) -> Option<(bool, bool)> {
+    let shown = client::rpc(state_dir, "agent_show", json!({"alias": alias, "limit": 0})).ok()?;
+    let provider = shown["agent"]["provider"].as_str().unwrap_or_default();
+    let kind = shown["agent"]["endpoint_kind"].as_str().unwrap_or_default();
+    let cloud = provider == "devin" && kind == "cloud";
+    Some((registry::has_actor(provider, kind), cloud))
+}
+
+/// CAD-1752: brief an agent the board just registered, as `cadence join`
+/// does: the briefing carries `instructions` and the durable kickoff is
+/// queued (it waits for the endpoint like any queued message). A failure
+/// never fails the register: `out["briefing"]` is the path or `{error}`.
+/// A mailbox has nothing to brief and gets no field.
+pub fn brief_registered(
+    state_dir: &Path,
+    alias: &str,
+    instructions: Option<&str>,
+    out: &mut Value,
+) {
+    if !matches!(briefable(state_dir, alias), Some((true, _))) {
+        return;
+    }
+    out["briefing"] = match brief_agent(state_dir, alias, true, instructions) {
+        Ok(path) => json!(path),
+        Err(err) => json!({"error": err.to_string()}),
+    };
+}
+
+/// CAD-1752: after `agent_instructions_set` succeeded, rewrite the
+/// briefing with the new text and queue one short message telling the
+/// agent to re-read it. The agent is never restarted. On success `out`
+/// gains `briefing` and `applies: "next_turn"`; on failure `briefing` is
+/// `{error}` and `applies` stays as the daemon reported it. A Devin cloud
+/// session cannot read host paths, so it keeps `next_launch`.
+pub fn deliver_job_update(state_dir: &Path, alias: &str, text: &str, out: &mut Value) {
+    match briefable(state_dir, alias) {
+        Some((true, false)) => {}
+        _ => return,
+    }
+    let result = brief_agent(state_dir, alias, false, Some(text)).and_then(|path| {
+        let digest = crate::delegation::sha256_hex(text.as_bytes());
+        client::rpc_relay(
+            state_dir,
+            "agent_send",
+            json!({"alias": alias,
+                   "text": format!(
+                       "Your job was updated by the operator \u{2014} re-read your briefing ({}) before your next step.",
+                       path.display()),
+                   "message": format!("job-update-{alias}-{}", &digest[..12])}),
+        )?;
+        Ok(path)
+    });
+    match result {
+        Ok(path) => {
+            out["briefing"] = json!(path);
+            out["applies"] = json!("next_turn");
+        }
+        Err(err) => out["briefing"] = json!({"error": err.to_string()}),
+    }
+}
+
 fn copy_briefing_as_agent(path: &Path, body: &[u8]) -> Result<()> {
-    copy_briefing_with_helper(path, body, Path::new(cadence_agent::agent_uid::HELPER_DEST))
+    copy_briefing_with_helper(path, body, Path::new(crate::agent_uid::HELPER_DEST))
 }
 
 fn copy_briefing_with_helper(path: &Path, body: &[u8], helper: &Path) -> Result<()> {
@@ -196,7 +283,7 @@ fn copy_briefing_with_helper(path: &Path, body: &[u8], helper: &Path) -> Result<
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let mut child = cadence_agent::reaper::spawn(&mut command)?;
+    let mut child = crate::reaper::spawn(&mut command)?;
     child
         .stdin
         .take()
@@ -215,7 +302,7 @@ fn copy_briefing_with_helper(path: &Path, body: &[u8], helper: &Path) -> Result<
 /// Prompt posted into a Devin cloud session. The briefing file is still
 /// written for the operator; the session itself cannot read that path
 /// or run `cadence self`, so the role text is inlined here.
-pub(crate) fn cloud_session_prompt(
+pub fn cloud_session_prompt(
     alias: &str,
     root: &str,
     instructions: Option<&str>,
@@ -226,7 +313,7 @@ pub(crate) fn cloud_session_prompt(
             let flat = text.replace(['\n', '\r'], " ");
             format!(
                 " Role instructions: {}.",
-                cadence_agent::store::omit_host_paths(&flat)
+                crate::store::omit_host_paths(&flat)
             )
         })
         .unwrap_or_default();
@@ -242,7 +329,7 @@ pub(crate) fn cloud_session_prompt(
 /// The briefing document: identity, protocol quickref, and the group
 /// roster at write time. It is a snapshot — `cadence self` and
 /// `agent list` remain the live truth.
-pub(crate) fn briefing_body(
+pub fn briefing_body(
     state_dir: &Path,
     agent: &Value,
     root: &str,
@@ -344,11 +431,22 @@ pub(crate) fn briefing_body(
     // cwd belongs to — PM-curated facts every worker should carry.
     // Absent pm dir / unresolvable project / no rules → no section.
     let memory = (|| -> Option<String> {
-        let cwd = agent["cwd"].as_str()?;
-        let pm = cadence_agent::issue::Pm::open_default().ok()?;
-        let proj = cadence_agent::issue::project::resolve(&pm.dir, None, Path::new(cwd)).ok()?;
-        let (matched, errors) = cadence_agent::memory::project_rules(&pm, &proj.key);
-        if let Some(line) = cadence_agent::memory::load_errors_line(&errors) {
+        let pm = crate::issue::Pm::open_default().ok()?;
+        // CAD-1752: the project of the agent's task (`agent_show`'s
+        // `turn_project`), else the one its cwd belongs to. A catalogue
+        // agent with no task has neither, so it carries no memory section.
+        let proj = match agent["turn_project"].as_str() {
+            Some(key) => crate::issue::project::list(&pm.dir)
+                .ok()?
+                .into_iter()
+                .find(|p| p.key == key)?,
+            None => {
+                let cwd = agent["cwd"].as_str()?;
+                crate::issue::project::resolve(&pm.dir, None, Path::new(cwd)).ok()?
+            }
+        };
+        let (matched, errors) = crate::memory::project_rules(&pm, &proj.key);
+        if let Some(line) = crate::memory::load_errors_line(&errors) {
             eprintln!("{line}");
         }
         if matched.lessons.is_empty() && matched.withheld.is_empty() {
@@ -365,10 +463,10 @@ pub(crate) fn briefing_body(
                 "- `{}` ({}): {} — {}",
                 m.front.id,
                 matched.label(m),
-                cadence_agent::memory::fact_line(&m.body),
-                cadence_agent::memory::apply_line(&m.body)
+                crate::memory::fact_line(&m.body),
+                crate::memory::apply_line(&m.body)
             );
-            if items.len() + line.len() + 1 > cadence_agent::memory::LESSON_MAX_BYTES {
+            if items.len() + line.len() + 1 > crate::memory::LESSON_MAX_BYTES {
                 omitted += 1;
                 continue;
             }
@@ -391,7 +489,7 @@ pub(crate) fn briefing_body(
         let mut withheld = String::new();
         for (m, reason) in matched.withheld.iter().take(8) {
             let line = format!("- `{}`: {reason}\n", m.front.id);
-            if withheld.len() + line.len() > cadence_agent::memory::LESSON_MAX_BYTES {
+            if withheld.len() + line.len() > crate::memory::LESSON_MAX_BYTES {
                 break;
             }
             withheld.push_str(&line);
@@ -447,7 +545,7 @@ pub(crate) fn briefing_body(
 }
 
 /// The cadence block as this build writes it.
-pub(crate) fn agents_block() -> String {
+pub fn agents_block() -> String {
     format!(
         "{AGENTS_BEGIN}\n\
          ## Cadence-managed agents\n\n\
@@ -465,7 +563,7 @@ pub(crate) fn agents_block() -> String {
 /// replace: a repository carrying one of these verbatim has not edited
 /// it. Append the outgoing text here whenever [`agents_block`] changes
 /// (CAD-1530).
-pub(crate) const SUPERSEDED_AGENTS_BLOCKS: &[&str] = &[
+pub const SUPERSEDED_AGENTS_BLOCKS: &[&str] = &[
     // The first shipped block. It sent a managed agent to the lane copy
     // of its briefing, which exists only in a sandboxed (agent-UID) pty
     // pane; every other agent's briefing is the state-dir copy, whose
@@ -502,7 +600,7 @@ fn agents_region(text: &str) -> Option<&str> {
 /// Anything else is left exactly as found, as is every byte outside the
 /// markers: another repository's file, and a begin marker with no end
 /// marker, are both left alone rather than appended to.
-pub(crate) fn ensure_agents_block(repo: &Path) -> Result<()> {
+pub fn ensure_agents_block(repo: &Path) -> Result<()> {
     let path = repo.join("AGENTS.md");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let block = agents_block();

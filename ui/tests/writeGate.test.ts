@@ -1,4 +1,4 @@
-import { kickoffBlock, parseLoginNonce, writeBlock, READ_ONLY_REASON } from "../src/features/auth/gate";
+import { hireBlock, kickoffBlock, parseLoginNonce, writeBlock, READ_ONLY_REASON } from "../src/features/auth/gate";
 import type { Meta } from "../src/lib/types";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
@@ -47,3 +47,12 @@ console.log("write gate checks passed");
 // A cookie but no key for this browser: say that the browser is not signed in.
 const tab = writeBlock({ ...base, signed_in: false, tab_signed_out: true, login_hint: "cadence ui login" }) ?? "";
 equal(tab.includes("browser isn’t signed in"), true, "missing-key reason");
+
+// CAD-1752: hiring and job edits are operator-only routes. A signed-in member
+// passes the write gate but not the hire gate; the reason is shown.
+equal(hireBlock({ ...base, signed_in: true, operator: true }), null, "the operator may hire");
+equal(hireBlock({ ...base, signed_in: true, operator: false }), "Only the operator can hire.", "a member may not hire");
+equal(hireBlock({ ...base, signed_in: true, operator: null }) !== null, true, "an unconfirmed operator status stays blocked");
+equal(hireBlock({ ...base, read_only: true, signed_in: true, operator: true }), READ_ONLY_REASON, "a read-only board blocks hiring");
+equal(hireBlock({ ...base, signed_in: false })?.includes("Sign in"), true, "signed out is blocked with the sign-in reason");
+equal(hireBlock(null) !== null, true, "no meta yet: hiring stays blocked, never a silent pass");

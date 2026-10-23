@@ -258,6 +258,15 @@ pub(super) fn pi_worker_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
     Ok(state_dir.join("agents").join(alias))
 }
 
+/// CAD-1752: the working dir of an agent hired without a repo —
+/// `<state>/agents/<alias>/home`, created 0700. Only this subdir is the
+/// agent's cwd; the parent also holds its `pi/` login and session file.
+pub fn pi_agent_home(state_dir: &Path, alias: &str) -> Result<PathBuf> {
+    let home = pi_worker_dir(state_dir, alias)?.join("home");
+    ensure_private_dir(&home)?;
+    Ok(home)
+}
+
 /// The worker's private `PI_CODING_AGENT_DIR` (`<worker>/pi`) — created
 /// 0700 on open, holding its copied `auth.json`.
 pub(super) fn pi_worker_config_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
@@ -267,6 +276,120 @@ pub(super) fn pi_worker_config_dir(state_dir: &Path, alias: &str) -> Result<Path
 /// The worker's persistent Pi session file (`<worker>/session.jsonl`).
 pub(super) fn pi_worker_session(state_dir: &Path, alias: &str) -> Result<PathBuf> {
     Ok(pi_worker_dir(state_dir, alias)?.join("session.jsonl"))
+}
+
+/// CAD-1752: where this worker's forked sessions land
+/// (`<worker>/sessions`, inside the one dir its grant already covers).
+pub(super) fn pi_worker_sessions_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
+    Ok(pi_worker_dir(state_dir, alias)?.join("sessions"))
+}
+
+/// The pointer to the session file this worker currently uses
+/// (`<worker>/session.current`), written after every successful open
+/// from Pi's own `get_state.sessionFile`. Absent = `session.jsonl`.
+fn pi_session_pointer(state_dir: &Path, alias: &str) -> Result<PathBuf> {
+    Ok(pi_worker_dir(state_dir, alias)?.join("session.current"))
+}
+
+pub(super) fn pi_current_session(state_dir: &Path, alias: &str) -> Result<PathBuf> {
+    let dir = pi_worker_dir(state_dir, alias)?;
+    let pointed = std::fs::read_to_string(pi_session_pointer(state_dir, alias)?)
+        .ok()
+        .map(|t| PathBuf::from(t.trim()))
+        .filter(|p| p.starts_with(&dir) && p.is_file());
+    match pointed {
+        Some(path) => Ok(path),
+        None => pi_worker_session(state_dir, alias),
+    }
+}
+
+/// Record Pi's reported session file as current, if it is inside the
+/// worker's own dir. Best effort: a missed write only means the next
+/// launch re-derives from the previous pointer.
+pub(super) fn record_current_session(state_dir: &Path, alias: &str, reported: &str) {
+    let Ok(dir) = pi_worker_dir(state_dir, alias) else {
+        return;
+    };
+    let path = PathBuf::from(reported);
+    if !path.starts_with(&dir) || !path.is_file() {
+        return;
+    }
+    let Ok(pointer) = pi_session_pointer(state_dir, alias) else {
+        return;
+    };
+    let tmp = pointer.with_extension("tmp");
+    if std::fs::write(&tmp, path.to_string_lossy().as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, &pointer);
+    }
+}
+
+/// The `cwd` in a Pi session file's header line.
+fn session_header_cwd(path: &Path) -> Option<PathBuf> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(file).read_line(&mut line).ok()?;
+    let header: Value = serde_json::from_str(line.trim()).ok()?;
+    header.get("cwd").and_then(Value::as_str).map(PathBuf::from)
+}
+
+/// The deterministic id of the fork that carries `source` into `workdir`:
+/// the same relaunch always names the same session, so a retry after a
+/// crash reuses it instead of colliding with it.
+fn fork_session_id(alias: &str, workdir: &Path, source: &Path) -> String {
+    let digest = crate::delegation::sha256_hex(
+        format!("{alias}\0{}\0{}", workdir.display(), source.display()).as_bytes(),
+    );
+    format!("lane-{}", &digest[..24])
+}
+
+/// The session argv of a Pi WORKER. Pi takes a resumed session's cwd from
+/// the FILE HEADER, not the process cwd, so a catalogue agent launched in
+/// a different workdir than its session file records is moved with
+/// `--fork <current> --session-dir <own dir> --session-id <id>`: Pi copies
+/// every entry into a new file whose header carries the new workdir (the
+/// old file is kept). A fork already made for the same relaunch is reopened
+/// with `--session`. A fork failure ends the launch (Pi exits); there is
+/// no fresh-session fallback.
+pub(super) fn worker_session_args(state_dir: &Path, agent: &Agent) -> Result<Vec<String>> {
+    let current = pi_current_session(state_dir, &agent.alias)?;
+    let resume = |path: &Path| vec!["--session".to_string(), path.to_string_lossy().to_string()];
+    let is_hire = agent
+        .params
+        .as_ref()
+        .is_some_and(|p| p.get("catalogue").is_some());
+    let workdir = launch_workdir(agent);
+    let same = |a: &Path, b: &Path| {
+        a.canonicalize().unwrap_or_else(|_| a.to_path_buf())
+            == b.canonicalize().unwrap_or_else(|_| b.to_path_buf())
+    };
+    let Some(recorded) = session_header_cwd(&current).filter(|_| is_hire) else {
+        return Ok(resume(&current));
+    };
+    if same(&recorded, &workdir) {
+        return Ok(resume(&current));
+    }
+    let id = fork_session_id(&agent.alias, &workdir, &current);
+    let dir = pi_worker_sessions_dir(state_dir, &agent.alias)?;
+    let suffix = format!("_{id}.jsonl");
+    let existing = std::fs::read_dir(&dir).ok().and_then(|entries| {
+        entries.flatten().map(|e| e.path()).find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(&suffix))
+        })
+    });
+    if let Some(done) = existing {
+        return Ok(resume(&done));
+    }
+    ensure_private_dir(&dir)?;
+    Ok(vec![
+        "--fork".to_string(),
+        current.to_string_lossy().to_string(),
+        "--session-dir".to_string(),
+        dir.to_string_lossy().to_string(),
+        "--session-id".to_string(),
+        id,
+    ])
 }
 
 /// The agent's own `XDG_CACHE_HOME` (CAD-570): the master gets
@@ -441,12 +564,7 @@ pub(super) fn build_command(
     if crate::master::is_master(&agent.alias) {
         cmd.push("--no-session".to_string());
     } else {
-        cmd.extend([
-            "--session".to_string(),
-            pi_worker_session(state_dir, &agent.alias)?
-                .to_string_lossy()
-                .to_string(),
-        ]);
+        cmd.extend(worker_session_args(state_dir, agent)?);
     }
     for flag in [
         "--offline",
@@ -564,4 +682,123 @@ pub(super) fn launch_command(
     };
     let argv = crate::master::confine_argv(&confine, &policy, &command);
     Ok((argv, Some(policy)))
+}
+
+#[cfg(test)]
+mod cad1752_session_argv_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn hire(state: &Path, workdir: Option<&Path>) -> Agent {
+        let mut params = json!({"catalogue": "developer", "confine": true});
+        if let Some(dir) = workdir {
+            params["launch_workdir"] = json!(dir.to_string_lossy());
+        }
+        Agent {
+            alias: "dev-2".into(),
+            uid: "agt-t".into(),
+            provider: "pi".into(),
+            endpoint_kind: "managed".into(),
+            role: "worker".into(),
+            team_role: None,
+            cwd: state
+                .join("agents/dev-2/home")
+                .to_string_lossy()
+                .into_owned(),
+            sandbox: "read-only".into(),
+            instructions: None,
+            thread_id: None,
+            session_id: None,
+            model: None,
+            effort: None,
+            pid: None,
+            pid_start: None,
+            endpoint: None,
+            params: Some(params),
+            model_selection: None,
+            quota: None,
+            generation: None,
+            state: "idle".into(),
+            enabled: true,
+            gc_keep: false,
+            archived_at: None,
+            archived_by: None,
+            archive_reason: None,
+            lifecycle_rev: 0,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        }
+    }
+
+    #[test]
+    fn lane_and_home_relaunches_fork_and_a_matching_cwd_resumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        let worker = state.join("agents/dev-2");
+        let home = worker.join("home");
+        let lane = tmp.path().join("repo/.cadence/wt/t-1");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&lane).unwrap();
+        let session = worker.join("session.jsonl");
+        std::fs::write(
+            &session,
+            format!(
+                "{}\n",
+                json!({"type": "session", "cwd": home.to_string_lossy()})
+            ),
+        )
+        .unwrap();
+        let sessions = worker.join("sessions");
+
+        // Home session, lane workdir: fork into the agent's own sessions dir.
+        let argv = worker_session_args(state, &hire(state, Some(&lane))).unwrap();
+        let id = fork_session_id("dev-2", &lane, &session);
+        assert_eq!(
+            argv,
+            vec![
+                "--fork".to_string(),
+                session.to_string_lossy().to_string(),
+                "--session-dir".to_string(),
+                sessions.to_string_lossy().to_string(),
+                "--session-id".to_string(),
+                id.clone(),
+            ]
+        );
+
+        // Same cwd as the header: plain resume.
+        let argv = worker_session_args(state, &hire(state, None)).unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "--session".to_string(),
+                session.to_string_lossy().to_string()
+            ]
+        );
+
+        // The fork exists and is current; back home forks again from it.
+        let forked = sessions.join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
+        std::fs::write(
+            &forked,
+            format!(
+                "{}\n",
+                json!({"type": "session", "cwd": lane.to_string_lossy()})
+            ),
+        )
+        .unwrap();
+        record_current_session(state, "dev-2", &forked.to_string_lossy());
+        let argv = worker_session_args(state, &hire(state, None)).unwrap();
+        assert_eq!(argv[0], "--fork");
+        assert_eq!(argv[1], forked.to_string_lossy());
+        assert_eq!(argv[5], fork_session_id("dev-2", &home, &forked));
+        // Still in the lane: resume the fork.
+        let argv = worker_session_args(state, &hire(state, Some(&lane))).unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "--session".to_string(),
+                forked.to_string_lossy().to_string()
+            ]
+        );
+    }
 }

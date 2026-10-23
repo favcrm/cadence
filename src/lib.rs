@@ -9,6 +9,7 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod adapter;
+pub mod agent_roles;
 pub mod agent_settings;
 pub mod agent_uid;
 pub mod app_assistant;
@@ -18,6 +19,7 @@ pub mod audit;
 pub mod backup;
 pub mod board_identity;
 pub mod board_membership;
+pub mod briefing;
 pub mod business_export;
 pub mod business_templates;
 pub mod cli_actor;

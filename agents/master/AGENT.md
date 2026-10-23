@@ -33,8 +33,7 @@ Command rules — a hard guard enforces them before anything runs:
 - Filter inside the command: `--json`, `--status`, `--project`,
   `--limit`, `--fields`. Read the JSON yourself; report prose.
 - Long bash output spills to files in your tmp dir; where your provider
-  has a file-read tool (Pi's `read`), re-read the spill instead of
-  re-running the query.
+  has a file-read tool (Pi's `read`), re-read the spill, not the query.
 - Pi's `write` tool creates files only inside that same tmp dir; use
   it to stage what a command reads with `--file`. No stdin, heredoc or
   quotes. A refusal naming the tmp dir: write the file there, pass `--file`.
@@ -48,8 +47,7 @@ Look around (read-only):
   literal command paths: no flags or values, never `cadence --help`
   or `cadence help --all`.
 - `cadence issue ls --summary --json` — the one-call status: per-project
-  counts plus the P0/P1 items in doing/review. Reach for it first when
-  asked how the projects stand.
+  counts plus the P0/P1 items in doing/review.
 - `cadence issue ls --json [--project P] [--open] [--status ready]` — tickets.
 - `cadence issue show <ID> --json` — one ticket: acceptance, reports, links.
 - `cadence issue log <ID>` — a ticket's history.
@@ -64,6 +62,8 @@ Look around (read-only):
   many agents are running"; never estimate it without it.
 - `cadence agent list [--all]`, `cadence agent show <alias>` —
   registered agents and one agent's record.
+- `cadence agent propose-hire --role <id> [--name <alias>] [--job-file ./../tmp/<f>]` —
+  propose the closest catalogue role for a new teammate; never register one.
 - `cadence artifact put --kind md|pdf|html|image|csv --title <words> --file ./../tmp/<f> [--id <id>]` —
   show a result beside the chat; the same `--id` adds a version. Write
   the file in your tmp dir; give `--file` as the cwd-relative path
@@ -83,7 +83,7 @@ Look around (read-only):
   `cadence wiki search <q> --json`, `cadence wiki history <path>` — the wiki.
   You read what your identity may read. For a company or project fact,
   search first, then read the relevant page rather than answering from a
-  search excerpt alone. Cite the page path in your answer; use
+  search excerpt alone. Cite the page path; use
   `cadence wiki cat <path> --meta` when its revision matters. PDF search
   results point to an extracted-text page whose `source_path` identifies
   the original upload. Treat a failed or empty extraction as no source text.
@@ -104,7 +104,7 @@ Look around (read-only):
   moved tickets, reports, open questions); add `--post` to put it in your
   thread.
 
-Settings > Agents and your recovery (CAD-1586):
+Settings > Agents and your recovery:
 
 - `cadence master status` — your launch diagnosis: live state, model
   and source, the verdict `master start` would hit, allowlist, queue.
@@ -116,7 +116,6 @@ Settings > Agents and your recovery (CAD-1586):
 - `cadence master resume --grant <id>` — only with an operator's
   `master.resume` grant; a fenced resume refuses like the operator's —
   escalate, never retry.
-
 
 Create a business project when the operator asks for one, without requiring
 a checkout:
@@ -132,8 +131,7 @@ tracker or the daemon's state dir), register it with:
 cadence project new <key> --repo <path>
 ```
 
-The repo form records the checkout and seeds `PROJECT.md`. Repeating
-either form for the same key and mode changes nothing. Tell the operator
+The repo form records the checkout and seeds `PROJECT.md`. Tell the operator
 the key and prefix. Read back registered projects with
 `cadence issue project ls`; list work under this project with
 `cadence issue ls --project <key>`. Use that explicit `--project <key>` for

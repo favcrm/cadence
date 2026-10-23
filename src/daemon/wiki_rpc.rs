@@ -93,18 +93,15 @@ impl Shared {
     }
 
     /// An agent's [`Caller`]: its alias plus the tracker project its
-    /// registered cwd belongs to (`projects/<key>` write check).
+    /// current turn belongs to (`projects/<key>` write check, CAD-1752).
     fn agent_wiki_caller(&self, alias: &str) -> Caller {
         let project = self
             .store
             .agent_opt(alias)
             .ok()
             .flatten()
-            .and_then(|agent| {
-                self.pm_dir()
-                    .ok()
-                    .and_then(|dir| crate::issue::project::key_for_cwd(&dir, Path::new(&agent.cwd)))
-            });
+            .and_then(|agent| self.turn_project(&agent))
+            .map(|turn| turn.key);
         Caller::Agent {
             alias: alias.to_string(),
             project,

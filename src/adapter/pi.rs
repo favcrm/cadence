@@ -132,11 +132,11 @@ use pi_guard::*;
 use pi_launch::*;
 
 pub use pi_confine::{
-    pi_master_confinement, pi_worker_confinement, refuse_confined_devin,
+    launch_workdir, pi_master_confinement, pi_worker_confinement, refuse_confined_devin,
     refuse_confined_devin_agent, worker_confined, CONFINE_WORKER_EXTRA_READ_ENV,
     CONFINE_WORKER_EXTRA_WRITE_ENV,
 };
-pub use pi_launch::{copy_pi_auth, pi_config_dir};
+pub use pi_launch::{copy_pi_auth, pi_agent_home, pi_config_dir};
 pub(crate) use pi_launch::{pi_master_env_scrub, pi_worker_env_scrub, resolve_pi_launch_command};
 
 /// Pi's display form of a provider HTTP error (`formatProviderError`):
@@ -1241,6 +1241,7 @@ impl ProviderAdapter for PiAdapter {
         // including launch/effort setup, must revoke its prompt capability.
         // Keep all fallible post-launch work inside one cleanup boundary.
         *self.transport.write().unwrap() = Arc::clone(&transport);
+        let workdir = launch_workdir(agent).to_string_lossy().into_owned();
         let initialized = (|| {
             #[cfg(all(unix, target_os = "linux"))]
             let pid = match protected {
@@ -1249,10 +1250,10 @@ impl ProviderAdapter for PiAdapter {
                         .map_err(Error::rejected)?;
                     transport.launch_protected(ctx, &routing, &self.log_path)?
                 }
-                None => transport.launch(&agent.cwd, &self.log_path, &env)?,
+                None => transport.launch(&workdir, &self.log_path, &env)?,
             };
             #[cfg(not(all(unix, target_os = "linux")))]
-            let pid = transport.launch(&agent.cwd, &self.log_path, &env)?;
+            let pid = transport.launch(&workdir, &self.log_path, &env)?;
             // Effort: validate against the model's real levels, then verify
             // what stuck — Pi answers success even on a silent fallback.
             if let Some(effort) = params.get("effort").and_then(Value::as_str) {
@@ -1327,6 +1328,13 @@ impl ProviderAdapter for PiAdapter {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
+            // CAD-1752: the session file Pi actually opened (a lane
+            // relaunch forks into a new one) is this worker's current one.
+            if !master {
+                if let Some(file) = data.get("sessionFile").and_then(Value::as_str) {
+                    record_current_session(&self.state_dir, &agent.alias, file);
+                }
+            }
             let Some((reported_full, reported_id)) = resolved_pi_model(&data) else {
                 return Err(Error::provider("pi did not report a nonempty provider and model id at open — transport closed (CAD-603)"));
             };

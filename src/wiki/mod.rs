@@ -195,7 +195,7 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
                          project: {})",
                         project
                             .as_deref()
-                            .unwrap_or("none — cwd is no project repo")
+                            .unwrap_or("none — no running task, and cwd is no project repo")
                     )),
                     Caller::User(_) => Ok(()),
                     Caller::Public => no(

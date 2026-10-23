@@ -428,6 +428,11 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/agents", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/resume", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/unfence", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/agents/*/instructions",
+        RouteClass::OperatorOnly,
+    ),
     // CAD-608: the issue page's lane. Unlisted writes would fail closed
     // the same way; listed so a reader sees they are the operator's.
     route("POST", "/api/issues/*/lane/ask", RouteClass::OperatorOnly),
