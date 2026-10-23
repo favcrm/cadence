@@ -958,10 +958,26 @@ impl Shared {
                 crate::issue::lockseam::outside_lock("app-capability-provider-call");
                 let output = adapter
                     .execute_app_capability(&credential, &authority, input, &call_id)
-                    .map_err(Error::rejected)?;
+                    .map_err(|error| {
+                        let reason = if crate::platform::refuse_leak(
+                            "app capability failure",
+                            &error,
+                            &credential,
+                        )
+                        .is_ok()
+                        {
+                            error.chars().take(250).collect::<String>()
+                        } else {
+                            "Provider failure details were withheld because they matched credential custody.".into()
+                        };
+                        let _ = self
+                            .store
+                            .app_run_call_failed(&run_id, &step, "refused", &reason);
+                        Error::rejected(error)
+                    })?;
                 // CAD-1258 interleaving point: a revoke or upgrade may land here.
                 crate::issue::lockseam::outside_lock("app-capability-before-record");
-                workspace::with_runtime_snapshot(&pm, &install, |bundle, files| {
+                let recorded = workspace::with_runtime_snapshot(&pm, &install, |bundle, files| {
                     let _custody = self
                         .platform_custody_lock
                         .lock()
@@ -1020,7 +1036,19 @@ impl Shared {
                                 .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
                         },
                     )
-                })
+                });
+                if recorded.is_err() {
+                    // The provider answered but lock 2 refused or could not
+                    // retain it: leave a durable uncertain failure, never a
+                    // silent drop. The claim blocks any resend.
+                    let _ = self.store.app_run_call_failed(
+                        &run_id,
+                        &step,
+                        "uncertain",
+                        "App authority changed while the provider call ran; the result was not retained and no automatic retry was made.",
+                    );
+                }
+                recorded
             }
             "app_run_capability_results"
             | "app_run_capability_result"
