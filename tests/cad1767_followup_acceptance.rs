@@ -1483,3 +1483,99 @@ fn cad1767_member_master_state_hides_the_operators_turn() {
         "the operator's turn reached a member: {wrong:#?}"
     );
 }
+
+// ------------------------------------ G2 round 3: agent detail event tail
+//
+// PM finding on PR #1290: `GET /api/agents/{alias}` returns the agent's
+// last 20 events to any signed-in viewer, and a `turn_finished` event
+// carries the turn's result; for the master that is its Home reply.
+
+const HOME_REPLY: &str = "master-home-reply-secret-needle";
+
+/// The member's agent detail of the master carries the Home reply text
+/// nowhere (events or elsewhere), also through the master's native ids;
+/// the owner's detail does.
+#[test]
+fn cad1767_member_agent_detail_events_carry_no_master_home_text() {
+    let fx = Fx::start(Board::Public);
+    let (store, _home) = master_with_home(&fx);
+    // A master Home turn, finished through the store's own finish path.
+    fx.op(
+        "thread_send",
+        json!({"alias": "master", "text": "operator asks", "message": "home-done"}),
+    );
+    let token = cadence_agent::adapter::registry::PI_MANAGED_TURN_TOKENS
+        .mint("0123456789abcdef0123456789abcdef");
+    rusqlite::Connection::open(fx.state().join("cadence.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE messages SET state='submitting', started=1.0 WHERE id='home-done'",
+            [],
+        )
+        .unwrap();
+    store.mark_running("home-done", &token).unwrap();
+    let message = store.message("home-done").unwrap().expect("the Home turn");
+    store
+        .finish(
+            &message,
+            "completed",
+            &json!({"status": "completed", "text": HOME_REPLY}),
+            None,
+        )
+        .unwrap();
+
+    // Fixture: the daemon's event log does carry the reply for the
+    // master (`turn_finished.result`), so the detail's tail can leak it.
+    let log = fx.op("agent_events", json!({"alias": "master", "after": 0}));
+    assert!(
+        log.to_string().contains(HOME_REPLY),
+        "fixture: turn_finished does not carry the Home reply: {log}"
+    );
+    let owner = fx.platform_cookie("owner");
+    let member = fx.platform_cookie("member");
+    let mut wrong = Vec::new();
+    for name in ["master", NATIVE_THREAD, NATIVE_SESSION] {
+        let route = format!("/api/agents/{name}");
+        let op = fx.http(&Asserted::Operator, "GET", &route, None, Some(&owner), None);
+        let m = fx.http(
+            &Asserted::Operator,
+            "GET",
+            &route,
+            None,
+            Some(&member),
+            None,
+        );
+        eprintln!(
+            "CAD-1767 detail {route}: owner {} member {}",
+            op.status, m.status
+        );
+        if name == "master" && (op.status != 200 || !op.raw.contains(HOME_REPLY)) {
+            let kinds: Vec<Value> = op.body["events"]
+                .as_array()
+                .map(|evs| evs.iter().map(|e| json!([e["seq"], e["kind"]])).collect())
+                .unwrap_or_default();
+            wrong.push(format!(
+                "control {route}: owner {} lacks the reply; events {kinds:?}",
+                op.status
+            ));
+        }
+        if m.raw.contains(HOME_REPLY) {
+            let kinds: Vec<Value> = m.body["events"]
+                .as_array()
+                .map(|evs| {
+                    evs.iter()
+                        .filter(|e| e.to_string().contains(HOME_REPLY))
+                        .map(|e| e["kind"].clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            wrong.push(format!(
+                "{route}: member detail carries the reply (events {kinds:?})"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "master Home text in a member's agent detail: {wrong:#?}"
+    );
+}
