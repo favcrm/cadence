@@ -53,11 +53,12 @@ export function kickoffBlock(meta: Meta | null): string | null {
   return null;
 }
 
+/** The reason a non-operator session is refused hiring and job edits. */
+export const OPERATOR_HIRE_REASON = "Only the operator can hire.";
+
 /** Why hiring (and editing an agent's job) is disabled, or null when this
  *  session may. Both go over operator-only routes, so a signed-in member
  *  (`operator: false`) passes [`writeBlock`] but is still refused. */
-export const OPERATOR_HIRE_REASON = "Only the operator can hire.";
-
 export function hireBlock(meta: Meta | null): string | null {
   const writes = writeBlock(meta);
   if (writes) return writes;

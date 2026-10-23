@@ -2438,7 +2438,9 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             }
             // `/api/master/state` — the header chips + turn state (CAD-551).
             if path == "/api/master/state" {
-                send(request, home::master_state(state_dir));
+                // CAD-1767: only a proven operator reads the turn's text.
+                let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
+                send(request, home::master_state(state_dir, operator));
                 return;
             }
             // CAD-819: the cross-agent work conversation view (read-only).

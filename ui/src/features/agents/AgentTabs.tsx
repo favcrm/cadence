@@ -459,7 +459,7 @@ function Job({ c }: { c: TabContext }) {
           )}
         </div>
       ) : (
-        <Note>{jobBlock}</Note>
+        <Note>{jobBlock === null ? null : t(jobBlock)}</Note>
       )}
       {applies && (
         <p className="ap-saved" role="status">

@@ -939,10 +939,24 @@ pub(super) fn master_summary(
 /// chips (model/effort/context) and in-flight turn. A plain read like
 /// `/api/threads/<alias>`; a daemon without `master_state` answers 501
 /// and the UI falls back to the agents payload.
-pub(super) fn master_state(state_dir: &std::path::Path) -> HttpResp {
+pub(super) fn master_state(state_dir: &std::path::Path, operator: bool) -> HttpResp {
     match client::rpc(state_dir, "master_state", json!({})) {
-        Ok(out) => json_response(out),
+        Ok(mut out) => {
+            if !operator {
+                redact_master_state(&mut out);
+            }
+            json_response(out)
+        }
         Err(e) => rpc_err(&e, "master_state"),
+    }
+}
+
+/// CAD-1767: what a non-operator may see of the master's state: the state,
+/// queue counts and routing metadata, but never the text of the operator's
+/// turn (`turn.summary` is the running or queued message's body).
+pub(super) fn redact_master_state(state: &mut Value) {
+    if let Some(turn) = state.get_mut("turn").and_then(Value::as_object_mut) {
+        turn.remove("summary");
     }
 }
 

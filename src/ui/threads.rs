@@ -229,10 +229,14 @@ fn cursor_arg(raw: Option<String>, what: &str) -> std::result::Result<i64, HttpR
 /// read agent threads, but never the operator-only entries
 /// (`store::operator_only_kind`: artifact cards, hire proposals) and never
 /// the master's Home conversation. Fail closed: only a proven operator
-/// gets the page whole. Returns the seqs the unfiltered page covered so a
-/// stream's cursor still advances past what was hidden.
-fn member_view(page: &mut Value, alias: &str) {
-    let home = crate::master::is_master(alias)
+/// gets the page whole. Whether this is the master's Home is decided from the
+/// DAEMON's reply (the resolved `alias` and the thread's `install_id`), never
+/// from the URL's spelling: an absent field counts as Home. It edits `page`
+/// in place; the stream collects the page's seqs itself so its cursor still
+/// advances past what was hidden.
+fn member_view(page: &mut Value) {
+    let resolved_master = page["alias"].as_str().is_none_or(crate::master::is_master);
+    let home = resolved_master
         && page["thread"]
             .as_object()
             .is_none_or(|t| t.get("install_id").is_none_or(Value::is_null));
@@ -306,7 +310,7 @@ pub(super) fn read(
     match client::rpc(state_dir, "thread_read", params) {
         Ok(mut page) => {
             if !operator {
-                member_view(&mut page, alias);
+                member_view(&mut page);
             }
             json_response(page)
         }
@@ -350,20 +354,34 @@ pub(super) fn stream(
     // Fail before the stream opens when the alias or daemon is wrong —
     // a 404/501/503 beats an event stream that only ever errors.
     let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
-    if let Err(e) = budget.read(
+    let first = match budget.read(
         state_dir,
         "thread_read",
         with_conversation(json!({"alias": alias, "after": cursor, "limit": 1})),
     ) {
-        let _ = request.respond(rpc_err(&e));
-        return;
-    }
+        Ok(page) => page,
+        Err(e) => {
+            let _ = request.respond(rpc_err(&e));
+            return;
+        }
+    };
     // The same private read as GET /api/master/state. Put the authoritative
     // turn on this connection before any resumed entries, not on a racing
     // board stream whose asynchronous refresh may still hold the old turn.
-    let master = if alias == "master" {
+    // Whether this IS the master is the daemon's answer (the resolved
+    // alias), not the URL's spelling.
+    let master = if first["alias"]
+        .as_str()
+        .is_some_and(crate::master::is_master)
+    {
         match budget.read(state_dir, "master_state", json!({})) {
-            Ok(state) => Some(state),
+            Ok(mut state) => {
+                // CAD-1767: a non-operator never gets the operator's turn text.
+                if !operator {
+                    super::home::redact_master_state(&mut state);
+                }
+                Some(state)
+            }
             Err(e) => {
                 let _ = request.respond(rpc_err(&e));
                 return;
@@ -415,7 +433,7 @@ pub(super) fn stream(
                     .map(|rows| rows.iter().filter_map(|e| e["seq"].as_i64()).collect())
                     .unwrap_or_default();
                 if !operator {
-                    member_view(&mut page, alias);
+                    member_view(&mut page);
                 }
                 let entries = page["entries"].as_array().cloned().unwrap_or_default();
                 if entries.is_empty() && !frame(&mut w, b": ping\n\n") {
