@@ -100,8 +100,8 @@ export const NAV: { screen: Screen; label: string; route: Route }[] = [
  * is `route.screen === "projects"` (`navProject` in App.tsx).
  *
  * - `slug` — the project page (`/projects/:slug`). A sidebar project opens it.
- * - `chips` — an in-page chip row, stored as `?project=` (Agents, Team
- *   overview).
+ * - `chips` — an in-page chip row, stored as `?project=` (Team overview).
+ *   Agents belong to the team, not a project (CAD-1752), so `/agents` has none.
  * - `picker` — an in-page project picker, stored as `?project=`
  *   (Settings → Memory).
  * - `none` — no project scope in the URL or in state.
@@ -112,7 +112,6 @@ export function projectScope(route: Route): ProjectScope {
   switch (route.screen) {
     case "projects":
       return "slug";
-    case "agents":
     case "overview":
       return "chips";
     case "settings":
