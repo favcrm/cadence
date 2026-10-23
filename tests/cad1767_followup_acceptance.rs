@@ -1819,6 +1819,7 @@ const SWEEP_NEEDLES: &[&str] = &[
     "sweep-helper-running-n5",
     "sweep-helper-result-n6",
     "sweep-saved-job-n7", // a catalogue agent's saved job
+    "sweepkickoffn8",     // a dispatched task's running kickoff
 ];
 
 /// Every `/api/...` route the board's source names, expanded with the
@@ -2021,6 +2022,54 @@ fn cad1767_member_route_sweep_carries_no_operator_text() {
         "agent_instructions_set",
         json!({"alias": "acct-job", "instructions": n(9)}),
     );
+    // A DISPATCHED task per agent through the daemon's own job/task/dispatch
+    // path, its kickoff made running; the kickoff's head names the spec, so
+    // n8 is in the running summary the fleet row binds to the task.
+    let mut dispatched = Vec::new();
+    for alias in ["helper", "master"] {
+        let job = format!("job-sweep-{alias}");
+        fx.op(
+            "job_new",
+            json!({"pm": alias, "job": job, "title": "sweep job",
+                   "spec": format!("specs/{}-{alias}.md", n(10)),
+                   "spec_sha256": "0".repeat(64),
+                   "issue": if alias == "master" { "CAD-9002" } else { "CAD-9001" }}),
+        );
+        let task = fx.op(
+            "task_new",
+            json!({"job": job, "assignee": alias, "title": "sweep task"}),
+        )["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let out = fx.rpc(
+            Asserted::Operator,
+            "task_dispatch",
+            json!({"by": "operator", "task": task, "to": alias}),
+        );
+        eprintln!("CAD-1767 sweep task_dispatch {alias}: {out:?}");
+        let Ok(out) = out else { continue };
+        let message = out["message"]["id"]
+            .as_str()
+            .or_else(|| out["message"].as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("task_dispatch answered no message id: {out}"));
+        let token = cadence_agent::adapter::registry::PI_MANAGED_TURN_TOKENS
+            .mint("0123456789abcdef0123456789abcdef");
+        rusqlite::Connection::open(fx.state().join("cadence.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE messages SET state='submitting', started=1.0 WHERE id=?1",
+                [&message],
+            )
+            .unwrap();
+        store.mark_running(&message, &token).unwrap();
+        dispatched.push(alias);
+    }
+    assert!(
+        dispatched.contains(&"helper"),
+        "fixture: no dispatched task for the ordinary agent"
+    );
     let ids: Vec<String> = [
         "master",
         "helper",
@@ -2060,7 +2109,10 @@ fn cad1767_member_route_sweep_carries_no_operator_text() {
             let hits: Vec<String> = needle_hits(&body)
                 .into_iter()
                 .filter(|hit| {
-                    !(ordinary_thread && [n(6), n(7), n(8)].iter().any(|nd| hit.starts_with(nd)))
+                    !(ordinary_thread
+                        && [n(6), n(7), n(8), n(10)]
+                            .iter()
+                            .any(|nd| hit.starts_with(nd)))
                 })
                 .collect();
             if !hits.is_empty() {
@@ -2083,14 +2135,87 @@ fn cad1767_member_route_sweep_carries_no_operator_text() {
     eprintln!("CAD-1767 sweep skipped: {skipped:#?}");
     eprintln!("CAD-1767 sweep owner saw: {owner_seen:?}");
     // Control: the owner sees the operator text where the operator should.
-    let mut wrong: Vec<String> = [n(0), n(1), n(2), n(4), n(5), n(7), n(8), n(9)]
+    let mut wrong: Vec<String> = [n(0), n(1), n(2), n(4), n(5), n(7), n(8), n(9), n(10)]
         .iter()
         .filter(|needle| !owner_seen.contains(**needle))
         .map(|needle| format!("control: the owner never saw {needle}"))
         .collect();
     wrong.extend(leaks);
+
+    // The entity stream: agent frames go out only when an agent changes, so
+    // read while changing both agents, and require that an `event: agent`
+    // frame actually arrived (a quiet stream would prove nothing).
+    for (who, cookie) in [("member", &member), ("owner", &owner)] {
+        let raw = fx.stream_while("/api/stream?entities=1", cookie, || {
+            for (i, alias) in ["helper", "master"].iter().enumerate() {
+                let _ = fx.rpc(
+                    Asserted::Operator,
+                    "agent_send",
+                    json!({"alias": alias, "text": format!("nudge {i}"),
+                           "message": format!("sweep-nudge-{who}-{alias}")}),
+                );
+            }
+        });
+        let frames: Vec<&str> = raw
+            .split("\n\n")
+            .filter(|f| f.starts_with("event: agent") || f.contains("\nevent: agent"))
+            .collect();
+        eprintln!(
+            "CAD-1767 sweep {who} /api/stream?entities=1: {} agent frames",
+            frames.len()
+        );
+        if frames.is_empty() {
+            wrong.push(format!(
+                "{who}: no `event: agent` frame arrived on /api/stream?entities=1"
+            ));
+        }
+        let hits: Vec<String> = frames.iter().flat_map(|f| needle_hits(f)).collect();
+        if who == "member" && !hits.is_empty() {
+            wrong.push(format!("/api/stream?entities=1 agent frames: {hits:?}"));
+        }
+        if who == "owner" && !hits.iter().any(|h| h.starts_with(n(10))) {
+            wrong.push(format!(
+                "control: the owner's agent frames lack {}: {hits:?}",
+                n(10)
+            ));
+        }
+    }
     assert!(
         wrong.is_empty(),
         "operator text reached a member: {wrong:#?}"
     );
+}
+
+impl Fx {
+    /// Read a stream for a bounded window while `act` changes state.
+    fn stream_while(&self, path: &str, cookie: &str, act: impl FnOnce()) -> String {
+        let token = Seam::token_at(&self.state()).unwrap();
+        let request = format!(
+            "GET {path} HTTP/1.0\r\nHost: {host}\r\nX-Cadence-Board: 1\r\n\
+             Origin: http://{host}\r\nSec-Fetch-Site: same-origin\r\n\
+             {AS_HEADER}: operator\r\n{TOKEN_HEADER}: {token}\r\nCookie: {cookie}\r\n\r\n",
+            host = self.host,
+        );
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let reader = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(8);
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 16384];
+            while Instant::now() < until {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    Err(_) => {}
+                }
+            }
+            String::from_utf8_lossy(&raw).to_string()
+        });
+        std::thread::sleep(Duration::from_millis(1500));
+        act();
+        reader.join().unwrap()
+    }
 }
