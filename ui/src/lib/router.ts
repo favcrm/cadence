@@ -68,7 +68,7 @@ export type Route =
   | { screen: "appsManage"; installId: string }
   | { screen: "workspaceApp"; installId: string }
   | { screen: "workspaceAppKey"; appKey: string }
-  | { screen: "agents"; alias: string | null; tab?: AgentTab; recruit?: boolean }
+  | { screen: "agents"; alias: string | null; tab?: AgentTab; recruit?: boolean; ask?: boolean }
   | { screen: "threads" }
   /** CAD-1703: the tab, search and filters, from the query (`?tab=done&search=…`). */
   | { screen: "myWork"; view?: MyWorkView }
@@ -400,6 +400,7 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
       alias: route.alias,
       ...(route.alias && tab !== "overview" ? { tab } : {}),
       ...(!route.alias && q.get("recruit") === "1" ? { recruit: true } : {}),
+      ...(!route.alias && q.get("ask") === "1" ? { ask: true } : {}),
     };
   }
   if (route.screen === "myWork") {
@@ -452,7 +453,7 @@ export function locationHref(loc: AppLocation, search = ""): string {
   // an app page's too (CAD-1040: the operator's back door to native
   // controls instead of the mounted app screen); it never carries over to
   // another installation.
-  for (const key of ["tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page", "recruit"]) q.delete(key);
+  for (const key of ["tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page", "recruit", "ask"]) q.delete(key);
   // CAD-1703: My work's view belongs to its own route.
   for (const key of MY_WORK_URL_KEYS) q.delete(key);
   writeFilters(q, NO_FILTERS);
@@ -469,6 +470,7 @@ export function locationHref(loc: AppLocation, search = ""): string {
   if (route.screen === "agents") {
     if (route.alias && route.tab) q.set("tab", route.tab);
     if (!route.alias && route.recruit) q.set("recruit", "1");
+    if (!route.alias && route.ask) q.set("ask", "1");
   }
   if (route.screen === "projects") {
     if (route.section === "issues") {

@@ -201,6 +201,8 @@ async function render() {
         open,
         tab,
         recruit: recruiting,
+        ask: false,
+        onAsk: () => {},
         onOpenAgent: (alias) => {
           open = alias;
           tab = "overview";

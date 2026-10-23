@@ -4,14 +4,13 @@ import { issueIndex } from "../../lib/scope";
 import { useTranslate } from "../../lib/locale";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { IconSearch } from "../../ui/icons";
-import { navigate } from "../../lib/useLocation";
 import { resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
-import { setComposerDraft } from "../app-shell/chat/composerStore";
 import Button from "../../ui/Button";
 import { HireBlock } from "../auth/WriteGate";
 import AgentAvatar from "./AgentAvatar";
 import SeatCard from "./SeatCard";
+import RecruitChat from "./RecruitChat";
 import AgentPage from "./AgentPage";
 import { FirstJobs } from "./AgentTabs";
 import HireSheet from "./HireSheet";
@@ -53,6 +52,8 @@ export default function Agents({
   open,
   tab,
   recruit,
+  ask,
+  onAsk,
   onOpenAgent: setOpen,
   onTab,
   onRecruit,
@@ -64,6 +65,8 @@ export default function Agents({
   open: string | null;
   tab: AgentTab;
   recruit: boolean;
+  ask: boolean;
+  onAsk: () => void;
   onOpenAgent: (alias: string | null) => void;
   onTab: (tab: AgentTab) => void;
   onRecruit: (on: boolean) => void;
@@ -104,11 +107,7 @@ export default function Agents({
   const hosted = roles.data?.install.hosted ?? false;
   const suggestion = suggestedRoles(installed.data ?? [], roles.data?.roles ?? []);
   const taken = allAgents.map((a) => a.alias);
-  const askMaster = () => {
-    // Never sends: the prompt waits in Master's composer.
-    setComposerDraft("home", "I need someone to ");
-    navigate("/");
-  };
+  const askMaster = onAsk;
   const hired = (alias: string, role: AgentRole) => {
     setPicked(null);
     setJoined({ alias, role });
@@ -144,6 +143,15 @@ export default function Agents({
         roles={roles}
         tab={tab}
         onTab={onTab}
+        onBack={() => setOpen(null)}
+        onOpenIssue={onOpenIssue}
+      />
+    );
+  }
+  if (ask) {
+    return (
+      <RecruitChat
+        hireBlock={hireBlock}
         onBack={() => setOpen(null)}
         onOpenIssue={onOpenIssue}
       />

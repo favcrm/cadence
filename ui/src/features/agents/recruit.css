@@ -184,3 +184,4 @@ button.rc-seat:focus-visible { outline: 2px solid var(--color-accent); outline-o
 .rc-seat .t, .rc-seat .s { display: block; }
 .rc-seat .st { min-width: 0; }
 @media (max-width: 700px) { .ag-search { max-width: none; margin-left: 0; flex-basis: 100%; } }
+.rc-chat { max-width: 680px; display: grid; gap: 12px; }

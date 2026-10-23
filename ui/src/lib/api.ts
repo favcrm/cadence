@@ -559,6 +559,10 @@ export const api = {
     else q.set("after", String(at.after ?? 0));
     return get<ThreadPage>(`/api/threads/${encodeURIComponent(alias)}?${q.toString()}`);
   },
+  /** `POST /api/threads/master/conversations {kind:"recruit"}` (CAD-1772):
+   *  find-or-create the master's single Recruit conversation. */
+  recruitConversation: () =>
+    post<{ conversation: { id: string } }>("/api/threads/master/conversations", { kind: "recruit" }),
   /** `POST /api/threads/<alias>/messages` — `message` makes a retry idempotent.
    *  `refs` are the needs-me subjects the message cites (CAD-574 "Ask
    *  master"): they land on the entry's payload, never in the text.
