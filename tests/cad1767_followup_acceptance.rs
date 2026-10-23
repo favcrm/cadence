@@ -2045,7 +2045,24 @@ fn cad1767_member_route_sweep_carries_no_operator_text() {
         let (status, body) = fx.sweep_get(route, &member);
         if status == 200 {
             admitted.push(route.clone());
-            let hits = needle_hits(&body);
+            // Operator decision 1: an ordinary (non-master) agent's own
+            // thread stays readable by members, operator messages and the
+            // agent's replies included, so its chat needles (n4-n6) are
+            // allowed on that agent's thread routes. Everything else -
+            // master Home, artifact, proposal, saved job, and running text
+            // anywhere outside the thread (decision 2) - stays asserted.
+            let ordinary_thread = ["helper", "acct-job"].iter().any(|alias| {
+                let base = format!("/api/threads/{alias}");
+                route == &base
+                    || route.starts_with(&format!("{base}?"))
+                    || route.starts_with(&format!("{base}/"))
+            });
+            let hits: Vec<String> = needle_hits(&body)
+                .into_iter()
+                .filter(|hit| {
+                    !(ordinary_thread && [n(6), n(7), n(8)].iter().any(|nd| hit.starts_with(nd)))
+                })
+                .collect();
             if !hits.is_empty() {
                 leaks.push(format!("{route}: {hits:?}"));
             }
