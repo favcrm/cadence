@@ -667,6 +667,39 @@ pub(crate) fn member_running_json(m: &Value) -> Value {
     })
 }
 
+/// CAD-1767: the same allowlist for a running item that is already reduced
+/// (the fleet list's `message` and `running_messages[]`): id, state, task
+/// id and created; the `summary` and anything else is dropped.
+pub(crate) fn member_running_item(item: &Value) -> Value {
+    json!({
+        "id": item["id"],
+        "state": "running",
+        "task": item["task"],
+        "created": item["created"],
+    })
+}
+
+/// CAD-1767: strip running-message text from one fleet row for a
+/// non-operator. `message` (the first running item) and every
+/// `running_messages` item are rebuilt from the allowlist.
+pub(crate) fn redact_agent_row(row: &mut Value) {
+    if row["message"].is_object() {
+        row["message"] = member_running_item(&row["message"]);
+    }
+    if let Some(items) = row["running_messages"].as_array_mut() {
+        for item in items.iter_mut() {
+            *item = member_running_item(item);
+        }
+    }
+}
+
+/// The fleet payload for a non-operator: every row redacted.
+pub(crate) fn redact_agents_payload(payload: &mut Value) {
+    if let Some(rows) = payload["agents"].as_array_mut() {
+        rows.iter_mut().for_each(redact_agent_row);
+    }
+}
+
 pub(crate) fn agent_activity_seconds(value: &Value) -> Option<f64> {
     let seconds = if let Some(seconds) = value.as_f64() {
         seconds
@@ -2103,10 +2136,16 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             request,
             stages::milestones(state_dir, pm_dir, query("project").as_deref()),
         ),
-        "/api/agents" => send(
-            request,
-            json_response(read_model::get(state_dir, pm_dir).agents()),
-        ),
+        "/api/agents" => {
+            // CAD-1767: running-message text is the operator's; anyone else
+            // (fail closed) gets the allowlisted rows.
+            let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
+            let mut payload = read_model::get(state_dir, pm_dir).agents();
+            if !operator {
+                redact_agents_payload(&mut payload);
+            }
+            send(request, json_response(payload))
+        }
         // CAD-546: the `local` platform's outbox — an operator-only
         // read, the same proof the board's operator write routes take.
         "/api/outbox" => {
@@ -2191,7 +2230,8 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     );
                     return;
                 }
-                stream_events(request, state_dir, pm_dir, admission);
+                let operator = operator::admit_operator_read(&request, state_dir, opts).is_ok();
+                stream_events(request, state_dir, pm_dir, admission, operator);
             }
         }
         _ => {

@@ -139,11 +139,24 @@ pub(crate) fn stream_hello(entities: bool) -> String {
     format!("event: hello\ndata: {data}\n\n")
 }
 
+/// One `event: agent` frame with its row's running-message text removed.
+fn redact_agent_frame(frame: &str) -> String {
+    let Some((head, tail)) = frame.split_once("\ndata: ") else {
+        return frame.to_string();
+    };
+    let Ok(mut data) = serde_json::from_str::<Value>(tail.trim()) else {
+        return frame.to_string();
+    };
+    super::serve::redact_agent_row(&mut data["agent"]);
+    format!("{head}\ndata: {data}\n\n")
+}
+
 pub(super) fn stream_events(
     request: Request,
     state_dir: &Path,
     pm_dir: &Path,
     mut admission: super::operator::ReadAdmission,
+    operator: bool,
 ) {
     let entities = request
         .url()
@@ -192,8 +205,17 @@ pub(super) fn stream_events(
                 if !entities && f.starts_with("event: aggregates\n") {
                     continue;
                 }
-                let optimized = entities.then(|| read_model::entity_frame(&f));
-                let bytes = optimized.as_deref().unwrap_or(&f);
+                // CAD-1767: an `agent` row frame carries the running message's
+                // text; a non-operator's copy is redacted first.
+                let redacted;
+                let f: &str = if !operator && f.starts_with("event: agent\n") {
+                    redacted = redact_agent_frame(&f);
+                    &redacted
+                } else {
+                    &f
+                };
+                let optimized = entities.then(|| read_model::entity_frame(f));
+                let bytes = optimized.as_deref().unwrap_or(f);
                 if !frame(&mut w, bytes.as_bytes()) {
                     return;
                 }
