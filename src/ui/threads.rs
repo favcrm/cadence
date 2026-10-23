@@ -149,6 +149,8 @@ struct ConversationReq {
     context_id: Option<String>,
     subject: Option<String>,
     general: Option<bool>,
+    /// CAD-1772: `"recruit"` — the master's Recruit conversation.
+    kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -237,9 +239,10 @@ fn cursor_arg(raw: Option<String>, what: &str) -> std::result::Result<i64, HttpR
 fn member_view(page: &mut Value) {
     let resolved_master = page["alias"].as_str().is_none_or(crate::master::is_master);
     let home = resolved_master
-        && page["thread"]
-            .as_object()
-            .is_none_or(|t| t.get("install_id").is_none_or(Value::is_null));
+        && page["thread"].as_object().is_none_or(|t| {
+            t.get("install_id")
+                .is_none_or(|i| i.is_null() || i.as_str() == Some(crate::store::RECRUIT_INSTALL))
+        });
     if let Some(entries) = page["entries"].as_array_mut() {
         entries.retain(|e| {
             !home
@@ -759,6 +762,24 @@ pub(super) fn post_conversation(
     };
     // On `/api/app-installations/<id>/conversations` the path names the
     // installation and a body `install_id` is refused, never reconciled.
+    if let Some(kind) = req.kind {
+        if path_install.is_some()
+            || req.install_id.is_some()
+            || req.context_id.is_some()
+            || req.subject.is_some()
+            || req.general.is_some()
+        {
+            return err_response(400, "kind takes no install, context, subject or general");
+        }
+        let mut params = json!({"alias": alias, "kind": kind});
+        if let Err(resp) = super::operator::relay_owner_proof(&mut params, relay) {
+            return resp;
+        }
+        return match client::rpc(state_dir, "conversation_create", params) {
+            Ok(created) => json_response(created),
+            Err(e) => rpc_err(&e),
+        };
+    }
     let install = match (path_install, req.install_id) {
         (Some(_), Some(_)) => return err_response(400, "install_id is named by the path"),
         (Some(path), None) => path.to_string(),

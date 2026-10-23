@@ -22,7 +22,7 @@ import type {
   AgentSettingsSnapshot,
 } from "../../lib/types";
 
-const ROLES: Array<[string, string]> = [
+export const ROLES: Array<[string, string]> = [
   ["pm", "PM"],
   ["research", "Research"],
   ["architect", "Architect"],

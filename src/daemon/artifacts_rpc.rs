@@ -126,7 +126,7 @@ impl Shared {
             .ok_or_else(|| {
                 Error::rejected("artifact put: the turn's conversation cannot be resolved")
             })?;
-        let (scope, context) = if thread.is_home() {
+        let (scope, context) = if thread.runs_as_home() {
             (store::CHAT_FILE_SCOPE_HOME.to_string(), String::new())
         } else {
             let install = thread.install_id.as_deref().unwrap_or_default();

@@ -1834,6 +1834,7 @@ impl Shared {
         entry: store::NewEntry,
     ) -> Result<Option<i64>> {
         match thread {
+            // The Recruit conversation appends to its own thread, like an app.
             Some(t) if !t.is_home() => self.store.thread_append_to(&t.id, entry),
             _ => self.store.thread_append(alias, entry),
         }

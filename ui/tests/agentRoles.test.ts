@@ -24,7 +24,7 @@ const role = (id: string, category: string, title: string, job: string): AgentRo
 });
 const roles = [
   role("quotation", "business", "Quotation", "Turns a request into a quote."),
-  role("sales", "customer", "Sales follow-up", "Keeps leads warm."),
+  role("support", "customer", "Support", "Drafts replies."),
   role("accountant", "business", "Accountant", "Reconciles invoices."),
   role("developer", "tech", "Developer", "Builds features."),
 ];
@@ -38,7 +38,12 @@ check(aliasProblem("developer-1", []) === null, "a free name passes");
 
 // Suggested for you: from installed apps; nothing matching hides the section.
 const crm = suggestedRoles([{ name: "crm", title: "CRM" }], roles);
-check(crm.roles.map((r) => r.id).join() === "quotation,sales", "CRM suggests quotation and sales");
+check(crm.roles.map((r) => r.id).join() === "quotation,support", "CRM suggests quotation and support");
+check(
+  suggestedRoles([{ name: "crm", title: "CRM" }, { name: "invoices", title: "Invoices" }], roles).roles.map((r) => r.id).join() ===
+    "quotation,accountant,support",
+  "CRM and Invoices suggest Quotation, Accountant, Support in the mockup's order",
+);
 check(crm.labels.join() === "CRM", "the matching app is named");
 check(suggestedRoles([{ name: "invoices", title: "Invoices" }], roles).roles[0]?.id === "accountant", "Invoices suggests accountant");
 check(suggestedRoles([{ name: "notes", title: "Notes" }], roles).roles.length === 0, "no match, no suggestions");

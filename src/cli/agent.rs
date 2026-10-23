@@ -303,6 +303,8 @@ pub(crate) enum AgentAction {
         #[arg(long)]
         file: PathBuf,
     },
+    /// List the catalogue roles (id, title, job) a hire can use. Read-only.
+    Roles,
     /// Propose hiring a catalogue role (the master, on its live turn): the
     /// operator reviews a card and hires from it. Registers nothing.
     ProposeHire {
@@ -929,6 +931,14 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
             )?;
             cadence_agent::briefing::deliver_job_update(&state_dir, &alias, &text, &mut out);
             out
+        }
+        AgentAction::Roles => {
+            let roles: Vec<Value> = cadence_agent::agent_roles::ROLES
+                .iter()
+                .map(|r| json!({"id": r.id, "title": r.title, "job": r.job}))
+                .collect();
+            print_json(&json!({"roles": roles}));
+            return Ok(0);
         }
         AgentAction::ProposeHire { role, name, job_file } => {
             // The job is read through the master's command-file rules, never

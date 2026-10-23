@@ -344,13 +344,13 @@ impl Shared {
                 self.store
                     .thread_by_id(id)?
                     .filter(|thread| {
-                        thread.alias == alias && thread.install_id.is_none() && !thread.archived
+                        thread.alias == alias && thread.runs_as_home() && !thread.archived
                     })
                     .ok_or_else(|| Error::rejected("Unknown Home conversation"))?
             }
             None => self.store.ensure_thread(&alias)?,
         };
-        if thread.alias != alias || thread.install_id.is_some() || thread.archived {
+        if thread.alias != alias || !thread.runs_as_home() || thread.archived {
             return Err(Error::rejected(
                 "Home upload requires an unarchived Home conversation",
             ));
@@ -637,7 +637,7 @@ impl Shared {
                             "chat file read: the turn's conversation cannot be resolved",
                         )
                     })?;
-                if thread.is_home() {
+                if thread.runs_as_home() {
                     self.prove_home_conversation(Some(&thread.id))?;
                     file.home_scope()?;
                     if file.location_version == Some(1) {

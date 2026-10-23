@@ -229,7 +229,27 @@ impl Thread {
     pub fn is_home(&self) -> bool {
         self.install_id.is_none()
     }
+
+    /// CAD-1772: does this conversation run its master turn with the Home
+    /// scope and tools (Home itself, or the Recruit conversation)? Every
+    /// Home-versus-app branch asks this, never `is_home` alone.
+    pub fn runs_as_home(&self) -> bool {
+        self.is_home() || self.is_recruit()
+    }
+
+    /// CAD-1772: the master's Recruit conversation.
+    pub fn is_recruit(&self) -> bool {
+        self.install_id.as_deref() == Some(RECRUIT_INSTALL)
+    }
 }
+
+/// CAD-1772: the reserved pseudo-installation of the master's single
+/// Recruit conversation. It is not an app: no installation row exists,
+/// and the conversation is operator-only and runs as a Home turn. The `@`
+/// cannot pass `proto::identifier`, so no real installation, context or
+/// app record can ever carry this id (a real install named `recruit` is
+/// an ordinary app).
+pub const RECRUIT_INSTALL: &str = "@recruit";
 
 /// A campaign conversation's subject prefix.
 pub const SUBJECT_CAMPAIGN: &str = "campaign:";
@@ -1322,7 +1342,7 @@ impl Store {
             }
             if let Some(id) = conversation {
                 let thread = Self::thread_by_id_in(tx, id)?
-                    .filter(|t| t.alias == alias && t.install_id.is_none() && !t.archived)
+                    .filter(|t| t.alias == alias && t.runs_as_home() && !t.archived)
                     .ok_or_else(|| Error::rejected("Unknown or unavailable Home conversation"))?;
                 Self::thread_write_in(tx, &thread, entry)?;
                 return Ok(());

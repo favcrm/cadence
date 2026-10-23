@@ -442,7 +442,7 @@ impl Shared {
             _ => return MasterScope::Unresolved,
         };
         match self.store.message_conversation(ALIAS, &running) {
-            Ok(Some(t)) if !t.is_home() => MasterScope::App(t.id),
+            Ok(Some(t)) if !t.runs_as_home() => MasterScope::App(t.id),
             Ok(_) => MasterScope::Home,
             Err(_) => MasterScope::Unresolved,
         }

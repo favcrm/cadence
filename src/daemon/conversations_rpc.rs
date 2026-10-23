@@ -61,7 +61,8 @@ fn campaign_of(subject: &str) -> Result<&str> {
 }
 
 /// A conversation's identity for the session-switch rule: every home
-/// message (or one with no thread) is one key.
+/// message (or one with no thread) is one key. The Recruit conversation
+/// keeps its own key: it runs as Home but never shares Home's session.
 fn session_key(thread: Option<&store::Thread>) -> String {
     match thread {
         Some(t) if !t.is_home() => t.id.clone(),
@@ -139,7 +140,7 @@ impl Shared {
             None => None,
         };
         let profile = match &target {
-            Some(t) if !t.is_home() => master::Profile::App,
+            Some(t) if !t.runs_as_home() => master::Profile::App,
             _ => master::Profile::Home,
         };
         // Same conversation as the last delivered message AND a session
@@ -672,6 +673,7 @@ impl Shared {
                 "context_id",
                 "subject",
                 "general",
+                "kind",
                 "public_session",
             ],
             "conversation create",
@@ -680,6 +682,31 @@ impl Shared {
         // CAD-1374: the verified owner human, or `None` for the local operator.
         let human = self.verified_owner_human(params)?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // CAD-1772: the master's single Recruit conversation — find or
+        // create, no installation. Operator-only like every create above.
+        if let Some(kind) = optional_text(params, "kind")? {
+            if kind != "recruit" {
+                return Err(Error::rejected("kind must be \"recruit\""));
+            }
+            if ["install_id", "context_id", "subject", "general"]
+                .iter()
+                .any(|k| params.get(*k).is_some_and(|v| !v.is_null()))
+                || !master::is_master(&alias)
+            {
+                return Err(Error::rejected(
+                    "the Recruit conversation is the Master's alone and takes no install, context, subject or general",
+                ));
+            }
+            let (thread, created) = self.store.conversation_create_as(
+                &alias,
+                store::RECRUIT_INSTALL,
+                None,
+                ConversationKind::General,
+                human.as_ref(),
+            )?;
+            self.wake();
+            return Ok(json!({"conversation": thread.to_json(), "created": created}));
+        }
         let install = required_str(params, "install_id")?;
         self.known_install(install)?;
         // A context is proven when given; a campaign subject needs one.

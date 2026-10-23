@@ -7,6 +7,7 @@
  * livelier loop and `still` freezes every animation. */
 
 import { useId } from "react";
+import { MASTER } from "../home/master";
 
 export const AVATAR_LOOKS = [
   "builder",
@@ -181,7 +182,8 @@ function Prop({ slug, p }: { slug: AvatarLook; p: Palette }) {
 /** A hired agent's pinned look (`params.look`), else the alias-hashed one. */
 export function agentLook(alias: string, params?: Record<string, unknown> | null): AvatarLook {
   const pinned = params?.look;
-  return isLook(pinned) ? pinned : lookFor(alias);
+  // The master wears the robot (CAD-1772), unless a look is pinned.
+  return isLook(pinned) ? pinned : alias === MASTER ? "robot" : lookFor(alias);
 }
 
 function isLook(value: unknown): value is AvatarLook {

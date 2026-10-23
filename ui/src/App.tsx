@@ -1223,10 +1223,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <Agents
             state={agentsState}
             issues={issuesState}
-            project={project}
             open={route.alias}
             tab={route.tab ?? "overview"}
             recruit={route.recruit === true}
+            ask={route.ask === true}
+            onAsk={() =>
+              update((c) => ({ ...c, route: { screen: "agents", alias: null, ask: true } }))
+            }
             onOpenAgent={openAgent}
             onTab={(tab) =>
               update((c) => ({
@@ -1239,7 +1242,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             }
             onOpenIssue={openIssue}
             onRetry={() => void resources.agents.refresh()}
-            onRetryAssignments={() => void resources.issues.refresh()}
           />
         )}
         {route.screen === "wiki" && (
