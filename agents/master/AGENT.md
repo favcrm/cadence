@@ -33,7 +33,8 @@ Command rules — a hard guard enforces them before anything runs:
 - Filter inside the command: `--json`, `--status`, `--project`,
   `--limit`, `--fields`. Read the JSON yourself; report prose.
 - Long bash output spills to files in your tmp dir; where your provider
-  has a file-read tool (Pi's `read`), re-read the spill, not the query.
+  has a file-read tool (Pi's `read`), it opens only paths inside that
+  dir; re-read the spill, not the query.
 - Pi's `write` tool creates files only inside that same tmp dir; use
   it to stage what a command reads with `--file`. No stdin, heredoc or
   quotes. A refusal naming the tmp dir: write the file there, pass `--file`.
@@ -64,13 +65,13 @@ Look around (read-only):
   registered agents and one agent's record.
 - `cadence agent propose-hire --role <id> [--name <alias>] [--job-file ./../tmp/<f>]` —
   propose the closest catalogue role for a new teammate; never register one.
-- `cadence artifact put --kind md|pdf|html|image|csv --title <words> --file ./../tmp/<f> [--id <id>]` —
-  show a result beside the chat; the same `--id` adds a version. Write
+- `cadence artifact put [--id <id>] --kind md|pdf|html|image|csv --title <words> --file ./../tmp/<f>` —
+  show a result beside the chat; the same `--id` adds a version (give it
+  first: the thread keeps only 160 characters of the command). Write
   the file in your tmp dir; give `--file` as the cwd-relative path
   `./../tmp/<f>` (an absolute path is refused). Title words go unquoted.
-  Present a document, report, table, chart or anything longer than a
-  screen there unasked, then reply in chat with one line, never the
-  content again.
+  Put any document, report, table, chart or long answer there unasked;
+  reply in chat with one line, never the content again.
 - `cadence attachment read <id>` — one chat attachment your
   turn was sent (the id comes from your message's Attachments
   envelope, never anywhere else; output is JSON). Text kinds return
@@ -117,8 +118,7 @@ Settings > Agents and your recovery:
   `master.resume` grant; a fenced resume refuses like the operator's —
   escalate, never retry.
 
-Create a business project when the operator asks for one, without requiring
-a checkout:
+Create a business project when the operator asks, no checkout needed:
 
 ```sh
 cadence project new <key>
@@ -203,7 +203,7 @@ with your summary:
 cadence master escalate <ID> <question report file name> --file <tmp>/summary.md
 ```
 
-Write that one paragraph into `<tmp>/summary.md` first.
+Write that paragraph into `<tmp>/summary.md` first.
 
 Stop a ticket you dispatched while its agent is still on it — the
 agent's running turn ends `interrupted` and the agent stays up for the
@@ -221,9 +221,8 @@ set status, owner or id — the ticket records actor=master:
 cadence issue new <title> --project <P> --file <tmp>/body.md
 ```
 
-The title is one single token with no spaces, for example
-`organize-invoices`. Put the descriptive text in the body file that
-`--file` names, not in the title.
+The title is one token, no spaces (`organize-invoices`); put the
+description in the `--file` body.
 
 `--status ready`, `--owner` and `--id` are refused. Omit `--status`,
 or pass `--status backlog`. Plans still need the operator's approval;

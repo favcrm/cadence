@@ -5,12 +5,15 @@
  * falls back to plain text.
  */
 export const CSV_MAX_ROWS = 2000;
+export const CSV_MAX_COLS = 50;
 
 export interface CsvTable {
   header: string[];
   rows: string[][];
   /** Data rows in the file (the table shows at most `CSV_MAX_ROWS`). */
   total: number;
+  /** Columns in the widest record (the table shows at most `CSV_MAX_COLS`). */
+  columns: number;
 }
 
 export function parseCsv(text: string): CsvTable | null {
@@ -59,5 +62,7 @@ export function parseCsv(text: string): CsvTable | null {
   if (field !== "" || wasQuoted || row.length > 0) endRow();
   if (records.length === 0) return null;
   const [header, ...rest] = records;
-  return { header, rows: rest.slice(0, CSV_MAX_ROWS), total: rest.length };
+  const columns = records.reduce((n, r) => Math.max(n, r.length), 0);
+  const cap = (r: string[]) => (r.length > CSV_MAX_COLS ? r.slice(0, CSV_MAX_COLS) : r);
+  return { header: cap(header), rows: rest.slice(0, CSV_MAX_ROWS).map(cap), total: rest.length, columns };
 }

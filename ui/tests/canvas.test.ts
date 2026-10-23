@@ -4,6 +4,7 @@ import {
   clampWidth,
   closeDrawer,
   defaultWidth,
+  defaultWidthFor,
   closeTab,
   feedCanvas,
   openArtifact,
@@ -14,7 +15,7 @@ import {
 import { feedParts, plainStep } from "../src/features/canvas/feed";
 import { parseCsv } from "../src/features/canvas/csv";
 import { askBody, askLabel, makeAskRef } from "../src/features/canvas/askRefs";
-import { isArtifactPutCall, threadItems, toolSteps, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
+import { isArtifactPutCall, planRef, threadItems, toolSteps, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);
@@ -106,17 +107,25 @@ equal(drawerLayout(1100, 660, "app", null), { mode: "cover", width: 544 }, "app,
 // Default widths scale with the viewport, wider for html/csv/pdf, within their clamps.
 equal([defaultWidth("md", 1835), defaultWidth("md", 1000), defaultWidth("md", 800)], [760, 480, 480], "default width 45%, 480..760");
 equal([defaultWidth("html", 1835), defaultWidth("csv", 1280), defaultWidth("pdf", 900)], [960, 704, 560], "document kinds 55%, 560..960");
-// Expand: cover taking most of the page; Home keeps a 64px chat strip, the app shell stops at the chat pane.
-equal(drawerLayout(1440, 480, "home", null, true), { mode: "cover", width: 1168 }, "home expands beside a chat strip");
-equal(drawerLayout(1440, 480, "app", 700, true), { mode: "cover", width: 728 }, "app expand never covers the chat pane");
+// Expand: cover taking most of the page, leaving a ~64px chat strip. The app shell keeps the chat pane's edge when that gains 96px or more; otherwise it covers the pane down to the strip.
+equal(drawerLayout(1440, 480, "home", null, true), { mode: "cover", width: 1136 }, "home expands beside a chat strip");
+equal(drawerLayout(1440, 480, "app", 700, true), { mode: "cover", width: 728 }, "app expand keeps the chat pane edge when it gains 96px or more");
 equal(drawerLayout(900, 480, "app", 860, true).mode, "cover", "app expand at 900 stays beside the narrowed chat");
 equal(drawerLayout(500, 480, "home", null, true).mode, "sheet", "a phone is a sheet either way");
+// Expand never does nothing: where the chat pane's edge leaves no more room than cover has, it covers the chat down to the strip.
+const crmCover = drawerLayout(1280, 704, "app", 640);
+const crmExpand = drawerLayout(1280, 704, "app", 640, true);
+equal([crmCover.width, crmExpand.width > crmCover.width + 96], [628, true], "expand widens a drawer already at the chat pane's edge (1280)");
+equal(drawerLayout(900, 560, "app", 860, true).width > drawerLayout(900, 560, "app", 860).width, true, "expand widens at 900 too");
+// A document kind keeps its 560px floor at 900; the cap follows the floor.
+equal([defaultWidthFor("csv", 900), defaultWidthFor("md", 900), defaultWidthFor("html", 1280)], [560, 480, 704], "default widths hold their floors at 900");
+equal(clampWidth(100, 900, 560), 560, "a floor lifts the minimum");
 equal([clampWidth(100, 1440), clampWidth(2000, 1440), clampWidth(500, 1440)], [360, 864, 500], "width clamps to 360px..60%");
 
 // A quoted-empty record is a record; blank lines and the trailing newline are not.
-equal(parseCsv('h\r\n""\r\nx\r\n'), { header: ["h"], rows: [[""], ["x"]], total: 2 }, "a quoted-empty row is kept");
-equal(parseCsv('""\r\nx\r\n'), { header: [""], rows: [["x"]], total: 1 }, "a quoted-empty header is kept");
-equal(parseCsv("a\n\nb\n"), { header: ["a"], rows: [["b"]], total: 1 }, "blank lines are skipped");
+equal(parseCsv('h\r\n""\r\nx\r\n'), { header: ["h"], rows: [[""], ["x"]], total: 2, columns: 1 }, "a quoted-empty row is kept");
+equal(parseCsv('""\r\nx\r\n'), { header: [""], rows: [["x"]], total: 1, columns: 1 }, "a quoted-empty header is kept");
+equal(parseCsv("a\n\nb\n"), { header: ["a"], rows: [["b"]], total: 1, columns: 1 }, "blank lines are skipped");
 
 // The feed reads cards and the live step from the thread, nothing else.
 const e = (seq: number, role: string, kind: string, text: string, message: string, payload: Record<string, unknown> | null = null): ThreadEntry => ({
@@ -246,17 +255,55 @@ const putState: ThreadState = {
 };
 equal(feedParts(threadItems(putState), 0, "m1").working?.updating, ["art-a"], "the put names its target");
 equal(feedParts(threadItems(putState), 0, null).working, null, "no strip when no turn runs");
+// The global-flags form is a put too; a landed put is no longer "updating"; a second put names its own target.
+for (const text of ["Bash: cadence --org local artifact put --kind md", "cadence --json --state-dir /x/y artifact put --kind md", "bash: /usr/bin/cadence --org=local artifact put --kind md"]) {
+  equal(isArtifactPutCall(text), true, `put with global flags: ${text}`);
+}
+equal(["cadence --org local issue ls artifact put", "cadence issue show artifact put", "cadence artifact ls"].map(isArtifactPutCall), [false, false, false], "other commands are not puts");
+const twoPuts: ThreadState = {
+  exists: true,
+  pending: [],
+  entries: [
+    e(1, "operator", "message", "two", "m1"),
+    e(2, "agent", "tool_call", "Bash: cadence artifact put --id art-a --kind md --file ./../tmp/a.md", "m1", { tool_use_id: "t1" }),
+    e(3, "agent", "tool_result", "ok", "m1", { tool_use_id: "t1" }),
+    e(4, "agent", "tool_call", "Bash: cadence artifact put --id art-a --kind md --file ./../tmp/b.md", "m1", { tool_use_id: "t2" }),
+  ],
+};
+equal(feedParts(threadItems(twoPuts), 0, "m1").working?.updating, ["art-a"], "the second, still-open put is the one updating");
+// A command quoted mid-sentence leaves the plan line.
+const quoted: ThreadState = {
+  exists: true,
+  pending: [],
+  entries: [
+    e(1, "operator", "message", "go", "m1"),
+    e(2, "agent", "assistant_text", 'Next I will run "cadence artifact put --kind md --title x" and then `cadence status --json` for counts.', "m1"),
+  ],
+};
+equal(feedParts(threadItems(quoted), 0, "m1").working?.plan, "Next I will run … and then … for counts.", "quoted commands are elided");
+// Linear on 200k-character runs (a quadratic regex would not finish).
+const probeStart = Date.now();
+const longRuns = ["\"".repeat(200000), "\"".repeat(100000) + "/".repeat(100000), "`".repeat(100000) + "cadence x", "(".repeat(100000), "/".repeat(200000), "=".repeat(200000), "plan show ".repeat(20000), "plan show " + "A".repeat(200000), `plan show ${"x ".repeat(100000)}`, "cadence " + "--a ".repeat(50000) + "artifact put", `"cadence ${"a ".repeat(100000)}`];
+for (const run of longRuns) {
+  planRef({ ...e(1, "agent", "tool_call", run, "m1") });
+  isArtifactPutCall(run);
+  feedParts(threadItems({ exists: true, pending: [], entries: [e(1, "operator", "message", "go", "m1"), e(2, "agent", "assistant_text", run, "m1")] }), 0, "m1");
+}
+equal(Date.now() - probeStart < 3000, true, "200k-character runs stay linear");
+equal([planRef(e(1, "agent", "tool_call", "Bash: cadence plan show CAD-12", "m1")), planRef(e(1, "agent", "tool_call", "plan show x\nplan approve EPIC-3 now", "m1")), planRef(e(1, "agent", "tool_call", "plan show", "m1"))], ["CAD-12", "EPIC-3", null], "plan commands still name their epic");
 
 // CSV: RFC 4180 quoting, a header row, a row cap, and a refusal to guess.
 equal(
   parseCsv('a,b\r\n"x, y","say ""hi"""\n"two\nlines",3\n'),
-  { header: ["a", "b"], rows: [["x, y", 'say "hi"'], ["two\nlines", "3"]], total: 2 },
+  { header: ["a", "b"], rows: [["x, y", 'say "hi"'], ["two\nlines", "3"]], total: 2, columns: 2 },
   "quoted fields",
 );
 equal(parseCsv('a,b\n"open,1'), null, "an unterminated quote falls back to text");
 equal(parseCsv('a,b\n"x"y,1'), null, "text after a closing quote falls back to text");
 const big = parseCsv(`h\n${Array.from({ length: 2500 }, (_, i) => i).join("\n")}`);
 equal([big?.rows.length, big?.total], [2000, 2500], "at most 2,000 rows, total reported");
+const wide = parseCsv(`${Array.from({ length: 80 }, (_, i) => `h${i}`).join(",")}\n${Array.from({ length: 80 }, (_, i) => i).join(",")}`);
+equal([wide?.header.length, wide?.rows[0].length, wide?.columns], [50, 50, 80], "at most 50 columns, count reported");
 
 // Ask to change: the chip expands into the body the master receives.
 const ask = makeAskRef({ artifact: "art-a", version: 2, title: "Report", passage: "Tuesday lunch is soft" });

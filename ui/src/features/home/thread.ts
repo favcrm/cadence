@@ -321,9 +321,21 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
 
 // ---- CAD-551: steps, refusals, and the working row's "what now" ----
 
-/** A tool call that runs `cadence artifact put` (not text that merely names it). */
+/** A tool call that runs `cadence artifact put` (not text that merely names
+ *  it), with or without global flags (`cadence --org x artifact put …`). Reads
+ *  at most the first words, so its cost does not grow with the text. */
 export function isArtifactPutCall(text: string): boolean {
-  return /^\s*(?:bash:\s*)?(?:\S*\/)?cadence\s+artifact\s+put\b/i.test(text);
+  const words = text.slice(0, 1000).replace(/^\s*(?:bash:\s*)?/i, "").split(/\s+/, 24);
+  if (!/^(?:\S*\/)?cadence$/i.test(words[0] ?? "")) return false;
+  let flagValue = false;
+  for (let i = 1; i < words.length; i++) {
+    const w = words[i].toLowerCase();
+    if (w === "artifact" && words[i + 1]?.toLowerCase() === "put") return true;
+    if (w.startsWith("-")) flagValue = !w.includes("=");
+    else if (flagValue) flagValue = false;
+    else return false;
+  }
+  return false;
 }
 
 /** One tool call and the result that answered it (when it has). */
@@ -422,7 +434,22 @@ export function openStep(entries: ThreadEntry[]): ThreadEntry | null {
 
 const EPIC_ID = /[A-Z][A-Z0-9]{0,9}-\d+/;
 const EPIC_JSON = new RegExp(`"epic"\\s*:\\s*"(${EPIC_ID.source})"`);
-const PLAN_CMD = new RegExp(`\\bplan (?:propose[ds]?|show|approve|reject)\\b[^\\n]*?\\b(${EPIC_ID.source})\\b`);
+const PLAN_VERB = /\bplan (?:propose[ds]?|show|approve|reject)\b/;
+const EPIC_WORD = new RegExp(`\\b(${EPIC_ID.source})\\b`, "g");
+
+/** The epic a `plan propose|show|approve|reject … X-1` command names: on each
+ *  line, the first epic id after the first plan verb. One verb search and one
+ *  id search per line, so the cost is linear in the text. */
+function planCommandEpic(text: string): string | null {
+  for (const line of text.split("\n")) {
+    const verb = PLAN_VERB.exec(line);
+    if (!verb) continue;
+    EPIC_WORD.lastIndex = verb.index + verb[0].length;
+    const epic = EPIC_WORD.exec(line);
+    if (epic) return epic[1];
+  }
+  return null;
+}
 const PLAN_TICKETS = /"tickets"\s*:\s*\[/;
 const PLAN_BLOCK = /"plan"\s*:\s*\{/;
 const PLAN_PROSE = new RegExp(`\\b[Pp]lan (${EPIC_ID.source})\\b`);
@@ -444,7 +471,7 @@ export function planRef(entry: ThreadEntry): string | null {
   const planShaped = PLAN_TICKETS.test(text) || PLAN_BLOCK.test(text);
   return (
     (planShaped ? EPIC_JSON.exec(text)?.[1] : null) ??
-    (TOOL_KINDS.has(entry.kind) ? PLAN_CMD.exec(text)?.[1] : null) ??
+    (TOOL_KINDS.has(entry.kind) ? planCommandEpic(text) : null) ??
     PLAN_PROSE.exec(text)?.[1] ??
     null
   );
