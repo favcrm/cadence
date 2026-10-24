@@ -25,11 +25,12 @@
 use std::path::Path;
 use std::time::Duration;
 
+use cadence_core::issue::{is_closed, Blocker};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::client;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::issue::model::Front;
 use crate::issue::write::{commit_front_with_comment, issue_dir, load_front};
 use crate::issue::{board, line_times, lockseam, time, Pm};
@@ -49,22 +50,28 @@ pub const PARK_GRACE_SECS: i64 = 24 * 3600;
 /// sweep sends after its commit, with the PM lock released).
 const NOTICE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Statuses a blocker must reach to count as closed — the same pair
-/// readiness and the dispatch path use.
-const CLOSED: &[&str] = &["done", "dropped"];
-
-/// `blocked_by` targets still open — the shared lookup behind the
-/// `ready` gate and the notice text.
-fn open_blockers(pm_dir: &Path, front: &Front) -> Vec<String> {
+/// `blocked_by` targets with their current status — a target that cannot
+/// be found counts as open.
+fn blockers_of(pm_dir: &Path, front: &Front) -> Vec<Blocker> {
     front
         .blocked_by
         .iter()
-        .filter(|dep| {
-            board::find_issue(pm_dir, dep)
-                .map(|b| !CLOSED.contains(&b.front.status.as_str()))
-                .unwrap_or(true)
+        .map(|dep| Blocker {
+            id: dep.clone(),
+            status: board::find_issue(pm_dir, dep)
+                .map(|b| b.front.status)
+                .unwrap_or_else(|_| "missing".to_string()),
         })
-        .cloned()
+        .collect()
+}
+
+/// `blocked_by` targets still open — the shared lookup behind the
+/// notice text.
+fn open_blockers(pm_dir: &Path, front: &Front) -> Vec<String> {
+    blockers_of(pm_dir, front)
+        .into_iter()
+        .filter(|b| !is_closed(&b.status))
+        .map(|b| b.id)
         .collect()
 }
 
@@ -73,19 +80,10 @@ fn open_blockers(pm_dir: &Path, front: &Front) -> Vec<String> {
 /// honest statuses are `backlog`/`doing`+warning — not a pick nobody
 /// can take.
 pub fn check_ready(pm_dir: &Path, front: &Front) -> Result<()> {
-    let open = open_blockers(pm_dir, front);
-    if open.is_empty() {
-        return Ok(());
-    }
-    Err(Error::rejected(format!(
-        "{}: status=ready but blocked_by {} still open — \
-         the queue skips blocked tickets anyway; land {} or \
-         `cadence issue unlink {} blocked_by <id>` first",
-        front.id,
-        open.join(", "),
-        if open.len() == 1 { "it" } else { "them" },
-        front.id,
-    )))
+    Ok(cadence_core::issue::check_ready(
+        &front.id,
+        &blockers_of(pm_dir, front),
+    )?)
 }
 
 /// One control-free needs-you line to an agent alias — best-effort, the

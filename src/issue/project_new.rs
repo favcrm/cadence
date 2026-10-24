@@ -27,6 +27,8 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::{model, project, work, write, Pm};
+pub use cadence_core::issue::check_prefix;
+use cadence_core::issue::derive_prefix;
 
 /// Keys a project may never take: `<pm>/agents/` holds the agent files
 /// (AGENT-FILESYSTEM.md; the master's `agents/master/`, CAD-339).
@@ -63,41 +65,6 @@ pub fn check_key(key: &str) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-/// `CADENCE` → valid; an issue prefix is 1-8 uppercase letters/digits
-/// starting with a letter.
-pub fn check_prefix(prefix: &str) -> Result<()> {
-    let ok = !prefix.is_empty()
-        && prefix.len() <= 8
-        && prefix
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-        && prefix.starts_with(|c: char| c.is_ascii_uppercase());
-    if ok {
-        Ok(())
-    } else {
-        Err(Error::rejected(format!(
-            "Invalid prefix '{prefix}' — uppercase letters/digits starting with a letter"
-        )))
-    }
-}
-
-/// The key's first three letters/digits, uppercased (`reminders` →
-/// `REM`); a key that starts with a digit needs `--prefix`.
-fn derive_prefix(key: &str) -> Result<String> {
-    let prefix: String = key
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(3)
-        .collect::<String>()
-        .to_ascii_uppercase();
-    check_prefix(&prefix).map_err(|_| {
-        Error::rejected(format!(
-            "Cannot derive an issue prefix from '{key}' — pass --prefix"
-        ))
-    })?;
-    Ok(prefix)
 }
 
 /// `pm=1,dev=4` or repeated `slug=n` → an ordered, de-duplicated map.

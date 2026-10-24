@@ -88,7 +88,7 @@ pub fn edit(
             Some(t) => (false, t),
             None => (true, raw.strip_prefix('+').unwrap_or(raw)),
         };
-        part("--tag", || model::normalize_tags(&[tag.to_string()]))?;
+        part("--tag", || Ok(model::normalize_tags(&[tag.to_string()])?))?;
         tag_delta.push((add, tag.to_string()));
     }
     let links: Vec<(bool, &str, &str)> = spec
