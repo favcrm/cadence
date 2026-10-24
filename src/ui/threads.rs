@@ -43,7 +43,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use serde::Deserialize;
+use cadence_core::board_api::{ConversationReq, ThreadMessageReq};
 use serde_json::{json, Value};
 use tiny_http::Request;
 
@@ -93,82 +93,6 @@ impl Drop for ChatUploadIngressPermit {
     fn drop(&mut self) {
         CHAT_UPLOAD_INGRESS.fetch_sub(1, Ordering::AcqRel);
     }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ThreadMessageReq {
-    text: String,
-    /// Client-chosen id: a retried POST is the same message, not two.
-    message: Option<String>,
-    /// CAD-802: the shell chat's current installation/context. Never
-    /// authority — the daemon resolves both against its store and
-    /// refuses unknown installs, unknown/archived contexts and any
-    /// extra key (including a browser-stamped `verified`).
-    app: Option<ThreadApp>,
-    /// CAD-574: needs-me subjects the message cites (the rail's "Ask
-    /// master"). The daemon's `thread_refs` is the strict side — this
-    /// field only carries `{kind,id}` pairs through the relay.
-    refs: Option<Vec<ThreadRef>>,
-    /// CAD-1098: a selector among the conversations of `app`'s
-    /// installation — never authority; the daemon checks it.
-    conversation: Option<String>,
-    /// CAD-1168: retained chat-file ids from `/api/chat/upload`. The
-    /// daemon's `thread_attachments` resolves them — this relay only
-    /// carries `{id}` handles through, never names or paths.
-    attachments: Option<Vec<ThreadAttachment>>,
-    /// One retained library image. The daemon re-proves id, revision and digest.
-    media_refs: Option<Vec<ThreadMediaRef>>,
-    /// CAD-1591: the contextual-reply recipient constraint — the uid the
-    /// operator's composer recorded. Relayed verbatim; the daemon
-    /// validates the shape and fences it inside the enqueue
-    /// transaction, never here.
-    expected_recipient_uid: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ThreadMediaRef {
-    asset_id: String,
-    revision: i64,
-    sha256: String,
-}
-
-/// A retained chat-file handle — the daemon re-validates the grammar
-/// and existence; the board never dereferences it to a path.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ThreadAttachment {
-    id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConversationReq {
-    install_id: Option<String>,
-    context_id: Option<String>,
-    subject: Option<String>,
-    general: Option<bool>,
-    /// CAD-1772: `"recruit"` — the master's Recruit conversation.
-    kind: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ThreadRef {
-    kind: String,
-    id: String,
-}
-
-/// CAD-802: the shell chat's current App. The shape alone travels
-/// here — the daemon proves the installation and context against its
-/// own store and stamps the verified binding on the entry.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ThreadApp {
-    install_id: String,
-    /// Absent for an installation-only binding (no context selected).
-    context_id: Option<String>,
 }
 
 /// Alias grammar checked before it reaches the daemon — the same one

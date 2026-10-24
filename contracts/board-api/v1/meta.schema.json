@@ -61,7 +61,15 @@
       "type": "boolean"
     },
     "session": {
-      "description": "The live session (`{id, origin, user, created, ..}`), or null."
+      "description": "The live session, or null. The daemon's session check supplies it;\nthe board relays it untouched.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SessionInfo"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "signed_in": {
       "description": "A live session; `null` when the check could not answer in budget.",
@@ -149,6 +157,127 @@
           ]
         }
       }
+    },
+    "SessionInfo": {
+      "description": "A live board session as the daemon reports it; never the token.",
+      "type": "object",
+      "properties": {
+        "account_id": {
+          "description": "Non-secret durable account handle; null on legacy sessions.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "expires_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        },
+        "idle_expires_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "last_used": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "origin": {
+          "$ref": "#/$defs/SessionOrigin"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionScope"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "user": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionUser"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "user_agent": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "origin",
+        "created",
+        "last_used",
+        "idle_expires_at",
+        "expires_at",
+        "user_agent"
+      ]
+    },
+    "SessionOrigin": {
+      "description": "Where a board session was opened.",
+      "type": "string",
+      "enum": [
+        "loopback",
+        "tailnet",
+        "public"
+      ]
+    },
+    "SessionScope": {
+      "description": "The verified tenancy of a scoped public session.",
+      "type": "object",
+      "properties": {
+        "issuer": {
+          "type": "string"
+        },
+        "organization_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "issuer",
+        "organization_id"
+      ]
+    },
+    "SessionUser": {
+      "description": "The platform-asserted user of a `public` session.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string"
+        },
+        "handle": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "role": {
+          "description": "The mapped Cadence role: `operator` or `member`.",
+          "type": "string"
+        },
+        "sub": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sub",
+        "email",
+        "name",
+        "role",
+        "handle"
+      ]
     }
   }
 }

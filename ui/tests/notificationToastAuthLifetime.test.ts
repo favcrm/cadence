@@ -47,6 +47,10 @@ function proof(id: string, sub: string): Meta {
     // This fixture mocks that route, so it models that surface.
     hosted: true,
     anonymous_reads: false,
+    device_login: false,
+    login_hint: "cadence ui login",
+    platform_account_configured: false,
+    tab_signed_out: false,
     read_only: false,
     signed_in: true,
     operator: true,

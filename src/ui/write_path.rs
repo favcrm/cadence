@@ -4,11 +4,13 @@
 //! `write_reply`) the read side reuses.
 
 use std::collections::{BTreeMap, HashMap};
-
-use cadence_core::board_api::{CardAgent, IssueDetail};
 use std::io::Read;
 use std::path::Path;
 
+use cadence_core::board_api::{
+    AgentRegisterReq, CardAgent, CommentReq, IssueDetail, LinkReq, NewIssueReq, PatchReq, RefReq,
+    ReportReq,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
@@ -158,81 +160,6 @@ pub(crate) fn parse_json<T: for<'de> Deserialize<'de>>(
     serde_json::from_slice(bytes).map_err(|e| err_response(400, &format!("bad request json: {e}")))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct NewIssueReq {
-    project: String,
-    title: String,
-    priority: Option<String>,
-    owner: Option<String>,
-    component: Option<String>,
-    tags: Option<Vec<String>>,
-    parent: Option<String>,
-    blocked_by: Option<Vec<String>>,
-    /// CAD-140: the board's report/idea composer files the description
-    /// with the issue — one call instead of create-then-comment.
-    /// `None`/blank keeps `new_issue`'s default body.
-    pub(crate) body: Option<String>,
-}
-
-/// CAD-140: `POST /api/reports` — file a question, feedback, idea or
-/// bug through the canonical intake path. `project` is the board the
-/// operator files from: ideas land there, while questions, feedback
-/// and bugs route to the `cadence` project like `cadence report` (the
-/// server decides — the UI never routes). Unknown fields are refused
-/// so a forged `by`/`actor` never reaches the write.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReportReq {
-    kind: String,
-    project: String,
-    title: String,
-    priority: Option<String>,
-    body: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PatchReq {
-    status: Option<String>,
-    priority: Option<String>,
-    /// `""` clears owner.
-    owner: Option<String>,
-    /// `""` clears component.
-    component: Option<String>,
-    title: Option<String>,
-    body: Option<String>,
-    /// Replaces the tag list; `[]` clears it.
-    tags: Option<Vec<String>>,
-    if_rev: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct LinkReq {
-    #[serde(rename = "type")]
-    kind: String,
-    target: String,
-    if_rev: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RefReq {
-    kind: String,
-    url: Option<String>,
-    path: Option<String>,
-    label: Option<String>,
-    if_rev: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CommentReq {
-    body: String,
-    if_rev: Option<String>,
-}
-
 /// A write op's outcome → HTTP response. Conflicts are 409 with the
 /// reason; success re-reads the issue and returns the fresh card and
 /// detail payloads so the UI needs no second fetch.
@@ -380,30 +307,6 @@ pub(crate) fn post_report(
         }
         Err(e) => err_response(500, &format!("report filed but reload failed: {e}")),
     }
-}
-
-/// Body for `POST /api/agents`. Every field is one `rpc_register` reads;
-/// `deny_unknown_fields` refuses identity-shaped keys (`by`, `actor`,
-/// `operator`, …) and anything else the daemon has no say in. Location is
-/// not a daemon field: `cloud` pins provider and endpoint kind to `sandbox`.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AgentRegisterReq {
-    alias: String,
-    /// Start blank only; a `catalogue` hire takes the runtime from the install.
-    location: Option<String>,
-    provider: Option<String>,
-    endpoint_kind: Option<String>,
-    role: Option<String>,
-    team_role: Option<String>,
-    model_policy: Option<String>,
-    cwd: Option<String>,
-    sandbox: Option<String>,
-    instructions: Option<String>,
-    params: Option<String>,
-    /// CAD-1752: hire from this role of `GET /api/agent-roles`.
-    catalogue: Option<String>,
-    look: Option<String>,
 }
 
 /// Maps a setup location to the `(provider, endpoint_kind)` pair the daemon
@@ -2439,9 +2342,9 @@ pub(crate) fn send(request: Request, mut resp: HttpResp, head_only: bool) {
     }
 }
 
-/// Merge the `by_issue` runtime strip into a card/detail payload —
-/// cards get `agents: [{alias, task, task_state, state, message,
-/// resume}]` only when a job actually binds agents to the issue.
+/// Merge the `by_issue` runtime strip into an issue detail — it gets
+/// `agents: [{alias, task, task_state, state, message, resume}]` only when
+/// a job actually binds agents to the issue.
 pub(crate) fn with_agents(
     mut payload: IssueDetail,
     by_issue: &BTreeMap<String, Vec<CardAgent>>,

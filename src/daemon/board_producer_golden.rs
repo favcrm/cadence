@@ -186,6 +186,9 @@ fn master_state_live_session_bytes_are_unchanged() {
     );
 }
 
+/// Zeroes `created`, `at` and `updated`, so these goldens do not pin the
+/// float formatting of those wall-clock fields; the `since` values the
+/// master_state goldens pin from fixed clocks do.
 fn scrub(v: &mut Value, thread_id: &str) {
     match v {
         Value::Object(map) => {

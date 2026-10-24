@@ -287,7 +287,7 @@ async function main() {
     equal(masterStatus(agents([{ alias: "master", state: "stopped" }]), false).kind, "stopped", "stopped");
     equal(masterStatus(agents([{ alias: "master", state: "idle" }]), false), { kind: "running", state: "idle" }, "running");
     equal(
-      masterStatus({ daemon: "unreachable", agents: [], totals: null } as AgentsPayload, false).kind,
+      masterStatus({ daemon: "unreachable", agents: [], totals: null, by_issue: {}, refresh_error: false, snapshot_age_secs: 0, stale: false } as AgentsPayload, false).kind,
       "offline",
       "daemon down",
     );

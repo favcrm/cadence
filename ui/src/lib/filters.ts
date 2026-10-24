@@ -74,8 +74,8 @@ export const activeCount = (f: BoardFilters) =>
   PARAMS.reduce((n, [facet]) => n + f[facet].length, 0);
 
 export function matches(f: BoardFilters, t: IssueCard): boolean {
-  const any = (want: string[], have?: string) =>
-    want.length === 0 || (have !== undefined && want.includes(have));
+  const any = (want: string[], have?: string | null) =>
+    want.length === 0 || (typeof have === "string" && want.includes(have));
   return (
     f.tags.every((tag) => (t.tags ?? []).includes(tag)) &&
     any(f.epics, t.parent) &&

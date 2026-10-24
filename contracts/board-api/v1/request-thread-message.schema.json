@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadMessageReq",
+  "type": "object",
+  "properties": {
+    "app": {
+      "description": "CAD-802: the shell chat's current installation/context. Never\nauthority — the daemon resolves both against its store and\nrefuses unknown installs, unknown/archived contexts and any\nextra key (including a browser-stamped `verified`).",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadApp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "attachments": {
+      "description": "CAD-1168: retained chat-file ids from `/api/chat/upload`. The\ndaemon's `thread_attachments` resolves them — this relay only\ncarries `{id}` handles through, never names or paths.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/ThreadAttachment"
+      }
+    },
+    "conversation": {
+      "description": "CAD-1098: a selector among the conversations of `app`'s\ninstallation — never authority; the daemon checks it.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "expected_recipient_uid": {
+      "description": "CAD-1591: the contextual-reply recipient constraint — the uid the\noperator's composer recorded. Relayed verbatim; the daemon\nvalidates the shape and fences it inside the enqueue\ntransaction, never here.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "media_refs": {
+      "description": "One retained library image. The daemon re-proves id, revision and digest.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/ThreadMediaRef"
+      }
+    },
+    "message": {
+      "description": "Client-chosen id: a retried POST is the same message, not two.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "refs": {
+      "description": "CAD-574: needs-me subjects the message cites (the rail's \"Ask\nmaster\"). The daemon's `thread_refs` is the strict side — this\nfield only carries `{kind,id}` pairs through the relay.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/ThreadRef"
+      }
+    },
+    "text": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "text"
+  ],
+  "$defs": {
+    "ThreadApp": {
+      "description": "CAD-802: the shell chat's current App. The shape alone travels\nhere — the daemon proves the installation and context against its\nown store and stamps the verified binding on the entry.",
+      "type": "object",
+      "properties": {
+        "context_id": {
+          "description": "Absent for an installation-only binding (no context selected).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "install_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "install_id"
+      ]
+    },
+    "ThreadAttachment": {
+      "description": "A retained chat-file handle — the daemon re-validates the grammar\nand existence; the board never dereferences it to a path.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id"
+      ]
+    },
+    "ThreadMediaRef": {
+      "type": "object",
+      "properties": {
+        "asset_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "asset_id",
+        "revision",
+        "sha256"
+      ]
+    },
+    "ThreadRef": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "id"
+      ]
+    }
+  }
+}

@@ -24,6 +24,45 @@ export interface ActivityEntry {
   title?: string | null;
 }
 
+/** A provider allowance record as the store keeps it. The envelope is fixed;
+ * `data` is the provider's own report (for Codex, its rate-limit buckets). */
+export interface AgentQuota {
+  account_id?: string | null;
+  assignee: string;
+  data: unknown;
+  observed_at: string;
+  provider: string;
+  /** Why the state is not `available`; absent when it is. */
+  reason?: string | null;
+  source: string;
+  /** `available` | `unknown` | `unavailable` | `error` | `blocked` | `stale`. */
+  state: string;
+  thread_id: string;
+  updated_at: string;
+}
+
+/** Body for `POST /api/agents`. Every field is one `rpc_register` reads;
+ * `deny_unknown_fields` refuses identity-shaped keys (`by`, `actor`,
+ * `operator`, …) and anything else the daemon has no say in. Location is
+ * not a daemon field: `cloud` pins provider and endpoint kind to `sandbox`. */
+export interface AgentRegisterReq {
+  alias: string;
+  /** CAD-1752: hire from this role of `GET /api/agent-roles`. */
+  catalogue?: string | null;
+  cwd?: string | null;
+  endpoint_kind?: string | null;
+  instructions?: string | null;
+  /** Start blank only; a `catalogue` hire takes the runtime from the install. */
+  location?: string | null;
+  look?: string | null;
+  model_policy?: string | null;
+  params?: string | null;
+  provider?: string | null;
+  role?: string | null;
+  sandbox?: string | null;
+  team_role?: string | null;
+}
+
 /** One `/api/agents` row. Mailboxes (`inbox: true`) carry the unread
  * fields; workers carry the rest of the optional ones. */
 export interface AgentRow {
@@ -60,8 +99,9 @@ export interface AgentRow {
   parked: number;
   provider?: string | null;
   queued: number;
-  /** Optional account/pool allowance views; null means unavailable. */
-  quota?: unknown;
+  /** The provider allowance record; null means unavailable. The store
+   * writes it only through `canonical_quota`, so the envelope is fixed. */
+  quota?: AgentQuota | null;
   /** The daemon's fence text, which names the recovery commands. */
   recovery?: string | null;
   resume?: string | null;
@@ -165,12 +205,26 @@ export interface ClaimCard {
   stale?: string | null;
 }
 
+export interface CommentReq {
+  body: string;
+  if_rev?: string | null;
+}
+
 export interface CommentRow {
   at: string;
   author: string;
   body: string;
   kind?: string | null;
   name: string;
+}
+
+export interface ConversationReq {
+  context_id?: string | null;
+  general?: boolean | null;
+  install_id?: string | null;
+  /** CAD-1772: `"recruit"` — the master's Recruit conversation. */
+  kind?: string | null;
+  subject?: string | null;
 }
 
 export type DaemonReach = "reachable" | "unreachable";
@@ -180,6 +234,16 @@ export interface DeliverySyncMeta {
   every_secs: number;
   gh?: string | null;
   gh_error?: string | null;
+}
+
+/** One reason an epic is not on track, with its next action. */
+export interface HealthReason {
+  /** `blocked` | `stage_time` | `stalled`. */
+  cause: string;
+  detail: string;
+  issue: string;
+  next: string;
+  owner?: string | null;
 }
 
 /** One `git log` line of the issue's `issue.md`. */
@@ -297,6 +361,12 @@ export interface LinkRef {
   title?: string | null;
 }
 
+export interface LinkReq {
+  if_rev?: string | null;
+  target: string;
+  type: string;
+}
+
 /** The live session's context usage, when the provider answers `stats`. */
 export interface MasterContext {
   percent?: number | null;
@@ -377,8 +447,9 @@ export interface MetaResponse {
   operator?: boolean | null;
   platform_account_configured: boolean;
   read_only: boolean;
-  /** The live session (`{id, origin, user, created, ..}`), or null. */
-  session?: unknown;
+  /** The live session, or null. The daemon's session check supplies it;
+   * the board relays it untouched. */
+  session?: SessionInfo | null;
   /** A live session; `null` when the check could not answer in budget. */
   signed_in?: boolean | null;
   tab_signed_out: boolean;
@@ -388,12 +459,53 @@ export interface MetaResponse {
   version: string;
 }
 
+export interface NewIssueReq {
+  blocked_by?: string[] | null;
+  /** CAD-140: the board's report/idea composer files the description
+   * with the issue — one call instead of create-then-comment.
+   * `None`/blank keeps `new_issue`'s default body. */
+  body?: string | null;
+  component?: string | null;
+  owner?: string | null;
+  parent?: string | null;
+  priority?: string | null;
+  project: string;
+  tags?: string[] | null;
+  title: string;
+}
+
 /** A notes-chain entry tagged to the issue. */
 export interface NoteRow {
   at: string;
   kind: string;
   name: string;
   title: string;
+}
+
+export interface PatchReq {
+  body?: string | null;
+  /** `""` clears component. */
+  component?: string | null;
+  if_rev?: string | null;
+  /** `""` clears owner. */
+  owner?: string | null;
+  priority?: string | null;
+  status?: string | null;
+  /** Replaces the tag list; `[]` clears it. */
+  tags?: string[] | null;
+  title?: string | null;
+}
+
+/** Work-item counts by status bucket. */
+export interface ProgressCounts {
+  blocked: number;
+  doing: number;
+  done: number;
+  dropped: number;
+  /** Backlog plus ready. */
+  open: number;
+  review: number;
+  total: number;
 }
 
 /** A typed link kept on an issue: PR, commit, note, preview, message, ...
@@ -422,6 +534,28 @@ export interface Ref {
   worktree?: string | null;
 }
 
+export interface RefReq {
+  if_rev?: string | null;
+  kind: string;
+  label?: string | null;
+  path?: string | null;
+  url?: string | null;
+}
+
+/** CAD-140: `POST /api/reports` — file a question, feedback, idea or
+ * bug through the canonical intake path. `project` is the board the
+ * operator files from: ideas land there, while questions, feedback
+ * and bugs route to the `cadence` project like `cadence report` (the
+ * server decides — the UI never routes). Unknown fields are refused
+ * so a forged `by`/`actor` never reaches the write. */
+export interface ReportReq {
+  body?: string | null;
+  kind: string;
+  priority?: string | null;
+  project: string;
+  title: string;
+}
+
 /** A running kickoff reduced to what the board shows. */
 export interface RunningMessage {
   /** Epoch seconds (the daemon serializes `Message.created` as f64). */
@@ -429,6 +563,63 @@ export interface RunningMessage {
   id?: string | null;
   summary?: string | null;
   task?: string | null;
+}
+
+/** A live board session as the daemon reports it; never the token. */
+export interface SessionInfo {
+  /** Non-secret durable account handle; null on legacy sessions. */
+  account_id?: string | null;
+  created: number;
+  expires_at: number;
+  id: string;
+  idle_expires_at: number;
+  last_used: number;
+  origin: SessionOrigin;
+  scope?: SessionScope | null;
+  user?: SessionUser | null;
+  user_agent: string;
+}
+
+/** Where a board session was opened. */
+export type SessionOrigin = "loopback" | "tailnet" | "public";
+
+/** The verified tenancy of a scoped public session. */
+export interface SessionScope {
+  issuer: string;
+  organization_id: string;
+}
+
+/** The platform-asserted user of a `public` session. */
+export interface SessionUser {
+  email: string;
+  handle: string;
+  name: string;
+  /** The mapped Cadence role: `operator` or `member`. */
+  role: string;
+  sub: string;
+}
+
+/** One move `epic_stage` accepts from the epic's current stage. */
+export interface StageMove {
+  forward: boolean;
+  /** Only the proven operator may make it. */
+  needs_operator: boolean;
+  to: string;
+}
+
+/** CAD-802: the shell chat's current App. The shape alone travels
+ * here — the daemon proves the installation and context against its
+ * own store and stamps the verified binding on the entry. */
+export interface ThreadApp {
+  /** Absent for an installation-only binding (no context selected). */
+  context_id?: string | null;
+  install_id: string;
+}
+
+/** A retained chat-file handle — the daemon re-validates the grammar
+ * and existence; the board never dereferences it to a path. */
+export interface ThreadAttachment {
+  id: string;
 }
 
 /** One thread entry. For a message entry of the same thread the payload
@@ -460,6 +651,41 @@ export interface ThreadInfo {
   updated: number;
 }
 
+export interface ThreadMediaRef {
+  asset_id: string;
+  revision: number;
+  sha256: string;
+}
+
+export interface ThreadMessageReq {
+  /** CAD-802: the shell chat's current installation/context. Never
+   * authority — the daemon resolves both against its store and
+   * refuses unknown installs, unknown/archived contexts and any
+   * extra key (including a browser-stamped `verified`). */
+  app?: ThreadApp | null;
+  /** CAD-1168: retained chat-file ids from `/api/chat/upload`. The
+   * daemon's `thread_attachments` resolves them — this relay only
+   * carries `{id}` handles through, never names or paths. */
+  attachments?: ThreadAttachment[] | null;
+  /** CAD-1098: a selector among the conversations of `app`'s
+   * installation — never authority; the daemon checks it. */
+  conversation?: string | null;
+  /** CAD-1591: the contextual-reply recipient constraint — the uid the
+   * operator's composer recorded. Relayed verbatim; the daemon
+   * validates the shape and fences it inside the enqueue
+   * transaction, never here. */
+  expected_recipient_uid?: string | null;
+  /** One retained library image. The daemon re-proves id, revision and digest. */
+  media_refs?: ThreadMediaRef[] | null;
+  /** Client-chosen id: a retried POST is the same message, not two. */
+  message?: string | null;
+  /** CAD-574: needs-me subjects the message cites (the rail's "Ask
+   * master"). The daemon's `thread_refs` is the strict side — this
+   * field only carries `{kind,id}` pairs through the relay. */
+  refs?: ThreadRef[] | null;
+  text: string;
+}
+
 /** `thread_read` (daemon RPC; `GET /api/threads/<alias>` relays it).
  * A forward read carries `cursor`; a backward one also `more_before`. */
 export interface ThreadPage {
@@ -471,23 +697,61 @@ export interface ThreadPage {
   thread?: ThreadInfo | null;
 }
 
+export interface ThreadRef {
+  id: string;
+  kind: string;
+}
+
 /** The CAD-405 work block on a card: type, milestone, size; stage,
  * progress and health on epics. */
 export interface WorkBlock {
   config_error?: string | null;
   config_unapproved?: string | null;
-  /** Epics only: `{state, reasons, days_in_stage, ..}`. */
-  health?: unknown;
+  /** Epics only. */
+  health?: WorkHealth | null;
   milestone?: string | null;
   milestone_source?: string | null;
   /** Epics only: weighted child progress. */
-  progress?: unknown;
+  progress?: WorkProgress | null;
   size?: string | null;
-  /** Epics only: `{id, source, since, exit, next, next_needs_operator,
-   * terminal, stages, moves}`. */
-  stage?: unknown;
+  /** Epics only; `null` otherwise. */
+  stage?: WorkStage | null;
   type: string;
   /** `field` | `implicit`. */
   type_source: string;
   weight: number;
+}
+
+/** An epic's health: `stalled` is time in stage, not child activity. */
+export interface WorkHealth {
+  days_in_stage?: number | null;
+  limit_days: number;
+  reasons: HealthReason[];
+  /** `on_track` | `at_risk` | `stalled`. */
+  state: string;
+}
+
+/** Size-weighted progress over a set of work items. */
+export interface WorkProgress {
+  counts: ProgressCounts;
+  done_weight: number;
+  ratio: number;
+  total_weight: number;
+}
+
+/** An epic's stage in its project's stage list. */
+export interface WorkStage {
+  /** The exit criterion of this stage; `null` for a stage the list lacks. */
+  exit?: string | null;
+  id: string;
+  /** The legal moves from here; empty while PROJECT.md cannot be loaded. */
+  moves: StageMove[];
+  next?: string | null;
+  next_needs_operator: boolean;
+  /** When the epic entered the stage (ISO); `null` when unknown. */
+  since?: string | null;
+  /** `field` | `plan` | `status` | `default`. */
+  source: string;
+  stages: string[];
+  terminal: boolean;
 }

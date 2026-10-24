@@ -8,6 +8,12 @@ function equal(actual: unknown, expected: unknown, what: string): void {
 }
 
 const base: Meta = {
+  anonymous_reads: false,
+  device_login: false,
+  hosted: false,
+  login_hint: "cadence ui login",
+  platform_account_configured: false,
+  tab_signed_out: false,
   read_only: false,
   actor: "operator (ui)",
   tailnet_url: null,

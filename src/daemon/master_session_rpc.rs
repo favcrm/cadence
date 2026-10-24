@@ -107,7 +107,7 @@ impl Shared {
                 window: u.get("contextWindow").cloned().unwrap_or(Value::Null),
                 percent: u.get("percent").cloned().unwrap_or(Value::Null),
             });
-        let session_json = session.as_ref().map(|s| MasterSession {
+        let session = session.as_ref().map(|s| MasterSession {
             id: s.get("sessionId").cloned().unwrap_or(Value::Null),
             messages: s.get("messageCount").cloned().unwrap_or(Value::Null),
             streaming: s.get("isStreaming").cloned().unwrap_or(Value::Null),
@@ -185,7 +185,7 @@ impl Shared {
                 .unwrap_or(Value::Null),
             effort,
             context,
-            session: session_json,
+            session,
             commands: commands.iter().map(|c| (*c).to_string()).collect(),
             turn,
             queue,

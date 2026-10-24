@@ -236,7 +236,7 @@ export function turnState(
       typeof c === "number" ? c : c ? Date.parse(c) / 1000 : null;
     return {
       kind: "working",
-      message: row.message.id,
+      message: row.message.id ?? "",
       summary: row.message.summary,
       since: since !== null && Number.isNaN(since) ? null : since,
       queued: row.queued,

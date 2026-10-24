@@ -23,7 +23,9 @@ function equal(actual: unknown, expected: unknown, what: string): void {
 }
 
 const STAGES = ["shape", "build", "verify", "release", "done"];
-const stage = (id: string, moves: WorkStage["moves"], source = "field"): WorkStage => ({
+const noCounts = { open: 0, doing: 0, review: 0, blocked: 0, done: 0, dropped: 0, total: 0 };
+// `moves` is undefined for a server that predates the field; the wire type always has it.
+const stage = (id: string, moves: WorkStage["moves"] | undefined, source = "field"): WorkStage => ({
   id,
   source,
   since: "2026-09-20T00:00:00Z",
@@ -32,7 +34,7 @@ const stage = (id: string, moves: WorkStage["moves"], source = "field"): WorkSta
   next_needs_operator: false,
   terminal: id === "done",
   stages: STAGES,
-  moves,
+  moves: moves as WorkStage["moves"],
 });
 const OPERATOR: Viewer = { readOnly: false, operator: true };
 const AGENT: Viewer = { readOnly: false, operator: false };
@@ -134,7 +136,7 @@ async function main() {
   // Progress is the weights, never a count; nothing weighted is no percent.
   {
     equal(
-      progressView({ done_weight: 8, total_weight: 12, ratio: 0.67, counts: {} }),
+      progressView({ done_weight: 8, total_weight: 12, ratio: 0.67, counts: noCounts }),
       { done: 8, total: 12, percent: 67, label: "8/12 weight" },
       "weighted",
     );

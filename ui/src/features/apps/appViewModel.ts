@@ -777,7 +777,7 @@ export function notReadyText(
  * worker that can run.
  */
 export function teamCandidates(
-  agents: { alias: string; state?: string; inbox?: boolean }[] | undefined,
+  agents: { alias: string; state?: string | null; inbox?: boolean | null }[] | undefined,
 ): { alias: string; state: string }[] {
   return (agents ?? [])
     .filter((a) => !a.inbox)
