@@ -45,7 +45,7 @@ export default function HostedSmtpConnect({
   const [preset, setPreset] = useState<Preset>(PRESETS[0]);
   const [host, setHost] = useState(PRESETS[0].host);
   const [tls, setTls] = useState<TlsMode>(PRESETS[0].tls);
-  const [address, setAddress] = useState("");
+  const [address, setAddress] = useState(connected ?? "");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
   const [consent, setConsent] = useState(false);
@@ -84,14 +84,13 @@ export default function HostedSmtpConnect({
     }, riskNeeded && consent)
       .then(() => setPassword(""))
       .catch((e: unknown) => {
-        // Nothing was stored on this refusal; keep the typed password
-        // so the operator can tick and resend without retyping it.
+        // A refusal stores nothing; never keep the secret after the request
+        // settles, including the custody-consent refusal. The operator
+        // re-enters the password after ticking consent.
+        setPassword("");
         if (e instanceof ApiError && e.code === "custody_unprotected") {
           setRiskNeeded(true);
-          setError(connectErrorText(e));
-          return;
         }
-        setPassword("");
         setError(connectErrorText(e));
       })
       .finally(() => setPending(false));
@@ -116,12 +115,12 @@ export default function HostedSmtpConnect({
             disabled={pending}
             onClick={() => choose(p)}
           >
-            {p.label}
+            {t(p.label)}
           </Button>
         ))}
       </div>
       <p className="text-label text-ink-400 break-words" data-hint={preset.id}>
-        {preset.hint}
+        {t(preset.hint)}
       </p>
       <div className="crm-field-row">
         <div className="crm-field">

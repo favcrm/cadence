@@ -32,6 +32,7 @@ import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
 import Connections from "./features/settings/Connections";
 import EmailSending from "./features/settings/EmailSending";
+import SettingsLayout from "./features/settings/SettingsLayout";
 import Templates from "./features/templates/Templates";
 import Update from "./features/settings/Update";
 import Outbox from "./features/outbox/Outbox";
@@ -1261,41 +1262,40 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? boardReadOnly : null} />
         )}
         {route.screen === "settings" && (
-          <SectionTabs
-            label="settings"
-            tabs={[
-              { label: "Agents", href: hrefFor({ screen: "settings", section: "models" }), on: route.section === "models" },
-              { label: "Connections", href: hrefFor({ screen: "settings", section: "connections" }), on: route.section === "connections" },
-              // CAD-1312: Email sending leaves the settings nav; its
-              // /settings/email route and screen remain reachable directly.
-              { label: "Memory", href: hrefFor({ screen: "settings", section: "memory" }), on: route.section === "memory" },
-              { label: "Update", href: hrefFor({ screen: "settings", section: "update" }), on: route.section === "update" },
-              ...(meta?.platform_account_configured ? [{ label: "Account", href: hrefFor({ screen: "settings", section: "account" }), on: route.section === "account" }] : []),
-              { label: "Templates", href: hrefFor({ screen: "settings", section: "templates" }), on: route.section === "templates" },
+          <SettingsLayout
+            groups={[
               {
-                label: "Master permissions",
-                href: hrefFor({ screen: "settings", section: "permissions" }),
-                on: route.section === "permissions",
+                label: "Workspace",
+                items: [
+                  { label: "Agents", href: hrefFor({ screen: "settings", section: "models" }), on: route.section === "models" },
+                  { label: "Connections", href: hrefFor({ screen: "settings", section: "connections" }), on: route.section === "connections" },
+                  { label: "Email sending", href: hrefFor({ screen: "settings", section: "email" }), on: route.section === "email" },
+                ],
+              },
+              {
+                label: "System",
+                items: [
+                  { label: "Status", href: hrefFor({ screen: "settings", section: "update" }), on: route.section === "update" },
+                  ...(meta?.platform_account_configured ? [{ label: "Account", href: hrefFor({ screen: "settings", section: "account" }), on: route.section === "account" }] : []),
+                  { label: "Master permissions", href: hrefFor({ screen: "settings", section: "permissions" }), on: route.section === "permissions" },
+                ],
               },
             ]}
-          />
+          >
+            {route.section === "memory" && (
+              <Memory project={project} projects={projects} projectHref={filterHref} onError={writeError} />
+            )}
+            {route.section === "models" && <ModelDefaults />}
+            {route.section === "connections" && (
+              <Connections viewer={viewer} page={route.page} />
+            )}
+            {route.section === "email" && <EmailSending viewer={viewer} />}
+            {route.section === "templates" && <Templates />}
+            {route.section === "account" && <PlatformAccount />}
+            {route.section === "update" && <Update viewer={viewer} health={health} />}
+            {route.section === "permissions" && <MasterPermissions viewer={{ ...viewer, boardReadOnly, signedIn: meta?.signed_in === true, sessionId: meta?.session?.id ?? null }} />}
+          </SettingsLayout>
         )}
-        {route.screen === "settings" && route.section === "memory" && (
-          <Memory project={project} projects={projects} projectHref={filterHref} onError={writeError} />
-        )}
-        {route.screen === "settings" && route.section === "models" && <ModelDefaults />}
-        {route.screen === "settings" && route.section === "connections" && (
-          <Connections viewer={viewer} page={route.page} />
-        )}
-        {route.screen === "settings" && route.section === "email" && (
-          <EmailSending viewer={viewer} />
-        )}
-        {route.screen === "settings" && route.section === "templates" && <Templates />}
-        {route.screen === "settings" && route.section === "account" && <PlatformAccount />}
-        {route.screen === "settings" && route.section === "update" && (
-          <Update viewer={viewer} />
-        )}
-        {route.screen === "settings" && route.section === "permissions" && <MasterPermissions viewer={{ ...viewer, boardReadOnly, signedIn: meta?.signed_in === true, sessionId: meta?.session?.id ?? null }} />}
         {screen === "notFound" && (
           <main className="px-4 lg:px-8 pt-10 pb-9">
             <h1 className="text-section font-semibold text-ink-100">{t("Nothing lives here")}</h1>

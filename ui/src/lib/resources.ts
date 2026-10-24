@@ -279,7 +279,17 @@ export const resources = {
    */
   connectionProviders: cache.resource<ConnectionProvider[]>(
     "connectionProviders",
-    () => api.connectionProviders().then((r) => r.providers),
+    () =>
+      api
+        .connectionProviders()
+        .then((r) => r.providers)
+        .catch((error: unknown) => {
+          // A tenant board does not carry the provider catalogue. That is a
+          // known empty directory, not a transient read failure; other
+          // failures stay failed so the catalogue can be retried.
+          if (error instanceof ApiError && error.status === 501) return [];
+          throw error;
+        }),
     { isEmpty: (rows) => rows.length === 0 },
   ),
   /**
