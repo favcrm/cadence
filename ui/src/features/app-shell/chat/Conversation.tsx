@@ -1689,8 +1689,16 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           </button>
         </div>
       )}
-      {emptyState === null && (
-      <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} role="log" aria-live="polite" aria-relevant="additions" aria-label={t("Conversation messages")}>
+      <ol
+        className="app-chat-list"
+        ref={listRef}
+        onScroll={onListScroll}
+        role="log"
+        aria-live="polite"
+        aria-relevant="additions"
+        aria-label={t("Conversation messages")}
+        hidden={emptyState !== null}
+      >
         {shown.map((item, i) => (
           <li
             key={item.key}
@@ -1714,7 +1722,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           </li>
         ))}
       </ol>
-      )}
       <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
       {unseen > 0 && (
         <button type="button" className="lnk text-label app-chat-jump" onClick={jumpToLatest} data-jump-to-latest>

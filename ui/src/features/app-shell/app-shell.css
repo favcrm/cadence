@@ -342,6 +342,12 @@
   padding: 0;
 }
 
+/* Keep the log node mounted while the empty state is shown: its native
+   scroll/follow handlers bind once to this node. */
+.app-chat-list[hidden] {
+  display: none;
+}
+
 .app-chat-form {
   display: grid;
   gap: 0.5rem;
