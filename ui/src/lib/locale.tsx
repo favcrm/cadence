@@ -592,6 +592,7 @@ Object.assign(zhTW, {
   "Refresh board": "重新整理看板",
   "Checking connection…": "正在檢查連線…",
   "Daemon connected": "Daemon 已連線",
+  "Daemon disconnected": "Daemon 已中斷連線",
   "Daemon disconnected — live activity is unavailable": "Daemon 已中斷連線 — 即時活動無法使用",
   "Theme:": "佈景主題：",
   "Switch to": "切換為",
