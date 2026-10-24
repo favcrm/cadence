@@ -298,25 +298,31 @@ assert(text().includes("All apps") && text().includes("Reports"), "← All apps 
 assert(text().includes("This app's screen is unavailable."), "an app without its own screen shows the one unavailable state");
 assert(!text().includes("No records yet") && !text().includes("CAD-781"), "core draws no records UI of its own");
 assert(text().includes("Master answer stays connected"), "the left pane shows the real master thread");
+assert(host.querySelector(".app-chat-avatar .agent-avatar"), "the chat header shows the master avatar");
+assert(!host.querySelector(".app-chat-mark"), "the static star mark is gone");
 assert(!text().includes("ctx-a"), "CAD-1051: internal context ids never render in the chat");
 equal(panes(), 1, "exactly one chat pane in the document");
 equal(boxes(), 1, "exactly one chat draft box id in the document");
 assert(!host.querySelector('[aria-label="App context"]'), "context selector removed — context follows URL only");
 
-// Narrow switch (approved mock): a full-width Assistant | Workspace
-// segmented control replaces the overlay drawer. The assistant is shown
-// by default; both panels stay mounted so the draft survives switching.
-const tabs = Array.from(host.querySelectorAll<HTMLButtonElement>(".app-shell-panel-tab"));
-equal(tabs.map((t) => t.textContent), ["Assistant", "Workspace"], "segmented Assistant | Workspace switch");
+// Narrow switch: one compact top-right toggle in the shell crumb replaces
+// the full-width segmented row. The assistant is shown by default; both
+// panels stay mounted so the draft survives switching.
+const panelToggle = host.querySelector<HTMLButtonElement>(".app-shell-panel-toggle");
+assert(panelToggle, "the narrow top-right pane toggle exists");
+assert(!host.querySelector(".app-shell-panels"), "the full-width Assistant | Workspace row is gone");
 assert(!host.querySelector(".app-shell-chat-toggle") && !host.querySelector(".app-shell-scrim"), "no overlay drawer toggle or scrim remains");
 const grid = host.querySelector(".app-shell-grid") as HTMLElement;
 equal(grid.getAttribute("data-shell-panel"), "chat", "the assistant is the default narrow panel");
-equal(tabs[0].getAttribute("aria-pressed"), "true", "Assistant tab is pressed by default");
+equal(panelToggle.getAttribute("aria-pressed"), "false", "the toggle is not pressed for the assistant");
+equal(panelToggle.getAttribute("aria-label"), "Open workspace", "the toggle names its next action");
 await fill("#app-shell-chat-box", "unsent shell draft");
-await click(tabs[1]);
-equal(grid.getAttribute("data-shell-panel"), "work", "Workspace tab shows the workspace");
-equal(tabs[1].getAttribute("aria-pressed"), "true", "Workspace tab pressed");
-await click(tabs[0]);
+await click(panelToggle);
+equal(grid.getAttribute("data-shell-panel"), "work", "the toggle shows the workspace");
+equal(panelToggle.getAttribute("aria-pressed"), "true", "the workspace toggle is pressed");
+equal(panelToggle.getAttribute("aria-label"), "Back to assistant", "the toggle flips its accessible name");
+await click(panelToggle);
+equal(grid.getAttribute("data-shell-panel"), "chat", "the toggle returns to the assistant");
 equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement)?.value, "unsent shell draft", "one pane keeps one draft across switching");
 equal(panes(), 1, "switching never mounts a second chat pane");
 

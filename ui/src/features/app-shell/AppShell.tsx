@@ -275,9 +275,10 @@ export default function AppShell({
   // direct links and browser back keep scope.
   const view: OutletView = query.get("appview") === "new" ? "new" : "list";
   const recordId = query.get("record");
-  // Narrow widths: one full-width panel at a time (the approved mock's
-  // Assistant | Workspace switch). Both stay mounted — only CSS hides the
-  // other — so draft, stream and workspace state survive switching.
+  // Narrow widths: one full-width panel at a time. The compact top-right
+  // toggle in the crumb switches Assistant/Workspace. Both stay mounted —
+  // only CSS hides the other — so draft, stream and workspace state survive
+  // switching.
   const [panel, setPanel] = useState<"chat" | "work">("chat");
   const mediaTarget = useRef<MediaComposerTarget | null>(null);
   const registerMediaTarget = useCallback((target: MediaComposerTarget) => {
@@ -900,6 +901,21 @@ export default function AppShell({
         )}
 
         <span className="flex-1" />
+        <button
+          type="button"
+          className="app-shell-panel-toggle"
+          data-shell-panel-toggle
+          aria-label={t(panel === "chat" ? "Open workspace" : "Back to assistant")}
+          aria-pressed={panel === "work"}
+          aria-controls={panel === "chat" ? "app-shell-workspace" : "app-shell-chat"}
+          title={t(panel === "chat" ? "Open workspace" : "Back to assistant")}
+          onClick={() => setPanel(panel === "chat" ? "work" : "chat")}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="4" y="5" width="16" height="14" rx="2" />
+            <path d="M14 5v14" />
+          </svg>
+        </button>
         {launchableWorkflows.map((flow) => (
           <Button
             key={flow.name}
@@ -933,21 +949,6 @@ export default function AppShell({
             {t(previewKey === null ? "Contract preview (dev)" : "Exit contract preview")}
           </a>
         )}
-      </div>
-
-      <div className="app-shell-panels" role="group" aria-label={t("Panel")}>
-        {(["chat", "work"] as const).map((p) => (
-          <button
-            key={p}
-            type="button"
-            className="app-shell-panel-tab"
-            aria-pressed={panel === p}
-            aria-controls={p === "chat" ? "app-shell-chat" : "app-shell-workspace"}
-            onClick={() => setPanel(p)}
-          >
-            {t(p === "chat" ? "Assistant" : "Workspace")}
-          </button>
-        ))}
       </div>
 
       <div className="app-shell-grid" data-chat-collapsed={chatCollapsed || undefined} data-shell-panel={panel}>
