@@ -436,10 +436,18 @@ export function useSelectedConversationId(installId: string): string | null {
   return useSyncExternalStore(subscribe, () => readKey(`chat-conv:${installId}`));
 }
 
-export function useChatCollapsed(installId: string): [boolean, (next: boolean) => void] {
+/** The stored choice, or null when this installation was never toggled. */
+export function readChatCollapsedChoice(installId: string): boolean | null {
+  const raw = readKey(`chat-collapsed:${installId}`);
+  return raw === "1" ? true : raw === "0" ? false : null;
+}
+
+export { resolveChatCollapsed } from "./chatCollapsed";
+
+export function useChatCollapsed(installId: string): [boolean | null, (next: boolean) => void] {
   const raw = useSyncExternalStore(subscribe, () => readKey(`chat-collapsed:${installId}`));
   const set = useCallback((next: boolean) => setCollapsed(installId, next), [installId]);
-  return [raw === "1", set];
+  return [raw === "1" ? true : raw === "0" ? false : null, set];
 }
 
 export interface ConversationLinkRequest {
