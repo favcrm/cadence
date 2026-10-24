@@ -70,5 +70,6 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -eu
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "cadence-core wasm, contract v1"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --latest=false --title "$TAG" --notes "cadence-core wasm, contract v1"
+          gh release edit "$TAG" --latest=false
           gh release upload "$TAG" --clobber dist/core.wasm dist/core.wasm.sha256 dist/*.schema.json
