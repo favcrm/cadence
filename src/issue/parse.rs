@@ -31,11 +31,15 @@ impl AcceptanceItem {
     /// `dispatch` all report: `done` mirrors `checked` for readers
     /// that speak in completion rather than checkbox terms.
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "text": self.text,
-            "checked": self.checked,
-            "done": self.checked,
-        })
+        serde_json::to_value(self.row()).expect("acceptance item serializes")
+    }
+
+    pub fn row(&self) -> cadence_core::board_api::AcceptanceRow {
+        cadence_core::board_api::AcceptanceRow {
+            text: self.text.clone(),
+            checked: self.checked,
+            done: self.checked,
+        }
     }
 }
 

@@ -2,6 +2,28 @@
 // Do not edit: change the Rust types, then `CADENCE_CORE_WRITE_SCHEMA=1 cargo test -p cadence-core`
 // and `bun run --cwd ui gen:board-api`.
 
+/** One checklist item of the `Acceptance` section; `done` mirrors `checked`. */
+export interface AcceptanceRow {
+  checked: boolean;
+  done: boolean;
+  text: string;
+}
+
+/** One merged activity entry: `kind` is `note` (with `note_kind`, `title`,
+ * `name`), `comment` (`author`, `body`, `name`) or `commit` (`commit`,
+ * `subject`). */
+export interface ActivityEntry {
+  at: string;
+  author?: string | null;
+  body?: string | null;
+  commit?: string | null;
+  kind: string;
+  name?: string | null;
+  note_kind?: string | null;
+  subject?: string | null;
+  title?: string | null;
+}
+
 /** One `/api/agents` row. Mailboxes (`inbox: true`) carry the unread
  * fields; workers carry the rest of the optional ones. */
 export interface AgentRow {
@@ -103,6 +125,11 @@ export interface AppOrigin {
   install_id: string;
 }
 
+export interface ArtifactRow {
+  name: string;
+  size: number;
+}
+
 /** One bound agent on an issue card or drawer — from the job binding. */
 export interface CardAgent {
   alias: string;
@@ -138,6 +165,14 @@ export interface ClaimCard {
   stale?: string | null;
 }
 
+export interface CommentRow {
+  at: string;
+  author: string;
+  body: string;
+  kind?: string | null;
+  name: string;
+}
+
 export type DaemonReach = "reachable" | "unreachable";
 
 /** The `gh` this board's delivery sync runs, fixed at start. */
@@ -145,6 +180,69 @@ export interface DeliverySyncMeta {
   every_secs: number;
   gh?: string | null;
   gh_error?: string | null;
+}
+
+/** One `git log` line of the issue's `issue.md`. */
+export interface HistoryEntry {
+  at: string;
+  commit: string;
+  subject: string;
+}
+
+/** `GET /api/issues/:id` and `issue show --json`: the drawer payload.
+ * The board adds `agents` when a job binds agents to the issue. */
+export interface IssueDetail {
+  acceptance: AcceptanceRow[];
+  activity: ActivityEntry[];
+  agents?: CardAgent[] | null;
+  artifacts: ArtifactRow[];
+  blocked: boolean;
+  blocked_reason?: string | null;
+  body: string;
+  checks: CardChecks;
+  claim?: ClaimCard | null;
+  comments: CommentRow[];
+  commits: unknown[];
+  commits_skipped: unknown[];
+  component?: string | null;
+  container: boolean;
+  created: string;
+  /** The issue's front matter as stored. */
+  frontmatter: Record<string, unknown>;
+  history: HistoryEntry[];
+  id: string;
+  links: IssueLinks;
+  notes_chain: NoteRow[];
+  owner?: string | null;
+  parent?: string | null;
+  path: string;
+  paths: string[];
+  /** Plan state, tickets and weighted progress; null unless a plan epic. */
+  plan?: unknown;
+  priority: string;
+  project: string;
+  ready: boolean;
+  refs: Ref[];
+  /** Task reports filed on the issue (`issue/task_report.rs` rows). */
+  reports: unknown[];
+  rev: string;
+  size?: string | null;
+  status: string;
+  status_source: string;
+  tags: string[];
+  title: string;
+  /** The CAD-405 work block (`work::detail`). */
+  work?: WorkBlock | null;
+}
+
+export interface IssueLinks {
+  blocked_by: LinkRef[];
+  blocks: LinkRef[];
+  children: LinkRef[];
+  duplicate_of?: LinkRef | null;
+  duplicates: LinkRef[];
+  parent?: LinkRef | null;
+  relates: LinkRef[];
 }
 
 /** One `GET /api/issues` row: the core card, its work block and, only when
@@ -187,6 +285,16 @@ export interface IssuesResponse {
   refresh_error: boolean;
   snapshot_age_secs: number;
   stale: boolean;
+}
+
+/** A link target in the drawer: the issue's title and status when it is on
+ * the board, else just its id with `missing: true`. */
+export interface LinkRef {
+  id: string;
+  missing: boolean;
+  status?: string | null;
+  status_source?: string | null;
+  title?: string | null;
 }
 
 /** The live session's context usage, when the provider answers `stats`. */
@@ -278,6 +386,14 @@ export interface MetaResponse {
   tailnet_proof?: unknown;
   tailnet_url?: string | null;
   version: string;
+}
+
+/** A notes-chain entry tagged to the issue. */
+export interface NoteRow {
+  at: string;
+  kind: string;
+  name: string;
+  title: string;
 }
 
 /** A typed link kept on an issue: PR, commit, note, preview, message, ...

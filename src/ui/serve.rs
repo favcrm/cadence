@@ -2602,11 +2602,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                             None => send(
                                 request,
                                 json_response(with_agents(
-                                    crate::issue::work::detail_json(
-                                        &pm.dir,
-                                        &read.ctx(&by_id),
-                                        view,
-                                    ),
+                                    crate::issue::work::detail(&pm.dir, &read.ctx(&by_id), view),
                                     &read.by_issue,
                                     &id,
                                 )),

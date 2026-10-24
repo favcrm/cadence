@@ -2,7 +2,9 @@
 //! repository root. One list serves the core's own staleness test and the root
 //! crate's lib test, which the required CI `test` job runs on every PR and in
 //! the merge queue.
-use crate::board_api::{AgentsResponse, IssuesResponse, MasterState, MetaResponse, ThreadPage};
+use crate::board_api::{
+    AgentsResponse, IssueDetail, IssuesResponse, MasterState, MetaResponse, ThreadPage,
+};
 use crate::evaluate::{Refused, Request, Success};
 use crate::issue::IssueCard;
 
@@ -41,6 +43,10 @@ pub fn committed_schemas() -> Vec<(&'static str, String)> {
         (
             "contracts/board-api/v1/meta.schema.json",
             pretty(schemars::schema_for!(MetaResponse)),
+        ),
+        (
+            "contracts/board-api/v1/issue-detail.schema.json",
+            pretty(schemars::schema_for!(IssueDetail)),
         ),
         (
             "contracts/board-api/v1/master-state.schema.json",

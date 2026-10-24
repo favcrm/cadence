@@ -7,7 +7,7 @@
 //! report, a stored session) stays a `serde_json::Value`; `schemars(with)`
 //! then documents the shape without changing a byte of output. A key the
 //! daemon omits is `skip_serializing_if`; a key it sends as `null` is not.
-use crate::issue::IssueCard;
+use crate::issue::{CardChecks, ClaimCard, IssueCard, Ref};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
@@ -421,4 +421,146 @@ pub struct ThreadPage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub more_before: Option<bool>,
     pub reply_seq: i64,
+}
+
+/// A link target in the drawer: the issue's title and status when it is on
+/// the board, else just its id with `missing: true`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct LinkRef {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_source: Option<String>,
+    pub missing: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct IssueLinks {
+    pub parent: Option<LinkRef>,
+    pub children: Vec<LinkRef>,
+    pub blocked_by: Vec<LinkRef>,
+    pub blocks: Vec<LinkRef>,
+    pub relates: Vec<LinkRef>,
+    pub duplicate_of: Option<LinkRef>,
+    pub duplicates: Vec<LinkRef>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ArtifactRow {
+    pub name: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct CommentRow {
+    pub name: String,
+    pub author: String,
+    pub at: String,
+    pub kind: Option<String>,
+    pub body: String,
+}
+
+/// A notes-chain entry tagged to the issue.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct NoteRow {
+    pub name: String,
+    pub kind: String,
+    pub at: String,
+    pub title: String,
+}
+
+/// One checklist item of the `Acceptance` section; `done` mirrors `checked`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct AcceptanceRow {
+    pub text: String,
+    pub checked: bool,
+    pub done: bool,
+}
+
+/// One `git log` line of the issue's `issue.md`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct HistoryEntry {
+    pub commit: String,
+    pub at: String,
+    pub subject: String,
+}
+
+/// One merged activity entry: `kind` is `note` (with `note_kind`, `title`,
+/// `name`), `comment` (`author`, `body`, `name`) or `commit` (`commit`,
+/// `subject`).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ActivityEntry {
+    pub at: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+/// `GET /api/issues/:id` and `issue show --json`: the drawer payload.
+/// The board adds `agents` when a job binds agents to the issue.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct IssueDetail {
+    pub id: String,
+    pub project: String,
+    pub title: String,
+    pub status: String,
+    pub status_source: String,
+    pub priority: String,
+    pub owner: Option<String>,
+    pub claim: Option<ClaimCard>,
+    pub component: Option<String>,
+    pub tags: Vec<String>,
+    pub paths: Vec<String>,
+    pub parent: Option<String>,
+    pub container: bool,
+    pub ready: bool,
+    pub blocked: bool,
+    pub blocked_reason: Option<String>,
+    pub created: String,
+    pub rev: String,
+    /// The issue's front matter as stored.
+    #[schemars(with = "serde_json::Map<String, Value>")]
+    pub frontmatter: Value,
+    pub body: String,
+    pub path: String,
+    pub links: IssueLinks,
+    pub refs: Vec<Ref>,
+    pub artifacts: Vec<ArtifactRow>,
+    pub comments: Vec<CommentRow>,
+    /// Task reports filed on the issue (`issue/task_report.rs` rows).
+    #[schemars(with = "Vec<Value>")]
+    pub reports: Vec<Value>,
+    pub notes_chain: Vec<NoteRow>,
+    pub acceptance: Vec<AcceptanceRow>,
+    pub size: Option<String>,
+    /// Plan state, tickets and weighted progress; null unless a plan epic.
+    #[schemars(with = "Option<Value>")]
+    pub plan: Value,
+    pub history: Vec<HistoryEntry>,
+    pub activity: Vec<ActivityEntry>,
+    #[schemars(with = "Vec<Value>")]
+    pub commits: Vec<Value>,
+    #[schemars(with = "Vec<Value>")]
+    pub commits_skipped: Vec<Value>,
+    pub checks: CardChecks,
+    /// The CAD-405 work block (`work::detail`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work: Option<WorkBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Vec<CardAgent>>,
 }
