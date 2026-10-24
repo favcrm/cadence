@@ -25,9 +25,14 @@ with another.
 ## 1. Host and toolchain
 
 For a local Cadence host, install or update the public release and run
-`cadence setup`. For a hosted org, use the hosted board and the client-only
-`cadence-client`; app management there is the board's Manage page (the remote
-CLI has no app-management verbs).
+`cadence setup`. For a hosted org, use the client-only `cadence-client` /
+`cadence --org` with a saved human login. The remote CLI has the immutable
+published-release catalog journey (`release-check`, `release-install`,
+`release-update`, `release-revoke`, `ls`, `show`, `operation`, `pending`,
+`reconcile`); local path and Git-source install/update commands are refused
+with `--org`. The hosted board `/apps/explore` and `/apps/manage/<id>` is the
+UI and the path for source/Git updates. See
+[Selected remote: immutable published releases](app-catalog.md#selected-remote-immutable-published-releases).
 
 The app toolchain is a release asset, not something the host installs. Download
 `cadence-app-toolchain-<tag>.tar.gz` and its `.sha256` from the same Cadence
@@ -131,9 +136,11 @@ requires the real Cadence board. Use the canonical frame for the host frame:
 
 ```sh
 cadence app frame-kit --out /tmp/my-frame \
-  --bundle ./app --parent-origin http://127.0.0.1:3186
+  --bundle ./app --parent-origin http://localhost:3186
 ```
 
+The parent origin must be the actual frame parent; the kit accepts HTTPS or an
+HTTP `localhost`/`*.localhost` origin with a port, not a loopback IP literal.
 Do not copy or patch the generated frame. Use the matching CLI release.
 `cadence app fixtures --bundle ./app --json` emits deterministic PUSH
 fixtures; use them for the app's projection tests.
@@ -179,14 +186,18 @@ approval.
 
 ## 6. Hosted
 
-Hosted operators use the board: `/apps/explore` for the published catalogue,
-`/apps/catalog/<id>` for a release, and `/apps/manage/<id>` for install and
-update. The bundle and digest are the same as local. Hosted boards read
-catalogue metadata from `api.internal`; the release document is proxied
-through the closed `catalogue-packages.internal` broker. The remote
-`cadence --org` CLI is limited to status, agent/issue/message reads and issue
-create/comment/set; it has **no app-management verbs**. The board is the
-hosted path, and every install/update is operator-only.
+Hosted operators have two paths. The remote CLI (`cadence --org <workspace>`)
+with a saved human login supports the immutable published-release catalog
+journey: `release-check`, `release-install`, `release-update`,
+`release-revoke`, `ls`, `show`, `operation`, `pending` and `reconcile`. The
+board `/apps/explore`, `/apps/catalog/<id>` and `/apps/manage/<id>` is the UI
+and the path for source/Git updates; local path/Git catalog commands are
+refused with `--org`. Both bind the exact listing/version/digest and operation
+id; see the
+[selected-remote contract](app-catalog.md#selected-remote-immutable-published-releases).
+Hosted boards read catalogue metadata from `api.internal`; the release document
+is proxied through the closed `catalogue-packages.internal` broker. Every
+install/update is operator-only.
 
 ## 7. Existing apps
 
@@ -218,7 +229,7 @@ Do not ship two bridge protocols for one app.
 - ship a second shell or recreate the board drawer chrome;
 - install unpinned or skip `install-check`;
 - use the retired `builtin:` source;
-- assume the hosted remote CLI has app-management verbs;
+- assume arbitrary source-based app management works remotely; the published-release catalog commands are the remote path, and source/Git updates use the board;
 - edit the packaged app-kit or regenerate its lockfile;
 - claim the host board is the app's surface; the app owns its surface.
 

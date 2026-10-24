@@ -36,7 +36,10 @@ The archive's `frame-kit/frame.html`, `kit.css`, and `metadata.json` come from `
 
 ```sh
 cadence app frame-kit --out /tmp/my-app-frame \
-  --bundle ./path/to/app-bundle --parent-origin http://127.0.0.1:5173
+  --bundle ./path/to/app-bundle --parent-origin http://localhost:5173
 ```
+
+The parent origin must be the actual frame parent; the kit accepts HTTPS or an
+HTTP `localhost`/`*.localhost` origin with a port, not a loopback IP literal.
 
 The packaged files are canonical host output, not a copied editable renderer. The default offline frame is an empty reference, not an app-mounted harness. This toolchain alone does not establish Social, native API, or frame-harness integration.
