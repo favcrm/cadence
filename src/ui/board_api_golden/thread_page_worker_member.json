@@ -1,0 +1,71 @@
+{
+  "alias": "w1",
+  "cursor": 3,
+  "entries": [
+    {
+      "created": 0,
+      "kind": "message",
+      "message": "m-run",
+      "payload": {
+        "delivery": {
+          "completed": null,
+          "started": 110.25,
+          "state": "running"
+        },
+        "source": "operator"
+      },
+      "role": "operator",
+      "seq": 1,
+      "text": "hello m-run",
+      "thread": "THREAD"
+    },
+    {
+      "created": 0,
+      "kind": "message",
+      "message": "m-q1",
+      "payload": {
+        "delivery": {
+          "completed": null,
+          "started": null,
+          "state": "queued"
+        },
+        "source": "operator"
+      },
+      "role": "operator",
+      "seq": 2,
+      "text": "hello m-q1",
+      "thread": "THREAD"
+    },
+    {
+      "created": 0,
+      "kind": "message",
+      "message": "m-q2",
+      "payload": {
+        "delivery": {
+          "completed": null,
+          "started": null,
+          "state": "queued"
+        },
+        "source": "operator"
+      },
+      "role": "operator",
+      "seq": 3,
+      "text": "hello m-q2",
+      "thread": "THREAD"
+    }
+  ],
+  "reply_seq": 0,
+  "thread": {
+    "alias": "master",
+    "archived": false,
+    "context_id": null,
+    "created": 0,
+    "general": false,
+    "id": "THREAD",
+    "install_id": null,
+    "is_general": false,
+    "subject": null,
+    "title": null,
+    "updated": 0
+  }
+}

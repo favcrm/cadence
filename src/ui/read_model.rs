@@ -27,7 +27,7 @@
 //! daemon writes through their RPCs.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -36,10 +36,12 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
-use cadence_core::board_api::{Freshness, IssueListItem};
+use cadence_core::board_api::{
+    AgentsPayload, AgentsResponse, CardAgent, DaemonReach, Freshness, IssueListItem,
+};
 use serde_json::{json, Value};
 
-use super::{agents_payload_from, board_job_list, dir_mtime, event_resources, value_fp};
+use super::{agents_payload_typed, board_job_list, dir_mtime, event_resources, value_fp};
 use crate::client;
 use crate::issue::{board, model, plan, project, work, write as issue_write, Pm};
 use crate::overview;
@@ -501,7 +503,7 @@ impl Tracker {
 pub(super) struct BoardRead {
     pub views: Arc<Vec<board::View>>,
     revs: Arc<HashMap<String, String>>,
-    pub by_issue: Value,
+    pub by_issue: BTreeMap<String, Vec<CardAgent>>,
     /// CAD-405 gate approvals, read with the daemon snapshot.
     pub approvals: Arc<work::Approvals>,
     /// Age, staleness and refresh error of the daemon snapshot behind
@@ -647,7 +649,7 @@ pub(super) struct DaemonSnap {
     outcomes: board::JobOutcomes,
     /// `None` when `job_list` failed.
     jobs_fp: Option<u64>,
-    agents: Value,
+    agents: AgentsPayload,
     /// `None` when `agent_list` failed.
     agents_fp: Option<u64>,
     approvals: Arc<work::Approvals>,
@@ -730,9 +732,11 @@ fn fetch_daemon(state_dir: &Path) -> DaemonSnap {
     });
     let agents_down = list.is_none();
     let failed = agents_down || jobs.is_none();
-    let agents = agents_payload_from(state_dir, list.clone(), jobs.as_ref());
-    let agents_fp =
-        list.map(|l| value_fp(&json!([rows_fp(&l["agents"]), rows_fp(&agents["agents"])])));
+    let agents = agents_payload_typed(state_dir, list.clone(), jobs.as_ref());
+    let agents_fp = list.map(|l| {
+        let rows = serde_json::to_value(&agents.agents).expect("agent rows serialize");
+        value_fp(&json!([rows_fp(&l["agents"]), rows_fp(&rows)]))
+    });
     let outcomes = jobs
         .as_ref()
         .map(|l| board::outcomes_from_jobs(l["jobs"].as_array().map(Vec::as_slice).unwrap_or(&[])))
@@ -1064,12 +1068,15 @@ impl Model {
     /// `unreachable` then, like a first-time failure, so the board shows
     /// it offline.
     fn served_agents(&self, snap: &DaemonSnap) -> Value {
-        let mut agents = snap.agents.clone();
+        let mut payload = snap.agents.clone();
         if snap.agents_down || lock(&self.daemon).daemon_down {
-            agents["daemon"] = json!("unreachable");
+            payload.daemon = DaemonReach::Unreachable;
         }
-        merge_freshness(&mut agents, &self.freshness(snap));
-        agents
+        serde_json::to_value(AgentsResponse {
+            payload,
+            freshness: self.freshness(snap),
+        })
+        .expect("agents serialize")
     }
 
     /// Age, staleness and refresh error of `snap` as it is served, beside
@@ -1124,7 +1131,7 @@ impl Model {
         BoardRead {
             views,
             revs: t.revs(),
-            by_issue: snap.agents["by_issue"].clone(),
+            by_issue: snap.agents.by_issue.clone(),
             approvals: snap.approvals.clone(),
             freshness: self.freshness(snap),
             pm_dir: pm.dir.clone(),
@@ -1677,22 +1684,34 @@ pub(super) fn merge_freshness(into: &mut Value, fresh: &Freshness) {
 
 /// `/api/agents` rows keyed by alias.
 fn agent_rows(snap: &DaemonSnap) -> Entities {
-    snap.agents["agents"]
-        .as_array()
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|r| {
-                    let alias = r["alias"].as_str()?.to_string();
-                    Some((alias, (value_fp(&stable_row(r)), r.clone())))
-                })
-                .collect()
+    snap.agents
+        .agents
+        .iter()
+        .filter_map(|row| {
+            let r = serde_json::to_value(row).ok()?;
+            Some((row.alias.clone(), (value_fp(&stable_row(&r)), r)))
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cadence_core::board_api::{AgentRow, AgentTotals};
+
+    /// A reachable, empty roster that carries its fetch number in
+    /// `totals.queued`, so a test can tell which fetch it was served.
+    fn versioned(n: u64) -> AgentsPayload {
+        AgentsPayload {
+            daemon: DaemonReach::Reachable,
+            agents: vec![],
+            totals: Some(AgentTotals {
+                queued: n as i64,
+                ..AgentTotals::default()
+            }),
+            by_issue: BTreeMap::new(),
+        }
+    }
 
     fn fixture(dir: &Path) {
         std::fs::create_dir_all(dir.join("comments")).unwrap();
@@ -1765,10 +1784,17 @@ mod tests {
         let read = BoardRead {
             views: Arc::new(views.clone()),
             revs: Arc::new(HashMap::from([("CAD-1".to_string(), "abc123".to_string())])),
-            by_issue: json!({"CAD-3": [{
-                "alias": "w1", "task": "t1", "task_state": "running",
-                "state": "running", "message": "m1", "resume": null,
-            }]}),
+            by_issue: BTreeMap::from([(
+                "CAD-3".to_string(),
+                vec![CardAgent {
+                    alias: "w1".into(),
+                    task: "t1".into(),
+                    task_state: "running".into(),
+                    state: Some("running".into()),
+                    message: Some("m1".into()),
+                    resume: None,
+                }],
+            )]),
             approvals: Arc::new(work::Approvals::new()),
             freshness: Freshness {
                 snapshot_age_secs: 0.5,
@@ -1779,9 +1805,15 @@ mod tests {
         };
         let cards: Vec<Value> = views.iter().map(|v| read.card(&ctx, v)).collect();
         super::super::board_api_golden::golden("issue_cards.json", &Value::Array(cards));
-        let mut body = json!({"issues": []});
-        merge_freshness(&mut body, &read.freshness);
-        super::super::board_api_golden::golden("issues_envelope.json", &body);
+        // The handler's own envelope: cards flattened beside the freshness.
+        let body = cadence_core::board_api::IssuesResponse {
+            issues: views.iter().map(|v| read.card_item(&ctx, v)).collect(),
+            freshness: read.freshness.clone(),
+        };
+        super::super::board_api_golden::golden(
+            "issues_envelope.json",
+            &serde_json::to_value(body).unwrap(),
+        );
     }
 
     #[test]
@@ -1865,9 +1897,9 @@ mod tests {
                 jobs_fp: Some(n),
                 // A failed fetch carries the real stand-in the fetcher builds.
                 agents: if fails(n) {
-                    agents_payload_from(Path::new("/nonexistent/state"), None, None)
+                    agents_payload_typed(Path::new("/nonexistent/state"), None, None)
                 } else {
-                    json!({"daemon": "reachable", "agents": [], "v": n})
+                    versioned(n)
                 },
                 agents_fp: Some(n),
                 approvals: Arc::new(Default::default()),
@@ -1950,7 +1982,7 @@ mod tests {
                 let (m, b) = (model.clone(), barrier.clone());
                 std::thread::spawn(move || {
                     b.wait();
-                    m.agents()["v"].clone()
+                    m.agents()["totals"]["queued"].clone()
                 })
             })
             .collect();
@@ -1970,7 +2002,7 @@ mod tests {
         let (on_fetch, parked) = fetch_gate(2);
         let (model, calls) = fake_daemon(on_fetch, None);
         lock(&model.hub).running = true;
-        assert_eq!(model.agents()["v"], 1);
+        assert_eq!(model.agents()["totals"]["queued"], 1);
         let refresh = {
             let m = model.clone();
             std::thread::spawn(move || m.fetch_shared())
@@ -1982,11 +2014,21 @@ mod tests {
             asked.elapsed() < Duration::from_millis(500),
             "a read waited on the slow refresh"
         );
-        assert_eq!(served["v"], 1);
+        assert_eq!(served["totals"]["queued"], 1);
         assert!(served["snapshot_age_secs"].as_f64().unwrap() > 0.0);
         drop(parked);
-        assert_eq!(refresh.join().unwrap().agents["v"], 2);
-        assert_eq!(model.agents()["v"], 2);
+        assert_eq!(
+            refresh
+                .join()
+                .unwrap()
+                .agents
+                .totals
+                .as_ref()
+                .unwrap()
+                .queued,
+            2
+        );
+        assert_eq!(model.agents()["totals"]["queued"], 2);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -1997,19 +2039,19 @@ mod tests {
         lock(&model.hub).running = true;
         let before_write = {
             let m = model.clone();
-            std::thread::spawn(move || m.agents()["v"].clone())
+            std::thread::spawn(move || m.agents()["totals"]["queued"].clone())
         };
         parked.wait();
         model.invalidate();
         assert_eq!(
-            model.agents()["v"],
+            model.agents()["totals"]["queued"],
             2,
             "the write must not join the older fetch"
         );
         drop(parked);
         assert_eq!(before_write.join().unwrap(), 1);
         assert_eq!(
-            model.agents()["v"],
+            model.agents()["totals"]["queued"],
             2,
             "the late older fetch must not be kept"
         );
@@ -2042,7 +2084,7 @@ mod tests {
         let (model, calls) = fake_daemon(on_fetch, None);
         let reader = {
             let m = model.clone();
-            std::thread::spawn(move || m.agents()["v"].clone())
+            std::thread::spawn(move || m.agents()["totals"]["queued"].clone())
         };
         parked.wait();
         let subscriber = {
@@ -2066,12 +2108,16 @@ mod tests {
         let (model, calls) = fake_daemon_failing(|_| {}, None, |n| n == 2);
         lock(&model.hub).running = true;
         let good = model.agents();
-        assert_eq!(good["v"], 1);
+        assert_eq!(good["totals"]["queued"], 1);
         assert_eq!(good["refresh_error"], false);
         let failed = model.fetch_shared();
-        assert_eq!(failed.agents["v"], 1, "the failed fetch replaced last-good");
+        assert_eq!(
+            failed.agents.totals.as_ref().unwrap().queued,
+            1,
+            "the failed fetch replaced last-good"
+        );
         let served = model.agents();
-        assert_eq!(served["v"], 1);
+        assert_eq!(served["totals"]["queued"], 1);
         assert_eq!(
             served["daemon"], "unreachable",
             "the board must show the daemon offline while last-good is served"
@@ -2080,7 +2126,10 @@ mod tests {
         assert_eq!(served["stale"], true);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         // The next good fetch clears the error.
-        assert_eq!(model.fetch_shared().agents["v"], 3);
+        assert_eq!(
+            model.fetch_shared().agents.totals.as_ref().unwrap().queued,
+            3
+        );
         assert_eq!(model.agents()["refresh_error"], false);
     }
 
@@ -2143,7 +2192,7 @@ mod tests {
         parked.wait();
         model.invalidate();
         let post_write = model.agents();
-        assert_eq!(post_write["v"], 2);
+        assert_eq!(post_write["totals"]["queued"], 2);
         drop(parked);
         let (published, _) = ticking.join().unwrap();
         assert_ne!(published, Some(1), "published the pre-write build");
@@ -2170,9 +2219,9 @@ mod tests {
                 outcomes: Default::default(),
                 jobs_fp: (n == 1).then_some(n),
                 agents: if n > 1 {
-                    agents_payload_from(Path::new("/nonexistent/state"), None, None)
+                    agents_payload_typed(Path::new("/nonexistent/state"), None, None)
                 } else {
-                    json!({"daemon": "reachable", "agents": [], "v": n})
+                    versioned(n)
                 },
                 agents_fp: (n == 1).then_some(n),
                 approvals: Arc::new(Default::default()),
@@ -2266,19 +2315,37 @@ mod tests {
         let fetch: Fetch = Box::new(move |_| {
             let failed = is_down.load(Ordering::SeqCst);
             // Agent `x` exists while card CAD-2 does.
-            let mut agents = vec![json!({"alias": "w"})];
+            let row = |alias: &str| AgentRow {
+                alias: alias.to_string(),
+                ..AgentRow::default()
+            };
+            let mut agents = vec![row("w")];
             if second_dir.exists() {
-                agents.push(json!({"alias": "x"}));
+                agents.push(row("x"));
             }
             DaemonSnap {
                 at: Instant::now(),
                 outcomes: Default::default(),
                 jobs_fp: (!failed).then_some(1),
                 agents: if failed {
-                    agents_payload_from(Path::new("/nonexistent/state"), None, None)
+                    agents_payload_typed(Path::new("/nonexistent/state"), None, None)
                 } else {
-                    json!({"daemon": "reachable", "agents": agents,
-                           "by_issue": {"CAD-1": [{"alias": "w"}]}})
+                    AgentsPayload {
+                        daemon: DaemonReach::Reachable,
+                        agents,
+                        totals: None,
+                        by_issue: BTreeMap::from([(
+                            "CAD-1".to_string(),
+                            vec![CardAgent {
+                                alias: "w".into(),
+                                task: String::new(),
+                                task_state: String::new(),
+                                state: None,
+                                message: None,
+                                resume: None,
+                            }],
+                        )]),
+                    }
                 },
                 agents_fp: (!failed).then_some(1),
                 approvals: Arc::new(Default::default()),
@@ -2351,7 +2418,7 @@ mod tests {
         let pm = Pm::at(&model.pm_dir).unwrap();
         let read = model.board(&pm, None);
         assert!(
-            read.by_issue.get("CAD-1").is_none(),
+            !read.by_issue.contains_key("CAD-1"),
             "the read was not stripped"
         );
         assert_eq!(
@@ -2441,7 +2508,7 @@ mod tests {
         };
         wait_for_joins(&model, 1);
         drop(parked);
-        assert_eq!(waiter.join().unwrap()["v"], 2);
+        assert_eq!(waiter.join().unwrap()["totals"]["queued"], 2);
         assert!(crashing.join().is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }

@@ -175,20 +175,24 @@ pub struct Thread {
 }
 
 impl Thread {
+    pub fn info(&self) -> cadence_core::board_api::ThreadInfo {
+        cadence_core::board_api::ThreadInfo {
+            id: self.id.clone(),
+            alias: self.alias.clone(),
+            created: self.created,
+            updated: self.updated,
+            install_id: self.install_id.clone(),
+            context_id: self.context_id.clone(),
+            subject: self.subject.clone(),
+            general: self.is_general,
+            is_general: self.is_general,
+            archived: self.archived,
+            title: self.title.clone(),
+        }
+    }
+
     pub fn to_json(&self) -> Value {
-        json!({
-            "id": self.id,
-            "alias": self.alias,
-            "created": self.created,
-            "updated": self.updated,
-            "install_id": self.install_id,
-            "context_id": self.context_id,
-            "subject": self.subject,
-            "general": self.is_general,
-            "is_general": self.is_general,
-            "archived": self.archived,
-            "title": self.title,
-        })
+        serde_json::to_value(self.info()).expect("thread serializes")
     }
 
     /// Home is the master's own chat: no installation scope.
@@ -251,17 +255,21 @@ pub struct ThreadEntry {
 }
 
 impl ThreadEntry {
+    pub fn row(&self) -> cadence_core::board_api::ThreadEntryRow {
+        cadence_core::board_api::ThreadEntryRow {
+            seq: self.seq,
+            thread: self.thread_id.clone(),
+            role: self.role.clone(),
+            kind: self.kind.clone(),
+            text: self.text.clone(),
+            payload: self.payload.clone(),
+            message: self.message_id.clone(),
+            created: self.created,
+        }
+    }
+
     pub fn to_json(&self) -> Value {
-        json!({
-            "seq": self.seq,
-            "thread": self.thread_id,
-            "role": self.role,
-            "kind": self.kind,
-            "text": self.text,
-            "payload": self.payload,
-            "message": self.message_id,
-            "created": self.created,
-        })
+        serde_json::to_value(self.row()).expect("thread entry serializes")
     }
 }
 

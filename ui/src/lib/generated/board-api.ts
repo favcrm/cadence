@@ -2,18 +2,40 @@
 // Do not edit: change the Rust types, then `CADENCE_CORE_WRITE_SCHEMA=1 cargo test -p cadence-core`
 // and `bun run --cwd ui gen:board-api`.
 
+/** One checklist item of the `Acceptance` section; `done` mirrors `checked`. */
+export interface AcceptanceRow {
+  checked: boolean;
+  done: boolean;
+  text: string;
+}
+
+/** One merged activity entry: `kind` is `note` (with `note_kind`, `title`,
+ * `name`), `comment` (`author`, `body`, `name`) or `commit` (`commit`,
+ * `subject`). */
+export interface ActivityEntry {
+  at: string;
+  author?: string | null;
+  body?: string | null;
+  commit?: string | null;
+  kind: string;
+  name?: string | null;
+  note_kind?: string | null;
+  subject?: string | null;
+  title?: string | null;
+}
+
 /** One `/api/agents` row. Mailboxes (`inbox: true`) carry the unread
  * fields; workers carry the rest of the optional ones. */
 export interface AgentRow {
   alias: string;
   /** A hire's catalogue identity (workers only). */
   catalogue?: string | null;
-  dead: boolean;
+  dead?: boolean | null;
   effort?: string | null;
   effort_applicable?: boolean | null;
   effort_reported?: string | null;
   effort_source?: string | null;
-  endpoint_kind: string;
+  endpoint_kind?: string | null;
   event_cursor?: number | null;
   fenced: boolean;
   group: string;
@@ -36,7 +58,7 @@ export interface AgentRow {
   /** Issue ids bound through jobs — exact, not text-derived. */
   on: string[];
   parked: number;
-  provider: string;
+  provider?: string | null;
   queued: number;
   /** Optional account/pool allowance views; null means unavailable. */
   quota?: unknown;
@@ -51,7 +73,7 @@ export interface AgentRow {
   /** Seconds since the running turn's last observed activity. */
   silent_secs?: number | null;
   stalled?: boolean | null;
-  state: string;
+  state?: string | null;
   /** `stopped (auto, idle 72m)` when the idle timer stopped it. */
   state_label?: string | null;
   tasks: AgentTask[];
@@ -95,6 +117,19 @@ export interface AgentsResponse {
   totals?: AgentTotals | null;
 }
 
+/** The app conversation a Home turn belongs to, proven from the message's
+ * persisted provenance; `context_id` is `""` for an installation-only chat. */
+export interface AppOrigin {
+  context_id: string;
+  conversation_id: string;
+  install_id: string;
+}
+
+export interface ArtifactRow {
+  name: string;
+  size: number;
+}
+
 /** One bound agent on an issue card or drawer — from the job binding. */
 export interface CardAgent {
   alias: string;
@@ -102,7 +137,8 @@ export interface CardAgent {
   message?: string | null;
   /** Concrete resume command for a stopped pane. */
   resume?: string | null;
-  state: string;
+  /** The agent's state; `null` when the daemon reports none. */
+  state?: string | null;
   task: string;
   task_state: string;
 }
@@ -129,6 +165,14 @@ export interface ClaimCard {
   stale?: string | null;
 }
 
+export interface CommentRow {
+  at: string;
+  author: string;
+  body: string;
+  kind?: string | null;
+  name: string;
+}
+
 export type DaemonReach = "reachable" | "unreachable";
 
 /** The `gh` this board's delivery sync runs, fixed at start. */
@@ -138,10 +182,73 @@ export interface DeliverySyncMeta {
   gh_error?: string | null;
 }
 
+/** One `git log` line of the issue's `issue.md`. */
+export interface HistoryEntry {
+  at: string;
+  commit: string;
+  subject: string;
+}
+
+/** `GET /api/issues/:id` and `issue show --json`: the drawer payload.
+ * The board adds `agents` when a job binds agents to the issue. */
+export interface IssueDetail {
+  acceptance: AcceptanceRow[];
+  activity: ActivityEntry[];
+  agents?: CardAgent[] | null;
+  artifacts: ArtifactRow[];
+  blocked: boolean;
+  blocked_reason?: string | null;
+  body: string;
+  checks: CardChecks;
+  claim?: ClaimCard | null;
+  comments: CommentRow[];
+  commits: unknown[];
+  commits_skipped: unknown[];
+  component?: string | null;
+  container: boolean;
+  created: string;
+  /** The issue's front matter as stored. */
+  frontmatter: Record<string, unknown>;
+  history: HistoryEntry[];
+  id: string;
+  links: IssueLinks;
+  notes_chain: NoteRow[];
+  owner?: string | null;
+  parent?: string | null;
+  path: string;
+  paths: string[];
+  /** Plan state, tickets and weighted progress; null unless a plan epic. */
+  plan?: unknown;
+  priority: string;
+  project: string;
+  ready: boolean;
+  refs: Ref[];
+  /** Task reports filed on the issue (`issue/task_report.rs` rows). */
+  reports: unknown[];
+  rev: string;
+  size?: string | null;
+  status: string;
+  status_source: string;
+  tags: string[];
+  title: string;
+  /** The CAD-405 work block (`work::detail`). */
+  work?: WorkBlock | null;
+}
+
+export interface IssueLinks {
+  blocked_by: LinkRef[];
+  blocks: LinkRef[];
+  children: LinkRef[];
+  duplicate_of?: LinkRef | null;
+  duplicates: LinkRef[];
+  parent?: LinkRef | null;
+  relates: LinkRef[];
+}
+
 /** One `GET /api/issues` row: the core card, its work block and, only when
  * a job binds agents to the issue, the agent strip. */
 export interface IssueListItem {
-  /** The daemon's bound-agent strip, passed through as the roster built it. */
+  /** The bound-agent strip, present only when a job binds agents to the issue. */
   agents?: CardAgent[] | null;
   blocked: boolean;
   blocked_by: string[];
@@ -180,11 +287,76 @@ export interface IssuesResponse {
   stale: boolean;
 }
 
+/** A link target in the drawer: the issue's title and status when it is on
+ * the board, else just its id with `missing: true`. */
+export interface LinkRef {
+  id: string;
+  missing: boolean;
+  status?: string | null;
+  status_source?: string | null;
+  title?: string | null;
+}
+
+/** The live session's context usage, when the provider answers `stats`. */
+export interface MasterContext {
+  percent?: number | null;
+  tokens?: number | null;
+  window?: number | null;
+}
+
+/** One queued turn's routing metadata; never its body. */
+export interface MasterQueued {
+  conversation?: string | null;
+  message: string;
+}
+
+/** The live provider session, when the provider answers `state`. */
+export interface MasterSession {
+  compacting?: boolean | null;
+  id?: string | null;
+  messages?: number | null;
+  streaming?: boolean | null;
+}
+
+/** `master_state` (daemon RPC; `GET /api/master/state` relays it): what the
+ * master header shows. A member's copy drops the turn's `summary`. */
+export interface MasterState {
+  alias: string;
+  /** The session verbs the live provider accepts. */
+  commands: string[];
+  context?: MasterContext | null;
+  effort?: string | null;
+  endpoint_kind: string;
+  live: boolean;
+  model?: string | null;
+  model_label?: string | null;
+  provider: string;
+  queue: MasterQueued[];
+  queued: number;
+  session?: MasterSession | null;
+  turn?: MasterTurn | null;
+}
+
+/** The master turn the working row mirrors: `working` while it runs,
+ * `queued` for the queue head. */
+export interface MasterTurn {
+  app_origin?: AppOrigin | null;
+  conversation?: string | null;
+  message: string;
+  /** Queue position of a queued head (always 1). */
+  position?: number | null;
+  /** Epoch seconds: `started` while it runs, `created` while it waits. */
+  since: number;
+  state: string;
+  /** The operator's message text. A member never receives it. */
+  summary?: string | null;
+}
+
 /** The daemon's build, when it answered inside the metadata budget. */
 export interface MetaDaemon {
-  build_commit: string;
-  build_time: string;
-  started_at: number;
+  build_commit?: string | null;
+  build_time?: string | null;
+  started_at?: number | null;
 }
 
 /** `GET /api/meta`: what this client may do and who writes credit to, plus
@@ -214,6 +386,14 @@ export interface MetaResponse {
   tailnet_proof?: unknown;
   tailnet_url?: string | null;
   version: string;
+}
+
+/** A notes-chain entry tagged to the issue. */
+export interface NoteRow {
+  at: string;
+  kind: string;
+  name: string;
+  title: string;
 }
 
 /** A typed link kept on an issue: PR, commit, note, preview, message, ...
@@ -246,9 +426,49 @@ export interface Ref {
 export interface RunningMessage {
   /** Epoch seconds (the daemon serializes `Message.created` as f64). */
   created?: number | null;
-  id: string;
+  id?: string | null;
   summary?: string | null;
   task?: string | null;
+}
+
+/** One thread entry. For a message entry of the same thread the payload
+ * also carries `delivery: {state, started, completed}`. */
+export interface ThreadEntryRow {
+  created: number;
+  kind: string;
+  message?: string | null;
+  payload?: unknown;
+  role: string;
+  seq: number;
+  text: string;
+  thread: string;
+}
+
+/** A conversation (thread) row. */
+export interface ThreadInfo {
+  alias: string;
+  archived: boolean;
+  context_id?: string | null;
+  created: number;
+  general: boolean;
+  id: string;
+  install_id?: string | null;
+  is_general: boolean;
+  /** `campaign:<id>` for a campaign conversation. */
+  subject?: string | null;
+  title?: string | null;
+  updated: number;
+}
+
+/** `thread_read` (daemon RPC; `GET /api/threads/<alias>` relays it).
+ * A forward read carries `cursor`; a backward one also `more_before`. */
+export interface ThreadPage {
+  alias: string;
+  cursor: number;
+  entries: ThreadEntryRow[];
+  more_before?: boolean | null;
+  reply_seq: number;
+  thread?: ThreadInfo | null;
 }
 
 /** The CAD-405 work block on a card: type, milestone, size; stage,

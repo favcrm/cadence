@@ -32,7 +32,7 @@ use crate::issue::areas::scrub;
 use crate::issue::board::{self, View};
 use crate::issue::model::{self, Front};
 use crate::issue::{parse, plan, project};
-use cadence_core::board_api::WorkBlock;
+use cadence_core::board_api::{IssueDetail, WorkBlock};
 
 /// Default epic stages and their exit criteria.
 pub const DEFAULT_STAGES: &[(&str, &str)] = &[
@@ -957,8 +957,13 @@ pub fn item_block(ctx: &Ctx, view: &View) -> WorkBlock {
 /// The drawer payload ([`board::detail_json`]) with its `work` block —
 /// `GET /api/issues/:id` and `issue show --json`.
 pub fn detail_json(pm_dir: &Path, ctx: &Ctx, view: &View) -> Value {
-    let mut detail = board::detail_json(pm_dir, view, ctx.by_id);
-    detail["work"] = item_json(ctx, view);
+    serde_json::to_value(detail(pm_dir, ctx, view)).expect("issue detail serializes")
+}
+
+/// [`detail_json`] as the typed wire struct.
+pub fn detail(pm_dir: &Path, ctx: &Ctx, view: &View) -> IssueDetail {
+    let mut detail = board::detail(pm_dir, view, ctx.by_id);
+    detail.work = Some(item_block(ctx, view));
     detail
 }
 

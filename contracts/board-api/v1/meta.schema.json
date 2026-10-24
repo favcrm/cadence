@@ -131,20 +131,24 @@
       "type": "object",
       "properties": {
         "build_commit": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "build_time": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "started_at": {
-          "type": "number"
+          "type": [
+            "number",
+            "null"
+          ]
         }
-      },
-      "required": [
-        "build_commit",
-        "build_time",
-        "started_at"
-      ]
+      }
     }
   }
 }

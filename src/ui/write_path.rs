@@ -3,7 +3,9 @@
 //! fans out to, plus the shared response plumbing (`send`, `coded_response`,
 //! `write_reply`) the read side reuses.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+use cadence_core::board_api::{CardAgent, IssueDetail};
 use std::io::Read;
 use std::path::Path;
 
@@ -535,7 +537,7 @@ pub(crate) fn issue_payloads(pm: &Pm, state_dir: &Path, id: &str) -> Result<(Val
     Ok((
         read.card(&ctx, view),
         with_agents(
-            crate::issue::work::detail_json(&pm.dir, &ctx, view),
+            crate::issue::work::detail(&pm.dir, &ctx, view),
             &read.by_issue,
             id,
         ),
@@ -2440,11 +2442,13 @@ pub(crate) fn send(request: Request, mut resp: HttpResp, head_only: bool) {
 /// Merge the `by_issue` runtime strip into a card/detail payload —
 /// cards get `agents: [{alias, task, task_state, state, message,
 /// resume}]` only when a job actually binds agents to the issue.
-pub(crate) fn with_agents(mut payload: Value, by_issue: &Value, id: &str) -> Value {
-    if let Some(agents) = by_issue.get(id) {
-        payload["agents"] = agents.clone();
-    }
-    payload
+pub(crate) fn with_agents(
+    mut payload: IssueDetail,
+    by_issue: &BTreeMap<String, Vec<CardAgent>>,
+    id: &str,
+) -> Value {
+    payload.agents = by_issue.get(id).cloned();
+    serde_json::to_value(payload).expect("issue detail serializes")
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@
 //! report, a stored session) stays a `serde_json::Value`; `schemars(with)`
 //! then documents the shape without changing a byte of output. A key the
 //! daemon omits is `skip_serializing_if`; a key it sends as `null` is not.
-use crate::issue::IssueCard;
+use crate::issue::{CardChecks, ClaimCard, IssueCard, Ref};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
@@ -28,11 +28,10 @@ pub struct CardAgent {
     pub alias: String,
     pub task: String,
     pub task_state: String,
-    #[schemars(with = "String")]
-    pub state: Value,
+    /// The agent's state; `null` when the daemon reports none.
+    pub state: Option<String>,
     /// Running kickoff message id for this task, if live.
-    #[schemars(with = "Option<String>")]
-    pub message: Value,
+    pub message: Option<String>,
     /// Concrete resume command for a stopped pane.
     pub resume: Option<String>,
 }
@@ -72,10 +71,9 @@ pub struct IssueListItem {
     #[serde(flatten)]
     pub card: IssueCard,
     pub work: WorkBlock,
-    /// The daemon's bound-agent strip, passed through as the roster built it.
+    /// The bound-agent strip, present only when a job binds agents to the issue.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<Vec<CardAgent>>")]
-    pub agents: Option<Value>,
+    pub agents: Option<Vec<CardAgent>>,
 }
 
 /// `GET /api/issues`.
@@ -89,7 +87,7 @@ pub struct IssuesResponse {
 /// A running kickoff reduced to what the board shows.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct RunningMessage {
-    #[schemars(with = "String")]
+    #[schemars(with = "Option<String>")]
     pub id: Value,
     #[schemars(with = "Option<String>")]
     pub task: Value,
@@ -118,10 +116,8 @@ pub struct AgentTask {
 #[derive(Clone, Debug, Default, Serialize, JsonSchema)]
 pub struct AgentRow {
     pub alias: String,
-    #[schemars(with = "String")]
-    pub provider: Value,
-    #[schemars(with = "String")]
-    pub endpoint_kind: Value,
+    pub provider: Option<String>,
+    pub endpoint_kind: Option<String>,
     #[schemars(with = "Option<String>")]
     pub role: Value,
     /// Model-preference role, independent of the runtime `role`.
@@ -163,8 +159,7 @@ pub struct AgentRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<String>")]
     pub kind: Option<Value>,
-    #[schemars(with = "String")]
-    pub state: Value,
+    pub state: Option<String>,
     pub group: String,
     pub group_root: bool,
     pub running: i64,
@@ -195,8 +190,7 @@ pub struct AgentRow {
     /// When `resume` applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_hint: Option<String>,
-    #[schemars(with = "bool")]
-    pub dead: Value,
+    pub dead: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbox: Option<bool>,
     /// Epoch seconds, or ISO text from older observations.
@@ -265,11 +259,11 @@ pub struct DeliverySyncMeta {
 /// The daemon's build, when it answered inside the metadata budget.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct MetaDaemon {
-    #[schemars(with = "String")]
+    #[schemars(with = "Option<String>")]
     pub build_commit: Value,
-    #[schemars(with = "String")]
+    #[schemars(with = "Option<String>")]
     pub build_time: Value,
-    #[schemars(with = "serde_json::Number")]
+    #[schemars(with = "Option<serde_json::Number>")]
     pub started_at: Value,
 }
 
@@ -303,4 +297,270 @@ pub struct MetaResponse {
     pub build_time: String,
     pub daemon: Option<MetaDaemon>,
     pub delivery_sync: Option<DeliverySyncMeta>,
+}
+
+/// The app conversation a Home turn belongs to, proven from the message's
+/// persisted provenance; `context_id` is `""` for an installation-only chat.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct AppOrigin {
+    pub install_id: String,
+    pub context_id: String,
+    pub conversation_id: String,
+}
+
+/// The master turn the working row mirrors: `working` while it runs,
+/// `queued` for the queue head.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct MasterTurn {
+    pub state: String,
+    pub message: String,
+    pub conversation: Option<String>,
+    pub app_origin: Option<AppOrigin>,
+    /// The operator's message text. A member never receives it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Epoch seconds: `started` while it runs, `created` while it waits.
+    pub since: f64,
+    /// Queue position of a queued head (always 1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<u32>,
+}
+
+/// One queued turn's routing metadata; never its body.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct MasterQueued {
+    pub message: String,
+    pub conversation: Option<String>,
+}
+
+/// The live session's context usage, when the provider answers `stats`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct MasterContext {
+    #[schemars(with = "Option<serde_json::Number>")]
+    pub tokens: Value,
+    #[schemars(with = "Option<serde_json::Number>")]
+    pub window: Value,
+    #[schemars(with = "Option<serde_json::Number>")]
+    pub percent: Value,
+}
+
+/// The live provider session, when the provider answers `state`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct MasterSession {
+    #[schemars(with = "Option<String>")]
+    pub id: Value,
+    #[schemars(with = "Option<serde_json::Number>")]
+    pub messages: Value,
+    #[schemars(with = "Option<bool>")]
+    pub streaming: Value,
+    #[schemars(with = "Option<bool>")]
+    pub compacting: Value,
+}
+
+/// `master_state` (daemon RPC; `GET /api/master/state` relays it): what the
+/// master header shows. A member's copy drops the turn's `summary`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct MasterState {
+    pub alias: String,
+    pub provider: String,
+    pub endpoint_kind: String,
+    pub live: bool,
+    pub model: Option<String>,
+    #[schemars(with = "Option<String>")]
+    pub model_label: Value,
+    pub effort: Option<String>,
+    pub context: Option<MasterContext>,
+    pub session: Option<MasterSession>,
+    /// The session verbs the live provider accepts.
+    pub commands: Vec<String>,
+    pub turn: Option<MasterTurn>,
+    pub queue: Vec<MasterQueued>,
+    pub queued: i64,
+}
+
+/// A conversation (thread) row.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ThreadInfo {
+    pub id: String,
+    pub alias: String,
+    pub created: f64,
+    pub updated: f64,
+    pub install_id: Option<String>,
+    pub context_id: Option<String>,
+    /// `campaign:<id>` for a campaign conversation.
+    pub subject: Option<String>,
+    pub general: bool,
+    pub is_general: bool,
+    pub archived: bool,
+    pub title: Option<String>,
+}
+
+/// One thread entry. For a message entry of the same thread the payload
+/// also carries `delivery: {state, started, completed}`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ThreadEntryRow {
+    pub seq: i64,
+    pub thread: String,
+    pub role: String,
+    pub kind: String,
+    pub text: String,
+    #[schemars(with = "Option<Value>")]
+    pub payload: Option<Value>,
+    pub message: Option<String>,
+    pub created: f64,
+}
+
+/// `thread_read` (daemon RPC; `GET /api/threads/<alias>` relays it).
+/// A forward read carries `cursor`; a backward one also `more_before`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ThreadPage {
+    pub alias: String,
+    pub thread: Option<ThreadInfo>,
+    pub entries: Vec<ThreadEntryRow>,
+    pub cursor: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub more_before: Option<bool>,
+    pub reply_seq: i64,
+}
+
+/// A link target in the drawer: the issue's title and status when it is on
+/// the board, else just its id with `missing: true`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct LinkRef {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_source: Option<String>,
+    pub missing: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct IssueLinks {
+    pub parent: Option<LinkRef>,
+    pub children: Vec<LinkRef>,
+    pub blocked_by: Vec<LinkRef>,
+    pub blocks: Vec<LinkRef>,
+    pub relates: Vec<LinkRef>,
+    pub duplicate_of: Option<LinkRef>,
+    pub duplicates: Vec<LinkRef>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ArtifactRow {
+    pub name: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct CommentRow {
+    pub name: String,
+    pub author: String,
+    pub at: String,
+    pub kind: Option<String>,
+    pub body: String,
+}
+
+/// A notes-chain entry tagged to the issue.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct NoteRow {
+    pub name: String,
+    pub kind: String,
+    pub at: String,
+    pub title: String,
+}
+
+/// One checklist item of the `Acceptance` section; `done` mirrors `checked`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct AcceptanceRow {
+    pub text: String,
+    pub checked: bool,
+    pub done: bool,
+}
+
+/// One `git log` line of the issue's `issue.md`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct HistoryEntry {
+    pub commit: String,
+    pub at: String,
+    pub subject: String,
+}
+
+/// One merged activity entry: `kind` is `note` (with `note_kind`, `title`,
+/// `name`), `comment` (`author`, `body`, `name`) or `commit` (`commit`,
+/// `subject`).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ActivityEntry {
+    pub at: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+/// `GET /api/issues/:id` and `issue show --json`: the drawer payload.
+/// The board adds `agents` when a job binds agents to the issue.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct IssueDetail {
+    pub id: String,
+    pub project: String,
+    pub title: String,
+    pub status: String,
+    pub status_source: String,
+    pub priority: String,
+    pub owner: Option<String>,
+    pub claim: Option<ClaimCard>,
+    pub component: Option<String>,
+    pub tags: Vec<String>,
+    pub paths: Vec<String>,
+    pub parent: Option<String>,
+    pub container: bool,
+    pub ready: bool,
+    pub blocked: bool,
+    pub blocked_reason: Option<String>,
+    pub created: String,
+    pub rev: String,
+    /// The issue's front matter as stored.
+    #[schemars(with = "serde_json::Map<String, Value>")]
+    pub frontmatter: Value,
+    pub body: String,
+    pub path: String,
+    pub links: IssueLinks,
+    pub refs: Vec<Ref>,
+    pub artifacts: Vec<ArtifactRow>,
+    pub comments: Vec<CommentRow>,
+    /// Task reports filed on the issue (`issue/task_report.rs` rows).
+    #[schemars(with = "Vec<Value>")]
+    pub reports: Vec<Value>,
+    pub notes_chain: Vec<NoteRow>,
+    pub acceptance: Vec<AcceptanceRow>,
+    pub size: Option<String>,
+    /// Plan state, tickets and weighted progress; null unless a plan epic.
+    #[schemars(with = "Option<Value>")]
+    pub plan: Value,
+    pub history: Vec<HistoryEntry>,
+    pub activity: Vec<ActivityEntry>,
+    #[schemars(with = "Vec<Value>")]
+    pub commits: Vec<Value>,
+    #[schemars(with = "Vec<Value>")]
+    pub commits_skipped: Vec<Value>,
+    pub checks: CardChecks,
+    /// The CAD-405 work block (`work::detail`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work: Option<WorkBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Vec<CardAgent>>,
 }

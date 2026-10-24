@@ -1,0 +1,55 @@
+{
+  "alias": "master",
+  "cursor": 3,
+  "entries": [
+    {
+      "created": 0,
+      "kind": "message",
+      "message": "m-q1",
+      "payload": {
+        "delivery": {
+          "completed": null,
+          "started": null,
+          "state": "queued"
+        },
+        "source": "operator"
+      },
+      "role": "operator",
+      "seq": 2,
+      "text": "hello m-q1",
+      "thread": "THREAD"
+    },
+    {
+      "created": 0,
+      "kind": "message",
+      "message": "m-q2",
+      "payload": {
+        "delivery": {
+          "completed": null,
+          "started": null,
+          "state": "queued"
+        },
+        "source": "operator"
+      },
+      "role": "operator",
+      "seq": 3,
+      "text": "hello m-q2",
+      "thread": "THREAD"
+    }
+  ],
+  "more_before": true,
+  "reply_seq": 0,
+  "thread": {
+    "alias": "master",
+    "archived": false,
+    "context_id": null,
+    "created": 0,
+    "general": false,
+    "id": "THREAD",
+    "install_id": null,
+    "is_general": false,
+    "subject": null,
+    "title": null,
+    "updated": 0
+  }
+}

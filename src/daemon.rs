@@ -212,6 +212,8 @@ mod cli_rpc;
 #[cfg(all(test, feature = "cli-runtime-test"))]
 pub(crate) use cli_rpc::prime_jwks_for_test as prime_cli_jwks_for_test;
 #[cfg(all(test, feature = "test-seam"))]
+mod board_producer_golden;
+#[cfg(all(test, feature = "test-seam"))]
 mod cad1700_acceptance;
 mod connection_test;
 mod connections_rpc;

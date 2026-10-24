@@ -734,6 +734,7 @@ pub(crate) fn agent_events_tail(
 /// the board still renders. Built from an `agent_list` asked with
 /// `board: true` and a [`board_job_list`] — the read model fetches both
 /// once and shares the job list with the cards' job outcomes.
+#[cfg(test)]
 pub(crate) fn agents_payload_from(
     state_dir: &Path,
     list: Option<Value>,
@@ -742,7 +743,7 @@ pub(crate) fn agents_payload_from(
     serde_json::to_value(agents_payload_typed(state_dir, list, jobs)).expect("agents serialize")
 }
 
-fn agents_payload_typed(
+pub(crate) fn agents_payload_typed(
     state_dir: &Path,
     list: Option<Value>,
     jobs: Option<&Value>,
@@ -776,8 +777,8 @@ fn agents_payload_typed(
         // The fields the daemon reports on every row, mailbox or worker.
         let base = AgentRow {
             alias: alias.to_string(),
-            provider: agent["provider"].clone(),
-            endpoint_kind: agent["endpoint_kind"].clone(),
+            provider: agent["provider"].as_str().map(str::to_string),
+            endpoint_kind: agent["endpoint_kind"].as_str().map(str::to_string),
             role: agent["role"].clone(),
             team_role: agent["team_role"].clone(),
             model_selection: agent["model_selection"].clone(),
@@ -801,7 +802,7 @@ fn agents_payload_typed(
                 .unwrap_or(alias)
                 .to_string(),
             group_root: agent["params"]["upstream"].is_null(),
-            dead: agent["dead"].clone(),
+            dead: agent["dead"].as_bool(),
             ..AgentRow::default()
         };
         // Mailboxes are not workers — they still appear on the Agents
@@ -815,7 +816,7 @@ fn agents_payload_typed(
             let unread = agent["inbox"]["queued"].as_i64().unwrap_or(0);
             totals.queued += unread;
             out.push(AgentRow {
-                state: json!("inbox"),
+                state: Some("inbox".to_string()),
                 queued: unread,
                 unread: Some(unread),
                 oldest_unread_age_secs: Some(agent["inbox"]["oldest_age_secs"].clone()),
@@ -893,8 +894,8 @@ fn agents_payload_typed(
                     alias: alias.to_string(),
                     task: tid.to_string(),
                     task_state: binding.task_state.clone(),
-                    state: agent["state"].clone(),
-                    message: message["id"].clone(),
+                    state: agent["state"].as_str().map(str::to_string),
+                    message: message["id"].as_str().map(str::to_string),
                     resume: resume.clone(),
                 });
             bound.push(AgentTask {
@@ -928,7 +929,7 @@ fn agents_payload_typed(
             catalogue: Some(agent["params"]["catalogue"].clone()),
             look: Some(agent["params"]["look"].clone()),
             kind: Some(agent["params"]["kind"].clone()),
-            state: agent["state"].clone(),
+            state: agent["state"].as_str().map(str::to_string),
             running,
             queued,
             unknown,
@@ -2601,11 +2602,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                             None => send(
                                 request,
                                 json_response(with_agents(
-                                    crate::issue::work::detail_json(
-                                        &pm.dir,
-                                        &read.ctx(&by_id),
-                                        view,
-                                    ),
+                                    crate::issue::work::detail(&pm.dir, &read.ctx(&by_id), view),
                                     &read.by_issue,
                                     &id,
                                 )),

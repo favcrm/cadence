@@ -1,0 +1,476 @@
+[
+  {
+    "acceptance": [],
+    "activity": [],
+    "artifacts": [],
+    "blocked": false,
+    "blocked_reason": null,
+    "body": "",
+    "checks": {
+      "done": 0,
+      "total": 0
+    },
+    "claim": null,
+    "comments": [],
+    "commits": [],
+    "commits_skipped": [],
+    "component": null,
+    "container": true,
+    "created": "2026-09-01T00:00:00Z",
+    "frontmatter": {
+      "created": "2026-09-01T00:00:00Z",
+      "id": "CAD-1",
+      "priority": "P2",
+      "status": "backlog",
+      "title": "CAD-1",
+      "type": "epic"
+    },
+    "history": [],
+    "id": "CAD-1",
+    "links": {
+      "blocked_by": [],
+      "blocks": [],
+      "children": [
+        {
+          "id": "CAD-2",
+          "missing": false,
+          "status": "done",
+          "status_source": "file",
+          "title": "CAD-2"
+        },
+        {
+          "id": "CAD-3",
+          "missing": false,
+          "status": "doing",
+          "status_source": "file",
+          "title": "CAD-3"
+        }
+      ],
+      "duplicate_of": null,
+      "duplicates": [],
+      "parent": null,
+      "relates": []
+    },
+    "notes_chain": [],
+    "owner": null,
+    "parent": null,
+    "path": "/nonexistent/CAD-1/issue.md",
+    "paths": [],
+    "plan": null,
+    "priority": "P2",
+    "project": "cadence",
+    "ready": false,
+    "refs": [],
+    "reports": [],
+    "rev": "",
+    "size": null,
+    "status": "doing",
+    "status_source": "rollup",
+    "tags": [],
+    "title": "CAD-1",
+    "work": {
+      "health": {
+        "days_in_stage": null,
+        "limit_days": 5,
+        "reasons": [
+          {
+            "cause": "blocked",
+            "detail": "CAD-3 waits on CAD-9, CAD-77",
+            "issue": "CAD-3",
+            "next": "unblock CAD-3 or re-plan around it",
+            "owner": "dev-1"
+          }
+        ],
+        "state": "at_risk"
+      },
+      "milestone": null,
+      "milestone_source": null,
+      "progress": {
+        "counts": {
+          "blocked": 1,
+          "doing": 1,
+          "done": 1,
+          "dropped": 0,
+          "open": 0,
+          "review": 0,
+          "total": 2
+        },
+        "done_weight": 3,
+        "ratio": 0.75,
+        "total_weight": 4
+      },
+      "size": null,
+      "stage": {
+        "exit": "Goal, non-goals and acceptance written; tasks listed",
+        "id": "shape",
+        "moves": [
+          {
+            "forward": true,
+            "needs_operator": true,
+            "to": "build"
+          }
+        ],
+        "next": "build",
+        "next_needs_operator": true,
+        "since": null,
+        "source": "default",
+        "stages": [
+          "shape",
+          "build",
+          "verify",
+          "release",
+          "done"
+        ],
+        "terminal": false
+      },
+      "type": "epic",
+      "type_source": "field",
+      "weight": 3
+    }
+  },
+  {
+    "acceptance": [
+      {
+        "checked": true,
+        "done": true,
+        "text": "first"
+      },
+      {
+        "checked": false,
+        "done": false,
+        "text": "second"
+      }
+    ],
+    "activity": [
+      {
+        "at": "2026-09-03T00:00:00Z",
+        "author": "pm",
+        "body": "hello",
+        "kind": "comment",
+        "name": "20260903-000000-pm"
+      },
+      {
+        "at": "2026-09-04T00:00:00Z",
+        "author": "dev-1",
+        "body": "world",
+        "kind": "comment",
+        "name": "20260904-000000-dev"
+      }
+    ],
+    "artifacts": [
+      {
+        "name": "out.txt",
+        "size": 12
+      }
+    ],
+    "blocked": true,
+    "blocked_reason": null,
+    "body": "Intro.\n\n## Acceptance\n- [x] first\n- [ ] second\n",
+    "checks": {
+      "done": 1,
+      "total": 2
+    },
+    "claim": {
+      "age_secs": 0,
+      "at": "2026-09-02T00:00:00Z",
+      "by": "pm",
+      "last_seen": null,
+      "note": "mine",
+      "session": "s-1",
+      "stale": null
+    },
+    "comments": [
+      {
+        "at": "2026-09-03T00:00:00Z",
+        "author": "pm",
+        "body": "hello",
+        "kind": "note",
+        "name": "20260903-000000-pm"
+      },
+      {
+        "at": "2026-09-04T00:00:00Z",
+        "author": "dev-1",
+        "body": "world",
+        "kind": null,
+        "name": "20260904-000000-dev"
+      }
+    ],
+    "commits": [],
+    "commits_skipped": [],
+    "component": "ui",
+    "container": false,
+    "created": "2026-09-01T00:00:00Z",
+    "frontmatter": {
+      "blocked_by": [
+        "CAD-9",
+        "CAD-77"
+      ],
+      "claim": {
+        "at": "2026-09-02T00:00:00Z",
+        "by": "pm",
+        "note": "mine",
+        "session": "s-1"
+      },
+      "component": "ui",
+      "created": "2026-09-01T00:00:00Z",
+      "duplicate_of": "CAD-2",
+      "id": "CAD-3",
+      "owner": "dev-1",
+      "parent": "CAD-1",
+      "paths": [
+        "src/ui/**"
+      ],
+      "priority": "P2",
+      "refs": [
+        {
+          "kind": "pr",
+          "url": "https://example.test/pr/1"
+        }
+      ],
+      "relates": [
+        "CAD-2"
+      ],
+      "size": "S",
+      "status": "doing",
+      "tags": [
+        "ui",
+        "m1"
+      ],
+      "title": "CAD-3"
+    },
+    "history": [],
+    "id": "CAD-3",
+    "links": {
+      "blocked_by": [
+        {
+          "id": "CAD-9",
+          "missing": false,
+          "status": "backlog",
+          "status_source": "file",
+          "title": "CAD-9"
+        },
+        {
+          "id": "CAD-77",
+          "missing": true
+        }
+      ],
+      "blocks": [],
+      "children": [],
+      "duplicate_of": {
+        "id": "CAD-2",
+        "missing": false,
+        "status": "done",
+        "status_source": "file",
+        "title": "CAD-2"
+      },
+      "duplicates": [],
+      "parent": {
+        "id": "CAD-1",
+        "missing": false,
+        "status": "doing",
+        "status_source": "rollup",
+        "title": "CAD-1"
+      },
+      "relates": [
+        {
+          "id": "CAD-2",
+          "missing": false,
+          "status": "done",
+          "status_source": "file",
+          "title": "CAD-2"
+        }
+      ]
+    },
+    "notes_chain": [],
+    "owner": "dev-1",
+    "parent": "CAD-1",
+    "path": "/nonexistent/CAD-3/issue.md",
+    "paths": [
+      "src/ui/**"
+    ],
+    "plan": null,
+    "priority": "P2",
+    "project": "cadence",
+    "ready": false,
+    "refs": [
+      {
+        "kind": "pr",
+        "url": "https://example.test/pr/1"
+      }
+    ],
+    "reports": [],
+    "rev": "",
+    "size": "S",
+    "status": "doing",
+    "status_source": "file",
+    "tags": [
+      "ui",
+      "m1"
+    ],
+    "title": "CAD-3",
+    "work": {
+      "health": null,
+      "milestone": "m1",
+      "milestone_source": "tag",
+      "progress": null,
+      "size": "S",
+      "stage": null,
+      "type": "task",
+      "type_source": "implicit",
+      "weight": 1
+    }
+  },
+  {
+    "acceptance": [],
+    "activity": [],
+    "artifacts": [],
+    "blocked": false,
+    "blocked_reason": null,
+    "body": "",
+    "checks": {
+      "done": 0,
+      "total": 0
+    },
+    "claim": null,
+    "comments": [],
+    "commits": [],
+    "commits_skipped": [],
+    "component": null,
+    "container": false,
+    "created": "2026-09-01T00:00:00Z",
+    "frontmatter": {
+      "created": "2026-09-01T00:00:00Z",
+      "id": "CAD-2",
+      "parent": "CAD-1",
+      "priority": "P2",
+      "status": "done",
+      "title": "CAD-2"
+    },
+    "history": [],
+    "id": "CAD-2",
+    "links": {
+      "blocked_by": [],
+      "blocks": [],
+      "children": [],
+      "duplicate_of": null,
+      "duplicates": [
+        {
+          "id": "CAD-3",
+          "missing": false,
+          "status": "doing",
+          "status_source": "file",
+          "title": "CAD-3"
+        }
+      ],
+      "parent": {
+        "id": "CAD-1",
+        "missing": false,
+        "status": "doing",
+        "status_source": "rollup",
+        "title": "CAD-1"
+      },
+      "relates": []
+    },
+    "notes_chain": [],
+    "owner": null,
+    "parent": "CAD-1",
+    "path": "/nonexistent/CAD-2/issue.md",
+    "paths": [],
+    "plan": null,
+    "priority": "P2",
+    "project": "cadence",
+    "ready": false,
+    "refs": [],
+    "reports": [],
+    "rev": "",
+    "size": null,
+    "status": "done",
+    "status_source": "file",
+    "tags": [],
+    "title": "CAD-2",
+    "work": {
+      "health": null,
+      "milestone": null,
+      "milestone_source": null,
+      "progress": null,
+      "size": null,
+      "stage": null,
+      "type": "task",
+      "type_source": "implicit",
+      "weight": 3
+    }
+  },
+  {
+    "acceptance": [],
+    "activity": [],
+    "artifacts": [],
+    "blocked": false,
+    "blocked_reason": null,
+    "body": "",
+    "checks": {
+      "done": 0,
+      "total": 0
+    },
+    "claim": null,
+    "comments": [],
+    "commits": [],
+    "commits_skipped": [],
+    "component": null,
+    "container": false,
+    "created": "2026-09-01T00:00:00Z",
+    "frontmatter": {
+      "created": "2026-09-01T00:00:00Z",
+      "id": "CAD-9",
+      "priority": "P2",
+      "status": "backlog",
+      "title": "CAD-9"
+    },
+    "history": [],
+    "id": "CAD-9",
+    "links": {
+      "blocked_by": [],
+      "blocks": [
+        {
+          "id": "CAD-3",
+          "missing": false,
+          "status": "doing",
+          "status_source": "file",
+          "title": "CAD-3"
+        }
+      ],
+      "children": [],
+      "duplicate_of": null,
+      "duplicates": [],
+      "parent": null,
+      "relates": []
+    },
+    "notes_chain": [],
+    "owner": null,
+    "parent": null,
+    "path": "/nonexistent/CAD-9/issue.md",
+    "paths": [],
+    "plan": null,
+    "priority": "P2",
+    "project": "cadence",
+    "ready": true,
+    "refs": [],
+    "reports": [],
+    "rev": "",
+    "size": null,
+    "status": "backlog",
+    "status_source": "file",
+    "tags": [],
+    "title": "CAD-9",
+    "work": {
+      "health": null,
+      "milestone": null,
+      "milestone_source": null,
+      "progress": null,
+      "size": null,
+      "stage": null,
+      "type": "task",
+      "type_source": "implicit",
+      "weight": 3
+    }
+  }
+]

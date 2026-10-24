@@ -1,22 +1,27 @@
 //! CAD-534: `cadence daemon` threads RPC handlers — moved verbatim from src/daemon.rs.
 
 use super::*;
+use cadence_core::board_api::{ThreadEntryRow, ThreadPage};
 
 impl Shared {
     /// The entries as JSON. A message-linked entry whose stored message
     /// belongs to this alias and to the entry's own thread carries
     /// `payload.delivery` (`state`, `started`, `completed`); its other
     /// payload keys are kept. Anything else gets no delivery.
-    fn entries_json(&self, alias: &str, entries: &[store::ThreadEntry]) -> Result<Vec<Value>> {
+    fn entries_json(
+        &self,
+        alias: &str,
+        entries: &[store::ThreadEntry],
+    ) -> Result<Vec<ThreadEntryRow>> {
         let mut out = Vec::with_capacity(entries.len());
         for entry in entries {
-            let mut j = entry.to_json();
+            let mut row = entry.row();
             let Some(id) = &entry.message_id else {
-                out.push(j);
+                out.push(row);
                 continue;
             };
             let Some(message) = self.store.message(id)?.filter(|m| m.alias == alias) else {
-                out.push(j);
+                out.push(row);
                 continue;
             };
             let same_thread = self
@@ -27,7 +32,7 @@ impl Shared {
                 None | Some(Value::Null) => serde_json::Map::new(),
                 Some(Value::Object(obj)) => obj.clone(),
                 Some(_) => {
-                    out.push(j);
+                    out.push(row);
                     continue;
                 }
             };
@@ -36,9 +41,9 @@ impl Shared {
                     "delivery".into(),
                     json!({"state": message.state, "started": message.started, "completed": message.completed}),
                 );
-                j["payload"] = Value::Object(payload);
+                row.payload = Some(Value::Object(payload));
             }
-            out.push(j);
+            out.push(row);
         }
         Ok(out)
     }
@@ -154,14 +159,15 @@ impl Shared {
                 Some(thread) => self.store.thread_reply_seq(&thread.id)?,
                 None => 0,
             };
-            return Ok(json!({
-                "alias": alias,
-                "thread": thread.as_ref().map(store::Thread::to_json),
-                "entries": self.entries_json(&alias, &entries)?,
-                "cursor": cursor,
-                "more_before": more,
-                "reply_seq": reply_seq,
-            }));
+            return Ok(serde_json::to_value(ThreadPage {
+                alias: alias.clone(),
+                thread: thread.as_ref().map(store::Thread::info),
+                entries: self.entries_json(&alias, &entries)?,
+                cursor,
+                more_before: Some(more),
+                reply_seq,
+            })
+            .expect("thread page serializes"));
         }
         let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
         let deadline = Instant::now() + Duration::from_secs(wait);
@@ -185,13 +191,15 @@ impl Shared {
                     Some(thread) => self.store.thread_reply_seq(&thread.id)?,
                     None => 0,
                 };
-                return Ok(json!({
-                    "alias": alias,
-                    "thread": thread.as_ref().map(store::Thread::to_json),
-                    "entries": self.entries_json(&alias, &entries)?,
-                    "cursor": cursor,
-                    "reply_seq": reply_seq,
-                }));
+                return Ok(serde_json::to_value(ThreadPage {
+                    alias: alias.clone(),
+                    thread: thread.as_ref().map(store::Thread::info),
+                    entries: self.entries_json(&alias, &entries)?,
+                    cursor,
+                    more_before: None,
+                    reply_seq,
+                })
+                .expect("thread page serializes"));
             }
             let step = deadline.min(Instant::now() + Duration::from_secs(1));
             self.changed.wait_until(step);

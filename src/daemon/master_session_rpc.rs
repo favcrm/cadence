@@ -1,6 +1,9 @@
 //! CAD-534: `cadence daemon` master session RPC handlers — moved verbatim from src/daemon.rs.
 
 use super::*;
+use cadence_core::board_api::{
+    AppOrigin, MasterContext, MasterQueued, MasterSession, MasterState, MasterTurn,
+};
 
 impl Shared {
     /// CAD-1700: `master_stamp` — the board's `master` push frame reads
@@ -96,33 +99,31 @@ impl Shared {
             .map(str::to_string)
             .or_else(|| agent.effort.clone())
             .or_else(|| configured("effort"));
-        let context = stats.as_ref().and_then(|s| s.get("contextUsage")).map(|u| {
-            json!({
-                "tokens": u.get("tokens").cloned().unwrap_or(Value::Null),
-                "window": u.get("contextWindow").cloned().unwrap_or(Value::Null),
-                "percent": u.get("percent").cloned().unwrap_or(Value::Null),
-            })
-        });
-        let session_json = session.as_ref().map(|s| {
-            json!({
-                "id": s.get("sessionId").cloned().unwrap_or(Value::Null),
-                "messages": s.get("messageCount").cloned().unwrap_or(Value::Null),
-                "streaming": s.get("isStreaming").cloned().unwrap_or(Value::Null),
-                "compacting": s.get("isCompacting").cloned().unwrap_or(Value::Null),
-            })
+        let context = stats
+            .as_ref()
+            .and_then(|s| s.get("contextUsage"))
+            .map(|u| MasterContext {
+                tokens: u.get("tokens").cloned().unwrap_or(Value::Null),
+                window: u.get("contextWindow").cloned().unwrap_or(Value::Null),
+                percent: u.get("percent").cloned().unwrap_or(Value::Null),
+            });
+        let session_json = session.as_ref().map(|s| MasterSession {
+            id: s.get("sessionId").cloned().unwrap_or(Value::Null),
+            messages: s.get("messageCount").cloned().unwrap_or(Value::Null),
+            streaming: s.get("isStreaming").cloned().unwrap_or(Value::Null),
+            compacting: s.get("isCompacting").cloned().unwrap_or(Value::Null),
         });
         // The turn the working row mirrors: `running` first, else the
         // queue head. `since` is epoch seconds — `started` while it
         // runs, `created` while it waits.
         // CAD-1098: the conversation the turn belongs to, so a panel can
         // say "queued" while another conversation's turn runs.
-        let conversation_of = |id: &str| -> Value {
+        let conversation_of = |id: &str| -> Option<String> {
             self.store
                 .message_conversation(alias, id)
                 .ok()
                 .flatten()
-                .map(|t| json!(t.id))
-                .unwrap_or(Value::Null)
+                .map(|t| t.id)
         };
         let running = self.store.running_message(alias)?;
         // CAD-1700: the complete ordered queue behind the board's master
@@ -137,92 +138,87 @@ impl Shared {
             None => self.store.queued_head(alias)?,
         };
         let turn = match &running {
-            Some(m) => json!({
-                "state": "working",
-                "message": m.id,
-                "conversation": conversation_of(&m.id),
-                "app_origin": self.master_turn_app_origin(&m.id),
-                "summary": m.body,
-                "since": m.started.unwrap_or(m.created),
+            Some(m) => Some(MasterTurn {
+                state: "working".into(),
+                message: m.id.clone(),
+                conversation: conversation_of(&m.id),
+                app_origin: self.master_turn_app_origin(&m.id),
+                summary: Some(m.body.clone()),
+                since: m.started.unwrap_or(m.created),
+                position: None,
             }),
-            None => match &head {
-                Some(m) => {
-                    let conversation = match queued.iter().find(|(id, _)| id == &m.id) {
-                        Some((_, Some(thread))) => json!(thread),
-                        Some((_, None)) => Value::Null,
-                        // The head left the queue between the two reads:
-                        // report its own conversation, never a neighbour's.
-                        None => conversation_of(&m.id),
-                    };
-                    json!({
-                        "state": "queued",
-                        "message": m.id,
-                        "conversation": conversation,
-                        "app_origin": self.master_turn_app_origin(&m.id),
-                        "summary": m.body,
-                        "since": m.created,
-                        "position": 1,
-                    })
+            None => head.as_ref().map(|m| {
+                let conversation = match queued.iter().find(|(id, _)| id == &m.id) {
+                    Some((_, thread)) => thread.clone(),
+                    // The head left the queue between the two reads:
+                    // report its own conversation, never a neighbour's.
+                    None => conversation_of(&m.id),
+                };
+                MasterTurn {
+                    state: "queued".into(),
+                    message: m.id.clone(),
+                    conversation,
+                    app_origin: self.master_turn_app_origin(&m.id),
+                    summary: Some(m.body.clone()),
+                    since: m.created,
+                    position: Some(1),
                 }
-                None => Value::Null,
-            },
+            }),
         };
         let queue = queued
             .iter()
-            .map(|(id, conversation)| json!({"message": id, "conversation": conversation}))
+            .map(|(id, conversation)| MasterQueued {
+                message: id.clone(),
+                conversation: conversation.clone(),
+            })
             .collect::<Vec<_>>();
-        Ok(json!({
-            "alias": alias,
-            "provider": agent.provider,
-            "endpoint_kind": agent.endpoint_kind,
-            "live": live,
-            "model": model_id,
-            "model_label": model.as_ref().and_then(|m| m.get("name").or_else(|| m.get("id"))).cloned().unwrap_or(Value::Null),
-            "effort": effort,
-            "context": context,
-            "session": session_json,
-            "commands": commands,
-            "turn": turn,
-            "queue": queue,
-            "queued": self.store.queued_count(alias)?,
-        }))
+        Ok(serde_json::to_value(MasterState {
+            alias: alias.to_string(),
+            provider: agent.provider.clone(),
+            endpoint_kind: agent.endpoint_kind.clone(),
+            live,
+            model: model_id,
+            model_label: model
+                .as_ref()
+                .and_then(|m| m.get("name").or_else(|| m.get("id")))
+                .cloned()
+                .unwrap_or(Value::Null),
+            effort,
+            context,
+            session: session_json,
+            commands: commands.iter().map(|c| (*c).to_string()).collect(),
+            turn,
+            queue,
+            queued: self.store.queued_count(alias)?,
+        })
+        .expect("master state serializes"))
     }
 
     /// Best-effort navigation metadata for the exact persisted master turn.
     /// This projection proves the current app and conversation while the
     /// runtime snapshot is held; it is not an authorization or revocation-atomic grant.
-    fn master_turn_app_origin(&self, message_id: &str) -> Value {
+    fn master_turn_app_origin(&self, message_id: &str) -> Option<AppOrigin> {
         let alias = crate::master::ALIAS;
-        let Some(thread) = self
+        let thread = self
             .store
             .message_conversation(alias, message_id)
             .ok()
-            .flatten()
-        else {
-            return Value::Null;
-        };
-        let Some(install) = thread
+            .flatten()?;
+        let install = thread
             .install_id
             .as_deref()
-            .filter(|install| !install.is_empty())
-        else {
-            return Value::Null;
-        };
+            .filter(|install| !install.is_empty())?;
         if thread.alias != alias
             || thread.archived
             || thread.runs_as_home()
             || thread.id.is_empty()
             || thread.subject.is_some()
         {
-            return Value::Null;
+            return None;
         }
 
-        let Ok(pm_dir) = self.pm_dir() else {
-            return Value::Null;
-        };
-        let Ok(pm) = self.pm_at(&pm_dir) else {
-            return Value::Null;
-        };
+        let pm_dir = self.pm_dir().ok()?;
+        let pm = self.pm_at(&pm_dir).ok()?;
         let conversation_id = thread.id.clone();
         crate::issue::app_catalog::workspace::with_runtime_read(&pm, install, |row, _files| {
             let Some(digest) = row.get("digest").and_then(Value::as_str) else {
@@ -299,15 +295,14 @@ impl Shared {
                 "context_id": (!context.is_empty()).then_some(context.as_str()),
             });
             self.verify_conversation_selector(alias, &app, &conversation_id)?;
-            Ok(Some(json!({
-                "install_id": install,
-                "context_id": context,
-                "conversation_id": conversation_id,
-            })))
+            Ok(Some(AppOrigin {
+                install_id: install.to_string(),
+                context_id: context,
+                conversation_id: conversation_id.clone(),
+            }))
         })
         .ok()
         .flatten()
-        .unwrap_or(Value::Null)
     }
 
     /// `master_models` (CAD-575) — the operator's per-role read of the

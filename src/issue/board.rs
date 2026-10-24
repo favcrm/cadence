@@ -15,7 +15,8 @@ use crate::issue::{notes, parse, project};
 
 mod presentation;
 pub use presentation::{
-    activity_json, card_json, card_json_rev, card_rev, detail_json, epic_json, epics_json, rev_of,
+    activity_json, card_json, card_json_rev, card_rev, detail, detail_json, epic_json, epics_json,
+    rev_of,
 };
 
 /// A loaded issue folder.

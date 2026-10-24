@@ -1,7 +1,7 @@
 //! CAD-1792: the typed board-API bodies serialize to the same bytes the
 //! `json!` builders did. Each golden is the pretty body captured from the
 //! pre-typing code; `CADENCE_WRITE_GOLDEN=1` rewrites them.
-use super::member_view::redact_agents_payload;
+use super::member_view::{member_view, redact_agents_payload, redact_master_state};
 use super::serve::agents_payload_from;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -88,6 +88,141 @@ fn agents_payload_bytes_are_unchanged() {
         "agents_no_jobs.json",
         &agents_payload_from(dir.path(), Some(roster()), None),
     );
+}
+
+/// CAD-1795: what a member sees of the daemon's `master_state` and
+/// `thread_read` replies, redacted from the operator goldens the daemon
+/// producers are pinned to (`daemon::board_producer_golden`).
+#[test]
+fn member_views_of_master_state_and_threads_are_unchanged() {
+    let read = |name: &str| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/ui/board_api_golden")
+            .join(name);
+        parse(&std::fs::read_to_string(path).unwrap())
+    };
+    for name in ["idle", "queued", "running"] {
+        let mut state = read(&format!("master_state_{name}.json"));
+        redact_master_state(&mut state);
+        golden(&format!("master_state_{name}_member.json"), &state);
+    }
+    for name in ["forward", "tail"] {
+        let mut page = read(&format!("thread_page_{name}.json"));
+        member_view(&mut page);
+        golden(&format!("thread_page_{name}_member.json"), &page);
+    }
+    // A worker's thread: members keep its entries, minus the operator-only kinds.
+    let mut worker = read("thread_page_forward.json");
+    worker["alias"] = Value::from("w1");
+    let mut hire = worker["entries"][0].clone();
+    hire["kind"] = Value::from("hire_proposal");
+    worker["entries"].as_array_mut().unwrap().push(hire);
+    member_view(&mut worker);
+    golden("thread_page_worker_member.json", &worker);
+}
+
+/// CAD-1795: `GET /api/issues/:id` and `issue show --json`, byte for byte.
+/// A detailed issue (links both ways, a missing link, comments, artifacts,
+/// refs, a claim, acceptance items) and a bare one.
+#[test]
+fn issue_detail_bytes_are_unchanged() {
+    use crate::issue::board::{self, Comment, Issue};
+    use crate::issue::model::{Claim, CommentFront, Front};
+    use crate::issue::work;
+    use std::collections::HashMap;
+    let new = |id: &str, parent: Option<&str>| {
+        let mut front = Front::new(id, id, "2026-09-01T00:00:00Z");
+        front.parent = parent.map(str::to_string);
+        Issue {
+            project: "cadence".into(),
+            dir: PathBuf::from("/nonexistent").join(id),
+            front,
+            body: String::new(),
+            comments: vec![],
+            artifacts: vec![],
+        }
+    };
+    let mut epic = new("CAD-1", None);
+    epic.front.item_type = Some("epic".into());
+    let mut rich = new("CAD-3", Some("CAD-1"));
+    rich.front.status = "doing".into();
+    rich.front.owner = Some("dev-1".into());
+    rich.front.component = Some("ui".into());
+    rich.front.size = Some("S".into());
+    rich.front.tags = vec!["ui".into(), "m1".into()];
+    rich.front.paths = vec!["src/ui/**".into()];
+    rich.front.blocked_by = vec!["CAD-9".into(), "CAD-77".into()];
+    rich.front.relates = vec!["CAD-2".into()];
+    rich.front.duplicate_of = Some("CAD-2".into());
+    rich.front.claim = Some(Claim {
+        by: "pm".into(),
+        at: "2026-09-02T00:00:00Z".into(),
+        session: Some("s-1".into()),
+        last_seen: None,
+        note: Some("mine".into()),
+        stale: None,
+    });
+    rich.front.refs = vec![serde_json::from_value(
+        serde_json::json!({"kind": "pr", "url": "https://example.test/pr/1"}),
+    )
+    .unwrap()];
+    rich.body = "Intro.\n\n## Acceptance\n- [x] first\n- [ ] second\n".into();
+    rich.comments = vec![
+        Comment {
+            name: "20260903-000000-pm".into(),
+            front: CommentFront {
+                author: "pm".into(),
+                at: "2026-09-03T00:00:00Z".into(),
+                kind: Some("note".into()),
+            },
+            body: "hello".into(),
+        },
+        Comment {
+            name: "20260904-000000-dev".into(),
+            front: CommentFront {
+                author: "dev-1".into(),
+                at: "2026-09-04T00:00:00Z".into(),
+                kind: None,
+            },
+            body: "world".into(),
+        },
+    ];
+    rich.artifacts = vec![("out.txt".into(), 12)];
+    let mut dup = new("CAD-2", Some("CAD-1"));
+    dup.front.status = "done".into();
+    let views = board::views(
+        std::path::Path::new("/no-notes"),
+        vec![epic, rich, dup, new("CAD-9", None)],
+    );
+    let by_id: HashMap<String, &board::View> = views
+        .iter()
+        .map(|v| (v.issue.front.id.clone(), v))
+        .collect();
+    let ctx = work::Ctx {
+        by_id: &by_id,
+        configs: HashMap::from([(
+            "cadence".to_string(),
+            work::ProjectWork {
+                cfg: work::WorkConfig::default(),
+                error: None,
+                unapproved: None,
+            },
+        )]),
+        now: 1_790_000_000,
+    };
+    let pm_dir = std::path::Path::new("/nonexistent");
+    // The claim's age is measured from the wall clock.
+    let details: Vec<Value> = views
+        .iter()
+        .map(|v| {
+            let mut detail = work::detail_json(pm_dir, &ctx, v);
+            if detail["claim"]["age_secs"].is_number() {
+                detail["claim"]["age_secs"] = Value::from(0);
+            }
+            detail
+        })
+        .collect();
+    golden("issue_details.json", &Value::Array(details));
 }
 
 /// `/api/meta`: the typed body equals the `json!` literal it replaced
