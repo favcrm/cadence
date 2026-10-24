@@ -62,3 +62,23 @@ export function setThemePref(pref: ThemePref): void {
   writeThemePref(pref, browserStorage());
   applyThemePref(pref);
 }
+
+/** The theme a framed app must be told about: the `data-theme` the board is
+ *  actually showing, or null for "system" (the pick that leaves the attribute
+ *  off so the OS decides). A sandboxed frame is a separate document and never
+ *  sees this attribute, so the host must carry it into the mount. */
+export type FrameTheme = "light" | "dark";
+export function appliedFrameTheme(root: HTMLElement = document.documentElement): FrameTheme | null {
+  const value = root.getAttribute("data-theme");
+  return value === "light" || value === "dark" ? value : null;
+}
+
+/** Observe the applied theme, so an open screen can re-mint with the new one.
+ *  Returns an unsubscribe (no-op outside a browser). */
+export function onAppliedThemeChange(listener: (theme: FrameTheme | null) => void): () => void {
+  if (typeof MutationObserver === "undefined" || typeof document === "undefined") return () => {};
+  const target = document.documentElement;
+  const observer = new MutationObserver(() => listener(appliedFrameTheme(target)));
+  observer.observe(target, { attributes: true, attributeFilter: ["data-theme"] });
+  return () => observer.disconnect();
+}

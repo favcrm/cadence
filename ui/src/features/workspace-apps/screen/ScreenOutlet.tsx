@@ -9,6 +9,7 @@ import ScreenSlotLayer from "./ScreenSlotLayer";
 import { parseDraftImageRef, type ScreenPush } from "./screenProtocol";
 import { workspaceApps } from "../workspaceApps";
 import { useLocale } from "../../../lib/locale";
+import { appliedFrameTheme, onAppliedThemeChange, type FrameTheme } from "../../../lib/theme";
 import { downscaleToDataUrl } from "./screenAssets";
 import { registerNavigationGuard, useHref } from "../../../lib/useLocation";
 import { recordServices, object, exact, type HostCommand } from "./screenServices";
@@ -68,6 +69,12 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   const [slot, setSlot] = useState<SlotView | null>(null);
   const [link, setLink] = useState<string | null>(null);
   const [state, setState] = useState<"loading" | "ready" | "fallback">("loading");
+  // The board's applied pick, carried into the mount: a sandboxed frame is its
+  // own document and never sees the board's `data-theme`. A change re-mints the
+  // receipt (the effect below depends on it), so the frame is never left on a
+  // stale theme.
+  const [frameTheme, setFrameTheme] = useState<FrameTheme | null>(() => appliedFrameTheme());
+  useEffect(() => onAppliedThemeChange(setFrameTheme), []);
   const [failure, setFailure] = useState<ScreenPaneState | null>(null);
   const [attempt, setAttempt] = useState(0);
   /** Retry re-mounts the same projection: the effect's scope identity is
@@ -146,7 +153,13 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         const response = await privateFetch(`/api/app-installations/${encodeURIComponent(current.install_id)}/screens/${encodeURIComponent(current.tag)}/mount`, {
           method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
           headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
-          body: JSON.stringify(current.context_id ? { context_id: current.context_id } : {}),
+          // The frame is its own document and cannot see the board's
+          // `data-theme`; the mount carries the applied pick, and "system"
+          // omits it so the frame's own media query decides.
+          body: JSON.stringify({
+            ...(current.context_id ? { context_id: current.context_id } : {}),
+            ...(frameTheme ? { theme: frameTheme } : {}),
+          }),
         }, session);
         if (!response.ok) {
           if ([401, 403].includes(response.status)) purgeDisplayCache();
@@ -258,7 +271,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         void revokeTool(token);
       }
     };
-  }, [scope, attempt]);
+  }, [scope, attempt, frameTheme]);
   useEffect(() => { if (mounted.current) channel.current?.update(decorate(projection, mounted.current)); }, [projection, href, locale]);
   return <>
     <div aria-label={t("Installed app screen")} style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "ready" ? "block" : "none" }}>
