@@ -1,10 +1,10 @@
-//! Contract checks: the committed JSON Schema equals the one generated from
+//! Contract checks (in-crate: the root test runner only selects root-package targets): the committed JSON Schema equals the one generated from
 //! the Rust types, and every golden case in `tests/cases/*.json` evaluates to
 //! its expected bytes. The same case files are the fixture a wasm host runs.
 //!
 //! A case is `{"input": <envelope object, or a string sent as raw bytes>,
 //! "expected": <response>}`.
-use cadence_core::evaluate::{Refused, Request, Success};
+use crate::evaluate::{Refused, Request, Success};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -59,7 +59,7 @@ fn golden_cases() {
             Value::String(raw) => raw.clone().into_bytes(),
             envelope => serde_json::to_vec(envelope).unwrap(),
         };
-        let actual: Value = serde_json::from_slice(&cadence_core::evaluate(&input)).unwrap();
+        let actual: Value = serde_json::from_slice(&crate::evaluate(&input)).unwrap();
         assert_eq!(actual, case["expected"], "{}", path.display());
         count += 1;
     }

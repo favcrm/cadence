@@ -9,3 +9,6 @@ pub use frontmatter::split_front;
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm-abi"))]
 mod wasm;
+
+#[cfg(test)]
+mod contract_tests;

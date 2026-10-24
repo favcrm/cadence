@@ -1,0 +1,12 @@
+{
+ "input": {
+  "v": 1,
+  "op": "app.manifest.preflight",
+  "input": null
+ },
+ "expected": {
+  "ok": false,
+  "code": "invalid_command",
+  "message": "invalid type: null, expected struct ManifestPreflightInput"
+ }
+}
