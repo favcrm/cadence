@@ -314,6 +314,15 @@ for (const density of ["full", "compact"] as const) {
   ok(legacy.includes('data-earlier="true"') && legacy.includes("Earlier transcript"), "legacy: marked as earlier transcript");
   ok(!legacy.includes(">Worker note<"), "legacy: the reply is not repeated inside the trace");
 
+  // A current transcript's last note is not an answer merely because it is
+  // last: Home enables legacy promotion only when the whole thread has no
+  // turn_result.
+  const errorNote = renderTurn(
+    threadItems(state([agent(1, "assistant_text", "Provider error")])),
+  );
+  ok(!errorNote.includes('data-kind="answer"'), "current note: no legacy answer");
+  ok(errorNote.includes('data-kind="no-answer"'), "current note: no answer state");
+
   // A tool-turn note is not a reply: it stays in the trace and the completed
   // turn says no answer returned instead of inventing one from position.
   const toolTurn = renderTurn(
