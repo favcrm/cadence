@@ -332,6 +332,12 @@ export default function Update({
                   {report ? releaseLabel(report.target_version, report.target) : t("Not checked yet")}
                 </dd>
               </div>
+              <div>
+                <dt>{t("Connectivity")}</dt>
+                <dd data-state={readError ? "unavailable" : "connected"}>
+                  {readError ? t("Last read failed") : t("Connected")}
+                </dd>
+              </div>
             </dl>
             <div className="update-release-footer">
               <p>

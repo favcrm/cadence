@@ -18,6 +18,8 @@ function equal(actual: unknown, expected: unknown, why: string): void {
 interface World {
   connections: any[];
   binding: any | null;
+  /** Per-context bindings; a missing key falls back to `binding`. */
+  bindings?: Record<string, any | null>;
   contexts: any[];
   origin: { unsubscribe_origin: string | null; stored: boolean };
   posts: { path: string; body: any }[];
@@ -76,24 +78,38 @@ async function mount(world: World, viewer = { operator: true, readOnly: false })
         return json([{ install_id: "install-crm", name: "crm", title: "CRM", smtp_custody: true }, { install_id: "install-social", name: "social-content", title: "Social" }]);
       case "GET /api/app-installations/install-crm/contexts": return json({ contexts: world.contexts });
       case "GET /api/connections": return json({ connections: world.connections });
-      case "POST /api/crm-smtp/show":
-        return world.binding ? json({ binding: world.binding }) : json({ error: "no SMTP sender is bound to this context" }, 409);
+      case "POST /api/crm-smtp/show": {
+        const found = world.bindings && Object.hasOwn(world.bindings, body.context_id)
+          ? world.bindings[body.context_id]
+          : world.binding;
+        return found ? json({ binding: found }) : json({ error: "no SMTP sender is bound to this context" }, 409);
+      }
       case "GET /api/crm-send/origin": return json(world.origin);
       case "POST /api/crm-send/origin":
         world.origin = { unsubscribe_origin: body.unsubscribe_origin, stored: body.unsubscribe_origin !== null };
         return json(world.origin);
       case "POST /api/crm-smtp/bind": {
         const row = world.connections.find((r) => r.id === body.connection_id);
-        world.binding = bindingFor(row);
-        return json({ binding: world.binding });
+        const next = bindingFor(row);
+        next.context_id = body.context_id;
+        world.binding = next;
+        world.bindings = { ...world.bindings, [body.context_id]: next };
+        return json({ binding: next });
       }
       case "POST /api/crm-smtp/rebind": {
         if (body.expected_revision !== world.binding.link_revision) return json({ error: "stale link revision" }, 409);
         const row = world.connections.find((r) => r.id === body.connection_id);
-        world.binding = bindingFor(row, { link_revision: world.binding.link_revision + 1 });
-        return json({ binding: world.binding });
+        const next = bindingFor(row, { link_revision: world.binding.link_revision + 1 });
+        next.context_id = body.context_id;
+        world.binding = next;
+        world.bindings = { ...world.bindings, [body.context_id]: next };
+        return json({ binding: next });
       }
-      case "POST /api/crm-smtp/revoke": world.binding = null; return json({ ok: true });
+      case "POST /api/crm-smtp/revoke": {
+        world.binding = null;
+        if (world.bindings) delete world.bindings[body.context_id];
+        return json({ ok: true });
+      }
     }
     throw new Error(`Unexpected ${method} ${url.pathname}`);
   }) as typeof fetch;
@@ -128,7 +144,7 @@ async function mount(world: World, viewer = { operator: true, readOnly: false })
 const fresh = (over: Partial<World> = {}): World => ({
   connections: [smtpRow("conn-a")], binding: null,
   contexts: [{ id: "ctx-a", state: "active", config: { label: "Acme" } }],
-  origin: { unsubscribe_origin: null, stored: false }, posts: [], ...over,
+  origin: { unsubscribe_origin: null, stored: false }, bindings: {}, posts: [], ...over,
 });
 
 async function main() {
@@ -141,6 +157,33 @@ async function main() {
     await m.settle(() => assert(m.host.querySelector("[data-state=live]")?.textContent?.includes("Sending from conn-a@example.com"), "live status"));
     const bind = world.posts.find((p) => p.path === "/api/crm-smtp/bind")!;
     equal(Object.keys(bind.body).sort(), ["connection_id", "context_id", "install_id", "request_id"], "bind body carries ids only, no revisions");
+    await m.unmount();
+  }
+  // CAD-1797: every eligible app/context is listed; each keeps its own
+  // binding. The page does not re-implement the Connections account form.
+  {
+    const a = smtpRow("conn-a"), b = smtpRow("conn-b");
+    const world = fresh({
+      connections: [a, b],
+      contexts: [
+        { id: "ctx-a", state: "active", config: { label: "Acme" } },
+        { id: "ctx-b", state: "active", config: { label: "Billing" } },
+      ],
+      bindings: { "ctx-a": bindingFor(a) },
+    });
+    const m = await mount(world);
+    await m.settle(() => {
+      assert(m.host.textContent!.includes("Acme") && m.host.textContent!.includes("Billing"), "both contexts render");
+      assert(m.host.querySelectorAll("[data-state=live]").length === 1, "only the bound context is live");
+      assert(m.host.querySelectorAll("[data-state=unbound]").length === 1, "the other context is unbound");
+    });
+    assert(!m.host.querySelector("#email-sending-target"), "no single-target selector");
+    assert(!m.host.querySelector("[data-section=connect-email]"), "no duplicate SMTP account form");
+    assert(!m.host.querySelector("input[type=password]"), "no password field on the policy page");
+    await m.click(m.button("Use this sender"));
+    await m.settle(() => assert(m.host.querySelectorAll("[data-state=live]").length === 2, "the second context binds"));
+    const bind = world.posts.find((p) => p.path === "/api/crm-smtp/bind")!;
+    equal(bind.body.context_id, "ctx-b", "the bind carries the second context");
     await m.unmount();
   }
   // Hosted sender label; its row has no password field; main path hides revisions.

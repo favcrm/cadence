@@ -45,7 +45,7 @@ export default function HostedSmtpConnect({
   const [preset, setPreset] = useState<Preset>(PRESETS[0]);
   const [host, setHost] = useState(PRESETS[0].host);
   const [tls, setTls] = useState<TlsMode>(PRESETS[0].tls);
-  const [address, setAddress] = useState("");
+  const [address, setAddress] = useState(connected ?? "");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
   const [consent, setConsent] = useState(false);
@@ -116,12 +116,12 @@ export default function HostedSmtpConnect({
             disabled={pending}
             onClick={() => choose(p)}
           >
-            {p.label}
+            {t(p.label)}
           </Button>
         ))}
       </div>
       <p className="text-label text-ink-400 break-words" data-hint={preset.id}>
-        {preset.hint}
+        {t(preset.hint)}
       </p>
       <div className="crm-field-row">
         <div className="crm-field">
