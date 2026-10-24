@@ -172,3 +172,18 @@ fn meta_bytes_are_unchanged() {
         json!({"gh": null, "gh_error": "no gh", "every_secs": 5})
     );
 }
+
+/// The committed core and board-API schemas match the Rust types. The core
+/// crate checks this too, but only in the path-filtered core-wasm workflow;
+/// this copy runs in the required `test` job on every PR and in the queue.
+#[test]
+fn committed_contract_schemas_match_core_types() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for (path, generated) in cadence_core::contracts::committed_schemas() {
+        let committed = std::fs::read_to_string(repo.join(path)).unwrap_or_default();
+        assert_eq!(
+            committed, generated,
+            "{path} is stale; regenerate with CADENCE_CORE_WRITE_SCHEMA=1 cargo test -p cadence-core, then bun run --cwd ui gen:board-api"
+        );
+    }
+}

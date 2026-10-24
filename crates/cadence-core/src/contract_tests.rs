@@ -4,8 +4,6 @@
 //!
 //! A case is `{"input": <envelope object, or a string sent as raw bytes>,
 //! "expected": <response>}`.
-use crate::evaluate::{Refused, Request, Success};
-use crate::issue::IssueCard;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -13,72 +11,21 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn pretty(schema: schemars::Schema) -> String {
-    serde_json::to_string_pretty(&schema).unwrap() + "\n"
-}
-
 #[test]
-fn committed_schema_matches_rust_types() {
-    let dir = root().join("../../contracts/cadence-core/v1");
-    let files = [
-        (
-            "request.schema.json",
-            pretty(schemars::schema_for!(Request)),
-        ),
-        (
-            "success.schema.json",
-            pretty(schemars::schema_for!(Success)),
-        ),
-        (
-            "refused.schema.json",
-            pretty(schemars::schema_for!(Refused)),
-        ),
-        (
-            "issue-card.schema.json",
-            pretty(schemars::schema_for!(IssueCard)),
-        ),
-    ];
-    for (name, generated) in files {
-        let path = dir.join(name);
+fn committed_schemas_match_rust_types() {
+    let repo = root().join("../..");
+    for (path, generated) in crate::contracts::committed_schemas() {
+        let path = repo.join(path);
         if std::env::var_os("CADENCE_CORE_WRITE_SCHEMA").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, &generated).unwrap();
         }
         let committed = std::fs::read_to_string(&path).unwrap_or_default();
         assert_eq!(
-            committed, generated,
-            "{name} is stale; regenerate with CADENCE_CORE_WRITE_SCHEMA=1 cargo test -p cadence-core"
-        );
-    }
-}
-
-#[test]
-fn committed_board_api_schema_matches_rust_types() {
-    use crate::board_api::{AgentsResponse, IssuesResponse, MetaResponse};
-    let dir = root().join("../../contracts/board-api/v1");
-    let files = [
-        (
-            "issues.schema.json",
-            pretty(schemars::schema_for!(IssuesResponse)),
-        ),
-        (
-            "agents.schema.json",
-            pretty(schemars::schema_for!(AgentsResponse)),
-        ),
-        (
-            "meta.schema.json",
-            pretty(schemars::schema_for!(MetaResponse)),
-        ),
-    ];
-    for (name, generated) in files {
-        let path = dir.join(name);
-        if std::env::var_os("CADENCE_CORE_WRITE_SCHEMA").is_some() {
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(&path, &generated).unwrap();
-        }
-        let committed = std::fs::read_to_string(&path).unwrap_or_default();
-        assert_eq!(
-            committed, generated,
-            "{name} is stale; regenerate with CADENCE_CORE_WRITE_SCHEMA=1 cargo test -p cadence-core, then bun run --cwd ui gen:board-api"
+            committed,
+            generated,
+            "{} is stale; regenerate with CADENCE_CORE_WRITE_SCHEMA=1 cargo test -p cadence-core, then bun run --cwd ui gen:board-api",
+            path.display()
         );
     }
 }
