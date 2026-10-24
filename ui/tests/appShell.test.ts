@@ -220,6 +220,23 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     }
     return json({ ok: true });
   }
+  if (path === "/api/agents") return json({
+    daemon: "ok",
+    agents: [{
+      alias: "master",
+      provider: "pi",
+      endpoint_kind: "managed",
+      state: "running",
+      params: { look: "builder" },
+      look: "builder",
+      group: "rollout",
+      running: 0,
+      queued: 0,
+      unknown: 0,
+      parked: 0,
+    }],
+    by_issue: {},
+  });
   if (path === "/api/app-installations/install-shell") return json(generic);
   if (path === "/api/app-installations/install-second") return json(second);
   if (path === "/api/app-installations/install-social") return json(social);
@@ -298,7 +315,7 @@ assert(text().includes("All apps") && text().includes("Reports"), "← All apps 
 assert(text().includes("This app's screen is unavailable."), "an app without its own screen shows the one unavailable state");
 assert(!text().includes("No records yet") && !text().includes("CAD-781"), "core draws no records UI of its own");
 assert(text().includes("Master answer stays connected"), "the left pane shows the real master thread");
-assert(host.querySelector(".app-chat-avatar .agent-avatar"), "the chat header shows the master avatar");
+assert(host.querySelector('.app-chat-title .agent-avatar[data-slug="builder"]'), "the chat header shows the master's configured avatar look");
 assert(!host.querySelector(".app-chat-mark"), "the static star mark is gone");
 assert(!text().includes("ctx-a"), "CAD-1051: internal context ids never render in the chat");
 equal(panes(), 1, "exactly one chat pane in the document");

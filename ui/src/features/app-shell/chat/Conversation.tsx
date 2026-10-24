@@ -153,9 +153,6 @@ type AppMode = Extract<ConversationMode, { kind: "app" }>;
 const APP_WINDOW = 120;
 /** The composer's textarea id: the starters fill and focus it. */
 const COMPOSER_ID = "app-shell-chat-box";
-/** The master is the agent behind every app conversation; its look is
- *  stable and already owned by the agents feature (robot by default). */
-const MASTER_AVATAR = agentLook(MASTER);
 
 export interface HomeListProps {
   mode: { kind: "home" };
@@ -453,6 +450,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const convId = active.state === "ready" ? (active.selected?.id ?? null) : null;
   const thread = useResource(store);
   const masterState = useQuery(resources.masterState);
+  const agentsState = useQuery(resources.agents);
+  const masterRow = agentsState.data?.agents?.find((a) => a.alias === MASTER);
+  const masterLook = agentLook(MASTER, masterRow?.params);
   const homeThread = useResource(resources.masterThread);
   // One draft per conversation: the composer remounts per store, so
   // switching conversations keeps each one's typed text (the stores and
@@ -1510,7 +1510,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       <div className="app-chat-head">
         <div className="app-chat-title min-w-0">
           <span className="app-chat-avatar" aria-hidden>
-            <AgentAvatar slug={MASTER_AVATAR} size={28} still />
+            <AgentAvatar slug={masterLook} look={masterRow?.look ?? undefined} size={28} still />
           </span>
           <strong>{t("Assistant")}</strong>
           {(convLabel !== null || streamDown) && (
@@ -1672,7 +1672,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       )}
       {emptyState !== null && (
         <div className="app-chat-empty" data-empty={emptyState.kind}>
-          <AgentAvatar slug={MASTER_AVATAR} size={44} still />
+          <AgentAvatar slug={masterLook} look={masterRow?.look ?? undefined} size={44} still />
           <p className="text-label text-ink-500">{t(emptyState.text)}</p>
         </div>
       )}
