@@ -180,10 +180,16 @@ async function main() {
   root = createRoot(host);
   fail = true;
   hold = false;
-  await render();
+  await render(false, true, {
+    ok: true, pm_present: true, projects: 0, issues: 0, daemon: "reachable", embedded: true,
+  });
   assert(
     text().includes("Update status unavailable") && !text().includes("Loading"),
     "A failed initial read stops loading and remains retryable",
+  );
+  assert(
+    text().includes("Daemon connected") && !text().includes("Installed release"),
+    "Connectivity renders from health even when the update read failed",
   );
   fail = false;
   await click(button("Retry status"));

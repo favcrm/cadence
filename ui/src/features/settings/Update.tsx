@@ -321,9 +321,9 @@ export default function Update({
             <p>{t(stateText).replace("{phase}", () => String(phase ?? "")).replace("{change_count}", () => String(report?.change_count ?? ""))}</p>
           </div>
         </div>
-        {status && (
-          <>
-            <dl className="update-versions">
+        <dl className="update-versions">
+          {status && (
+            <>
               <div>
                 <dt>{t("Installed release")}</dt>
                 <dd>
@@ -336,29 +336,33 @@ export default function Update({
                   {report ? releaseLabel(report.target_version, report.target) : t("Not checked yet")}
                 </dd>
               </div>
-              <div>
-                <dt>{t("Connectivity")}</dt>
-                <dd
-                  data-state={
-                    health === undefined
-                      ? "unknown"
-                      : health === null
-                        ? "checking"
-                        : health !== "unavailable" && health.daemon === "reachable"
-                          ? "connected"
-                          : "unavailable"
-                  }
-                >
-                  {health === undefined
-                    ? t("Not checked yet")
-                    : health === null
-                      ? t("Checking…")
-                      : health !== "unavailable" && health.daemon === "reachable"
-                        ? t("Daemon connected")
-                        : t("Daemon disconnected")}
-                </dd>
-              </div>
-            </dl>
+            </>
+          )}
+          <div>
+            <dt>{t("Connectivity")}</dt>
+            <dd
+              data-state={
+                health === undefined
+                  ? "unknown"
+                  : health === null
+                    ? "checking"
+                    : health !== "unavailable" && health.daemon === "reachable"
+                      ? "connected"
+                      : "unavailable"
+              }
+            >
+              {health === undefined
+                ? t("Not checked yet")
+                : health === null
+                  ? t("Checking…")
+                  : health !== "unavailable" && health.daemon === "reachable"
+                    ? t("Daemon connected")
+                    : t("Daemon disconnected")}
+            </dd>
+          </div>
+        </dl>
+        {status && (
+          <>
             <div className="update-release-footer">
               <p>
                 {status.checked_at ? t("Last checked {time}").replace("{time}", () => timeLabel(status.checked_at!)) : t("No completed check yet")}

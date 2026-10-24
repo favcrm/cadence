@@ -153,6 +153,54 @@ async function main() {
   });
   assert(!(host2.textContent ?? "").includes("stub-app-password"), "the secret never appears in text");
   await act(async () => root2.unmount());
+
+  // A save that finishes after the form is left must not navigate the
+  // operator away from the page they moved to.
+  const SmtpAccountForm = (require("../src/features/settings/SmtpAccountForm") as typeof import("../src/features/settings/SmtpAccountForm")).default;
+  let resolveSave!: (response: Response) => void;
+  globalThis.fetch = ((input: unknown, init?: RequestInit) => {
+    if (init?.method === "POST" && String(input).endsWith("/api/connections")) {
+      return new Promise<Response>((resolve) => { resolveSave = resolve; });
+    }
+    throw new Error(`Unexpected ${String(input)}`);
+  }) as typeof fetch;
+  let saved: string | null = null;
+  const host3 = document.createElement("div");
+  document.body.append(host3);
+  const root3 = createRoot(host3);
+  act(() => {
+    root3.render(
+      React.createElement(LocaleProvider, null,
+        React.createElement(SmtpAccountForm, { rows: [], onSaved: (id: string) => { saved = id; } }),
+      ),
+    );
+  });
+  await settle(() => assert(host3.querySelector("#hs-password"), "late-save form renders"));
+  const field3 = (label: string) =>
+    Array.from(host3.querySelectorAll("label")).find((l) => (l.textContent ?? "").includes(label));
+  const fill3 = (label: string, value: string) => {
+    const lab = field3(label);
+    assert(lab, `field labelled ${label}`);
+    const input = lab!.parentElement!.querySelector("input") as HTMLInputElement;
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!;
+      setter.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  };
+  fill3("Your email address", "owner@essentialfoods.test");
+  fill3("App password", "stub-app-password");
+  const submit3 = Array.from(host3.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === "Connect email") as HTMLButtonElement;
+  act(() => submit3.click());
+  await settle(() => assert(typeof resolveSave === "function", "save request started"));
+  await act(async () => root3.unmount());
+  await act(async () => {
+    resolveSave(new Response(JSON.stringify({ connection: { id: "late-save" } }), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    }));
+    await sleep(0);
+  });
+  assert(saved === null, "a save completing after unmount does not navigate");
   console.log("connections fallback checks passed");
 }
 void main();

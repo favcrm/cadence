@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import type { Connection } from "../../lib/types";
 import Button from "../../ui/Button";
@@ -26,9 +26,20 @@ export default function SmtpAccountForm({
     rows.find((row) => row.provider === "smtp") ??
     null;
   const [replacing, setReplacing] = useState(false);
+  const mounted = useRef(true);
+  const request = useRef(0);
   const address = emailRow?.smtp?.sender ?? null;
 
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      request.current += 1;
+    };
+  }, []);
+
   const connect = async (d: ConnectDetails, acceptRisk: boolean) => {
+    const generation = ++request.current;
     const fields = {
       host: d.host,
       port: d.port,
@@ -50,6 +61,9 @@ export default function SmtpAccountForm({
           scopes: [SMTP_SEND_SCOPE],
           ...fields,
         });
+    // A route change or Cancel while verification is in flight must not
+    // pull the operator off the page they moved to.
+    if (!mounted.current || generation !== request.current) return;
     onSaved(out.connection.id);
   };
 
@@ -60,7 +74,7 @@ export default function SmtpAccountForm({
           {t("Connected: {account}").replace("{account}", () => String(address ?? emailRow.account))}
         </p>
         <div className="crm-toolbar">
-          <Button size="sm" onClick={() => setReplacing(true)}>{t("Replace email account")}</Button>
+          <Button size="sm" onClick={() => { request.current += 1; setReplacing(true); }}>{t("Replace email account")}</Button>
         </div>
         <p className="text-micro text-ink-500 break-words">
           {t("Apps choose this account in Settings → Email sending.")}
@@ -77,7 +91,7 @@ export default function SmtpAccountForm({
       <HostedSmtpConnect
         connected={address}
         onConnect={connect}
-        onCancel={emailRow ? () => setReplacing(false) : undefined}
+        onCancel={emailRow ? () => { request.current += 1; setReplacing(false); } : undefined}
       />
     </div>
   );
