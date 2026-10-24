@@ -1,0 +1,24 @@
+{
+  "input": {
+    "v": 1,
+    "op": "issue.validate",
+    "input": {
+      "tags": [
+        "ui",
+        "api",
+        "ui"
+      ]
+    }
+  },
+  "expected": {
+    "ok": true,
+    "value": {
+      "valid": true,
+      "tags": [
+        "api",
+        "ui"
+      ],
+      "refusals": []
+    }
+  }
+}

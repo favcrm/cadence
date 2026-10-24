@@ -510,7 +510,7 @@ pub fn views_with_jobs(notes_dir: &Path, issues: Vec<Issue>, jobs: &JobOutcomes)
     let done = |id: &str| {
         status_of
             .get(id)
-            .map(|(s, _)| matches!(s.as_str(), "done" | "dropped"))
+            .map(|(s, _)| cadence_core::issue::is_closed(s))
             .unwrap_or(false)
     };
     issues
@@ -528,7 +528,7 @@ pub fn views_with_jobs(notes_dir: &Path, issues: Vec<Issue>, jobs: &JobOutcomes)
             // job-blocked issue is neither ready nor cleanly movable.
             let blocked =
                 issue.front.blocked_by.iter().any(|b| !done(b)) || blocked_reason.is_some();
-            let ready = matches!(status.as_str(), "backlog" | "ready") && !blocked;
+            let ready = cadence_core::issue::leaf_ready(&status, blocked);
             let blocks = blocks_of.get(&id).cloned().unwrap_or_default();
             let duplicates = duplicates_of.get(&id).cloned().unwrap_or_default();
             let (checks_done, checks_total) = parse::checkbox_progress(&issue.body);

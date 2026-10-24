@@ -9,9 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// Board columns minus `dropped` — dropped issues leave the board.
-pub const STATUSES: &[&str] = &["backlog", "ready", "doing", "review", "done", "dropped"];
-pub const PRIORITIES: &[&str] = &["P0", "P1", "P2", "P3"];
+pub use cadence_core::issue::{
+    check_id, check_key, check_priority, check_status, normalize_tags, valid_id, valid_key,
+    valid_tag, Ref, PRIORITIES, STATUSES, TAG_MAX,
+};
+
 /// Link fields stored on one side only; inverses are computed.
 pub const LINK_KINDS: &[&str] = &["blocked_by", "relates", "parent", "duplicate_of"];
 pub const REF_KINDS: &[&str] = &[
@@ -33,41 +35,6 @@ pub const SETTABLE: &[&str] = &[
 /// CAD-405 work-item types. An issue without `type` is an `epic` when
 /// it has children (or carries a plan) and a `task` otherwise.
 pub const TYPES: &[&str] = &["epic", "task", "bug", "spike"];
-/// Most tags one issue may carry.
-pub const TAG_MAX: usize = 12;
-
-/// `note` refs use `path` (the notes directory), preview refs store the
-/// publish path — never a signed URL.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct Ref {
-    pub kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    /// `issue finish` marks worktree/branch refs closed rather than
-    /// deleting them — the ref stays as history.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub closed: Option<bool>,
-    /// `message` refs only: the worktree the dispatch ran against, so
-    /// a re-start under `--name` leaves the earlier kickoff bound to
-    /// its own pair instead of every worktree the issue ever opens.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree: Option<String>,
-    /// `worktree` refs only: the effective cargo target dir for the
-    /// checkout — the shared cache or the worktree-local `target/`
-    /// when the project opted out — so `issue finish` and
-    /// `doctor --host` account for the right bytes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cargo_target: Option<String>,
-    /// `message` refs only: the dispatch recipient — structured so
-    /// finish finds the agent holding the bound message without
-    /// parsing it back out of the display label.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent: Option<String>,
-}
 
 /// CAD-383: who holds an issue that is in flight, since when, and why.
 /// Written by `issue claim`, by `issue start`/`dispatch` when they move
@@ -306,87 +273,6 @@ pub struct CommentFront {
     pub kind: Option<String>,
 }
 
-/// Issue id grammar: `<PREFIX>-<n>`, prefix uppercase letters/digits
-/// starting with a letter, n a positive number. Validated before any
-/// path is built from an id.
-pub fn valid_id(id: &str) -> bool {
-    let Some((prefix, num)) = id.rsplit_once('-') else {
-        return false;
-    };
-    !prefix.is_empty()
-        && prefix.len() <= 16
-        && prefix.starts_with(|c: char| c.is_ascii_uppercase())
-        && prefix
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-        && !num.is_empty()
-        && num.len() <= 9
-        && num.chars().all(|c| c.is_ascii_digit())
-        && num != "0"
-}
-
-pub fn check_id(id: &str) -> Result<String> {
-    if valid_id(id) {
-        Ok(id.to_string())
-    } else {
-        Err(Error::rejected(format!(
-            "Invalid issue id '{id}' — expected <PREFIX>-<n> like CAD-16"
-        )))
-    }
-}
-
-/// A project key or alias-safe name: lowercase letters, digits, hyphens.
-pub fn valid_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= 32
-        && key
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && !key.starts_with('-')
-}
-
-pub fn check_key(key: &str) -> Result<String> {
-    if valid_key(key) {
-        Ok(key.to_string())
-    } else {
-        Err(Error::rejected(format!(
-            "Invalid project key '{key}' — 1-32 lowercase letters, digits or hyphens"
-        )))
-    }
-}
-
-pub fn check_status(status: &str) -> Result<()> {
-    if STATUSES.contains(&status) {
-        Ok(())
-    } else {
-        Err(Error::rejected(format!(
-            "Unknown status '{status}' — one of {}",
-            STATUSES.join(" ")
-        )))
-    }
-}
-
-pub fn check_priority(priority: &str) -> Result<()> {
-    if PRIORITIES.contains(&priority) {
-        Ok(())
-    } else {
-        Err(Error::rejected(format!(
-            "Unknown priority '{priority}' — one of {}",
-            PRIORITIES.join(" ")
-        )))
-    }
-}
-
-/// Tag grammar: `[a-z0-9][a-z0-9-]{0,31}`.
-pub fn valid_tag(tag: &str) -> bool {
-    !tag.is_empty()
-        && tag.len() <= 32
-        && !tag.starts_with('-')
-        && tag
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
 /// System vocabulary exempt from a project's declared `tags:`
 /// allowlist — `cadence report`'s `intake` + kind tags file into any
 /// project without seeding its vocabulary first.
@@ -403,29 +289,6 @@ pub fn system_tag(tag: &str) -> bool {
             | "parked"
             | "idea-stale"
     )
-}
-
-/// The stored shape of a tag list: every tag well-formed, sorted,
-/// de-duplicated, at most `TAG_MAX`.
-pub fn normalize_tags(tags: &[String]) -> Result<Vec<String>> {
-    for tag in tags {
-        if !valid_tag(tag) {
-            return Err(Error::rejected(format!(
-                "Invalid tag '{tag}' — 1-32 lowercase letters, digits or hyphens, \
-                 not starting with a hyphen"
-            )));
-        }
-    }
-    let mut out = tags.to_vec();
-    out.sort();
-    out.dedup();
-    if out.len() > TAG_MAX {
-        return Err(Error::rejected(format!(
-            "{} tags — an issue carries at most {TAG_MAX}",
-            out.len()
-        )));
-    }
-    Ok(out)
 }
 
 /// Artifact basename grammar — shared by the upload route and the
@@ -491,43 +354,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn id_grammar() {
-        assert!(valid_id("CAD-16"));
-        assert!(valid_id("OPS-3"));
-        assert!(valid_id("A-1"));
-        assert!(!valid_id("cad-16"));
-        assert!(!valid_id("CAD16"));
-        assert!(!valid_id("CAD-"));
-        assert!(!valid_id("CAD-0"));
-        assert!(!valid_id("-CAD-16"));
-        assert!(!valid_id("CAD-16/extra"));
-        assert!(!valid_id("../CAD-16"));
-        assert!(!valid_id("CAD-16.md"));
-        assert!(!valid_id("1-2"));
-    }
-
-    #[test]
-    fn tag_grammar_and_normalizing() {
-        assert!(valid_tag("ui"));
-        assert!(valid_tag("2026-q4"));
-        assert!(valid_tag(&"a".repeat(32)));
-        assert!(!valid_tag(&"a".repeat(33)));
-        assert!(!valid_tag(""));
-        assert!(!valid_tag("-ui"));
-        assert!(!valid_tag("UI"));
-        assert!(!valid_tag("a b"));
-        assert!(!valid_tag("a,b"));
-        let tags = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(
-            normalize_tags(&tags(&["ui", "api", "ui"])).unwrap(),
-            tags(&["api", "ui"])
-        );
-        assert!(normalize_tags(&tags(&["Bad"])).is_err());
-        let many: Vec<String> = (0..13).map(|n| format!("t{n}")).collect();
-        assert!(normalize_tags(&many).is_err());
-    }
-
-    #[test]
     fn effective_type_and_milestone() {
         let mut f = Front::new("CAD-1", "t", "2026-09-23T00:00:00Z");
         assert_eq!(item_type(&f, false), "task");
@@ -547,14 +373,5 @@ mod tests {
         for tag in ["mvp", "m", "m-x", "mx-1", "ops"] {
             assert_eq!(milestone_tag(tag), None, "{tag}");
         }
-    }
-
-    #[test]
-    fn key_grammar() {
-        assert!(valid_key("cadence"));
-        assert!(valid_key("ops-2"));
-        assert!(!valid_key("Cadence"));
-        assert!(!valid_key("a_b"));
-        assert!(!valid_key("../x"));
     }
 }

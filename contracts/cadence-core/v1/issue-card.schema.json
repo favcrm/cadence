@@ -1,0 +1,290 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "IssueCard",
+  "description": "The compact issue card `GET /api/issues` and `issue ls --json` return.",
+  "type": "object",
+  "properties": {
+    "blocked": {
+      "type": "boolean"
+    },
+    "blocked_by": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blocked_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "checks": {
+      "$ref": "#/$defs/CardChecks"
+    },
+    "claim": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClaimCard"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "component": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "container": {
+      "type": "boolean"
+    },
+    "counts": {
+      "$ref": "#/$defs/CardCounts"
+    },
+    "created": {
+      "type": "string"
+    },
+    "duplicate_of": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "id": {
+      "type": "string"
+    },
+    "owner": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parent": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "priority": {
+      "type": "string"
+    },
+    "project": {
+      "type": "string"
+    },
+    "ready": {
+      "type": "boolean"
+    },
+    "refs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Ref"
+      }
+    },
+    "relates": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "rev": {
+      "description": "Content hash of `issue.md`: the `if_rev` token for writes.",
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "status_source": {
+      "description": "`rollup` | `notes` | `file` — where `status` came from.",
+      "type": "string"
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "title": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "project",
+    "title",
+    "status",
+    "status_source",
+    "priority",
+    "tags",
+    "paths",
+    "blocked_by",
+    "relates",
+    "refs",
+    "container",
+    "ready",
+    "blocked",
+    "created",
+    "rev",
+    "counts",
+    "checks"
+  ],
+  "$defs": {
+    "CardChecks": {
+      "type": "object",
+      "properties": {
+        "done": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "total": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "done",
+        "total"
+      ]
+    },
+    "CardCounts": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "comments": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "refs": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "comments",
+        "artifacts",
+        "refs"
+      ]
+    },
+    "ClaimCard": {
+      "description": "The in-flight claim on a card, with its age.",
+      "type": "object",
+      "properties": {
+        "age_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "at": {
+          "type": "string"
+        },
+        "by": {
+          "type": "string"
+        },
+        "last_seen": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stale": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "by",
+        "at"
+      ]
+    },
+    "Ref": {
+      "description": "A typed link kept on an issue: PR, commit, note, preview, message, ...",
+      "type": "object",
+      "properties": {
+        "agent": {
+          "description": "`message` refs only: the dispatch recipient.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cargo_target": {
+          "description": "`worktree` refs only: the effective cargo target dir for the checkout.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "closed": {
+          "description": "`issue finish` marks worktree/branch refs closed rather than\ndeleting them — the ref stays as history.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worktree": {
+          "description": "`message` refs only: the worktree the dispatch ran against.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    }
+  }
+}

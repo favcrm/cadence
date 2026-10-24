@@ -1,10 +1,11 @@
-//! Contract checks (in-crate: the root test runner only selects root-package targets): the committed JSON Schema equals the one generated from
+//! Contract checks: the committed JSON Schema equals the one generated from
 //! the Rust types, and every golden case in `tests/cases/*.json` evaluates to
 //! its expected bytes. The same case files are the fixture a wasm host runs.
 //!
 //! A case is `{"input": <envelope object, or a string sent as raw bytes>,
 //! "expected": <response>}`.
 use crate::evaluate::{Refused, Request, Success};
+use crate::issue::IssueCard;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -32,6 +33,10 @@ fn committed_schema_matches_rust_types() {
             "refused.schema.json",
             pretty(schemars::schema_for!(Refused)),
         ),
+        (
+            "issue-card.schema.json",
+            pretty(schemars::schema_for!(IssueCard)),
+        ),
     ];
     for (name, generated) in files {
         let path = dir.join(name);
@@ -41,7 +46,7 @@ fn committed_schema_matches_rust_types() {
         let committed = std::fs::read_to_string(&path).unwrap_or_default();
         assert_eq!(
             committed, generated,
-            "{name} is stale; regenerate with CADENCE_CORE_WRITE_SCHEMA=1 cargo test -p cadence-core --test contract"
+            "{name} is stale; regenerate with CADENCE_CORE_WRITE_SCHEMA=1 cargo test -p cadence-core"
         );
     }
 }

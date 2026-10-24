@@ -7,6 +7,6 @@
   "expected": {
     "ok": false,
     "code": "invalid_command",
-    "message": "unknown variant `nope`, expected `app.manifest.preflight`"
+    "message": "unknown variant `nope`, expected one of `app.manifest.preflight`, `issue.validate`, `issue.readiness`"
   }
 }

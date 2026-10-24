@@ -38,6 +38,7 @@ use crate::error::{Error, Result};
 use crate::issue::line_times::LineTimes;
 use crate::issue::model::{Claim, Front};
 use crate::issue::{history, time, write, Pm};
+use cadence_core::issue::ClaimCard;
 
 /// Statuses where a foreign holder refuses; elsewhere it only warns.
 pub const PROTECTED: &[&str] = &["doing", "review"];
@@ -224,16 +225,22 @@ pub fn take_over_record(by: &str, t: &TakeOver) -> (String, String) {
     )
 }
 
+/// The claim with its age, as the card carries it — `None` when unclaimed.
+pub fn card(front: &Front, now: i64) -> Option<ClaimCard> {
+    front.claim.as_ref().map(|c| ClaimCard {
+        by: c.by.clone(),
+        at: c.at.clone(),
+        session: c.session.clone(),
+        last_seen: c.last_seen.clone(),
+        note: c.note.clone(),
+        stale: c.stale.clone(),
+        age_secs: time::parse_iso(&c.at).map(|t| (now - t).max(0)),
+    })
+}
+
 /// `claim` as JSON with its age — `null` when unclaimed.
 pub fn json(front: &Front, now: i64) -> Value {
-    match &front.claim {
-        Some(c) => json!({
-            "by": c.by, "at": c.at, "session": c.session,
-            "last_seen": c.last_seen, "note": c.note, "stale": c.stale,
-            "age_secs": time::parse_iso(&c.at).map(|t| (now - t).max(0)),
-        }),
-        None => Value::Null,
-    }
+    serde_json::to_value(card(front, now)).expect("claim card serializes")
 }
 
 /// A fresh claim stamped now.

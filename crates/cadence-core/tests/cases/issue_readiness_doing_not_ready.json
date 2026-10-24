@@ -1,0 +1,17 @@
+{
+  "input": {
+    "v": 1,
+    "op": "issue.readiness",
+    "input": {
+      "status": "doing",
+      "blockers": []
+    }
+  },
+  "expected": {
+    "ok": true,
+    "value": {
+      "ready": false,
+      "blocked": false
+    }
+  }
+}

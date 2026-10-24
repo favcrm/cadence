@@ -3,6 +3,7 @@ pub mod app_compat;
 pub mod error;
 pub mod evaluate;
 pub mod frontmatter;
+pub mod issue;
 pub use error::{Error, Result};
 pub use evaluate::evaluate;
 pub use frontmatter::split_front;

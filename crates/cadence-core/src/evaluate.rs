@@ -7,6 +7,7 @@
 //! compatibility decision (the native host stays authoritative for that).
 use crate::app_compat::parse_requires;
 use crate::frontmatter::split_front;
+use crate::issue::{self, ReadinessInput, ReadinessValue, ValidateInput, ValidateValue};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -56,6 +57,12 @@ pub enum Operation {
     /// Split the frontmatter, then check `needs.requires`.
     #[serde(rename = "app.manifest.preflight")]
     AppManifestPreflight(ManifestPreflightInput),
+    /// Check an issue id, project key, tags, status and priority.
+    #[serde(rename = "issue.validate")]
+    IssueValidate(ValidateInput),
+    /// Whether an issue is ready or blocked, given its blockers' statuses.
+    #[serde(rename = "issue.readiness")]
+    IssueReadiness(ReadinessInput),
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -69,12 +76,21 @@ pub struct ManifestPreflightInput {
 #[derive(Serialize, JsonSchema)]
 pub struct ManifestPreflightValue {}
 
+/// The success value of whichever operation ran.
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum OpValue {
+    Preflight(ManifestPreflightValue),
+    Validate(ValidateValue),
+    Readiness(ReadinessValue),
+}
+
 /// Success response.
 #[derive(Serialize, JsonSchema)]
 pub struct Success {
     #[schemars(extend("const" = true))]
     pub ok: bool,
-    pub value: ManifestPreflightValue,
+    pub value: OpValue,
 }
 
 /// Refusal response.
@@ -118,7 +134,7 @@ pub fn manifest_preflight(manifest: &str) -> Result<(), Refusal> {
     Ok(())
 }
 
-fn dispatch(input: &[u8]) -> Result<ManifestPreflightValue, Refusal> {
+fn dispatch(input: &[u8]) -> Result<OpValue, Refusal> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(refuse(
             Code::InvalidCommand,
@@ -148,8 +164,10 @@ fn dispatch(input: &[u8]) -> Result<ManifestPreflightValue, Refusal> {
     match request.operation {
         Operation::AppManifestPreflight(input) => {
             manifest_preflight(&input.manifest)?;
-            Ok(ManifestPreflightValue {})
+            Ok(OpValue::Preflight(ManifestPreflightValue {}))
         }
+        Operation::IssueValidate(input) => Ok(OpValue::Validate(issue::validate(&input))),
+        Operation::IssueReadiness(input) => Ok(OpValue::Readiness(issue::readiness(&input))),
     }
 }
 

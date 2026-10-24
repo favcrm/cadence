@@ -9,7 +9,7 @@
       "const": true
     },
     "value": {
-      "$ref": "#/$defs/ManifestPreflightValue"
+      "$ref": "#/$defs/OpValue"
     }
   },
   "required": [
@@ -17,9 +17,91 @@
     "value"
   ],
   "$defs": {
+    "FieldRefusal": {
+      "description": "One refused field.",
+      "type": "object",
+      "properties": {
+        "field": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "field",
+        "message"
+      ]
+    },
     "ManifestPreflightValue": {
       "description": "Success value of `app.manifest.preflight`.",
       "type": "object"
+    },
+    "OpValue": {
+      "description": "The success value of whichever operation ran.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ManifestPreflightValue"
+        },
+        {
+          "$ref": "#/$defs/ValidateValue"
+        },
+        {
+          "$ref": "#/$defs/ReadinessValue"
+        }
+      ]
+    },
+    "ReadinessValue": {
+      "description": "Success value of `issue.readiness`.",
+      "type": "object",
+      "properties": {
+        "blocked": {
+          "type": "boolean"
+        },
+        "ready": {
+          "type": "boolean"
+        },
+        "refusal": {
+          "description": "Why `status=ready` would be refused; present only then.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "ready",
+        "blocked"
+      ]
+    },
+    "ValidateValue": {
+      "description": "Success value of `issue.validate`.",
+      "type": "object",
+      "properties": {
+        "refusals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FieldRefusal"
+          }
+        },
+        "tags": {
+          "description": "Sorted, de-duplicated tags; present when `tags` was given and valid.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "valid": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "valid",
+        "refusals"
+      ]
     }
   }
 }
