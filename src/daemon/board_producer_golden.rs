@@ -119,6 +119,73 @@ fn master_state_and_thread_read_bytes_are_unchanged() {
     golden("thread_page_tail.json", &tail);
 }
 
+/// CAD-1798: a provider that answers `state` and `stats`, as Pi does: the
+/// live model, thinking level, context usage and session fields win over
+/// the stored launch params.
+struct LiveStub;
+
+impl ProviderAdapter for LiveStub {
+    fn open(&self, _agent: &crate::store::Agent) -> Result<crate::adapter::Identity> {
+        Err(Error::rejected("stub"))
+    }
+    fn run_turn(
+        &self,
+        _prompt: &str,
+        _client_message_id: &str,
+        _on_started: &dyn Fn(&str),
+    ) -> Result<crate::adapter::TurnResult> {
+        Err(Error::rejected("stub"))
+    }
+    fn respond(&self, _request_id: &Value, _result: Value) -> Result<()> {
+        Ok(())
+    }
+    fn interrupt(&self) {}
+    fn disconnected(&self) -> bool {
+        false
+    }
+    fn close(&self) {}
+    fn session_commands(&self) -> &'static [&'static str] {
+        &["state", "stats"]
+    }
+    fn session_command(&self, command: &str, _arg: Option<&str>) -> Result<Value> {
+        Ok(match command {
+            "state" => json!({
+                "model": {"id": "live/model-2", "name": "Live Model 2", "provider": "live"},
+                "thinkingLevel": "medium",
+                "sessionId": "sess-1",
+                "messageCount": 7,
+                "isStreaming": true,
+                "isCompacting": false,
+            }),
+            _ => {
+                json!({"contextUsage": {"tokens": 1234, "contextWindow": 200000, "percent": 0.617}})
+            }
+        })
+    }
+}
+
+#[test]
+fn master_state_live_session_bytes_are_unchanged() {
+    let (_dir, shared) = fixture();
+    let ctl = Arc::new(AgentCtl {
+        adapter: Mutex::new(Some(Arc::new(LiveStub))),
+        wake: Notify::new(),
+        thread: Mutex::new(None),
+        stall: Mutex::new(StallWatch::default()),
+        cloud_held: AtomicBool::new(false),
+    });
+    shared
+        .lifecycle
+        .lock()
+        .unwrap()
+        .agents
+        .insert("master".to_string(), ctl);
+    golden(
+        "master_state_live.json",
+        &call(&shared, "master_state", json!({})),
+    );
+}
+
 fn scrub(v: &mut Value, thread_id: &str) {
     match v {
         Value::Object(map) => {

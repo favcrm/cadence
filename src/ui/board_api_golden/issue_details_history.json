@@ -1,0 +1,314 @@
+[
+  {
+    "acceptance": [],
+    "activity": [
+      {
+        "at": "2026-09-01T01:00:00+00:00",
+        "commit": "6baf5f8",
+        "kind": "commit",
+        "subject": "edit CAD-1 #00"
+      },
+      {
+        "at": "2026-09-01T02:00:00+00:00",
+        "commit": "7968f87",
+        "kind": "commit",
+        "subject": "edit CAD-1 #01"
+      }
+    ],
+    "artifacts": [],
+    "blocked": false,
+    "blocked_reason": null,
+    "body": "",
+    "checks": {
+      "done": 0,
+      "total": 0
+    },
+    "claim": null,
+    "comments": [],
+    "commits": [],
+    "commits_skipped": [],
+    "component": null,
+    "container": true,
+    "created": "2026-09-01T00:00:00Z",
+    "frontmatter": {
+      "created": "2026-09-01T00:00:00Z",
+      "id": "CAD-1",
+      "plan": {
+        "decided_at": "2026-09-02T00:00:00Z",
+        "decided_by": "operator",
+        "proposed_at": "2026-09-01T00:00:00Z",
+        "proposed_by": "pm",
+        "state": "approved",
+        "tickets": [
+          "CAD-3"
+        ]
+      },
+      "priority": "P2",
+      "status": "backlog",
+      "title": "CAD-1",
+      "type": "epic"
+    },
+    "history": [
+      {
+        "at": "2026-09-01T02:00:00+00:00",
+        "commit": "7968f87",
+        "subject": "edit CAD-1 #01"
+      },
+      {
+        "at": "2026-09-01T01:00:00+00:00",
+        "commit": "6baf5f8",
+        "subject": "edit CAD-1 #00"
+      }
+    ],
+    "id": "CAD-1",
+    "links": {
+      "blocked_by": [],
+      "blocks": [],
+      "children": [
+        {
+          "id": "CAD-3",
+          "missing": false,
+          "status": "review",
+          "status_source": "notes",
+          "title": "CAD-3"
+        }
+      ],
+      "duplicate_of": null,
+      "duplicates": [],
+      "parent": null,
+      "relates": []
+    },
+    "notes_chain": [],
+    "owner": null,
+    "parent": null,
+    "path": "PM/cadence/CAD-1/issue.md",
+    "paths": [],
+    "plan": {
+      "decided_at": "2026-09-02T00:00:00Z",
+      "decided_by": "operator",
+      "progress": {
+        "counts": {
+          "backlog": 0,
+          "doing": 0,
+          "done": 0,
+          "dropped": 0,
+          "ready": 0,
+          "review": 1
+        },
+        "done_weight": 0,
+        "ratio": 0.0,
+        "total_weight": 1
+      },
+      "proposed_at": "2026-09-01T00:00:00Z",
+      "proposed_by": "pm",
+      "reason": null,
+      "state": "approved",
+      "tickets": [
+        {
+          "acceptance": 0,
+          "blocked_by": [],
+          "id": "CAD-3",
+          "owner": null,
+          "size": "S",
+          "status": "review",
+          "title": "CAD-3",
+          "weight": 1
+        }
+      ]
+    },
+    "priority": "P2",
+    "project": "cadence",
+    "ready": false,
+    "refs": [],
+    "reports": [],
+    "rev": "fnv1a:9eff4c9fb8a196f5",
+    "size": null,
+    "status": "doing",
+    "status_source": "rollup",
+    "tags": [],
+    "title": "CAD-1",
+    "work": {
+      "health": {
+        "days_in_stage": 19,
+        "limit_days": 5,
+        "reasons": [
+          {
+            "cause": "stalled",
+            "detail": "19 days in 'build' (limit 5)",
+            "issue": "CAD-1",
+            "next": "meet the 'build' exit criterion and move the stage, or record why it waits",
+            "owner": null
+          }
+        ],
+        "state": "stalled"
+      },
+      "milestone": null,
+      "milestone_source": null,
+      "progress": {
+        "counts": {
+          "blocked": 0,
+          "doing": 0,
+          "done": 0,
+          "dropped": 0,
+          "open": 0,
+          "review": 1,
+          "total": 1
+        },
+        "done_weight": 0,
+        "ratio": 0.0,
+        "total_weight": 1
+      },
+      "size": null,
+      "stage": {
+        "exit": "All tasks done or dropped",
+        "id": "build",
+        "moves": [
+          {
+            "forward": true,
+            "needs_operator": false,
+            "to": "verify"
+          }
+        ],
+        "next": "verify",
+        "next_needs_operator": false,
+        "since": "2026-09-02T00:00:00Z",
+        "source": "plan",
+        "stages": [
+          "shape",
+          "build",
+          "verify",
+          "release",
+          "done"
+        ],
+        "terminal": false
+      },
+      "type": "epic",
+      "type_source": "field",
+      "weight": 3
+    }
+  },
+  {
+    "acceptance": [],
+    "activity": [
+      {
+        "at": "2026-09-02T01:00:00+00:00",
+        "commit": "d264c67",
+        "kind": "commit",
+        "subject": "edit CAD-3 #10"
+      },
+      {
+        "at": "2026-09-02T02:00:00+00:00",
+        "commit": "6d2eb2d",
+        "kind": "commit",
+        "subject": "edit CAD-3 #11"
+      },
+      {
+        "at": "2026-09-05T12:00:00Z",
+        "kind": "note",
+        "name": "20260905-120000-pm-kickoff.md",
+        "note_kind": "kickoff",
+        "title": "Kickoff: start CAD-3"
+      },
+      {
+        "at": "2026-09-06T12:00:00Z",
+        "kind": "note",
+        "name": "20260906-120000-rev-verdict.md",
+        "note_kind": "verdict",
+        "title": "Verdict: CAD-3 - pass"
+      }
+    ],
+    "artifacts": [],
+    "blocked": false,
+    "blocked_reason": null,
+    "body": "",
+    "checks": {
+      "done": 0,
+      "total": 0
+    },
+    "claim": null,
+    "comments": [],
+    "commits": [],
+    "commits_skipped": [],
+    "component": null,
+    "container": false,
+    "created": "2026-09-01T00:00:00Z",
+    "frontmatter": {
+      "created": "2026-09-01T00:00:00Z",
+      "id": "CAD-3",
+      "parent": "CAD-1",
+      "priority": "P2",
+      "size": "S",
+      "status": "doing",
+      "title": "CAD-3"
+    },
+    "history": [
+      {
+        "at": "2026-09-02T02:00:00+00:00",
+        "commit": "6d2eb2d",
+        "subject": "edit CAD-3 #11"
+      },
+      {
+        "at": "2026-09-02T01:00:00+00:00",
+        "commit": "d264c67",
+        "subject": "edit CAD-3 #10"
+      }
+    ],
+    "id": "CAD-3",
+    "links": {
+      "blocked_by": [],
+      "blocks": [],
+      "children": [],
+      "duplicate_of": null,
+      "duplicates": [],
+      "parent": {
+        "id": "CAD-1",
+        "missing": false,
+        "status": "doing",
+        "status_source": "rollup",
+        "title": "CAD-1"
+      },
+      "relates": []
+    },
+    "notes_chain": [
+      {
+        "at": "2026-09-05T12:00:00Z",
+        "kind": "kickoff",
+        "name": "20260905-120000-pm-kickoff.md",
+        "title": "Kickoff: start CAD-3"
+      },
+      {
+        "at": "2026-09-06T12:00:00Z",
+        "kind": "verdict",
+        "name": "20260906-120000-rev-verdict.md",
+        "title": "Verdict: CAD-3 - pass"
+      }
+    ],
+    "owner": null,
+    "parent": "CAD-1",
+    "path": "PM/cadence/CAD-3/issue.md",
+    "paths": [],
+    "plan": null,
+    "priority": "P2",
+    "project": "cadence",
+    "ready": false,
+    "refs": [],
+    "reports": [],
+    "rev": "fnv1a:9eff4c9fb8a196f5",
+    "size": "S",
+    "status": "review",
+    "status_source": "notes",
+    "tags": [],
+    "title": "CAD-3",
+    "work": {
+      "health": null,
+      "milestone": null,
+      "milestone_source": null,
+      "progress": null,
+      "size": "S",
+      "stage": null,
+      "type": "task",
+      "type_source": "implicit",
+      "weight": 1
+    }
+  }
+]
