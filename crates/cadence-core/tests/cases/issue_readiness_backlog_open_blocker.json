@@ -1,0 +1,22 @@
+{
+  "input": {
+    "v": 1,
+    "op": "issue.readiness",
+    "input": {
+      "status": "backlog",
+      "blockers": [
+        {
+          "id": "CAD-4",
+          "status": "review"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "ok": true,
+    "value": {
+      "ready": false,
+      "blocked": true
+    }
+  }
+}

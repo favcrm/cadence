@@ -1,0 +1,25 @@
+{
+  "input": {
+    "v": 1,
+    "op": "issue.validate",
+    "input": {
+      "id": "CAD-16",
+      "project_key": "cadence",
+      "tags": [
+        "ui"
+      ],
+      "status": "doing",
+      "priority": "P1"
+    }
+  },
+  "expected": {
+    "ok": true,
+    "value": {
+      "valid": true,
+      "tags": [
+        "ui"
+      ],
+      "refusals": []
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "input": {
+    "v": 1,
+    "op": "issue.validate",
+    "input": {
+      "id": "CAD-0"
+    }
+  },
+  "expected": {
+    "ok": true,
+    "value": {
+      "valid": false,
+      "refusals": [
+        {
+          "field": "id",
+          "message": "Invalid issue id 'CAD-0' \u2014 expected <PREFIX>-<n> like CAD-16"
+        }
+      ]
+    }
+  }
+}

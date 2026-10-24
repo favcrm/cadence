@@ -1,0 +1,16 @@
+{
+  "input": {
+    "v": 1,
+    "op": "issue.validate",
+    "input": {
+      "id": "CAD-007"
+    }
+  },
+  "expected": {
+    "ok": true,
+    "value": {
+      "valid": true,
+      "refusals": []
+    }
+  }
+}
