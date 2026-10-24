@@ -35,6 +35,17 @@ function uiBuild(): string {
   return `${version}+${sha || "unknown"}`;
 }
 
+// The UI package's own version — the shell side of an app screen's
+// `min_shell`. Injected so the bundle never reads package.json at runtime.
+function shellVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")) as { version?: unknown };
+    return typeof pkg.version === "string" ? pkg.version : "0.1.0";
+  } catch {
+    return "0.1.0";
+  }
+}
+
 // Dev proxies only to the explicitly selected sandbox board.
 function devBoardPort(): number {
   const raw = process.env.CADENCE_DEV_BOARD_PORT;
@@ -102,6 +113,7 @@ export default defineConfig(({ command, isPreview }) => ({
   plugins: [react(), tailwindcss(), precompress()],
   define: {
     __CADENCE_BUILD__: JSON.stringify(uiBuild()),
+    __SHELL_VERSION__: JSON.stringify(shellVersion()),
   },
   server:
     command === "serve" && !isPreview

@@ -1465,3 +1465,13 @@ Object.assign(zhTW, {
   "Earlier transcript": "較早的對話紀錄",
   "No answer returned": "未傳回回答",
 });
+
+Object.assign(zhTW, {
+  "Your session ended. Sign in again.": "你的工作階段已結束。請重新登入。",
+  "This app's files are not on this board yet.": "此應用程式的檔案尚未存在於此看板上。",
+  "This app's screen is not available on this board.": "此應用程式的畫面在此看板上無法使用。",
+  "The app did not finish loading.": "應用程式未能完成載入。",
+  "This app needs a newer board (needs {required}, this board is {current}).": "此應用程式需要較新的看板（需要 {required}，此看板為 {current}）。",
+  "Reinstall": "重新安裝",
+  "Check for update": "檢查更新",
+});

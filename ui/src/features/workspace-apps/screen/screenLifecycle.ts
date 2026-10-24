@@ -64,7 +64,27 @@ const RECORD_REPLY_BYTES_MAX = 1048576;
 const RECORD_REPLY_WIRE_BYTES_MAX = RECORD_REPLY_BYTES_MAX + 1024;
 const jsonBytes = (value: unknown): number => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 
+declare const __SHELL_VERSION__: string | undefined;
+/** The shell's own version, injected by the Vite build from `ui/package.json`.
+ *  The test runner has no define, so the package version's default stands. */
+export const shellVersion: string = typeof __SHELL_VERSION__ === "string" ? __SHELL_VERSION__ : "0.1.0";
+
+/** Order two dotted numeric versions. Both sides here are validated shell
+ *  versions (at most three numeric parts), so a missing part reads as 0. */
+export function compareShellVersions(left: string, right: string): number {
+  const a = left.split(".").map(Number);
+  const b = right.split(".").map(Number);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const diff = (a[i] ?? 0) - (b[i] ?? 0);
+    if (diff !== 0) return diff > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
 export type MountReceipt = { mount: string; bridge_nonce: string; generation: number; tag: string;
+  /** The oldest shell the screen's contract supports (three numeric parts,
+   *  e.g. `1.2.3`). The shell refuses to mount below it. */
+  min_shell?: string;
   /** CAD-1177: the mount's server-bound action context token, held by the
    *  host only (never sent to the frame) to prove a `tool` call belongs to
    *  this mount. `null`/absent for a read-only screen. */
@@ -99,7 +119,9 @@ export function parseMount(value: unknown, tag: string): MountReceipt | null {
   const v = value as Record<string, unknown>;
   const keySet = Object.keys(v);
   const keysOk = ["bridge_nonce", "generation", "mount", "tag"].every(k => keySet.includes(k)) &&
-    keySet.every(k => ["bridge_nonce", "generation", "mount", "tag", "action_token", "tools", "media", "host_contract", "operations", "navigation", "display_scope_key", "display_session_key", "install_id", "context_id", "digest", "remote_images"].includes(k));
+    keySet.every(k => ["bridge_nonce", "generation", "mount", "tag", "min_shell", "action_token", "tools", "media", "host_contract", "operations", "navigation", "display_scope_key", "display_session_key", "install_id", "context_id", "digest", "remote_images"].includes(k));
+  const minShell = v.min_shell;
+  const minShellOk = minShell === undefined || (typeof minShell === "string" && /^\d+\.\d+\.\d+$/.test(minShell));
   const tools = v.tools;
   const toolsOk = tools === undefined || (Array.isArray(tools) && tools.length <= 32 &&
     new Set(tools).size === tools.length && tools.every(a => typeof a === "string" && TOOL_ALIAS.test(a)));
@@ -125,7 +147,7 @@ export function parseMount(value: unknown, tag: string): MountReceipt | null {
     typeof v.install_id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v.install_id) && typeof v.context_id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v.context_id) && typeof v.digest === "string" && /^sha256:[a-f0-9]{64}$/.test(v.digest) && typeof v.display_scope_key === "string" && /^[a-f0-9]{64}$/.test(v.display_scope_key) &&
     Array.isArray(v.remote_images) && v.remote_images.length <= 1 && v.remote_images.every(x => x === "instagram-cdn")
     : v.host_contract === undefined && recordsKeys.every(k => v[k] === undefined);
-  if (!keysOk || !toolsOk || !mediaOk || !recordsOk ||
+  if (!keysOk || !minShellOk || !toolsOk || !mediaOk || !recordsOk ||
       typeof v.mount !== "string" || !/^\/api\/app-screen\/[a-f0-9]{64}$/.test(v.mount) ||
       typeof v.bridge_nonce !== "string" || !/^[a-f0-9]{64}$/.test(v.bridge_nonce) ||
       v.mount.endsWith(v.bridge_nonce) || v.tag !== tag || !actionOk ||
