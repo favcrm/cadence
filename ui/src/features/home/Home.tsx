@@ -714,17 +714,21 @@ function MasterHome({
   const permissionPending = usePendingPermission(threadEntries);
   // Results older than this Home visit are history, not a live outcome.
   const liveSince = useMemo(() => Date.now(), []);
+  const streamReconnecting = link !== null && link !== "live";
   const turnBar = turnBarState(
     {
       master: master.data,
       entries: threadEntries,
       pendingMessages: (thread.data?.pending ?? []).filter((p) => p.state !== "failed").map((p) => p.message),
       awaitingApproval: permissionPending,
-      reconnecting: link !== null && link !== "live",
+      reconnecting: streamReconnecting,
       liveSince,
     },
     homeConversation ?? null,
   );
+  // The Pi watch closes normally between turns; the SPA reconnects with a
+  // fresh cursor. That is not a stale conversation while no turn is active.
+  const activeTurn = turnBar.kind === "working" || turnBar.kind === "queued";
   const aheadHref = useConversationDestination(
     turnBar.kind === "queued" ? turnBar.aheadConversation : null,
     master.data,
@@ -1152,7 +1156,7 @@ function MasterHome({
               {status.kind === "running" ? status.state : status.kind === "absent" ? t("not started") : status.kind}
             </span>
             <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
-            {link && link !== "live" && status.kind === "running" && (
+            {streamReconnecting && activeTurn && status.kind === "running" && (
               <span className="text-micro text-ink-500">{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
             )}
           </div>
@@ -1199,7 +1203,7 @@ function MasterHome({
               liveAfter={liveAfter.current ?? 0}
               onRetry={onRetrySend}
               working={workingActivity}
-              stale={link !== null && link !== "live"}
+              stale={streamReconnecting && activeTurn}
             />
             {cmds.map((c) => (
               <CmdCard key={c.id} cmd={c} onOpenIssue={onOpenIssue} />
@@ -1218,7 +1222,7 @@ function MasterHome({
                 indicator (CAD-1462). */}
             <TurnBar
               state={turnBar}
-              reconnecting={link !== null && link !== "live"}
+              reconnecting={streamReconnecting && activeTurn}
               since={serverTurn?.since ?? null}
               actions={{
                 onStop: writeBlock === null ? (message) => runTurnCommand("stop", message) : undefined,
