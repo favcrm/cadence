@@ -1464,4 +1464,12 @@ Object.assign(zhTW, {
   "Assistant is typing": "助理正在輸入",
   "Earlier transcript": "較早的對話紀錄",
   "No answer returned": "未傳回回答",
+  // CAD-1797: settings shell and app-wide email sending.
+  "Settings sections": "設定區段",
+  "Sending app": "寄送應用程式",
+  "Send email from": "寄送電子郵件帳戶",
+  "Choose the account your apps send email from. An app can use the workspace account or a sender of its own.": "選擇應用程式寄送電子郵件時使用的帳戶。應用程式可使用工作區帳戶，或使用自己的寄件者。",
+  "Connected. Apps can send from {sender}.": "已連接。應用程式可由此地址寄送：{sender}。",
+  "This app can't send or test-send from {address} until a sender is chosen again. A prepared send loses its approval.": "在重新選擇寄件者之前，此應用程式無法從 {address} 寄送或測試寄送。已準備的寄送會失去核准。",
+  "Board version, release status and the update action.": "看板版本、發行狀態與更新操作。",
 });

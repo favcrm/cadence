@@ -65,7 +65,7 @@ function renderNote(note: SendNote | null, t: (english: string) => string): stri
     case "chosen": return t("Sender chosen.");
     case "changed": return t("Sender changed.");
     case "removed": return t("Sender removed.");
-    case "connected": return t("Connected. Campaigns now send from {sender}.").replace("{sender}", () => note.value ?? "");
+    case "connected": return t("Connected. Apps can send from {sender}.").replace("{sender}", () => note.value ?? "");
     case "origin-cleared": return t("Unsubscribe address cleared — sends refuse until one is set.");
     case "origin-set": return t("Unsubscribe links now use {origin}.").replace("{origin}", () => note.value ?? "");
   }
@@ -97,7 +97,7 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="email-sending-title">
       <h1 id="email-sending-title" className="text-section font-medium text-ink-100">{t("Email sending")}</h1>
-      <p className="text-label text-ink-400 mt-1 mb-4 break-words">{t("Choose where CRM campaign email is sent from. Campaigns use this sender; nothing is sent until an operator approves a campaign.")}</p>
+      <p className="text-label text-ink-400 mt-1 mb-4 break-words">{t("Choose the account your apps send email from. An app can use the workspace account or a sender of its own.")}</p>
       {viewer.operator === null ? (
         <PageState title={viewer.access === "unavailable" ? t("Access could not be confirmed") : t("Checking access…")}>
           {viewer.access === "unavailable" ? (
@@ -125,13 +125,13 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
         <div className="grid gap-3 min-w-0">
           {targets.length > 1 && (
             <div className="crm-field">
-              <label className="text-label text-ink-300" htmlFor="email-sending-target">{t("CRM context")}</label>
+              <label className="text-label text-ink-300" htmlFor="email-sending-target">{t("Sending app")}</label>
               <Select
                 id="email-sending-target"
                 value={String(picked)}
                 onChange={(v) => setPicked(Number(v))}
                 options={targets.map((t, i) => ({ value: String(i), label: t.label }))}
-                aria-label={t("CRM context")}
+                aria-label={t("Sending app")}
                 full
               />
             </div>
@@ -310,13 +310,13 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
       {canWrite && usable.length > 0 && !(hostedSmtp && usable.length === 1 && emailRow && live !== null) && (
         <div className="crm-field-row">
           <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="email-sender">{t("Send campaign email from")}</label>
+            <label className="text-label text-ink-300" htmlFor="email-sender">{t("Send email from")}</label>
             <Select
               id="email-sender"
               value={chosenId}
               onChange={setPicked}
               options={usable.map((r) => ({ value: r.id, label: senderLine(r) }))}
-              aria-label={t("Send campaign email from")}
+              aria-label={t("Send email from")}
               disabled={pending}
               full
             />
@@ -372,7 +372,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
           title={t("Stop using this sender?")}
           body={
             <p>
-              {t("Campaigns can't send or test-send from {address} until a sender is chosen again. A prepared send loses its approval.").replace("{address}", () => String(binding.sender.address ?? ""))}</p>
+              {t("This app can't send or test-send from {address} until a sender is chosen again. A prepared send loses its approval.").replace("{address}", () => String(binding.sender.address ?? ""))}</p>
           }
           confirmLabel={t("Stop using")}
           pending={pending}

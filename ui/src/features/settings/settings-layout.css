@@ -1,0 +1,107 @@
+/* Settings shell (CAD-1797): one compact sub-navigation beside the content.
+   Reuses the board's tokens; no new palette or global theme change. */
+
+.settings-layout {
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  gap: 30px;
+  align-items: start;
+  max-width: 1180px;
+  margin-inline: auto;
+  padding: 20px 0 40px;
+}
+
+.settings-subnav {
+  position: sticky;
+  top: 48px;
+  display: grid;
+  gap: 1px;
+  padding-left: 32px;
+}
+
+.settings-subnav-group {
+  display: grid;
+  gap: 1px;
+}
+
+.settings-subnav-label {
+  margin: 12px 0 2px;
+  padding: 0 9px;
+  font: 500 9px/1.4 "IBM Plex Mono", monospace;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--color-ink-500);
+}
+
+.settings-subnav-group:first-child .settings-subnav-label {
+  margin-top: 0;
+}
+
+.settings-subnav-link {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  padding: 4px 9px;
+  border-radius: 5px;
+  color: var(--color-ink-300);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.4;
+  text-decoration: none;
+}
+
+.settings-subnav-link:hover {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+
+.settings-subnav-link[data-on] {
+  background: color-mix(in srgb, var(--color-accent) 12%, var(--color-ink-850));
+  color: var(--color-accent);
+}
+
+.settings-subnav-link[data-on]::after {
+  content: "";
+  width: 5px;
+  height: 5px;
+  margin-left: auto;
+  border-radius: 50%;
+  background: var(--color-accent);
+}
+
+.settings-content {
+  min-width: 0;
+}
+
+@media (max-width: 960px) {
+  .settings-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    padding: 12px 0 32px;
+  }
+
+  .settings-subnav {
+    position: static;
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    padding: 0 16px 8px;
+    border-bottom: 1px solid var(--color-ink-700);
+    scrollbar-width: thin;
+  }
+
+  .settings-subnav-group {
+    display: flex;
+    gap: 2px;
+  }
+
+  .settings-subnav-label {
+    display: none;
+  }
+
+  .settings-subnav-link {
+    min-height: 32px;
+    white-space: nowrap;
+  }
+}

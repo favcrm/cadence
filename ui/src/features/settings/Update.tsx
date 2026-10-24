@@ -257,8 +257,8 @@ export default function Update({
     <main className="update-workspace">
       <header className="update-heading">
         <div>
-          <h1>{t("Update")}</h1>
-          <p>{t("Review the latest release and follow its installation.")}</p>
+          <h1>{t("Status")}</h1>
+          <p>{t("Board version, release status and the update action.")}</p>
         </div>
         <Button
           icon={<IconRefresh />}
