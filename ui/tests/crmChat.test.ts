@@ -143,6 +143,11 @@ await flush();
 equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement).value, DRAFT, "draft survives navigation to a record");
 
 // Collapse to a rail; draft and pane survive; waiting dot on new reply.
+// An app page may open collapsed (CAD-1810); this check starts from the pane.
+if (grid().hasAttribute("data-chat-collapsed")) {
+  await click(host.querySelector(".app-chat-rail"));
+  await flush();
+}
 const before = box.value;
 await click(host.querySelector(".app-chat-collapse"));
 assert(grid().hasAttribute("data-chat-collapsed"), "grid collapses");

@@ -201,6 +201,8 @@ export interface AppPaneProps {
   /** Refresh the live projection after the native endpoint refuses upload. */
   onFileUploadUnavailable: () => void;
   collapsed: boolean;
+  /** A decision is waiting for this person; the shell keeps the rail visible. */
+  onPendingDecision?: (pending: boolean) => void;
   onCollapsed: (next: boolean) => void;
   /** The shell's own navigation for the `open-view` card action. */
   onOpenView: (view: string) => void;
@@ -436,7 +438,7 @@ function AppRow({
  * carry the route's installation and context; the daemon proves both and
  * stamps the verified binding on the entry.
  */
-function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onMediaTarget }: AppPaneProps) {
+function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onMediaTarget, onPendingDecision }: AppPaneProps) {
   const { t, formatNumber } = useLocale();
   const { installId, descriptor } = mode;
   const documentVisible = useDocumentVisible();
@@ -465,7 +467,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const [operationState, setOperationState] = useState<{ scope: string; revision: number | null; pending: boolean } | null>(null);
   const onOperationState = useCallback((pending: boolean, revision: number | null) => {
     setOperationState({ scope: operationScope, revision, pending });
-  }, [operationScope]);
+    onPendingDecision?.(pending);
+  }, [operationScope, onPendingDecision]);
   const operationsCurrent = operationState?.scope === operationScope && operationState.revision === streamRevision;
   const streamDown = streamLink !== "live" || !operationsCurrent;
   const [historyOpen, setHistoryOpen] = useState(false);

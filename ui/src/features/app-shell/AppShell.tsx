@@ -19,7 +19,7 @@ import type { ChatBinding, ChatScope, MediaComposerTarget } from "./chat/types";
 import { assertRecordId, type HostScope } from "./hostActions";
 import { isDev } from "../../env";
 import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
-import { useChatCollapsed, selectConversation, setDraftSubject, campaignSubject, whatsappSubject, conversationList, type ConversationLinkRequest } from "./conversationClient";
+import { resolveChatCollapsed, useChatCollapsed, selectConversation, setDraftSubject, campaignSubject, whatsappSubject, conversationList, type ConversationLinkRequest } from "./conversationClient";
 import { installedAppHref } from "../apps/appViewModel";
 import { useLocale } from "../../lib/locale";
 import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
@@ -286,7 +286,12 @@ export default function AppShell({
   }, []);
   // CAD-1051: desktop rail. Narrow widths keep the drawer above.
   // CAD-1098: collapse state is per app installation.
-  const [chatCollapsed, setChatCollapsed] = useChatCollapsed(installId);
+  const [chatChoice, setChatCollapsed] = useChatCollapsed(installId);
+  const [pendingDecision, setPendingDecision] = useState(false);
+  // A pending decision survives an installation switch only as long as the
+  // assistant that reported it is the one on screen.
+  useEffect(() => { setPendingDecision(false); }, [installId]);
+  const chatCollapsed = resolveChatCollapsed(chatChoice, installId, pendingDecision);
   // CAD-861: the app-views/v1 contract preview is a dev-only overlay
   // keyed by `contract-preview` in the URL — it never mounts in a
   // production bundle and never replaces the trusted outlet by default.
@@ -968,6 +973,7 @@ export default function AppShell({
             onMediaTarget={registerMediaTarget}
             collapsed={chatCollapsed}
             onCollapsed={setChatCollapsed}
+            onPendingDecision={setPendingDecision}
             onOpenView={openView}
           />
         </div>
