@@ -31,6 +31,7 @@ use crate::error::{Error, Result};
 use crate::issue::areas::scrub;
 use crate::issue::board::{self, View};
 use crate::issue::model::{self, Front};
+use cadence_core::board_api::WorkBlock;
 use crate::issue::{parse, plan, project};
 
 /// Default epic stages and their exit criteria.
@@ -889,25 +890,33 @@ fn effective_milestone(ctx: &Ctx, view: &View) -> Option<(String, &'static str)>
 /// CLI and the epic rows: type, milestone, size and weight for every
 /// issue; stage, progress and health for epics (`null` otherwise).
 pub fn item_json(ctx: &Ctx, view: &View) -> Value {
+    serde_json::to_value(item_block(ctx, view)).expect("work block serializes")
+}
+
+/// [`item_json`] as the typed wire block.
+pub fn item_block(ctx: &Ctx, view: &View) -> WorkBlock {
     let f = &view.issue.front;
     let cfg = ctx.config(&view.issue.project);
     let kind = model::item_type(f, view.container);
     let milestone = effective_milestone(ctx, view);
-    let mut out = json!({
-        "type": kind,
-        "type_source": if f.item_type.as_deref().is_some_and(|t| model::TYPES.contains(&t)) {
+    let mut out = WorkBlock {
+        kind: kind.to_string(),
+        type_source: if f.item_type.as_deref().is_some_and(|t| model::TYPES.contains(&t)) {
             "field"
         } else {
             "implicit"
-        },
-        "milestone": milestone.as_ref().map(|(m, _)| m),
-        "milestone_source": milestone.as_ref().map(|(_, s)| s),
-        "size": f.size,
-        "weight": model::size_weight(f.size.as_deref()),
-        "stage": Value::Null,
-        "progress": Value::Null,
-        "health": Value::Null,
-    });
+        }
+        .to_string(),
+        milestone: milestone.as_ref().map(|(m, _)| m.clone()),
+        milestone_source: milestone.as_ref().map(|(_, s)| s.to_string()),
+        size: f.size.clone(),
+        weight: model::size_weight(f.size.as_deref()),
+        stage: Value::Null,
+        progress: Value::Null,
+        health: Value::Null,
+        config_error: None,
+        config_unapproved: None,
+    };
     if kind == "epic" {
         let stage = stage_of(f, cfg, view.status == "done");
         let kids = ctx.kids(view);
@@ -915,7 +924,7 @@ pub fn item_json(ctx: &Ctx, view: &View) -> Value {
             .index
             .and_then(|i| cfg.stages.get(i + 1))
             .map(|s| s.id.clone());
-        out["stage"] = json!({
+        out.stage = json!({
             "id": stage.id,
             "source": stage.source,
             "since": stage.since.map(crate::issue::time::iso),
@@ -931,16 +940,12 @@ pub fn item_json(ctx: &Ctx, view: &View) -> Value {
                 legal_moves(f, cfg, &stage)
             },
         });
-        out["progress"] = progress_json(&kids);
-        out["health"] = health_json(view, &stage, cfg, &kids, ctx.now);
+        out.progress = progress_json(&kids);
+        out.health = health_json(view, &stage, cfg, &kids, ctx.now);
     }
     if let Some(w) = ctx.work(&view.issue.project) {
-        if let Some(err) = &w.error {
-            out["config_error"] = json!(err);
-        }
-        if let Some(note) = &w.unapproved {
-            out["config_unapproved"] = json!(note);
-        }
+        out.config_error = w.error.clone();
+        out.config_unapproved = w.unapproved.clone();
     }
     out
 }

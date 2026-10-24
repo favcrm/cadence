@@ -2,11 +2,14 @@
 //! accept loop (`serve`), the response/static-file helpers they share, the
 //! embedded SPA build, and the `/api/agents` read model it serves.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
+use cadence_core::board_api::{
+    AgentRow, AgentTask, AgentTotals, AgentsPayload, CardAgent, DaemonReach, RunningMessage,
+};
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
@@ -647,12 +650,13 @@ pub(crate) fn current_message_summary(m: &Value) -> Option<String> {
 /// HTTP caller (CAD-375; the daemon withholds it from the board's own
 /// connection too).
 pub(crate) fn running_json(m: &Value) -> Value {
-    json!({
-        "id": m["id"],
-        "task": m["task_id"],
-        "created": m["created"],
-        "summary": current_message_summary(m),
+    serde_json::to_value(RunningMessage {
+        id: m["id"].clone(),
+        task: m["task_id"].clone(),
+        created: m["created"].clone(),
+        summary: current_message_summary(m),
     })
+    .expect("running message serializes")
 }
 
 pub(crate) fn agent_activity_seconds(value: &Value) -> Option<f64> {
@@ -734,17 +738,29 @@ pub(crate) fn agents_payload_from(
     list: Option<Value>,
     jobs: Option<&Value>,
 ) -> Value {
+    serde_json::to_value(agents_payload_typed(state_dir, list, jobs)).expect("agents serialize")
+}
+
+fn agents_payload_typed(
+    state_dir: &Path,
+    list: Option<Value>,
+    jobs: Option<&Value>,
+) -> AgentsPayload {
     let Some(list) = list else {
-        return json!({"daemon": "unreachable", "agents": [], "totals": null, "by_issue": {}});
+        return AgentsPayload {
+            daemon: DaemonReach::Unreachable,
+            agents: vec![],
+            totals: None,
+            by_issue: BTreeMap::new(),
+        };
     };
     let task_map = jobs
         .map(|jobs| task_issue_map_from(state_dir, jobs))
         .unwrap_or_default();
     let agents = list["agents"].as_array().cloned().unwrap_or_default();
     let mut out = Vec::new();
-    let mut inboxes = 0i64;
-    let mut by_issue: HashMap<String, Vec<Value>> = HashMap::new();
-    let mut totals = json!({"running": 0, "queued": 0, "fenced": 0, "parked": 0, "inboxes": 0});
+    let mut by_issue: BTreeMap<String, Vec<CardAgent>> = BTreeMap::new();
+    let mut totals = AgentTotals::default();
     for agent in &agents {
         let alias = agent["alias"].as_str().unwrap_or_default();
         let provider = agent["provider"].as_str().unwrap_or_default();
@@ -756,42 +772,55 @@ pub(crate) fn agents_payload_from(
             agent["session_id"].as_str().unwrap_or_default(),
             agent["endpoint"].as_str().unwrap_or_default(),
         );
+        // The fields the daemon reports on every row, mailbox or worker.
+        let base = AgentRow {
+            alias: alias.to_string(),
+            provider: agent["provider"].clone(),
+            endpoint_kind: agent["endpoint_kind"].clone(),
+            role: agent["role"].clone(),
+            team_role: agent["team_role"].clone(),
+            model_selection: agent["model_selection"].clone(),
+            model_lookup_role: agent["model_lookup_role"].clone(),
+            // Preserve provider evidence so the UI can distinguish a
+            // confirmed effective model from a requested/configured one.
+            model: agent["model"].clone(),
+            model_reported: agent["model_reported"].clone(),
+            model_configured: agent["model_configured"].clone(),
+            model_source: agent["model_source"].clone(),
+            effort: agent["effort"].clone(),
+            effort_reported: agent["effort_reported"].clone(),
+            effort_source: agent["effort_source"].clone(),
+            effort_applicable: agent["effort_applicable"].clone(),
+            // Quota integrations can add this account/pool-scoped view;
+            // absent data stays absent and is rendered unavailable below.
+            quota: agent["quota"].clone(),
+            usage_limit: agent["usage_limit"].clone(),
+            group: agent["params"]["upstream"]
+                .as_str()
+                .unwrap_or(alias)
+                .to_string(),
+            group_root: agent["params"]["upstream"].is_null(),
+            dead: agent["dead"].clone(),
+            ..AgentRow::default()
+        };
         // Mailboxes are not workers — they still appear on the Agents
         // screen (as kind "inbox") but never count as busy/fenced.
         let actor = registry::has_actor(provider, kind);
         if !actor {
-            inboxes += 1;
+            totals.inboxes += 1;
             // CAD-480: the mailbox's unread backlog and its oldest
             // unread age are the row's queue evidence — the daemon
             // computes both in `agent.inbox`.
             let unread = agent["inbox"]["queued"].as_i64().unwrap_or(0);
-            let oldest_unread_age_secs = agent["inbox"]["oldest_age_secs"].clone();
-            totals["queued"] = json!(totals["queued"].as_i64().unwrap_or(0) + unread);
-            out.push(json!({
-                "alias": alias, "provider": agent["provider"],
-                "endpoint_kind": agent["endpoint_kind"],
-                "role": agent["role"],
-                "team_role": agent["team_role"],
-                "model_selection": agent["model_selection"],
-                "model_lookup_role": agent["model_lookup_role"],
-                "model": agent["model"],
-                "model_reported": agent["model_reported"],
-                "model_configured": agent["model_configured"],
-                "model_source": agent["model_source"],
-                "effort": agent["effort"],
-                "effort_reported": agent["effort_reported"],
-                "effort_source": agent["effort_source"],
-                "effort_applicable": agent["effort_applicable"],
-                "quota": agent["quota"],
-                "usage_limit": agent["usage_limit"],
-                "state": "inbox", "group": agent["params"]["upstream"].as_str().unwrap_or(alias),
-                "group_root": agent["params"]["upstream"].is_null(),
-                "running": 0, "queued": unread, "unread": unread,
-                "oldest_unread_age_secs": oldest_unread_age_secs,
-                "unknown": 0, "parked": 0,
-                "fenced": false, "on": [], "tasks": [], "message": Value::Null,
-                "dead": agent["dead"], "inbox": true,
-            }));
+            totals.queued += unread;
+            out.push(AgentRow {
+                state: json!("inbox"),
+                queued: unread,
+                unread: Some(unread),
+                oldest_unread_age_secs: Some(agent["inbox"]["oldest_age_secs"].clone()),
+                inbox: Some(true),
+                ..base
+            });
             continue;
         }
         // A CAD-325 daemon folds the show slice into the row (`board`);
@@ -842,7 +871,7 @@ pub(crate) fn agents_payload_from(
         // Exact binding: the agent's assigned tasks joined through
         // `jobs.issue_id`. A running kickoff's task is the live one.
         let mut on: Vec<String> = Vec::new();
-        let mut bound: Vec<Value> = Vec::new();
+        let mut bound: Vec<AgentTask> = Vec::new();
         for tid in agent["tasks"].as_array().cloned().unwrap_or_default() {
             let Some(tid) = tid.as_str() else { continue };
             let Some(binding) = task_map.get(tid) else {
@@ -856,34 +885,34 @@ pub(crate) fn agents_payload_from(
                 .find(|m| m["task"].as_str() == Some(tid))
                 .cloned()
                 .unwrap_or(Value::Null);
-            bound.push(json!({
-                "task": tid,
-                "task_state": binding.task_state,
-                "title": binding.task_title,
-                "issue": binding.issue,
-                "job": binding.job,
-                "job_title": binding.job_title,
-                "job_state": binding.job_state,
-                "message": message,
-            }));
             by_issue
                 .entry(binding.issue.clone())
                 .or_default()
-                .push(json!({
-                    "alias": alias,
-                    "task": tid,
-                    "task_state": binding.task_state,
-                    "state": agent["state"],
-                    "message": message["id"].clone(),
-                    "resume": resume,
-                }));
+                .push(CardAgent {
+                    alias: alias.to_string(),
+                    task: tid.to_string(),
+                    task_state: binding.task_state.clone(),
+                    state: agent["state"].clone(),
+                    message: message["id"].clone(),
+                    resume: resume.clone(),
+                });
+            bound.push(AgentTask {
+                task: tid.to_string(),
+                task_state: binding.task_state.clone(),
+                title: binding.task_title.clone(),
+                issue: binding.issue.clone(),
+                job: binding.job.clone(),
+                job_title: binding.job_title.clone(),
+                job_state: binding.job_state.clone(),
+                message,
+            });
         }
         let fenced = unknown > 0 || agent["state"].as_str() == Some("attention");
-        totals["running"] = json!(totals["running"].as_i64().unwrap_or(0) + running);
-        totals["queued"] = json!(totals["queued"].as_i64().unwrap_or(0) + queued);
-        totals["parked"] = json!(totals["parked"].as_i64().unwrap_or(0) + parked);
+        totals.running += running;
+        totals.queued += queued;
+        totals.parked += parked;
         if fenced {
-            totals["fenced"] = json!(totals["fenced"].as_i64().unwrap_or(0) + 1);
+            totals.fenced += 1;
         }
         // The daemon's own fence text already names the recovery path —
         // the board renders it as copyable code, verbatim.
@@ -892,56 +921,40 @@ pub(crate) fn agents_payload_from(
         } else {
             None
         };
-        out.push(json!({
-            "alias": alias,
-            "provider": agent["provider"],
-            "endpoint_kind": agent["endpoint_kind"],
-            "role": agent["role"],
-            "team_role": agent["team_role"],
+        out.push(AgentRow {
             // CAD-1752: only the catalogue identity of a hire, never the
             // whole params object - this list goes to every viewer.
-            "catalogue": agent["params"]["catalogue"],
-            "look": agent["params"]["look"],
-            "kind": agent["params"]["kind"],
-            "model_selection": agent["model_selection"],
-            "model_lookup_role": agent["model_lookup_role"],
-            // Preserve provider evidence so the UI can distinguish a
-            // confirmed effective model from a requested/configured one.
-            "model": agent["model"],
-            "model_reported": agent["model_reported"],
-            "model_configured": agent["model_configured"],
-            "model_source": agent["model_source"],
-            "effort": agent["effort"],
-            "effort_reported": agent["effort_reported"],
-            "effort_source": agent["effort_source"],
-            "effort_applicable": agent["effort_applicable"],
-            // Quota integrations can add this account/pool-scoped view;
-            // absent data stays absent and is rendered unavailable below.
-            "quota": agent["quota"],
-            "usage_limit": agent["usage_limit"],
-            "state": agent["state"],
-            "group": agent["params"]["upstream"].as_str().unwrap_or(alias),
-            "group_root": agent["params"]["upstream"].is_null(),
-            "running": running, "queued": queued, "unknown": unknown,
-            "parked": parked, "fenced": fenced,
-            "on": on,
-            "tasks": bound,
-            "message": running_msgs.first().cloned().unwrap_or(Value::Null),
-            "running_messages": running_msgs,
-            "recovery": recovery,
-            "resume": resume,
-            "resume_hint": "after stop",
-            "dead": agent["dead"],
-            "last_activity": last_activity,
-            "silent_secs": agent["silent_secs"],
-            "stalled": agent["stalled"],
+            catalogue: Some(agent["params"]["catalogue"].clone()),
+            look: Some(agent["params"]["look"].clone()),
+            kind: Some(agent["params"]["kind"].clone()),
+            state: agent["state"].clone(),
+            running,
+            queued,
+            unknown,
+            parked,
+            fenced,
+            on,
+            tasks: bound,
+            message: running_msgs.first().cloned().unwrap_or(Value::Null),
+            running_messages: Some(running_msgs),
+            recovery: Some(recovery),
+            resume: Some(resume),
+            resume_hint: Some("after stop".to_string()),
+            last_activity: Some(last_activity),
+            silent_secs: Some(agent["silent_secs"].clone()),
+            stalled: Some(agent["stalled"].clone()),
             // CAD-96: `stopped (auto, idle 72m)` — null unless auto-stopped.
-            "state_label": agent["state_label"],
-            "event_cursor": cursor,
-        }));
+            state_label: Some(agent["state_label"].clone()),
+            event_cursor: Some(cursor),
+            ..base
+        });
     }
-    totals["inboxes"] = json!(inboxes);
-    json!({"daemon": "reachable", "agents": out, "totals": totals, "by_issue": by_issue})
+    AgentsPayload {
+        daemon: DaemonReach::Reachable,
+        agents: out,
+        totals: Some(totals),
+        by_issue,
+    }
 }
 
 /// `/api/agents/<alias>` — the drawer detail: the daemon's own
@@ -1988,16 +2001,19 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 // AOS-274: filter before the slice and the card, so a
                 // restricted project contributes no row or count.
                 let readable = super::project_policy::readable(&pm, &actor);
-                let mut body = json!({
-                    "issues": read
+                let body = cadence_core::board_api::IssuesResponse {
+                    issues: read
                         .views
                         .iter()
                         .filter(|v| slice.matches(v) && readable.contains(&v.issue.project))
-                        .map(|v| read.card(&ctx, v))
-                        .collect::<Vec<_>>(),
-                });
-                read_model::merge_freshness(&mut body, read.freshness.clone());
-                send(request, json_response(body));
+                        .map(|v| read.card_item(&ctx, v))
+                        .collect(),
+                    freshness: read.freshness.clone(),
+                };
+                send(
+                    request,
+                    json_response(serde_json::to_value(body).expect("issues serialize")),
+                );
             }
             Err(e) => send(request, err_response(503, &e.to_string())),
         },

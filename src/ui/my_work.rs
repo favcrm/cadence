@@ -103,7 +103,7 @@ impl Snapshot {
                 })
                 .collect::<Vec<_>>(),
         });
-        read_model::merge_freshness(&mut body, self.board.freshness.clone());
+        read_model::merge_freshness(&mut body, &self.board.freshness);
         Some(body)
     }
 
@@ -166,7 +166,7 @@ impl Snapshot {
             "status_counts": status_counts,
             "projects": projects,
         });
-        read_model::merge_freshness(&mut body, self.board.freshness.clone());
+        read_model::merge_freshness(&mut body, &self.board.freshness);
         Some(body)
     }
 

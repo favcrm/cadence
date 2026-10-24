@@ -45,6 +45,8 @@ mod apps;
 mod artifacts;
 mod assist_route;
 mod business_templates;
+#[cfg(test)]
+mod board_api_golden;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1337_acceptance;
 mod cli_route;
