@@ -216,11 +216,18 @@ export interface MetaResponse {
   version: string;
 }
 
-/** A typed link kept on an issue: PR, commit, note, preview, message, ... */
+/** A typed link kept on an issue: PR, commit, note, preview, message, ...
+ * `note` refs use `path` (the notes directory), preview refs store the
+ * publish path — never a signed URL. */
 export interface Ref {
-  /** `message` refs only: the dispatch recipient. */
+  /** `message` refs only: the dispatch recipient — structured so
+   * finish finds the agent holding the bound message without
+   * parsing it back out of the display label. */
   agent?: string | null;
-  /** `worktree` refs only: the effective cargo target dir for the checkout. */
+  /** `worktree` refs only: the effective cargo target dir for the
+   * checkout — the shared cache or the worktree-local `target/`
+   * when the project opted out — so `issue finish` and
+   * `doctor --host` account for the right bytes. */
   cargo_target?: string | null;
   /** `issue finish` marks worktree/branch refs closed rather than
    * deleting them — the ref stays as history. */
@@ -229,7 +236,9 @@ export interface Ref {
   label?: string | null;
   path?: string | null;
   url?: string | null;
-  /** `message` refs only: the worktree the dispatch ran against. */
+  /** `message` refs only: the worktree the dispatch ran against, so
+   * a re-start under `--name` leaves the earlier kickoff bound to
+   * its own pair instead of every worktree the issue ever opens. */
   worktree?: string | null;
 }
 

@@ -286,6 +286,7 @@
           "$ref": "#/$defs/WorkBlock"
         }
       },
+      "additionalProperties": true,
       "required": [
         "id",
         "project",
@@ -309,18 +310,18 @@
       ]
     },
     "Ref": {
-      "description": "A typed link kept on an issue: PR, commit, note, preview, message, ...",
+      "description": "A typed link kept on an issue: PR, commit, note, preview, message, ...\n`note` refs use `path` (the notes directory), preview refs store the\npublish path — never a signed URL.",
       "type": "object",
       "properties": {
         "agent": {
-          "description": "`message` refs only: the dispatch recipient.",
+          "description": "`message` refs only: the dispatch recipient — structured so\nfinish finds the agent holding the bound message without\nparsing it back out of the display label.",
           "type": [
             "string",
             "null"
           ]
         },
         "cargo_target": {
-          "description": "`worktree` refs only: the effective cargo target dir for the checkout.",
+          "description": "`worktree` refs only: the effective cargo target dir for the\ncheckout — the shared cache or the worktree-local `target/`\nwhen the project opted out — so `issue finish` and\n`doctor --host` account for the right bytes.",
           "type": [
             "string",
             "null"
@@ -355,7 +356,7 @@
           ]
         },
         "worktree": {
-          "description": "`message` refs only: the worktree the dispatch ran against.",
+          "description": "`message` refs only: the worktree the dispatch ran against, so\na re-start under `--name` leaves the earlier kickoff bound to\nits own pair instead of every worktree the issue ever opens.",
           "type": [
             "string",
             "null"
