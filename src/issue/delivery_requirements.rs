@@ -184,7 +184,6 @@ const HUMAN_EXACT: &[&str] = &[
     "src/cli/daemon.rs",
     "src/cli/update.rs",
     "src/cli/upgrade.rs",
-    "src/audit.rs",
     "src/delegation.rs",
     "src/issue/delivery_policy.rs",
     "src/issue/delivery_requirements.rs",
