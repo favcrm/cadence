@@ -92,6 +92,7 @@ async function main() {
     const url = new URL(path, "http://localhost");
     if (url.pathname.endsWith("/stream")) return streamFixture(path);
     if (url.pathname === "/api/meta") return json({ read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session: { id: "canonical-session", origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test" } });
+    if (url.pathname === "/api/assist/actions") return json({ actions: [] });
     if (url.pathname === "/api/human-threads/notifications") {
       humanThreadsCalls++;
       return json({
