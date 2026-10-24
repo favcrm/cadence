@@ -1,12 +1,12 @@
 :root {
   color-scheme: light dark;
-  --fg: var(--fg, #171717);
-  --muted: var(--muted, #6b7280);
-  --border: var(--border, #e5e7eb);
-  --bg: var(--surface, #ffffff);
-  --accent: var(--accent, #0f766e);
-  --success: var(--success, #15803d);
-  --error: var(--error, #b91c1c);
+  --app-fg: var(--fg, #171717);
+  --app-muted: var(--muted, #6b7280);
+  --app-border: var(--border, #e5e7eb);
+  --app-bg: var(--surface, #ffffff);
+  --app-accent: var(--accent, #0f766e);
+  --app-success: var(--success, #15803d);
+  --app-error: var(--error, #b91c1c);
 }
 
 html,
@@ -16,7 +16,7 @@ body {
 }
 
 body {
-  color: var(--fg);
+  color: var(--app-fg);
   background: transparent;
   font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
 }
@@ -39,7 +39,7 @@ body {
 
 .eyebrow {
   margin: 0 0 4px;
-  color: var(--muted);
+  color: var(--app-muted);
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.08em;
@@ -59,17 +59,17 @@ h2 {
 
 .status {
   flex: 0 0 auto;
-  border: 1px solid var(--border);
+  border: 1px solid var(--app-border);
   border-radius: 999px;
   padding: 4px 10px;
-  color: var(--muted);
+  color: var(--app-muted);
   font-size: 12px;
   white-space: nowrap;
 }
 
 .status.ok {
-  border-color: color-mix(in srgb, var(--success) 40%, var(--border));
-  color: var(--success);
+  border-color: color-mix(in srgb, var(--app-success) 40%, var(--app-border));
+  color: var(--app-success);
 }
 
 .card {
@@ -79,10 +79,10 @@ h2 {
   align-items: flex-start;
   gap: 12px;
   max-width: 640px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--app-border);
   border-radius: 12px;
   padding: 18px;
-  background: var(--bg);
+  background: var(--app-bg);
 }
 
 .card p {
@@ -90,11 +90,11 @@ h2 {
 }
 
 .muted {
-  color: var(--muted);
+  color: var(--app-muted);
 }
 
 .error {
-  color: var(--error);
+  color: var(--app-error);
   overflow-wrap: anywhere;
 }
 
@@ -105,14 +105,14 @@ h2 {
   border-radius: 8px;
   padding: 8px 12px;
   color: #fff;
-  background: var(--accent);
+  background: var(--app-accent);
   font: inherit;
   font-weight: 600;
 }
 
 .btn.ghost {
-  border-color: var(--border);
-  color: var(--fg);
+  border-color: var(--app-border);
+  color: var(--app-fg);
   background: transparent;
 }
 
@@ -124,9 +124,9 @@ h2 {
   width: min(380px, 100%);
   flex-direction: column;
   gap: 14px;
-  border-left: 1px solid var(--border);
+  border-left: 1px solid var(--app-border);
   padding: 20px;
-  background: var(--bg);
+  background: var(--app-bg);
   box-shadow: -20px 0 40px rgb(0 0 0 / 18%);
 }
 

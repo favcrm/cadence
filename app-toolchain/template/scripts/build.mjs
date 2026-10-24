@@ -10,12 +10,15 @@ const out = path.join(appRoot, "screens/main");
 
 const candidates = [
   process.env.CADENCE_APP_KIT,
+  path.resolve(root, "app-kit"),
   path.resolve(root, "../app-kit"),
   path.resolve(root, "../../ui/app-kit"),
 ].filter(Boolean);
 const appKit = candidates.find((candidate) => existsSync(path.join(candidate, "package.json")));
 if (!appKit) {
-  console.error("build: set CADENCE_APP_KIT to the app-kit folder, or place it next to the template (../app-kit)");
+  console.error(
+    "build: vendor the app-kit at app-kit/ (or keep the archive sibling ../app-kit), or set CADENCE_APP_KIT for a direct bun build; cadence app dev scrubs that variable",
+  );
   process.exit(1);
 }
 

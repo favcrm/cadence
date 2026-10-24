@@ -44,12 +44,15 @@ Copy the template, then change the identity in both `package.json`
 
 The build finds the app-kit in this order:
 
-1. `CADENCE_APP_KIT` (an absolute path to the app-kit folder);
-2. `../app-kit` (the layout in the app-toolchain archive);
-3. `../../ui/app-kit` (the Cadence checkout).
+1. `CADENCE_APP_KIT` (direct `bun scripts/build.mjs` only);
+2. `app-kit/` inside the app (vendor it);
+3. `../app-kit` (the archive sibling layout);
+4. `../../ui/app-kit` (the Cadence checkout).
 
-In the archive layout, keep the template and `app-kit/` siblings. In a copied
-app, set `CADENCE_APP_KIT` or place the app-kit at `../app-kit`.
+`cadence app dev` runs the check in a scrubbed environment, so
+`CADENCE_APP_KIT` is not available there. For that loop, vendor the app-kit
+at `app-kit/` or keep the template and `app-kit/` siblings. In the archive,
+copy both out together.
 
 ## Checks and install
 
