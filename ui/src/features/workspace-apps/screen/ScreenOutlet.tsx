@@ -9,6 +9,7 @@ import ScreenSlotLayer from "./ScreenSlotLayer";
 import { parseDraftImageRef, type ScreenPush } from "./screenProtocol";
 import { workspaceApps } from "../workspaceApps";
 import { useLocale } from "../../../lib/locale";
+import { appliedFrameTheme, onAppliedThemeChange, type FrameTheme } from "../../../lib/theme";
 import { downscaleToDataUrl } from "./screenAssets";
 import { registerNavigationGuard, useHref } from "../../../lib/useLocation";
 import { recordServices, object, exact, type HostCommand } from "./screenServices";
@@ -68,6 +69,15 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   const [slot, setSlot] = useState<SlotView | null>(null);
   const [link, setLink] = useState<string | null>(null);
   const [state, setState] = useState<"loading" | "ready" | "fallback">("loading");
+  // The board's applied pick, carried on the frame URL: a sandboxed frame is
+  // its own document and never sees the board's `data-theme`. A later change is
+  // pushed to the live frame (see the effect below) — never a re-mount, which
+  // would discard whatever the operator had typed.
+  const [frameTheme, setFrameTheme] = useState<FrameTheme | null>(() => appliedFrameTheme());
+  // Read by the frame's load handler: a pick that changed while the document
+  // was still parsing must still land once the listener exists.
+  const frameThemeRef = useRef<FrameTheme | null>(frameTheme);
+  useEffect(() => onAppliedThemeChange(setFrameTheme), []);
   const [failure, setFailure] = useState<ScreenPaneState | null>(null);
   const [attempt, setAttempt] = useState(0);
   /** Retry re-mounts the same projection: the effect's scope identity is
@@ -146,7 +156,12 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         const response = await privateFetch(`/api/app-installations/${encodeURIComponent(current.install_id)}/screens/${encodeURIComponent(current.tag)}/mount`, {
           method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
           headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
-          body: JSON.stringify(current.context_id ? { context_id: current.context_id } : {}),
+          // The mount body is closed (`{context_id?}`) on every host — the
+          // native board refuses an unknown field, so the pick never rides
+          // here; it travels on the frame URL and in the live message below.
+          body: JSON.stringify({
+            ...(current.context_id ? { context_id: current.context_id } : {}),
+          }),
         }, session);
         if (!response.ok) {
           if ([401, 403].includes(response.status)) purgeDisplayCache();
@@ -173,7 +188,22 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         frame.setAttribute("sandbox", "allow-scripts");
         frame.referrerPolicy = "no-referrer";
         frame.style.cssText = "display:block;width:100%;height:100%;border:0;min-height:0";
-        frame.src = receipt.mount;
+        // The frame URL is what survives a restart or a reload, so the pick
+        // rides there too: a cap minted before the theme existed still gets
+        // the right document. `system` stays query-less (the OS decides).
+        // Read it now, not from this effect's render: a pick that changed while
+        // the mount request was pending must not mint the old theme.
+        const mountedTheme = appliedFrameTheme();
+        frame.src = mountedTheme ? `${receipt.mount}?theme=${mountedTheme}` : receipt.mount;
+        // The URL carries the pick at mount time; a change during the load can
+        // only be delivered once the document's listener runs, so repeat the
+        // current pick on load. A host that has no listener ignores it.
+        frame.addEventListener("load", () => {
+          frame.contentWindow?.postMessage(
+            { type: "cadence-theme", theme: frameThemeRef.current ?? "system" },
+            "*",
+          );
+        }, { once: true });
         // The container has no earlier frame: previous layout cleanup removed it.
         container.current.replaceChildren(frame);
         if (!frame.contentWindow) { pending = { kind: "frame_unavailable" }; throw new Error("Screen frame unavailable"); }
@@ -259,6 +289,14 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
       }
     };
   }, [scope, attempt]);
+  // A pick change while the screen is open: post it to the frame, which
+  // applies it without a reload. Re-mounting here would throw away unsaved
+  // edits; a host that has no listener simply ignores the message.
+  useEffect(() => {
+    frameThemeRef.current = frameTheme;
+    const frame = container.current?.querySelector("iframe");
+    frame?.contentWindow?.postMessage({ type: "cadence-theme", theme: frameTheme ?? "system" }, "*");
+  }, [frameTheme]);
   useEffect(() => { if (mounted.current) channel.current?.update(decorate(projection, mounted.current)); }, [projection, href, locale]);
   return <>
     <div aria-label={t("Installed app screen")} style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "ready" ? "block" : "none" }}>
