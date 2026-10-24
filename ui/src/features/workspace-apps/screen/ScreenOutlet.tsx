@@ -69,10 +69,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   const [slot, setSlot] = useState<SlotView | null>(null);
   const [link, setLink] = useState<string | null>(null);
   const [state, setState] = useState<"loading" | "ready" | "fallback">("loading");
-  // The board's applied pick, carried into the mount: a sandboxed frame is its
-  // own document and never sees the board's `data-theme`. A change re-mints the
-  // receipt (the effect below depends on it), so the frame is never left on a
-  // stale theme.
+  // The board's applied pick, carried on the frame URL: a sandboxed frame is
+  // its own document and never sees the board's `data-theme`. A later change is
+  // pushed to the live frame (see the effect below) — never a re-mount, which
+  // would discard whatever the operator had typed.
   const [frameTheme, setFrameTheme] = useState<FrameTheme | null>(() => appliedFrameTheme());
   useEffect(() => onAppliedThemeChange(setFrameTheme), []);
   const [failure, setFailure] = useState<ScreenPaneState | null>(null);
@@ -153,12 +153,11 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         const response = await privateFetch(`/api/app-installations/${encodeURIComponent(current.install_id)}/screens/${encodeURIComponent(current.tag)}/mount`, {
           method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
           headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
-          // The frame is its own document and cannot see the board's
-          // `data-theme`; the mount carries the applied pick, and "system"
-          // omits it so the frame's own media query decides.
+          // The mount body is closed (`{context_id?}`) on every host — the
+          // native board refuses an unknown field, so the pick never rides
+          // here; it travels on the frame URL and in the live message below.
           body: JSON.stringify({
             ...(current.context_id ? { context_id: current.context_id } : {}),
-            ...(frameTheme ? { theme: frameTheme } : {}),
           }),
         }, session);
         if (!response.ok) {
@@ -274,7 +273,14 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         void revokeTool(token);
       }
     };
-  }, [scope, attempt, frameTheme]);
+  }, [scope, attempt]);
+  // A pick change while the screen is open: post it to the frame, which
+  // applies it without a reload. Re-mounting here would throw away unsaved
+  // edits; a host that has no listener simply ignores the message.
+  useEffect(() => {
+    const frame = container.current?.querySelector("iframe");
+    frame?.contentWindow?.postMessage({ type: "cadence-theme", theme: frameTheme ?? "system" }, "*");
+  }, [frameTheme]);
   useEffect(() => { if (mounted.current) channel.current?.update(decorate(projection, mounted.current)); }, [projection, href, locale]);
   return <>
     <div aria-label={t("Installed app screen")} style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "ready" ? "block" : "none" }}>
