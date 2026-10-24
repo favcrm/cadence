@@ -1302,6 +1302,18 @@ older pending verification; a feature's ordinary role-based `403` does not
 sign the board session out. Signed-in members pass the read boundary without
 operator privileges. Authentication and write authority remain separate.
 
+**`operator` in `/api/meta` (CAD-432, CAD-1193).** A signed-in session says
+who you are, not that you are the operator. `GET /api/meta` computes
+`operator` only with `?operator=1` (the UI asks once per page load);
+without it the field is `null`. With it, `true`/`false` is a proven answer
+and `null` means unknown: a dependency (the daemon's `daemon_info` or
+`agent_list`) did not answer in budget, and the board fails closed, never
+granting the role. A sandbox board therefore answers at all only with a
+live daemon on the same state dir, and answers `true` only when the board
+process, and the browser that asks, run outside any agent pane or managed
+endpoint and the board was not launched by the daemon; a board started from
+an agent pane gets a proven `false`.
+
 Private async work owns one operation across response headers, body decoding
 and any follow-up request, state adoption or navigation. Pause, caller cancellation or
 session reset permanently abandons that operation; re-verification cannot
