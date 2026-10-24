@@ -107,6 +107,102 @@ test("init posts to the exact origin with one transferred port, then ready", asy
   assert.deepEqual(inbox[0], { v: 1, op: "ready", accepts: ["screen.v2"] });
 });
 
+test("presentation opt-in is advertised and dispatched; the default is outlet", async () => {
+  const modes = [];
+  const { receiver, inbox, host } = connect({
+    accepts: ["screen.v2", "screen-actions.v1", "screen-presentation.v1"],
+    onPresentation: (mode) => modes.push(mode),
+  });
+  const ready = await waitFor(() => inbox.find((m) => m.op === "ready"), "ready");
+  assert.deepEqual(ready.accepts, ["screen.v2", "screen-actions.v1", "screen-presentation.v1"]);
+  assert.equal(receiver.presentation(), "outlet");
+  host.postMessage({ v: 1, op: "presentation", mode: "drawer" });
+  await waitFor(() => receiver.presentation() === "drawer", "the drawer surface");
+  assert.deepEqual(modes, ["drawer"]);
+});
+
+test("presentation without the opt-in closes the port", async () => {
+  const { receiver, inbox, host, errors } = connect({ accepts: ["screen.v2"] });
+  await waitFor(() => inbox.find((m) => m.op === "ready"), "ready");
+  host.postMessage({ v: 1, op: "presentation", mode: "drawer" });
+  await waitFor(() => errors.length === 1, "the teardown");
+  assert.match(errors[0], /opt-in/);
+  assert.equal(receiver.presentation(), "outlet");
+});
+
+test("drawer helpers send host UI verbs and validate the surface", async () => {
+  const { receiver, inbox, host, pushes } = connect({
+    accepts: ["screen.v2", "screen-actions.v1", "screen-presentation.v1"],
+  });
+  await waitFor(() => inbox.find((m) => m.op === "ready"), "ready");
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the push");
+  host.postMessage({ v: 1, op: "presentation", mode: "drawer" });
+  await waitFor(() => receiver.presentation() === "drawer", "the presentation");
+  const opening = receiver.openDrawer("settings");
+  const open = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "screen.drawer.open"), "the drawer open");
+  assert.deepEqual(open.args, { surface: "settings" });
+  host.postMessage({ v: 2, op: "reply", id: open.id, ok: true, data: { mode: "drawer", surface: "settings" } });
+  assert.deepEqual(await opening, { mode: "drawer", surface: "settings" });
+  const closing = receiver.closeDrawer();
+  const close = await waitFor(() => inbox.find((m) => m.op === "call" && m.verb === "screen.drawer.close"), "the drawer close");
+  assert.deepEqual(close.args, {});
+  assert.notEqual(close.id, open.id);
+  host.postMessage({ v: 2, op: "reply", id: close.id, ok: true, data: { mode: "outlet" } });
+  assert.deepEqual(await closing, { mode: "outlet" });
+  await assert.rejects(receiver.openDrawer("not a surface!"), /surface/);
+});
+
+test("drawer helpers refuse without the presentation opt-in", async () => {
+  const { receiver, host, pushes } = connect({ accepts: ["screen.v2"] });
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the push");
+  await assert.rejects(receiver.openDrawer("settings"), /opt into/);
+  await assert.rejects(receiver.closeDrawer(), /opt into/);
+});
+
+test("opted-in drawer helpers wait for an actual host presentation", async () => {
+  const { receiver, inbox, host, pushes } = connect({
+    accepts: ["screen.v2", "screen-presentation.v1"],
+  });
+  await waitFor(() => inbox.find((m) => m.op === "ready"), "ready");
+  host.postMessage(push());
+  await waitFor(() => pushes.length === 1, "the push");
+  await assert.rejects(receiver.openDrawer("settings"), ScreenClosedError);
+  await assert.rejects(receiver.closeDrawer(), ScreenClosedError);
+  assert.equal(inbox.filter((m) => m.op === "call").length, 0);
+  host.postMessage({ v: 1, op: "presentation", mode: "drawer" });
+  await waitFor(() => receiver.presentation() === "drawer", "the presentation");
+  const opening = receiver.openDrawer("settings");
+  const open = await waitFor(
+    () => inbox.find((m) => m.op === "call" && m.verb === "screen.drawer.open"),
+    "the drawer open",
+  );
+  host.postMessage({ v: 2, op: "reply", id: open.id, ok: true, data: { mode: "drawer", surface: "settings" } });
+  await opening;
+});
+
+test("opted-in malformed presentations close the port without dispatching", async () => {
+  const cases = [
+    { v: 2, op: "presentation", mode: "drawer" },
+    { v: 1, op: "presentation", mode: "other" },
+    { v: 1, op: "presentation" },
+    { v: 1, op: "presentation", mode: "drawer", extra: true },
+  ];
+  for (const message of cases) {
+    const modes = [];
+    const { receiver, inbox, host, errors } = connect({
+      accepts: ["screen.v2", "screen-presentation.v1"],
+      onPresentation: (mode) => modes.push(mode),
+    });
+    await waitFor(() => inbox.find((m) => m.op === "ready"), "ready");
+    host.postMessage(message);
+    await waitFor(() => errors.length === 1, "the teardown");
+    assert.equal(receiver.presentation(), "outlet");
+    assert.deepEqual(modes, []);
+  }
+});
+
 test("a PUSH reaches onPush and locks the identity", async () => {
   const { host, pushes, receiver } = connect();
   host.postMessage(push());
@@ -332,6 +428,9 @@ test("a refused boot returns an inert receiver whose calls also report closed", 
   });
   assert.equal(receiver.boot, null);
   assert.equal(errors.length, 1);
+  assert.equal(receiver.presentation(), "outlet");
+  await assert.rejects(receiver.openDrawer("settings"), ScreenClosedError);
+  await assert.rejects(receiver.closeDrawer(), ScreenClosedError);
   await assert.rejects(receiver.call("read.run", {}), ScreenClosedError);
   await assert.rejects(receiver.asset("media:1"), ScreenClosedError);
   assert.equal(receiver.state("x"), false);
