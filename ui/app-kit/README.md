@@ -50,9 +50,9 @@ await receiver.closeDrawer();          // host returns the frame to the outlet
 
 `openDrawer`/`closeDrawer` send the host UI verbs `screen.drawer.open` and
 `screen.drawer.close`. They are shell verbs, not app capabilities, so they are
-not required in the PUSH's `actions`. A host that never opts in sends no
-presentation message; the app keeps its own drawer and the helpers reject with
-`ScreenClosedError`, which is the intended fallback.
+not required in the PUSH's `actions`. A host that never opts in — or opts in
+but never sends a presentation — leaves the app in its own drawer; the helpers
+reject with `ScreenClosedError`, which is the intended fallback.
 
 ```js
 import { createScreenReceiver } from "@cadence/app-kit";

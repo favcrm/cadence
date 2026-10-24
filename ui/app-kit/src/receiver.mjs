@@ -143,6 +143,9 @@ function inert(reason) {
     tool: refuse,
     asset: refuse,
     state: () => false,
+    presentation: () => "outlet",
+    openDrawer: refuse,
+    closeDrawer: refuse,
     teardown() {},
   });
 }
@@ -219,6 +222,10 @@ export function createScreenReceiver(options = {}) {
   let locked = null;
   let liveV2 = false;
   let presentation = "outlet";
+  // The opt-in says the app can be presented; only a host message proves it
+  // actually is. The drawer helpers wait for that proof so an opted-in app on
+  // a non-presenting host keeps its own drawer (CAD-1785 fallback).
+  let presented = false;
   let seq = 0;
   // The host closes a mount that starts a second tool while one is running.
   // A local timeout does not cancel the host invocation, so busy survives it
@@ -375,6 +382,7 @@ export function createScreenReceiver(options = {}) {
         if (!presentationAccepted) fail("presentation without the opt-in");
         if (message.v !== 1 || Object.keys(message).sort().join() !== "mode,op,v" ||
             (message.mode !== "outlet" && message.mode !== "drawer")) fail("invalid presentation message");
+        presented = true;
         presentation = message.mode;
         onPresentation?.(presentation);
         return;
@@ -429,6 +437,9 @@ export function createScreenReceiver(options = {}) {
       if (!presentationAccepted) {
         return Promise.reject(new ScreenClosedError("the host did not opt into screen-presentation.v1"));
       }
+      if (!presented) {
+        return Promise.reject(new ScreenClosedError("the host has not presented this screen"));
+      }
       if (typeof surface !== "string" || !/^[a-z0-9_-]{1,64}$/.test(surface)) {
         return Promise.reject(new TypeError("surface must be 1-64 of a-z, 0-9, _ or -"));
       }
@@ -438,6 +449,9 @@ export function createScreenReceiver(options = {}) {
     closeDrawer() {
       if (!presentationAccepted) {
         return Promise.reject(new ScreenClosedError("the host did not opt into screen-presentation.v1"));
+      }
+      if (!presented) {
+        return Promise.reject(new ScreenClosedError("the host has not presented this screen"));
       }
       return request("call", { verb: "screen.drawer.close", args: {} });
     },
