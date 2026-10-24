@@ -893,6 +893,11 @@ export default function AppShell({
         <span className="truncate text-ink-100 text-cardtitle" aria-current="page">
           {loading ? t("Loading…") : title}
         </span>
+        {!loading && installation?.version && (
+          <span className="text-micro text-ink-500" data-app-version={installation.version}>
+            v{installation.version}
+          </span>
+        )}
 
         <span className="flex-1" />
         {launchableWorkflows.map((flow) => (
