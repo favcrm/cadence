@@ -74,6 +74,9 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   // pushed to the live frame (see the effect below) — never a re-mount, which
   // would discard whatever the operator had typed.
   const [frameTheme, setFrameTheme] = useState<FrameTheme | null>(() => appliedFrameTheme());
+  // Read by the frame's load handler: a pick that changed while the document
+  // was still parsing must still land once the listener exists.
+  const frameThemeRef = useRef<FrameTheme | null>(frameTheme);
   useEffect(() => onAppliedThemeChange(setFrameTheme), []);
   const [failure, setFailure] = useState<ScreenPaneState | null>(null);
   const [attempt, setAttempt] = useState(0);
@@ -189,6 +192,15 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         // rides there too: a cap minted before the theme existed still gets
         // the right document. `system` stays query-less (the OS decides).
         frame.src = frameTheme ? `${receipt.mount}?theme=${frameTheme}` : receipt.mount;
+        // The URL carries the pick at mount time; a change during the load can
+        // only be delivered once the document's listener runs, so repeat the
+        // current pick on load. A host that has no listener ignores it.
+        frame.addEventListener("load", () => {
+          frame.contentWindow?.postMessage(
+            { type: "cadence-theme", theme: frameThemeRef.current ?? "system" },
+            "*",
+          );
+        }, { once: true });
         // The container has no earlier frame: previous layout cleanup removed it.
         container.current.replaceChildren(frame);
         if (!frame.contentWindow) { pending = { kind: "frame_unavailable" }; throw new Error("Screen frame unavailable"); }
@@ -278,6 +290,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
   // applies it without a reload. Re-mounting here would throw away unsaved
   // edits; a host that has no listener simply ignores the message.
   useEffect(() => {
+    frameThemeRef.current = frameTheme;
     const frame = container.current?.querySelector("iframe");
     frame?.contentWindow?.postMessage({ type: "cadence-theme", theme: frameTheme ?? "system" }, "*");
   }, [frameTheme]);
