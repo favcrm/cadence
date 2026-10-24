@@ -233,6 +233,8 @@ jobs:
       - run: python3 scripts/acceptance/test-cad-1400-release-install-gate.py
       - run: python3 scripts/test_ci_fast_linker.py
       - run: python3 scripts/test_release_reuse.py
+      # CAD-1800: a core-v* release must never become GitHub's Latest (install.sh).
+      - run: python3 scripts/test_core_wasm_release_latest.py
       # CAD-1745: the independent shard-report selector acceptance drives the
       # real CLI over a raw REST transport substitute (carried aliases
       # included) and feeds the selected reports through check-test-junit.py.
