@@ -298,3 +298,127 @@ pub struct MetaResponse {
     pub daemon: Option<MetaDaemon>,
     pub delivery_sync: Option<DeliverySyncMeta>,
 }
+
+/// The app conversation a Home turn belongs to, proven from the message's
+/// persisted provenance; `context_id` is `""` for an installation-only chat.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct AppOrigin {
+    pub install_id: String,
+    pub context_id: String,
+    pub conversation_id: String,
+}
+
+/// The master turn the working row mirrors: `working` while it runs,
+/// `queued` for the queue head.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct MasterTurn {
+    pub state: String,
+    pub message: String,
+    pub conversation: Option<String>,
+    pub app_origin: Option<AppOrigin>,
+    /// The operator's message text. A member never receives it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Epoch seconds: `started` while it runs, `created` while it waits.
+    pub since: f64,
+    /// Queue position of a queued head (always 1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<u32>,
+}
+
+/// One queued turn's routing metadata; never its body.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct MasterQueued {
+    pub message: String,
+    pub conversation: Option<String>,
+}
+
+/// The live session's context usage, when the provider answers `stats`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct MasterContext {
+    #[schemars(with = "Option<serde_json::Number>")]
+    pub tokens: Value,
+    #[schemars(with = "Option<serde_json::Number>")]
+    pub window: Value,
+    #[schemars(with = "Option<serde_json::Number>")]
+    pub percent: Value,
+}
+
+/// The live provider session, when the provider answers `state`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct MasterSession {
+    #[schemars(with = "Option<String>")]
+    pub id: Value,
+    #[schemars(with = "Option<serde_json::Number>")]
+    pub messages: Value,
+    #[schemars(with = "Option<bool>")]
+    pub streaming: Value,
+    #[schemars(with = "Option<bool>")]
+    pub compacting: Value,
+}
+
+/// `master_state` (daemon RPC; `GET /api/master/state` relays it): what the
+/// master header shows. A member's copy drops the turn's `summary`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct MasterState {
+    pub alias: String,
+    pub provider: String,
+    pub endpoint_kind: String,
+    pub live: bool,
+    pub model: Option<String>,
+    #[schemars(with = "Option<String>")]
+    pub model_label: Value,
+    pub effort: Option<String>,
+    pub context: Option<MasterContext>,
+    pub session: Option<MasterSession>,
+    /// The session verbs the live provider accepts.
+    pub commands: Vec<String>,
+    pub turn: Option<MasterTurn>,
+    pub queue: Vec<MasterQueued>,
+    pub queued: i64,
+}
+
+/// A conversation (thread) row.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ThreadInfo {
+    pub id: String,
+    pub alias: String,
+    pub created: f64,
+    pub updated: f64,
+    pub install_id: Option<String>,
+    pub context_id: Option<String>,
+    /// `campaign:<id>` for a campaign conversation.
+    pub subject: Option<String>,
+    pub general: bool,
+    pub is_general: bool,
+    pub archived: bool,
+    pub title: Option<String>,
+}
+
+/// One thread entry. For a message entry of the same thread the payload
+/// also carries `delivery: {state, started, completed}`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ThreadEntryRow {
+    pub seq: i64,
+    pub thread: String,
+    pub role: String,
+    pub kind: String,
+    pub text: String,
+    #[schemars(with = "Option<Value>")]
+    pub payload: Option<Value>,
+    pub message: Option<String>,
+    pub created: f64,
+}
+
+/// `thread_read` (daemon RPC; `GET /api/threads/<alias>` relays it).
+/// A forward read carries `cursor`; a backward one also `more_before`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ThreadPage {
+    pub alias: String,
+    pub thread: Option<ThreadInfo>,
+    pub entries: Vec<ThreadEntryRow>,
+    pub cursor: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub more_before: Option<bool>,
+    pub reply_seq: i64,
+}

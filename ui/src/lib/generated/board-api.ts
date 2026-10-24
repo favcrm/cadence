@@ -95,6 +95,14 @@ export interface AgentsResponse {
   totals?: AgentTotals | null;
 }
 
+/** The app conversation a Home turn belongs to, proven from the message's
+ * persisted provenance; `context_id` is `""` for an installation-only chat. */
+export interface AppOrigin {
+  context_id: string;
+  conversation_id: string;
+  install_id: string;
+}
+
 /** One bound agent on an issue card or drawer — from the job binding. */
 export interface CardAgent {
   alias: string;
@@ -181,6 +189,61 @@ export interface IssuesResponse {
   stale: boolean;
 }
 
+/** The live session's context usage, when the provider answers `stats`. */
+export interface MasterContext {
+  percent?: number | null;
+  tokens?: number | null;
+  window?: number | null;
+}
+
+/** One queued turn's routing metadata; never its body. */
+export interface MasterQueued {
+  conversation?: string | null;
+  message: string;
+}
+
+/** The live provider session, when the provider answers `state`. */
+export interface MasterSession {
+  compacting?: boolean | null;
+  id?: string | null;
+  messages?: number | null;
+  streaming?: boolean | null;
+}
+
+/** `master_state` (daemon RPC; `GET /api/master/state` relays it): what the
+ * master header shows. A member's copy drops the turn's `summary`. */
+export interface MasterState {
+  alias: string;
+  /** The session verbs the live provider accepts. */
+  commands: string[];
+  context?: MasterContext | null;
+  effort?: string | null;
+  endpoint_kind: string;
+  live: boolean;
+  model?: string | null;
+  model_label?: string | null;
+  provider: string;
+  queue: MasterQueued[];
+  queued: number;
+  session?: MasterSession | null;
+  turn?: MasterTurn | null;
+}
+
+/** The master turn the working row mirrors: `working` while it runs,
+ * `queued` for the queue head. */
+export interface MasterTurn {
+  app_origin?: AppOrigin | null;
+  conversation?: string | null;
+  message: string;
+  /** Queue position of a queued head (always 1). */
+  position?: number | null;
+  /** Epoch seconds: `started` while it runs, `created` while it waits. */
+  since: number;
+  state: string;
+  /** The operator's message text. A member never receives it. */
+  summary?: string | null;
+}
+
 /** The daemon's build, when it answered inside the metadata budget. */
 export interface MetaDaemon {
   build_commit?: string | null;
@@ -250,6 +313,46 @@ export interface RunningMessage {
   id?: string | null;
   summary?: string | null;
   task?: string | null;
+}
+
+/** One thread entry. For a message entry of the same thread the payload
+ * also carries `delivery: {state, started, completed}`. */
+export interface ThreadEntryRow {
+  created: number;
+  kind: string;
+  message?: string | null;
+  payload?: unknown;
+  role: string;
+  seq: number;
+  text: string;
+  thread: string;
+}
+
+/** A conversation (thread) row. */
+export interface ThreadInfo {
+  alias: string;
+  archived: boolean;
+  context_id?: string | null;
+  created: number;
+  general: boolean;
+  id: string;
+  install_id?: string | null;
+  is_general: boolean;
+  /** `campaign:<id>` for a campaign conversation. */
+  subject?: string | null;
+  title?: string | null;
+  updated: number;
+}
+
+/** `thread_read` (daemon RPC; `GET /api/threads/<alias>` relays it).
+ * A forward read carries `cursor`; a backward one also `more_before`. */
+export interface ThreadPage {
+  alias: string;
+  cursor: number;
+  entries: ThreadEntryRow[];
+  more_before?: boolean | null;
+  reply_seq: number;
+  thread?: ThreadInfo | null;
 }
 
 /** The CAD-405 work block on a card: type, milestone, size; stage,

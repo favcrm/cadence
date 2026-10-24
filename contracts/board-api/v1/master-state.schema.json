@@ -1,0 +1,242 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MasterState",
+  "description": "`master_state` (daemon RPC; `GET /api/master/state` relays it): what the\nmaster header shows. A member's copy drops the turn's `summary`.",
+  "type": "object",
+  "properties": {
+    "alias": {
+      "type": "string"
+    },
+    "commands": {
+      "description": "The session verbs the live provider accepts.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "context": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MasterContext"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "effort": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "endpoint_kind": {
+      "type": "string"
+    },
+    "live": {
+      "type": "boolean"
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model_label": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provider": {
+      "type": "string"
+    },
+    "queue": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MasterQueued"
+      }
+    },
+    "queued": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "session": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MasterSession"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "turn": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MasterTurn"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "alias",
+    "provider",
+    "endpoint_kind",
+    "live",
+    "commands",
+    "queue",
+    "queued"
+  ],
+  "$defs": {
+    "AppOrigin": {
+      "description": "The app conversation a Home turn belongs to, proven from the message's\npersisted provenance; `context_id` is `\"\"` for an installation-only chat.",
+      "type": "object",
+      "properties": {
+        "context_id": {
+          "type": "string"
+        },
+        "conversation_id": {
+          "type": "string"
+        },
+        "install_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "install_id",
+        "context_id",
+        "conversation_id"
+      ]
+    },
+    "MasterContext": {
+      "description": "The live session's context usage, when the provider answers `stats`.",
+      "type": "object",
+      "properties": {
+        "percent": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "tokens": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "window": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "MasterQueued": {
+      "description": "One queued turn's routing metadata; never its body.",
+      "type": "object",
+      "properties": {
+        "conversation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "message"
+      ]
+    },
+    "MasterSession": {
+      "description": "The live provider session, when the provider answers `state`.",
+      "type": "object",
+      "properties": {
+        "compacting": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "messages": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "streaming": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "MasterTurn": {
+      "description": "The master turn the working row mirrors: `working` while it runs,\n`queued` for the queue head.",
+      "type": "object",
+      "properties": {
+        "app_origin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AppOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "conversation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "position": {
+          "description": "Queue position of a queued head (always 1).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "since": {
+          "description": "Epoch seconds: `started` while it runs, `created` while it waits.",
+          "type": "number",
+          "format": "double"
+        },
+        "state": {
+          "type": "string"
+        },
+        "summary": {
+          "description": "The operator's message text. A member never receives it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "state",
+        "message",
+        "since"
+      ]
+    }
+  }
+}
