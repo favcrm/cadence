@@ -21,7 +21,7 @@ pub(crate) fn member_running_item(item: &Value) -> Value {
 /// counts, model and effort facts, ids and timing - what the roster, the
 /// cards and the agent page read. Any field not named here is dropped, so a
 /// field added to the row later stays hidden from members by default.
-pub(super) const MEMBER_ROW_FIELDS: &[&str] = &[
+const MEMBER_ROW_FIELDS: &[&str] = &[
     "alias",
     "provider",
     "endpoint_kind",
@@ -67,7 +67,7 @@ pub(super) const MEMBER_ROW_FIELDS: &[&str] = &[
 
 /// A bound task as a non-operator sees it: ids, states and titles, with
 /// its running kickoff reduced to the one running-item allowlist.
-pub(super) const MEMBER_TASK_FIELDS: &[&str] = &[
+const MEMBER_TASK_FIELDS: &[&str] = &[
     "task",
     "task_state",
     "title",
@@ -77,7 +77,7 @@ pub(super) const MEMBER_TASK_FIELDS: &[&str] = &[
     "job_state",
 ];
 
-pub(super) fn member_message(item: &Value) -> Value {
+fn member_message(item: &Value) -> Value {
     if item.is_object() {
         member_running_item(item)
     } else {
@@ -133,9 +133,8 @@ pub(crate) fn redact_agents_payload(payload: &mut Value) {
 /// anything a payload gains later is dropped by default. Top level: the
 /// ids, kind and time. Payload: only these scalar fields; every other one
 /// (`result`, `text`, `body`, `before`/`after`, …) is dropped.
-pub(super) const MEMBER_EVENT_FIELDS: &[&str] =
-    &["seq", "alias", "kind", "job_id", "task_id", "at"];
-pub(super) const MEMBER_EVENT_PAYLOAD: &[&str] = &[
+const MEMBER_EVENT_FIELDS: &[&str] = &["seq", "alias", "kind", "job_id", "task_id", "at"];
+const MEMBER_EVENT_PAYLOAD: &[&str] = &[
     "message",
     "turn_id",
     "state",
@@ -148,7 +147,7 @@ pub(super) const MEMBER_EVENT_PAYLOAD: &[&str] = &[
 /// A short machine code (`snake_case`, no spaces): the only form of
 /// `error` / `reason` a non-operator keeps. Free text - a provider's own
 /// message, a sentence - is dropped, because it can quote message content.
-pub(super) fn is_machine_code(value: &str) -> bool {
+fn is_machine_code(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value.bytes().all(|b| {
@@ -214,7 +213,7 @@ pub(super) fn member_view(page: &mut Value) {
 /// queue counts and routing metadata, but never the text of the operator's
 /// turn. The turn is REBUILT from an allowlist, so a field added later is
 /// dropped by default.
-pub(crate) fn redact_master_state(state: &mut Value) {
+pub(super) fn redact_master_state(state: &mut Value) {
     const TURN_FIELDS: &[&str] = &[
         "state",
         "message",
