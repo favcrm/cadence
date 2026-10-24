@@ -32,6 +32,10 @@
   font-size: 10px;
   font-weight: 600;
 }
+.decisions-count[data-zero] {
+  background: var(--color-ink-800);
+  color: var(--color-ink-500);
+}
 @media (max-width: 640px) {
   .decisions-trigger-label { display: none; }
 }
@@ -129,6 +133,15 @@
   text-align: center;
   font-size: var(--text-secondary);
   color: var(--color-ink-500);
+}
+.decisions-alert {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--color-fail) 40%, var(--color-ink-700));
+  border-radius: 0.4rem;
+  background: color-mix(in srgb, var(--color-fail) 7%, transparent);
+  color: var(--color-fail);
+  font-size: var(--text-micro);
 }
 
 .decisions-card {

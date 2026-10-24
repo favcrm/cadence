@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { subscribeMasterChanged } from "../../lib/masterChanged";
+import { issuePath } from "../issues/model";
 import { useTranslate } from "../../lib/locale";
 import "./decisions.css";
 
@@ -34,6 +36,7 @@ type Row = {
   status: "pending" | "approved" | "denied";
   receipt: string | null;
   unconfirmed: boolean;
+  retry: "approve" | "deny" | null;
 };
 
 type LoadState =
@@ -82,6 +85,7 @@ function toRow(action: StagedAction): Row | null {
     status: action.status,
     receipt,
     unconfirmed: false,
+    retry: null,
   };
 }
 
@@ -158,27 +162,55 @@ export default function DecisionsPanel() {
   const [conflict, setConflict] = useState<string | null>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const drawer = useRef<HTMLDivElement>(null);
+  const rowRefs = useRef(new Map<string, HTMLButtonElement>());
+  const retryTimer = useRef<number | null>(null);
+  const alive = useRef(true);
 
-  const load = useCallback(async (signal?: AbortSignal) => {
+  const load = useCallback(async (signal?: AbortSignal): Promise<Row[] | null> => {
     const controller = new AbortController();
     const stop = signal ? () => controller.abort() : () => {};
     signal?.addEventListener("abort", stop, { once: true });
     try {
       const actions = await readActions(controller.signal);
       const rows = actions.map(toRow).filter((row): row is Row => row !== null);
+      if (!alive.current) return null;
+      if (retryTimer.current !== null) {
+        window.clearTimeout(retryTimer.current);
+        retryTimer.current = null;
+      }
       setState({ kind: "ready", rows });
+      return rows;
     } catch (error) {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || !alive.current) return null;
       if (error instanceof DecisionsError && (error.status === 404 || error.status === 501 || error.status === 401 || error.status === 403)) {
         setState({ kind: "unavailable" });
-        return;
+        return null;
       }
       // Keep the last good list; a refresh failure is not a reason to invent
-      // an empty queue.
-      setState((current) => (current.kind === "ready" ? current : { kind: "unavailable" }));
+      // an empty queue. A first read that failed transiently retries on its
+      // own and on the next master change, so a 5xx cannot hide the surface
+      // until Home is remounted.
+      setState((current) => (current.kind === "ready" ? current : { kind: "loading" }));
+      if (retryTimer.current === null)
+        retryTimer.current = window.setTimeout(() => {
+          retryTimer.current = null;
+          void load();
+        }, 5_000);
+      return null;
     } finally {
       signal?.removeEventListener("abort", stop);
     }
+  }, []);
+
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+      if (retryTimer.current !== null) {
+        window.clearTimeout(retryTimer.current);
+        retryTimer.current = null;
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -190,11 +222,15 @@ export default function DecisionsPanel() {
   const waiting = state.kind === "ready" ? state.rows.filter((row) => row.status === "pending") : [];
   const decided = state.kind === "ready" ? state.rows.filter((row) => row.status !== "pending") : [];
 
+  // The Home thread reports every master-state move, including a staged write
+  // that arrives while the queue is empty. This is the only refresh path for
+  // an idle queue; there is no polling timer to leak or tick down.
   useEffect(() => {
-    if (state.kind !== "ready" || waiting.length === 0) return;
-    const timer = window.setInterval(() => void load(), 30_000);
-    return () => window.clearInterval(timer);
-  }, [load, state.kind, waiting.length]);
+    if (state.kind !== "ready") return;
+    return subscribeMasterChanged(() => {
+      void load();
+    });
+  }, [load, state.kind]);
 
   useEffect(() => {
     document.body.toggleAttribute("data-decisions-open", open);
@@ -212,7 +248,9 @@ export default function DecisionsPanel() {
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       if (expanded !== null) {
+        const focusRow = rowRefs.current.get(expanded);
         setExpanded(null);
+        window.setTimeout(() => focusRow?.focus(), 0);
         return;
       }
       setOpen(false);
@@ -225,7 +263,21 @@ export default function DecisionsPanel() {
   const close = () => {
     setOpen(false);
     setExpanded(null);
+    setConflict(null);
     trigger.current?.focus();
+  };
+
+  const markUnconfirmed = (id: string, decision: "approve" | "deny") => {
+    setState((current) =>
+      current.kind === "ready"
+        ? {
+            kind: "ready",
+            rows: current.rows.map((entry) =>
+              entry.id === id ? { ...entry, unconfirmed: true, retry: decision } : entry,
+            ),
+          }
+        : current,
+    );
   };
 
   const run = async (row: Row, decision: "approve" | "deny") => {
@@ -234,12 +286,38 @@ export default function DecisionsPanel() {
     setConflict(null);
     try {
       await decide(row.id, decision);
-      setNotice({
-        kind: "ok",
-        text: decision === "approve" ? t("Issue created · cannot repeat") : t("Denied · nothing created"),
-      });
       setExpanded(null);
-      await load();
+      const refreshed = await load();
+      if (!refreshed) {
+        markUnconfirmed(row.id, decision);
+        setConflict(t("The outcome is unconfirmed. Retry the same decision; it cannot run twice."));
+        return;
+      }
+      const current = refreshed.find((entry) => entry.id === row.id);
+      if (!current) {
+        setConflict(t("This request is no longer in the list."));
+        return;
+      }
+      if (current.status === "approved") {
+        setNotice({
+          kind: "ok",
+          text:
+            decision === "deny"
+              ? `${t("Already approved")}${current.receipt ? ` · ${current.receipt}` : ""}`
+              : t("Issue created · cannot repeat"),
+        });
+      } else if (current.status === "denied") {
+        setNotice({
+          kind: "ok",
+          text:
+            decision === "approve"
+              ? t("Already denied · nothing created")
+              : t("Denied · nothing created"),
+        });
+      } else {
+        markUnconfirmed(row.id, decision);
+        setConflict(t("The outcome is unconfirmed. Retry the same decision; it cannot run twice."));
+      }
       window.setTimeout(() => {
         drawer.current?.querySelector<HTMLButtonElement>(".decisions-row")?.focus();
       }, 0);
@@ -247,22 +325,13 @@ export default function DecisionsPanel() {
       if (error instanceof DecisionsError && error.status === 403) {
         setConflict(t("Only the workspace owner can decide this request."));
       } else if (error instanceof DecisionsError && error.status === 409) {
-        setConflict(t("This request was already decided. The list is refreshing."));
         await load();
+        setConflict(t("This request was already decided. The list is refreshed."));
       } else if (error instanceof DecisionsError && error.status === 404) {
-        setConflict(t("This request no longer exists."));
         await load();
+        setConflict(t("This request no longer exists."));
       } else {
-        setState((current) =>
-          current.kind === "ready"
-            ? {
-                kind: "ready",
-                rows: current.rows.map((entry) =>
-                  entry.id === row.id ? { ...entry, unconfirmed: true } : entry,
-                ),
-              }
-            : current,
-        );
+        markUnconfirmed(row.id, decision);
         setConflict(t("The outcome is unconfirmed. Retry the same decision; it cannot run twice."));
       }
     } finally {
@@ -271,7 +340,7 @@ export default function DecisionsPanel() {
   };
 
   if (state.kind === "loading" || state.kind === "unavailable") return null;
-  if (waiting.length === 0 && !open) return null;
+  if (waiting.length === 0 && decided.length === 0 && !open) return null;
 
   const rows = tab === "waiting" ? waiting : decided;
 
@@ -290,7 +359,7 @@ export default function DecisionsPanel() {
           <path d="m8 6.2 2.4 1.4v2.8L8 11.8 5.6 10.4V7.6z" />
         </svg>
         <span className="decisions-trigger-label">{t("Decisions")}</span>
-        <span className="decisions-count" aria-live="polite">
+        <span className="decisions-count" data-zero={waiting.length === 0 || undefined} aria-live="polite">
           {waiting.length}
         </span>
       </button>
@@ -335,6 +404,11 @@ export default function DecisionsPanel() {
           </div>
 
           <div className="decisions-list" role="tabpanel">
+            {conflict && (
+              <p className="decisions-alert" role="alert">
+                {conflict}
+              </p>
+            )}
             {rows.length === 0 ? (
               <p className="decisions-empty">
                 {t("No decisions waiting. Requests appear here when the assistant stages a write.")}
@@ -342,6 +416,14 @@ export default function DecisionsPanel() {
             ) : (
               rows.map((row) => {
                 const isOpen = expanded === row.id;
+                const attempt = row.unconfirmed ? (row.retry ?? "approve") : "approve";
+                const other = attempt === "approve" ? "deny" : "approve";
+                const attemptLabel = row.unconfirmed
+                  ? attempt === "approve"
+                    ? t("Retry approval")
+                    : t("Retry denial")
+                  : t("Approve");
+                const otherLabel = other === "approve" ? t("Approve") : t("Deny");
                 return (
                   <article
                     key={row.id}
@@ -351,6 +433,10 @@ export default function DecisionsPanel() {
                   >
                     <button
                       type="button"
+                      ref={(element) => {
+                        if (element) rowRefs.current.set(row.id, element);
+                        else rowRefs.current.delete(row.id);
+                      }}
                       className="decisions-row"
                       aria-expanded={isOpen}
                       onClick={() => { setExpanded(isOpen ? null : row.id); setConflict(null); }}
@@ -358,13 +444,20 @@ export default function DecisionsPanel() {
                       <span className="decisions-row-main">
                         <span className="decisions-row-title">{row.title}</span>
                         <span className="decisions-row-meta">
-                          {row.status === "pending"
-                            ? t("create issue")
-                            : row.status === "approved"
-                              ? t("created")
-                              : t("denied")}
-                          {row.project ? ` · ${row.project}` : ""}
-                          {row.priority ? ` · ${row.priority}` : ""}
+                          {row.status === "approved" ? (
+                            <>
+                              {t("created")}
+                              {row.receipt ? ` · ${row.receipt}` : ""} · {t("one-time")}
+                            </>
+                          ) : row.status === "denied" ? (
+                            <>{t("denied")} · {t("nothing created")}</>
+                          ) : (
+                            <>
+                              {t("create issue")}
+                              {row.project ? ` · ${row.project}` : ""}
+                              {row.priority ? ` · ${row.priority}` : ""}
+                            </>
+                          )}
                           {row.unconfirmed ? ` · ${t("unconfirmed")}` : ""}
                         </span>
                       </span>
@@ -380,11 +473,17 @@ export default function DecisionsPanel() {
                           <p className="decisions-effect">{t("Creates one issue · nothing sent")}</p>
                         )}
                         {row.body && <p className="decisions-rationale">{row.body}</p>}
-                        {row.status === "approved" && row.receipt && (
-                          <p className="decisions-effect">{t("One issue created · one-time")}</p>
-                        )}
-                        {row.status === "pending" && conflict && (
-                          <p className="decisions-error" role="alert">{conflict}</p>
+                        {row.status === "approved" && (
+                          <p className="decisions-effect">
+                            {row.receipt && row.project ? (
+                              <a className="lnk" href={issuePath(row.project, row.receipt)}>
+                                {t("Open")} {row.receipt}
+                              </a>
+                            ) : row.receipt ? (
+                              <span>{row.receipt}</span>
+                            ) : null}
+                            {row.receipt ? ` · ${t("one-time")}` : t("One issue created · one-time")}
+                          </p>
                         )}
                         {row.status === "pending" && (
                           <div className="decisions-actions">
@@ -392,34 +491,32 @@ export default function DecisionsPanel() {
                               type="button"
                               className="decisions-btn decisions-btn-primary"
                               disabled={busy !== null}
-                              aria-busy={(busy?.id === row.id && busy.decision === "approve") || undefined}
-                              onClick={() => void run(row, "approve")}
+                              aria-busy={(busy?.id === row.id && busy.decision === attempt) || undefined}
+                              onClick={() => void run(row, attempt)}
                             >
-                              {busy?.id === row.id && busy.decision === "approve" ? (
+                              {busy?.id === row.id && busy.decision === attempt ? (
                                 <>
                                   <span className="decisions-spin" aria-hidden="true" />
-                                  {t("Approving…")}
+                                  {attempt === "approve" ? t("Approving…") : t("Denying…")}
                                 </>
-                              ) : row.unconfirmed ? (
-                                t("Retry")
                               ) : (
-                                t("Approve")
+                                attemptLabel
                               )}
                             </button>
                             <button
                               type="button"
                               className="decisions-btn decisions-btn-ghost"
                               disabled={busy !== null}
-                              aria-busy={(busy?.id === row.id && busy.decision === "deny") || undefined}
-                              onClick={() => void run(row, "deny")}
+                              aria-busy={(busy?.id === row.id && busy.decision === other) || undefined}
+                              onClick={() => void run(row, other)}
                             >
-                              {busy?.id === row.id && busy.decision === "deny" ? (
+                              {busy?.id === row.id && busy.decision === other ? (
                                 <>
                                   <span className="decisions-spin" aria-hidden="true" />
-                                  {t("Denying…")}
+                                  {other === "approve" ? t("Approving…") : t("Denying…")}
                                 </>
                               ) : (
-                                t("Deny")
+                                otherLabel
                               )}
                             </button>
                           </div>
