@@ -119,7 +119,7 @@ fn meta_bytes_are_unchanged() {
             "tailnet_proof": tailnet_proof,
             "operator": operator,
             "platform_account_configured": false,
-            "tailnet_url": full.then(|| "https://x.ts.net"),
+            "tailnet_url": full.then_some("https://x.ts.net"),
             "version": "1.2.3",
             "build_commit": "deadbeef",
             "build_time": "now",
