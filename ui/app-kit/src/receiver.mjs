@@ -163,6 +163,7 @@ export function createScreenReceiver(options = {}) {
   const {
     onPush,
     onError,
+    onPresentation,
     accepts = ["screen.v2"],
     timeoutMs = DEFAULT_TIMEOUT_MS,
     onSlotState,
@@ -172,23 +173,27 @@ export function createScreenReceiver(options = {}) {
     MessageChannel: Channel = globalThis.MessageChannel,
   } = options;
   if (typeof onPush !== "function") throw new TypeError("onPush is required");
-  const ACCEPTED = new Set(["screen.v1", "screen.v2", "screen-actions.v1"]);
+  const ACCEPTED = new Set(["screen.v1", "screen.v2", "screen-actions.v1", "screen-presentation.v1"]);
   if (
     !Array.isArray(accepts) ||
     accepts.length === 0 ||
     accepts.some((value) => !ACCEPTED.has(value)) ||
     !accepts.some((value) => value === "screen.v1" || value === "screen.v2")
   ) {
-    throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1");
+    throw new TypeError("accepts must name screen.v1 or screen.v2, optionally screen-actions.v1 or screen-presentation.v1");
   }
   const actionsAccepted = accepts.includes("screen-actions.v1");
   if (actionsAccepted && !accepts.includes("screen.v2")) {
     throw new TypeError("screen-actions.v1 needs screen.v2");
   }
+  const presentationAccepted = accepts.includes("screen-presentation.v1");
+  if (presentationAccepted && !accepts.includes("screen.v2")) {
+    throw new TypeError("screen-presentation.v1 needs screen.v2");
+  }
   // `screen.v1` is a local PUSH filter. The host's ready envelope admits only
   // v2 contract names, and a v1-only mount sends the bare ready.
   const ready = accepts.includes("screen.v2")
-    ? { v: 1, op: "ready", accepts: ["screen.v2", ...(actionsAccepted ? ["screen-actions.v1"] : [])] }
+    ? { v: 1, op: "ready", accepts: ["screen.v2", ...(actionsAccepted ? ["screen-actions.v1"] : []), ...(presentationAccepted ? ["screen-presentation.v1"] : [])] }
     : { v: 1, op: "ready" };
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new TypeError("timeoutMs must be positive");
   if (!parent || typeof parent.postMessage !== "function") throw new TypeError("a parent window is required");
@@ -213,6 +218,7 @@ export function createScreenReceiver(options = {}) {
   let accepted = false;
   let locked = null;
   let liveV2 = false;
+  let presentation = "outlet";
   let seq = 0;
   // The host closes a mount that starts a second tool while one is running.
   // A local timeout does not cancel the host invocation, so busy survives it
@@ -362,6 +368,17 @@ export function createScreenReceiver(options = {}) {
         if (!settle(message)) fail(`reply for an id this mount never sent: ${message.id}`);
         return;
       }
+      if (message.op === "presentation") {
+        // CAD-1615 (host): the surface this frame is presented in. Only a host
+        // that saw the opt-in may send it; the mode is validated like any
+        // other closed message.
+        if (!presentationAccepted) fail("presentation without the opt-in");
+        if (message.v !== 1 || Object.keys(message).sort().join() !== "mode,op,v" ||
+            (message.mode !== "outlet" && message.mode !== "drawer")) fail("invalid presentation message");
+        presentation = message.mode;
+        onPresentation?.(presentation);
+        return;
+      }
       if (message.op !== "screen") fail(`unknown op ${JSON.stringify(message.op)}`);
       if (message.tag !== boot.tag) fail("PUSH tag mismatch");
       if (message.v !== 1 && message.v !== 2) fail("unsupported PUSH version");
@@ -404,6 +421,25 @@ export function createScreenReceiver(options = {}) {
         return Promise.reject(new TypeError("args must be a plain object within 16 KiB"));
       }
       return request("call", { verb, args });
+    },
+    /** The surface the host currently presents this frame in. */
+    presentation: () => presentation,
+    /** Ask the host to present the app's surface in the board-wide drawer. */
+    openDrawer(surface) {
+      if (!presentationAccepted) {
+        return Promise.reject(new ScreenClosedError("the host did not opt into screen-presentation.v1"));
+      }
+      if (typeof surface !== "string" || !/^[a-z0-9_-]{1,64}$/.test(surface)) {
+        return Promise.reject(new TypeError("surface must be 1-64 of a-z, 0-9, _ or -"));
+      }
+      return request("call", { verb: "screen.drawer.open", args: { surface } });
+    },
+    /** Ask the host to close the board-wide drawer it opened. */
+    closeDrawer() {
+      if (!presentationAccepted) {
+        return Promise.reject(new ScreenClosedError("the host did not opt into screen-presentation.v1"));
+      }
+      return request("call", { verb: "screen.drawer.close", args: {} });
     },
     slot(verb, args = {}, anchor = "footer") {
       if (typeof verb !== "string" || verb.length === 0 || verb.length > 128) {

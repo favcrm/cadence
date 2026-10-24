@@ -15,12 +15,16 @@ export interface ScreenPush {
   [key: string]: unknown;
 }
 
+export type ScreenPresentationMode = "outlet" | "drawer";
+
 export interface ScreenReceiverOptions {
   boot?: ScreenBoot;
   onPush(push: ScreenPush): void;
   onError?(reason: string): void;
   onSlotState?(event: SlotState): void;
-  accepts?: readonly ("screen.v1" | "screen.v2" | "screen-actions.v1")[];
+  /** CAD-1615: the host names the surface this frame is presented in. */
+  onPresentation?(mode: ScreenPresentationMode): void;
+  accepts?: readonly ("screen.v1" | "screen.v2" | "screen-actions.v1" | "screen-presentation.v1")[];
   timeoutMs?: number;
   document?: { getElementById(id: string): { textContent: string | null } | null };
   parent?: { postMessage(message: unknown, origin: string, transfer?: unknown[]): void };
@@ -49,6 +53,12 @@ export interface ScreenReceiver {
   tool<T = unknown>(alias: string, input?: unknown, requestId?: string, generationScope?: GenerationScope): Promise<T>;
   asset(ref: string): Promise<string>;
   state(data: string): boolean;
+  /** The surface the host currently presents this frame in. */
+  presentation(): ScreenPresentationMode;
+  /** Ask the host to present the app's surface in the board-wide drawer. */
+  openDrawer(surface: string): Promise<unknown>;
+  /** Ask the host to close the board-wide drawer it opened. */
+  closeDrawer(): Promise<unknown>;
   teardown(): void;
 }
 

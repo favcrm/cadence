@@ -28,6 +28,32 @@ CLI.
 
 ## Usage
 
+## Presentation and the board-wide drawer
+
+A screen opts into the host's `screen-presentation.v1` contract by naming it in
+`accepts` (with `screen.v2`). The host then tells the frame which surface it is
+presented in — the app outlet (`"outlet"`) or the board-wide drawer
+(`"drawer"`). The drawer is host-owned: the host owns its geometry, scrim and
+close control, while the app draws only its surface full-bleed.
+
+```js
+const receiver = createScreenReceiver({
+  accepts: ["screen.v2", "screen-actions.v1", "screen-presentation.v1"],
+  onPresentation(mode) { renderSurface(mode); }, // "outlet" | "drawer"
+  onPush(push) { /* ... */ },
+});
+
+receiver.presentation();          // current surface, defaults to "outlet"
+await receiver.openDrawer("settings"); // host opens the board-wide drawer
+await receiver.closeDrawer();          // host returns the frame to the outlet
+```
+
+`openDrawer`/`closeDrawer` send the host UI verbs `screen.drawer.open` and
+`screen.drawer.close`. They are shell verbs, not app capabilities, so they are
+not required in the PUSH's `actions`. A host that never opts in sends no
+presentation message; the app keeps its own drawer and the helpers reject with
+`ScreenClosedError`, which is the intended fallback.
+
 ```js
 import { createScreenReceiver } from "@cadence/app-kit";
 
