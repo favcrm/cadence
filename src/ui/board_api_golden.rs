@@ -339,7 +339,11 @@ fn issue_detail_with_history_notes_and_plan_bytes_are_unchanged() {
             detail
         })
         .collect();
-    golden("issue_details_history.json", &Value::Array(details));
+    // Newer git prints a UTC `%aI` as `Z`, older git as `+00:00`.
+    let details = serde_json::to_string(&details)
+        .unwrap()
+        .replace("+00:00\"", "Z\"");
+    golden("issue_details_history.json", &parse(&details));
 }
 
 /// `/api/meta`: the typed body equals the `json!` literal it replaced
