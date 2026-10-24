@@ -208,7 +208,7 @@ function ConnectionsIndex({
   }, [providersRes]);
   const rows = listState?.data ?? [];
   const providers = providersState?.data ?? [];
-  const catalogUnavailable = providersState?.status === "failed" || providersState?.status === "empty";
+  const catalogUnavailable = providersState?.status === "empty";
   const refresh = () => {
     if (listRes) void listRes.revalidate();
     if (providersRes) void providersRes.revalidate();
@@ -432,7 +432,7 @@ function ConnectionsAdd({
   const addProviders = providers.filter((p) => p.provider !== "local");
   const pinned = page.kind === "addProvider" ? page.provider : null;
   const chosen = pinned ? addProviders.find((p) => p.provider === pinned) ?? null : null;
-  const catalogUnavailable = providersState?.status === "failed" || providersState?.status === "empty";
+  const catalogUnavailable = providersState?.status === "empty";
   const smtpFallback = catalogUnavailable && (page.kind === "add" || (page.kind === "addProvider" && page.provider === "smtp"));
 
   let title = t("Add connection");

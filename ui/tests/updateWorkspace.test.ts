@@ -44,6 +44,7 @@ const Update = (
   require("../src/features/settings/Update") as typeof import("../src/features/settings/Update")
 ).default;
 type Status = import("../src/lib/types").UpdateStatus;
+type Health = import("../src/lib/types").Health;
 const sample = (): Status => ({
   current: { version: "0.1.0", sha: "old" },
   check: {
@@ -121,22 +122,31 @@ const click = async (el: Element | undefined) => {
   );
   await flush();
 };
-const render = async (readOnly = false, operator = true) => {
+const render = async (
+  readOnly = false,
+  operator = true,
+  health?: Health | null | "unavailable",
+) => {
   await React.act(async () =>
     root.render(
-      React.createElement(Update, { viewer: { readOnly, operator } }),
+      React.createElement(Update, { viewer: { readOnly, operator }, health }),
     ),
   );
   await flush();
 };
-const fresh = async (s = sample(), readOnly = false, operator = true) => {
+const fresh = async (
+  s = sample(),
+  readOnly = false,
+  operator = true,
+  health?: Health | null | "unavailable",
+) => {
   await React.act(async () => root.unmount());
   root = createRoot(host);
   status = s;
   fail = false;
   hold = false;
   gets.length = posts.length = 0;
-  await render(readOnly, operator);
+  await render(readOnly, operator, health);
 };
 const text = () => host.textContent ?? "";
 async function main() {
@@ -425,6 +435,14 @@ async function main() {
     text().includes("fresh mount") && !text().includes("unmounted read"),
     "Late unmounted response cannot affect a new instance",
   );
+  // CAD-1797 review: connectivity is the shell's /api/health observation,
+  // not an inference from a successful update read.
+  await fresh(sample(), false, true, {
+    ok: true, pm_present: true, projects: 0, issues: 0, daemon: "reachable", embedded: true,
+  });
+  assert(text().includes("Daemon connected"), "connectivity follows the health probe");
+  await fresh(sample(), false, true, "unavailable");
+  assert(text().includes("Daemon disconnected"), "an unavailable health probe is not connected");
   await React.act(async () => root.unmount());
   console.log("updateWorkspace: PASS");
 }

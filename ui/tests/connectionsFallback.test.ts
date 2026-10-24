@@ -111,6 +111,48 @@ async function main() {
   equal(posts[0].body.username, "owner@essentialfoods.test", "SMTP login");
   assert(posts[0].body.secret === "stub-app-password", "secret crosses once in the request");
   await act(async () => root.unmount());
+
+  // A custody-consent refusal stores nothing; the secret must not survive
+  // the settled request, even though the consent retry stays available.
+  const { ApiError } = require("../src/lib/apiError") as typeof import("../src/lib/apiError");
+  const HostedSmtpConnect = (require("../src/features/settings/HostedSmtpConnect") as typeof import("../src/features/settings/HostedSmtpConnect")).default;
+  const host2 = document.createElement("div");
+  document.body.append(host2);
+  const root2 = createRoot(host2);
+  act(() => {
+    root2.render(
+      React.createElement(LocaleProvider, null,
+        React.createElement(HostedSmtpConnect, {
+          connected: null,
+          onConnect: async () => { throw new ApiError("unprotected", 400, { code: "custody_unprotected" }); },
+        }),
+      ),
+    );
+  });
+  await settle(() => assert(host2.querySelector("#hs-password"), "credential form renders"));
+  const field2 = (label: string) =>
+    Array.from(host2.querySelectorAll("label")).find((l) => (l.textContent ?? "").includes(label));
+  const fill2 = (label: string, value: string) => {
+    const lab = field2(label);
+    assert(lab, `field labelled ${label}`);
+    const input = lab!.parentElement!.querySelector("input") as HTMLInputElement;
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!;
+      setter.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  };
+  fill2("Your email address", "owner@essentialfoods.test");
+  fill2("App password", "stub-app-password");
+  const submit2 = Array.from(host2.querySelectorAll("button")).find((b) => (b.textContent ?? "").trim() === "Connect email") as HTMLButtonElement;
+  act(() => submit2.click());
+  await settle(() => {
+    const password = host2.querySelector("#hs-password") as HTMLInputElement;
+    assert(password.value === "", "password is cleared after a custody refusal");
+    assert((host2.textContent ?? "").includes("This workspace can't keep the password apart"), "consent guidance remains");
+  });
+  assert(!(host2.textContent ?? "").includes("stub-app-password"), "the secret never appears in text");
+  await act(async () => root2.unmount());
   console.log("connections fallback checks passed");
 }
 void main();

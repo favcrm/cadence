@@ -1292,7 +1292,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             {route.section === "email" && <EmailSending viewer={viewer} />}
             {route.section === "templates" && <Templates />}
             {route.section === "account" && <PlatformAccount />}
-            {route.section === "update" && <Update viewer={viewer} />}
+            {route.section === "update" && <Update viewer={viewer} health={health} />}
             {route.section === "permissions" && <MasterPermissions viewer={{ ...viewer, boardReadOnly, signedIn: meta?.signed_in === true, sessionId: meta?.session?.id ?? null }} />}
           </SettingsLayout>
         )}

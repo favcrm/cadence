@@ -84,14 +84,13 @@ export default function HostedSmtpConnect({
     }, riskNeeded && consent)
       .then(() => setPassword(""))
       .catch((e: unknown) => {
-        // Nothing was stored on this refusal; keep the typed password
-        // so the operator can tick and resend without retyping it.
+        // A refusal stores nothing; never keep the secret after the request
+        // settles, including the custody-consent refusal. The operator
+        // re-enters the password after ticking consent.
+        setPassword("");
         if (e instanceof ApiError && e.code === "custody_unprotected") {
           setRiskNeeded(true);
-          setError(connectErrorText(e));
-          return;
         }
-        setPassword("");
         setError(connectErrorText(e));
       })
       .finally(() => setPending(false));

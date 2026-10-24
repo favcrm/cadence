@@ -4,7 +4,7 @@ import { useWriteBlock } from "../auth/WriteGate";
 import Button from "../../ui/Button";
 import { IconRefresh, IconWarning } from "../../ui/icons";
 import { fmtTime, releaseLabel } from "../../lib/fmt";
-import type { UpdateStatus, WaitingTurn } from "../../lib/types";
+import type { Health, UpdateStatus, WaitingTurn } from "../../lib/types";
 import "./update.css";
 import { useTranslate } from "../../lib/locale";
 
@@ -69,6 +69,7 @@ function outcome(
 /** Release status is observed from the server; a start receipt alone is not a completed run. */
 export default function Update({
   viewer,
+  health,
 }: {
   viewer: {
     readOnly: boolean;
@@ -78,6 +79,9 @@ export default function Update({
     access?: "checking" | "unavailable" | null;
     onRetryAccess?: () => void;
   };
+  /** The shell's /api/health observation: null while checking, "unavailable"
+   *  when the probe failed. A successful update read is not daemon proof. */
+  health?: Health | null | "unavailable";
 }) {
   const t = useTranslate();
   const [status, setStatus] = useState<UpdateStatus | null>(null);
@@ -334,8 +338,24 @@ export default function Update({
               </div>
               <div>
                 <dt>{t("Connectivity")}</dt>
-                <dd data-state={readError ? "unavailable" : "connected"}>
-                  {readError ? t("Last read failed") : t("Connected")}
+                <dd
+                  data-state={
+                    health === undefined
+                      ? "unknown"
+                      : health === null
+                        ? "checking"
+                        : health !== "unavailable" && health.daemon === "reachable"
+                          ? "connected"
+                          : "unavailable"
+                  }
+                >
+                  {health === undefined
+                    ? t("Not checked yet")
+                    : health === null
+                      ? t("Checking…")
+                      : health !== "unavailable" && health.daemon === "reachable"
+                        ? t("Daemon connected")
+                        : t("Daemon disconnected")}
                 </dd>
               </div>
             </dl>
