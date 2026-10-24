@@ -8,6 +8,7 @@
   },
   "expected": {
     "ok": true,
+    "op": "app.manifest.preflight",
     "value": {}
   }
 }

@@ -15,6 +15,7 @@
   },
   "expected": {
     "ok": true,
+    "op": "issue.readiness",
     "value": {
       "ready": false,
       "blocked": true,

@@ -3,6 +3,7 @@
     "v": 1,
     "op": "issue.readiness",
     "input": {
+      "id": "CAD-5",
       "status": "ready",
       "blockers": [
         {
@@ -18,6 +19,7 @@
   },
   "expected": {
     "ok": true,
+    "op": "issue.readiness",
     "value": {
       "ready": true,
       "blocked": false

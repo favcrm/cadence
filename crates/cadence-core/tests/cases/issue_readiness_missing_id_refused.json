@@ -1,0 +1,15 @@
+{
+  "input": {
+    "v": 1,
+    "op": "issue.readiness",
+    "input": {
+      "status": "ready",
+      "blockers": []
+    }
+  },
+  "expected": {
+    "ok": false,
+    "code": "invalid_command",
+    "message": "missing field `id`"
+  }
+}

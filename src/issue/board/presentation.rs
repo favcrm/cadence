@@ -16,12 +16,15 @@ pub fn rev_of(issue: &Issue) -> Value {
 
 /// Compact card payload for `GET /api/issues` and `issue ls --json`.
 pub fn card_json(view: &View) -> Value {
-    card_json_rev(view, rev_of(&view.issue))
+    card_json_rev(
+        view,
+        &crate::issue::write::issue_rev(&view.issue.dir).unwrap_or_default(),
+    )
 }
 
 /// [`card_json`] with the `rev` token supplied — the board's read model
 /// hashes `issue.md` once per change instead of once per card render.
-pub fn card_json_rev(view: &View, rev: Value) -> Value {
+pub fn card_json_rev(view: &View, rev: &str) -> Value {
     let f = &view.issue.front;
     let card = IssueCard {
         id: f.id.clone(),
@@ -45,7 +48,7 @@ pub fn card_json_rev(view: &View, rev: Value) -> Value {
         blocked: view.blocked,
         blocked_reason: view.blocked_reason.map(str::to_string),
         created: f.created.clone(),
-        rev: rev.as_str().unwrap_or_default().to_string(),
+        rev: rev.to_string(),
         counts: CardCounts {
             comments: view.issue.comments.len(),
             artifacts: view.issue.artifacts.len(),
