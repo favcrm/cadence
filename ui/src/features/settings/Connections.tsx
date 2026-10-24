@@ -34,6 +34,7 @@ import {
   type VerificationOutcome,
 } from "./connectionsView";
 import { PRESETS, portFor, type Preset, type TlsMode } from "./hostedSmtpView";
+import SmtpAccountForm from "./SmtpAccountForm";
 import { connectionLabel } from "../../lib/connections";
 import "./connections.css";
 import { useTranslate } from "../../lib/locale";
@@ -207,6 +208,7 @@ function ConnectionsIndex({
   }, [providersRes]);
   const rows = listState?.data ?? [];
   const providers = providersState?.data ?? [];
+  const catalogUnavailable = providersState?.status === "empty";
   const refresh = () => {
     if (listRes) void listRes.revalidate();
     if (providersRes) void providersRes.revalidate();
@@ -218,7 +220,7 @@ function ConnectionsIndex({
       <div className="flex flex-wrap items-start gap-3 mb-4">
         <div className="min-w-0 flex-1">
           <h1 id="connections-title" className="text-section font-medium text-ink-100">{t("Connections")}</h1>
-          <p className="text-label text-ink-400 mt-1 break-words">{t("Exact provider accounts in this workspace. Creating or selecting a connection grants no worker, app or run permissions.")}</p>
+          <p className="text-label text-ink-400 mt-1 break-words">{t("The accounts your apps use. Credentials stay here; each app chooses how it uses them.")}</p>
         </div>
         {viewer.operator && (
           <div className="flex flex-wrap gap-2 shrink-0 items-center">
@@ -260,12 +262,18 @@ function ConnectionsIndex({
             failed="could not load connections"
             onRetry={refresh}
           />
-          <ResourceGate
-            state={providersState ?? emptyGate}
-            loading="loading services…"
-            failed="could not load the registered services"
-            onRetry={refresh}
-          />
+          {catalogUnavailable ? (
+            <p className="text-label text-ink-500 break-words" data-state="catalogue-unavailable">
+              {t("The service catalogue is not available on this board. Email accounts from this workspace are shown below.")}
+            </p>
+          ) : (
+            <ResourceGate
+              state={providersState ?? emptyGate}
+              loading="loading services…"
+              failed="could not load the registered services"
+              onRetry={refresh}
+            />
+          )}
           {listState?.data && (
             <div className="space-y-3 min-w-0">
               {groups.length === 0 ? (
@@ -331,6 +339,15 @@ function ServiceSection({
           >
             {t("Set up {label}").replace("{label}", () => String(group.label ?? ""))}</Button>
         )}
+        {!group.builtin && canWrite && group.provider === "smtp" && group.info === null && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="ml-auto"
+            href={connectionAddProviderHref("smtp")}
+          >
+            {group.connections.length === 0 ? t("Add email account") : t("Replace email account")}</Button>
+        )}
       </div>
       {group.connections.length === 0 ? (
         <p className="text-label text-ink-500 break-words">
@@ -346,7 +363,7 @@ function ServiceSection({
               >
                 <span className="conn-row-main">
                   <span className="text-label font-medium text-ink-100 min-w-0 break-words">
-                    {connectionLabel(row)}
+                    {isSmtpSender(row) && row.smtp?.sender ? row.smtp.sender : connectionLabel(row)}
                   </span>
                   <span
                     className={`chip ${row.kind === "builtin" ? "bg-ink-800 text-ink-300" : "bg-accent/15 text-accent"}`}
@@ -368,7 +385,7 @@ function ServiceSection({
       {group.builtin && (
         <p className="text-micro text-ink-500 mt-2 break-words">{t("Built-in accounts are always present — they carry no credential and cannot be edited or disconnected here.")}</p>
       )}
-      {!group.builtin && !group.info && (
+      {!group.builtin && !group.info && group.provider !== "smtp" && (
         <p className="text-micro text-ink-500 mt-2 break-words">{t("This provider's service metadata could not be loaded — the account stays under its recorded name. Refresh services; a failed load is not proof the provider was removed.")}</p>
       )}
     </section>
@@ -415,9 +432,12 @@ function ConnectionsAdd({
   const addProviders = providers.filter((p) => p.provider !== "local");
   const pinned = page.kind === "addProvider" ? page.provider : null;
   const chosen = pinned ? addProviders.find((p) => p.provider === pinned) ?? null : null;
+  const catalogUnavailable = providersState?.status === "empty";
+  const smtpFallback = catalogUnavailable && (page.kind === "add" || (page.kind === "addProvider" && page.provider === "smtp"));
 
-  let title = "Add connection";
-  if (page.kind === "addProvider") title = chosen ? `Set up ${serviceLabel(chosen.provider)}` : `Set up ${pinned ?? ""}`;
+  let title = t("Add connection");
+  if (page.kind === "addProvider") title = t("Set up {label}").replace("{label}", () => serviceLabel(chosen?.provider ?? pinned ?? ""));
+  if (smtpFallback && page.kind === "addProvider") title = t("Add email account");
 
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="connections-add-title">
@@ -440,13 +460,6 @@ function ConnectionsAdd({
         <PageState title={t("Operator access required")}>{t("Connections are available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
       ) : (
         <div className="conn-form mt-4">
-          <StaleChip state={providersState ?? emptyGate} />
-          <ResourceGate
-            state={providersState ?? emptyGate}
-            loading="loading services…"
-            failed="could not load the registered services"
-            onRetry={refresh}
-          />
           {!canWrite ? (
             <PageState title={t("Read-only board")}>
               {t("This board is read-only — connections cannot be added or changed here.")}
@@ -454,37 +467,69 @@ function ConnectionsAdd({
                 <Link href={connectionsIndexHref()} className="lnk">{t("Back to connections")}</Link>
               </span>
             </PageState>
-          ) : providersState?.data && page.kind === "add" ? (
-            <ServiceChooser providers={addProviders} />
-          ) : providersState?.data && page.kind === "addProvider" ? (
-            chosen === null ? (
-              <PageState title={t("Service unavailable")}>
-                {t("That service is not available for setup — it may have been removed or its reviewed enrollment metadata could not be read.")}
-                <span className="block mt-3">
-                  <Link href={connectionAddHref()} className="lnk">{t("Choose a different service")}</Link>
-                </span>
-              </PageState>
-            ) : (
-              <>
-                <AddConnection
-                  // The draft (secret + consent) lives only in this
-                  // component; keying on the provider means a route
-                  // change to another service can never reuse it.
-                  key={chosen.provider}
-                  providers={addProviders}
-                  existing={rows}
-                  preset={chosen.provider}
-                  hideProviderPicker
-                  submitLabel={t("Save connection")}
-                  onClose={() => navigate(connectionsIndexHref())}
-                  onAdded={(id) => {
+          ) : smtpFallback ? (
+            <>
+              <p className="text-label text-ink-400 break-words" data-state="smtp-fallback">
+                {t("The service catalogue is not available on this board. You can still manage the workspace email account here.")}
+              </p>
+              <ResourceGate
+                state={listState ?? emptyGate}
+                loading="loading connections…"
+                failed="could not load connections"
+                onRetry={refresh}
+              />
+              {listState?.data && (
+                <SmtpAccountForm
+                  rows={rows}
+                  onSaved={(id) => {
                     refresh();
                     navigate(connectionDetailHref(id));
                   }}
                 />
-              </>
-            )
-          ) : null}
+              )}
+            </>
+          ) : (
+            <>
+              <StaleChip state={providersState ?? emptyGate} />
+              <ResourceGate
+                state={providersState ?? emptyGate}
+                loading="loading services…"
+                failed="could not load the registered services"
+                onRetry={refresh}
+              />
+              {providersState?.data && page.kind === "add" ? (
+                <ServiceChooser providers={addProviders} />
+              ) : providersState?.data && page.kind === "addProvider" ? (
+                chosen === null ? (
+                  <PageState title={t("Service unavailable")}>
+                    {t("That service is not available for setup — it may have been removed or its reviewed enrollment metadata could not be read.")}
+                    <span className="block mt-3">
+                      <Link href={connectionAddHref()} className="lnk">{t("Choose a different service")}</Link>
+                    </span>
+                  </PageState>
+                ) : (
+                  <>
+                    <AddConnection
+                      // The draft (secret + consent) lives only in this
+                      // component; keying on the provider means a route
+                      // change to another service can never reuse it.
+                      key={chosen.provider}
+                      providers={addProviders}
+                      existing={rows}
+                      preset={chosen.provider}
+                      hideProviderPicker
+                      submitLabel={t("Save connection")}
+                      onClose={() => navigate(connectionsIndexHref())}
+                      onAdded={(id) => {
+                        refresh();
+                        navigate(connectionDetailHref(id));
+                      }}
+                    />
+                  </>
+                )
+              ) : null}
+            </>
+          )}
         </div>
       )}
     </section>

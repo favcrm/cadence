@@ -4,7 +4,7 @@ import { useWriteBlock } from "../auth/WriteGate";
 import Button from "../../ui/Button";
 import { IconRefresh, IconWarning } from "../../ui/icons";
 import { fmtTime, releaseLabel } from "../../lib/fmt";
-import type { UpdateStatus, WaitingTurn } from "../../lib/types";
+import type { Health, UpdateStatus, WaitingTurn } from "../../lib/types";
 import "./update.css";
 import { useTranslate } from "../../lib/locale";
 
@@ -69,6 +69,7 @@ function outcome(
 /** Release status is observed from the server; a start receipt alone is not a completed run. */
 export default function Update({
   viewer,
+  health,
 }: {
   viewer: {
     readOnly: boolean;
@@ -78,6 +79,9 @@ export default function Update({
     access?: "checking" | "unavailable" | null;
     onRetryAccess?: () => void;
   };
+  /** The shell's /api/health observation: null while checking, "unavailable"
+   *  when the probe failed. A successful update read is not daemon proof. */
+  health?: Health | null | "unavailable";
 }) {
   const t = useTranslate();
   const [status, setStatus] = useState<UpdateStatus | null>(null);
@@ -257,8 +261,8 @@ export default function Update({
     <main className="update-workspace">
       <header className="update-heading">
         <div>
-          <h1>{t("Update")}</h1>
-          <p>{t("Review the latest release and follow its installation.")}</p>
+          <h1>{t("Status")}</h1>
+          <p>{t("Board version, release status and the update action.")}</p>
         </div>
         <Button
           icon={<IconRefresh />}
@@ -317,9 +321,9 @@ export default function Update({
             <p>{t(stateText).replace("{phase}", () => String(phase ?? "")).replace("{change_count}", () => String(report?.change_count ?? ""))}</p>
           </div>
         </div>
-        {status && (
-          <>
-            <dl className="update-versions">
+        <dl className="update-versions">
+          {status && (
+            <>
               <div>
                 <dt>{t("Installed release")}</dt>
                 <dd>
@@ -332,7 +336,33 @@ export default function Update({
                   {report ? releaseLabel(report.target_version, report.target) : t("Not checked yet")}
                 </dd>
               </div>
-            </dl>
+            </>
+          )}
+          <div>
+            <dt>{t("Connectivity")}</dt>
+            <dd
+              data-state={
+                health === undefined
+                  ? "unknown"
+                  : health === null
+                    ? "checking"
+                    : health !== "unavailable" && health.daemon === "reachable"
+                      ? "connected"
+                      : "unavailable"
+              }
+            >
+              {health === undefined
+                ? t("Not checked yet")
+                : health === null
+                  ? t("Checking…")
+                  : health !== "unavailable" && health.daemon === "reachable"
+                    ? t("Daemon connected")
+                    : t("Daemon disconnected")}
+            </dd>
+          </div>
+        </dl>
+        {status && (
+          <>
             <div className="update-release-footer">
               <p>
                 {status.checked_at ? t("Last checked {time}").replace("{time}", () => timeLabel(status.checked_at!)) : t("No completed check yet")}
