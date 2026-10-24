@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useId, useMemo, useState, type ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
 import type { ThreadRef } from "../../lib/types";
 import Md from "../../ui/Md";
@@ -504,5 +504,304 @@ export function entryRefs(payload: unknown): ThreadRef[] {
       !!r && typeof r === "object" &&
       typeof (r as ThreadRef).kind === "string" &&
       typeof (r as ThreadRef).id === "string",
+  );
+}
+
+// ---- Home's one assistant turn -------------------------------------------
+// The revamp groups the RENDER, not the data: `threadItems` stays flat for
+// the canvas feed, the working state and the window, and `threadRuns` only
+// says which contiguous items paint as one turn. A turn is one quiet head,
+// one folded trace (reasoning / worker notes / tool runs), the answer on its
+// own surface, then the artifact cards it produced.
+
+/** `9s` / `1m 4s` from two entry stamps; null when they do not measure. The
+ *  trace never keeps a clock of its own — the dock's working row does. */
+function traceElapsed(from: string | null | undefined, to: string | null | undefined): string | null {
+  if (!from || !to) return null;
+  const start = Date.parse(from);
+  const end = Date.parse(to);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+  const secs = Math.max(0, Math.round((end - start) / 1000));
+  if (secs < 1) return null;
+  if (secs < 60) return `${secs}s`;
+  return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+}
+
+/** The newest stored stamp in a turn — its head's time when it has no answer. */
+function lastCreated(items: ThreadItem[]): string | null {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    if (item.type === "pending") continue;
+    if (item.type === "tools") {
+      const last = item.entries[item.entries.length - 1];
+      if (last) return last.created ?? null;
+      continue;
+    }
+    return item.entry.created ?? null;
+  }
+  return null;
+}
+
+/** Three typing dots: the only streaming affordance. The transport sends
+ *  whole entries, never token deltas, so there is no skeleton and no
+ *  fabricated answer body to show while a turn works. */
+function TypingDots() {
+  const t = useTranslate();
+  return (
+    <div className="typing" role="status" data-kind="typing">
+      <span className="typing-dots" aria-hidden>
+        <i />
+        <i />
+        <i />
+      </span>
+      <span className="sr-only">{t("Assistant is typing")}</span>
+    </div>
+  );
+}
+
+/** One disclosure for the turn's evidence. Tool runs keep their own
+ *  StepsGroup inside it, so raw detail is still behind the existing
+ *  disclosure rather than printed in the main flow. */
+function TurnTrace({
+  items,
+  steps,
+  running,
+  summary,
+  elapsed,
+  density,
+}: {
+  items: ThreadItem[];
+  steps: number;
+  running: boolean;
+  summary: string;
+  elapsed: string | null;
+  density: Density;
+}) {
+  const t = useTranslate();
+  const [open, setOpen] = useState(false);
+  const id = useId();
+  const title = running ? t("Thinking…") : elapsed ? `${t("Thought for")} ${elapsed}` : t("Reasoning");
+  return (
+    <div className="steps turntrace min-w-0" data-kind="turn-trace" data-open={open || undefined}>
+      <button
+        type="button"
+        className="steps-head turntrace-head"
+        aria-expanded={open}
+        aria-controls={id}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <span className="steps-caret num shrink-0" aria-hidden>
+          ›
+        </span>
+        <span className="turntrace-title shrink-0">{title}</span>
+        {summary !== "" && <span className="turntrace-summary num truncate min-w-0">· {summary}</span>}
+        <span className="turntrace-count num shrink-0">
+          {steps} {steps === 1 ? t("step") : t("steps")}
+        </span>
+      </button>
+      <div className="steps-body" id={id}>
+        <div className="turntrace-wrap">
+          <ol className="turntrace-list">
+            {items.map((item) => {
+              if (item.type === "tools") {
+                return (
+                  <li key={item.key} className="turntrace-item">
+                    <StepsGroup entries={item.entries} density={density} />
+                  </li>
+                );
+              }
+              if (item.type !== "thinking" && item.type !== "commentary") return null;
+              const withheld = item.type === "thinking" && carriesSecret(item.entry.text);
+              return (
+                <li key={item.key} className="turntrace-item">
+                  <div className="turntrace-kicker num">
+                    {item.type === "thinking" ? t("Reasoning") : t("Worker note")}
+                  </div>
+                  <p className="turntrace-text">
+                    {withheld ? t("Reasoning withheld — it contained a request token.") : item.entry.text}
+                  </p>
+                </li>
+              );
+            })}
+          </ol>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** The answer surface: the existing Markdown renderer, with the turn's
+ *  chrome only (kicker, copy). Tables, callouts and code chips are scoped
+ *  styles on `.answer`; the Markdown itself is never forked. */
+function AnswerSurface({
+  entry,
+  density,
+  onOpenIssue,
+  earlier = false,
+}: {
+  entry: ThreadEntry;
+  density: Density;
+  onOpenIssue?: (id: string) => void;
+  /** An older transcript's last note, shown as its reply. */
+  earlier?: boolean;
+}) {
+  const t = useTranslate();
+  const [copied, setCopied] = useState(false);
+  const failure = turnFailure(entry, t);
+  return (
+    <>
+      {failure && (
+        <div
+          className="answer-fail text-fail break-words"
+          role="alert"
+          data-kind="turn-failure"
+        >
+          {failure}
+        </div>
+      )}
+      {entry.text.trim() !== "" && (
+        <section
+          className="answer"
+          data-kind="answer"
+          data-earlier={earlier || undefined}
+          aria-label={t("Assistant answer")}
+        >
+          <div className="answer-head">
+            <span className="answer-kicker">
+              <span className="answer-dot" aria-hidden />
+              {t("Answer")}
+            </span>
+            {earlier && <span className="answer-earlier num">{t("Earlier transcript")}</span>}
+            <button
+              type="button"
+              className="lnk answer-copy"
+              aria-label={t("Copy answer")}
+              onClick={() => {
+                void navigator.clipboard
+                  ?.writeText(entry.text)
+                  .then(() => {
+                    setCopied(true);
+                    window.setTimeout(() => setCopied(false), 1600);
+                  })
+                  .catch(() => undefined);
+              }}
+            >
+              {copied ? t("Copied") : t("Copy")}
+            </button>
+          </div>
+          <div className={`answer-body issue-reader ${density === "compact" ? "text-secondary" : "text-body"}`}>
+            <Md text={entry.text} onOpen={onOpenIssue} />
+          </div>
+        </section>
+      )}
+    </>
+  );
+}
+
+/**
+ * Reconnecting (CAD-1782): one quiet line at the top of the thread. The last
+ * saved turn stays readable exactly as it was — no stale answer border, no
+ * relabelled card, no warning fill. Retry reopens the page's stream.
+ */
+export function StreamBanner({ onRetry }: { onRetry: () => void }) {
+  const t = useTranslate();
+  return (
+    <div className="streambanner" role="status" data-kind="stale">
+      <span className="banner-spinner" aria-hidden />
+      <span>{t("Reconnecting — showing the last saved turn")}</span>
+      <button type="button" className="lnk streambanner-retry" onClick={onRetry}>
+        {t("Retry")}
+      </button>
+    </div>
+  );
+}
+
+/**
+ * One assistant turn on Home (the worker-transcript revamp): one quiet head,
+ * one collapsed trace, one Markdown answer, then its artifact cards. The flat
+ * items still exist for the canvas feed; this is only the paint.
+ *
+ * `running` comes from the host's turn state, never from the items: a turn
+ * with no answer is not assumed to be streaming (an aborted turn is not).
+ */
+export function ThreadTurn({
+  items,
+  running = false,
+  density = "full",
+  onOpenIssue,
+  after,
+}: {
+  items: ThreadItem[];
+  running?: boolean;
+  density?: Density;
+  onOpenIssue?: (id: string) => void;
+  /** Plan cards and the correction report, under the answer. */
+  after?: ReactNode;
+}) {
+  const t = useTranslate();
+  const traceItems = items.filter(
+    (item) => item.type === "thinking" || item.type === "commentary" || item.type === "tools",
+  );
+  const answer = items.find((item) => item.type === "answer");
+  const artifacts = items.filter((item) => item.type === "artifact");
+  // A transcript from before `turn_result` has no answer item: its last
+  // worker note IS what the operator read as the reply. Only the LAST
+  // non-artifact item can be that note — a note followed by tools is a
+  // tool-turn step, not a reply, and must stay in the trace.
+  const lastNote = [...items].reverse().find((item) => item.type !== "artifact");
+  const legacy =
+    !answer && !running && lastNote?.type === "commentary" ? lastNote : null;
+  const trace = legacy ? traceItems.filter((item) => item.key !== legacy.key) : traceItems;
+  const shown = answer ?? legacy;
+  // Streaming is a turn the host says is running AND that has no answer yet:
+  // a turn whose answer already landed keeps its finished look.
+  const streaming = running && shown === null;
+  const noAnswer = !streaming && shown === null;
+  const steps = trace.reduce(
+    (count, item) => count + (item.type === "tools" ? toolSteps(item.entries).length : 1),
+    0,
+  );
+  const intro = trace.find((item) => item.type === "thinking") ?? trace[0];
+  const introEntry =
+    intro === undefined ? undefined : intro.type === "tools" ? intro.entries[0] : intro.entry;
+  const summary =
+    introEntry && !carriesSecret(introEntry.text) ? stepSummary(introEntry.text) : "";
+  const elapsed = streaming ? null : traceElapsed(introEntry?.created, shown?.entry.created);
+  const headAt = shown?.entry.created ?? lastCreated(items);
+  return (
+    <div className="turn min-w-0" data-kind="turn" data-turn-state={streaming ? "running" : "complete"}>
+      <div className="turn-head">
+        <span className="turn-avatar" aria-hidden>
+          ✳
+        </span>
+        <span className="turn-name">{t("Assistant")}</span>
+        <span className="turn-time num">{streaming ? t("now") : time(headAt)}</span>
+      </div>
+      {trace.length > 0 && (
+        <TurnTrace
+          items={trace}
+          steps={steps}
+          running={streaming}
+          summary={summary}
+          elapsed={elapsed}
+          density={density}
+        />
+      )}
+      {shown && <AnswerSurface entry={shown.entry} density={density} onOpenIssue={onOpenIssue} earlier={legacy !== null} />}
+      {noAnswer && (
+        <div className="noanswer" data-kind="no-answer">
+          {t("No answer returned")}
+        </div>
+      )}
+      {streaming && <TypingDots />}
+      {artifacts.length > 0 && (
+        <div className="turn-artifacts">
+          {artifacts.map((item) =>
+            item.type === "artifact" ? <ArtifactCard key={item.key} entry={item.entry} /> : null,
+          )}
+        </div>
+      )}
+      {after}
+    </div>
   );
 }

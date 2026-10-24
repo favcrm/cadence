@@ -322,6 +322,56 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
   return items;
 }
 
+/** Item types that belong to an assistant turn. */
+const TURN_MEMBERS = new Set(["thinking", "commentary", "tools", "answer", "artifact", "hire"]);
+
+/** One render run: an assistant turn (its flat items), or one item that is
+ *  not part of a turn. The items themselves stay flat — `threadItems` is
+ *  still the one contract for the canvas feed, the working state and the
+ *  window; a turn is only how a contiguous run of them paints. */
+export type ThreadRun =
+  | { turn: true; key: string; items: ThreadItem[] }
+  | { turn: false; key: string; item: ThreadItem };
+
+/**
+ * Group the flat render list into turns. Reasoning, commentary, tool runs,
+ * the answer and its artifact cards are one turn while they stay contiguous.
+ * A terminal `answer` closes the turn: a further reasoning/commentary/tool
+ * item starts the next one, while artifact cards may still follow it. A run
+ * of artifact cards with no agent text is not a turn (no head, no trace).
+ */
+export function threadRuns(items: ThreadItem[]): ThreadRun[] {
+  const runs: ThreadRun[] = [];
+  let run: ThreadItem[] = [];
+  const flush = () => {
+    if (run.length === 0) return;
+    if (run.some((item) => item.type !== "artifact")) {
+      runs.push({ turn: true, key: run[0].key, items: run });
+    } else {
+      for (const item of run) runs.push({ turn: false, key: item.key, item });
+    }
+    run = [];
+  };
+  for (const item of items) {
+    if (!TURN_MEMBERS.has(item.type)) {
+      flush();
+      runs.push({ turn: false, key: item.key, item });
+      continue;
+    }
+    if (item.type !== "artifact" && run.some((i) => i.type === "answer")) flush();
+    run.push(item);
+  }
+  flush();
+  return runs;
+}
+
+/** The queued message id an item's entries carry — the turn it belongs to. */
+export function itemMessage(item: ThreadItem): string | null {
+  if (item.type === "pending") return item.pending.message;
+  if (item.type === "tools") return item.entries.find((e) => e.message)?.message ?? null;
+  return item.entry.message ?? null;
+}
+
 // ---- CAD-551: steps, refusals, and the working row's "what now" ----
 
 /** A tool call that runs `cadence artifact put` (not text that merely names

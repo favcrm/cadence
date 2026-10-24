@@ -1,10 +1,15 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import PermissionCard from "../src/features/home/PermissionCard";
-import { entryRefs, ThreadItemView, type Density } from "../src/features/home/ThreadView";
+import { entryRefs, StreamBanner, ThreadItemView, ThreadTurn, type Density } from "../src/features/home/ThreadView";
 declare function require(name: string): any;
 declare const process: { cwd(): string };
-import type { ThreadEntry, ThreadItem } from "../src/features/home/thread";
+import {
+  threadItems,
+  type ThreadEntry,
+  type ThreadItem,
+  type ThreadState,
+} from "../src/features/home/thread";
 
 /**
  * CAD-1029: the shared master-thread renderer. "full" is what Home has
@@ -231,4 +236,107 @@ for (const density of ["full", "compact"] as const) {
   ok(failed.includes("billing is not set up") && failed.includes("owner needs to set up billing"), "failed turn: billing reason");
   ok(!failed.includes("data-kind=\"answer\""), "failed turn: no empty answer body");
   ok(!failed.includes("Retry"), "failed turn: no retry on an executed turn");
+}
+
+// The worker-transcript turn (Home): one quiet head, one folded trace, one
+// Markdown answer, then the artifact cards. Grouping is a RENDER decision —
+// the flat items `threadItems` returns are unchanged.
+{
+  const at = (seq: number) => `2026-10-02T10:00:${String(seq).padStart(2, "0")}Z`;
+  const agent = (
+    seq: number,
+    kind: string,
+    text: string,
+    payload: Record<string, unknown> | null = null,
+  ): ThreadEntry => ({ seq, role: "agent", kind, text, payload, message: "m1", created: at(seq) });
+  const state = (entries: ThreadEntry[]): ThreadState => ({ exists: true, entries, pending: [] });
+  const count = (html: string, needle: string) => html.split(needle).length - 1;
+  const renderTurn = (items: ThreadItem[], running = false) =>
+    renderToStaticMarkup(createElement(ThreadTurn, { items, running, onOpenIssue: noop }));
+
+  const completeItems = threadItems(
+    state([
+      agent(1, "thinking", "Read the board, then the pending queue."),
+      agent(2, "assistant_text", "Board read; one pending action."),
+      agent(3, "tool_call", "Bash: cadence board read", { tool_use_id: "t1" }),
+      agent(4, "tool_result", "2 issues", { tool_use_id: "t1" }),
+      agent(5, "turn_result", "**One** action waits.\n\n| id | title |\n|---|---|\n| PILOT-1 | smoke |"),
+      agent(6, "artifact", "", { id: "art-a", version: 1, kind: "csv", title: "Board snapshot", bytes: 4200 }),
+    ]),
+  );
+  const complete = renderTurn(completeItems);
+  ok(count(complete, 'data-kind="turn"') === 1, "turn: exactly one turn");
+  ok(complete.includes('data-turn-state="complete"'), "turn: completed state");
+  ok(count(complete, 'class="turn-head"') === 1, "turn: one head");
+  ok(complete.includes(">Assistant<"), "turn: head names the assistant");
+  ok(complete.includes("turn-time"), "turn: head carries the time");
+  ok(!complete.includes("GLM") && !complete.includes("Working"), "turn: no model and no status chip in the head");
+  ok(count(complete, 'data-kind="turn-trace"') === 1, "turn: one trace disclosure");
+  ok(complete.includes('aria-expanded="false"'), "turn: trace starts collapsed");
+  ok(complete.includes("Thought for 4s"), "turn: the trace measures the turn");
+  ok(complete.includes(">Reasoning<") && complete.includes(">Worker note<"), "turn: reasoning and the worker note are trace rows");
+  ok(!complete.includes('data-kind="commentary"'), "turn: no standalone commentary row");
+  ok(count(complete, 'data-kind="tools"') === 1, "turn: the tool run keeps its own disclosure");
+  // The answer: Markdown through Md, not the raw text.
+  ok(count(complete, 'data-kind="answer"') === 1, "turn: one answer surface");
+  ok(complete.includes("<strong>One</strong>"), "turn: answer Markdown bold");
+  ok(complete.includes("<table>") && complete.includes(">PILOT-1<"), "turn: answer Markdown table");
+  ok(!complete.includes("| id | title |"), "turn: no literal Markdown pipes");
+  // Artifacts come after the answer, still the existing card.
+  ok(count(complete, 'data-kind="artifact"') === 1, "turn: the artifact card survives");
+  ok(complete.indexOf('data-kind="artifact"') > complete.indexOf('data-kind="answer"'), "turn: artifacts after the answer");
+  ok(!renderTurn(completeItems, true).includes('data-kind="typing"'), "turn: a landed answer ends the typing state");
+
+  // Streaming: the collapsed trace and three dots only.
+  const runningItems = threadItems(
+    state([agent(1, "thinking", "Reading the board."), agent(2, "tool_call", "Bash: cadence board read")]),
+  );
+  const running = renderTurn(runningItems, true);
+  ok(running.includes('data-turn-state="running"'), "streaming: running state");
+  ok(running.includes("Thinking…"), "streaming: the trace says it is thinking");
+  ok(count(running, 'data-kind="typing"') === 1, "streaming: one typing row");
+  ok(count(running, "<i></i>") === 3, "streaming: exactly three dots");
+  ok(!running.includes('data-kind="answer"'), "streaming: no answer body");
+  ok(!running.toLowerCase().includes("skeleton"), "streaming: no skeleton");
+  ok(!running.includes("data-assistant-activity") && !running.includes("Working"), "streaming: no status chip");
+
+  // A transcript from before `turn_result`: the last worker note reads as the
+  // reply, with the quiet earlier-transcript marker.
+  const legacy = renderTurn(threadItems(state([agent(1, "assistant_text", "An older reply.")])));
+  ok(legacy.includes('data-kind="answer"') && legacy.includes("An older reply."), "legacy: the last note is the answer");
+  ok(legacy.includes('data-earlier="true"') && legacy.includes("Earlier transcript"), "legacy: marked as earlier transcript");
+  ok(!legacy.includes(">Worker note<"), "legacy: the reply is not repeated inside the trace");
+
+  // A tool-turn note is not a reply: it stays in the trace and the completed
+  // turn says no answer returned instead of inventing one from position.
+  const toolTurn = renderTurn(
+    threadItems(
+      state([
+        agent(1, "assistant_text", "Checking the board."),
+        agent(2, "tool_call", "Bash: cadence board read"),
+      ]),
+    ),
+  );
+  ok(!toolTurn.includes('data-kind="answer"'), "tool turn: no invented answer");
+  ok(toolTurn.includes('data-kind="no-answer"'), "tool turn: no answer state");
+  ok(toolTurn.includes("Checking the board."), "tool turn: the note stays in the trace");
+  const toolsOnly = renderTurn(threadItems(state([agent(1, "tool_call", "Bash: cadence board read")])));
+  ok(toolsOnly.includes('data-kind="no-answer"'), "tools only: no answer state");
+
+  // A failed turn keeps its reason and no empty answer body.
+  const failure =
+    '503: {"message":"This company has no billing account yet; its owner sets one up.","type":"server_error","code":"billing_unavailable"}';
+  const failed = renderTurn(
+    threadItems(state([agent(1, "turn_result", "", { status: "failed", error: failure })])),
+  );
+  ok(failed.includes('data-kind="turn-failure"') && failed.includes('role="alert"'), "failed turn: alert row");
+  ok(failed.includes("billing is not set up"), "failed turn: billing reason");
+  ok(!failed.includes('data-kind="answer"'), "failed turn: no empty answer body");
+
+  // Reconnecting: one quiet notice with Retry — never a stale card or label.
+  const banner = renderToStaticMarkup(createElement(StreamBanner, { onRetry: noop }));
+  ok(count(banner, 'data-kind="stale"') === 1, "reconnect: one notice");
+  ok(banner.includes('role="status"') && banner.includes("banner-spinner"), "reconnect: a status line with a spinner");
+  ok(banner.includes("Reconnecting — showing the last saved turn") && banner.includes("Retry"), "reconnect: copy and Retry");
+  ok(!banner.includes("border ") && !banner.includes("bg-warn"), "reconnect: no stale card styling");
 }
