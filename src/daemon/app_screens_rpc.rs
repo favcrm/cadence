@@ -700,6 +700,14 @@ pub const SCREEN_KIT_CSS: &str = concat!(
     include_str!("../../design/kit.css"),
     "\n",
     include_str!("screen_kit.css"),
+    "\n",
+    // CAD-1622: the shared drawer shell's rules, so any app screen can render
+    // the shell the CRM app uses without shipping host CSS. The package the
+    // CRM app consumes builds from these same files, so the two copies cannot
+    // drift.
+    include_str!("../../ui/screen-ui/src/drawer-base.css"),
+    "\n",
+    include_str!("../../ui/screen-ui/src/drawer.css"),
 );
 /// The kit contract version a package can feature-detect.
 pub const SCREEN_KIT_VERSION: &str = "cadence-kit/1";
@@ -961,6 +969,22 @@ mod tests {
         let kit = &h[kit_start..kit_start + h[kit_start..].find("</style>").unwrap()];
         assert!(kit.contains(include_str!("../../design/tokens.css")));
         assert!(kit.contains(include_str!("../../design/kit.css")));
+        // CAD-1622: the shared drawer shell's rules travel with the kit.
+        assert!(kit.contains(include_str!("../../ui/screen-ui/src/drawer-base.css")));
+        assert!(kit.contains(include_str!("../../ui/screen-ui/src/drawer.css")));
+        for class in [
+            ".crm-drawer {",
+            ".crm-drawer-scrim",
+            ".crm-drawer-shell",
+            ".crm-drawer-top",
+            ".crm-drawer-body",
+            ".crm-drawer-foot",
+        ] {
+            assert!(
+                kit.contains(class),
+                "kit lacks the shared drawer shell rule {class}"
+            );
+        }
         for class in [
             ".btn {",
             ".field {",
