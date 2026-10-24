@@ -53,6 +53,7 @@ import type { MediaChatAttach } from "./screen/screenLifecycle";
 import { makePlanner, runCall, type ActionContext } from "./screen/screenActions";
 import { useScreenExtras } from "./screen/useScreenExtras";
 import { screenTag, screenProjection, settleIntentRead, type IntentRead } from "./screen/screenProjection";
+import { screenFailurePane, type ScreenPaneState } from "./screen/screenFailure";
 import { socialPublish } from "./socialPublish";
 import { supportsSocialContentWorkspace } from "./socialContentSupport";
 import { isUnchangedUpgradeError } from "../explorer/appErrors";
@@ -112,6 +113,36 @@ export function WorkspaceAppCachedPreview({
       ) : (
         <p className="mt-3 text-label text-ink-400">{t("Workspace details will appear after access is verified.")}</p>
       )}
+    </section>
+  );
+}
+
+/**
+ * One honest pane for a screen that did not mount: the state's own title and
+ * only the actions that can change it. The outlet supplies `onRetry` (a
+ * remount of the same projection); `onReinstall` exists only when the app has
+ * a recorded install source and this viewer may write.
+ */
+function ScreenFailurePane({ failure, onRetry, onReinstall, busy }: {
+  failure: ScreenPaneState;
+  onRetry: () => void;
+  onReinstall?: () => void;
+  busy?: boolean;
+}) {
+  const t = useTranslate();
+  const pane = screenFailurePane(failure, onReinstall !== undefined);
+  const title = failure.kind === "needs_host_update"
+    ? t(pane.title).replace("{required}", () => failure.required).replace("{current}", () => failure.current)
+    : t(pane.title);
+  return (
+    <section className="card px-4 py-5" aria-label={t("Installed app screen")} data-screen-pane={failure.kind} role="status">
+      <p className="wa-muted">{title}</p>
+      <div className="wa-row">
+        {pane.actions.includes("sign_in") && <Button href="/login">{t("Sign in")}</Button>}
+        {pane.actions.includes("retry") && <Button onClick={onRetry}>{t("Retry")}</Button>}
+        {pane.actions.includes("reinstall") && onReinstall && <Button onClick={onReinstall} loading={busy}>{t("Reinstall")}</Button>}
+        {pane.actions.includes("check_update") && <Button onClick={() => window.location.reload()}>{t("Check for update")}</Button>}
+      </div>
     </section>
   );
 }
@@ -1008,14 +1039,43 @@ export default function WorkspaceApp({
       full
     />
   );
+  const reinstallSource = data && canWrite && data.installation.source?.kind === "git"
+    ? data.installation.source.url ?? null
+    : null;
+  // Reinstall re-applies the recorded source to this installation. A plain
+  // install would be refused as already installed, so this is the existing
+  // upgrade path pinned to the current digest.
+  const reinstall = (installation: Installation, source: string) => () => void mutate(async () => {
+    const checked = await workspaceApps.upgradeCheck(installation.install_id, {
+      source,
+      expected_digest: installation.digest,
+      expected_generation: installation.catalog_generation,
+      catalogue_resolution: "manual",
+    });
+    const requestKey = JSON.stringify([installation.install_id, "reinstall", checked.expected_digest, checked.expected_generation, checked.digest]);
+    await workspaceApps.upgrade(installation.install_id, {
+      source,
+      expected_digest: checked.expected_digest,
+      expected_generation: checked.expected_generation,
+      expected_new_digest: checked.digest,
+      request_id: retainedRequest(requestKey),
+      catalogue_resolution: "manual",
+    });
+    completeRequest(requestKey);
+  });
+  const renderScreenFailure = (failure: ScreenPaneState, retry: () => void) => (
+    <ScreenFailurePane failure={failure} onRetry={retry} busy={busy}
+      onReinstall={data && reinstallSource ? reinstall(data.installation, reinstallSource) : undefined} />
+  );
   const screen = (fallback: React.ReactNode) => projection
-    ? <><ScreenHost projection={projection} fallback={fallback} loadAsset={screenExtras.loadAsset} actions={screenActions} onMediaAttach={onMediaAttach} onScreenDrawer={onScreenDrawer} presentation={presentation} onNavigation={(navigation) => { if (navigation === null) onScreenClosed?.(); }} /><Toast msg={connectToastMsg} /></> : <>{fallback}<Toast msg={connectToastMsg} /></>;
+    ? <><ScreenHost projection={projection} fallback={fallback} renderFailure={renderScreenFailure} loadAsset={screenExtras.loadAsset} actions={screenActions} onMediaAttach={onMediaAttach} onScreenDrawer={onScreenDrawer} presentation={presentation} onNavigation={(navigation) => { if (navigation === null) onScreenClosed?.(); }} /><Toast msg={connectToastMsg} /></> : <>{fallback}<Toast msg={connectToastMsg} /></>;
   if (data && !supportsSocialContentWorkspace(data.installation)) {
     return screen(<main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>
       <section className="wa-panel wa-stack">
         <p>{data.installation.summary}</p>
         <p className="wa-muted">{t("This installation has no supported board workspace yet. Use its installed guide and the app commands to inspect supported workflows.")}</p>
+        <div className="wa-row"><Button onClick={() => void refresh(true)}>{t("Retry")}</Button></div>
         <p className="wa-kicker">{t("Installation {id} · version {version}").replace("{id}", () => installId).replace("{version}", () => data.installation.version)}</p>
         <pre className="wa-preview">{data.installation.guide}</pre>
       </section>

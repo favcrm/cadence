@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { sessionHeaders } from "../../../lib/sessionKey";
 import { beginPrivateOperation, onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration, type PrivateOperation } from "../../../lib/privateSession";
-import { parseMount, ScreenChannel, type AssetLoader, type MediaChatAttach, type ScreenActions } from "./screenLifecycle";
+import { compareShellVersions, parseMount, ScreenChannel, shellVersion, type AssetLoader, type MediaChatAttach, type ScreenActions } from "./screenLifecycle";
+import type { ScreenFailure, ScreenPaneState } from "./screenFailure";
 import { invokeTool, revokeTool } from "./screenActions";
 import { type SlotView } from "./screenSlot";
 import ScreenSlotLayer from "./ScreenSlotLayer";
@@ -17,9 +18,24 @@ import { parseRoutePatch, routeFromHref, type RoutePatch } from "./screenRoute";
 import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation, type ScreenPresentationMode } from "./screenProtocol";
 import type { MountReceipt } from "./screenLifecycle";
 
+/** The pane renderer: the outlet's typed failure and a retry that re-mounts
+ *  this same projection without a reload. */
+export type ScreenFailurePane = (failure: ScreenPaneState, retry: () => void) => ReactNode;
+
+/** The tenant's structured refusal carries `error.code`; anything else is null. */
+function mountRefusalCode(body: unknown): string | null {
+  if (!body || typeof body !== "object" || Array.isArray(body) || !("error" in body)) return null;
+  const error = body.error;
+  if (!error || typeof error !== "object" || Array.isArray(error) || !("code" in error)) return null;
+  return typeof error.code === "string" ? error.code : null;
+}
+
 /** App code lives in its independently installed bundle, never in the board. */
-export default function ScreenOutlet({ projection, fallback, loadAsset, actions, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation }: {
-  projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader;
+export default function ScreenOutlet({ projection, fallback, renderFailure, loadAsset, actions, onRoute, onCommand, onNavigation, onMediaAttach, onScreenDrawer, presentation }: {
+  projection: ScreenPush; fallback: ReactNode;
+  /** Render the specific pane for a mount failure; absent keeps `fallback`. */
+  renderFailure?: ScreenFailurePane;
+  loadAsset?: AssetLoader;
   /** The operator's verbs for this frame (HP3); absent for a non-operator, so every `call`/`slot` closes it. */
   actions?: Pick<ScreenActions, "call" | "planner">;
   onRoute?: (patch: RoutePatch, navigation: ScreenNavigation) => void;
@@ -52,6 +68,11 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
   const [slot, setSlot] = useState<SlotView | null>(null);
   const [link, setLink] = useState<string | null>(null);
   const [state, setState] = useState<"loading" | "ready" | "fallback">("loading");
+  const [failure, setFailure] = useState<ScreenPaneState | null>(null);
+  const [attempt, setAttempt] = useState(0);
+  /** Retry re-mounts the same projection: the effect's scope identity is
+   *  unchanged, so only the attempt counter rebuilds the frame. */
+  const retry = () => { setFailure(null); setState("loading"); setAttempt(value => value + 1); };
   // CAD-1615 — the surface the shell presents this frame in reaches the
   // child over the same port. The host owns the geometry; the child draws
   // its surface there.
@@ -113,11 +134,13 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
       } else throw new Error("Unsupported host command");
     };
     setState("loading");
+    setFailure(null);
     setSlot(null); setLink(null); setPreview(null); setRemoteImages([]);
-    const fail = () => { clearLeaveGuard(); if (isCurrent()) { services?.retire(); mounted.current = null; navigationCallbacks.current.onNavigation?.(null); setPreview(null); setSlot(null); setState("fallback"); } };
+    const fail = (why: ScreenPaneState) => { clearLeaveGuard(); if (isCurrent()) { setFailure(why); services?.retire(); mounted.current = null; navigationCallbacks.current.onNavigation?.(null); setPreview(null); setSlot(null); setState("fallback"); } };
     const onMessage = (event: MessageEvent) => owned?.receive(event);
     window.addEventListener("message", onMessage);
     void (async () => {
+      let pending: ScreenFailure = { kind: "frame_unavailable" };
       try {
         const current = latest.current;
         const response = await privateFetch(`/api/app-installations/${encodeURIComponent(current.install_id)}/screens/${encodeURIComponent(current.tag)}/mount`, {
@@ -125,11 +148,19 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
           headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
           body: JSON.stringify(current.context_id ? { context_id: current.context_id } : {}),
         }, session);
-        if (!response.ok) { if ([401, 403].includes(response.status)) purgeDisplayCache(); throw new Error("Screen mount refused"); }
+        if (!response.ok) {
+          if ([401, 403].includes(response.status)) purgeDisplayCache();
+          pending = { kind: "refused", status: response.status, code: mountRefusalCode(await response.json().catch(() => null)) };
+          throw new Error("Screen mount refused");
+        }
         const receipt = parseMount(await response.json(), current.tag);
-        if (!receipt) throw new Error("Invalid screen mount receipt");
+        if (!receipt) { pending = { kind: "invalid_receipt" }; throw new Error("Invalid screen mount receipt"); }
         session.assertCurrent();
-        if (receipt.host_contract === "screen-records.v1" && (receipt.install_id !== current.install_id || receipt.context_id !== current.context_id || receipt.digest !== current.digest)) throw new Error("Screen receipt scope changed");
+        if (receipt.host_contract === "screen-records.v1" && (receipt.install_id !== current.install_id || receipt.context_id !== current.context_id || receipt.digest !== current.digest)) { pending = { kind: "invalid_receipt" }; throw new Error("Screen receipt scope changed"); }
+        if (receipt.min_shell && compareShellVersions(receipt.min_shell, shellVersion) > 0) {
+          fail({ kind: "needs_host_update", required: receipt.min_shell, current: shellVersion });
+          return;
+        }
         if (!isCurrent() || !container.current) return;
         mounted.current = receipt;
         if (receipt.host_contract === "screen-records.v1") {
@@ -145,14 +176,14 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
         frame.src = receipt.mount;
         // The container has no earlier frame: previous layout cleanup removed it.
         container.current.replaceChildren(frame);
-        if (!frame.contentWindow) throw new Error("Screen frame unavailable");
+        if (!frame.contentWindow) { pending = { kind: "frame_unavailable" }; throw new Error("Screen frame unavailable"); }
         // CAD-1177: hold the mount's action token host-side. It is never
         // rendered into the frame and never crosses the MessagePort — a
         // `tool` op only carries alias/input/request_id, and the host
         // appends this token on the invoke relay.
         actionToken = receipt.action_token ?? null;
         owned = new ScreenChannel(frame.contentWindow, receipt, decorate(latest.current, receipt),
-          () => { clearLeaveGuard(); frame.remove(); }, fail, () => { if (isCurrent()) { clearTimeout(timer); setState("ready"); navigationCallbacks.current.onNavigation?.(receipt.navigation ?? null); } },
+          () => { clearLeaveGuard(); frame.remove(); }, () => fail({ kind: "frame_unavailable" }), () => { if (isCurrent()) { clearTimeout(timer); setState("ready"); navigationCallbacks.current.onNavigation?.(receipt.navigation ?? null); } },
           async ref => {
             const draft=parseDraftImageRef(ref);
             if(draft&&actionToken){
@@ -192,10 +223,14 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
           });
         channel.current = owned;
         frame.addEventListener("load", () => owned?.load());
-        timer = setTimeout(() => { owned?.close(true); }, 10000);
+        timer = setTimeout(() => {
+          if (!isCurrent() || owned === null || owned !== channel.current) return;
+          fail({ kind: "handshake_timeout" });
+          owned.close();
+        }, 10000);
       } catch {
         if (!retired && !session.signal.aborted && !controller.signal.aborted && privateReadsAllowed() && generation === privateSessionGeneration()) {
-          owned?.close(); container.current?.replaceChildren(); fail();
+          owned?.close(); container.current?.replaceChildren(); fail(pending);
         }
       }
     })();
@@ -223,7 +258,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
         void revokeTool(token);
       }
     };
-  }, [scope]);
+  }, [scope, attempt]);
   useEffect(() => { if (mounted.current) channel.current?.update(decorate(projection, mounted.current)); }, [projection, href, locale]);
   return <>
     <div aria-label={t("Installed app screen")} style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "ready" ? "block" : "none" }}>
@@ -253,6 +288,6 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
         </div>
       </div>
     )}
-    {state === "fallback" && fallback}
+    {state === "fallback" && (failure && renderFailure ? renderFailure(failure, retry) : fallback)}
   </>;
 }
