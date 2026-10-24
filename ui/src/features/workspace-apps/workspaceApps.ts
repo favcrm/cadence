@@ -24,6 +24,8 @@ export interface Installation {
   /** Catalogue release locator recorded after an exact metadata match. Null on a path or Git install. */
   catalogue?: CatalogueLocator | null;
   project_link: string | null; approved: boolean | null; executable: boolean;
+  /** The tenant's lifecycle word; only an active install has an app route. */
+  state?: "active" | "disabled" | "removed";
   /** CAD-1129 soft remove: epoch seconds of the mark, and when Restore stops working. */
   removed?: number | null; restore_after?: number | null;
   approval: { state: string }; guide: string; files: string[];

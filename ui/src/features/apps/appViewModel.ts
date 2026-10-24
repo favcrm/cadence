@@ -78,13 +78,13 @@ export function installationAppHref(
  * Whether the screen mounts stays the host's own approval check.
  */
 export function screenInstallHref(
-  installs: Pick<Installation, "install_id" | "name" | "project_link" | "files" | "removed">[] | null,
+  installs: Pick<Installation, "install_id" | "name" | "project_link" | "files" | "removed" | "state">[] | null,
   project: string,
   name: string,
 ): string | null {
   const hits = (installs ?? []).filter(
     (i) =>
-      i.removed == null && i.name === name && i.project_link === project &&
+      i.removed == null && (i.state ?? "active") === "active" && i.name === name && i.project_link === project &&
       i.files.some((f) => /^screens\/[a-z0-9][a-z0-9-]{0,31}\/screens\.json$/.test(f)),
   );
   if (hits.length !== 1) return null;
