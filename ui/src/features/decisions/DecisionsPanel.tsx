@@ -165,24 +165,49 @@ export default function DecisionsPanel() {
   const rowRefs = useRef(new Map<string, HTMLButtonElement>());
   const retryTimer = useRef<number | null>(null);
   const alive = useRef(true);
+  const rowsRef = useRef<Row[]>([]);
+  const loadGeneration = useRef(0);
+
+  /** Publish a fetched list, keeping the verb an owner already tried for a
+   *  still-pending action. A refresh must not turn "Retry denial" into
+   *  "Approve" while the owner is focused on it. Authoritative terminal
+   *  status or removal drops the retained intent. */
+  const applyRows = useCallback((rows: Row[]): Row[] => {
+    const retained = new Map<string, "approve" | "deny">();
+    for (const row of rowsRef.current) {
+      if (row.status === "pending" && row.unconfirmed) retained.set(row.id, row.retry ?? "approve");
+    }
+    const merged = rows.map((row) =>
+      row.status === "pending" && retained.has(row.id)
+        ? { ...row, unconfirmed: true, retry: retained.get(row.id) ?? "approve" }
+        : row,
+    );
+    rowsRef.current = merged;
+    setState({ kind: "ready", rows: merged });
+    return merged;
+  }, []);
 
   const load = useCallback(async (signal?: AbortSignal): Promise<Row[] | null> => {
+    // Only the newest read may publish. A master event can start a refresh
+    // while a decision's reconciliation read is in flight; an older snapshot
+    // arriving late must not replace the newer authoritative one.
+    const generation = ++loadGeneration.current;
+    if (retryTimer.current !== null) {
+      window.clearTimeout(retryTimer.current);
+      retryTimer.current = null;
+    }
     const controller = new AbortController();
     const stop = signal ? () => controller.abort() : () => {};
     signal?.addEventListener("abort", stop, { once: true });
     try {
       const actions = await readActions(controller.signal);
       const rows = actions.map(toRow).filter((row): row is Row => row !== null);
-      if (!alive.current) return null;
-      if (retryTimer.current !== null) {
-        window.clearTimeout(retryTimer.current);
-        retryTimer.current = null;
-      }
-      setState({ kind: "ready", rows });
-      return rows;
+      if (!alive.current || generation !== loadGeneration.current) return null;
+      return applyRows(rows);
     } catch (error) {
-      if (controller.signal.aborted || !alive.current) return null;
+      if (controller.signal.aborted || !alive.current || generation !== loadGeneration.current) return null;
       if (error instanceof DecisionsError && (error.status === 404 || error.status === 501 || error.status === 401 || error.status === 403)) {
+        rowsRef.current = [];
         setState({ kind: "unavailable" });
         return null;
       }
@@ -200,7 +225,7 @@ export default function DecisionsPanel() {
     } finally {
       signal?.removeEventListener("abort", stop);
     }
-  }, []);
+  }, [applyRows]);
 
   useEffect(() => {
     alive.current = true;
@@ -268,16 +293,13 @@ export default function DecisionsPanel() {
   };
 
   const markUnconfirmed = (id: string, decision: "approve" | "deny") => {
-    setState((current) =>
-      current.kind === "ready"
-        ? {
-            kind: "ready",
-            rows: current.rows.map((entry) =>
-              entry.id === id ? { ...entry, unconfirmed: true, retry: decision } : entry,
-            ),
-          }
-        : current,
+    const rows = rowsRef.current.map((entry) =>
+      entry.id === id && entry.status === "pending"
+        ? { ...entry, unconfirmed: true, retry: decision }
+        : entry,
     );
+    rowsRef.current = rows;
+    setState({ kind: "ready", rows });
   };
 
   const run = async (row: Row, decision: "approve" | "deny") => {
@@ -288,12 +310,7 @@ export default function DecisionsPanel() {
       await decide(row.id, decision);
       setExpanded(null);
       const refreshed = await load();
-      if (!refreshed) {
-        markUnconfirmed(row.id, decision);
-        setConflict(t("The outcome is unconfirmed. Retry the same decision; it cannot run twice."));
-        return;
-      }
-      const current = refreshed.find((entry) => entry.id === row.id);
+      const current = (refreshed ?? rowsRef.current).find((entry) => entry.id === row.id);
       if (!current) {
         setConflict(t("This request is no longer in the list."));
         return;
@@ -350,6 +367,7 @@ export default function DecisionsPanel() {
         ref={trigger}
         type="button"
         className="decisions-trigger"
+        aria-label={t("Decisions")}
         aria-haspopup="dialog"
         aria-expanded={open}
         onClick={() => (open ? close() : setOpen(true))}
