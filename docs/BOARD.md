@@ -1308,8 +1308,11 @@ who you are, not that you are the operator. `GET /api/meta` computes
 without it the field is `null`. With it, `true`/`false` is a proven answer
 and `null` means unknown: a dependency (the daemon's `daemon_info` or
 `agent_list`) did not answer in budget, and the board fails closed, never
-granting the role. A sandbox board therefore reports a real answer only
-with a live daemon on the same state dir, started outside any agent pane.
+granting the role. A sandbox board therefore answers at all only with a
+live daemon on the same state dir, and answers `true` only when the board
+process, and the browser that asks, run outside any agent pane or managed
+endpoint and the board was not launched by the daemon; a board started from
+an agent pane gets a proven `false`.
 
 Private async work owns one operation across response headers, body decoding
 and any follow-up request, state adoption or navigation. Pause, caller cancellation or
