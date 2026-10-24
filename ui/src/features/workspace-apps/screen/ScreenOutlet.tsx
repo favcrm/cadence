@@ -191,7 +191,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         // The frame URL is what survives a restart or a reload, so the pick
         // rides there too: a cap minted before the theme existed still gets
         // the right document. `system` stays query-less (the OS decides).
-        frame.src = frameTheme ? `${receipt.mount}?theme=${frameTheme}` : receipt.mount;
+        // Read it now, not from this effect's render: a pick that changed while
+        // the mount request was pending must not mint the old theme.
+        const mountedTheme = appliedFrameTheme();
+        frame.src = mountedTheme ? `${receipt.mount}?theme=${mountedTheme}` : receipt.mount;
         // The URL carries the pick at mount time; a change during the load can
         // only be delivered once the document's listener runs, so repeat the
         // current pick on load. A host that has no listener ignores it.

@@ -49,10 +49,12 @@ const receipt = { mount: `/api/app-screen/${"b".repeat(64)}`, bridge_nonce: nonc
 const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200, headers: { "Content-Type": "application/json" } });
 const mounts: string[] = [];
 const mountCount = () => mounts.length;
+/** Holds the mount response so a test can change the pick mid-request. */
+let holdMount: Promise<void> | null = null;
 globalThis.fetch = async (input, init) => {
   const path = String(input);
   if (init?.method === "POST") {
-    if (path === "/api/app-installations/install-a/screens/main/mount") { mounts.push(path); return json(receipt); }
+    if (path === "/api/app-installations/install-a/screens/main/mount") { mounts.push(path); if (holdMount) await holdMount; return json(receipt); }
     throw new Error(`Unexpected write ${path}`);
   }
   if (path === "/api/app-installations/install-a") return json(installation);
@@ -178,6 +180,24 @@ async function main() {
   mounts.length = 0;
   await render();
   assert(frame()?.getAttribute("src") === receipt.mount, "System leaves the frame URL query-less");
+  document.documentElement.removeAttribute("data-theme");
+  await React.act(async () => root.unmount()); root = createRoot(host);
+
+  // A pick that changes while the mount request is pending must not mint the
+  // frame with the old theme: the URL is built from the pick current then.
+  await React.act(async () => root.unmount()); root = createRoot(host);
+  history.replaceState(null, "", "/app-installations/install-a");
+  document.documentElement.setAttribute("data-theme", "light");
+  mounts.length = 0;
+  let release!: () => void;
+  holdMount = new Promise<void>(resolve => { release = resolve; });
+  await render();
+  document.documentElement.setAttribute("data-theme", "dark");
+  await flush();
+  await React.act(async () => { release(); holdMount = null; await new Promise(resolve => setTimeout(resolve, 0)); });
+  await flush(); await flush();
+  assert(mountCount() === 1, "A pick change during the mount still mounts once");
+  assert(frame()?.getAttribute("src") === `${receipt.mount}?theme=dark`, "The pending mount uses the pick current at frame creation");
   document.documentElement.removeAttribute("data-theme");
   await React.act(async () => root.unmount()); root = createRoot(host);
 
