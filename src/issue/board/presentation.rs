@@ -3,6 +3,7 @@
 
 use super::{Issue, View};
 use crate::issue::{history, model, parse};
+use cadence_core::issue::{CardChecks, CardCounts, IssueCard};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
@@ -22,36 +23,40 @@ pub fn card_json(view: &View) -> Value {
 /// hashes `issue.md` once per change instead of once per card render.
 pub fn card_json_rev(view: &View, rev: Value) -> Value {
     let f = &view.issue.front;
-    json!({
-        "id": f.id,
-        "project": view.issue.project,
-        "title": f.title,
-        "status": view.status,
-        "status_source": view.status_source,
-        "priority": f.priority,
-        "owner": f.owner,
-        "claim": crate::issue::claim::json(f, crate::issue::time::now_epoch()),
-        "component": f.component,
-        "tags": f.tags,
-        "paths": f.paths,
-        "parent": f.parent,
-        "blocked_by": f.blocked_by,
-        "relates": f.relates,
-        "duplicate_of": f.duplicate_of,
-        "refs": f.refs,
-        "container": view.container,
-        "ready": view.ready,
-        "blocked": view.blocked,
-        "blocked_reason": view.blocked_reason,
-        "created": f.created,
-        "rev": rev,
-        "counts": {
-            "comments": view.issue.comments.len(),
-            "artifacts": view.issue.artifacts.len(),
-            "refs": f.refs.len(),
+    let card = IssueCard {
+        id: f.id.clone(),
+        project: view.issue.project.clone(),
+        title: f.title.clone(),
+        status: view.status.clone(),
+        status_source: view.status_source.to_string(),
+        priority: f.priority.clone(),
+        owner: f.owner.clone(),
+        claim: crate::issue::claim::card(f, crate::issue::time::now_epoch()),
+        component: f.component.clone(),
+        tags: f.tags.clone(),
+        paths: f.paths.clone(),
+        parent: f.parent.clone(),
+        blocked_by: f.blocked_by.clone(),
+        relates: f.relates.clone(),
+        duplicate_of: f.duplicate_of.clone(),
+        refs: f.refs.clone(),
+        container: view.container,
+        ready: view.ready,
+        blocked: view.blocked,
+        blocked_reason: view.blocked_reason.map(str::to_string),
+        created: f.created.clone(),
+        rev: rev.as_str().unwrap_or_default().to_string(),
+        counts: CardCounts {
+            comments: view.issue.comments.len(),
+            artifacts: view.issue.artifacts.len(),
+            refs: f.refs.len(),
         },
-        "checks": {"done": view.checks_done, "total": view.checks_total},
-    })
+        checks: CardChecks {
+            done: view.checks_done,
+            total: view.checks_total,
+        },
+    };
+    serde_json::to_value(card).expect("issue card serializes")
 }
 
 /// One epic — an issue with children — with its children's progress:
