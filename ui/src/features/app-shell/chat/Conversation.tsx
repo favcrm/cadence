@@ -19,6 +19,7 @@ import { useQuery, useResource } from "../../../lib/useResource";
 import Link from "../../../ui/Link";
 import type { ThreadRef } from "../../../lib/types";
 import { MASTER } from "../../home/master";
+import AgentAvatar, { agentLook } from "../../agents/AgentAvatar";
 import { atTail, jumpLabel, tailTop } from "../../home/dock";
 import {
   initialFollow,
@@ -152,6 +153,9 @@ type AppMode = Extract<ConversationMode, { kind: "app" }>;
 const APP_WINDOW = 120;
 /** The composer's textarea id: the starters fill and focus it. */
 const COMPOSER_ID = "app-shell-chat-box";
+/** The master is the agent behind every app conversation; its look is
+ *  stable and already owned by the agents feature (robot by default). */
+const MASTER_AVATAR = agentLook(MASTER);
 
 export interface HomeListProps {
   mode: { kind: "home" };
@@ -1477,6 +1481,18 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         : active.selected !== null
           ? conversationLabel(active.selected, selectedIndex, subjects, t)
           : null;
+  const emptyState =
+    active.state === "ready" && convId === null && draftSubject === null && items.length === 0
+      ? {
+          kind: "conversations",
+          text: "No conversation yet. Start one with + New.",
+        }
+      : usable && loaded && items.length === 0
+        ? {
+            kind: "chat",
+            text: "Nothing here yet. Send the first message.",
+          }
+        : null;
 
   return (
     <div className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
@@ -1493,7 +1509,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       </button>
       <div className="app-chat-head">
         <div className="app-chat-title min-w-0">
-          <span className="app-chat-mark" aria-hidden>✳</span>
+          <span className="app-chat-avatar" aria-hidden>
+            <AgentAvatar slug={MASTER_AVATAR} size={28} still />
+          </span>
           <strong>{t("Assistant")}</strong>
           {(convLabel !== null || streamDown) && (
             <span
@@ -1638,11 +1656,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           </button>
         </p>
       )}
-      {active.state === "ready" && convId === null && (
-        <p className="text-label text-ink-500" data-empty="conversations">
-          {t("No conversation yet. Start one with + New.")}
-        </p>
-      )}
       <TurnBar state={turnState} since={masterState.data?.turn?.since ?? null} actions={turnActions} reconnecting={streamDown} />
       {thread.status === "failed" && (
         <p className="text-label text-fail" role="alert">
@@ -1657,10 +1670,11 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           {t("Reading the thread…")}
         </p>
       )}
-      {usable && loaded && items.length === 0 && (
-        <p className="text-label text-ink-500" data-empty="chat">
-          {t("Nothing here yet. Send the first message.")}
-        </p>
+      {emptyState !== null && (
+        <div className="app-chat-empty" data-empty={emptyState.kind}>
+          <AgentAvatar slug={MASTER_AVATAR} size={44} still />
+          <p className="text-label text-ink-500">{t(emptyState.text)}</p>
+        </div>
       )}
       {usable && loaded && items.length > 0 && (hidden > 0 || moreBefore) && (
         <div className="flex justify-center">
@@ -1675,7 +1689,16 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           </button>
         </div>
       )}
-      <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} role="log" aria-live="polite" aria-relevant="additions" aria-label={t("Conversation messages")}>
+      <ol
+        className="app-chat-list"
+        ref={listRef}
+        onScroll={onListScroll}
+        role="log"
+        aria-live="polite"
+        aria-relevant="additions"
+        aria-label={t("Conversation messages")}
+        hidden={emptyState !== null}
+      >
         {shown.map((item, i) => (
           <li
             key={item.key}
