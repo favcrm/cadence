@@ -599,7 +599,7 @@ function TurnTrace({
           {steps} {steps === 1 ? t("step") : t("steps")}
         </span>
       </button>
-      <div className="steps-body" id={id}>
+      <div className="steps-body" id={id} inert={!open} aria-hidden={!open}>
         <div className="turntrace-wrap">
           <ol className="turntrace-list">
             {items.map((item) => {
@@ -728,12 +728,17 @@ export function ThreadTurn({
   items,
   running = false,
   density = "full",
+  allowLegacy = false,
   onOpenIssue,
   after,
 }: {
   items: ThreadItem[];
   running?: boolean;
   density?: Density;
+  /** Only a transcript with no `turn_result` anywhere may treat its last
+   *  worker note as an older answer; a new transcript's intermediate note
+   *  must stay in the trace. */
+  allowLegacy?: boolean;
   onOpenIssue?: (id: string) => void;
   /** Plan cards and the correction report, under the answer. */
   after?: ReactNode;
@@ -750,13 +755,15 @@ export function ThreadTurn({
   // tool-turn step, not a reply, and must stay in the trace.
   const lastNote = [...items].reverse().find((item) => item.type !== "artifact");
   const legacy =
-    !answer && !running && lastNote?.type === "commentary" ? lastNote : null;
+    allowLegacy && !answer && !running && lastNote?.type === "commentary" ? lastNote : null;
   const trace = legacy ? traceItems.filter((item) => item.key !== legacy.key) : traceItems;
   const shown = answer ?? legacy;
   // Streaming is a turn the host says is running AND that has no answer yet:
   // a turn whose answer already landed keeps its finished look.
   const streaming = running && shown === null;
-  const noAnswer = !streaming && shown === null;
+  const failure = shown ? turnFailure(shown.entry, t) : null;
+  const hasAnswer = shown !== null && (shown.entry.text.trim() !== "" || failure !== null);
+  const noAnswer = !streaming && !hasAnswer;
   const steps = trace.reduce(
     (count, item) => count + (item.type === "tools" ? toolSteps(item.entries).length : 1),
     0,

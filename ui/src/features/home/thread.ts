@@ -343,6 +343,7 @@ export type ThreadRun =
 export function threadRuns(items: ThreadItem[]): ThreadRun[] {
   const runs: ThreadRun[] = [];
   let run: ThreadItem[] = [];
+  let runMessage: string | null = null;
   const flush = () => {
     if (run.length === 0) return;
     if (run.some((item) => item.type !== "artifact")) {
@@ -351,6 +352,7 @@ export function threadRuns(items: ThreadItem[]): ThreadRun[] {
       for (const item of run) runs.push({ turn: false, key: item.key, item });
     }
     run = [];
+    runMessage = null;
   };
   for (const item of items) {
     if (!TURN_MEMBERS.has(item.type)) {
@@ -358,8 +360,16 @@ export function threadRuns(items: ThreadItem[]): ThreadRun[] {
       runs.push({ turn: false, key: item.key, item });
       continue;
     }
+    const message = itemMessage(item);
+    // Never join two operator turns just because the intervening row is a
+    // system note; the message id is the turn's identity when both sides
+    // carry one.
+    if (run.length > 0 && message !== null && runMessage !== null && message !== runMessage) {
+      flush();
+    }
     if (item.type !== "artifact" && run.some((i) => i.type === "answer")) flush();
     run.push(item);
+    if (message !== null) runMessage = message;
   }
   flush();
   return runs;

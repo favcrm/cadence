@@ -228,6 +228,10 @@ function HomeList({
 }: HomeListProps) {
   const { t } = useLocale();
   const runs = useMemo(() => threadRuns(items), [items]);
+  // Only a transcript with no answer kind anywhere predates the mapper. A
+  // current transcript may legitimately have answer-less runs (tool turns,
+  // errors); those notes must stay in the trace, never become older answers.
+  const allowLegacy = !items.some((item) => item.type === "answer");
   const row = (item: ThreadItem) => {
     // Live items (or the operator's pending ones) enter with the rise
     // animation; anything at or below the mount seq is history.
@@ -269,6 +273,7 @@ function HomeList({
             <ThreadTurn
               items={run.items}
               running={busy}
+              allowLegacy={allowLegacy}
               onOpenIssue={onOpenIssue}
               after={
                 <>

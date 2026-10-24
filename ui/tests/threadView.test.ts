@@ -251,8 +251,10 @@ for (const density of ["full", "compact"] as const) {
   ): ThreadEntry => ({ seq, role: "agent", kind, text, payload, message: "m1", created: at(seq) });
   const state = (entries: ThreadEntry[]): ThreadState => ({ exists: true, entries, pending: [] });
   const count = (html: string, needle: string) => html.split(needle).length - 1;
-  const renderTurn = (items: ThreadItem[], running = false) =>
-    renderToStaticMarkup(createElement(ThreadTurn, { items, running, onOpenIssue: noop }));
+  const renderTurn = (items: ThreadItem[], running = false, allowLegacy = false) =>
+    renderToStaticMarkup(
+      createElement(ThreadTurn, { items, running, allowLegacy, onOpenIssue: noop }),
+    );
 
   const completeItems = threadItems(
     state([
@@ -273,6 +275,7 @@ for (const density of ["full", "compact"] as const) {
   ok(!complete.includes("GLM") && !complete.includes("Working"), "turn: no model and no status chip in the head");
   ok(count(complete, 'data-kind="turn-trace"') === 1, "turn: one trace disclosure");
   ok(complete.includes('aria-expanded="false"'), "turn: trace starts collapsed");
+  ok(complete.includes('inert=""') && complete.includes('aria-hidden="true"'), "turn: collapsed trace is inert");
   ok(complete.includes("Thought for 4s"), "turn: the trace measures the turn");
   ok(complete.includes(">Reasoning<") && complete.includes(">Worker note<"), "turn: reasoning and the worker note are trace rows");
   ok(!complete.includes('data-kind="commentary"'), "turn: no standalone commentary row");
@@ -302,7 +305,11 @@ for (const density of ["full", "compact"] as const) {
 
   // A transcript from before `turn_result`: the last worker note reads as the
   // reply, with the quiet earlier-transcript marker.
-  const legacy = renderTurn(threadItems(state([agent(1, "assistant_text", "An older reply.")])));
+  const legacy = renderTurn(
+    threadItems(state([agent(1, "assistant_text", "An older reply.")])),
+    false,
+    true,
+  );
   ok(legacy.includes('data-kind="answer"') && legacy.includes("An older reply."), "legacy: the last note is the answer");
   ok(legacy.includes('data-earlier="true"') && legacy.includes("Earlier transcript"), "legacy: marked as earlier transcript");
   ok(!legacy.includes(">Worker note<"), "legacy: the reply is not repeated inside the trace");
@@ -322,6 +329,9 @@ for (const density of ["full", "compact"] as const) {
   ok(toolTurn.includes("Checking the board."), "tool turn: the note stays in the trace");
   const toolsOnly = renderTurn(threadItems(state([agent(1, "tool_call", "Bash: cadence board read")])));
   ok(toolsOnly.includes('data-kind="no-answer"'), "tools only: no answer state");
+  const emptyAnswer = renderTurn(threadItems(state([agent(1, "turn_result", "   ")])));
+  ok(emptyAnswer.includes('data-kind="no-answer"'), "empty answer: no-answer state");
+  ok(!emptyAnswer.includes('data-kind="answer"'), "empty answer: no empty surface");
 
   // A failed turn keeps its reason and no empty answer body.
   const failure =
