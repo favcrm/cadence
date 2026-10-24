@@ -161,6 +161,9 @@ export interface HomeListProps {
   /** The running turn's message id, when a turn runs: a grouped turn uses it
    *  to show typing instead of a finished-looking answer. */
   running?: string | null;
+  /** Whether the whole thread has no `turn_result`; defaults to the visible
+   *  window so an old-API transcript can still mark its last note. */
+  legacyTranscript?: boolean;
   onOpenIssue: (id: string) => void;
   onRetry: (
     message: string,
@@ -220,6 +223,7 @@ function HomeList({
   readOnly,
   liveAfter,
   running = null,
+  legacyTranscript,
   onOpenIssue,
   onRetry,
   onDiscard,
@@ -231,7 +235,8 @@ function HomeList({
   // Only a transcript with no answer kind anywhere predates the mapper. A
   // current transcript may legitimately have answer-less runs (tool turns,
   // errors); those notes must stay in the trace, never become older answers.
-  const allowLegacy = !items.some((item) => item.type === "answer");
+  // Home passes the full thread; the window is the fallback for direct use.
+  const allowLegacy = legacyTranscript ?? !items.some((item) => item.type === "answer");
   const row = (item: ThreadItem) => {
     // Live items (or the operator's pending ones) enter with the rise
     // animation; anything at or below the mount seq is history.
