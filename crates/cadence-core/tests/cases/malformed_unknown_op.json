@@ -1,0 +1,12 @@
+{
+  "input": {
+    "v": 1,
+    "op": "nope",
+    "input": {}
+  },
+  "expected": {
+    "ok": false,
+    "code": "invalid_command",
+    "message": "unknown variant `nope`, expected `app.manifest.preflight`"
+  }
+}

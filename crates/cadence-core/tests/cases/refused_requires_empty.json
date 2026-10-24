@@ -1,0 +1,14 @@
+{
+  "input": {
+    "v": 1,
+    "op": "app.manifest.preflight",
+    "input": {
+      "manifest": "---\nneeds:\n  requires: {}\n---\n"
+    }
+  },
+  "expected": {
+    "ok": false,
+    "code": "invalid_manifest",
+    "message": "app.md `needs.requires` must declare `core` or `contracts`"
+  }
+}

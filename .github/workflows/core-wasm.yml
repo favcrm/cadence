@@ -1,0 +1,59 @@
+name: core-wasm
+
+# CAD-1788: build the cadence-core wasm artifact other hosts consume, and on a
+# `core-v*` tag attach it with its sha256 and the contract schemas to a release.
+on:
+  pull_request:
+    paths:
+      - "crates/cadence-core/**"
+      - "contracts/cadence-core/**"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/core-wasm.yml"
+  push:
+    tags: ["core-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  core-wasm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write # release upload, only used on a core-v* tag
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: scripts/ci-rust-toolchain --profile minimal --target wasm32-unknown-unknown
+      # Native golden corpus + the check that fails when a committed schema
+      # differs from the one generated from the Rust types.
+      - run: cargo test -p cadence-core --locked
+      - name: Build core.wasm
+        env:
+          # Path-independent output so the same commit gives the same sha256.
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/src --remap-path-prefix=/home/runner/.cargo=/cargo
+        run: |
+          set -eu
+          cargo build -p cadence-core --target wasm32-unknown-unknown --release --features wasm-abi --locked
+          mkdir -p dist
+          cp target/wasm32-unknown-unknown/release/cadence_core.wasm dist/core.wasm
+          cp contracts/cadence-core/v1/*.schema.json dist/
+          (cd dist && sha256sum core.wasm > core.wasm.sha256)
+          echo "contract version: v1" | tee dist/CONTRACT_VERSION
+          cat dist/core.wasm.sha256
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cadence-core-wasm
+          path: dist/
+          if-no-files-found: error
+      - name: Attach to the release
+        if: ${{ startsWith(github.ref, 'refs/tags/core-v') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "cadence-core wasm, contract v1"
+          gh release upload "$TAG" --clobber dist/core.wasm dist/core.wasm.sha256 dist/*.schema.json

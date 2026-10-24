@@ -13,5 +13,7 @@ default = ["wasm-abi"]
 wasm-abi = []
 
 [dependencies]
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_yaml = "0.9"
