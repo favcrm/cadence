@@ -713,7 +713,7 @@ fn rows_fp(rows: &Value) -> Value {
 /// Two RPCs against a CAD-325 daemon: `job_list` with task rows (job
 /// outcomes and task bindings) and `agent_list` with each actor's board
 /// slice. An older daemon still answers — through the per-job and
-/// per-agent fallbacks in [`agents_payload_from`].
+/// per-agent fallbacks in [`agents_payload_typed`].
 ///
 /// The three calls run concurrently: each daemon connection can wait up
 /// to one 50 ms accept poll before it is served, so in sequence they

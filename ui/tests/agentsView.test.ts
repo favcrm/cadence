@@ -58,6 +58,8 @@ const base: Agent = {
   role: "Developer",
   state: "idle",
   group: "pm",
+  group_root: false,
+  tasks: [],
   running: 0,
   queued: 0,
   unknown: 0,
@@ -65,6 +67,7 @@ const base: Agent = {
   fenced: false,
   on: [],
 };
+const fresh = { by_issue: {}, refresh_error: false, snapshot_age_secs: 0, stale: false };
 const agents: Agent[] = [
   {
     ...base,
@@ -80,6 +83,7 @@ const agents: Agent[] = [
         title: "Account settings",
         task_state: "running",
         job: "j12",
+        job_state: "running",
       },
     ],
   },
@@ -152,7 +156,7 @@ globalThis.fetch = async (input, init) => {
       tasks: tasks?.map((t) => t.task),
       enabled: true,
       session_id: `session-${alias}`,
-    },
+    } as AgentDetail["agent"],
     queued: a.queued,
     unknown: a.unknown,
     running: [],
@@ -185,6 +189,7 @@ let recruiting = false;
 let state = loaded<import("../src/lib/types").AgentsPayload>({
   daemon: "reachable",
   agents,
+  ...fresh,
   totals: null,
 });
 let issueState = loaded(issues);
@@ -264,10 +269,10 @@ async function main() {
   // CAD-1772: a plain Idle is grey; the master reads Ready (green) and always leads the roster.
   assert(seatStatus({ ...base, alias: "idler" }, (x: string) => x).tone === "ink", "plain Idle is the ink tone");
   assert(seatStatus({ ...base, alias: "master" }, (x: string) => x).text === "Ready", "the master at rest is Ready");
-  state = loaded({ daemon: "reachable", agents: [...agents, { ...base, alias: "master" }], totals: null });
+  state = loaded({ daemon: "reachable", agents: [...agents, { ...base, alias: "master" }], totals: null, ...fresh });
   await render();
   assert(aliases()[0] === "master", "the master is always the first seat");
-  state = loaded({ daemon: "reachable", agents, totals: null });
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
   await render();
   // CAD-1772: compact seat cards, no stat tiles, no project scope.
   assert(host.querySelectorAll(".agents-triage-cell").length === 0, "the five stat tiles are gone");
@@ -397,10 +402,10 @@ async function main() {
     host.textContent?.includes("stale") && aliases().length === 4,
     "stale payload stays visible",
   );
-  state = loaded({ daemon: "reachable", agents: [agents[3], agents[4]], totals: null });
+  state = loaded({ daemon: "reachable", agents: [agents[3], agents[4]], totals: null, ...fresh });
   await render();
   assert(host.textContent?.includes("No current agents") && aliases().length === 0, "only stopped agents and mailboxes yield a clear current-view empty state");
-  state = loaded({ daemon: "reachable", agents, totals: null });
+  state = loaded({ daemon: "reachable", agents, totals: null, ...fresh });
   issueState = {
     ...issueState,
     data: null,

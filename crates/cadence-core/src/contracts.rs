@@ -3,7 +3,9 @@
 //! crate's lib test, which the required CI `test` job runs on every PR and in
 //! the merge queue.
 use crate::board_api::{
-    AgentsResponse, IssueDetail, IssuesResponse, MasterState, MetaResponse, ThreadPage,
+    AgentRegisterReq, AgentsResponse, CommentReq, ConversationReq, IssueDetail, IssuesResponse,
+    LinkReq, MasterState, MetaResponse, NewIssueReq, PatchReq, RefReq, ReportReq, ThreadMessageReq,
+    ThreadPage,
 };
 use crate::evaluate::{Refused, Request, Success};
 use crate::issue::IssueCard;
@@ -55,6 +57,42 @@ pub fn committed_schemas() -> Vec<(&'static str, String)> {
         (
             "contracts/board-api/v1/thread-page.schema.json",
             pretty(schemars::schema_for!(ThreadPage)),
+        ),
+        (
+            "contracts/board-api/v1/request-new-issue.schema.json",
+            pretty(schemars::schema_for!(NewIssueReq)),
+        ),
+        (
+            "contracts/board-api/v1/request-report.schema.json",
+            pretty(schemars::schema_for!(ReportReq)),
+        ),
+        (
+            "contracts/board-api/v1/request-patch-issue.schema.json",
+            pretty(schemars::schema_for!(PatchReq)),
+        ),
+        (
+            "contracts/board-api/v1/request-link.schema.json",
+            pretty(schemars::schema_for!(LinkReq)),
+        ),
+        (
+            "contracts/board-api/v1/request-ref.schema.json",
+            pretty(schemars::schema_for!(RefReq)),
+        ),
+        (
+            "contracts/board-api/v1/request-comment.schema.json",
+            pretty(schemars::schema_for!(CommentReq)),
+        ),
+        (
+            "contracts/board-api/v1/request-agent-register.schema.json",
+            pretty(schemars::schema_for!(AgentRegisterReq)),
+        ),
+        (
+            "contracts/board-api/v1/request-thread-message.schema.json",
+            pretty(schemars::schema_for!(ThreadMessageReq)),
+        ),
+        (
+            "contracts/board-api/v1/request-conversation.schema.json",
+            pretty(schemars::schema_for!(ConversationReq)),
         ),
     ]
 }

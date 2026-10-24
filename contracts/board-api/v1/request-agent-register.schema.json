@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentRegisterReq",
+  "description": "Body for `POST /api/agents`. Every field is one `rpc_register` reads;\n`deny_unknown_fields` refuses identity-shaped keys (`by`, `actor`,\n`operator`, …) and anything else the daemon has no say in. Location is\nnot a daemon field: `cloud` pins provider and endpoint kind to `sandbox`.",
+  "type": "object",
+  "properties": {
+    "alias": {
+      "type": "string"
+    },
+    "catalogue": {
+      "description": "CAD-1752: hire from this role of `GET /api/agent-roles`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "cwd": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "endpoint_kind": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "instructions": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "location": {
+      "description": "Start blank only; a `catalogue` hire takes the runtime from the install.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "look": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model_policy": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "params": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "role": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sandbox": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "team_role": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "alias"
+  ]
+}

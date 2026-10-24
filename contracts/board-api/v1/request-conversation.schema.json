@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConversationReq",
+  "type": "object",
+  "properties": {
+    "context_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "general": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "install_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "kind": {
+      "description": "CAD-1772: `\"recruit\"` — the master's Recruit conversation.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "subject": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

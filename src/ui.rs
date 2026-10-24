@@ -1969,19 +1969,21 @@ mod tests {
     /// so a forged `by`/`actor` never reaches the tracker write.
     #[test]
     fn new_issue_body_is_optional_and_unlisted_fields_refused() {
-        let bare: super::write_path::NewIssueReq = serde_json::from_value(serde_json::json!({
-            "project": "demo", "title": "t",
-        }))
-        .unwrap();
+        let bare: cadence_core::board_api::NewIssueReq =
+            serde_json::from_value(serde_json::json!({
+                "project": "demo", "title": "t",
+            }))
+            .unwrap();
         assert!(bare.body.is_none());
-        let filed: super::write_path::NewIssueReq = serde_json::from_value(serde_json::json!({
-            "project": "demo", "title": "t", "tags": ["intake", "idea"],
-            "body": "t\n\nwhy this matters",
-        }))
-        .unwrap();
+        let filed: cadence_core::board_api::NewIssueReq =
+            serde_json::from_value(serde_json::json!({
+                "project": "demo", "title": "t", "tags": ["intake", "idea"],
+                "body": "t\n\nwhy this matters",
+            }))
+            .unwrap();
         assert_eq!(filed.body.as_deref(), Some("t\n\nwhy this matters"));
         assert!(
-            serde_json::from_value::<super::write_path::NewIssueReq>(serde_json::json!({
+            serde_json::from_value::<cadence_core::board_api::NewIssueReq>(serde_json::json!({
                 "project": "demo", "title": "t", "by": "operator",
             }))
             .is_err()

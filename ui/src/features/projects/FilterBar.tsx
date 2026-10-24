@@ -22,7 +22,7 @@ interface Props {
 }
 
 /// value → how many cards in scope carry it, most used first.
-function tally(values: (string | undefined)[][]): [string, number][] {
+function tally(values: (string | null | undefined)[][]): [string, number][] {
   const counts = new Map<string, number>();
   for (const vs of values) {
     for (const v of vs) if (v) counts.set(v, (counts.get(v) ?? 0) + 1);

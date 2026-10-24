@@ -1,0 +1,27 @@
+{
+  "alias": "master",
+  "commands": [
+    "state",
+    "stats"
+  ],
+  "context": {
+    "percent": 0.617,
+    "tokens": 1234,
+    "window": 200000
+  },
+  "effort": "medium",
+  "endpoint_kind": "managed",
+  "live": true,
+  "model": "live/model-2",
+  "model_label": "Live Model 2",
+  "provider": "pi",
+  "queue": [],
+  "queued": 0,
+  "session": {
+    "compacting": false,
+    "id": "sess-1",
+    "messages": 7,
+    "streaming": true
+  },
+  "turn": null
+}

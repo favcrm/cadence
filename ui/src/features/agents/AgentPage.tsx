@@ -93,10 +93,11 @@ export default function AgentPage({
   const profile: Agent | undefined = a
     ? {
         group: "",
+        group_root: false,
         parked: 0,
         ...observed,
         ...a,
-        tasks: observed?.tasks,
+        tasks: observed?.tasks ?? [],
         running: detail.running.length,
         queued: detail.queued,
         unknown: detail.unknown,

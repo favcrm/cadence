@@ -53,6 +53,58 @@
     "refresh_error"
   ],
   "$defs": {
+    "AgentQuota": {
+      "description": "A provider allowance record as the store keeps it. The envelope is fixed;\n`data` is the provider's own report (for Codex, its rate-limit buckets).",
+      "type": "object",
+      "properties": {
+        "account_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "assignee": {
+          "type": "string"
+        },
+        "data": true,
+        "observed_at": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why the state is not `available`; absent when it is.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "state": {
+          "description": "`available` | `unknown` | `unavailable` | `error` | `blocked` | `stale`.",
+          "type": "string"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "assignee",
+        "thread_id",
+        "state",
+        "source",
+        "observed_at",
+        "updated_at",
+        "data"
+      ]
+    },
     "AgentRow": {
       "description": "One `/api/agents` row. Mailboxes (`inbox: true`) carry the unread\nfields; workers carry the rest of the optional ones.",
       "type": "object",
@@ -212,7 +264,15 @@
           "format": "int64"
         },
         "quota": {
-          "description": "Optional account/pool allowance views; null means unavailable."
+          "description": "The provider allowance record; null means unavailable. The store\nwrites it only through `canonical_quota`, so the envelope is fixed.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentQuota"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "recovery": {
           "description": "The daemon's fence text, which names the recovery commands.",
