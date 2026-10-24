@@ -1,8 +1,9 @@
 # Native installation
 
-[Cadence 0.2.0](https://github.com/favcrm/cadence/releases/tag/v0.2.0) is the
-current published stable local CLI release (`latest=true`), published 2026-10-15
-from source `361c118f76449317ad8edcc71126ed6572e00366` by
+The current published stable local CLI release is the GitHub `latest` tag; see
+the release list for its version and source. This document preserves the v0.2.0
+public-install proof, published 2026-10-15 from source
+`361c118f76449317ad8edcc71126ed6572e00366` by
 [tag workflow run 38708389618, attempt 2](https://github.com/favcrm/cadence/actions/runs/38708389618).
 Its immutable release is stable (`draft=false`, `prerelease=false`) and contains
 nine public assets. Anonymous download of all nine assets and attestation

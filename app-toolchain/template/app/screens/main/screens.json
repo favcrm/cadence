@@ -1,0 +1,26 @@
+{
+  "contract": "app-screens/v2",
+  "app": "app-template",
+  "entry": "client.js",
+  "assets": [
+    {
+      "name": "client.js",
+      "media_type": "text/javascript",
+      "sha256": "sha256:6f7b8a579588618e19751c9649a79f08d634b16c4da2a9379ba0a5ff6fcc2c4b",
+      "size": 13630
+    },
+    {
+      "name": "styles.css",
+      "media_type": "text/css",
+      "sha256": "sha256:8fac369ce13b2a20bf587a5edea3182395f0afbb2a0f3017c085bcfa6df1c33c",
+      "size": 2282
+    }
+  ],
+  "provenance": {
+    "source_digest": "sha256:19f1d5e78ea7075a354348f47c95c4240b64a6c741e015225646a5307d9cb369",
+    "sdk_digest": "sha256:5f5525b82a2dc2c19b71024678fdba9011c55737cb4ff47e88cd0b5c326d6726",
+    "toolchain_digest": "sha256:366048465cfbc452c812eb77bbe247afcd7cab33cfcb3364339710aadbc4b7b9"
+  },
+  "host_contract": "screen-actions.v1",
+  "may": []
+}

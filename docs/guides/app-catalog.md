@@ -4,8 +4,11 @@
 requiring a project. The default workspace is the daemon's PM root. An operator's
 install or update records consent for the installed digest when its local
 execution contract passes validation. Install and update do not create worker
-grants or load custom app UI; run approvals and outward-effect permissions
-remain separate.
+grants; the bundle's declared `app-screens` package is the app UI. Run
+approvals and outward-effect permissions remain separate.
+
+For a new app, start with [App development](app-development.md); this guide
+remains the catalog and install contract.
 
 Local catalog commands, including reads, require a reachable daemon and an operator
 caller. They fail when the daemon is unavailable; there is no offline catalog

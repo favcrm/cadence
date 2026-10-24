@@ -4,6 +4,9 @@ Detached app repositories own their screens, workflows, preview tooling and
 toolchain. Cadence provides one entrypoint, the package contract and the
 refusal boundary; it does not copy the app's renderer or install anything.
 
+For the end-to-end path (toolchain, starter, app-kit, install), start with
+[App development](app-development.md).
+
 ## Contract
 
 An app repository declares a `cadence` object in its `package.json`:

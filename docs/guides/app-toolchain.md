@@ -2,6 +2,9 @@
 
 Cadence publishes a platform-neutral `cadence-app-toolchain-<tag>.tar.gz` asset and `.sha256` sidecar on its existing versioned GitHub Releases. It is optional starter tooling for app-owned React/Vite projects and ships the app-side screen-bridge receiver (`app-kit/`). It is not an SDK, an authority or an app runtime. It does not change SOC-3 app adoption or SOC-1/SOC-5 holds.
 
+For the end-to-end starter, see [App development](app-development.md) and
+[`app-toolchain/template/`](../../app-toolchain/template/README.md).
+
 ## Download and verify
 
 Choose a published Cadence release tag and download both matching assets. For example:
