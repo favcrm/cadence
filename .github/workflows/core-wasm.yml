@@ -70,6 +70,13 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -eu
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --latest=false --title "$TAG" --notes "cadence-core wasm, contract v1"
-          gh release edit "$TAG" --latest=false
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]; then
+              echo "core-v* release $TAG is already published and immutable; tag a new core-v*" >&2
+              exit 1
+            fi
+          else
+            gh release create "$TAG" --draft --latest=false --title "$TAG" --notes "cadence-core wasm, contract v1"
+          fi
           gh release upload "$TAG" --clobber dist/core.wasm dist/core.wasm.sha256 dist/*.schema.json
+          gh release edit "$TAG" --draft=false --latest=false
