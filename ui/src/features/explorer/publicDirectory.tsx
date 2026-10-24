@@ -63,10 +63,16 @@ export type PublicVersions = {
 };
 /** The install rows a viewer may know: the operator's verified list, or a
  * member's readable `/api/app-home` rows (never privileged fields). */
+import { canOpenInstall, type InstallLifecycleState } from "./installAccess";
+
 export type InstallRef = Pick<
   Installation,
   "install_id" | "name" | "title" | "removed" | "catalogue"
-> & Partial<Pick<Installation, "version" | "digest" | "catalog_generation" | "project_link">> & { project?: string };
+> & Partial<Pick<Installation, "version" | "digest" | "catalog_generation" | "project_link">> & {
+  project?: string;
+  /** The tenant's lifecycle word; only an active row can open its app route. */
+  state?: InstallLifecycleState;
+};
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 /** The proxy's admitted id and version token charsets — a stricter client
@@ -538,7 +544,10 @@ function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetry
   // A claimant without a readable install_id stays a fact row — no Open,
   // Manage or chooser link can name it.
   const addressable = install !== null && typeof install.install_id === "string" ? install : null;
-  const openHref = addressable ? installationAppHref(rows, addressable.install_id) : null;
+  // A disabled or removed install has no openable route: offering Open there
+  // sends the reader to "Unknown installation".
+  const openable = addressable !== null && canOpenInstall(addressable.state, addressable.removed);
+  const openHref = addressable && openable ? installationAppHref(rows, addressable.install_id) : null;
   const title = install?.title ?? catalogued[0]?.title ?? id;
   return (
     <article className="pub-detail" aria-label={title}>
@@ -728,7 +737,10 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
   const installParamMissing = installationParam !== null && installs.rows !== null && named === null;
   const chooser = installationParam === null && matching.length > 1 ? matching : null;
   const install = installationParam !== null ? named : matching.length === 1 ? matching[0] : null;
-  const openHref = install ? installationAppHref(installs.rows, install.install_id) : null;
+  const openHref =
+    install && canOpenInstall(install.state, install.removed)
+      ? installationAppHref(installs.rows, install.install_id)
+      : null;
   const { release, missing } = selectedRelease(versions, versionParam);
 
   const selectVersion = (version: string) => {

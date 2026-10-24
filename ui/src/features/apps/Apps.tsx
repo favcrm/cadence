@@ -142,6 +142,9 @@ export default function Apps({ viewer }: { viewer: Viewer }) {
   // link is emitted; for members (no list read) the route itself proves
   // uniqueness — an ambiguous or unsafe key renders no link.
   const openHref = (installation: HomeInstallation): string | null => {
+    // Only an active install has an app route; an off or removed card must not
+    // offer an Open that lands on "Unknown installation".
+    if (installation.attention.state === "off" || installation.attention.state === "removed") return null;
     if (installs !== null) return installationAppHref(installs, installation.install_id);
     return installedAppHref(installation.name);
   };
