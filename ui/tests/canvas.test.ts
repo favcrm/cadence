@@ -12,10 +12,10 @@ import {
   selectVersion,
   type FeedCard,
 } from "../src/features/canvas/canvasStore";
-import { feedParts, plainStep } from "../src/features/canvas/feed";
+import { feedParts, plainStep, topSeq } from "../src/features/canvas/feed";
 import { parseCsv } from "../src/features/canvas/csv";
 import { askBody, askLabel, makeAskRef } from "../src/features/canvas/askRefs";
-import { isArtifactPutCall, planRef, threadItems, toolSteps, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
+import { isArtifactPutCall, planRef, threadItems, threadRuns, toolSteps, type ThreadEntry, type ThreadState } from "../src/features/home/thread";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);
@@ -314,3 +314,47 @@ equal(
   'About artifact art-a (version 2) "Report", this passage:\n> Tuesday lunch is soft\n\nmake it softer',
   "body carries id, version and passage",
 );
+
+// Regression (worker transcript): grouping the RENDER must not change what
+// the canvas reads. The artifact card, the working plan, the live step and the
+// watermark all still come from the same flat items.
+{
+  const grouped: ThreadState = {
+    exists: true,
+    pending: [],
+    entries: [
+      e(1, "operator", "message", "show me the board", "m1"),
+      e(2, "agent", "thinking", "Reading the board.", "m1"),
+      e(3, "agent", "assistant_text", "Pulling the numbers", "m1"),
+      e(4, "agent", "tool_call", "Bash: cadence board read", "m1"),
+      e(5, "agent", "artifact", "", "m1", { id: "art-g", version: 1, kind: "csv", title: "Board snapshot", bytes: 4200 }),
+      e(6, "agent", "turn_result", "Two issues.", "m1"),
+    ],
+  };
+  const flat = threadItems(grouped);
+  const runs = threadRuns(flat);
+  equal(runs.length, 2, "the operator row, then one grouped turn");
+  equal(runs[1].turn ? runs[1].items.length : 0, 5, "the turn holds thinking, commentary, the tool run, the card and the answer");
+  equal(
+    runs.flatMap((r) => (r.turn ? r.items : [r.item])).map((i) => i.key),
+    flat.map((i) => i.key),
+    "every flat item survives grouping",
+  );
+  const parts = feedParts(flat, 0, "m1");
+  equal(parts.cards.map((c) => [c.key, c.live, c.operatorTurn, c.turn]), [["art-g@1", true, true, "m1"]], "the artifact card is still fed");
+  equal(parts.turn, "m1", "the turn is still fed");
+  equal(
+    [parts.working?.plan, parts.working?.step, parts.working?.count],
+    ["Pulling the numbers", "Checking the board", 1],
+    "the plan and the live step are still fed",
+  );
+  equal(topSeq(flat), 6, "the watermark includes every folded entry");
+  equal(
+    feedParts(runs.flatMap((r) => (r.turn ? r.items : [r.item])), 0, "m1"),
+    parts,
+    "the feed is byte-identical from the grouped render",
+  );
+  resetCanvas();
+  feedCanvas({ conversation: "c1", surface: "home", composerKey: "home", ...parts });
+  equal(canvasSnapshot().tabs.map((t) => t.id), ["art-g"], "the grouped turn still opens its card");
+}

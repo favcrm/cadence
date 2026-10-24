@@ -38,7 +38,7 @@ import { turnBarState } from "../app-shell/chat/turnBarState";
 import { useConversationDestination } from "../app-shell/chat/conversationNavigation";
 import MemberChat from "./MemberChat";
 import { memberScope } from "./memberThread";
-import { time } from "./ThreadView";
+import { StreamBanner, time } from "./ThreadView";
 import {
   initialFollow,
   motionBehavior,
@@ -484,18 +484,7 @@ const ThreadList = memo(function ThreadList({
   if (items.length === 0) return null;
   return (
     <>
-      {stale && (
-        <div
-          className="flex items-center justify-between gap-3 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-micro text-warn"
-          role="status"
-          data-kind="stale"
-        >
-          <span>{t("Reconnecting — this conversation may be out of date.")}</span>
-          <button className="lnk" onClick={() => window.location.reload()}>
-            {t("Refresh")}
-          </button>
-        </div>
-      )}
+      {stale && <StreamBanner onRetry={() => window.location.reload()} />}
       {(hidden > 0 || moreBefore) && (
         <div className="flex justify-center">
           <button className="lnk text-label disabled:opacity-50" disabled={loadingEarlier} onClick={onEarlier}>
@@ -508,6 +497,8 @@ const ThreadList = memo(function ThreadList({
         items={shown}
         readOnly={readOnly}
         liveAfter={liveAfter}
+        running={working?.message ?? null}
+        legacyTranscript={!items.some((item) => item.type === "answer")}
         onOpenIssue={onOpenIssue}
         onRetry={onRetry}
         onDiscard={discard}
@@ -539,6 +530,9 @@ const ThreadList = memo(function ThreadList({
             kind: "row",
             node: <AssistantNameRow at={at} live={live} />,
             position: below ? "after" : "before",
+            // A fallback row rides an EARLIER item; the run it lands in
+            // keeps the flat rendering so the row is not folded away.
+            ...(anchorItem === null ? { fallback: true as const } : {}),
           };
         }}
         after={(item) =>

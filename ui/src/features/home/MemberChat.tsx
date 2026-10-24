@@ -224,6 +224,7 @@ export default function MemberChat({
             <Conversation
               mode={{ kind: "home" }}
               items={shown}
+              legacyTranscript={!items.some((item) => item.type === "answer")}
               readOnly={readOnly}
               liveAfter={liveAfter.current}
               onOpenIssue={onOpenIssue}

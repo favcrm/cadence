@@ -1,6 +1,7 @@
 import { chatContext } from "../chatScreen";
 import { useCanvasFeed } from "../../canvas/feed";
 import {
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -32,15 +33,17 @@ import {
   type Follow,
   type ScrollKind,
 } from "../../home/scrollFollow";
-import { ThreadItemView, type Density } from "../../home/ThreadView";
+import { ThreadTurn, ThreadItemView, type Density } from "../../home/ThreadView";
 import CorrectionReport from "../../wiki/CorrectionReport";
 import {
   addPending,
   discardPending,
+  itemMessage,
   newMessageId,
   settlePending,
   stepSummary,
   threadItems,
+  threadRuns,
   visibleWindow,
   type ThreadItem,
 } from "../../home/thread";
@@ -155,6 +158,12 @@ export interface HomeListProps {
   items: ThreadItem[];
   readOnly: boolean;
   liveAfter: number;
+  /** The running turn's message id, when a turn runs: a grouped turn uses it
+   *  to show typing instead of a finished-looking answer. */
+  running?: string | null;
+  /** Whether the whole thread has no `turn_result`. Every host passes its
+   *  full list, not the rendered window. */
+  legacyTranscript: boolean;
   onOpenIssue: (id: string) => void;
   onRetry: (
     message: string,
@@ -175,7 +184,15 @@ export interface HomeListProps {
 /** Where an item's live activity lands. */
 export type ItemActivity =
   | { kind: "header"; node: ReactNode }
-  | { kind: "row"; node: ReactNode; position: "before" | "after" };
+  | {
+      kind: "row";
+      node: ReactNode;
+      position: "before" | "after";
+      /** The running turn has no stored row of its own, so this row rides an
+       *  EARLIER item. Grouping that item's run would hide the row, so the
+       *  run renders flat instead. */
+      fallback?: true;
+    };
 export interface AppPaneProps {
   mode: AppMode;
   density: Density;
@@ -194,23 +211,85 @@ export default function Conversation(props: HomeListProps | AppPaneProps) {
   return props.mode.kind === "home" ? <HomeList {...(props as HomeListProps)} /> : <AppPane {...(props as AppPaneProps)} />;
 }
 
-/** Home's rows: the exact `<ol>` Home rendered before, one renderer. */
-function HomeList({ items, readOnly, liveAfter, onOpenIssue, onRetry, onDiscard, after, activity }: HomeListProps) {
+/**
+ * Home's rows. The flat items stay flat — the canvas feed, the working
+ * state, plan anchors and the window all read them — and `threadRuns` only
+ * says which contiguous ones paint as one assistant turn. A turn draws one
+ * head, one folded trace, one answer surface and its artifact cards; every
+ * other item keeps the row renderer unchanged.
+ */
+function HomeList({
+  items,
+  readOnly,
+  liveAfter,
+  running = null,
+  legacyTranscript,
+  onOpenIssue,
+  onRetry,
+  onDiscard,
+  after,
+  activity,
+}: HomeListProps) {
   const { t } = useLocale();
+  const runs = useMemo(() => threadRuns(items), [items]);
+  // Only a transcript with no answer kind anywhere predates the mapper. A
+  // current transcript may legitimately have answer-less runs (tool turns,
+  // errors); those notes must stay in the trace, never become older answers.
+  const allowLegacy = legacyTranscript;
+  const row = (item: ThreadItem) => {
+    // Live items (or the operator's pending ones) enter with the rise
+    // animation; anything at or below the mount seq is history.
+    const live = item.type === "pending" || Number(item.key.slice(1)) > liveAfter;
+    const act = activity?.(item) ?? null;
+    return (
+      <li key={item.key} className={`min-w-0 space-y-2${live ? " msg-in" : ""}`}>
+        {act?.kind === "row" && act.position === "before" ? act.node : null}
+        <ThreadItemView item={item} readOnly={readOnly} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={onDiscard} activity={act?.kind === "header" ? act.node : undefined} />
+        {item.type === "answer" && <CorrectionReport question={visibleQuestion(items, items.indexOf(item))} answer={item.entry.text} />}
+        {act?.kind === "row" && act.position === "after" ? act.node : null}
+        {after?.(item)}
+      </li>
+    );
+  };
   return (
     <ol className="space-y-3 min-w-0" role="log" aria-live="polite" aria-relevant="additions" aria-label={t("messages")} data-rendered={items.length}>
-      {items.map((item, index) => {
-        // Live items (or the operator's pending ones) enter with the
-        // rise animation; anything at or below the mount seq is history.
-        const live = item.type === "pending" || Number(item.key.slice(1)) > liveAfter;
-        const act = activity?.(item) ?? null;
+      {runs.map((run) => {
+        if (!run.turn) return row(run.item);
+        const acts = run.items.map((item) => activity?.(item) ?? null);
+        // The unnamed-turn fallback rides an EARLIER item's row. Folding
+        // that item's run would hide the working row, so the run keeps the
+        // flat rendering it has today. A hire proposal is its own card;
+        // keep the existing flat row instead of folding it into a trace.
+        if (
+          acts.some((act) => act?.kind === "row" && act.fallback === true) ||
+          run.items.some((item) => item.type === "hire")
+        ) {
+          return <Fragment key={run.key}>{run.items.map(row)}</Fragment>;
+        }
+        // The turn's own live rows fold into the head and the typing dots.
+        const busy =
+          acts.some((act) => act !== null) ||
+          (running !== null && run.items.some((item) => itemMessage(item) === running));
+        const live = Number(run.key.slice(1)) > liveAfter;
+        const answer = run.items.find((item) => item.type === "answer");
         return (
-          <li key={item.key} className={`min-w-0 space-y-2${live ? " msg-in" : ""}`}>
-            {act?.kind === "row" && act.position === "before" ? act.node : null}
-            <ThreadItemView item={item} readOnly={readOnly} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={onDiscard} activity={act?.kind === "header" ? act.node : undefined} />
-            {item.type === "answer" && <CorrectionReport question={visibleQuestion(items, index)} answer={item.entry.text} />}
-            {act?.kind === "row" && act.position === "after" ? act.node : null}
-            {after?.(item)}
+          <li key={run.key} className={`min-w-0${live ? " msg-in" : ""}`}>
+            <ThreadTurn
+              items={run.items}
+              running={busy}
+              allowLegacy={allowLegacy}
+              onOpenIssue={onOpenIssue}
+              after={
+                <>
+                  {answer && (
+                    <CorrectionReport question={visibleQuestion(items, items.indexOf(answer))} answer={answer.entry.text} />
+                  )}
+                  {run.items.map((item) => (
+                    <Fragment key={`after-${item.key}`}>{after?.(item)}</Fragment>
+                  ))}
+                </>
+              }
+            />
           </li>
         );
       })}
