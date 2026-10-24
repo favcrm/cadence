@@ -15,6 +15,8 @@ const base: Agent = {
   endpoint_kind: "pty",
   state: "idle",
   group: "team-pm",
+  group_root: false,
+  tasks: [],
   running: 0,
   queued: 0,
   unknown: 0,
@@ -115,7 +117,7 @@ equal(
 equal(
   holding({
     state: "stopped",
-    tasks: [{ task: "t", issue: "DEMO-1", task_state: "running", job: "j" }],
+    tasks: [{ task: "t", issue: "DEMO-1", task_state: "running", job: "j", job_state: "running" }],
   }),
   true,
   "stopped agent still owns a task",
@@ -207,6 +209,7 @@ equal(
           issue: "DEMO-1",
           title: "Account settings",
           task_state: "running",
+          job_state: "running",
           job: "j1",
         },
       ],

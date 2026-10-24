@@ -24,7 +24,7 @@ function assert(value: unknown, what: string): asserts value { if (!value) throw
 const card = (id: string, title: string, status: string): IssueCard => ({
   id, title, status, project: "cadence", status_source: "file", priority: "P2",
   blocked_by: [], relates: [], refs: [], container: false, ready: true, blocked: false,
-  created: "2026-09-27", rev: "fixture", counts: { comments: 0, artifacts: 0, refs: 0 },
+  created: "2026-09-27", rev: "fixture", counts: { comments: 0, artifacts: 0, refs: 0 }, paths: [], tags: [], work: { type: "task", type_source: "implicit", weight: 1 },
   checks: { done: 0, total: 0 },
 });
 const active = card("CAD-1", "Active task", "doing");

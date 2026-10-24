@@ -225,6 +225,127 @@ fn issue_detail_bytes_are_unchanged() {
     golden("issue_details.json", &Value::Array(details));
 }
 
+/// CAD-1798: the drawer of a plan epic and of its ticket against a real PM
+/// repo: the `git log` history and merged activity, the notes chain, the
+/// plan block, and the epic's stage, progress and health. Commit and note
+/// times are pinned so the abbreviated hashes are stable.
+#[test]
+fn issue_detail_with_history_notes_and_plan_bytes_are_unchanged() {
+    use crate::issue::board::{self, Issue};
+    use crate::issue::model::{Front, Plan};
+    use crate::issue::work;
+    use std::collections::HashMap;
+    use std::process::Command;
+    let root = tempfile::Builder::new().prefix("c98g").tempdir().unwrap();
+    let pm = root.path().join("pm");
+    let notes = root.path().join("notes");
+    std::fs::create_dir_all(&pm).unwrap();
+    std::fs::create_dir_all(&notes).unwrap();
+    let git = |args: &[&str], date: &str| {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
+            .arg(&pm)
+            .args(args)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"], "2026-09-01T00:00:00+0000");
+    let new = |id: &str, parent: Option<&str>| {
+        let dir = pm.join("cadence").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut front = Front::new(id, id, "2026-09-01T00:00:00Z");
+        front.parent = parent.map(str::to_string);
+        Issue {
+            project: "cadence".into(),
+            dir,
+            front,
+            body: String::new(),
+            comments: vec![],
+            artifacts: vec![],
+        }
+    };
+    let mut epic = new("CAD-1", None);
+    epic.front.item_type = Some("epic".into());
+    epic.front.plan = Some(Plan {
+        state: "approved".into(),
+        proposed_by: "pm".into(),
+        proposed_at: "2026-09-01T00:00:00Z".into(),
+        tickets: vec!["CAD-3".into()],
+        decided_by: Some("operator".into()),
+        decided_at: Some("2026-09-02T00:00:00Z".into()),
+        reason: None,
+        workflow: None,
+    });
+    let mut task = new("CAD-3", Some("CAD-1"));
+    task.front.size = Some("S".into());
+    task.front.status = "doing".into();
+    for (i, (issue, day)) in [(&epic, 1), (&task, 2)].into_iter().enumerate() {
+        let file = issue.dir.join("issue.md");
+        for (n, text) in ["first\n", "second\n"].into_iter().enumerate() {
+            std::fs::write(&file, text).unwrap();
+            let date = format!("2026-09-0{}T0{}:00:00+0000", day, n + 1);
+            git(&["add", "-A"], &date);
+            git(
+                &[
+                    "commit",
+                    "-q",
+                    "-m",
+                    &format!("edit {} #{i}{n}", issue.front.id),
+                ],
+                &date,
+            );
+        }
+    }
+    std::fs::write(
+        notes.join("20260905-120000-pm-kickoff.md"),
+        "# Kickoff: start CAD-3\n> Issue: CAD-3\n\nGo.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        notes.join("20260906-120000-rev-verdict.md"),
+        "# Verdict: CAD-3 - pass\n> Issue: CAD-3\n\n## Verdict\npass\n",
+    )
+    .unwrap();
+    let views = board::views(&notes, vec![epic, task]);
+    let by_id: HashMap<String, &board::View> = views
+        .iter()
+        .map(|v| (v.issue.front.id.clone(), v))
+        .collect();
+    let ctx = work::Ctx {
+        by_id: &by_id,
+        configs: HashMap::from([(
+            "cadence".to_string(),
+            work::ProjectWork {
+                cfg: work::WorkConfig::default(),
+                error: None,
+                unapproved: None,
+            },
+        )]),
+        now: 1_790_000_000,
+    };
+    let details: Vec<Value> = views
+        .iter()
+        .map(|v| {
+            let mut detail = work::detail_json(&pm, &ctx, v);
+            // The temp root is the only machine-specific part.
+            let path = detail["path"]
+                .as_str()
+                .unwrap()
+                .replace(pm.to_str().unwrap(), "PM");
+            detail["path"] = Value::from(path);
+            detail
+        })
+        .collect();
+    // Newer git prints a UTC `%aI` as `Z`, older git as `+00:00`.
+    let details = serde_json::to_string(&details)
+        .unwrap()
+        .replace("+00:00\"", "Z\"");
+    golden("issue_details_history.json", &parse(&details));
+}
+
 /// `/api/meta`: the typed body equals the `json!` literal it replaced
 /// (kept here as the oracle), for a signed-in and an unknown session.
 #[test]

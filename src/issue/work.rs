@@ -32,7 +32,10 @@ use crate::issue::areas::scrub;
 use crate::issue::board::{self, View};
 use crate::issue::model::{self, Front};
 use crate::issue::{parse, plan, project};
-use cadence_core::board_api::{IssueDetail, WorkBlock};
+use cadence_core::board_api::{
+    HealthReason, IssueDetail, ProgressCounts, StageMove, WorkBlock, WorkHealth, WorkProgress,
+    WorkStage,
+};
 
 /// Default epic stages and their exit criteria.
 pub const DEFAULT_STAGES: &[(&str, &str)] = &[
@@ -664,7 +667,7 @@ pub fn plan_allows_moves(front: &Front) -> Result<()> {
 /// moves the writer allows and never re-derives the rule. A plan that
 /// is not approved owns the stage: no moves (`move_stage` refuses them).
 /// `needs_operator` marks the moves only the proven operator may make.
-pub fn legal_moves(front: &Front, cfg: &WorkConfig, cur: &StageState) -> Vec<Value> {
+pub fn legal_moves(front: &Front, cfg: &WorkConfig, cur: &StageState) -> Vec<StageMove> {
     if plan_allows_moves(front).is_err() {
         return vec![];
     }
@@ -672,12 +675,10 @@ pub fn legal_moves(front: &Front, cfg: &WorkConfig, cur: &StageState) -> Vec<Val
     cfg.stages
         .iter()
         .filter_map(|s| check_move(cfg, cur, &s.id, floor).ok())
-        .map(|mv| {
-            json!({
-                "to": mv.to,
-                "forward": mv.forward,
-                "needs_operator": mv.needs_operator,
-            })
+        .map(|mv| StageMove {
+            to: mv.to,
+            forward: mv.forward,
+            needs_operator: mv.needs_operator,
         })
         .collect()
 }
@@ -773,6 +774,11 @@ fn ratio(done: u64, total: u64) -> f64 {
 /// open (backlog + ready) · doing · review · blocked, plus done and
 /// dropped.
 pub fn progress_json(items: &[&View]) -> Value {
+    serde_json::to_value(progress(items)).expect("progress serializes")
+}
+
+/// [`progress_json`] as the typed wire struct.
+pub fn progress(items: &[&View]) -> WorkProgress {
     let pairs: Vec<(&str, Option<&str>)> = items
         .iter()
         .map(|v| (v.status.as_str(), v.issue.front.size.as_deref()))
@@ -782,22 +788,22 @@ pub fn progress_json(items: &[&View]) -> Value {
         items
             .iter()
             .filter(|v| s.contains(&v.status.as_str()))
-            .count()
+            .count() as u64
     };
-    json!({
-        "done_weight": done,
-        "total_weight": total,
-        "ratio": ratio(done, total),
-        "counts": {
-            "open": n(&["backlog", "ready"]),
-            "doing": n(&["doing"]),
-            "review": n(&["review"]),
-            "blocked": items.iter().filter(|v| v.blocked && is_open(v)).count(),
-            "done": n(&["done"]),
-            "dropped": n(&["dropped"]),
-            "total": items.len(),
+    WorkProgress {
+        done_weight: done,
+        total_weight: total,
+        ratio: ratio(done, total),
+        counts: ProgressCounts {
+            open: n(&["backlog", "ready"]),
+            doing: n(&["doing"]),
+            review: n(&["review"]),
+            blocked: items.iter().filter(|v| v.blocked && is_open(v)).count() as u64,
+            done: n(&["done"]),
+            dropped: n(&["dropped"]),
+            total: items.len() as u64,
         },
-    })
+    }
 }
 
 /// Health of an epic: `stalled` once it has been in its stage for 2×
@@ -813,6 +819,17 @@ pub fn health_json(
     kids: &[&View],
     now: i64,
 ) -> Value {
+    serde_json::to_value(health(epic, stage, cfg, kids, now)).expect("health serializes")
+}
+
+/// [`health_json`] as the typed wire struct.
+pub fn health(
+    epic: &View,
+    stage: &StageState,
+    cfg: &WorkConfig,
+    kids: &[&View],
+    now: i64,
+) -> WorkHealth {
     const DAY: i64 = 86_400;
     let limit = cfg.stage_limit_days;
     let elapsed = stage.since.map(|s| (now - s).max(0));
@@ -827,13 +844,13 @@ pub fn health_json(
                 Some(r) => r.to_string(),
                 None => format!("waits on {}", kf.blocked_by.join(", ")),
             };
-            reasons.push(json!({
-                "cause": "blocked",
-                "issue": kf.id,
-                "owner": kf.owner,
-                "detail": format!("{} {waits}", kf.id),
-                "next": format!("unblock {} or re-plan around it", kf.id),
-            }));
+            reasons.push(HealthReason {
+                cause: "blocked".into(),
+                issue: kf.id.clone(),
+                owner: kf.owner.clone(),
+                detail: format!("{} {waits}", kf.id),
+                next: format!("unblock {} or re-plan around it", kf.id),
+            });
             state = "at_risk";
         }
         let limit_s = limit as i64 * DAY;
@@ -850,22 +867,22 @@ pub fn health_json(
                     stage.id
                 )
             };
-            reasons.push(json!({
-                "cause": if stalled { "stalled" } else { "stage_time" },
-                "issue": f.id,
-                "owner": f.owner,
-                "detail": format!("{} days in '{}' (limit {limit})", e / DAY, stage.id),
-                "next": next,
-            }));
+            reasons.push(HealthReason {
+                cause: if stalled { "stalled" } else { "stage_time" }.into(),
+                issue: f.id.clone(),
+                owner: f.owner.clone(),
+                detail: format!("{} days in '{}' (limit {limit})", e / DAY, stage.id),
+                next,
+            });
             state = if stalled { "stalled" } else { "at_risk" };
         }
     }
-    json!({
-        "state": state,
-        "days_in_stage": days,
-        "limit_days": limit,
-        "reasons": reasons,
-    })
+    WorkHealth {
+        state: state.into(),
+        days_in_stage: days,
+        limit_days: limit,
+        reasons,
+    }
 }
 
 /// A task's own field or legacy tag wins over its parent epic's default.
@@ -915,9 +932,9 @@ pub fn item_block(ctx: &Ctx, view: &View) -> WorkBlock {
         milestone_source: milestone.as_ref().map(|(_, s)| s.to_string()),
         size: f.size.clone(),
         weight: model::size_weight(f.size.as_deref()),
-        stage: Value::Null,
-        progress: Value::Null,
-        health: Value::Null,
+        stage: None,
+        progress: None,
+        health: None,
         config_error: None,
         config_unapproved: None,
     };
@@ -928,24 +945,29 @@ pub fn item_block(ctx: &Ctx, view: &View) -> WorkBlock {
             .index
             .and_then(|i| cfg.stages.get(i + 1))
             .map(|s| s.id.clone());
-        out.stage = json!({
-            "id": stage.id,
-            "source": stage.source,
-            "since": stage.since.map(crate::issue::time::iso),
-            "exit": stage.index.map(|i| cfg.stages[i].exit.clone()),
-            "next": next,
-            "next_needs_operator": next.as_ref().is_some_and(|n| cfg.operator_stages.contains(n)),
-            "terminal": stage.terminal,
-            "stages": cfg.stage_ids(),
+        out.stage = Some(WorkStage {
+            id: stage.id.clone(),
+            source: stage.source.to_string(),
+            since: stage.since.map(crate::issue::time::iso),
+            exit: stage.index.map(|i| cfg.stages[i].exit.clone()),
+            next_needs_operator: next
+                .as_ref()
+                .is_some_and(|n| cfg.operator_stages.contains(n)),
+            next,
+            terminal: stage.terminal,
+            stages: cfg.stage_ids().into_iter().map(String::from).collect(),
             // A PROJECT.md the writer cannot load refuses every move.
-            "moves": if ctx.work(&view.issue.project).is_some_and(|w| w.error.is_some()) {
+            moves: if ctx
+                .work(&view.issue.project)
+                .is_some_and(|w| w.error.is_some())
+            {
                 vec![]
             } else {
                 legal_moves(f, cfg, &stage)
             },
         });
-        out.progress = progress_json(&kids);
-        out.health = health_json(view, &stage, cfg, &kids, ctx.now);
+        out.progress = Some(progress(&kids));
+        out.health = Some(health(view, &stage, cfg, &kids, ctx.now));
     }
     if let Some(w) = ctx.work(&view.issue.project) {
         out.config_error = w.error.clone();
@@ -1611,13 +1633,7 @@ milestones: [{id: m, status: "bo\e[31m\u202egus\a"}]
         let moves = |f: &Front, done: bool| -> Vec<(String, bool, bool)> {
             legal_moves(f, &cfg, &stage_of(f, &cfg, done))
                 .iter()
-                .map(|m| {
-                    (
-                        m["to"].as_str().unwrap().to_string(),
-                        m["forward"].as_bool().unwrap(),
-                        m["needs_operator"].as_bool().unwrap(),
-                    )
-                })
+                .map(|m| (m.to.clone(), m.forward, m.needs_operator))
                 .collect()
         };
         let own = |s: &str| (s.to_string(), false, false);

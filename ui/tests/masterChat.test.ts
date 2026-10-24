@@ -70,13 +70,15 @@ const masterRow: Agent = {
   state: "running",
   group: "g",
   group_root: false,
+  tasks: [],
   running: 1,
   queued: 2,
   unknown: 0,
   parked: 0,
   fenced: false,
   on: [],
-  message: { id: "m-run", summary: "row says", created: "2026-09-24T10:00:00Z" },
+  // An older daemon reported ISO text here; the reader still accepts it.
+  message: { id: "m-run", summary: "row says", created: "2026-09-24T10:00:00Z" as unknown as number },
 };
 
 const liveWorking: MasterState = {

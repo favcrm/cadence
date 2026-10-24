@@ -8,7 +8,7 @@ import type { Meta } from "./types";
  * mount and must not poll a 404 (CAD-1704).
  */
 export function humanThreadsAvailable(
-  meta: Pick<Meta, "hosted" | "session"> | null | undefined,
+  meta: Partial<Pick<Meta, "hosted" | "session">> | null | undefined,
 ): boolean {
   if (!meta) return false;
   return meta.hosted === true || meta.session?.origin === "public";

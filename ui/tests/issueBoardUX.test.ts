@@ -32,7 +32,7 @@ function assert(value: unknown, what: string): asserts value { if (!value) throw
 const card: Card = {
   id: "CAD-1", title: "Fix onboarding", status: "doing", project: "cadence", status_source: "file", priority: "P1",
   blocked_by: [], relates: [], refs: [], container: false, ready: true, blocked: false,
-  created: "2026-09-27", rev: "fixture", counts: { comments: 0, artifacts: 0, refs: 0 },
+  created: "2026-09-27", rev: "fixture", counts: { comments: 0, artifacts: 0, refs: 0 }, paths: [], tags: [], work: { type: "task", type_source: "implicit", weight: 1 },
   checks: { done: 1, total: 3 },
 };
 const props: React.ComponentProps<typeof Board> = {

@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PatchReq",
+  "type": "object",
+  "properties": {
+    "body": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "component": {
+      "description": "`\"\"` clears component.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "if_rev": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "owner": {
+      "description": "`\"\"` clears owner.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "priority": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tags": {
+      "description": "Replaces the tag list; `[]` clears it.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

@@ -8,96 +8,21 @@ export type CardAgent = Api.CardAgent;
 
 export type Ref = Api.Ref;
 
-export interface IssueCard {
-  id: string;
-  project: string;
-  title: string;
-  status: string;
-  status_source: StatusSource;
-  priority: string;
-  owner?: string;
-  component?: string;
-  /** Sorted, de-duplicated slicing labels. */
-  tags?: string[];
-  parent?: string;
-  blocked_by: string[];
-  relates: string[];
-  duplicate_of?: string;
-  refs: Ref[];
-  container: boolean;
-  ready: boolean;
-  blocked: boolean;
-  /** Why the card is flagged blocked beyond deps — e.g. "job blocked". */
-  blocked_reason?: string | null;
-  /** Agents bound to this issue through a job (tasks × jobs.issue_id). */
-  agents?: CardAgent[];
-  created: string;
-  /** Content hash of issue.md — send as `if_rev` on writes. */
-  rev: string;
-  counts: { comments: number; artifacts: number; refs: number };
-  checks: { done: number; total: number };
-  /** CAD-405 work model: type, milestone, size; stage/progress/health on epics. */
-  work?: WorkBlock;
-}
+/** A board card (`GET /api/issues` row): the core card, its work block and
+ *  the bound-agent strip. Generated from the daemon's Rust type. */
+export type IssueCard = Api.IssueListItem;
 
 /** CAD-405 epic health. `stalled` is time in stage, not child activity. */
 export type HealthState = "on_track" | "at_risk" | "stalled";
 
 /** One reason an epic or milestone is not on track, with its next action. */
-export interface HealthReason {
-  cause: string;
-  issue: string;
-  owner?: string | null;
-  detail: string;
-  next: string;
-}
-
-export interface WorkProgress {
-  done_weight: number;
-  total_weight: number;
-  ratio: number;
-  counts: Record<string, number>;
-}
-
+export type HealthReason = Api.HealthReason;
+export type WorkProgress = Api.WorkProgress;
 /** One move `epic_stage` accepts from the epic's current stage. */
-export interface StageMove {
-  to: string;
-  forward: boolean;
-  /** Only the proven operator may make it. */
-  needs_operator: boolean;
-}
-
-export interface WorkStage {
-  id: string;
-  source: string;
-  since: string | null;
-  exit: string | null;
-  next: string | null;
-  next_needs_operator: boolean;
-  terminal: boolean;
-  stages: string[];
-  /** CAD-432: the legal moves; absent from a server that predates it. */
-  moves?: StageMove[];
-}
-
+export type StageMove = Api.StageMove;
+export type WorkStage = Api.WorkStage;
 /** The `work` block on `/api/issues` cards and `/api/issues/:id`. */
-export interface WorkBlock {
-  type: string;
-  milestone: string | null;
-  milestone_source?: "field" | "tag" | "parent" | null;
-  size: string | null;
-  weight: number;
-  stage: WorkStage | null;
-  progress: WorkProgress | null;
-  health: {
-    state: HealthState;
-    days_in_stage: number | null;
-    limit_days: number;
-    reasons: HealthReason[];
-  } | null;
-  config_error?: string;
-  config_unapproved?: string;
-}
+export type WorkBlock = Api.WorkBlock;
 
 /** `GET /api/milestones` — one (project, milestone) roll-up. */
 export interface MilestoneRow {
@@ -561,23 +486,7 @@ export interface Overview {
 }
 
 /** A task assignment an agent is bound to through its job. */
-export interface AgentTask {
-  task: string;
-  task_state: string;
-  issue: string;
-  /** Task title from the job ledger, when one was supplied. */
-  title?: string | null;
-  /** Job id/title/state are the source of current-work context. */
-  job?: string | null;
-  job_title?: string | null;
-  job_state?: string | null;
-  message?: {
-    id: string;
-    task?: string;
-    created?: string;
-    summary?: string | null;
-  } | null;
-}
+export type AgentTask = Api.AgentTask;
 
 export type UsageState =
   | "available"
@@ -679,95 +588,34 @@ export interface InstructionsResult {
   new_sha256?: string;
 }
 
-export interface Agent {
-  alias: string;
+/** One `/api/agents` row. Generated from the daemon's Rust type, except the
+ *  fields re-declared here: a registered agent always reports `provider`,
+ *  `endpoint_kind` and `state` (only the Rust row type is lenient), the board
+ *  reads the allowance record as the wider `UsageLimit`, and the detail read
+ *  merges the launch `params` in. */
+export type Agent = Omit<
+  Api.AgentRow,
+  "provider" | "endpoint_kind" | "state" | "quota" | "usage_limit" | "model_selection" | "last_activity"
+> & {
   provider: string;
   endpoint_kind: string;
   state: string;
   /** Launch params; the detail read carries them. */
   params?: Record<string, unknown>;
-  /** CAD-1752: a hire's catalogue identity, served on every roster row. */
-  catalogue?: string | null;
-  look?: string | null;
-  kind?: string | null;
-  role?: string | null;
-  /** Model-preference role. Independent of runtime `role`. */
-  team_role?: string | null;
-  model_lookup_role?: string | null;
   model_selection?: {
     source?: string | null;
     lookup_role?: string | null;
     revision?: number | null;
     model?: string | null;
   } | null;
-  group: string;
-  group_root?: boolean;
-  /** Provider evidence: reported effective value beside launch config. */
-  model?: string | null;
-  model_reported?: string | null;
-  model_configured?: string | null;
-  model_source?: string | null;
-  effort?: string | null;
-  effort_reported?: string | null;
-  effort_source?: string | null;
-  effort_applicable?: boolean | null;
-  /** Optional account/pool allowance view; absent means unavailable. */
   quota?: UsageLimit | null;
   usage_limit?: UsageLimit | null;
-  running: number;
-  queued: number;
-  unknown: number;
-  parked: number;
-  fenced: boolean;
-  /** Issue ids bound through jobs — exact, not text-derived. */
-  on: string[];
-  tasks?: AgentTask[];
-  /** First running message, reduced. */
-  message?: {
-    id: string;
-    task?: string;
-    /** Epoch seconds — the daemon serializes Message.created as f64. */
-    created?: number | string;
-    summary?: string | null;
-  } | null;
-  running_messages?: {
-    id: string;
-    task?: string;
-    created?: number | string;
-    summary?: string | null;
-  }[];
-  /** The daemon's fence text — already names the recovery commands. */
-  recovery?: string | null;
-  /** Concrete resume command for a stopped pane, e.g. `devin -r devin-x`. */
-  resume?: string | null;
-  /** When `resume` applies — the pane is gone until then. */
-  resume_hint?: string;
-  dead?: boolean;
-  inbox?: boolean;
   /** Daemon messages use epoch seconds; older observations may use ISO text. */
   last_activity?: string | number | null;
-  /** Seconds since the running turn's last observed activity. */
-  silent_secs?: number;
-  /** The daemon declared this running turn stalled. */
-  stalled?: boolean;
-  /** CAD-96: `stopped (auto, idle 72m)` when the idle timer stopped it. */
-  state_label?: string | null;
-  event_cursor?: number;
-}
+};
 
-export interface AgentsPayload {
-  daemon: "reachable" | "unreachable";
-  agents: Agent[];
-  totals: {
-    running: number;
-    queued: number;
-    fenced: number;
-    parked: number;
-    inboxes: number;
-  } | null;
-  /** issue id → bound agent strip, for cards and drawers. */
-  by_issue?: Record<string, CardAgent[]>;
-}
+/** `GET /api/agents` (the roster beside its snapshot's freshness). */
+export type AgentsPayload = Omit<Api.AgentsResponse, "agents"> & { agents: Agent[] };
 
 /** Best-effort destination for a verified app-scoped master turn. This is
  * navigation metadata only; the app route proves its binding independently. */
@@ -934,55 +782,7 @@ export interface AgentDetail {
  *  plus the build identity of the serving binary and the daemon's when
  *  reachable. Tailnet-shared boards resolve the actor from Tailscale
  *  identity headers; `read_only` boards refuse every write. */
-export interface Meta {
-  platform_account_configured?: boolean;
-  read_only: boolean;
-  /** Explicit local unsigned-read policy. Missing/false never admits a workspace. */
-  anonymous_reads?: boolean;
-  /** CAD-313: this browser holds a live session (member or operator). Absent on a
-   *  server that predates sessions. CAD-1193: `null` when the session
-   *  check could not answer inside the metadata budget — an unknown,
-   *  never a sign-out. */
-  signed_in?: boolean | null;
-  session?: {
-    id: string;
-    origin: "loopback" | "tailnet" | "public";
-    user?: { sub: string; name: string; email: string; role: "operator" | "member"; handle: string } | null;
-    created: number;
-    last_used: number;
-    idle_expires_at: number;
-    expires_at: number;
-    user_agent: string;
-  } | null;
-  /** The command that signs this origin in (`cadence ui login [--tailnet]`). */
-  login_hint?: string;
-  /** CAD-777: remote device-grant sign-in is configured on this board
-   *  (and this origin may use it — loopback/tailnet only). */
-  device_login?: boolean;
-  /** This browser holds the session cookie but the daemon positively
-   *  answered this tab's key is not a live session — a new tab: each
-   *  tab signs in on its own. Never true on an unanswered check. */
-  tab_signed_out?: boolean;
-  actor: string;
-  /** Served through a configured public board name, not inferred from URL. */
-  hosted?: boolean;
-  /** CAD-432 (only with `?operator=1`): this client may make the
-   *  operator's decisions — a live session (CAD-313) plus the board's
-   *  operator proof on the peer and on the board process. CAD-1193:
-   *  `null` when the proof's dependencies could not answer inside the
-   *  metadata budget — access is being checked/unavailable, never a
-   *  resolved non-operator. */
-  operator?: boolean | null;
-  tailnet_url: string | null;
-  version: string;
-  build_commit: string;
-  build_time: string;
-  daemon?: {
-    build_commit: string;
-    build_time: string;
-    started_at: number;
-  } | null;
-}
+export type Meta = Api.MetaResponse;
 
 export interface Health {
   ok: boolean;
@@ -1407,7 +1207,8 @@ export interface AppRunPlan {
   decided_at?: string | null;
   reason?: string | null;
   tickets: RunTicket[];
-  progress: WorkProgress;
+  /** `plan.rs` counts by status (backlog, ready, doing, ...), not by bucket. */
+  progress: Omit<WorkProgress, "counts"> & { counts: Record<string, number> };
 }
 
 /**
