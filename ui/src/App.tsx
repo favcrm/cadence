@@ -936,6 +936,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               variant="header"
               readOnly={boardReadOnly}
               health={health}
+              hosted={meta?.hosted === true}
               onRefresh={refresh}
             >
               <SignIn meta={meta} onChange={refresh} access={viewer.access} recheckFinished={recheckFinished} onRetryWorkspace={reload} />
@@ -994,6 +995,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 variant="menu"
                 readOnly={boardReadOnly}
                 health={health}
+                hosted={meta?.hosted === true}
                 onRefresh={refresh}
               >
                 <SignIn meta={meta} onChange={refresh} access={viewer.access} recheckFinished={recheckFinished} onRetryWorkspace={reload} />
