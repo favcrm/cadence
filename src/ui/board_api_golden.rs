@@ -89,3 +89,81 @@ fn agents_payload_bytes_are_unchanged() {
         &agents_payload_from(dir.path(), Some(roster()), None),
     );
 }
+
+/// `/api/meta`: the typed body equals the `json!` literal it replaced
+/// (kept here as the oracle), for a signed-in and an unknown session.
+#[test]
+fn meta_bytes_are_unchanged() {
+    use cadence_core::board_api::{DeliverySyncMeta, MetaDaemon, MetaResponse};
+    use serde_json::json;
+    let session = json!({"id": "s1", "origin": "loopback", "user": null, "created": 1});
+    let proof = json!({"proven": false, "check": "peer", "why": "no proxy"});
+    let cases = [
+        (Some(true), session.clone(), proof.clone(), Some(true), true),
+        (None, Value::Null, Value::Null, None, false),
+    ];
+    for (i, (signed_in, session, tailnet_proof, operator, full)) in cases.into_iter().enumerate() {
+        let daemon = full.then(|| json!({"build_commit": "abc", "build_time": "t", "started_at": 7}));
+        let sync = full.then(|| json!({"gh": "/usr/bin/gh", "every_secs": 60}));
+        let oracle = json!({
+            "read_only": false,
+            "anonymous_reads": true,
+            "signed_in": signed_in,
+            "hosted": false,
+            "session": session,
+            "login_hint": "cadence ui login",
+            "device_login": full,
+            "tab_signed_out": false,
+            "actor": "ui",
+            "tailnet_proof": tailnet_proof,
+            "operator": operator,
+            "platform_account_configured": false,
+            "tailnet_url": full.then(|| "https://x.ts.net"),
+            "version": "1.2.3",
+            "build_commit": "deadbeef",
+            "build_time": "now",
+            "daemon": daemon,
+            "delivery_sync": sync,
+        });
+        let typed = MetaResponse {
+            read_only: false,
+            anonymous_reads: true,
+            signed_in,
+            hosted: false,
+            session,
+            login_hint: "cadence ui login".into(),
+            device_login: full,
+            tab_signed_out: false,
+            actor: "ui".into(),
+            tailnet_proof,
+            operator,
+            platform_account_configured: false,
+            tailnet_url: full.then(|| "https://x.ts.net".to_string()),
+            version: "1.2.3".into(),
+            build_commit: "deadbeef".into(),
+            build_time: "now".into(),
+            daemon: full.then(|| MetaDaemon {
+                build_commit: json!("abc"),
+                build_time: json!("t"),
+                started_at: json!(7),
+            }),
+            delivery_sync: full.then(|| DeliverySyncMeta {
+                gh: Some("/usr/bin/gh".into()),
+                gh_error: None,
+                every_secs: 60,
+            }),
+        };
+        let typed = serde_json::to_value(typed).unwrap();
+        assert_eq!(
+            serde_json::to_string_pretty(&typed).unwrap(),
+            serde_json::to_string_pretty(&oracle).unwrap(),
+            "case {i}"
+        );
+    }
+    // A failing `gh` reports its error and no path.
+    let err = DeliverySyncMeta { gh: None, gh_error: Some("no gh".into()), every_secs: 5 };
+    assert_eq!(
+        serde_json::to_value(err).unwrap(),
+        json!({"gh": null, "gh_error": "no gh", "every_secs": 5})
+    );
+}

@@ -52,6 +52,35 @@ fn committed_schema_matches_rust_types() {
 }
 
 #[test]
+fn committed_board_api_schema_matches_rust_types() {
+    use crate::board_api::{AgentsResponse, IssuesResponse, MetaResponse};
+    let dir = root().join("../../contracts/board-api/v1");
+    let files = [
+        (
+            "issues.schema.json",
+            pretty(schemars::schema_for!(IssuesResponse)),
+        ),
+        (
+            "agents.schema.json",
+            pretty(schemars::schema_for!(AgentsResponse)),
+        ),
+        ("meta.schema.json", pretty(schemars::schema_for!(MetaResponse))),
+    ];
+    for (name, generated) in files {
+        let path = dir.join(name);
+        if std::env::var_os("CADENCE_CORE_WRITE_SCHEMA").is_some() {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, &generated).unwrap();
+        }
+        let committed = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            committed, generated,
+            "{name} is stale; regenerate with CADENCE_CORE_WRITE_SCHEMA=1 cargo test -p cadence-core, then bun run --cwd ui gen:board-api"
+        );
+    }
+}
+
+#[test]
 fn golden_cases() {
     let mut count = 0;
     for entry in std::fs::read_dir(root().join("tests/cases")).unwrap() {

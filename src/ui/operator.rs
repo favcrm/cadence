@@ -1683,6 +1683,16 @@ fn device_config(
     crate::device_login::DeviceConfig::new(out["issuer"].as_str()?, out["org"].as_str()?).ok()
 }
 
+/// The session half of `/api/meta`.
+pub(super) struct MetaSession {
+    pub signed_in: Option<bool>,
+    pub hosted: bool,
+    pub session: Value,
+    pub login_hint: &'static str,
+    pub device_login: bool,
+    pub tab_signed_out: bool,
+}
+
 /// `/api/meta`'s session fields under `budget` (CAD-1193):
 /// `signed_in` is `true` for a live session, `false` when the daemon
 /// positively answered that the presented credentials are not one, and
@@ -1696,7 +1706,7 @@ pub(super) fn meta(
     state_dir: &std::path::Path,
     opts: &ServeOpts,
     budget: &client::MetaBudget,
-) -> Value {
+) -> MetaSession {
     let hosted = matches!(
         request_origin(request, opts),
         ReqOrigin::Known(Origin::Public)
@@ -1737,18 +1747,18 @@ pub(super) fn meta(
         None if !cookie => Some(false),
         None => None,
     };
-    json!({
-        "signed_in": signed_in,
-        "hosted": hosted,
-        "session": session.flatten(),
-        "login_hint": hint,
-        "device_login": device_login,
+    MetaSession {
+        signed_in,
+        hosted,
+        session: json!(session.flatten()),
+        login_hint: hint,
+        device_login,
         // A cookie but no live session for this browser: typically its
         // key storage was cleared. Public sessions have no page key, so
         // the cookie alone answers. An unanswerable check is NOT this
         // state.
-        "tab_signed_out": cookie && proven_signed_out,
-    })
+        tab_signed_out: cookie && proven_signed_out,
+    }
 }
 
 #[derive(Deserialize)]

@@ -8,7 +8,7 @@ use std::sync::{MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use cadence_core::board_api::{
-    AgentRow, AgentTask, AgentTotals, AgentsPayload, CardAgent, DaemonReach, RunningMessage,
+    AgentRow, AgentTask, AgentTotals, AgentsPayload, CardAgent, DaemonReach, MetaDaemon, MetaResponse, RunningMessage,
 };
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -1674,16 +1674,14 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             // full RPC bound.
             let budget = client::MetaBudget::fresh(client::MetaBudget::LIMIT);
             let session = operator::meta(&request, state_dir, opts, &budget);
-            let signed_in = session["signed_in"].as_bool() == Some(true);
+            let signed_in = session.signed_in == Some(true);
             let daemon = budget
                 .read(state_dir, "daemon_info", json!({}))
                 .ok()
-                .map(|info| {
-                    json!({
-                        "build_commit": info["build_commit"],
-                        "build_time": info["build_time"],
-                        "started_at": info["started_at"],
-                    })
+                .map(|info| MetaDaemon {
+                    build_commit: info["build_commit"].clone(),
+                    build_time: info["build_time"].clone(),
+                    started_at: info["started_at"].clone(),
                 });
             let (actor, tailnet_proof) = request_identity(&request, opts);
             let actor = if signed_in {
@@ -1708,9 +1706,9 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             // Public-origin sessions carry a verified user; every other
             // session is the operator's, matching `held_of`'s
             // attribution exactly.
-            let actor = if session["session"]["origin"].as_str() == Some("public") {
+            let actor = if session.session["origin"].as_str() == Some("public") {
                 serde_json::from_value::<crate::operator_auth::BoardUser>(
-                    session["session"]["user"].clone(),
+                    session.session["user"].clone(),
                 )
                 .map(|user| user.actor())
                 .unwrap_or(actor)
@@ -1721,31 +1719,39 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 operator::anonymous_reads_on(opts, operator::request_origin_kind(&request, opts));
             send(
                 request,
-                json_response(json!({
-                    "read_only": opts.read_only,
-                    "anonymous_reads": anonymous_reads_allowed,
-                    "signed_in": session["signed_in"],
-                    "hosted": session["hosted"],
-                    "session": session["session"],
-                    "login_hint": session["login_hint"],
-                    "device_login": session["device_login"],
-                    "tab_signed_out": session["tab_signed_out"],
-                    "actor": actor,
-                    "tailnet_proof": tailnet_proof,
-                    "operator": operator,
-                    "platform_account_configured": opts.public.as_ref().is_some_and(|board| board.issuer == "http://api.internal"),
-                    "tailnet_url": opts
-                        .tailnet
-                        .as_ref()
-                        .map(|(dns, port)| tailnet_url(dns, *port)),
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "build_commit": crate::overview::BUILD_COMMIT,
-                    "build_time": crate::overview::BUILD_TIME,
-                    "daemon": daemon,
-                    // CAD-446: the `gh` this board's sync runs, fixed at
-                    // start; `null` when the board runs no sync.
-                    "delivery_sync": signed_in.then(|| opts.delivery_sync.as_ref().map(|s| s.meta())).flatten(),
-                })),
+                json_response(
+                    serde_json::to_value(MetaResponse {
+                        read_only: opts.read_only,
+                        anonymous_reads: anonymous_reads_allowed,
+                        signed_in: session.signed_in,
+                        hosted: session.hosted,
+                        session: session.session,
+                        login_hint: session.login_hint.to_string(),
+                        device_login: session.device_login,
+                        tab_signed_out: session.tab_signed_out,
+                        actor,
+                        tailnet_proof,
+                        operator,
+                        platform_account_configured: opts
+                            .public
+                            .as_ref()
+                            .is_some_and(|board| board.issuer == "http://api.internal"),
+                        tailnet_url: opts
+                            .tailnet
+                            .as_ref()
+                            .map(|(dns, port)| tailnet_url(dns, *port)),
+                        version: env!("CARGO_PKG_VERSION").to_string(),
+                        build_commit: crate::overview::BUILD_COMMIT.to_string(),
+                        build_time: crate::overview::BUILD_TIME.to_string(),
+                        daemon,
+                        // CAD-446: the `gh` this board's sync runs, fixed at
+                        // start; `null` when the board runs no sync.
+                        delivery_sync: signed_in
+                            .then(|| opts.delivery_sync.as_ref().map(|s| s.meta()))
+                            .flatten(),
+                    })
+                    .expect("meta serializes"),
+                ),
             );
         }
         // CAD-561: the Update card's view and the draining banner.
