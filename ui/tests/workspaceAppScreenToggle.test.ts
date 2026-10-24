@@ -158,6 +158,29 @@ async function main() {
   assert(control("New post"), "Deep link to native renders the native controls");
   noTabBar("Deep-linked native view");
 
+  // The board's applied pick reaches the frame URL; a live change is pushed to
+  // the open frame, never a re-mount that would discard the operator's draft.
+  await React.act(async () => root.unmount()); root = createRoot(host);
+  history.replaceState(null, "", "/app-installations/install-a");
+  document.documentElement.setAttribute("data-theme", "light");
+  mounts.length = 0;
+  await render();
+  assert(mountCount() === 1 && frame(), "A themed mount still mounts the screen");
+  assert(frame()?.getAttribute("src") === `${receipt.mount}?theme=light`, "The pick rides the frame URL");
+  const live: any[] = [];
+  frame()!.contentWindow!.addEventListener("message", (event: any) => live.push(event.data));
+  document.documentElement.setAttribute("data-theme", "dark");
+  await flush(); await flush();
+  assert(mountCount() === 1, "A pick change never re-mounts the open screen");
+  assert(live.some(message => message?.type === "cadence-theme" && message?.theme === "dark"), "The open frame is told the new pick");
+  document.documentElement.removeAttribute("data-theme");
+  await React.act(async () => root.unmount()); root = createRoot(host);
+  mounts.length = 0;
+  await render();
+  assert(frame()?.getAttribute("src") === receipt.mount, "System leaves the frame URL query-less");
+  document.documentElement.removeAttribute("data-theme");
+  await React.act(async () => root.unmount()); root = createRoot(host);
+
   // The back door is operator-only: a non-operator deep link gets neither native controls nor a screen.
   await React.act(async () => root.unmount()); root = createRoot(host);
   mounts.length = 0;
