@@ -99,7 +99,7 @@
       ]
     },
     "ReadinessInput": {
-      "description": "Input of `issue.readiness`. `id` only names the issue in the refusal.",
+      "description": "Input of `issue.readiness`. `id` names the issue in the refusal.",
       "type": "object",
       "properties": {
         "blockers": {
@@ -109,10 +109,7 @@
           }
         },
         "id": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "status": {
           "type": "string"
@@ -120,6 +117,7 @@
       },
       "additionalProperties": false,
       "required": [
+        "id",
         "status",
         "blockers"
       ]

@@ -534,7 +534,7 @@ impl BoardRead {
     pub fn card(&self, ctx: &work::Ctx, v: &board::View) -> Value {
         let id = &v.issue.front.id;
         let mut card = match self.revs.get(id) {
-            Some(rev) => board::card_json_rev(v, json!(rev)),
+            Some(rev) => board::card_json_rev(v, rev),
             None => board::card_json(v),
         };
         card["work"] = work::item_json(ctx, v);

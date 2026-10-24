@@ -8,6 +8,7 @@
   },
   "expected": {
     "ok": true,
+    "op": "issue.validate",
     "value": {
       "valid": true,
       "refusals": []

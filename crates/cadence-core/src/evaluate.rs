@@ -1,6 +1,6 @@
 //! The one versioned JSON entry point every non-native host calls.
 //!
-//! Input `{v: 1, op, input}`; output `{ok: true, value}` or
+//! Input `{v: 1, op, input}`; output `{ok: true, op, value}` (`op` echoes the request) or
 //! `{ok: false, code, message}`. The rules live in typed Rust functions
 //! ([`manifest_preflight`]); [`evaluate`] only decodes, dispatches and encodes.
 //! Domain input only: not caller authentication, and not a host
@@ -76,12 +76,15 @@ pub struct ManifestPreflightInput {
 #[derive(Serialize, JsonSchema)]
 pub struct ManifestPreflightValue {}
 
-/// The success value of whichever operation ran.
+/// The success value of whichever operation ran, keyed by the echoed `op`.
 #[derive(Serialize, JsonSchema)]
-#[serde(untagged)]
+#[serde(tag = "op", content = "value")]
 pub enum OpValue {
+    #[serde(rename = "app.manifest.preflight")]
     Preflight(ManifestPreflightValue),
+    #[serde(rename = "issue.validate")]
     Validate(ValidateValue),
+    #[serde(rename = "issue.readiness")]
     Readiness(ReadinessValue),
 }
 
@@ -90,7 +93,8 @@ pub enum OpValue {
 pub struct Success {
     #[schemars(extend("const" = true))]
     pub ok: bool,
-    pub value: OpValue,
+    #[serde(flatten)]
+    pub result: OpValue,
 }
 
 /// Refusal response.
@@ -186,7 +190,10 @@ fn encode(value: &impl Serialize) -> Vec<u8> {
 
 pub fn evaluate(input: &[u8]) -> Vec<u8> {
     match dispatch(input) {
-        Ok(value) => encode(&Success { ok: true, value }),
+        Ok(value) => encode(&Success {
+            ok: true,
+            result: value,
+        }),
         Err(Refusal { code, message }) => refusal_bytes(code, &message),
     }
 }

@@ -27,12 +27,7 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::{model, project, work, write, Pm};
-pub use cadence_core::issue::check_prefix;
-use cadence_core::issue::derive_prefix;
-
-/// Keys a project may never take: `<pm>/agents/` holds the agent files
-/// (AGENT-FILESYSTEM.md; the master's `agents/master/`, CAD-339).
-pub const RESERVED_KEYS: &[&str] = &["agents"];
+use cadence_core::issue::{check_new_key, check_prefix, derive_prefix};
 
 /// Staffing seeded when the caller names none: one session each.
 pub const DEFAULT_AGENTS: &[(&str, u32)] = &[("pm", 1), ("dev", 1), ("qa", 1)];
@@ -58,13 +53,7 @@ pub struct Request {
 
 /// A project key `project new` accepts: well formed and not reserved.
 pub fn check_key(key: &str) -> Result<()> {
-    model::check_key(key)?;
-    if RESERVED_KEYS.contains(&key) {
-        return Err(Error::rejected(format!(
-            "Project key '{key}' is reserved — <pm>/{key}/ holds the agent files"
-        )));
-    }
-    Ok(())
+    Ok(check_new_key(key)?)
 }
 
 /// `pm=1,dev=4` or repeated `slug=n` → an ordered, de-duplicated map.

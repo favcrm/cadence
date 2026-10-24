@@ -155,7 +155,7 @@ pub fn project_add(
     crate::issue::project_new::check_key(key)?;
     let tags = model::normalize_tags(tags)?;
     let prefix = prefix.to_ascii_uppercase();
-    crate::issue::project_new::check_prefix(&prefix)?;
+    cadence_core::issue::check_prefix(&prefix)?;
     let lock = pm.lock_for_paths(std::slice::from_ref(&pm.dir.join(key)))?;
     let projects = project::list(&pm.dir)?;
     if projects.iter().any(|p| p.key == key) {

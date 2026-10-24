@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Board columns minus `dropped` — dropped issues leave the board.
+/// Every issue status; `dropped` issues leave the board.
 pub const STATUSES: &[&str] = &["backlog", "ready", "doing", "review", "done", "dropped"];
 pub const PRIORITIES: &[&str] = &["P0", "P1", "P2", "P3"];
 /// Most tags one issue may carry.
@@ -51,6 +51,10 @@ pub fn valid_key(key: &str) -> bool {
         && !key.starts_with('-')
 }
 
+/// Keys a project may never take: `<pm>/agents/` holds the agent files
+/// (AGENT-FILESYSTEM.md; the master's `agents/master/`, CAD-339).
+pub const RESERVED_KEYS: &[&str] = &["agents"];
+
 pub fn check_key(key: &str) -> Result<String> {
     if valid_key(key) {
         Ok(key.to_string())
@@ -59,6 +63,17 @@ pub fn check_key(key: &str) -> Result<String> {
             "Invalid project key '{key}' — 1-32 lowercase letters, digits or hyphens"
         )))
     }
+}
+
+/// A key a new project may take: well formed and not reserved.
+pub fn check_new_key(key: &str) -> Result<()> {
+    check_key(key)?;
+    if RESERVED_KEYS.contains(&key) {
+        return Err(Error::rejected(format!(
+            "Project key '{key}' is reserved — <pm>/{key}/ holds the agent files"
+        )));
+    }
+    Ok(())
 }
 
 /// `CADENCE` → valid; an issue prefix is 1-8 uppercase letters/digits
@@ -234,7 +249,7 @@ pub fn validate(input: &ValidateInput) -> ValidateValue {
         note("id", check_id(id).map(drop));
     }
     if let Some(key) = &input.project_key {
-        note("project_key", check_key(key).map(drop));
+        note("project_key", check_new_key(key));
     }
     if let Some(status) = &input.status {
         note("status", check_status(status));
@@ -256,11 +271,11 @@ pub fn validate(input: &ValidateInput) -> ValidateValue {
     }
 }
 
-/// Input of `issue.readiness`. `id` only names the issue in the refusal.
+/// Input of `issue.readiness`. `id` names the issue in the refusal.
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadinessInput {
-    pub id: Option<String>,
+    pub id: String,
     pub status: String,
     pub blockers: Vec<Blocker>,
 }
@@ -278,7 +293,7 @@ pub struct ReadinessValue {
 pub fn readiness(input: &ReadinessInput) -> ReadinessValue {
     let blocked = !open_ids(&input.blockers).is_empty();
     let refusal = if input.status == "ready" {
-        check_ready(input.id.as_deref().unwrap_or("issue"), &input.blockers)
+        check_ready(&input.id, &input.blockers)
             .err()
             .map(|error| error.to_string())
     } else {
@@ -292,6 +307,8 @@ pub fn readiness(input: &ReadinessInput) -> ReadinessValue {
 }
 
 /// A typed link kept on an issue: PR, commit, note, preview, message, ...
+/// `note` refs use `path` (the notes directory), preview refs store the
+/// publish path — never a signed URL.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct Ref {
     pub kind: String,
@@ -305,13 +322,20 @@ pub struct Ref {
     /// deleting them — the ref stays as history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed: Option<bool>,
-    /// `message` refs only: the worktree the dispatch ran against.
+    /// `message` refs only: the worktree the dispatch ran against, so
+    /// a re-start under `--name` leaves the earlier kickoff bound to
+    /// its own pair instead of every worktree the issue ever opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
-    /// `worktree` refs only: the effective cargo target dir for the checkout.
+    /// `worktree` refs only: the effective cargo target dir for the
+    /// checkout — the shared cache or the worktree-local `target/`
+    /// when the project opted out — so `issue finish` and
+    /// `doctor --host` account for the right bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cargo_target: Option<String>,
-    /// `message` refs only: the dispatch recipient.
+    /// `message` refs only: the dispatch recipient — structured so
+    /// finish finds the agent holding the bound message without
+    /// parsing it back out of the display label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
 }
@@ -341,8 +365,11 @@ pub struct CardChecks {
     pub total: u64,
 }
 
-/// The compact issue card `GET /api/issues` and `issue ls --json` return.
+/// The base issue card. `GET /api/issues` and `issue ls --json` return this
+/// plus keys added by `work::card_json` and the board read model, so the
+/// schema allows additional properties.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
+#[schemars(extend("additionalProperties" = true))]
 pub struct IssueCard {
     pub id: String,
     pub project: String,

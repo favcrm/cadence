@@ -111,7 +111,7 @@ pub(super) fn issue_ids(text: &str) -> Vec<String> {
         let Some((prefix, number)) = token.split_once('-') else {
             continue;
         };
-        let bound = crate::issue::project_new::check_prefix(prefix).is_ok()
+        let bound = cadence_core::issue::check_prefix(prefix).is_ok()
             && !number.is_empty()
             && number.bytes().all(|b| b.is_ascii_digit());
         if bound && !ids.iter().any(|id| id == token) {
