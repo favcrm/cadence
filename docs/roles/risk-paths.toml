@@ -33,7 +33,8 @@ paths = ["src/peer.rs", "src/daemon.rs", "src/daemon/identity.rs",
   "src/daemon/installer_enrollment_wire.rs", "src/platform/custody.rs",
   "src/cli/platform.rs", "src/bin/cadence-agent-exec/**", "src/cli_actor.rs",
   "src/board_identity.rs", "src/device_login.rs",
-  "src/remote_auth.rs", "src/remote_cli.rs", "src/remote_enrollment.rs"]
+  "src/remote_auth.rs", "src/remote_cli.rs", "src/remote_enrollment.rs",
+  "src/remote_cli/**", "src/remote_enrollment/**", "src/remote_*_acceptance.rs"]
 
 # Trigger 2, schema and store version. Pre-approvable at ticket time.
 [schema]
@@ -73,7 +74,7 @@ paths = ["docs/roles/**", "docs/CHARTER.md", "docs/AUDIT.md",
   "docs/design/**", "docs/cadence/**", "docs/START-HERE.md",
   "docs/ARCHITECTURE.md", "docs/BOARD.md",
   "AGENTS.md", "cadence-review.toml", "clippy.toml", "src/review.rs", "src/review/**",
-  "src/audit.rs", "src/audit/**", "src/delegation.rs", "src/delegation/**",
+  "src/audit/**", "src/delegation.rs", "src/delegation/**",
   "src/daemon/approvals_rpc.rs", "src/store/events.rs", "src/overview.rs",
   "src/delivery.rs", "src/issue/delivery_policy.rs", "src/issue/delivery_requirements.rs",
   "src/issue/model.rs",
