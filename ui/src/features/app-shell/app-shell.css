@@ -1,5 +1,6 @@
 @import "../../../screen-ui/src/primitives.css";
 @import "../../../screen-ui/src/drawer-base.css";
+@import "../agents/agents.css";
 
 /* CAD-802 trusted shared App shell. Canonical board tokens only.
  *
@@ -63,10 +64,10 @@
 
 /* The single chat node: a bounded flex column in the left pane on
    desktop. At narrow widths it is the full-width "Assistant" panel of
-   the approved mock's Assistant | Workspace switch — both panels stay
-   mounted and CSS shows one, so draft, stream and workspace state
-   survive switching. The column owns internal scrolling: the message
-   list takes the leftover height and scrolls (CAD-1007). */
+   the top-right Assistant/Workspace toggle — both panels stay mounted
+   and CSS shows one, so draft, stream and workspace state survive
+   switching. The column owns internal scrolling: the message list takes
+   the leftover height and scrolls (CAD-1007). */
 .app-shell-chat {
   display: flex;
   flex-direction: column;
@@ -75,39 +76,48 @@
   overflow: hidden;
 }
 
-.app-shell-panels {
-  display: flex;
-  gap: 0.5rem;
-  padding: 0.35rem 0;
-  margin-bottom: 0.5rem;
-  border-bottom: 1px solid var(--color-ink-700);
-  flex-shrink: 0;
-}
-
-.app-shell-panel-tab {
-  flex: 1;
-  min-height: 2.5rem;
-  padding: 0.35rem;
+.app-shell-panel-toggle {
+  display: none;
+  place-items: center;
+  flex: none;
+  width: 2.75rem;
+  height: 2.75rem;
+  padding: 0;
   border: 0;
-  border-radius: 0.3rem;
+  border-radius: 0.5rem;
   background: transparent;
   color: var(--color-ink-400);
-  font-size: var(--text-label);
+  cursor: pointer;
 }
 
-.app-shell-panel-tab[aria-pressed="true"] {
-  background: color-mix(in srgb, var(--color-accent) 9%, transparent);
+.app-shell-panel-toggle svg {
+  width: 1.125rem;
+  height: 1.125rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.app-shell-panel-toggle:hover {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+
+.app-shell-panel-toggle[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
   color: var(--color-accent);
 }
 
-.app-shell-panel-tab:focus-visible {
+.app-shell-panel-toggle:focus-visible {
   outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
+  outline-offset: 1px;
 }
 
-@media (min-width: 1024px) {
-  .app-shell-panels {
-    display: none;
+@media (max-width: 1023.98px) {
+  .app-shell-panel-toggle {
+    display: grid;
   }
 }
 
@@ -197,6 +207,26 @@
   padding: 0.75rem;
 }
 
+/* Narrow app shell: one gutter instead of the shell gutter plus the chat
+   card's border and padding. The desktop card stays unchanged. */
+@media (max-width: 1023.98px) {
+  .app-shell {
+    padding: 0.5rem 0.75rem 0.75rem;
+  }
+  .app-shell-crumb {
+    margin-bottom: 0.5rem;
+  }
+  .app-chat {
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    padding: 0;
+  }
+  .app-chat-form {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+}
+
 .app-chat-label {
   margin: 0;
   color: var(--color-ink-500);
@@ -282,6 +312,23 @@
   gap: 0.5rem;
 }
 
+.app-chat-empty {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.7rem;
+  padding: 1.5rem 1rem;
+  text-align: center;
+}
+
+.app-chat-empty p {
+  max-width: 28rem;
+  margin: 0;
+}
+
 .app-chat-list {
   display: grid;
   gap: 0.5rem;
@@ -293,6 +340,12 @@
   list-style: none;
   margin: 0;
   padding: 0;
+}
+
+/* Keep the log node mounted while the empty state is shown: its native
+   scroll/follow handlers bind once to this node. */
+.app-chat-list[hidden] {
+  display: none;
 }
 
 .app-chat-form {
@@ -967,8 +1020,9 @@
 .app-chat-rail {
   display: none;
 }
-/* CAD-1700 header (approved mockup): one row — "✳ Assistant · <conversation>"
-   on the left, three quiet borderless icon buttons on the right. */
+/* CAD-1700/CAD-1803 header: the master avatar and "Assistant ·
+   <conversation>" on the left, three quiet borderless icon buttons on the
+   right. */
 .app-chat-head {
   position: relative;
   display: flex;
@@ -981,7 +1035,7 @@
 }
 .app-chat-title {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 0.5rem;
   font-size: var(--text-body);
   color: var(--color-ink-100);
@@ -989,11 +1043,10 @@
 .app-chat-title strong {
   font-weight: 500;
 }
-.app-chat-mark {
+.app-chat-avatar {
+  display: flex;
+  flex: none;
   align-self: center;
-  color: var(--color-accent);
-  font-size: 1.1rem;
-  line-height: 1;
 }
 .app-chat-conv[data-state="offline"] {
   color: var(--color-warn);

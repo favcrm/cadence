@@ -181,7 +181,7 @@ export const resources = {
   }),
   /** `GET /api/agents` — agent rows, task bindings and `by_issue`. */
   agents: cache.resource<AgentsPayload>("agents", () => api.agents(), {
-    isEmpty: (p) => p.agents.length === 0,
+    isEmpty: (p) => (p?.agents?.length ?? 0) === 0,
   }),
   /**
    * `GET /api/overview` — slow (daemon probe + gh cache, ~30 s cold); fetched
