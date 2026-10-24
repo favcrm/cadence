@@ -20,6 +20,7 @@ interface World {
   binding: any | null;
   /** Per-context bindings; a missing key falls back to `binding`. */
   bindings?: Record<string, any | null>;
+  installations?: any[];
   contexts: any[];
   origin: { unsubscribe_origin: string | null; stored: boolean };
   posts: { path: string; body: any }[];
@@ -75,7 +76,7 @@ async function mount(world: World, viewer = { operator: true, readOnly: false })
     if (method === "POST") world.posts.push({ path: url.pathname, body });
     switch (`${method} ${url.pathname}`) {
       case "GET /api/app-installations":
-        return json([{ install_id: "install-crm", name: "crm", title: "CRM", smtp_custody: true }, { install_id: "install-social", name: "social-content", title: "Social" }]);
+        return json(world.installations ?? [{ install_id: "install-crm", name: "crm", title: "CRM", smtp_custody: true }, { install_id: "install-social", name: "social-content", title: "Social" }]);
       case "GET /api/app-installations/install-crm/contexts": return json({ contexts: world.contexts });
       case "GET /api/connections": return json({ connections: world.connections });
       case "POST /api/crm-smtp/show": {
@@ -184,6 +185,24 @@ async function main() {
     await m.settle(() => assert(m.host.querySelectorAll("[data-state=live]").length === 2, "the second context binds"));
     const bind = world.posts.find((p) => p.path === "/api/crm-smtp/bind")!;
     equal(bind.body.context_id, "ctx-b", "the bind carries the second context");
+    await m.unmount();
+  }
+  // CAD-1797 review: a disabled SMTP-capable install must not blank the
+  // active app's sender list or the workspace unsubscribe policy.
+  {
+    const world = fresh({
+      installations: [
+        { install_id: "install-crm", name: "crm", title: "CRM", smtp_custody: true, state: "active" },
+        { install_id: "install-disabled", name: "legacy", title: "Legacy", smtp_custody: true, state: "disabled" },
+      ],
+      binding: bindingFor(smtpRow("conn-a")),
+    });
+    const m = await mount(world);
+    await m.settle(() => {
+      assert(m.host.querySelector("[data-state=live]"), "active sender renders with a disabled SMTP install");
+      assert(m.host.querySelector("#email-origin"), "workspace policy renders with a disabled SMTP install");
+      assert(!(m.host.textContent ?? "").includes("Unknown installation"), "disabled install is not read");
+    });
     await m.unmount();
   }
   // Hosted sender label; its row has no password field; main path hides revisions.

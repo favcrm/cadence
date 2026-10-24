@@ -18,7 +18,7 @@ import {
 } from "../app-shell/sendClient";
 import type { HostScope } from "../app-shell/hostActions";
 import { HOSTED_ACCOUNT } from "./hostedSmtpView";
-import { workspaceApps } from "../workspace-apps/workspaceApps";
+import { workspaceApps, type Installation } from "../workspace-apps/workspaceApps";
 import {
   isHostedTransport,
   senderChoices,
@@ -40,9 +40,24 @@ interface Target {
   label: string;
 }
 
+/**
+ * A disabled or soft-removed install keeps `smtp_custody` but its contexts
+ * endpoint answers 404. Legacy/local responses omit the lifecycle fields and
+ * mean active.
+ */
+function activeInstall(install: Installation): boolean {
+  if (install.state === "disabled" || install.state === "removed") return false;
+  if (install.disabled_at !== undefined && install.disabled_at !== null) return false;
+  if (install.removed_at !== undefined && install.removed_at !== null) return false;
+  if (install.removed !== undefined && install.removed !== null) return false;
+  return true;
+}
+
 /** Every active context of an install that declares SMTP sending, flattened. */
 async function loadTargets(signal: AbortSignal): Promise<Target[]> {
-  const installs = (await workspaceApps.installations(signal)).filter((i) => i.smtp_custody === true);
+  const installs = (await workspaceApps.installations(signal)).filter(
+    (i) => i.smtp_custody === true && activeInstall(i),
+  );
   const out: Target[] = [];
   for (const install of installs) {
     const contexts = await workspaceApps.contexts(install.install_id, signal);
