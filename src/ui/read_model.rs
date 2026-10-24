@@ -2418,7 +2418,7 @@ mod tests {
         let pm = Pm::at(&model.pm_dir).unwrap();
         let read = model.board(&pm, None);
         assert!(
-            read.by_issue.get("CAD-1").is_none(),
+            !read.by_issue.contains_key("CAD-1"),
             "the read was not stripped"
         );
         assert_eq!(

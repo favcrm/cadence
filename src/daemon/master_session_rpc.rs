@@ -199,21 +199,15 @@ impl Shared {
     /// runtime snapshot is held; it is not an authorization or revocation-atomic grant.
     fn master_turn_app_origin(&self, message_id: &str) -> Option<AppOrigin> {
         let alias = crate::master::ALIAS;
-        let Some(thread) = self
+        let thread = self
             .store
             .message_conversation(alias, message_id)
             .ok()
-            .flatten()
-        else {
-            return None;
-        };
-        let Some(install) = thread
+            .flatten()?;
+        let install = thread
             .install_id
             .as_deref()
-            .filter(|install| !install.is_empty())
-        else {
-            return None;
-        };
+            .filter(|install| !install.is_empty())?;
         if thread.alias != alias
             || thread.archived
             || thread.runs_as_home()
@@ -223,12 +217,8 @@ impl Shared {
             return None;
         }
 
-        let Ok(pm_dir) = self.pm_dir() else {
-            return None;
-        };
-        let Ok(pm) = self.pm_at(&pm_dir) else {
-            return None;
-        };
+        let pm_dir = self.pm_dir().ok()?;
+        let pm = self.pm_at(&pm_dir).ok()?;
         let conversation_id = thread.id.clone();
         crate::issue::app_catalog::workspace::with_runtime_read(&pm, install, |row, _files| {
             let Some(digest) = row.get("digest").and_then(Value::as_str) else {
