@@ -728,7 +728,14 @@ function MasterHome({
   );
   // The Pi watch closes normally between turns; the SPA reconnects with a
   // fresh cursor. That is not a stale conversation while no turn is active.
-  const activeTurn = turnBar.kind === "working" || turnBar.kind === "queued";
+  // `writing` and `approval` are presentations of a running turn; `sending`
+  // is a message already in flight. All three still need the outage notice.
+  const activeTurn =
+    turnBar.kind === "working" ||
+    turnBar.kind === "writing" ||
+    turnBar.kind === "approval" ||
+    turnBar.kind === "sending" ||
+    turnBar.kind === "queued";
   const aheadHref = useConversationDestination(
     turnBar.kind === "queued" ? turnBar.aheadConversation : null,
     master.data,
