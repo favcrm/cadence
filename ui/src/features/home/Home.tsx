@@ -963,8 +963,12 @@ function MasterHome({
     const dock = dockRef.current;
     if (!dock || typeof ResizeObserver === "undefined") return;
     const apply = () => {
+      // Judge "on the tail" before the new padding lands: a strip that
+      // appears (Queued) must not push the last bubble under the dock.
+      const el = scrollRef.current;
+      const onTail = el ? atTail(el.scrollTop, el.scrollHeight, el.clientHeight) : false;
       document.documentElement.style.setProperty("--dock-h", `${dock.offsetHeight}px`);
-      if (follow.current.pinned) scrollPanel("jump");
+      if (follow.current.pinned || onTail) scrollPanel("jump");
     };
     const ro = new ResizeObserver(apply);
     ro.observe(dock);
