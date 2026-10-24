@@ -31,9 +31,10 @@ export function agentCategory(a: Agent): AgentCategory {
   )
     return "attention";
   if (a.inbox || a.provider === "inbox") return "inbox";
-  // A gone endpoint is stopped even while it holds queued mail, so the
-  // Stopped tab agrees with the "Dead — holding work" row.
-  if (!agentIsLive(a) && a.running === 0) return "stopped";
+  // A dead-holding-work row is stopped, so the Stopped tab agrees with
+  // its "Dead — holding work" state. A dead agent holding nothing keeps
+  // its own category.
+  if (agentHoldsWorkButDead(a) && a.running === 0) return "stopped";
   if (
     a.running > 0 ||
     a.queued > 0 ||
