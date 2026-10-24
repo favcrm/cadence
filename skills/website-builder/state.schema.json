@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "website-builder run.json",
+  "type": "object",
+  "required": ["version", "id", "created_at", "updated_at", "step", "status", "history", "brief", "content", "build", "review", "publish", "verify"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "step": { "enum": ["brief", "content", "build", "review", "publish", "verify", "done"] },
+    "status": { "enum": ["open", "done"] },
+    "brief": { "$ref": "#/$defs/brief" },
+    "content": { "$ref": "#/$defs/content" },
+    "build": { "$ref": "#/$defs/build" },
+    "review": { "$ref": "#/$defs/review" },
+    "publish": { "$ref": "#/$defs/publish" },
+    "verify": { "$ref": "#/$defs/verify" },
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["at", "step", "action", "digest"],
+        "additionalProperties": false,
+        "properties": {
+          "at": { "type": "string", "format": "date-time" },
+          "step": { "enum": ["brief", "content", "build", "review", "publish", "verify"] },
+          "action": { "const": "submitted" },
+          "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "brief": {
+      "type": ["object", "null"],
+      "required": ["owner_confirmed", "goal", "name"],
+      "properties": {
+        "owner_confirmed": { "const": true },
+        "goal": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "pattern": "^[a-z0-9-]{3,63}$" }
+      }
+    },
+    "content": {
+      "type": ["object", "null"],
+      "required": ["src", "facts_from_owner"],
+      "properties": {
+        "src": { "type": "string", "minLength": 1 },
+        "facts_from_owner": { "const": true }
+      }
+    },
+    "build": {
+      "type": ["object", "null"],
+      "required": ["out", "files", "bytes"],
+      "properties": {
+        "out": { "type": "string", "minLength": 1 },
+        "files": { "type": "integer", "minimum": 0 },
+        "bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "review": {
+      "type": ["object", "null"],
+      "required": ["owner_approved"],
+      "properties": { "owner_approved": { "const": true } }
+    },
+    "publish": {
+      "type": ["object", "null"],
+      "required": ["owner_approved", "release", "slug"],
+      "properties": {
+        "owner_approved": { "const": true },
+        "release": { "type": "string", "minLength": 1 },
+        "slug": { "type": "string", "pattern": "^[a-z0-9-]{3,63}$" }
+      }
+    },
+    "verify": {
+      "type": ["object", "null"],
+      "required": ["owner_accepted", "url", "status", "bytes_match", "form", "checked_at"],
+      "properties": {
+        "owner_accepted": { "const": true },
+        "url": { "type": "string", "format": "uri" },
+        "status": { "type": ["integer", "null"] },
+        "bytes_match": { "type": ["boolean"] },
+        "csp": { "type": ["string", "null"] },
+        "nosniff": { "type": "boolean" },
+        "form": { "type": ["string", "integer", "null"] },
+        "checked_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}
