@@ -53,6 +53,22 @@ async function main() {
   ok(!aria().includes("unavailable"), `answered probe is not "unavailable": ${aria()}`);
 
   await act(async () => {
+    root.render(React.createElement(StatusChips, { readOnly: false, health: health("unreachable"), hosted: true, onRefresh: () => {}, variant: "header" }));
+  });
+  ok(!aria().includes("Daemon disconnected"), `hosted board does not warn about an unused daemon: ${aria()}`);
+  ok(!aria().includes("unavailable"), `hosted answered probe is not unavailable: ${aria()}`);
+
+  await act(async () => {
+    root.render(React.createElement(StatusChips, { readOnly: false, health: "unavailable", hosted: true, onRefresh: () => {}, variant: "header" }));
+  });
+  ok(aria().includes("Connection unavailable"), `hosted failed probe still reports unavailable: ${aria()}`);
+
+  await act(async () => {
+    root.render(React.createElement(StatusChips, { readOnly: false, health: health("unreachable"), hosted: true, onRefresh: () => {}, variant: "menu" }));
+  });
+  ok(!text().includes("Daemon disconnected"), `hosted menu does not warn about an unused daemon: ${text()}`);
+
+  await act(async () => {
     root.render(React.createElement(StatusChips, { readOnly: false, health: null, onRefresh: () => {}, variant: "menu" }));
   });
   ok(!text().includes("Checking connection"), `pending menu probe stays quiet: ${text()}`);
