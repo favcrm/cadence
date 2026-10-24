@@ -408,6 +408,14 @@ await pick("Spring launch");
   await mount("install-crm");
 }
 
+// CAD-1810: an app page may open with the assistant collapsed (unless a
+// decision is waiting); this test needs the pane visible.
+if (host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed")) {
+  await React.act(async () => { (host.querySelector(".app-chat-rail") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await settle();
+}
+assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "the assistant is visible for this check");
+
 // A hidden but mounted pane must not clear another tab's unread state.
 await pick("General");
 await React.act(async () => {
@@ -429,10 +437,15 @@ equal((await readSeen("install-crm"))["c-gen"], 5, "returning to the visible pan
 await React.act(async () => { (host.querySelector(".app-chat-collapse") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 assert(host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "CRM chat collapses");
 await mount("install-other");
-assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "another app's chat is not collapsed");
+assert(host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "another app opens with its own assistant collapsed");
+await React.act(async () => { (host.querySelector(".app-chat-rail") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+await settle();
+assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "another app's chat expands independently");
 equal(await optionLabels(), ["General"], "another app lists only its own conversations");
 await mount("install-crm");
 assert(host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "the CRM chat stays collapsed");
+await mount("install-other");
+assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "the other app's own choice persists");
 
 // A cached legacy response leaves the real composer editable while the next
 // conversation-list request is pending. Draft text must survive when that
