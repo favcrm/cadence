@@ -85,6 +85,7 @@ docs/guides/*
 !docs/guides/app-artifact-release.md
 !docs/guides/app-catalog.md
 !docs/guides/app-contexts.md
+!docs/guides/app-development.md
 !docs/guides/app-runs.md
 !docs/guides/app-toolchain.md
 !docs/guides/app-works.md

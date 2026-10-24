@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+bun scripts/build.mjs
+cadence app check app
+node --test tests/*.test.mjs

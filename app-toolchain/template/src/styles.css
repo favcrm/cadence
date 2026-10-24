@@ -1,0 +1,138 @@
+:root {
+  color-scheme: light dark;
+  --app-fg: var(--fg, #171717);
+  --app-muted: var(--muted, #6b7280);
+  --app-border: var(--border, #e5e7eb);
+  --app-bg: var(--surface, #ffffff);
+  --app-accent: var(--accent, #0f766e);
+  --app-success: var(--success, #15803d);
+  --app-error: var(--error, #b91c1c);
+}
+
+html,
+body {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  color: var(--app-fg);
+  background: transparent;
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+#root {
+  box-sizing: border-box;
+  display: flex;
+  min-height: 100vh;
+  flex-direction: column;
+  gap: 16px;
+  padding: 24px;
+}
+
+.app-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.eyebrow {
+  margin: 0 0 4px;
+  color: var(--app-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+h1,
+h2 {
+  margin: 0;
+  font-size: 22px;
+  line-height: 1.2;
+}
+
+h2 {
+  font-size: 18px;
+}
+
+.status {
+  flex: 0 0 auto;
+  border: 1px solid var(--app-border);
+  border-radius: 999px;
+  padding: 4px 10px;
+  color: var(--app-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.status.ok {
+  border-color: color-mix(in srgb, var(--app-success) 40%, var(--app-border));
+  color: var(--app-success);
+}
+
+.card {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  max-width: 640px;
+  border: 1px solid var(--app-border);
+  border-radius: 12px;
+  padding: 18px;
+  background: var(--app-bg);
+}
+
+.card p {
+  margin: 0;
+}
+
+.muted {
+  color: var(--app-muted);
+}
+
+.error {
+  color: var(--app-error);
+  overflow-wrap: anywhere;
+}
+
+.btn {
+  appearance: none;
+  cursor: pointer;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: #fff;
+  background: var(--app-accent);
+  font: inherit;
+  font-weight: 600;
+}
+
+.btn.ghost {
+  border-color: var(--app-border);
+  color: var(--app-fg);
+  background: transparent;
+}
+
+.local-drawer {
+  position: fixed;
+  inset: 0 0 0 auto;
+  box-sizing: border-box;
+  display: flex;
+  width: min(380px, 100%);
+  flex-direction: column;
+  gap: 14px;
+  border-left: 1px solid var(--app-border);
+  padding: 20px;
+  background: var(--app-bg);
+  box-shadow: -20px 0 40px rgb(0 0 0 / 18%);
+}
+
+.drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}

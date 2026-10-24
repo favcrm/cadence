@@ -2,6 +2,9 @@
 
 Cadence publishes a platform-neutral `cadence-app-toolchain-<tag>.tar.gz` asset and `.sha256` sidecar on its existing versioned GitHub Releases. It is optional starter tooling for app-owned React/Vite projects and ships the app-side screen-bridge receiver (`app-kit/`). It is not an SDK, an authority or an app runtime. It does not change SOC-3 app adoption or SOC-1/SOC-5 holds.
 
+For the end-to-end starter, see [App development](app-development.md) and
+[`app-toolchain/template/`](../../app-toolchain/template/README.md).
+
 ## Download and verify
 
 Choose a published Cadence release tag and download both matching assets. For example:
@@ -33,7 +36,10 @@ The archive's `frame-kit/frame.html`, `kit.css`, and `metadata.json` come from `
 
 ```sh
 cadence app frame-kit --out /tmp/my-app-frame \
-  --bundle ./path/to/app-bundle --parent-origin http://127.0.0.1:5173
+  --bundle ./path/to/app-bundle --parent-origin http://localhost:5173
 ```
+
+The parent origin must be the actual frame parent; the kit accepts HTTPS or an
+HTTP `localhost`/`*.localhost` origin with a port, not a loopback IP literal.
 
 The packaged files are canonical host output, not a copied editable renderer. The default offline frame is an empty reference, not an app-mounted harness. This toolchain alone does not establish Social, native API, or frame-harness integration.

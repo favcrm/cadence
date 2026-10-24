@@ -4,8 +4,11 @@
 requiring a project. The default workspace is the daemon's PM root. An operator's
 install or update records consent for the installed digest when its local
 execution contract passes validation. Install and update do not create worker
-grants or load custom app UI; run approvals and outward-effect permissions
-remain separate.
+grants; the bundle's declared `app-screens` package is the app UI. Run
+approvals and outward-effect permissions remain separate.
+
+For a new app, start with [App development](app-development.md); this guide
+remains the catalog and install contract.
 
 Local catalog commands, including reads, require a reachable daemon and an operator
 caller. They fail when the daemon is unavailable; there is no offline catalog
@@ -420,9 +423,12 @@ The `cadence app catalog upgrade-check` and `cadence app catalog upgrade`
 commands accept absolute paths and Git URLs; `builtin:<catalog_id>` is
 retired (CAD-1422) and refused.
 The existing board upgrade-check and upgrade routes use the same pins and
-refuse stale proposals. The remote CLI (`cadence --org …`) remains limited to
-status, agent/issue/message reads, and issue create/comment/set; it has no
-app-management verbs, so hosted operators use the Manage page for updates.
+refuse stale proposals. The remote CLI (`cadence --org …`) supports the
+[selected-remote published-release journey](#selected-remote-immutable-published-releases)
+(`release-check`, `release-install`, `release-update`, `release-revoke`, `ls`,
+`show`, `operation`, `pending`, `reconcile`). Local path and Git-source
+install/update commands are refused with `--org`; hosted operators use the
+Manage page for those and for the UI.
 
 The built-in catalog is retired (CAD-1422): the binary embeds no app bundles
 or catalog index, and canonical apps ship from their own repositories' release
