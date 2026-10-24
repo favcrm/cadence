@@ -117,6 +117,13 @@ export function WorkspaceAppCachedPreview({
   );
 }
 
+/** The installed version, shown where the app's own name is — an update is
+ *  only visible to a person who can see what is installed. */
+function AppVersion({ version }: { version?: string }) {
+  if (!version) return null;
+  return <span className="text-micro text-ink-500" data-app-version={version}> · v{version}</span>;
+}
+
 /**
  * One honest pane for a screen that did not mount: the state's own title and
  * only the actions that can change it. The outlet supplies `onRetry` (a
@@ -1071,7 +1078,7 @@ export default function WorkspaceApp({
     ? <><ScreenHost projection={projection} fallback={fallback} renderFailure={renderScreenFailure} loadAsset={screenExtras.loadAsset} actions={screenActions} onMediaAttach={onMediaAttach} onScreenDrawer={onScreenDrawer} presentation={presentation} onNavigation={(navigation) => { if (navigation === null) onScreenClosed?.(); }} /><Toast msg={connectToastMsg} /></> : <>{fallback}<Toast msg={connectToastMsg} /></>;
   if (data && !supportsSocialContentWorkspace(data.installation)) {
     return screen(<main className="workspace-app" aria-label="Workspace app">
-      <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>
+      <header className="wa-header"><h1>{data.installation.title || data.installation.name}<AppVersion version={data.installation.version} /></h1><Button href="/apps">All apps</Button></header>
       <section className="wa-panel wa-stack">
         <p>{data.installation.summary}</p>
         <p className="wa-muted">{t("This installation has no supported board workspace yet. Use its installed guide and the app commands to inspect supported workflows.")}</p>
@@ -1093,7 +1100,7 @@ export default function WorkspaceApp({
             <IconApps size={22} />
           </span>
           <div>
-              <h1>{data?.installation.title || "Workspace app"}</h1>
+              <h1>{data?.installation.title || "Workspace app"}<AppVersion version={data?.installation.version} /></h1>
             <p className="wa-kicker">
               {t("Workspace app · reviewed drafts and Local release")}
             </p>
