@@ -1,0 +1,8 @@
+{
+  "input": "{not json",
+  "expected": {
+    "ok": false,
+    "code": "invalid_command",
+    "message": "command must be unambiguous JSON"
+  }
+}

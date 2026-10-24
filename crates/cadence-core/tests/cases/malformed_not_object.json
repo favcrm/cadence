@@ -1,0 +1,10 @@
+{
+  "input": [
+    1
+  ],
+  "expected": {
+    "ok": false,
+    "code": "invalid_command",
+    "message": "command must be an object"
+  }
+}

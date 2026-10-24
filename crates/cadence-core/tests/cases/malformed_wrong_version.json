@@ -1,0 +1,14 @@
+{
+  "input": {
+    "v": 2,
+    "op": "app.manifest.preflight",
+    "input": {
+      "manifest": ""
+    }
+  },
+  "expected": {
+    "ok": false,
+    "code": "invalid_command",
+    "message": "unsupported contract version"
+  }
+}

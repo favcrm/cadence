@@ -1,0 +1,14 @@
+{
+  "input": {
+    "v": 1,
+    "op": "app.manifest.preflight",
+    "input": {
+      "manifest": "---\nneeds:\n  requires: yes\n---\n"
+    }
+  },
+  "expected": {
+    "ok": false,
+    "code": "invalid_manifest",
+    "message": "app.md `needs.requires` is a mapping — `core:` a version range, `contracts:` name → majors"
+  }
+}

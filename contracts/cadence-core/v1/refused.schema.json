@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Refused",
+  "description": "Refusal response.",
+  "type": "object",
+  "properties": {
+    "code": {
+      "$ref": "#/$defs/Code"
+    },
+    "message": {
+      "description": "Human-readable refusal reason.",
+      "type": "string"
+    },
+    "ok": {
+      "type": "boolean",
+      "const": false
+    }
+  },
+  "required": [
+    "ok",
+    "code",
+    "message"
+  ],
+  "$defs": {
+    "Code": {
+      "description": "Closed set of refusal codes.",
+      "oneOf": [
+        {
+          "description": "The envelope is malformed, oversize, unversioned or names no known op.",
+          "type": "string",
+          "const": "invalid_command"
+        },
+        {
+          "description": "The manifest is not a well-formed `app.md` with a valid `needs.requires`.",
+          "type": "string",
+          "const": "invalid_manifest"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Request",
+  "description": "The request envelope.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "description": "Contract version; only `1` exists.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "oneOf": [
+    {
+      "description": "Split the frontmatter, then check `needs.requires`.",
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/ManifestPreflightInput"
+        },
+        "op": {
+          "type": "string",
+          "const": "app.manifest.preflight"
+        }
+      },
+      "required": [
+        "op",
+        "input"
+      ]
+    }
+  ],
+  "required": [
+    "v"
+  ],
+  "$defs": {
+    "ManifestPreflightInput": {
+      "type": "object",
+      "properties": {
+        "manifest": {
+          "description": "The exact `app.md` text.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "manifest"
+      ]
+    }
+  }
+}

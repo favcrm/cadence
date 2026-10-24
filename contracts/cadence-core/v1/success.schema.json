@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Success",
+  "description": "Success response.",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "const": true
+    },
+    "value": {
+      "$ref": "#/$defs/ManifestPreflightValue"
+    }
+  },
+  "required": [
+    "ok",
+    "value"
+  ],
+  "$defs": {
+    "ManifestPreflightValue": {
+      "description": "Success value of `app.manifest.preflight`.",
+      "type": "object"
+    }
+  }
+}

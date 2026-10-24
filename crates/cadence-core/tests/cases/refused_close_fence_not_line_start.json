@@ -1,0 +1,14 @@
+{
+  "input": {
+    "v": 1,
+    "op": "app.manifest.preflight",
+    "input": {
+      "manifest": "---\nname: demo ---\n"
+    }
+  },
+  "expected": {
+    "ok": false,
+    "code": "invalid_manifest",
+    "message": "Issue file is missing the closing '---' frontmatter fence"
+  }
+}

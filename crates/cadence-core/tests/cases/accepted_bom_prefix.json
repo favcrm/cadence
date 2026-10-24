@@ -1,0 +1,13 @@
+{
+  "input": {
+    "v": 1,
+    "op": "app.manifest.preflight",
+    "input": {
+      "manifest": "﻿---\nname: demo\n---\nbody\n"
+    }
+  },
+  "expected": {
+    "ok": true,
+    "value": {}
+  }
+}

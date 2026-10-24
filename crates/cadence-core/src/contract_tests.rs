@@ -1,0 +1,67 @@
+//! Contract checks (in-crate: the root test runner only selects root-package targets): the committed JSON Schema equals the one generated from
+//! the Rust types, and every golden case in `tests/cases/*.json` evaluates to
+//! its expected bytes. The same case files are the fixture a wasm host runs.
+//!
+//! A case is `{"input": <envelope object, or a string sent as raw bytes>,
+//! "expected": <response>}`.
+use crate::evaluate::{Refused, Request, Success};
+use serde_json::Value;
+use std::path::PathBuf;
+
+fn root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn pretty(schema: schemars::Schema) -> String {
+    serde_json::to_string_pretty(&schema).unwrap() + "\n"
+}
+
+#[test]
+fn committed_schema_matches_rust_types() {
+    let dir = root().join("../../contracts/cadence-core/v1");
+    let files = [
+        (
+            "request.schema.json",
+            pretty(schemars::schema_for!(Request)),
+        ),
+        (
+            "success.schema.json",
+            pretty(schemars::schema_for!(Success)),
+        ),
+        (
+            "refused.schema.json",
+            pretty(schemars::schema_for!(Refused)),
+        ),
+    ];
+    for (name, generated) in files {
+        let path = dir.join(name);
+        if std::env::var_os("CADENCE_CORE_WRITE_SCHEMA").is_some() {
+            std::fs::write(&path, &generated).unwrap();
+        }
+        let committed = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            committed, generated,
+            "{name} is stale; regenerate with CADENCE_CORE_WRITE_SCHEMA=1 cargo test -p cadence-core --test contract"
+        );
+    }
+}
+
+#[test]
+fn golden_cases() {
+    let mut count = 0;
+    for entry in std::fs::read_dir(root().join("tests/cases")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let case: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let input = match &case["input"] {
+            Value::String(raw) => raw.clone().into_bytes(),
+            envelope => serde_json::to_vec(envelope).unwrap(),
+        };
+        let actual: Value = serde_json::from_slice(&crate::evaluate(&input)).unwrap();
+        assert_eq!(actual, case["expected"], "{}", path.display());
+        count += 1;
+    }
+    assert!(count >= 10, "golden corpus went missing");
+}
