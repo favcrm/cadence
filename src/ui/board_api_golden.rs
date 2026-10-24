@@ -103,7 +103,8 @@ fn meta_bytes_are_unchanged() {
         (None, Value::Null, Value::Null, None, false),
     ];
     for (i, (signed_in, session, tailnet_proof, operator, full)) in cases.into_iter().enumerate() {
-        let daemon = full.then(|| json!({"build_commit": "abc", "build_time": "t", "started_at": 7}));
+        let daemon =
+            full.then(|| json!({"build_commit": "abc", "build_time": "t", "started_at": 7}));
         let sync = full.then(|| json!({"gh": "/usr/bin/gh", "every_secs": 60}));
         let oracle = json!({
             "read_only": false,
@@ -161,7 +162,11 @@ fn meta_bytes_are_unchanged() {
         );
     }
     // A failing `gh` reports its error and no path.
-    let err = DeliverySyncMeta { gh: None, gh_error: Some("no gh".into()), every_secs: 5 };
+    let err = DeliverySyncMeta {
+        gh: None,
+        gh_error: Some("no gh".into()),
+        every_secs: 5,
+    };
     assert_eq!(
         serde_json::to_value(err).unwrap(),
         json!({"gh": null, "gh_error": "no gh", "every_secs": 5})

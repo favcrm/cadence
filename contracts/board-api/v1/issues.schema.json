@@ -1,0 +1,432 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "IssuesResponse",
+  "description": "`GET /api/issues`.",
+  "type": "object",
+  "properties": {
+    "issues": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/IssueListItem"
+      }
+    },
+    "refresh_error": {
+      "type": "boolean"
+    },
+    "snapshot_age_secs": {
+      "type": "number",
+      "format": "double"
+    },
+    "stale": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "issues",
+    "snapshot_age_secs",
+    "stale",
+    "refresh_error"
+  ],
+  "$defs": {
+    "CardAgent": {
+      "description": "One bound agent on an issue card or drawer — from the job binding.",
+      "type": "object",
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "message": {
+          "description": "Running kickoff message id for this task, if live.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resume": {
+          "description": "Concrete resume command for a stopped pane.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        },
+        "task_state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "alias",
+        "task",
+        "task_state",
+        "state"
+      ]
+    },
+    "CardChecks": {
+      "type": "object",
+      "properties": {
+        "done": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "total": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "done",
+        "total"
+      ]
+    },
+    "CardCounts": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "comments": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "refs": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "comments",
+        "artifacts",
+        "refs"
+      ]
+    },
+    "ClaimCard": {
+      "description": "The in-flight claim on a card, with its age.",
+      "type": "object",
+      "properties": {
+        "age_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "at": {
+          "type": "string"
+        },
+        "by": {
+          "type": "string"
+        },
+        "last_seen": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stale": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "by",
+        "at"
+      ]
+    },
+    "IssueListItem": {
+      "description": "One `GET /api/issues` row: the core card, its work block and, only when\na job binds agents to the issue, the agent strip.",
+      "type": "object",
+      "properties": {
+        "agents": {
+          "description": "The daemon's bound-agent strip, passed through as the roster built it.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/CardAgent"
+          }
+        },
+        "blocked": {
+          "type": "boolean"
+        },
+        "blocked_by": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "blocked_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checks": {
+          "$ref": "#/$defs/CardChecks"
+        },
+        "claim": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClaimCard"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "component": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "container": {
+          "type": "boolean"
+        },
+        "counts": {
+          "$ref": "#/$defs/CardCounts"
+        },
+        "created": {
+          "type": "string"
+        },
+        "duplicate_of": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "priority": {
+          "type": "string"
+        },
+        "project": {
+          "type": "string"
+        },
+        "ready": {
+          "type": "boolean"
+        },
+        "refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ref"
+          }
+        },
+        "relates": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rev": {
+          "description": "Content hash of `issue.md`: the `if_rev` token for writes.",
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "status_source": {
+          "description": "`rollup` | `notes` | `file` — where `status` came from.",
+          "type": "string"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "title": {
+          "type": "string"
+        },
+        "work": {
+          "$ref": "#/$defs/WorkBlock"
+        }
+      },
+      "required": [
+        "id",
+        "project",
+        "title",
+        "status",
+        "status_source",
+        "priority",
+        "tags",
+        "paths",
+        "blocked_by",
+        "relates",
+        "refs",
+        "container",
+        "ready",
+        "blocked",
+        "created",
+        "rev",
+        "counts",
+        "checks",
+        "work"
+      ]
+    },
+    "Ref": {
+      "description": "A typed link kept on an issue: PR, commit, note, preview, message, ...",
+      "type": "object",
+      "properties": {
+        "agent": {
+          "description": "`message` refs only: the dispatch recipient.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cargo_target": {
+          "description": "`worktree` refs only: the effective cargo target dir for the checkout.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "closed": {
+          "description": "`issue finish` marks worktree/branch refs closed rather than\ndeleting them — the ref stays as history.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worktree": {
+          "description": "`message` refs only: the worktree the dispatch ran against.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "WorkBlock": {
+      "description": "The CAD-405 work block on a card: type, milestone, size; stage,\nprogress and health on epics.",
+      "type": "object",
+      "properties": {
+        "config_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "config_unapproved": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "health": {
+          "description": "Epics only: `{state, reasons, days_in_stage, ..}`."
+        },
+        "milestone": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "milestone_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "progress": {
+          "description": "Epics only: weighted child progress."
+        },
+        "size": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stage": {
+          "description": "Epics only: `{id, source, since, exit, next, next_needs_operator,\nterminal, stages, moves}`."
+        },
+        "type": {
+          "type": "string"
+        },
+        "type_source": {
+          "description": "`field` | `implicit`.",
+          "type": "string"
+        },
+        "weight": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "type",
+        "type_source",
+        "weight"
+      ]
+    }
+  }
+}

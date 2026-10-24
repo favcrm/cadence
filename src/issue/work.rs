@@ -31,8 +31,8 @@ use crate::error::{Error, Result};
 use crate::issue::areas::scrub;
 use crate::issue::board::{self, View};
 use crate::issue::model::{self, Front};
-use cadence_core::board_api::WorkBlock;
 use crate::issue::{parse, plan, project};
+use cadence_core::board_api::WorkBlock;
 
 /// Default epic stages and their exit criteria.
 pub const DEFAULT_STAGES: &[(&str, &str)] = &[
@@ -901,7 +901,11 @@ pub fn item_block(ctx: &Ctx, view: &View) -> WorkBlock {
     let milestone = effective_milestone(ctx, view);
     let mut out = WorkBlock {
         kind: kind.to_string(),
-        type_source: if f.item_type.as_deref().is_some_and(|t| model::TYPES.contains(&t)) {
+        type_source: if f
+            .item_type
+            .as_deref()
+            .is_some_and(|t| model::TYPES.contains(&t))
+        {
             "field"
         } else {
             "implicit"

@@ -64,7 +64,10 @@ fn committed_board_api_schema_matches_rust_types() {
             "agents.schema.json",
             pretty(schemars::schema_for!(AgentsResponse)),
         ),
-        ("meta.schema.json", pretty(schemars::schema_for!(MetaResponse))),
+        (
+            "meta.schema.json",
+            pretty(schemars::schema_for!(MetaResponse)),
+        ),
     ];
     for (name, generated) in files {
         let path = dir.join(name);

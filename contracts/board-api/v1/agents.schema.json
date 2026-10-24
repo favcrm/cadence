@@ -1,0 +1,474 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentsResponse",
+  "description": "`GET /api/agents`: the roster beside its snapshot's freshness.",
+  "type": "object",
+  "properties": {
+    "agents": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentRow"
+      }
+    },
+    "by_issue": {
+      "description": "Issue id to its bound agent strip.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/CardAgent"
+        }
+      }
+    },
+    "daemon": {
+      "$ref": "#/$defs/DaemonReach"
+    },
+    "refresh_error": {
+      "type": "boolean"
+    },
+    "snapshot_age_secs": {
+      "type": "number",
+      "format": "double"
+    },
+    "stale": {
+      "type": "boolean"
+    },
+    "totals": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentTotals"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "daemon",
+    "agents",
+    "by_issue",
+    "snapshot_age_secs",
+    "stale",
+    "refresh_error"
+  ],
+  "$defs": {
+    "AgentRow": {
+      "description": "One `/api/agents` row. Mailboxes (`inbox: true`) carry the unread\nfields; workers carry the rest of the optional ones.",
+      "type": "object",
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "catalogue": {
+          "description": "A hire's catalogue identity (workers only).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dead": {
+          "type": "boolean"
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort_applicable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "effort_reported": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endpoint_kind": {
+          "type": "string"
+        },
+        "event_cursor": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "fenced": {
+          "type": "boolean"
+        },
+        "group": {
+          "type": "string"
+        },
+        "group_root": {
+          "type": "boolean"
+        },
+        "inbox": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_activity": {
+          "description": "Epoch seconds, or ISO text from older observations."
+        },
+        "look": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "description": "The first running message, reduced.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunningMessage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "description": "Provider evidence: the reported effective value beside launch config.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_configured": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_lookup_role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_reported": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_selection": true,
+        "model_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "oldest_unread_age_secs": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "on": {
+          "description": "Issue ids bound through jobs — exact, not text-derived.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "parked": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "queued": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "quota": {
+          "description": "Optional account/pool allowance views; null means unavailable."
+        },
+        "recovery": {
+          "description": "The daemon's fence text, which names the recovery commands.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resume": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resume_hint": {
+          "description": "When `resume` applies.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "running": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "running_messages": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/RunningMessage"
+          }
+        },
+        "silent_secs": {
+          "description": "Seconds since the running turn's last observed activity.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "stalled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "state": {
+          "type": "string"
+        },
+        "state_label": {
+          "description": "`stopped (auto, idle 72m)` when the idle timer stopped it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentTask"
+          }
+        },
+        "team_role": {
+          "description": "Model-preference role, independent of the runtime `role`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unknown": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "unread": {
+          "description": "Mailboxes only: the unread backlog and its oldest age.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "usage_limit": true
+      },
+      "required": [
+        "alias",
+        "provider",
+        "endpoint_kind",
+        "state",
+        "group",
+        "group_root",
+        "running",
+        "queued",
+        "unknown",
+        "parked",
+        "fenced",
+        "on",
+        "tasks",
+        "dead"
+      ]
+    },
+    "AgentTask": {
+      "description": "One task bound to an agent through a job.",
+      "type": "object",
+      "properties": {
+        "issue": {
+          "type": "string"
+        },
+        "job": {
+          "type": "string"
+        },
+        "job_state": {
+          "type": "string"
+        },
+        "job_title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunningMessage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "task": {
+          "type": "string"
+        },
+        "task_state": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "task",
+        "task_state",
+        "issue",
+        "job",
+        "job_state"
+      ]
+    },
+    "AgentTotals": {
+      "type": "object",
+      "properties": {
+        "fenced": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "inboxes": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "parked": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "queued": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "running": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "running",
+        "queued",
+        "fenced",
+        "parked",
+        "inboxes"
+      ]
+    },
+    "CardAgent": {
+      "description": "One bound agent on an issue card or drawer — from the job binding.",
+      "type": "object",
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "message": {
+          "description": "Running kickoff message id for this task, if live.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resume": {
+          "description": "Concrete resume command for a stopped pane.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        },
+        "task_state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "alias",
+        "task",
+        "task_state",
+        "state"
+      ]
+    },
+    "DaemonReach": {
+      "type": "string",
+      "enum": [
+        "reachable",
+        "unreachable"
+      ]
+    },
+    "RunningMessage": {
+      "description": "A running kickoff reduced to what the board shows.",
+      "type": "object",
+      "properties": {
+        "created": {
+          "description": "Epoch seconds (the daemon serializes `Message.created` as f64).",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ]
+    }
+  }
+}

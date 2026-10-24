@@ -39,9 +39,7 @@ use std::time::{Duration, Instant, SystemTime};
 use cadence_core::board_api::{Freshness, IssueListItem};
 use serde_json::{json, Value};
 
-use super::{
-    agents_payload_from, board_job_list, dir_mtime, event_resources, value_fp,
-};
+use super::{agents_payload_from, board_job_list, dir_mtime, event_resources, value_fp};
 use crate::client;
 use crate::issue::{board, model, plan, project, work, write as issue_write, Pm};
 use crate::overview;
@@ -534,9 +532,10 @@ impl BoardRead {
     /// the issue's agent strip.
     pub fn card_item(&self, ctx: &work::Ctx, v: &board::View) -> IssueListItem {
         let id = &v.issue.front.id;
-        let rev = self.revs.get(id).cloned().unwrap_or_else(|| {
-            crate::issue::write::issue_rev(&v.issue.dir).unwrap_or_default()
-        });
+        let rev =
+            self.revs.get(id).cloned().unwrap_or_else(|| {
+                crate::issue::write::issue_rev(&v.issue.dir).unwrap_or_default()
+            });
         IssueListItem {
             card: board::card_rev(v, &rev),
             work: work::item_block(ctx, v),
@@ -1669,7 +1668,9 @@ impl Model {
 
 /// Adds the keys of the freshness object `fresh` to the JSON object `into`.
 pub(super) fn merge_freshness(into: &mut Value, fresh: &Freshness) {
-    if let (Some(into), Ok(Value::Object(fresh))) = (into.as_object_mut(), serde_json::to_value(fresh)) {
+    if let (Some(into), Ok(Value::Object(fresh))) =
+        (into.as_object_mut(), serde_json::to_value(fresh))
+    {
         into.extend(fresh);
     }
 }
@@ -1741,8 +1742,10 @@ mod tests {
                 issue("broken", "BRK-1", "backlog", None),
             ],
         );
-        let by_id: HashMap<String, &board::View> =
-            views.iter().map(|v| (v.issue.front.id.clone(), v)).collect();
+        let by_id: HashMap<String, &board::View> = views
+            .iter()
+            .map(|v| (v.issue.front.id.clone(), v))
+            .collect();
         let work = |error: Option<&str>, unapproved: Option<&str>| work::ProjectWork {
             cfg: work::WorkConfig::default(),
             error: error.map(str::to_string),

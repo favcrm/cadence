@@ -8,7 +8,8 @@ use std::sync::{MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use cadence_core::board_api::{
-    AgentRow, AgentTask, AgentTotals, AgentsPayload, CardAgent, DaemonReach, MetaDaemon, MetaResponse, RunningMessage,
+    AgentRow, AgentTask, AgentTotals, AgentsPayload, CardAgent, DaemonReach, MetaDaemon,
+    MetaResponse, RunningMessage,
 };
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};

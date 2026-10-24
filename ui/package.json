@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "node scripts/check-module-names.mjs && vite build && node scripts/build-app-fixtures.mjs",
     "test:url-state": "bun run test",
+    "gen:board-api": "node scripts/gen-board-api-types.mjs",
     "typecheck": "tsrs --noEmit",
     "lint": "oxlint --deny-warnings src tests scripts screen-ui acceptance vite.config.ts",
     "preview": "vite preview",

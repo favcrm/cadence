@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MetaResponse",
+  "description": "`GET /api/meta`: what this client may do and who writes credit to, plus\nthe build identity of the serving binary and the daemon's.",
+  "type": "object",
+  "properties": {
+    "actor": {
+      "type": "string"
+    },
+    "anonymous_reads": {
+      "description": "Explicit local unsigned-read policy.",
+      "type": "boolean"
+    },
+    "build_commit": {
+      "type": "string"
+    },
+    "build_time": {
+      "type": "string"
+    },
+    "daemon": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MetaDaemon"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "delivery_sync": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DeliverySyncMeta"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "device_login": {
+      "type": "boolean"
+    },
+    "hosted": {
+      "type": "boolean"
+    },
+    "login_hint": {
+      "description": "The command that signs this origin in.",
+      "type": "string"
+    },
+    "operator": {
+      "description": "Only with `?operator=1`; `null` is unknown, never a non-operator.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "platform_account_configured": {
+      "type": "boolean"
+    },
+    "read_only": {
+      "type": "boolean"
+    },
+    "session": {
+      "description": "The live session (`{id, origin, user, created, ..}`), or null."
+    },
+    "signed_in": {
+      "description": "A live session; `null` when the check could not answer in budget.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "tab_signed_out": {
+      "type": "boolean"
+    },
+    "tailnet_proof": {
+      "description": "How a tailnet proxy request was proven, or null."
+    },
+    "tailnet_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "read_only",
+    "anonymous_reads",
+    "hosted",
+    "login_hint",
+    "device_login",
+    "tab_signed_out",
+    "actor",
+    "platform_account_configured",
+    "version",
+    "build_commit",
+    "build_time"
+  ],
+  "$defs": {
+    "DeliverySyncMeta": {
+      "description": "The `gh` this board's delivery sync runs, fixed at start.",
+      "type": "object",
+      "properties": {
+        "every_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "gh": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "gh_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "every_secs"
+      ]
+    },
+    "MetaDaemon": {
+      "description": "The daemon's build, when it answered inside the metadata budget.",
+      "type": "object",
+      "properties": {
+        "build_commit": {
+          "type": "string"
+        },
+        "build_time": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "build_commit",
+        "build_time",
+        "started_at"
+      ]
+    }
+  }
+}

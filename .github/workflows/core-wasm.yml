@@ -7,6 +7,7 @@ on:
     paths:
       - "crates/cadence-core/**"
       - "contracts/cadence-core/**"
+      - "contracts/board-api/**"
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/core-wasm.yml"
@@ -40,6 +41,7 @@ jobs:
           mkdir -p dist
           cp target/wasm32-unknown-unknown/release/cadence_core.wasm dist/core.wasm
           cp contracts/cadence-core/v1/*.schema.json dist/
+          for f in contracts/board-api/v1/*.schema.json; do cp "$f" "dist/board-api-$(basename "$f")"; done
           (cd dist && sha256sum core.wasm > core.wasm.sha256)
           echo "contract version: v1" | tee dist/CONTRACT_VERSION
           cat dist/core.wasm.sha256
