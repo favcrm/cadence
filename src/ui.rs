@@ -62,6 +62,7 @@ mod lifecycle;
 mod locale;
 mod login;
 mod member_assist;
+mod member_view;
 mod my_work;
 mod notify_service;
 mod operator;

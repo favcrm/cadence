@@ -12,6 +12,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use super::artifacts;
 use super::human_threads;
+use super::member_view::{member_event, member_running_item, redact_agents_payload};
 use super::notify_service;
 use super::setup::{board_boot_agent_uid, setup_get, setup_refusal, WRITE_LOCK};
 use super::stream::stream_events;
@@ -654,132 +655,6 @@ pub(crate) fn running_json(m: &Value) -> Value {
     })
 }
 
-/// CAD-1767: a running message as a non-operator may see it - ONE
-/// allowlist of non-content fields (id, state, task id, created), applied
-/// to a raw daemon message (`task_id`) and to an already-reduced item
-/// (`task`) alike. No `summary` and nothing else, so a field added to the
-/// message later is dropped by default.
-pub(crate) fn member_running_item(item: &Value) -> Value {
-    json!({
-        "id": item["id"],
-        "state": "running",
-        "task": if item["task"].is_null() { &item["task_id"] } else { &item["task"] },
-        "created": item["created"],
-    })
-}
-
-/// The fleet-row fields a non-operator keeps: identity, runtime state,
-/// counts, model and effort facts, ids and timing - what the roster, the
-/// cards and the agent page read. Any field not named here is dropped, so a
-/// field added to the row later stays hidden from members by default.
-const MEMBER_ROW_FIELDS: &[&str] = &[
-    "alias",
-    "provider",
-    "endpoint_kind",
-    "role",
-    "team_role",
-    "catalogue",
-    "look",
-    "kind",
-    "model_selection",
-    "model_lookup_role",
-    "model",
-    "model_reported",
-    "model_configured",
-    "model_source",
-    "effort",
-    "effort_reported",
-    "effort_source",
-    "effort_applicable",
-    "quota",
-    "usage_limit",
-    "state",
-    "group",
-    "group_root",
-    "running",
-    "queued",
-    "unread",
-    "oldest_unread_age_secs",
-    "unknown",
-    "parked",
-    "fenced",
-    "on",
-    "recovery",
-    "resume",
-    "resume_hint",
-    "dead",
-    "inbox",
-    "last_activity",
-    "silent_secs",
-    "stalled",
-    "state_label",
-    "event_cursor",
-];
-
-/// A bound task as a non-operator sees it: ids, states and titles, with
-/// its running kickoff reduced to the one running-item allowlist.
-const MEMBER_TASK_FIELDS: &[&str] = &[
-    "task",
-    "task_state",
-    "title",
-    "issue",
-    "job",
-    "job_title",
-    "job_state",
-];
-
-fn member_message(item: &Value) -> Value {
-    if item.is_object() {
-        member_running_item(item)
-    } else {
-        Value::Null
-    }
-}
-
-/// CAD-1767: one fleet row rebuilt for a non-operator from the allowlists
-/// above - never patched from the full row.
-pub(crate) fn member_agent_row(row: &Value) -> Value {
-    let mut out = serde_json::Map::new();
-    for key in MEMBER_ROW_FIELDS {
-        if let Some(value) = row.get(*key) {
-            out.insert((*key).to_string(), value.clone());
-        }
-    }
-    out.insert("message".to_string(), member_message(&row["message"]));
-    if let Some(items) = row["running_messages"].as_array() {
-        out.insert(
-            "running_messages".to_string(),
-            Value::Array(items.iter().map(member_running_item).collect()),
-        );
-    }
-    if let Some(tasks) = row["tasks"].as_array() {
-        let rebuilt: Vec<Value> = tasks
-            .iter()
-            .map(|task| {
-                let mut t = serde_json::Map::new();
-                for key in MEMBER_TASK_FIELDS {
-                    if let Some(value) = task.get(*key) {
-                        t.insert((*key).to_string(), value.clone());
-                    }
-                }
-                t.insert("message".to_string(), member_message(&task["message"]));
-                Value::Object(t)
-            })
-            .collect();
-        out.insert("tasks".to_string(), Value::Array(rebuilt));
-    }
-    Value::Object(out)
-}
-
-/// The fleet payload for a non-operator: every row rebuilt.
-pub(crate) fn redact_agents_payload(payload: &mut Value) {
-    if let Some(rows) = payload["agents"].as_array_mut() {
-        for row in rows.iter_mut() {
-            *row = member_agent_row(row);
-        }
-    }
-}
-
 pub(crate) fn agent_activity_seconds(value: &Value) -> Option<f64> {
     let seconds = if let Some(seconds) = value.as_f64() {
         seconds
@@ -845,57 +720,6 @@ pub(crate) fn agent_events_tail(
         .into_iter()
         .filter(|e| e["seq"].as_i64().unwrap_or(0) > cursor - n)
         .collect())
-}
-
-/// CAD-1767: what a non-operator may see of one event - an ALLOWLIST, so
-/// anything a payload gains later is dropped by default. Top level: the
-/// ids, kind and time. Payload: only these scalar fields; every other one
-/// (`result`, `text`, `body`, `before`/`after`, …) is dropped.
-const MEMBER_EVENT_FIELDS: &[&str] = &["seq", "alias", "kind", "job_id", "task_id", "at"];
-const MEMBER_EVENT_PAYLOAD: &[&str] = &[
-    "message",
-    "turn_id",
-    "state",
-    "status",
-    "disposition",
-    "reason",
-    "error",
-];
-
-/// A short machine code (`snake_case`, no spaces): the only form of
-/// `error` / `reason` a non-operator keeps. Free text - a provider's own
-/// message, a sentence - is dropped, because it can quote message content.
-fn is_machine_code(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b':' | b'-')
-        })
-}
-
-pub(crate) fn member_event(event: &Value) -> Value {
-    let mut out = serde_json::Map::new();
-    for key in MEMBER_EVENT_FIELDS {
-        if let Some(value) = event.get(*key) {
-            out.insert((*key).to_string(), value.clone());
-        }
-    }
-    let mut payload = serde_json::Map::new();
-    if let Some(fields) = event["payload"].as_object() {
-        for key in MEMBER_EVENT_PAYLOAD {
-            match fields.get(*key) {
-                Some(value) if value.is_object() || value.is_array() => {}
-                Some(Value::String(text))
-                    if matches!(*key, "error" | "reason") && !is_machine_code(text) => {}
-                Some(value) => {
-                    payload.insert((*key).to_string(), value.clone());
-                }
-                None => {}
-            }
-        }
-    }
-    out.insert("payload".to_string(), Value::Object(payload));
-    Value::Object(out)
 }
 
 /// What the board needs from the daemon — agent rows enriched with the
