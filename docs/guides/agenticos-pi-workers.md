@@ -2,8 +2,9 @@
 
 Hosted startup supplies AgenticOS's model catalog to the master. Pi workers
 use separate private configuration directories, so they need their own catalog
-before Pi starts. For the explicit model `agenticos/z-ai/glm-5.3-flash`, Cadence
-checks `<state>/master/pi/models.json` against its reviewed AgenticOS
+before Pi starts. For the platform default alias `agenticos/default` (and any
+explicit legacy pin the catalog retains), Cadence checks
+`<state>/master/pi/models.json` against its reviewed AgenticOS
 provider definition and writes only that definition to the worker's private
 `models.json` at mode 0600. Every open refreshes this daemon-owned file.
 

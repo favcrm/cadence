@@ -231,9 +231,11 @@ fn check_model_id(model: &str) -> Result<()> {
 /// `[pi].models.default`; else refuse — pi's own fallback chain is
 /// never used. The winner must be on `models.allow`.
 /// CAD-1176: the model a hosted boot falls back to when the policy resolves
-/// nothing for a role. The hosted image ships the same id as its Pi default
-/// (`hosted.sh` pi_model); `CADENCE_PLATFORM_MODEL` overrides it.
-pub const PLATFORM_DEFAULT_MODEL: &str = "agenticos/z-ai/glm-5.3-flash";
+/// nothing for a role. The id is the AgenticOS gateway's stable alias, never a
+/// concrete model: the platform's published `generate_text` route owns which
+/// model actually runs, so Cadence holds no implicit model default.
+/// `CADENCE_PLATFORM_MODEL` overrides it.
+pub const PLATFORM_DEFAULT_MODEL: &str = "agenticos/default";
 
 fn platform_default_model() -> String {
     std::env::var("CADENCE_PLATFORM_MODEL")
@@ -1017,6 +1019,13 @@ mod tests {
         );
         let policy = read(&pm).unwrap();
         let p = policy.as_ref();
+        // The platform fallback is the gateway's stable alias: the platform
+        // DB picks the model, so no concrete id is Cadence's default.
+        assert_eq!(PLATFORM_DEFAULT_MODEL, "agenticos/default");
+        assert_eq!(
+            resolve_model(None, "worker", None).unwrap(),
+            "agenticos/default"
+        );
         assert_eq!(resolve_model(p, "worker", Some("a/m1")).unwrap(), "a/m1");
         // The role default fills an absent explicit choice; a pm-role
         // agent shares the worker default.
