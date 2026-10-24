@@ -186,7 +186,10 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
         frame.setAttribute("sandbox", "allow-scripts");
         frame.referrerPolicy = "no-referrer";
         frame.style.cssText = "display:block;width:100%;height:100%;border:0;min-height:0";
-        frame.src = receipt.mount;
+        // The frame URL is what survives a restart or a reload, so the pick
+        // rides there too: a cap minted before the theme existed still gets
+        // the right document. `system` stays query-less (the OS decides).
+        frame.src = frameTheme ? `${receipt.mount}?theme=${frameTheme}` : receipt.mount;
         // The container has no earlier frame: previous layout cleanup removed it.
         container.current.replaceChildren(frame);
         if (!frame.contentWindow) { pending = { kind: "frame_unavailable" }; throw new Error("Screen frame unavailable"); }
