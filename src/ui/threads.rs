@@ -227,35 +227,6 @@ fn cursor_arg(raw: Option<String>, what: &str) -> std::result::Result<i64, HttpR
     }
 }
 
-/// CAD-1767: what a non-operator reader of a thread page may see. Members
-/// read agent threads, but never the operator-only entries
-/// (`store::operator_only_kind`: artifact cards, hire proposals) and never
-/// the master's Home conversation. Fail closed: only a proven operator
-/// gets the page whole. Whether this is the master's Home is decided from the
-/// DAEMON's reply (the resolved `alias` and the thread's `install_id`), never
-/// from the URL's spelling: an absent field counts as Home. It edits `page`
-/// in place; the stream collects the page's seqs itself so its cursor still
-/// advances past what was hidden.
-fn member_view(page: &mut Value) {
-    let resolved_master = page["alias"].as_str().is_none_or(crate::master::is_master);
-    let home = resolved_master
-        && page["thread"].as_object().is_none_or(|t| {
-            t.get("install_id")
-                .is_none_or(|i| i.is_null() || i.as_str() == Some(crate::store::RECRUIT_INSTALL))
-        });
-    if let Some(entries) = page["entries"].as_array_mut() {
-        entries.retain(|e| {
-            !home
-                && !e["kind"]
-                    .as_str()
-                    .is_some_and(crate::store::operator_only_kind)
-        });
-    }
-    if home {
-        page["thread"] = Value::Null;
-    }
-}
-
 /// `GET /api/threads/<alias>` — one page after `after`. `operator` is the
 /// board's proven-operator verdict for this request; anything else gets the
 /// member view ([`member_view`]).
@@ -313,7 +284,7 @@ pub(super) fn read(
     match client::rpc(state_dir, "thread_read", params) {
         Ok(mut page) => {
             if !operator {
-                member_view(&mut page);
+                super::member_view::member_view(&mut page);
             }
             json_response(page)
         }
@@ -381,7 +352,7 @@ pub(super) fn stream(
             Ok(mut state) => {
                 // CAD-1767: a non-operator never gets the operator's turn text.
                 if !operator {
-                    super::home::redact_master_state(&mut state);
+                    super::member_view::redact_master_state(&mut state);
                 }
                 Some(state)
             }
@@ -436,7 +407,7 @@ pub(super) fn stream(
                     .map(|rows| rows.iter().filter_map(|e| e["seq"].as_i64()).collect())
                     .unwrap_or_default();
                 if !operator {
-                    member_view(&mut page);
+                    super::member_view::member_view(&mut page);
                 }
                 let entries = page["entries"].as_array().cloned().unwrap_or_default();
                 if entries.is_empty() && !frame(&mut w, b": ping\n\n") {

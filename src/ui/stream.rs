@@ -146,7 +146,7 @@ fn redact_agent_frame(frame: &str) -> Option<String> {
     let (head, tail) = frame.split_once("\ndata: ")?;
     let mut data: Value = serde_json::from_str(tail.trim()).ok()?;
     if let Some(row) = data.get_mut("agent") {
-        *row = super::serve::member_agent_row(row);
+        *row = super::member_view::member_agent_row(row);
     }
     Some(format!("{head}\ndata: {data}\n\n"))
 }
