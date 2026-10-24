@@ -1783,10 +1783,9 @@ button.refchip:hover {
 
 .chat-scroll {
   overscroll-behavior: contain;
-  /* CAD-1533: the tail clearance the CAD-600 dock left at 12px — one
-     step of the chat's 4/8/12/16/20 scale, so the last line separates
-     from the composer card. */
-  padding-bottom: calc(var(--dock-h, 7rem) + 1.25rem);
+  /* CAD-1533/1799: the tail clearance — 28px, past the 24px fade band
+     below, so the last line separates from the composer card. */
+  padding-bottom: calc(var(--dock-h, 7rem) + 1.75rem);
   /* The 24px band above the dock fades: a line clipped by the composer
      reads as continuing instead of colliding with its top edge. */
   -webkit-mask-image: linear-gradient(
@@ -1810,7 +1809,7 @@ button.refchip:hover {
     --need-clear: 4rem;
   }
   .chat-scroll {
-    padding-bottom: calc(var(--dock-h, 7rem) + 1.25rem + var(--need-clear));
+    padding-bottom: calc(var(--dock-h, 7rem) + 1.75rem + var(--need-clear));
   }
   /* The pill was centred in the same band as Needs-you, so the two hit
      targets overlapped. It sits above that band; the thread padding

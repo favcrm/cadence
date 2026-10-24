@@ -34,6 +34,17 @@ equal(
   "stopped",
   "stopped worker remains discoverable",
 );
+// A stopped master holding queued mail is "Dead — holding work" and must
+// also count under Stopped: row state and tab count share one classification.
+const deadHolding = { ...base, state: "stopped", queued: 1 };
+equal(category(deadHolding), "stopped", "stopped with queued mail");
+equal(lifecycleOf(deadHolding), "dead-holding", "dead-holding row");
+equal(agentMatchesFilter(deadHolding, "stopped"), true, "Stopped tab counts it");
+equal(agentMatchesFilter(deadHolding, "working"), false, "not working");
+equal(category({ state: "idle", dead: true }), "idle", "dead idle, no work");
+equal(category({ state: "busy", dead: true }), "working", "dead busy, no work");
+equal(agentMatchesFilter({ ...base, state: "idle", dead: true }, "current"), true, "dead idle stays Current");
+equal(category({ state: "stopped", running: 1 }), "working", "running outranks stopped");
 equal(
   category({ state: "starting" }),
   "working",

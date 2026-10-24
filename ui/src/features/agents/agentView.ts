@@ -31,6 +31,10 @@ export function agentCategory(a: Agent): AgentCategory {
   )
     return "attention";
   if (a.inbox || a.provider === "inbox") return "inbox";
+  // A dead-holding-work row is stopped, so the Stopped tab agrees with
+  // its "Dead — holding work" state. A dead agent holding nothing keeps
+  // its own category.
+  if (agentHoldsWorkButDead(a) && a.running === 0) return "stopped";
   if (
     a.running > 0 ||
     a.queued > 0 ||
@@ -62,14 +66,13 @@ export function agentMatchesFilter(a: Agent, filter: AgentFilter): boolean {
  * or undelivered mail. Everything else is a live agent parked on work or
  * an ordinary row. */
 export function agentHoldsWorkButDead(a: Agent): boolean {
-  const live =
-    !a.dead &&
-    !a.fenced &&
-    a.state !== "stopped" &&
-    a.state !== "dead";
   const holds =
     (a.tasks?.length ?? 0) > 0 || a.on.length > 0 || a.queued > 0;
-  return !live && holds;
+  return !agentIsLive(a) && holds;
+}
+
+function agentIsLive(a: Agent): boolean {
+  return !a.dead && !a.fenced && a.state !== "stopped" && a.state !== "dead";
 }
 
 export type AgentLifecycle =

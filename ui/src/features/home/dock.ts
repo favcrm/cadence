@@ -29,6 +29,17 @@ export function tailTop(scrollHeight: number, clientHeight: number): number {
   return Math.max(0, scrollHeight - clientHeight);
 }
 
+/** The scroller itself resized (window height, a notice mounting above
+ *  it): re-pin only when the reader was on the tail BEFORE the change —
+ *  a measurement after a shrink is already short of the tail. */
+export function repinOnResize(
+  wasOnTail: boolean,
+  prevClientHeight: number,
+  clientHeight: number,
+): boolean {
+  return wasOnTail && prevClientHeight !== clientHeight;
+}
+
 /** The jump pill's words: the count rides along while there is one.
  *  `t` translates each phrase (default: English), so the two surfaces
  *  that show this pill — Home and the app-pane chat — share one wording

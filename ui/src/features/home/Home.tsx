@@ -24,7 +24,7 @@ import {
 import { useCanvasFeed } from "../canvas/feed";
 import Composer from "./Composer";
 import type { AttachDestination } from "../app-shell/chat/attach";
-import { atTail, jumpLabel, tailTop } from "./dock";
+import { atTail, jumpLabel, repinOnResize, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
 import NeedsRail from "./NeedsRail";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
@@ -874,10 +874,14 @@ function MasterHome({
     },
     [engage],
   );
+  // The last on-tail state seen by the scroll handler, for the scroller's
+  // own resize observer below.
+  const onTailRef = useRef(true);
   const onPanelScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
     const near = atTail(el.scrollTop, el.scrollHeight, el.clientHeight);
+    onTailRef.current = near;
     if (near) setActivity(false);
     applyFollow(onViewportScroll(follow.current, near));
   }, []);
@@ -956,6 +960,23 @@ function MasterHome({
     return () => ro.disconnect();
   }, [scrollPanel, items.length, nameRowShown, turn.kind, cmds.length]);
 
+  // The scroller's own box shrinking (a shorter window, a notice mounting
+  // above it) leaves the tail under the dock: re-pin when the reader was
+  // on the tail before the change, never when they scrolled up.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let prev = el.clientHeight;
+    const ro = new ResizeObserver(() => {
+      const next = el.clientHeight;
+      const repin = repinOnResize(onTailRef.current, prev, next);
+      prev = next;
+      if (repin) scrollPanel("jump");
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [scrollPanel]);
+
   // The dock's measured height is the thread's bottom padding and the
   // pill's floor (`--dock-h`, styles.css); while pinned, a growing dock
   // (a longer draft, a wrapped hint) keeps the tail in view.
@@ -963,8 +984,12 @@ function MasterHome({
     const dock = dockRef.current;
     if (!dock || typeof ResizeObserver === "undefined") return;
     const apply = () => {
+      // Judge "on the tail" before the new padding lands: a strip that
+      // appears (Queued) must not push the last bubble under the dock.
+      const el = scrollRef.current;
+      const onTail = el ? atTail(el.scrollTop, el.scrollHeight, el.clientHeight) : false;
       document.documentElement.style.setProperty("--dock-h", `${dock.offsetHeight}px`);
-      if (follow.current.pinned) scrollPanel("jump");
+      if (follow.current.pinned || onTail) scrollPanel("jump");
     };
     const ro = new ResizeObserver(apply);
     ro.observe(dock);

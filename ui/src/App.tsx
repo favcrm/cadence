@@ -412,7 +412,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     });
   }, [loadDetail, recheck]);
   const retryAccess = useCallback(() => { void recheck(); }, [recheck]);
-  const metaUnavailable = meta.operator === null || meta.operator === undefined;
+  // An unsigned reader (admitted only by --allow-anonymous-reads) is a
+  // resolved non-operator: the server omits `operator` for it. Only a
+  // claimed session whose proof is missing is genuinely unavailable.
+  const anonymousReader = meta.signed_in === false;
+  const metaUnavailable = !anonymousReader && (meta.operator === null || meta.operator === undefined);
   const [recheckFinished, setRecheckFinished] = useState(false);
   useEffect(() => {
     setRecheckFinished(false);
@@ -798,7 +802,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // grant; both unknowns and every failure grant nothing.
   const viewer = {
     readOnly,
-    operator: meta?.operator ?? null,
+    operator: meta?.operator ?? (anonymousReader ? false : null),
     access: metaUnavailable ? ("unavailable" as const) : ("checking" as const),
     onRetryAccess: retryAccess,
     screenReader,
