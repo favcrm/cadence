@@ -1,7 +1,7 @@
 //! CAD-1792: the typed board-API bodies serialize to the same bytes the
 //! `json!` builders did. Each golden is the pretty body captured from the
 //! pre-typing code; `CADENCE_WRITE_GOLDEN=1` rewrites them.
-use super::member_view::redact_agents_payload;
+use super::member_view::{member_view, redact_agents_payload, redact_master_state};
 use super::serve::agents_payload_from;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -88,6 +88,37 @@ fn agents_payload_bytes_are_unchanged() {
         "agents_no_jobs.json",
         &agents_payload_from(dir.path(), Some(roster()), None),
     );
+}
+
+/// CAD-1795: what a member sees of the daemon's `master_state` and
+/// `thread_read` replies, redacted from the operator goldens the daemon
+/// producers are pinned to (`daemon::board_producer_golden`).
+#[test]
+fn member_views_of_master_state_and_threads_are_unchanged() {
+    let read = |name: &str| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/ui/board_api_golden")
+            .join(name);
+        parse(&std::fs::read_to_string(path).unwrap())
+    };
+    for name in ["idle", "queued", "running"] {
+        let mut state = read(&format!("master_state_{name}.json"));
+        redact_master_state(&mut state);
+        golden(&format!("master_state_{name}_member.json"), &state);
+    }
+    for name in ["forward", "tail"] {
+        let mut page = read(&format!("thread_page_{name}.json"));
+        member_view(&mut page);
+        golden(&format!("thread_page_{name}_member.json"), &page);
+    }
+    // A worker's thread: members keep its entries, minus the operator-only kinds.
+    let mut worker = read("thread_page_forward.json");
+    worker["alias"] = Value::from("w1");
+    let mut hire = worker["entries"][0].clone();
+    hire["kind"] = Value::from("hire_proposal");
+    worker["entries"].as_array_mut().unwrap().push(hire);
+    member_view(&mut worker);
+    golden("thread_page_worker_member.json", &worker);
 }
 
 /// `/api/meta`: the typed body equals the `json!` literal it replaced

@@ -1,0 +1,31 @@
+{
+  "alias": "master",
+  "commands": [],
+  "context": null,
+  "effort": "high",
+  "endpoint_kind": "managed",
+  "live": false,
+  "model": "fixture/model",
+  "model_label": null,
+  "provider": "pi",
+  "queue": [
+    {
+      "conversation": "THREAD",
+      "message": "m-q1"
+    },
+    {
+      "conversation": "THREAD",
+      "message": "m-q2"
+    }
+  ],
+  "queued": 2,
+  "session": null,
+  "turn": {
+    "app_origin": null,
+    "conversation": "THREAD",
+    "message": "m-run",
+    "since": 110.25,
+    "state": "working",
+    "summary": "hello m-run"
+  }
+}

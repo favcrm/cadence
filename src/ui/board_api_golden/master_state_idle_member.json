@@ -1,0 +1,15 @@
+{
+  "alias": "master",
+  "commands": [],
+  "context": null,
+  "effort": "high",
+  "endpoint_kind": "managed",
+  "live": false,
+  "model": "fixture/model",
+  "model_label": null,
+  "provider": "pi",
+  "queue": [],
+  "queued": 0,
+  "session": null,
+  "turn": null
+}
