@@ -62,8 +62,9 @@ function timeAgo(createdAt: number): string {
   return hours < 24 ? `${hours}h ago` : `${Math.floor(hours / 24)}d ago`;
 }
 
-function readString(input: Record<string, unknown>, key: string): string {
-  const value = input[key];
+function readString(input: unknown, key: string): string {
+  if (!input || typeof input !== "object") return "";
+  const value = (input as Record<string, unknown>)[key];
   return typeof value === "string" ? value : "";
 }
 
@@ -106,15 +107,19 @@ async function readActions(signal: AbortSignal): Promise<StagedAction[]> {
       body?.error?.message ?? "The decisions list could not be read.",
     );
   if (!Array.isArray(body?.actions)) throw new DecisionsError(502, "invalid_response", "The decisions list was invalid.");
-  return body.actions.filter(
-    (value): value is StagedAction =>
-      !!value &&
-      typeof value === "object" &&
-      typeof (value as StagedAction).id === "string" &&
-      typeof (value as StagedAction).tool === "string" &&
-      typeof (value as StagedAction).createdAt === "number" &&
-      ["pending", "approved", "denied"].includes((value as StagedAction).status),
-  );
+  return body.actions.filter((value): value is StagedAction => {
+    if (!value || typeof value !== "object") return false;
+    const action = value as Partial<StagedAction>;
+    return (
+      typeof action.id === "string" &&
+      typeof action.tool === "string" &&
+      typeof action.createdAt === "number" &&
+      !!action.input &&
+      typeof action.input === "object" &&
+      !Array.isArray(action.input) &&
+      ["pending", "approved", "denied"].includes(action.status ?? "")
+    );
+  });
 }
 
 async function decide(id: string, decision: "approve" | "deny"): Promise<void> {
@@ -260,6 +265,14 @@ export default function DecisionsPanel() {
   useEffect(() => {
     document.body.toggleAttribute("data-decisions-open", open);
     return () => document.body.removeAttribute("data-decisions-open");
+  }, [open]);
+
+  // A full-screen drawer must take focus, or the keyboard path stays on the
+  // page behind it. On the wide side-by-side layout the trigger remains a
+  // valid focus anchor and the drawer is non-modal.
+  useEffect(() => {
+    if (!open || window.innerWidth > 900) return;
+    drawer.current?.querySelector<HTMLButtonElement>(".decisions-close")?.focus();
   }, [open]);
 
   useEffect(() => {
