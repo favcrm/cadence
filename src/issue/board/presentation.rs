@@ -25,8 +25,13 @@ pub fn card_json(view: &View) -> Value {
 /// [`card_json`] with the `rev` token supplied — the board's read model
 /// hashes `issue.md` once per change instead of once per card render.
 pub fn card_json_rev(view: &View, rev: &str) -> Value {
+    serde_json::to_value(card_rev(view, rev)).expect("issue card serializes")
+}
+
+/// The typed card with its `rev` token supplied.
+pub fn card_rev(view: &View, rev: &str) -> IssueCard {
     let f = &view.issue.front;
-    let card = IssueCard {
+    IssueCard {
         id: f.id.clone(),
         project: view.issue.project.clone(),
         title: f.title.clone(),
@@ -58,8 +63,7 @@ pub fn card_json_rev(view: &View, rev: &str) -> Value {
             done: view.checks_done,
             total: view.checks_total,
         },
-    };
-    serde_json::to_value(card).expect("issue card serializes")
+    }
 }
 
 /// One epic — an issue with children — with its children's progress:

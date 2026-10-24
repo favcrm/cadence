@@ -86,7 +86,7 @@ export function Links({
             </dt>
             <dd
               className="text-secondary min-w-0 truncate"
-              title={r.url ?? r.path ?? r.label}
+              title={r.url ?? r.path ?? r.label ?? undefined}
             >
               {r.url ? (
                 <SafeLink className="lnk" href={r.url}>

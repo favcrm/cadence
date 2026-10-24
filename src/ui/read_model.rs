@@ -36,11 +36,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
+use cadence_core::board_api::{Freshness, IssueListItem};
 use serde_json::{json, Value};
 
-use super::{
-    agents_payload_from, board_job_list, dir_mtime, event_resources, value_fp, with_agents,
-};
+use super::{agents_payload_from, board_job_list, dir_mtime, event_resources, value_fp};
 use crate::client;
 use crate::issue::{board, model, plan, project, work, write as issue_write, Pm};
 use crate::overview;
@@ -507,7 +506,7 @@ pub(super) struct BoardRead {
     pub approvals: Arc<work::Approvals>,
     /// Age, staleness and refresh error of the daemon snapshot behind
     /// this read — the same keys `/api/agents` and the stream carry.
-    pub freshness: Value,
+    pub freshness: Freshness,
     pm_dir: PathBuf,
 }
 
@@ -531,14 +530,21 @@ impl BoardRead {
 
     /// The `/api/issues` card: `work::card_json` with the indexed rev and
     /// the issue's agent strip.
-    pub fn card(&self, ctx: &work::Ctx, v: &board::View) -> Value {
+    pub fn card_item(&self, ctx: &work::Ctx, v: &board::View) -> IssueListItem {
         let id = &v.issue.front.id;
-        let mut card = match self.revs.get(id) {
-            Some(rev) => board::card_json_rev(v, rev),
-            None => board::card_json(v),
-        };
-        card["work"] = work::item_json(ctx, v);
-        with_agents(card, &self.by_issue, id)
+        let rev =
+            self.revs.get(id).cloned().unwrap_or_else(|| {
+                crate::issue::write::issue_rev(&v.issue.dir).unwrap_or_default()
+            });
+        IssueListItem {
+            card: board::card_rev(v, &rev),
+            work: work::item_block(ctx, v),
+            agents: self.by_issue.get(id).cloned(),
+        }
+    }
+
+    pub fn card(&self, ctx: &work::Ctx, v: &board::View) -> Value {
+        serde_json::to_value(self.card_item(ctx, v)).expect("issue card serializes")
     }
 }
 
@@ -1062,20 +1068,20 @@ impl Model {
         if snap.agents_down || lock(&self.daemon).daemon_down {
             agents["daemon"] = json!("unreachable");
         }
-        merge_freshness(&mut agents, self.freshness(snap));
+        merge_freshness(&mut agents, &self.freshness(snap));
         agents
     }
 
     /// Age, staleness and refresh error of `snap` as it is served, beside
     /// an HTTP payload or a stream frame.
-    fn freshness(&self, snap: &DaemonSnap) -> Value {
+    fn freshness(&self, snap: &DaemonSnap) -> Freshness {
         let error = snap.failed || lock(&self.daemon).refresh_failed;
         let age = snap.at.elapsed();
-        json!({
-            "snapshot_age_secs": age.as_secs_f64(),
-            "stale": error || age >= SNAPSHOT_STALE,
-            "refresh_error": error,
-        })
+        Freshness {
+            snapshot_age_secs: age.as_secs_f64(),
+            stale: error || age >= SNAPSHOT_STALE,
+            refresh_error: error,
+        }
     }
 
     /// Was something read at `at` read after the last change mark?
@@ -1611,7 +1617,7 @@ impl Model {
             w.plans = fps(&plans);
         }
         let fresh = self.freshness(&snap);
-        let error_moved = (fresh["refresh_error"] == json!(true)) != w.refresh_error;
+        let error_moved = fresh.refresh_error != w.refresh_error;
         if error_moved {
             w.refresh_error = !w.refresh_error;
             if snap.failed {
@@ -1621,7 +1627,7 @@ impl Model {
                 if snap.agents_down {
                     meta["daemon"] = json!("unreachable");
                 }
-                merge_freshness(&mut meta, fresh.clone());
+                merge_freshness(&mut meta, &fresh);
                 frames.push(frame("agent_meta", &meta));
             }
         }
@@ -1661,8 +1667,10 @@ impl Model {
 }
 
 /// Adds the keys of the freshness object `fresh` to the JSON object `into`.
-pub(super) fn merge_freshness(into: &mut Value, fresh: Value) {
-    if let (Some(into), Value::Object(fresh)) = (into.as_object_mut(), fresh) {
+pub(super) fn merge_freshness(into: &mut Value, fresh: &Freshness) {
+    if let (Some(into), Ok(Value::Object(fresh))) =
+        (into.as_object_mut(), serde_json::to_value(fresh))
+    {
         into.extend(fresh);
     }
 }
@@ -1690,6 +1698,90 @@ mod tests {
         std::fs::create_dir_all(dir.join("comments")).unwrap();
         std::fs::create_dir_all(dir.join("artifacts")).unwrap();
         std::fs::write(dir.join("issue.md"), "a").unwrap();
+    }
+
+    /// CAD-1792: `/api/issues` rows keep their bytes whatever builds them -
+    /// an epic with progress and health, a bound agent strip, and a project
+    /// whose PROJECT.md is unreadable.
+    #[test]
+    fn issue_card_bytes_are_unchanged() {
+        use crate::issue::board::Issue;
+        use crate::issue::model::Front;
+        const NOW: i64 = 1_790_000_000;
+        let issue = |project: &str, id: &str, status: &str, parent: Option<&str>| {
+            let mut front = Front::new(id, id, "2026-09-01T00:00:00Z");
+            front.status = status.to_string();
+            front.parent = parent.map(str::to_string);
+            Issue {
+                project: project.to_string(),
+                dir: PathBuf::from("/nonexistent"),
+                front,
+                body: String::new(),
+                comments: vec![],
+                artifacts: vec![],
+            }
+        };
+        let mut epic = issue("cadence", "CAD-1", "backlog", None);
+        epic.front.item_type = Some("epic".into());
+        epic.front.stage = Some("build".into());
+        epic.front.stage_at = Some(crate::issue::time::iso(NOW - 2 * 86_400));
+        let mut busy = issue("cadence", "CAD-3", "doing", Some("CAD-1"));
+        busy.front.owner = Some("dev-1".into());
+        busy.front.size = Some("S".into());
+        busy.front.tags = vec!["ui".into()];
+        let mut blocked = issue("cadence", "CAD-4", "ready", Some("CAD-1"));
+        blocked.front.blocked_by = vec!["CAD-9".into()];
+        let views = board::views(
+            Path::new("/no-notes"),
+            vec![
+                epic,
+                issue("cadence", "CAD-2", "done", Some("CAD-1")),
+                busy,
+                blocked,
+                issue("cadence", "CAD-9", "doing", None),
+                issue("broken", "BRK-1", "backlog", None),
+            ],
+        );
+        let by_id: HashMap<String, &board::View> = views
+            .iter()
+            .map(|v| (v.issue.front.id.clone(), v))
+            .collect();
+        let work = |error: Option<&str>, unapproved: Option<&str>| work::ProjectWork {
+            cfg: work::WorkConfig::default(),
+            error: error.map(str::to_string),
+            unapproved: unapproved.map(str::to_string),
+        };
+        let ctx = work::Ctx {
+            by_id: &by_id,
+            configs: HashMap::from([
+                ("cadence".to_string(), work(None, None)),
+                (
+                    "broken".to_string(),
+                    work(Some("PROJECT.md: bad"), Some("gates not approved")),
+                ),
+            ]),
+            now: NOW,
+        };
+        let read = BoardRead {
+            views: Arc::new(views.clone()),
+            revs: Arc::new(HashMap::from([("CAD-1".to_string(), "abc123".to_string())])),
+            by_issue: json!({"CAD-3": [{
+                "alias": "w1", "task": "t1", "task_state": "running",
+                "state": "running", "message": "m1", "resume": null,
+            }]}),
+            approvals: Arc::new(work::Approvals::new()),
+            freshness: Freshness {
+                snapshot_age_secs: 0.5,
+                stale: false,
+                refresh_error: false,
+            },
+            pm_dir: PathBuf::from("/nonexistent"),
+        };
+        let cards: Vec<Value> = views.iter().map(|v| read.card(&ctx, v)).collect();
+        super::super::board_api_golden::golden("issue_cards.json", &Value::Array(cards));
+        let mut body = json!({"issues": []});
+        merge_freshness(&mut body, &read.freshness);
+        super::super::board_api_golden::golden("issues_envelope.json", &body);
     }
 
     #[test]

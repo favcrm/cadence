@@ -44,6 +44,8 @@ mod approvals;
 mod apps;
 mod artifacts;
 mod assist_route;
+#[cfg(test)]
+mod board_api_golden;
 mod business_templates;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1337_acceptance;
@@ -115,8 +117,8 @@ pub(crate) use stream::{dir_mtime, event_resources, projects_payload, value_fp};
 pub(crate) use tailscale::{ts, ts_self, ts_start_quiet};
 pub(crate) use write_path::{
     agent_roots, busy_response, coded_response, guard_fail, header_value, issue_payloads,
-    parse_json, parse_multipart, proxied_actor, read_body, tailnet_proxy, with_agents, write_err,
-    write_guard, write_reply, HttpResp, JSON_CAP, UI_ACTOR,
+    parse_json, parse_multipart, proxied_actor, read_body, tailnet_proxy, write_err, write_guard,
+    write_reply, HttpResp, JSON_CAP, UI_ACTOR,
 };
 
 /// The options `ui run` and `ui start` share. Every field is optional:

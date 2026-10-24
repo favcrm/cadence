@@ -358,10 +358,19 @@ impl DeliverySync {
     }
 
     /// What `/api/meta` shows: the `gh` this board runs and its period.
-    pub fn meta(&self) -> Value {
+    pub fn meta(&self) -> cadence_core::board_api::DeliverySyncMeta {
+        let every_secs = self.every.as_secs();
         match &self.gh {
-            Ok(gh) => json!({"gh": gh, "every_secs": self.every.as_secs()}),
-            Err(e) => json!({"gh": null, "gh_error": e, "every_secs": self.every.as_secs()}),
+            Ok(gh) => cadence_core::board_api::DeliverySyncMeta {
+                gh: Some(gh.to_string_lossy().into_owned()),
+                gh_error: None,
+                every_secs,
+            },
+            Err(e) => cadence_core::board_api::DeliverySyncMeta {
+                gh: None,
+                gh_error: Some(e.clone()),
+                every_secs,
+            },
         }
     }
 

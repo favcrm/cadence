@@ -1,25 +1,12 @@
 export type StatusSource = "file" | "notes" | "rollup" | "job";
 
-/** One bound agent on an issue card/drawer — from the job binding,
- *  never a text scan. */
-export interface CardAgent {
-  alias: string;
-  task: string;
-  task_state: string;
-  state: string;
-  /** Running kickoff message id for this task, if live. */
-  message?: string | null;
-  /** Concrete resume command for a stopped pane. */
-  resume?: string | null;
-}
+import type * as Api from "./generated/board-api";
 
-export interface Ref {
-  kind: string;
-  url?: string;
-  path?: string;
-  label?: string;
-  closed?: boolean;
-}
+/** One bound agent on an issue card/drawer — from the job binding,
+ *  never a text scan. Generated from the daemon's Rust type. */
+export type CardAgent = Api.CardAgent;
+
+export type Ref = Api.Ref;
 
 export interface IssueCard {
   id: string;
