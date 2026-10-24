@@ -8,7 +8,9 @@ use super::{required_str, Shared};
 use crate::app_assistant::Declared;
 use crate::error::{Error, Result};
 use crate::issue::app_catalog::workspace;
+use crate::store::app_audiences::AudienceBase;
 use crate::store::app_records::{AssistantOperationUpdate, AssistantPermissionWrite, RecordStore};
+use crate::store::app_sends::send_view;
 
 fn exact(params: &Value, allowed: &[&str]) -> Result<()> {
     let fields = params
@@ -285,7 +287,7 @@ impl Shared {
         crate::app_assistant::validate_input(&meta.input_schema, input)?;
         if matches!(
             action_id,
-            "campaigns.show" | "campaigns.create_draft" | "email.draft"
+            "campaigns.show" | "campaigns.create_draft" | "campaigns.approve" | "email.draft"
         ) {
             scoped.require_campaign(required_str(input, "campaign_id")?)?;
         }
@@ -488,6 +490,25 @@ impl Shared {
                     }
                     self.rpc_app_segment_assistant_save(&segment_params, peer_pid)
                 }
+                "segments.save_static" => {
+                    let mut segment_params = json!({
+                        "install_id": &scoped.install,
+                        "context_id": &scoped.context,
+                        "segment_id": required_str(input, "segment_id")?,
+                        "name": super::app_audiences_rpc::audience_name(input)?,
+                        "segment_type": "static",
+                        "member_ids": input.get("member_ids").cloned().unwrap_or_else(|| json!([])),
+                        "message": required_str(params, "message")?,
+                        "token": required_str(params, "token")?,
+                    });
+                    if let Some(expected_revision) = input.get("expected_revision") {
+                        segment_params["expected_revision"] = expected_revision.clone();
+                    }
+                    self.rpc_app_segment_assistant_save(&segment_params, peer_pid)
+                }
+                "segments.delete" => {
+                    records.app_segment_delete(&scoped.context, required_str(input, "segment_id")?)
+                }
                 "social.drafts.status" => self.social_status(&records, &scoped.context),
                 "campaigns.list" => records.app_content_list(&scoped.context),
                 "campaigns.show" => {
@@ -511,6 +532,98 @@ impl Shared {
                         &draft,
                         input.get("segment_id").and_then(Value::as_str),
                     )
+                }
+                "campaigns.apply" => {
+                    let proposal = required_str(input, "proposal_id")?;
+                    let shown = records.app_content_proposal_show(&scoped.context, proposal)?;
+                    if let Some(campaign) = shown
+                        .pointer("/proposal/campaign_id")
+                        .and_then(Value::as_str)
+                    {
+                        scoped.require_campaign(campaign)?;
+                    }
+                    records.app_content_proposal_apply(
+                        &scoped.context,
+                        proposal,
+                        input.get("expected_revision").and_then(Value::as_i64),
+                    )
+                }
+                "campaigns.discard" => records.app_content_proposal_discard(
+                    &scoped.context,
+                    required_str(input, "proposal_id")?,
+                ),
+                "campaigns.approve" => records.app_content_approve(
+                    &scoped.context,
+                    required_str(input, "campaign_id")?,
+                    input
+                        .get("expected_revision")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| Error::rejected("expected content revision is required"))?,
+                ),
+                "audiences.prepare" => {
+                    let base = AudienceBase::parse(
+                        input
+                            .get("base")
+                            .ok_or_else(|| Error::rejected("audience base is required"))?,
+                    )
+                    .map_err(|_| Error::rejected("audience base exceeds its supported grammar"))?;
+                    records.app_audience_prepare(
+                        &scoped.context,
+                        required_str(input, "freeze_id")?,
+                        &base,
+                        input.get("exclusion_list_id").and_then(Value::as_str),
+                        input
+                            .get("max_recipients")
+                            .and_then(Value::as_i64)
+                            .ok_or_else(|| {
+                                Error::rejected("audience maximum recipients is required")
+                            })?,
+                    )
+                }
+                "audiences.show" => {
+                    records.app_audience_show(&scoped.context, required_str(input, "freeze_id")?)
+                }
+                "sends.list" => {
+                    let campaign = input.get("campaign_id").and_then(Value::as_str);
+                    if let Some(campaign) = campaign {
+                        scoped.require_campaign(campaign)?;
+                    }
+                    let sends = records.app_campaign_sends(&scoped.context, campaign)?;
+                    let mut out = Vec::with_capacity(sends.len());
+                    for send in &sends {
+                        let counts =
+                            records.app_campaign_delivery_counts(&scoped.context, &send.send_id)?;
+                        out.push(json!({
+                            "send_id": send.send_id,
+                            "campaign_id": send.campaign_id,
+                            "state": send.state,
+                            "send_digest": send.send_digest,
+                            "created": send.created,
+                            "approved_at": send.approved_at,
+                            "counts": counts,
+                            "delivery_claim": "smtp-acceptance-only",
+                        }));
+                    }
+                    Ok(json!({"sends": out}))
+                }
+                "sends.show" => {
+                    let send_id = required_str(input, "send_id")?;
+                    let send = records
+                        .app_campaign_send(&scoped.context, send_id)?
+                        .ok_or_else(|| {
+                            Error::rejected(
+                                "campaign send is unavailable for this installation and context",
+                            )
+                        })?;
+                    let deliveries = records.app_campaign_deliveries(&scoped.context, send_id)?;
+                    let counts = records.app_campaign_delivery_counts(&scoped.context, send_id)?;
+                    Ok(send_view(
+                        &scoped.install,
+                        &scoped.context,
+                        &send,
+                        &deliveries,
+                        counts,
+                    ))
                 }
                 "email.draft" => {
                     let draft_value = input
@@ -1481,17 +1594,29 @@ fn resource_refs(action: &str, result: &Value) -> Value {
                 .pointer("/record/profile/display_name")
                 .and_then(Value::as_str),
         ),
-        "segments.show" | "segments.save" => (
+        "segments.show" | "segments.save" | "segments.save_static" => (
             "segment",
             result.pointer("/segment/id").and_then(Value::as_str),
             result.pointer("/segment/name").and_then(Value::as_str),
         ),
-        "campaigns.show" | "campaigns.create_draft" => (
+        "campaigns.show" | "campaigns.create_draft" | "campaigns.approve" => (
             "campaign",
             result
                 .pointer("/content/campaign_id")
                 .and_then(Value::as_str),
             result.pointer("/content/name").and_then(Value::as_str),
+        ),
+        "campaigns.apply" => (
+            "campaign",
+            result
+                .pointer("/content/campaign_id")
+                .and_then(Value::as_str),
+            Some("Campaign content"),
+        ),
+        "sends.show" => (
+            "send",
+            result.pointer("/send/send_id").and_then(Value::as_str),
+            Some("Campaign send"),
         ),
         "email.draft" => (
             "campaign",

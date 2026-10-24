@@ -782,6 +782,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_record_csv_import", Rule::Handler("operator_connection (CAD-779)")),
     ("app_record_csv_confirm", Rule::Handler("operator_connection (CAD-1014: host-bound confirm receipt mint)")),
     ("app_segment_save", Rule::Handler("operator_connection (CAD-780)")),
+    ("app_segment_delete", Rule::Handler("operator_connection (CAD-780)")),
     ("app_segment_show", Rule::Handler("operator_connection (CAD-780)")),
     ("app_segment_list", Rule::Handler("operator_connection (CAD-780)")),
     ("app_exclusion_save", Rule::Handler("operator_connection (CAD-780)")),

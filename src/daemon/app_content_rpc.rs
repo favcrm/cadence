@@ -36,7 +36,7 @@
 //! follows the CAD-768 strict-peer contract (URL IDs are authority,
 //! exact transport grammar, POST-only writes) and exposes no
 //! assistant-mint route.
-use super::app_audiences_rpc::{audience_expected, audience_name, audience_predicates};
+use super::app_audiences_rpc::{audience_expected, audience_name};
 use super::app_records_rpc::{csv_decisions, csv_text};
 use super::app_screen_services_rpc::ScreenServiceProof;
 use super::*;
@@ -802,7 +802,9 @@ impl Shared {
             "context_id",
             "segment_id",
             "name",
+            "segment_type",
             "predicates",
+            "member_ids",
             "expected_revision",
             "message",
             "token",
@@ -828,7 +830,9 @@ impl Shared {
             "domain": "cadence-app-segment-assistant-save-v1",
             "segment_id": required_str(params, "segment_id")?,
             "name": required_str(params, "name")?,
+            "segment_type": params.get("segment_type").cloned().unwrap_or(Value::Null),
             "predicates": params.get("predicates").cloned().unwrap_or(Value::Null),
+            "member_ids": params.get("member_ids").cloned().unwrap_or(Value::Null),
             "expected_revision": params.get("expected_revision").cloned().unwrap_or(Value::Null),
         }));
         records.app_assistant_claim(
@@ -839,12 +843,12 @@ impl Shared {
             &payload_digest,
             &scoped.caller,
         )?;
-        let result = records.app_segment_save(
+        let result = records.app_segment_save_definition(
             &scoped.context,
             required_str(params, "segment_id")?,
             audience_expected(params)?,
             &audience_name(params)?,
-            &audience_predicates(params)?,
+            &super::app_audiences_rpc::audience_segment_definition(params)?,
         )?;
         let digest = result
             .get("segment")

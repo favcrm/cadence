@@ -1313,3 +1313,159 @@ fn interrupted_running_operation_replay_is_unknown_without_duplicate_write() {
     );
     fx.finish("m-crash-after-write");
 }
+
+/// CAD-1808 batch 1: a live scoped turn can save a static segment, apply
+/// and approve its own campaign content, and freeze the audience without
+/// an operator decision. Send and SMTP remain outside this batch.
+#[test]
+fn cad1808_scoped_turn_runs_internal_campaign_workflow() {
+    let fx = Fx::new();
+    let token = fx.create_turn("m-cad1808-workflow");
+
+    let segment = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "segments.save_static",
+            "op-1808-segment",
+            json!({
+                "segment_id":"seg-selected",
+                "name":"Selected accounts",
+                "member_ids":["cust-a","cust-b"]
+            }),
+        )
+        .unwrap();
+    assert_eq!(segment["operation"]["status"], "succeeded");
+    assert_eq!(
+        segment["operation"]["result"]["segment"]["segment_type"],
+        "static"
+    );
+    assert_eq!(
+        segment["operation"]["result"]["segment"]["member_ids"],
+        json!(["cust-a", "cust-b"])
+    );
+
+    let preview = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "segments.preview",
+            "op-1808-preview",
+            json!({"segment_id":"seg-selected"}),
+        )
+        .unwrap();
+    assert_eq!(preview["operation"]["result"]["base_count"], 2);
+    assert_eq!(
+        preview["operation"]["result"]["final_count"], 0,
+        "both seeded customers have unknown email consent"
+    );
+
+    let draft = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "campaigns.create_draft",
+            "op-1808-campaign",
+            json!({"campaign_id":"c1","name":"Launch","segment_id":"seg-selected"}),
+        )
+        .unwrap();
+    assert_eq!(draft["operation"]["status"], "succeeded");
+
+    let proposal = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "email.draft",
+            "op-1808-proposal",
+            json!({
+                "campaign_id":"c1",
+                "proposal_id":"p1",
+                "draft":{"subject":"Hello","blocks":[{"type":"paragraph","text":"A real draft."}]}
+            }),
+        )
+        .unwrap();
+    assert_eq!(proposal["operation"]["status"], "succeeded");
+
+    let applied = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "campaigns.apply",
+            "op-1808-apply",
+            json!({"proposal_id":"p1"}),
+        )
+        .unwrap();
+    assert_eq!(applied["operation"]["status"], "succeeded");
+    assert_eq!(
+        applied["operation"]["result"]["content"]["revision"], 2,
+        "the blank draft is revision 1 and applying the proposal writes revision 2"
+    );
+
+    let approved = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "campaigns.approve",
+            "op-1808-approve",
+            json!({"campaign_id":"c1","expected_revision":2}),
+        )
+        .unwrap();
+    assert_eq!(approved["operation"]["status"], "succeeded");
+    assert_eq!(
+        approved["operation"]["result"]["content"]["approval"]["valid"],
+        true
+    );
+
+    let frozen = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "audiences.prepare",
+            "op-1808-freeze",
+            json!({
+                "freeze_id":"f1",
+                "base":{"mode":"segment","segment_id":"seg-selected"},
+                "max_recipients":10
+            }),
+        )
+        .unwrap();
+    assert_eq!(frozen["operation"]["status"], "succeeded");
+    assert_eq!(frozen["operation"]["result"]["freeze"]["final_count"], 0);
+
+    let shown = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "audiences.show",
+            "op-1808-show",
+            json!({"freeze_id":"f1"}),
+        )
+        .unwrap();
+    assert_eq!(shown["operation"]["status"], "succeeded");
+    assert_eq!(shown["operation"]["result"]["valid"], true);
+
+    let sends = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "sends.list",
+            "op-1808-sends",
+            json!({"campaign_id":"c1"}),
+        )
+        .unwrap();
+    assert_eq!(sends["operation"]["status"], "succeeded");
+    assert_eq!(sends["operation"]["result"]["sends"], json!([]));
+
+    let deleted = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "segments.delete",
+            "op-1808-delete",
+            json!({"segment_id":"seg-selected"}),
+        )
+        .unwrap();
+    assert_eq!(deleted["operation"]["status"], "succeeded");
+    assert_eq!(deleted["operation"]["result"]["deleted"], true);
+    fx.finish("m-cad1808-workflow");
+}

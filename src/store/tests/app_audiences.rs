@@ -1,4 +1,4 @@
-use super::super::app_audiences::{AudienceBase, Predicate};
+use super::super::app_audiences::{AudienceBase, Predicate, SegmentDefinition};
 use super::super::app_records::{record_db_path, ConsentProvenance, CustomerProfile, RecordStore};
 use super::super::app_runs::material_digest;
 use super::*;
@@ -527,4 +527,78 @@ fn cad780_older_installation_file_migrates_without_touching_rows() {
         .app_audience_preview("ctx-1", &base_all(), None)
         .unwrap();
     assert_eq!(preview["final_count"], 1);
+}
+
+#[test]
+fn cad1808_static_segment_uses_an_explicit_member_list() {
+    let dir = TempDir::new().unwrap();
+    let store = audience_file(&dir, "install-static");
+    seed_valid(&store, "ctx-1");
+    let members = vec![
+        "customer-a".to_string(),
+        "customer-b".to_string(),
+        "customer-d".to_string(),
+    ];
+    let saved = store
+        .app_segment_save_definition(
+            "ctx-1",
+            "seg-selected",
+            None,
+            "Selected accounts",
+            &SegmentDefinition::Static(members.clone()),
+        )
+        .unwrap();
+    assert_eq!(saved["segment"]["segment_type"], "static");
+    assert_eq!(saved["segment"]["member_ids"], json!(members));
+    assert_eq!(saved["segment"]["predicates"], json!([]));
+
+    let base =
+        AudienceBase::parse(&json!({"mode": "segment", "segment_id": "seg-selected"})).unwrap();
+    let preview = store.app_audience_preview("ctx-1", &base, None).unwrap();
+    assert_eq!(preview["base_count"], 3);
+    assert_eq!(
+        preview["final_count"], 1,
+        "only the granted member survives"
+    );
+
+    // Duplicates and unknown members refuse before any write.
+    assert!(store
+        .app_segment_save_definition(
+            "ctx-1",
+            "seg-dup",
+            None,
+            "Duplicate",
+            &SegmentDefinition::Static(vec!["customer-a".to_string(), "customer-a".to_string(),]),
+        )
+        .is_err());
+    assert!(store
+        .app_segment_save_definition(
+            "ctx-1",
+            "seg-unknown",
+            None,
+            "Unknown",
+            &SegmentDefinition::Static(vec!["customer-z".to_string()]),
+        )
+        .is_err());
+
+    // The revision CAS applies to static membership too.
+    let updated = store
+        .app_segment_save_definition(
+            "ctx-1",
+            "seg-selected",
+            Some(1),
+            "Selected accounts",
+            &SegmentDefinition::Static(vec!["customer-a".to_string()]),
+        )
+        .unwrap();
+    assert_eq!(updated["segment"]["revision"], 2);
+    assert_eq!(updated["segment"]["member_ids"], json!(["customer-a"]));
+
+    let deleted = store.app_segment_delete("ctx-1", "seg-selected").unwrap();
+    assert_eq!(deleted["deleted"], true);
+    assert!(store.app_segment_show("ctx-1", "seg-selected").is_err());
+    assert_eq!(
+        store.app_segment_list("ctx-1").unwrap()["segments"],
+        json!([])
+    );
 }
