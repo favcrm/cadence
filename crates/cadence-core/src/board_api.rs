@@ -28,11 +28,10 @@ pub struct CardAgent {
     pub alias: String,
     pub task: String,
     pub task_state: String,
-    #[schemars(with = "String")]
-    pub state: Value,
+    /// The agent's state; `null` when the daemon reports none.
+    pub state: Option<String>,
     /// Running kickoff message id for this task, if live.
-    #[schemars(with = "Option<String>")]
-    pub message: Value,
+    pub message: Option<String>,
     /// Concrete resume command for a stopped pane.
     pub resume: Option<String>,
 }
@@ -72,10 +71,9 @@ pub struct IssueListItem {
     #[serde(flatten)]
     pub card: IssueCard,
     pub work: WorkBlock,
-    /// The daemon's bound-agent strip, passed through as the roster built it.
+    /// The bound-agent strip, present only when a job binds agents to the issue.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<Vec<CardAgent>>")]
-    pub agents: Option<Value>,
+    pub agents: Option<Vec<CardAgent>>,
 }
 
 /// `GET /api/issues`.
@@ -89,7 +87,7 @@ pub struct IssuesResponse {
 /// A running kickoff reduced to what the board shows.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct RunningMessage {
-    #[schemars(with = "String")]
+    #[schemars(with = "Option<String>")]
     pub id: Value,
     #[schemars(with = "Option<String>")]
     pub task: Value,
@@ -118,10 +116,8 @@ pub struct AgentTask {
 #[derive(Clone, Debug, Default, Serialize, JsonSchema)]
 pub struct AgentRow {
     pub alias: String,
-    #[schemars(with = "String")]
-    pub provider: Value,
-    #[schemars(with = "String")]
-    pub endpoint_kind: Value,
+    pub provider: Option<String>,
+    pub endpoint_kind: Option<String>,
     #[schemars(with = "Option<String>")]
     pub role: Value,
     /// Model-preference role, independent of the runtime `role`.
@@ -163,8 +159,7 @@ pub struct AgentRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<String>")]
     pub kind: Option<Value>,
-    #[schemars(with = "String")]
-    pub state: Value,
+    pub state: Option<String>,
     pub group: String,
     pub group_root: bool,
     pub running: i64,
@@ -195,8 +190,7 @@ pub struct AgentRow {
     /// When `resume` applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_hint: Option<String>,
-    #[schemars(with = "bool")]
-    pub dead: Value,
+    pub dead: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbox: Option<bool>,
     /// Epoch seconds, or ISO text from older observations.
@@ -265,11 +259,11 @@ pub struct DeliverySyncMeta {
 /// The daemon's build, when it answered inside the metadata budget.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct MetaDaemon {
-    #[schemars(with = "String")]
+    #[schemars(with = "Option<String>")]
     pub build_commit: Value,
-    #[schemars(with = "String")]
+    #[schemars(with = "Option<String>")]
     pub build_time: Value,
-    #[schemars(with = "serde_json::Number")]
+    #[schemars(with = "Option<serde_json::Number>")]
     pub started_at: Value,
 }
 

@@ -111,7 +111,7 @@ pub(crate) use lifecycle::{
     START_REMAINING_ENV,
 };
 pub(crate) use serve::{
-    agents_payload_from, board_job_list, err_response, json_response, pct_decode,
+    agents_payload_typed, board_job_list, err_response, json_response, pct_decode,
 };
 pub(crate) use stream::{dir_mtime, event_resources, projects_payload, value_fp};
 pub(crate) use tailscale::{ts, ts_self, ts_start_quiet};

@@ -68,7 +68,10 @@
           ]
         },
         "dead": {
-          "type": "boolean"
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "effort": {
           "type": [
@@ -95,7 +98,10 @@
           ]
         },
         "endpoint_kind": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "event_cursor": {
           "type": [
@@ -196,7 +202,10 @@
           "format": "int64"
         },
         "provider": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "queued": {
           "type": "integer",
@@ -259,7 +268,10 @@
           ]
         },
         "state": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "state_label": {
           "description": "`stopped (auto, idle 72m)` when the idle timer stopped it.",
@@ -297,9 +309,6 @@
       },
       "required": [
         "alias",
-        "provider",
-        "endpoint_kind",
-        "state",
         "group",
         "group_root",
         "running",
@@ -308,8 +317,7 @@
         "parked",
         "fenced",
         "on",
-        "tasks",
-        "dead"
+        "tasks"
       ]
     },
     "AgentTask": {
@@ -416,7 +424,11 @@
           ]
         },
         "state": {
-          "type": "string"
+          "description": "The agent's state; `null` when the daemon reports none.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "task": {
           "type": "string"
@@ -428,8 +440,7 @@
       "required": [
         "alias",
         "task",
-        "task_state",
-        "state"
+        "task_state"
       ]
     },
     "DaemonReach": {
@@ -451,7 +462,10 @@
           ]
         },
         "id": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "summary": {
           "type": [
@@ -465,10 +479,7 @@
             "null"
           ]
         }
-      },
-      "required": [
-        "id"
-      ]
+      }
     }
   }
 }

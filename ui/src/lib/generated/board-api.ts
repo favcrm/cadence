@@ -8,12 +8,12 @@ export interface AgentRow {
   alias: string;
   /** A hire's catalogue identity (workers only). */
   catalogue?: string | null;
-  dead: boolean;
+  dead?: boolean | null;
   effort?: string | null;
   effort_applicable?: boolean | null;
   effort_reported?: string | null;
   effort_source?: string | null;
-  endpoint_kind: string;
+  endpoint_kind?: string | null;
   event_cursor?: number | null;
   fenced: boolean;
   group: string;
@@ -36,7 +36,7 @@ export interface AgentRow {
   /** Issue ids bound through jobs — exact, not text-derived. */
   on: string[];
   parked: number;
-  provider: string;
+  provider?: string | null;
   queued: number;
   /** Optional account/pool allowance views; null means unavailable. */
   quota?: unknown;
@@ -51,7 +51,7 @@ export interface AgentRow {
   /** Seconds since the running turn's last observed activity. */
   silent_secs?: number | null;
   stalled?: boolean | null;
-  state: string;
+  state?: string | null;
   /** `stopped (auto, idle 72m)` when the idle timer stopped it. */
   state_label?: string | null;
   tasks: AgentTask[];
@@ -102,7 +102,8 @@ export interface CardAgent {
   message?: string | null;
   /** Concrete resume command for a stopped pane. */
   resume?: string | null;
-  state: string;
+  /** The agent's state; `null` when the daemon reports none. */
+  state?: string | null;
   task: string;
   task_state: string;
 }
@@ -141,7 +142,7 @@ export interface DeliverySyncMeta {
 /** One `GET /api/issues` row: the core card, its work block and, only when
  * a job binds agents to the issue, the agent strip. */
 export interface IssueListItem {
-  /** The daemon's bound-agent strip, passed through as the roster built it. */
+  /** The bound-agent strip, present only when a job binds agents to the issue. */
   agents?: CardAgent[] | null;
   blocked: boolean;
   blocked_by: string[];
@@ -182,9 +183,9 @@ export interface IssuesResponse {
 
 /** The daemon's build, when it answered inside the metadata budget. */
 export interface MetaDaemon {
-  build_commit: string;
-  build_time: string;
-  started_at: number;
+  build_commit?: string | null;
+  build_time?: string | null;
+  started_at?: number | null;
 }
 
 /** `GET /api/meta`: what this client may do and who writes credit to, plus
@@ -246,7 +247,7 @@ export interface Ref {
 export interface RunningMessage {
   /** Epoch seconds (the daemon serializes `Message.created` as f64). */
   created?: number | null;
-  id: string;
+  id?: string | null;
   summary?: string | null;
   task?: string | null;
 }

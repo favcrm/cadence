@@ -410,7 +410,7 @@ export function deployRefs(refs: Ref[]): Ref[] {
 export function laneState(agents: CardAgent[]): string {
   if (agents.length === 0) return "none";
   const hot = agents.find((a) => a.state === "fenced" || a.state === "attention");
-  if (hot) return hot.state;
+  if (hot) return hot.state ?? "idle";
   return agents[0].state || "idle";
 }
 

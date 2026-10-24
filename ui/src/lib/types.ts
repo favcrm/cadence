@@ -1,6 +1,6 @@
-export type StatusSource = "file" | "notes" | "rollup" | "job";
-
 import type * as Api from "./generated/board-api";
+
+export type StatusSource = "file" | "notes" | "rollup" | "job";
 
 /** One bound agent on an issue card/drawer — from the job binding,
  *  never a text scan. Generated from the daemon's Rust type. */

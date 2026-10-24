@@ -3,7 +3,9 @@
 //! fans out to, plus the shared response plumbing (`send`, `coded_response`,
 //! `write_reply`) the read side reuses.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+use cadence_core::board_api::CardAgent;
 use std::io::Read;
 use std::path::Path;
 
@@ -2440,9 +2442,13 @@ pub(crate) fn send(request: Request, mut resp: HttpResp, head_only: bool) {
 /// Merge the `by_issue` runtime strip into a card/detail payload —
 /// cards get `agents: [{alias, task, task_state, state, message,
 /// resume}]` only when a job actually binds agents to the issue.
-pub(crate) fn with_agents(mut payload: Value, by_issue: &Value, id: &str) -> Value {
+pub(crate) fn with_agents(
+    mut payload: Value,
+    by_issue: &BTreeMap<String, Vec<CardAgent>>,
+    id: &str,
+) -> Value {
     if let Some(agents) = by_issue.get(id) {
-        payload["agents"] = agents.clone();
+        payload["agents"] = serde_json::to_value(agents).expect("card agents serialize");
     }
     payload
 }

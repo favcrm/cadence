@@ -1,5 +1,339 @@
 {
-  "issues": [],
+  "issues": [
+    {
+      "blocked": false,
+      "blocked_by": [],
+      "blocked_reason": null,
+      "checks": {
+        "done": 0,
+        "total": 0
+      },
+      "claim": null,
+      "component": null,
+      "container": true,
+      "counts": {
+        "artifacts": 0,
+        "comments": 0,
+        "refs": 0
+      },
+      "created": "2026-09-01T00:00:00Z",
+      "duplicate_of": null,
+      "id": "CAD-1",
+      "owner": null,
+      "parent": null,
+      "paths": [],
+      "priority": "P2",
+      "project": "cadence",
+      "ready": false,
+      "refs": [],
+      "relates": [],
+      "rev": "abc123",
+      "status": "doing",
+      "status_source": "rollup",
+      "tags": [],
+      "title": "CAD-1",
+      "work": {
+        "health": {
+          "days_in_stage": 2,
+          "limit_days": 5,
+          "reasons": [
+            {
+              "cause": "blocked",
+              "detail": "CAD-4 waits on CAD-9",
+              "issue": "CAD-4",
+              "next": "unblock CAD-4 or re-plan around it",
+              "owner": null
+            }
+          ],
+          "state": "at_risk"
+        },
+        "milestone": null,
+        "milestone_source": null,
+        "progress": {
+          "counts": {
+            "blocked": 1,
+            "doing": 1,
+            "done": 1,
+            "dropped": 0,
+            "open": 1,
+            "review": 0,
+            "total": 3
+          },
+          "done_weight": 3,
+          "ratio": 0.43,
+          "total_weight": 7
+        },
+        "size": null,
+        "stage": {
+          "exit": "All tasks done or dropped",
+          "id": "build",
+          "moves": [
+            {
+              "forward": false,
+              "needs_operator": false,
+              "to": "shape"
+            },
+            {
+              "forward": true,
+              "needs_operator": false,
+              "to": "verify"
+            }
+          ],
+          "next": "verify",
+          "next_needs_operator": false,
+          "since": "2026-09-19T14:13:20Z",
+          "source": "field",
+          "stages": [
+            "shape",
+            "build",
+            "verify",
+            "release",
+            "done"
+          ],
+          "terminal": false
+        },
+        "type": "epic",
+        "type_source": "field",
+        "weight": 3
+      }
+    },
+    {
+      "blocked": false,
+      "blocked_by": [],
+      "blocked_reason": null,
+      "checks": {
+        "done": 0,
+        "total": 0
+      },
+      "claim": null,
+      "component": null,
+      "container": false,
+      "counts": {
+        "artifacts": 0,
+        "comments": 0,
+        "refs": 0
+      },
+      "created": "2026-09-01T00:00:00Z",
+      "duplicate_of": null,
+      "id": "CAD-2",
+      "owner": null,
+      "parent": "CAD-1",
+      "paths": [],
+      "priority": "P2",
+      "project": "cadence",
+      "ready": false,
+      "refs": [],
+      "relates": [],
+      "rev": "",
+      "status": "done",
+      "status_source": "file",
+      "tags": [],
+      "title": "CAD-2",
+      "work": {
+        "health": null,
+        "milestone": null,
+        "milestone_source": null,
+        "progress": null,
+        "size": null,
+        "stage": null,
+        "type": "task",
+        "type_source": "implicit",
+        "weight": 3
+      }
+    },
+    {
+      "agents": [
+        {
+          "alias": "w1",
+          "message": "m1",
+          "resume": null,
+          "state": "running",
+          "task": "t1",
+          "task_state": "running"
+        }
+      ],
+      "blocked": false,
+      "blocked_by": [],
+      "blocked_reason": null,
+      "checks": {
+        "done": 0,
+        "total": 0
+      },
+      "claim": null,
+      "component": null,
+      "container": false,
+      "counts": {
+        "artifacts": 0,
+        "comments": 0,
+        "refs": 0
+      },
+      "created": "2026-09-01T00:00:00Z",
+      "duplicate_of": null,
+      "id": "CAD-3",
+      "owner": "dev-1",
+      "parent": "CAD-1",
+      "paths": [],
+      "priority": "P2",
+      "project": "cadence",
+      "ready": false,
+      "refs": [],
+      "relates": [],
+      "rev": "",
+      "status": "doing",
+      "status_source": "file",
+      "tags": [
+        "ui"
+      ],
+      "title": "CAD-3",
+      "work": {
+        "health": null,
+        "milestone": null,
+        "milestone_source": null,
+        "progress": null,
+        "size": "S",
+        "stage": null,
+        "type": "task",
+        "type_source": "implicit",
+        "weight": 1
+      }
+    },
+    {
+      "blocked": true,
+      "blocked_by": [
+        "CAD-9"
+      ],
+      "blocked_reason": null,
+      "checks": {
+        "done": 0,
+        "total": 0
+      },
+      "claim": null,
+      "component": null,
+      "container": false,
+      "counts": {
+        "artifacts": 0,
+        "comments": 0,
+        "refs": 0
+      },
+      "created": "2026-09-01T00:00:00Z",
+      "duplicate_of": null,
+      "id": "CAD-4",
+      "owner": null,
+      "parent": "CAD-1",
+      "paths": [],
+      "priority": "P2",
+      "project": "cadence",
+      "ready": false,
+      "refs": [],
+      "relates": [],
+      "rev": "",
+      "status": "ready",
+      "status_source": "file",
+      "tags": [],
+      "title": "CAD-4",
+      "work": {
+        "health": null,
+        "milestone": null,
+        "milestone_source": null,
+        "progress": null,
+        "size": null,
+        "stage": null,
+        "type": "task",
+        "type_source": "implicit",
+        "weight": 3
+      }
+    },
+    {
+      "blocked": false,
+      "blocked_by": [],
+      "blocked_reason": null,
+      "checks": {
+        "done": 0,
+        "total": 0
+      },
+      "claim": null,
+      "component": null,
+      "container": false,
+      "counts": {
+        "artifacts": 0,
+        "comments": 0,
+        "refs": 0
+      },
+      "created": "2026-09-01T00:00:00Z",
+      "duplicate_of": null,
+      "id": "CAD-9",
+      "owner": null,
+      "parent": null,
+      "paths": [],
+      "priority": "P2",
+      "project": "cadence",
+      "ready": false,
+      "refs": [],
+      "relates": [],
+      "rev": "",
+      "status": "doing",
+      "status_source": "file",
+      "tags": [],
+      "title": "CAD-9",
+      "work": {
+        "health": null,
+        "milestone": null,
+        "milestone_source": null,
+        "progress": null,
+        "size": null,
+        "stage": null,
+        "type": "task",
+        "type_source": "implicit",
+        "weight": 3
+      }
+    },
+    {
+      "blocked": false,
+      "blocked_by": [],
+      "blocked_reason": null,
+      "checks": {
+        "done": 0,
+        "total": 0
+      },
+      "claim": null,
+      "component": null,
+      "container": false,
+      "counts": {
+        "artifacts": 0,
+        "comments": 0,
+        "refs": 0
+      },
+      "created": "2026-09-01T00:00:00Z",
+      "duplicate_of": null,
+      "id": "BRK-1",
+      "owner": null,
+      "parent": null,
+      "paths": [],
+      "priority": "P2",
+      "project": "broken",
+      "ready": true,
+      "refs": [],
+      "relates": [],
+      "rev": "",
+      "status": "backlog",
+      "status_source": "file",
+      "tags": [],
+      "title": "BRK-1",
+      "work": {
+        "config_error": "PROJECT.md: bad",
+        "config_unapproved": "gates not approved",
+        "health": null,
+        "milestone": null,
+        "milestone_source": null,
+        "progress": null,
+        "size": null,
+        "stage": null,
+        "type": "task",
+        "type_source": "implicit",
+        "weight": 3
+      }
+    }
+  ],
   "refresh_error": false,
   "snapshot_age_secs": 0.5,
   "stale": false

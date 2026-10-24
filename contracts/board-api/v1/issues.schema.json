@@ -50,7 +50,11 @@
           ]
         },
         "state": {
-          "type": "string"
+          "description": "The agent's state; `null` when the daemon reports none.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "task": {
           "type": "string"
@@ -62,8 +66,7 @@
       "required": [
         "alias",
         "task",
-        "task_state",
-        "state"
+        "task_state"
       ]
     },
     "CardChecks": {
@@ -162,7 +165,7 @@
       "type": "object",
       "properties": {
         "agents": {
-          "description": "The daemon's bound-agent strip, passed through as the roster built it.",
+          "description": "The bound-agent strip, present only when a job binds agents to the issue.",
           "type": [
             "array",
             "null"

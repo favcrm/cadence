@@ -19,7 +19,6 @@ const doc = (node, pad) =>
 
 function ts(node, pad) {
   if (node === true || node === undefined || Object.keys(node).length === 0) return "unknown";
-  if (node === false) return "never";
   if (node.$ref) return ref(node.$ref);
   if (node.allOf) return node.allOf.map((n) => ts(n, pad)).join(" & ");
   const union = node.anyOf ?? node.oneOf;
