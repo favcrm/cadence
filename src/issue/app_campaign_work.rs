@@ -398,7 +398,11 @@ pub fn apply(
         }
     }
     if let Some(reason) = &patch.blocked_reason {
-        if reason.is_some() && next.status != Some(WorkStatus::Blocked) {
+        // The contract refuses a non-null reason unless *this request* says
+        // blocked: inheriting the row's current status would let a
+        // reason-only write through without the status the client must send
+        // (and the panel sends it deliberately on a reason-only edit).
+        if reason.is_some() && patch.status != Some(Some(WorkStatus::Blocked)) {
             return Err(Error::rejected(
                 "A blocked reason needs the blocked status.",
             ));
@@ -429,38 +433,37 @@ impl ReadinessFacts {
     }
 }
 
-/// The one next-decision algorithm. The recorded lifecycle wins first;
-/// then the caller-supplied readiness answers decide in task order. A
-/// readiness answer that is not recorded yields `unknown` rather than a
-/// failed check, and no answers at all yield no decision.
-pub fn next_decision(work: Option<&WorkRecord>, facts: Option<&ReadinessFacts>) -> Option<Value> {
+/// The one next-decision algorithm, applied only when the caller could read
+/// the readiness chain (`read` gates on that). The recorded lifecycle wins
+/// first; then the readiness answers decide in task order. A readiness answer
+/// that is not recorded yields `unknown` rather than a failed check.
+pub fn next_decision(work: Option<&WorkRecord>, facts: &ReadinessFacts) -> Value {
     if let Some(row) = work {
         if matches!(row.status, Some(WorkStatus::Done | WorkStatus::Cancelled)) {
-            return Some(json!({
+            return json!({
                 "key": "closed",
                 "label": "Closed — no further work",
                 "reason": Value::Null,
-            }));
+            });
         }
         if row.status == Some(WorkStatus::Blocked) || row.blocked_reason.is_some() {
             let label = match &row.blocked_reason {
                 None => "Unblock this campaign".to_string(),
                 Some(reason) => format!("Unblock: {reason}"),
             };
-            return Some(json!({
+            return json!({
                 "key": "unblock",
                 "label": label,
                 "reason": row.blocked_reason,
-            }));
+            });
         }
     }
-    let facts = facts?;
     if !facts.complete() {
-        return Some(json!({
+        return json!({
             "key": "unknown",
             "label": "Campaign readiness is not recorded",
             "reason": Value::Null,
-        }));
+        });
     }
     let (key, label) = if facts.draft == Some(false) {
         ("draft", "Draft the campaign email")
@@ -473,7 +476,7 @@ pub fn next_decision(work: Option<&WorkRecord>, facts: Option<&ReadinessFacts>) 
     } else {
         ("send", "Prepare and send the campaign")
     };
-    Some(json!({"key": key, "label": label, "reason": Value::Null}))
+    json!({"key": key, "label": label, "reason": Value::Null})
 }
 
 /// The recorded facts body `campaign-work.show` answers with, and the
@@ -624,7 +627,11 @@ pub fn read(input: ReadInput<'_>) -> Value {
         }
     }
 
-    let decision = next_decision(input.work, input.readiness);
+    // The app gates the decision itself on readiness: an unreadable chain
+    // yields no decision (partial), never a lifecycle shortcut.
+    let decision = input
+        .readiness
+        .map(|facts| next_decision(input.work, facts));
     let has_decision = decision.is_some();
     let mut unavailable: Vec<&str> = Vec::new();
     if !has_decision {
@@ -886,6 +893,23 @@ mod tests {
             Some("waiting on finance")
         );
         assert_eq!(reason_only.revision, 2);
+
+        // A reason-only write against an already-blocked row still has to
+        // send `status: "blocked"` itself: the current row's status is not
+        // the request's claim.
+        let omitted = apply(
+            Some(record_with_status(
+                WorkStatus::Blocked,
+                Some("waiting on finance"),
+            )),
+            &WorkPatch {
+                blocked_reason: Some(Some("waiting on legal".into())),
+                ..WorkPatch::default()
+            },
+            &attribution("operator", LATER),
+            Some(4),
+        );
+        assert!(omitted.is_err(), "an omitted blocked status must refuse");
     }
 
     fn record_with_status(status: WorkStatus, reason: Option<&str>) -> WorkRecord {
@@ -919,35 +943,26 @@ mod tests {
     fn next_decision_follows_lifecycle_first_then_the_readiness_chain() {
         let facts = ready();
         assert_eq!(
-            next_decision(
-                Some(&record_with_status(WorkStatus::Done, None)),
-                Some(&facts)
-            )
-            .unwrap()["key"],
+            next_decision(Some(&record_with_status(WorkStatus::Done, None)), &facts)["key"],
             "closed"
         );
         assert_eq!(
             next_decision(
                 Some(&record_with_status(WorkStatus::Cancelled, None)),
-                Some(&facts)
-            )
-            .unwrap()["key"],
+                &facts
+            )["key"],
             "closed"
         );
-        assert_eq!(
-            next_decision(Some(&record()), Some(&facts)).unwrap()["key"],
-            "send"
-        );
+        assert_eq!(next_decision(Some(&record()), &facts)["key"], "send");
         // An unassigned campaign still shows the campaign's next decision.
-        assert_eq!(next_decision(None, Some(&facts)).unwrap()["key"], "send");
+        assert_eq!(next_decision(None, &facts)["key"], "send");
         let blocked = next_decision(
             Some(&record_with_status(
                 WorkStatus::Blocked,
                 Some("waiting on legal"),
             )),
-            Some(&facts),
-        )
-        .unwrap();
+            &facts,
+        );
         assert_eq!(blocked["key"], "unblock");
         assert_eq!(blocked["reason"], "waiting on legal");
         assert!(blocked["label"]
@@ -985,19 +1000,45 @@ mod tests {
                 },
             ),
         ] {
-            assert_eq!(
-                next_decision(Some(&record()), Some(&facts)).unwrap()["key"],
-                key
-            );
+            assert_eq!(next_decision(Some(&record()), &facts)["key"], key);
         }
         // A missing chain answer is "not recorded", never a failed check.
         assert_eq!(
-            next_decision(Some(&record()), Some(&ReadinessFacts::default())).unwrap()["key"],
+            next_decision(Some(&record()), &ReadinessFacts::default())["key"],
             "unknown"
         );
-        // No chain at all yields no decision.
-        assert!(next_decision(Some(&record()), None).is_none());
-        assert!(next_decision(None, None).is_none());
+    }
+
+    #[test]
+    fn an_unreadable_readiness_chain_leaves_every_row_partial() {
+        // The app suppresses the decision entirely when the chain is null —
+        // even for a blocked, done or cancelled row. The host always passes
+        // no readiness, so this is the shipped behaviour, not a corner.
+        for work in [
+            record(),
+            record_with_status(WorkStatus::Blocked, Some("waiting on legal")),
+            record_with_status(WorkStatus::Done, None),
+            record_with_status(WorkStatus::Cancelled, None),
+        ] {
+            let reply = read(ReadInput {
+                app: "crm",
+                install: "inst-1",
+                context: Some("ctx-1"),
+                campaign: "welcome",
+                work: Some(&work),
+                content: None,
+                readiness: None,
+                access: Access::Authorized,
+                expected_revision: None,
+            });
+            assert_eq!(reply["state"], "partial", "{work:?}");
+            assert_eq!(reply["next_decision"], Value::Null, "{work:?}");
+            assert_eq!(reply["unavailable"], json!(["next_decision"]), "{work:?}");
+            // The recorded values still stand: partial names a gap, it does
+            // not hide the row.
+            assert_eq!(reply["revision"], 1);
+            assert_eq!(reply["assignment"]["assignee"], "Ada");
+        }
     }
 
     #[test]

@@ -142,6 +142,26 @@ fn service(
     )
 }
 
+/// The core-facing read boundary: caller-selected scope that the host
+/// verifies (installed package + live context) before any row is read.
+fn read(
+    native: &Native,
+    install: &str,
+    context: &str,
+    campaign: &str,
+    expected: Option<i64>,
+) -> crate::Result<Value> {
+    let mut params = json!({
+        "install_id": install,
+        "context_id": context,
+        "campaign_id": campaign,
+    });
+    if let Some(revision) = expected {
+        params["expected_revision"] = json!(revision);
+    }
+    native.rpc("crm_campaign_work_read", params)
+}
+
 fn member_session(native: &Native) -> Session {
     let user = BoardUser {
         sub: MEMBER.into(),
@@ -316,6 +336,34 @@ fn cad1827_campaign_work_pairs_and_cas_writes_through_the_relay() {
     assert_eq!(reason_only["work"]["revision"], 2);
     assert_eq!(reason_only["work"]["blocked_reason"], "waiting on finance");
 
+    // A reason-only write against this blocked row must still carry the
+    // blocked status itself; the row's current status is not the request's
+    // claim. The refusal changes nothing.
+    let omitted_status = service(
+        &native,
+        &owner,
+        "public",
+        &action,
+        "campaign-work.save",
+        json!({"campaign_id": CAMPAIGN, "expected_revision": 2, "blocked_reason": "waiting on tax"}),
+    )
+    .expect_err("an omitted blocked status must refuse");
+    assert_eq!(omitted_status.kind(), "rejected");
+    let unchanged_reason = service(
+        &native,
+        &owner,
+        "public",
+        &action,
+        "campaign-work.show",
+        json!({"campaign_id": CAMPAIGN}),
+    )
+    .expect("show after the refusal");
+    assert_eq!(unchanged_reason["work"]["revision"], 2);
+    assert_eq!(
+        unchanged_reason["work"]["blocked_reason"],
+        "waiting on finance"
+    );
+
     // Resuming clears the block text; a later orphan reason refuses.
     let resumed = service(
         &native,
@@ -399,6 +447,34 @@ fn cad1827_campaign_work_pairs_and_cas_writes_through_the_relay() {
     assert_eq!(untouched["work"]["assignee"], "Ada Chen");
     assert_eq!(untouched["work"]["revision"], 4);
 
+    // The same stale refusal over the board's HTTP peer keeps its own code:
+    // the board route must not collapse `stale_revision` into `conflict`.
+    let (status, body) = native.fx.http(
+        "operator",
+        &owner,
+        &call(
+            &action,
+            "campaign-work.save",
+            json!({"campaign_id": CAMPAIGN, "expected_revision": 0, "due_at": "2026-12-09"}),
+        ),
+    );
+    assert_eq!(status, 409, "the HTTP peer answers a conflict status");
+    assert_eq!(
+        body["code"], "stale_revision",
+        "the stale code survives HTTP"
+    );
+    let after_http = service(
+        &native,
+        &owner,
+        "public",
+        &action,
+        "campaign-work.show",
+        json!({"campaign_id": CAMPAIGN}),
+    )
+    .expect("show after the HTTP refusal");
+    assert_eq!(after_http["work"]["revision"], 4);
+    assert_eq!(after_http["work"]["due_at"], "2026-11-05");
+
     // A package that lists the operations without requiring the contract is
     // not installable: the host refuses it outright instead of installing a
     // screen whose work actions could not run.
@@ -469,4 +545,131 @@ fn cad1827_campaign_work_member_reads_but_never_saves() {
     .expect("operator read after the member refusal");
     assert_eq!(after["work"]["revision"], 1);
     assert_eq!(after["work"]["due_at"], Value::Null);
+}
+
+#[test]
+fn cad1827_campaign_work_core_read_is_authorized_and_stateful() {
+    let native = Native::new();
+    let scope = install(&native, "core-read", OPERATIONS, true).expect("paired install");
+    let (owner, _) = native.owner();
+
+    // Discovery names the packages that require the contract, and only the
+    // contexts that are still live. No app name is consulted.
+    let sources = native
+        .rpc("crm_campaign_work_sources", json!({}))
+        .expect("source discovery");
+    assert_eq!(sources["contract"], "crm-campaign-work/v1");
+    let rows = sources["sources"].as_array().expect("a source list");
+    let row = rows
+        .iter()
+        .find(|row| row["install_id"] == scope.install)
+        .expect("the paired install is a source");
+    assert_eq!(row["app"], "crm-cw-core-read");
+    assert!(
+        row["contexts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|context| context == &json!(scope.context)),
+        "the live context is named"
+    );
+    // A package that does not serve the contract is not a source.
+    let plain = native.fx.install("core-read-plain", &["records.list"]);
+    assert!(
+        rows.iter().all(|row| row["install_id"] != plain.install),
+        "an install without the operations is not a source"
+    );
+
+    // No recorded work: unavailable, never an inferred row.
+    let empty = read(&native, &scope.install, &scope.context, CAMPAIGN, None).expect("empty read");
+    assert_eq!(empty["state"], "unavailable");
+    assert_eq!(empty["revision"], Value::Null);
+    assert_eq!(empty["assignment"], Value::Null);
+    assert!(empty["unavailable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value == "assignee"));
+
+    // Record a row through the screen relay, then read it at the core
+    // boundary. The host cannot read the CRM readiness chain, so the read is
+    // partial with no decision — never a lifecycle shortcut.
+    let action = native.mount(&owner, "public", &scope, 1);
+    service(
+        &native,
+        &owner,
+        "public",
+        &action,
+        "campaign-work.save",
+        json!({"campaign_id": CAMPAIGN, "expected_revision": 0, "assignee": "Ada Chen",
+            "status": "blocked", "blocked_reason": "waiting on legal"}),
+    )
+    .expect("screen write");
+    let partial =
+        read(&native, &scope.install, &scope.context, CAMPAIGN, None).expect("partial read");
+    assert_eq!(partial["state"], "partial");
+    assert_eq!(partial["next_decision"], Value::Null);
+    // The decision and the unrecorded due date are the only gaps.
+    assert_eq!(partial["unavailable"], json!(["next_decision", "due_at"]));
+    assert_eq!(partial["revision"], 1);
+    assert_eq!(partial["assignment"]["assignee"], "Ada Chen");
+    assert_eq!(
+        partial["identity"],
+        format!(
+            "crm-cw-core-read:{}:{}:{}",
+            scope.install, scope.context, CAMPAIGN
+        )
+    );
+
+    // A stale expected revision returns the revision tokens only.
+    let stale =
+        read(&native, &scope.install, &scope.context, CAMPAIGN, Some(0)).expect("stale read");
+    assert_eq!(stale["state"], "stale");
+    assert_eq!(stale["refusal"]["code"], "stale_revision");
+    assert_eq!(stale["revision"], 1);
+    for key in [
+        "assignment",
+        "due_at",
+        "lifecycle",
+        "content",
+        "next_decision",
+    ] {
+        assert_eq!(stale[key], Value::Null, "{key} must not leak on stale");
+    }
+
+    // A source that does not serve the operation is forbidden, and reads no
+    // row: the shape carries no values at all.
+    let forbidden =
+        read(&native, &plain.install, &plain.context, CAMPAIGN, None).expect("forbidden read");
+    assert_eq!(forbidden["state"], "forbidden");
+    assert_eq!(forbidden["refusal"]["code"], "forbidden");
+    for key in [
+        "revision",
+        "content_revision",
+        "assignment",
+        "due_at",
+        "lifecycle",
+        "content",
+        "next_decision",
+    ] {
+        assert_eq!(
+            forbidden[key],
+            Value::Null,
+            "{key} must not leak on forbidden"
+        );
+    }
+
+    // A revoked (unknown) context on a real source is forbidden too.
+    let revoked =
+        read(&native, &scope.install, "ctx-missing", CAMPAIGN, None).expect("revoked context read");
+    assert_eq!(revoked["state"], "forbidden");
+    assert_eq!(revoked["revision"], Value::Null);
+
+    // The source itself must exist: an unknown installation is a request
+    // error, not a source that could be read or labelled forbidden.
+    let unknown = native.rpc(
+        "crm_campaign_work_read",
+        json!({"install_id": "inst-missing", "context_id": "ctx-1", "campaign_id": CAMPAIGN}),
+    );
+    assert!(unknown.is_err(), "an unknown installation must refuse");
 }

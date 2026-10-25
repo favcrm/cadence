@@ -141,6 +141,41 @@ pub fn declares_whatsapp_door(files: &BTreeMap<String, String>, app: &str) -> bo
     })
 }
 
+/// CAD-1827: declarative discovery — the package is a campaign-work source
+/// when its manifest requires `crm-campaign-work` major 1 *and* one of its
+/// integrity-checked screen packages, declared for the same app, serves
+/// `campaign-work.show`. Discovery is by contract and declaration only:
+/// there is no app-name branch, and any scan or parse failure reads as not
+/// a source rather than a partial answer.
+pub fn declares_campaign_work(files: &BTreeMap<String, String>) -> bool {
+    let metadata = match files
+        .get("app.md")
+        .map(|text| crate::issue::app::parse_manifest(text))
+    {
+        Some(Ok(metadata)) => metadata,
+        _ => return false,
+    };
+    if metadata
+        .requires
+        .contracts
+        .get(crate::issue::app_campaign_work::CONTRACT_NAME)
+        .map(Vec::as_slice)
+        != Some(&[crate::issue::app_campaign_work::CONTRACT_MAJOR][..])
+    {
+        return false;
+    }
+    tags_in(files).is_ok_and(|tags| {
+        tags.iter().any(|tag| {
+            extract(files, tag).is_ok_and(|pkg| {
+                pkg.app == metadata.app
+                    && pkg
+                        .operations
+                        .contains(&app_screen_decl::ScreenOperation::CampaignWorkShow)
+            })
+        })
+    })
+}
+
 /// Re-prove one screen package against the live bundle snapshot.
 ///
 /// Collects the `screens/<tag>/` members from `files`, refuses when the

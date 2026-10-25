@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const RESULT_CAP: usize = 1_048_576;
+/// CAD-1827: installation bound for campaign-work source discovery.
+const CAMPAIGN_WORK_SOURCES_MAX: usize = 64;
 const CONFIRM_TTL: Duration = Duration::from_secs(60);
 
 fn screen_access_denied(reason: &'static str) -> Error {
@@ -1131,6 +1133,164 @@ impl Shared {
                 &app,
             )
         })
+    }
+
+    /// CAD-1827: authorized discovery of campaign-work sources. The host
+    /// enumerates installed packages by the `crm-campaign-work` contract and
+    /// their declared `campaign-work.show` operation — never by app name —
+    /// and names only the contexts that are still live. No caller scope is
+    /// accepted: the host's own catalog is the only input.
+    pub(super) fn rpc_crm_campaign_work_sources(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        use crate::issue::app_campaign_work as work;
+        self.operator_connection("campaign work sources", params, peer_pid)?;
+        if params.as_object().is_none_or(|fields| !fields.is_empty()) {
+            return Err(Error::invalid(
+                "invalid",
+                "campaign work sources takes no fields",
+            ));
+        }
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        let listed = workspace::list(&pm)?;
+        let rows = match listed {
+            Value::Array(rows) => rows,
+            _ => return Err(Error::internal("installation catalog is unavailable")),
+        };
+        if rows.len() > CAMPAIGN_WORK_SOURCES_MAX {
+            return Err(Error::rejected(
+                "installation catalog exceeds the campaign work discovery bound",
+            ));
+        }
+        let mut sources = Vec::new();
+        for row in rows {
+            if row.get("removed").is_some_and(|removed| !removed.is_null()) {
+                continue;
+            }
+            let (Some(install), Some(app)) = (row["install_id"].as_str(), row["name"].as_str())
+            else {
+                continue;
+            };
+            // A removed, changed or unreadable install is not a source.
+            let declared = workspace::with_runtime_read(&pm, install, |_, files| {
+                Ok(app_screen_pkg::declares_campaign_work(files))
+            })
+            .unwrap_or(false);
+            if !declared {
+                continue;
+            }
+            let contexts = self
+                .store
+                .app_context_list(install)?
+                .get("contexts")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|context| context["state"] == "active")
+                .filter_map(|context| context["id"].as_str().map(str::to_string))
+                .collect::<Vec<String>>();
+            sources.push(json!({"install_id": install, "app": app, "contexts": contexts}));
+        }
+        Ok(json!({"contract": work::CONTRACT, "sources": sources}))
+    }
+
+    /// CAD-1827: the authorized core-facing read. Scope comes from verified
+    /// host state: the installation's own live package must serve
+    /// `campaign-work.show` and the context must be live, otherwise the
+    /// contract's `forbidden` shape is returned and no row is read. A
+    /// caller-supplied `expected_revision` that no longer matches yields
+    /// `stale` with revision tokens only.
+    pub(super) fn rpc_crm_campaign_work_read(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        use crate::issue::app_campaign_work::{self as work, Access, ReadInput};
+        self.operator_connection("campaign work read", params, peer_pid)?;
+        let allowed: &[&str] = &[
+            "install_id",
+            "context_id",
+            "campaign_id",
+            "expected_revision",
+        ];
+        let fields = params
+            .as_object()
+            .ok_or_else(|| Error::invalid("invalid", "campaign work read must be an object"))?;
+        for key in fields.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(Error::invalid(
+                    "invalid",
+                    "campaign work read has unsupported fields",
+                ));
+            }
+        }
+        let install = required_str(params, "install_id")?;
+        crate::proto::identifier(install, "installation ID")?;
+        let context = required_str(params, "context_id")?;
+        crate::proto::identifier(context, "context ID")?;
+        let campaign = required_str(params, "campaign_id")?;
+        work::check_campaign_id(campaign)?;
+        let expected = match params.get("expected_revision") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_i64()
+                    .filter(|revision| *revision >= 0)
+                    .ok_or_else(|| {
+                        Error::invalid(
+                            "invalid",
+                            "expected_revision must be a non-negative integer",
+                        )
+                    })?,
+            ),
+        };
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        // The source is the installation's own live bundle: a package that
+        // does not serve the operation is not a campaign-work source.
+        let (app, declared) = workspace::with_runtime_read(&pm, install, |description, files| {
+            let app = description["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| Error::rejected("installation app identity unavailable"))?
+                .to_string();
+            Ok((app, app_screen_pkg::declares_campaign_work(files)))
+        })?;
+        if !declared {
+            return Ok(work::read(ReadInput {
+                app: &app,
+                install,
+                context: Some(context),
+                campaign,
+                work: None,
+                content: None,
+                readiness: None,
+                access: Access::Forbidden,
+                expected_revision: None,
+            }));
+        }
+        match self.store.app_context_proof(install, context) {
+            Ok(_) => {}
+            // An unknown or archived context is not an authorized source.
+            Err(error) if error.kind() == "rejected" => {
+                return Ok(work::read(ReadInput {
+                    app: &app,
+                    install,
+                    context: Some(context),
+                    campaign,
+                    work: None,
+                    content: None,
+                    readiness: None,
+                    access: Access::Forbidden,
+                    expected_revision: None,
+                }))
+            }
+            Err(error) => return Err(error),
+        }
+        let records = crate::store::app_records::RecordStore::open(&self.state_dir, install)?;
+        records.app_campaign_work_read(context, campaign, &app, Access::Authorized, expected)
     }
 
     pub(super) fn rpc_app_screen_service_call(

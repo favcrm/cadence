@@ -8,7 +8,7 @@ import type { RecordCard, SlotPlan } from "./screenSlot";
 export const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 export function exact(v: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(v).every(k => keys.includes(k)); }
 const TOKEN = /^[a-f0-9]{64}$/;
-const WRITES = new Set(["records.create", "records.update", "segments.save", "exclusions.save", "suppressions.add", "audience.prepare", "content.save", "content.clone", "proposals.apply", "proposals.discard", "sender-bindings.save", "whatsapp.draft.discard"]);
+const WRITES = new Set(["records.create", "records.update", "segments.save", "exclusions.save", "suppressions.add", "audience.prepare", "content.save", "content.clone", "proposals.apply", "proposals.discard", "sender-bindings.save", "whatsapp.draft.discard", "campaign-work.save"]);
 const SECRET_FIELDS = new Set(["action_token", "confirmation_token", "confirmation_nonce", "confirm_token", "csv_confirm_token", "scope_proof", "password", "credentials", "credential", "secret", "session_key", "host_command"]);
 /** Service-only DTO projection. Private CSV delegation stays in this closure. */
 function sanitized(value: unknown): unknown {
@@ -36,6 +36,12 @@ function refusal(error: unknown, operation?: RecordCallVerb | RecordSlotVerb): A
     return { code: error.code, text: "Cadence refused this Works request. Refresh before trying again." };
   }
    if (status === 409 && error instanceof ApiError && error.code === "facts_changed") return { code: "facts_changed", text: "That changed. Refresh before trying again." };
+  // CAD-1827: a stale campaign-work revision keeps its own code through the
+  // bridge too. The app's stale-save recovery (re-read the row, keep the
+  // operator's edits) is keyed on `stale_revision`, not on a generic
+  // conflict, so collapsing it would strand the panel in an unusable state.
+  if (operation?.startsWith("campaign-work.") && status === 409 && error instanceof ApiError && error.code === "stale_revision")
+    return { code: "stale_revision", text: "These campaign work details changed. Reload them before saving again." };
   const code = ({ 401: "unauthorized", 403: "forbidden", 404: "not_found", 409: "conflict", 503: "unavailable" } as Record<number, string>)[status] ?? "failed";
   return { code, text: status === 401 || status === 403 ? "This app's access is no longer available." : status === 409 ? "That changed. Refresh before trying again." : "Cadence refused this request. Inspect fresh status before retrying an effect." };
 }

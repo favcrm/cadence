@@ -491,6 +491,27 @@ mod tests {
                 "crm",
             )
             .unwrap();
+        // A reason-only write must still carry the blocked status itself;
+        // the live row's status is not a claim this request made.
+        let omitted = store
+            .app_campaign_work_save(
+                CONTEXT,
+                CAMPAIGN,
+                1,
+                &patch(json!({"blocked_reason": "waiting on tax"})),
+                "operator",
+                "crm",
+            )
+            .unwrap_err();
+        assert_eq!(omitted.kind(), "rejected");
+        assert_eq!(
+            store
+                .app_campaign_work_facts(CONTEXT, CAMPAIGN, "crm")
+                .unwrap()["work"]["revision"],
+            1,
+            "an omitted-status reason changed nothing"
+        );
+
         // A reason-only edit of an already-blocked row is a valid CAS write.
         let reason_only = store
             .app_campaign_work_save(
@@ -594,12 +615,15 @@ mod tests {
         let current = store
             .app_campaign_work_read(CONTEXT, CAMPAIGN, "crm", Access::Authorized, Some(1))
             .unwrap();
-        // The recorded lifecycle decides without the readiness chain, so an
-        // authorized current read is `ok` — not a fallback or a guess.
-        assert_eq!(current["state"], "ok");
+        // The host cannot read the CRM readiness chain, so the decision is
+        // suppressed (partial) even though the row is blocked — the app
+        // gates `nextDecision` on readiness, and the host never guesses.
+        assert_eq!(current["state"], "partial");
         assert_eq!(current["identity"], "crm:install-a:ctx-a:welcome");
         assert_eq!(current["assignment"]["assignee"], "Ada");
-        assert_eq!(current["next_decision"]["key"], "unblock");
+        assert_eq!(current["next_decision"], Value::Null);
+        // The decision and the unrecorded due date are the only gaps.
+        assert_eq!(current["unavailable"], json!(["next_decision", "due_at"]));
     }
 
     #[test]

@@ -3386,6 +3386,10 @@ impl Shared {
             "app_works_request_review" => self.rpc_app_works(method, params, peer_pid, None),
             "app_works_review" => self.rpc_app_works(method, params, peer_pid, None),
             "app_works_export" => self.rpc_app_works(method, params, peer_pid, None),
+            // CAD-1827: the paired campaign-work contract's core-facing read
+            // and its declarative source discovery.
+            "crm_campaign_work_read" => self.rpc_crm_campaign_work_read(params, peer_pid),
+            "crm_campaign_work_sources" => self.rpc_crm_campaign_work_sources(params, peer_pid),
             "app_content_propose" => self.rpc_app_content(method, params, peer_pid),
             "app_content_proposal_request" => self.rpc_app_content(method, params, peer_pid),
             "app_content_assistant_propose" => {
