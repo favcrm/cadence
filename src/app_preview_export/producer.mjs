@@ -174,6 +174,8 @@ var RECORD_CALL_VERBS = [
 	"sends.list",
 	"smtp.show",
 	"origin.show",
+	"campaign-work.show",
+	"campaign-work.save",
 	"screen.preview.show",
 	"screen.preview.clear",
 	"screen.route.patch",
