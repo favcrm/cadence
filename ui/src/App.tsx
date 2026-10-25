@@ -66,6 +66,7 @@ import Setup from "./features/setup/Setup";
 import SetupNudge from "./features/setup/SetupNudge";
 import AuthBoundary from "./features/auth/AuthBoundary";
 import SignIn from "./features/auth/SignIn";
+import { metaAccess, wakingBanner } from "./features/auth/access";
 import { hireBlock, kickoffBlock as operatorKickoffBlock, writeBlock } from "./features/auth/gate";
 import { HireBlock, WriteGate } from "./features/auth/WriteGate";
 import { sessionHeaders } from "./lib/sessionKey";
@@ -444,8 +445,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // An unsigned reader (admitted only by --allow-anonymous-reads) is a
   // resolved non-operator: the server omits `operator` for it. Only a
   // claimed session whose proof is missing is genuinely unavailable.
-  const anonymousReader = meta.signed_in === false;
-  const metaUnavailable = !anonymousReader && (meta.operator === null || meta.operator === undefined);
+  const { metaUnavailable } = metaAccess(meta);
   const [recheckFinished, setRecheckFinished] = useState(false);
   useEffect(() => {
     setRecheckFinished(false);
@@ -878,10 +878,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // could not answer), and `onRetryAccess` gives the surfaces a real
   // re-check instead of a reload. `operator === true` stays the only
   // grant; both unknowns and every failure grant nothing.
+  const access = metaAccess(meta);
   const viewer = {
     readOnly,
-    operator: meta?.operator ?? (anonymousReader ? false : null),
-    access: metaUnavailable ? ("unavailable" as const) : ("checking" as const),
+    operator: access.operator,
+    access: access.access,
     onRetryAccess: retryAccess,
     screenReader,
   };
@@ -1489,7 +1490,7 @@ function WorkspaceAppEntry({
   if (viewer.operator === null) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
-        {viewer.access === "unavailable" ? (
+        {wakingBanner(viewer) ? (
           <Notice state="access-unavailable">
             <span role="status">{t("Workspace waking or unreachable.")} {recheckFinished ? t("Retry when ready.") : t("Checking again for up to 60 seconds…")}</span>
             {recheckFinished && <button type="button" className="lnk ml-2" onClick={onRetryWorkspace}>{t("Retry workspace")}</button>}
