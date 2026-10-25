@@ -1,3 +1,4 @@
+import { agentOn } from "../../lib/agentOn";
 import type { Agent } from "../../lib/types";
 import { agentIssueIds, type IssueIndex } from "../../lib/scope";
 
@@ -67,7 +68,7 @@ export function agentMatchesFilter(a: Agent, filter: AgentFilter): boolean {
  * an ordinary row. */
 export function agentHoldsWorkButDead(a: Agent): boolean {
   const holds =
-    (a.tasks?.length ?? 0) > 0 || a.on.length > 0 || a.queued > 0;
+    (a.tasks?.length ?? 0) > 0 || agentOn(a).length > 0 || a.queued > 0;
   return !agentIsLive(a) && holds;
 }
 
@@ -90,7 +91,7 @@ export function lifecycleOf(a: Agent): AgentLifecycle {
   const category = agentCategory(a);
   if (category === "inbox") return a.queued > 0 ? "stale-inbox" : "normal";
   if (category === "working") return "active";
-  if ((a.tasks?.length ?? 0) > 0 || a.on.length > 0) return "idle-holding";
+  if ((a.tasks?.length ?? 0) > 0 || agentOn(a).length > 0) return "idle-holding";
   return "normal";
 }
 

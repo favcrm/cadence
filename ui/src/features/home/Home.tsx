@@ -53,6 +53,7 @@ import {
   type Follow,
 } from "./scrollFollow";
 import { sendToMaster } from "./send";
+import { agentOn } from "../../lib/agentOn";
 import SinceCard from "./SinceCard";
 import {
   discardPending,
@@ -1161,7 +1162,7 @@ function MasterHome({
           onAsk={onAsk}
           onOpenDecision={onOpenDecision}
           onAskAgent={(agent, update) => setSeed((s) => ({
-            text: `Check in with ${agent.alias}${agent.on.length ? ` on ${agent.on.join(", ")}` : ""}. ${update ? `Their latest update: ${update.label}${update.text ? ` — ${update.text.slice(0, 1200)}` : ""}. ` : ""}What is the current progress, and does anything need my input?`,
+            text: `Check in with ${agent.alias}${agentOn(agent).length ? ` on ${agentOn(agent).join(", ")}` : ""}. ${update ? `Their latest update: ${update.label}${update.text ? ` — ${update.text.slice(0, 1200)}` : ""}. ` : ""}What is the current progress, and does anything need my input?`,
             refs: [], n: s.n + 1,
           }))}
           collapsed={railCollapsed}
