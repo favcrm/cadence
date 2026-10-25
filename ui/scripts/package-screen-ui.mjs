@@ -100,7 +100,7 @@ function visit(file) {
 }
 visit(entry);
 const cssNames = ["styles", "theme", "controls", "base", "foundation", "primitives", "drawer-base", "drawer"].map((name) => `screen-ui/src/${name}.css`);
-const sourceNames = [...seen, ...cssNames, "screen-ui/package.json", "scripts/package-screen-ui.mjs", "package.json", "bun.lock"].sort();
+const sourceNames = [...seen, ...cssNames, "screen-ui/package.json", "screen-ui/DESIGN.md", "scripts/package-screen-ui.mjs", "package.json", "bun.lock"].sort();
 const sourceFiles = sourceNames.map((name) => ({ path: `ui/${name}`, sha256: sha256(readFileSync(join(ui, name))) }));
 if (!working) {
   for (const file of sourceFiles) {
@@ -156,6 +156,7 @@ try {
     },
   });
   writeFileSync(join(pack, "package.json"), `${JSON.stringify(kitPackage, null, 2)}\n`);
+  writeFileSync(join(pack, "DESIGN.md"), readFileSync(join(ui, "screen-ui/DESIGN.md")));
   // Archive identity is content/toolchain based, independent of a later squash SHA.
   writeFileSync(join(pack, "build-manifest.json"), `${JSON.stringify(provenance, null, 2)}\n`);
   const tar = execFileSync("tar", ["--sort=name", "--format=ustar", "--mtime=@0", "--owner=0", "--group=0", "--numeric-owner", "--mode=u=rwX,go=rX", "-cf", "-", "-C", temp, "package"], { maxBuffer: 32 * 1024 * 1024 });
