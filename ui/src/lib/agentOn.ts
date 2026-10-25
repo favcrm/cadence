@@ -33,5 +33,8 @@ export function normalizeAgent(agent: Agent): Agent {
 }
 
 export function normalizeAgentsPayload(payload: AgentsPayload): AgentsPayload {
-  return { ...payload, agents: (payload.agents ?? []).map(normalizeAgent) };
+  // A missing roster is a malformed response, not an empty workspace: throwing
+  // keeps the resource's last-good data instead of publishing "no agents".
+  if (!Array.isArray(payload.agents)) throw new Error("agents payload is not a roster");
+  return { ...payload, agents: payload.agents.map(normalizeAgent) };
 }

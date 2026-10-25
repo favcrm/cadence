@@ -509,7 +509,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           if (resources.agents.get().data === null) {
             void resources.agents.invalidate();
           } else resources.agents.mutate((value) => ({ ...value,
-            agents: patchRows(value.agents, data.id as string, data.op, normalizeAgent(data.agent as Agent), (row) => row.alias),
+            agents: patchRows(
+              value.agents,
+              data.id as string,
+              data.op,
+              // A delete tombstone is { op, id } with no row; normalizing it
+              // would dereference nothing before patchRows removes it.
+              data.op === "upsert" ? normalizeAgent(data.agent as Agent) : (data.agent as Agent),
+              (row) => row.alias,
+            ),
           }));
         } else {
           if (!data.by_issue || !data.daemon || !("totals" in data)) { reconcile(); return; }

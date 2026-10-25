@@ -35,6 +35,14 @@ const kept = normalizeAgent({ ...minimal, running: 2, on: ["X-1"] });
 equal(kept.running, 2, "a present counter is kept");
 equal(kept.on, ["X-1"], "a present binding list is kept");
 
+let malformed = false;
+try {
+  normalizeAgentsPayload({ daemon: "reachable" } as unknown as AgentsPayload);
+} catch {
+  malformed = true;
+}
+equal(malformed, true, "a payload without a roster is an error, not an empty success");
+
 const payload = normalizeAgentsPayload({
   daemon: "reachable",
   agents: [minimal],
