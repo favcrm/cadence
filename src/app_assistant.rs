@@ -112,7 +112,7 @@ fn schema(id: &str) -> Option<Value> {
             &["post"],
         ),
         "social.draft.compose" => object(
-            json!({"caption":{"type":"string","minLength":1,"maxLength":2200},"brief":{"type":"string","maxLength":500},"asset_id":{"type":"string","minLength":1,"maxLength":128}}),
+            json!({"caption":{"type":"string","minLength":1,"maxLength":8800},"brief":{"type":"string","maxLength":500},"asset_id":{"type":"string","minLength":1,"maxLength":128}}),
             &["caption"],
         ),
         "social.drafts.attach_image" => object(

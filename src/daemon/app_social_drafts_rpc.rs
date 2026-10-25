@@ -315,7 +315,11 @@ impl Shared {
                 "uploaded image is outside the staging directory",
             ));
         }
-        let meta = std::fs::symlink_metadata(&path)
+        use std::io::Read as _;
+        let file = std::fs::File::open(&path)
+            .map_err(|_| Error::rejected("uploaded image is no longer available"))?;
+        let meta = file
+            .metadata()
             .map_err(|_| Error::rejected("uploaded image is no longer available"))?;
         if !meta.file_type().is_file()
             || meta.len() == 0
@@ -323,8 +327,13 @@ impl Shared {
         {
             return Err(Error::rejected("uploaded image is outside the size bound"));
         }
-        let raw = std::fs::read(&path)
+        let mut raw = Vec::with_capacity(meta.len() as usize);
+        file.take(2 * 1024 * 1024 + 64 * 1024 + 1)
+            .read_to_end(&mut raw)
             .map_err(|_| Error::rejected("uploaded image could not be read"))?;
+        if raw.len() as u64 > 2 * 1024 * 1024 + 64 * 1024 {
+            return Err(Error::rejected("uploaded image is outside the size bound"));
+        }
         let (bytes, mime, width, height) =
             crate::platform::agenticos_external::image::normalize_uploaded_image(&raw)
                 .map_err(|(_, message)| Error::rejected(message))?;
@@ -366,9 +375,6 @@ impl Shared {
                 bytes: &bytes,
             })?;
         records.app_social_tool_receipt_attach(context, &id, crate::store::now())?;
-        let preview = crate::platform::agenticos_external::image::preview_jpeg(&bytes, mime)
-            .map_err(|(_, message)| Error::rejected(message))?;
-        use base64::Engine as _;
         Ok(json!({
             "asset_id": id,
             "mime": mime,
@@ -376,7 +382,6 @@ impl Shared {
             "height": height,
             "size_bytes": bytes.len(),
             "digest": digest,
-            "preview": format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(preview)),
         }))
     }
 
@@ -437,6 +442,23 @@ impl Shared {
                 "origin",
                 "tool_alias",
                 "draft_id",
+            ][..],
+            "app_social_image_upload" => &[
+                "action_token",
+                "token",
+                "key",
+                "origin",
+                "tool_alias",
+                "name",
+                "tmp",
+            ][..],
+            "app_social_upload_asset" => &[
+                "action_token",
+                "token",
+                "key",
+                "origin",
+                "tool_alias",
+                "asset_id",
             ][..],
             "app_social_sources_show" => {
                 &["action_token", "token", "key", "origin", "tool_alias"][..]

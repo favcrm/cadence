@@ -162,6 +162,7 @@ pub(crate) enum ImageFault {
 
 type Fault = (ImageFault, &'static str);
 
+#[cfg(test)]
 pub(crate) fn image_mime(bytes: &[u8], header: &str) -> Result<&'static str, String> {
     image_checked(bytes, header).map_err(|(_, message)| message.to_owned())
 }
@@ -334,7 +335,7 @@ fn upload_limits() -> image::Limits {
 }
 
 /// Check an image that is already retained by the upload door or the
-/// generated-image path. Unlike [`image_mime`], this accepts the full
+/// generated-image path. Unlike `image_mime`, this accepts the full
 /// Instagram aspect range — the upload door normalises dimensions before
 /// custody — while still refusing non-JPEG/PNG, a mismatched stored media
 /// type, corrupt payloads and oversized decodes.
@@ -382,14 +383,34 @@ pub(crate) fn normalize_uploaded_image(
     }
     let format = upload_format(bytes)?;
     let limits = upload_limits();
+    use image::ImageDecoder as _;
     let mut probe = image::ImageReader::with_format(Cursor::new(bytes), format);
     probe.limits(limits.clone());
-    let (width, height) = probe.into_dimensions().map_err(|_| {
+    let mut decoder = probe.into_decoder().map_err(|_| {
         (
             ImageFault::Decode,
             "uploaded image dimensions are invalid or exceed the decode limit",
         )
     })?;
+    let orientation = decoder.orientation().map_err(|_| {
+        (
+            ImageFault::Decode,
+            "uploaded image orientation cannot be read",
+        )
+    })?;
+    let (stored_width, stored_height) = decoder.dimensions();
+    let rotated = matches!(
+        orientation,
+        image::metadata::Orientation::Rotate90
+            | image::metadata::Orientation::Rotate270
+            | image::metadata::Orientation::Rotate90FlipH
+            | image::metadata::Orientation::Rotate270FlipH
+    );
+    let (width, height) = if rotated {
+        (stored_height, stored_width)
+    } else {
+        (stored_width, stored_height)
+    };
     if width < UPLOAD_SIDE_MIN || height < UPLOAD_SIDE_MIN {
         return Err((
             ImageFault::TooSmall,
@@ -406,14 +427,13 @@ pub(crate) fn normalize_uploaded_image(
     if u64::from(width) * u64::from(height) > UPLOAD_PIXEL_LIMIT {
         return Err((ImageFault::Decode, "uploaded image exceeds the pixel limit"));
     }
-    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
-    reader.limits(limits);
-    let decoded = reader.decode().map_err(|_| {
+    let mut decoded = image::DynamicImage::from_decoder(decoder).map_err(|_| {
         (
             ImageFault::Decode,
             "uploaded image cannot be decoded within custody limits",
         )
     })?;
+    decoded.apply_orientation(orientation);
     if decoded.width() != width || decoded.height() != height {
         return Err((
             ImageFault::Decode,
@@ -750,5 +770,36 @@ mod tests {
         assert!(uploaded_image_mime(&encoded_png(2, 1), "").is_ok());
         assert!(uploaded_image_mime(b"not an image", "").is_err());
         assert!(uploaded_image_mime(&encoded_webp(800, 640), "").is_err());
+    }
+
+    fn jpeg_with_exif_orientation(width: u32, height: u32, orientation: u16) -> Vec<u8> {
+        let jpeg = encoded_jpeg(width, height);
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&[0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00]);
+        payload.extend_from_slice(&[0x01, 0x00]);
+        payload.extend_from_slice(&[0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00]);
+        payload.extend_from_slice(&orientation.to_le_bytes());
+        payload.extend_from_slice(&[0x00, 0x00]);
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        let mut app1 = vec![0xff, 0xe1];
+        app1.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        app1.extend_from_slice(&payload);
+        let mut out = Vec::with_capacity(jpeg.len() + app1.len());
+        out.extend_from_slice(&jpeg[..2]);
+        out.extend_from_slice(&app1);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    #[test]
+    fn uploaded_camera_orientation_is_applied_before_metadata_is_dropped() {
+        let source = jpeg_with_exif_orientation(500, 400, 6);
+        let (bytes, mime, width, height) = normalize_uploaded_image(&source).unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!((width, height), (400, 500));
+        assert!(bytes.len() <= ASSET_LIMIT);
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (400, 500));
+        assert!(!bytes.windows(6).any(|window| window == b"Exif\0\0"));
     }
 }

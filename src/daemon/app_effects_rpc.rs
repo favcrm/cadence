@@ -285,9 +285,10 @@ impl Shared {
                             "publish image exceeds the 2 MiB retained-media limit",
                         ));
                     }
-                    let mime =
-                        crate::platform::agenticos_external::image::image_mime(&bytes, &header)
-                            .map_err(Error::rejected)?;
+                    let mime = crate::platform::agenticos_external::image::uploaded_image_mime(
+                        &bytes, &header,
+                    )
+                    .map_err(|(_, message)| Error::rejected(message))?;
                     if !matches!(mime, "image/jpeg" | "image/png") {
                         return Err(Error::rejected("publish image must be JPEG or PNG"));
                     }
@@ -375,9 +376,10 @@ impl Shared {
                 if let Some(asset) = authority["asset_id"].as_str() {
                     let (header, digest, bytes) =
                         self.store.app_tool_asset_bytes(&install, asset)?;
-                    let mime =
-                        crate::platform::agenticos_external::image::image_mime(&bytes, &header)
-                            .map_err(Error::rejected)?;
+                    let mime = crate::platform::agenticos_external::image::uploaded_image_mime(
+                        &bytes, &header,
+                    )
+                    .map_err(|(_, message)| Error::rejected(message))?;
                     if bytes.len() > 2 * 1024 * 1024
                         || Some(bare_digest(&digest)) != frozen_image_digest(&authority)
                         || Some(bytes.len() as u64) != authority["size_bytes"].as_u64()
@@ -652,8 +654,9 @@ impl Shared {
             {
                 return Err(Error::rejected("social draft image changed since approval"));
             }
-            let mime = crate::platform::agenticos_external::image::image_mime(&bytes, &header)
-                .map_err(Error::rejected)?;
+            let mime =
+                crate::platform::agenticos_external::image::uploaded_image_mime(&bytes, &header)
+                    .map_err(|(_, message)| Error::rejected(message))?;
             if Some(mime) != authority["mime"].as_str() {
                 return Err(Error::rejected(
                     "social draft image type changed since approval",
