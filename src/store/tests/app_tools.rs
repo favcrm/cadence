@@ -132,3 +132,55 @@ fn cad1177_tool_receipt_survives_reopen() {
         .unwrap();
     assert_eq!(receipt["result"]["posts"][0]["id"], "p1");
 }
+
+#[test]
+fn uploaded_image_receipt_retains_a_bounded_asset() {
+    let (_d, store) = fresh();
+    let bytes = b"not-a-real-png-but-the-store-does-not-sniff";
+    let result = json!({
+        "kind": "social.uploaded_image",
+        "media_type": "image/png",
+        "width": 800,
+        "height": 1000,
+        "name": "photo.png",
+        "digest": "sha256:test",
+    });
+    let receipt = store
+        .app_tool_upload_record(crate::store::app_tools::AppToolUpload {
+            id: "up-receipt",
+            request: "request-upload",
+            install: "install1",
+            alias: "social.draft",
+            slot: "image",
+            result: &result,
+            media_type: "image/png",
+            bytes,
+        })
+        .unwrap();
+    assert_eq!(receipt["result"]["kind"], "social.uploaded_image");
+    assert_eq!(receipt["asset"]["media_type"], "image/png");
+    assert_eq!(receipt["install_id"], "install1");
+    let (header, digest, stored) = store
+        .app_tool_asset_bytes("install1", "up-receipt")
+        .unwrap();
+    assert_eq!(header, "image/png");
+    assert_eq!(stored, bytes);
+    assert_eq!(digest, crate::store::app_runs::artifact_digest(bytes));
+    // Another install cannot read this receipt or its bytes.
+    assert!(store.app_tool_result("up-receipt").is_ok());
+    assert!(store
+        .app_tool_asset_bytes("install2", "up-receipt")
+        .is_err());
+    assert!(store
+        .app_tool_upload_record(crate::store::app_tools::AppToolUpload {
+            id: "up-empty",
+            request: "request-empty",
+            install: "install1",
+            alias: "social.draft",
+            slot: "image",
+            result: &result,
+            media_type: "image/png",
+            bytes: b"",
+        })
+        .is_err());
+}

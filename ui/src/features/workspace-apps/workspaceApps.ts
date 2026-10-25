@@ -382,6 +382,53 @@ export const workspaceApps = {
     request<Record<string, unknown>>("/api/app-media/publish", undefined, body),
   socialDraftAction: (operation: "create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/save"|"effect-stage", body: Record<string, unknown> & { alias: string }) =>
     request<Record<string, unknown>>(`/api/app-social-drafts/${operation}`, undefined, toolActionBody(body)),
+  /** SOC-32: the host-owned image upload door. `file` goes as multipart; the
+   *  daemon re-proves the live mount/context/slot, normalises the image and
+   *  returns its durable asset id plus a small display preview. */
+  uploadSocialImage: async (body:{action_token:string;alias:string;file:File}):Promise<{asset_id:string;mime:string;width:number;height:number;size_bytes:number;digest:string}> => {
+    const generation = privateSessionGeneration();
+    const controller = new AbortController();
+    const unsubscribe = onPrivateReadsPaused(() => controller.abort());
+    try {
+      return await withPrivateOperation(async (op) => {
+        const form = new FormData();
+        form.append("action_token", body.action_token);
+        form.append("alias", body.alias);
+        form.append("name", body.file.name);
+        form.append("file", body.file, body.file.name);
+        const response = await privateFetch("/api/app-social-drafts/image", { method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
+          headers: { "X-Cadence-Board": "1", ...sessionHeaders() }, body: form }, op);
+        const value = await response.json().catch(() => null);
+        op.assertCurrent();
+        if (!response.ok) throw appResponseError(response, value);
+        if (controller.signal.aborted || !privateReadsAllowed() || generation !== privateSessionGeneration()) throw new DOMException("The private session changed", "AbortError");
+        const row = value as Record<string, unknown> | null;
+        if (!row || typeof row.asset_id !== "string" || !["image/jpeg", "image/png"].includes(String(row.mime)) ||
+            !Number.isSafeInteger(row.width) || !Number.isSafeInteger(row.height) || !Number.isSafeInteger(row.size_bytes) || typeof row.digest !== "string") {
+          throw new ApiError("The server returned an invalid social image receipt", 502);
+        }
+        return { asset_id: row.asset_id, mime: String(row.mime), width: row.width as number, height: row.height as number, size_bytes: row.size_bytes as number, digest: row.digest };
+      }, controller.signal);
+    } finally { unsubscribe(); }
+  },
+  socialUploadedAsset: async (body:{action_token:string;alias:string;asset_id:string}):Promise<{bytes:ArrayBuffer;mime:string}> => {
+    const generation = privateSessionGeneration();
+    const controller = new AbortController();
+    const unsubscribe = onPrivateReadsPaused(() => controller.abort());
+    try {
+      return await withPrivateOperation(async (op) => {
+        const response = await privateFetch("/api/app-social-drafts/uploaded", { method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
+          headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() }, body: JSON.stringify(toolActionBody({action_token: body.action_token, alias: body.alias, asset_id: body.asset_id})) }, op);
+        if (!response.ok) throw appResponseError(response, await response.json().catch(() => null));
+        const mime = response.headers.get("Content-Type") ?? "";
+        if (!["image/jpeg", "image/png"].includes(mime)) throw new ApiError("The server returned an invalid social image", 502);
+        const bytes = await response.arrayBuffer();
+        op.assertCurrent();
+        if (controller.signal.aborted || !privateReadsAllowed() || generation !== privateSessionGeneration()) throw new DOMException("The private session changed", "AbortError");
+        return { bytes, mime };
+      }, controller.signal);
+    } finally { unsubscribe(); }
+  },
   socialDraftAsset: async (body:{action_token:string;alias:string;draft_id:string}):Promise<{bytes:ArrayBuffer;mime:string}> => {
     const generation = privateSessionGeneration();
     const controller = new AbortController();

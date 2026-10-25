@@ -30,8 +30,12 @@ fn origin(params: &Value) -> Result<Origin> {
 }
 fn local_social_draft_write(method: &str) -> Result<bool> {
     match method {
-        "app_social_draft_list" | "app_social_draft_show" | "app_social_sources_show" => Ok(false),
+        "app_social_draft_list"
+        | "app_social_draft_show"
+        | "app_social_sources_show"
+        | "app_social_upload_asset" => Ok(false),
         "app_social_draft_asset"
+        | "app_social_image_upload"
         | "app_social_draft_create"
         | "app_social_draft_update"
         | "app_social_draft_discard"
@@ -80,8 +84,9 @@ fn source(params: &Value) -> Result<DraftSource> {
                 post_id,
             })
         }
+        "manual" if s.keys().all(|k| k == "kind") => Ok(DraftSource::Manual),
         _ => Err(Error::rejected(
-            "social draft source must name one real receipt or run",
+            "social draft source must name one real receipt or run, or be manual",
         )),
     }
 }
@@ -226,6 +231,7 @@ impl Shared {
                     ));
                 }
             }
+            DraftSource::Manual => {}
             DraftSource::Run {
                 run_id,
                 receipt_id,
@@ -262,8 +268,9 @@ impl Shared {
                 ));
             }
             let (header, digest, bytes) = self.store.app_tool_asset_bytes(install, asset)?;
-            let mime = crate::platform::agenticos_external::image::image_mime(&bytes, &header)
-                .map_err(Error::rejected)?;
+            let mime =
+                crate::platform::agenticos_external::image::uploaded_image_mime(&bytes, &header)
+                    .map_err(|(_, message)| Error::rejected(message))?;
             if !matches!(mime, "image/jpeg" | "image/png")
                 || bytes.len() > 2 * 1024 * 1024
                 || crate::store::app_runs::artifact_digest(&bytes) != digest
@@ -274,6 +281,108 @@ impl Shared {
             }
         }
         Ok(())
+    }
+
+    /// Retain one operator-picked image as a context-scoped receipt. The
+    /// board's multipart route stages the bytes under the shared upload dir;
+    /// this RPC re-proves the live mount and draft slot, normalises the image
+    /// (JPEG/PNG, 320 px floor, 4:5–1.91:1, max side 1440, EXIF dropped by
+    /// re-encode, <=2 MiB), records the standalone receipt, and attaches it
+    /// to the screen's context. The response carries a small display preview;
+    /// the draft/publish paths read the retained bytes, never this preview.
+    fn app_social_image_upload(
+        &self,
+        params: &Value,
+        ctx: &ToolContext,
+        context: &str,
+        records: &RecordStore,
+    ) -> Result<Value> {
+        let alias = required_str(params, "tool_alias")?;
+        let slot = ctx.tools.get(alias).ok_or_else(|| {
+            Error::rejected("image upload alias is not declared by the live screen")
+        })?;
+        let tmp = required_str(params, "tmp")?;
+        let root = self
+            .state_dir
+            .join(crate::wiki::UPLOAD_DIR)
+            .canonicalize()
+            .map_err(|_| Error::rejected("image upload staging is unavailable"))?;
+        let path = std::path::PathBuf::from(tmp)
+            .canonicalize()
+            .map_err(|_| Error::rejected("uploaded image is no longer available"))?;
+        if !path.starts_with(&root) || path.parent() != Some(root.as_path()) {
+            return Err(Error::rejected(
+                "uploaded image is outside the staging directory",
+            ));
+        }
+        use std::io::Read as _;
+        let file = std::fs::File::open(&path)
+            .map_err(|_| Error::rejected("uploaded image is no longer available"))?;
+        let meta = file
+            .metadata()
+            .map_err(|_| Error::rejected("uploaded image is no longer available"))?;
+        if !meta.file_type().is_file()
+            || meta.len() == 0
+            || meta.len() > 2 * 1024 * 1024 + 64 * 1024
+        {
+            return Err(Error::rejected("uploaded image is outside the size bound"));
+        }
+        let mut raw = Vec::with_capacity(meta.len() as usize);
+        file.take(2 * 1024 * 1024 + 64 * 1024 + 1)
+            .read_to_end(&mut raw)
+            .map_err(|_| Error::rejected("uploaded image could not be read"))?;
+        if raw.len() as u64 > 2 * 1024 * 1024 + 64 * 1024 {
+            return Err(Error::rejected("uploaded image is outside the size bound"));
+        }
+        let (bytes, mime, width, height) =
+            crate::platform::agenticos_external::image::normalize_uploaded_image(&raw)
+                .map_err(|(_, message)| Error::rejected(message))?;
+        let digest = crate::store::app_runs::artifact_digest(&bytes);
+        let raw_name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("image.jpg");
+        let name: String = raw_name
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect();
+        let name = if name.trim().is_empty() {
+            "image.jpg".to_owned()
+        } else {
+            name
+        };
+        let uuid = uuid::Uuid::new_v4().simple().to_string();
+        let id = format!("up-{uuid}");
+        let request = format!("upload-{uuid}");
+        let result = json!({
+            "kind": "social.uploaded_image",
+            "media_type": mime,
+            "width": width,
+            "height": height,
+            "name": name,
+            "digest": digest,
+        });
+        self.store
+            .app_tool_upload_record(crate::store::app_tools::AppToolUpload {
+                id: &id,
+                request: &request,
+                install: &ctx.install_id,
+                alias,
+                slot,
+                result: &result,
+                media_type: mime,
+                bytes: &bytes,
+            })?;
+        records.app_social_tool_receipt_attach(context, &id, crate::store::now())?;
+        Ok(json!({
+            "asset_id": id,
+            "mime": mime,
+            "width": width,
+            "height": height,
+            "size_bytes": bytes.len(),
+            "digest": digest,
+        }))
     }
 
     pub(super) fn rpc_app_social_draft(
@@ -334,6 +443,23 @@ impl Shared {
                 "tool_alias",
                 "draft_id",
             ][..],
+            "app_social_image_upload" => &[
+                "action_token",
+                "token",
+                "key",
+                "origin",
+                "tool_alias",
+                "name",
+                "tmp",
+            ][..],
+            "app_social_upload_asset" => &[
+                "action_token",
+                "token",
+                "key",
+                "origin",
+                "tool_alias",
+                "asset_id",
+            ][..],
             "app_social_sources_show" => {
                 &["action_token", "token", "key", "origin", "tool_alias"][..]
             }
@@ -365,6 +491,7 @@ impl Shared {
         let _draft_release = if matches!(
             method,
             "app_social_draft_create"
+                | "app_social_image_upload"
                 | "app_social_draft_update"
                 | "app_social_draft_discard"
                 | "app_social_sources_save"
@@ -448,8 +575,10 @@ impl Shared {
                     .ok_or_else(|| Error::rejected("social draft has no attached image"))?;
                 let (header, digest, bytes) =
                     self.store.app_tool_asset_bytes(&ctx.install_id, asset)?;
-                let mime = crate::platform::agenticos_external::image::image_mime(&bytes, &header)
-                    .map_err(Error::rejected)?;
+                let mime = crate::platform::agenticos_external::image::uploaded_image_mime(
+                    &bytes, &header,
+                )
+                .map_err(|(_, message)| Error::rejected(message))?;
                 if !matches!(mime, "image/jpeg" | "image/png") {
                     return Err(Error::rejected("publish image must be JPEG or PNG"));
                 }
@@ -459,6 +588,38 @@ impl Shared {
                 Ok(
                     json!({"install_id":ctx.install_id,"draft_id":draft["draft_id"],"revision":draft["revision"],"asset_id":asset,"mime":mime,"digest":digest,"size_bytes":bytes.len()}),
                 )
+            }
+            "app_social_image_upload" => {
+                self.app_social_image_upload(params, &ctx, &context, &records)
+            }
+            "app_social_upload_asset" => {
+                let asset = required_str(params, "asset_id")?;
+                if !records.app_social_tool_receipt_contains(&context, asset)? {
+                    return Err(Error::rejected(
+                        "uploaded image is not retained in this context",
+                    ));
+                }
+                let (header, digest, bytes) =
+                    self.store.app_tool_asset_bytes(&ctx.install_id, asset)?;
+                let mime = crate::platform::agenticos_external::image::uploaded_image_mime(
+                    &bytes, &header,
+                )
+                .map_err(|(_, message)| Error::rejected(message))?;
+                if !matches!(mime, "image/jpeg" | "image/png")
+                    || bytes.len() > 2 * 1024 * 1024
+                    || crate::store::app_runs::artifact_digest(&bytes) != digest
+                {
+                    return Err(Error::rejected(
+                        "uploaded image must be an intact owned JPEG or PNG",
+                    ));
+                }
+                Ok(json!({
+                    "install_id": ctx.install_id,
+                    "asset_id": asset,
+                    "mime": mime,
+                    "digest": digest,
+                    "size_bytes": bytes.len(),
+                }))
             }
             "app_social_draft_create" => {
                 let source = source(params)?;
@@ -511,5 +672,33 @@ impl Shared {
             }
             _ => Err(Error::rejected("unknown social draft action")),
         }
+    }
+}
+
+#[cfg(test)]
+mod manual_source_tests {
+    use super::source;
+    use serde_json::json;
+
+    #[test]
+    fn manual_source_is_closed() {
+        assert!(matches!(
+            source(&json!({"source": {"kind": "manual"}})).unwrap(),
+            crate::store::app_social_drafts::DraftSource::Manual
+        ));
+        for extra in ["post_id", "receipt_id", "run_id"] {
+            let mut fields = serde_json::Map::new();
+            fields.insert("kind".into(), json!("manual"));
+            fields.insert(extra.into(), json!("x"));
+            assert!(source(&json!({"source": fields})).is_err());
+        }
+        assert!(source(
+            &json!({"source": {"kind": "tool_receipt", "receipt_id": "r", "post_id": "p"}})
+        )
+        .is_ok());
+        assert!(source(
+            &json!({"source": {"kind": "run", "run_id": "r", "receipt_id": "c", "post_id": "p"}})
+        )
+        .is_ok());
     }
 }

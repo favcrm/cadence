@@ -133,6 +133,9 @@ pub enum DraftSource {
         receipt_id: String,
         post_id: Option<String>,
     },
+    /// A post composed from the owner's own caption and image. No fetched
+    /// profile post or run receipt exists; the provenance is explicit.
+    Manual,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

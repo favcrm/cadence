@@ -32,6 +32,8 @@ const CRM_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ap
 const FETCH: &str = r#"{ "id": "social.posts.fetch", "description": "Read recent posts.", "input_schema": { "type": "object", "properties": { "handle": { "type": "string", "minLength": 1, "maxLength": 64 } }, "required": [], "additionalProperties": false }, "effect": "read", "confirmation": "permission_required", "availability": "requires_context" }"#;
 const DRAFT: &str = r#"{ "id": "social.draft.create", "description": "Draft a caption.", "input_schema": { "type": "object", "properties": { "post": { "type": "string", "minLength": 1, "maxLength": 128 }, "instructions": { "type": "string", "maxLength": 500 }, "with_image": { "type": "boolean" } }, "required": ["post"], "additionalProperties": false }, "effect": "draft", "confirmation": "permission_required", "availability": "requires_context" }"#;
 const STATUS: &str = r#"{ "id": "social.drafts.status", "description": "Draft status.", "input_schema": { "type": "object", "properties": {}, "required": [], "additionalProperties": false }, "effect": "read", "confirmation": "none", "availability": "requires_context" }"#;
+const COMPOSE: &str = r#"{ "id": "social.draft.compose", "description": "Compose a manual draft.", "input_schema": { "type": "object", "properties": { "caption": { "type": "string", "minLength": 1, "maxLength": 8800 }, "brief": { "type": "string", "maxLength": 500 }, "asset_id": { "type": "string", "minLength": 1, "maxLength": 128 } }, "required": ["caption"], "additionalProperties": false }, "effect": "draft", "confirmation": "none", "availability": "requires_context" }"#;
+const ATTACH: &str = r#"{ "id": "social.drafts.attach_image", "description": "Attach an uploaded image.", "input_schema": { "type": "object", "properties": { "draft_id": { "type": "string", "minLength": 1, "maxLength": 128 }, "expected_revision": { "type": "integer", "minimum": 1 }, "asset_id": { "type": "string", "minLength": 1, "maxLength": 128 } }, "required": ["draft_id", "expected_revision", "asset_id"], "additionalProperties": false }, "effect": "draft", "confirmation": "none", "availability": "requires_context" }"#;
 
 fn descriptor(app: Option<&str>, actions: &[&str]) -> String {
     let app = app.map_or(String::new(), |a| format!(r#""app": "{a}","#));
@@ -43,6 +45,13 @@ fn descriptor(app: Option<&str>, actions: &[&str]) -> String {
 
 fn social_descriptor() -> String {
     descriptor(Some("social-content"), &[FETCH, DRAFT, STATUS])
+}
+
+fn soc32_descriptor() -> String {
+    descriptor(
+        Some("social-content"),
+        &[FETCH, DRAFT, COMPOSE, ATTACH, STATUS],
+    )
 }
 
 /// The step request id the ticket's exactly-once rule derives from
@@ -1454,4 +1463,153 @@ fn board_http_refuses_agent_decision_on_a_social_operation() {
     assert!(text.contains("denied"), "{text}");
     assert_eq!(door.spent(), (0, 0, 0));
     drop(guard);
+}
+
+#[test]
+fn soc32_manual_compose_and_attach_are_local_and_context_scoped() {
+    let fx = Fx::with_social(None);
+    let install = "manual-install";
+    let records = fx.records_of(install);
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        1200,
+        900,
+        image::Rgb([11, 22, 33]),
+    ))
+    .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+    .unwrap();
+    fx.shared
+        .store
+        .app_tool_upload_record(crate::store::app_tools::AppToolUpload {
+            id: "up-one",
+            request: "upload-one",
+            install,
+            alias: "social.draft",
+            slot: "image",
+            result: &json!({"kind":"social.uploaded_image","media_type":"image/png","width":1200,"height":900,"name":"one.png","digest":"sha256:one"}),
+            media_type: "image/png",
+            bytes: &png,
+        })
+        .unwrap();
+    records
+        .app_social_tool_receipt_attach("ctx-a", "up-one", 1.0)
+        .unwrap();
+    let draft = fx
+        .shared
+        .social_compose(
+            &records,
+            install,
+            "ctx-a",
+            "op-compose",
+            "agent:w1",
+            &json!({"caption":"A manual caption","brief":"a brief","asset_id":"up-one"}),
+        )
+        .unwrap();
+    assert_eq!(draft["source_kind"], "manual");
+    assert_eq!(draft["image"], "attached");
+    assert_eq!(draft["revision"], 1);
+    let draft_id = draft["draft_id"].as_str().unwrap().to_owned();
+    let attached = fx
+        .shared
+        .social_drafts_attach_image(
+            &records,
+            install,
+            "ctx-a",
+            "op-attach",
+            "agent:w1",
+            &json!({"draft_id":draft_id,"expected_revision":1,"asset_id":"up-one"}),
+        )
+        .unwrap();
+    assert_eq!(attached["image"], "attached");
+    assert_eq!(attached["revision"], 2);
+    // The same receipt is not a capability in another context.
+    let cross = fx.shared.social_compose(
+        &records,
+        install,
+        "ctx-b",
+        "op-cross",
+        "agent:w1",
+        &json!({"caption":"Cross-context","asset_id":"up-one"}),
+    );
+    let err = cross.unwrap_err().to_string();
+    assert!(
+        err.contains("not retained in this context"),
+        "cross-context upload must be refused: {err}"
+    );
+}
+
+#[test]
+fn soc32_upload_rpcs_reach_the_closed_admission_boundary() {
+    let fx = Fx::with_social(None);
+    for method in ["app_social_image_upload", "app_social_upload_asset"] {
+        let refused = fx
+            .shared
+            .rpc_app_social_draft(method, &json!({}), std::process::id())
+            .expect_err("an unauthenticated upload RPC must refuse");
+        let text = refused.to_string();
+        assert!(
+            !text.contains("unknown social draft action"),
+            "{method} was rejected by the method gate before its handler: {text}"
+        );
+    }
+}
+
+#[test]
+fn soc32_assistant_compose_and_attach_run_through_the_real_rpc() {
+    use image::ImageEncoder as _;
+    let fx = Fx::with_social(Some(&soc32_descriptor()));
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(
+            &vec![7u8; 500 * 400 * 3],
+            500,
+            400,
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+    fx.shared
+        .store
+        .app_tool_upload_record(crate::store::app_tools::AppToolUpload {
+            id: "up-soc32",
+            request: "upload-soc32",
+            install: &fx.install,
+            alias: "social.draft",
+            slot: "image",
+            result: &json!({"kind":"social.uploaded_image","media_type":"image/png","width":500,"height":400,"name":"soc32.png","digest":"sha256:soc32"}),
+            media_type: "image/png",
+            bytes: &png,
+        })
+        .unwrap();
+    fx.records()
+        .app_social_tool_receipt_attach(&fx.context, "up-soc32", 1.0)
+        .unwrap();
+    let token = fx.create_turn("m-soc32");
+    let composed = fx
+        .invoke(
+            "m-soc32",
+            &token,
+            "social.draft.compose",
+            "op-soc32-compose",
+            json!({"caption":"A manual caption","brief":"grounded in the brief","asset_id":"up-soc32"}),
+        )
+        .unwrap();
+    let operation = &composed["operation"];
+    assert_eq!(operation["status"], "succeeded", "{composed}");
+    assert_eq!(operation["result"]["source_kind"], "manual");
+    assert_eq!(operation["result"]["image"], "attached");
+    let draft = operation["result"]["draft_id"].as_str().unwrap().to_owned();
+    let revision = operation["result"]["revision"].as_i64().unwrap();
+    let attached = fx
+        .invoke(
+            "m-soc32",
+            &token,
+            "social.drafts.attach_image",
+            "op-soc32-attach",
+            json!({"draft_id":draft,"expected_revision":revision,"asset_id":"up-soc32"}),
+        )
+        .unwrap();
+    let operation = &attached["operation"];
+    assert_eq!(operation["status"], "succeeded", "{attached}");
+    assert_eq!(operation["result"]["image"], "attached");
+    assert_eq!(operation["result"]["revision"], revision + 1);
 }

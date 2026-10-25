@@ -1013,3 +1013,51 @@ fn image_publish_sends_only_the_approved_unchanged_bytes_under_one_bare_digest()
         "an image was imported for a refused effect"
     );
 }
+
+// SOC-32: an uploaded rectangular photo must survive the same draft and
+// publish material checks as a generated image. This exercises the real
+// `app_social_image_upload` RPC/admission and the staged/approved publish path.
+#[test]
+fn soc32_manual_rectangular_upload_publishes_unchanged() {
+    use image::ImageEncoder as _;
+    let fx = Fx::start();
+    let uploads = fx.dir().join(cadence_agent::wiki::UPLOAD_DIR);
+    std::fs::create_dir_all(&uploads).unwrap();
+    let tmp = uploads.join("soc32-rectangular.png");
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(
+            &vec![17u8; 1200 * 900 * 3],
+            1200,
+            900,
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+    std::fs::write(&tmp, &png).unwrap();
+    let uploaded = fx
+        .screen(
+            "app_social_image_upload",
+            json!({"tool_alias": "social.draft", "name": "soc32.png", "tmp": tmp}),
+        )
+        .unwrap_or_else(|e| panic!("upload: {e}"));
+    assert_eq!(uploaded["mime"], "image/jpeg");
+    assert_eq!(uploaded["width"], 1200);
+    assert_eq!(uploaded["height"], 900);
+    let asset = uploaded["asset_id"].as_str().unwrap().to_string();
+    let created = fx
+        .screen(
+            "app_social_draft_create",
+            json!({"tool_alias": "social.draft", "request_id": "soc32-manual",
+                "caption": CAPTION, "source": {"kind": "manual"}, "asset_id": asset}),
+        )
+        .unwrap_or_else(|e| panic!("manual draft: {e}"));
+    assert_eq!(created["source"]["kind"], "manual");
+    assert_eq!(created["asset_id"], asset);
+    let draft = created["draft_id"].as_str().unwrap().to_string();
+    let revision = created["revision"].as_i64().unwrap();
+    let (effect, digest) = fx.staged(&draft, revision, "soc32-rect");
+    let published = fx
+        .publish_now(&effect, &digest)
+        .unwrap_or_else(|e| panic!("publish rectangular upload: {e}"));
+    assert_eq!(published["effect"]["state"], "posted");
+}

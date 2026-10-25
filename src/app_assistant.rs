@@ -111,6 +111,14 @@ fn schema(id: &str) -> Option<Value> {
             json!({"post":{"type":"string","minLength":1,"maxLength":128},"instructions":{"type":"string","maxLength":500},"with_image":{"type":"boolean"}}),
             &["post"],
         ),
+        "social.draft.compose" => object(
+            json!({"caption":{"type":"string","minLength":1,"maxLength":8800},"brief":{"type":"string","maxLength":500},"asset_id":{"type":"string","minLength":1,"maxLength":128}}),
+            &["caption"],
+        ),
+        "social.drafts.attach_image" => object(
+            json!({"draft_id":{"type":"string","minLength":1,"maxLength":128},"expected_revision":{"type":"integer","minimum":1},"asset_id":{"type":"string","minLength":1,"maxLength":128}}),
+            &["draft_id", "expected_revision", "asset_id"],
+        ),
         "social.drafts.status" => object(json!({}), &[]),
         "media.refine.prepare" => object(
             json!({"asset_id":{"type":"string","minLength":1,"maxLength":64},"revision":{"type":"integer","minimum":1},"sha256":{"type":"string","minLength":71,"maxLength":71},"instructions":{"type":"string","minLength":1,"maxLength":2000}}),
@@ -274,6 +282,8 @@ pub fn registered_action(id: &str) -> Option<RegisteredAction> {
         "customer.tags.update" => ("write", "permission_required"),
         "social.posts.fetch" => ("read", "permission_required"),
         "social.draft.create" => ("draft", "permission_required"),
+        "social.draft.compose" => ("draft", "none"),
+        "social.drafts.attach_image" => ("draft", "none"),
         "social.drafts.status" => ("read", "none"),
         "media.refine.prepare" => ("draft", "permission_required"),
         "whatsapp.conversation.context" => ("read", "none"),
@@ -307,6 +317,8 @@ pub fn registered_action(id: &str) -> Option<RegisteredAction> {
             "customer.tags.update" => "customer.tags.update",
             "social.posts.fetch" => "social.posts.fetch",
             "social.draft.create" => "social.draft.create",
+            "social.draft.compose" => "social.draft.compose",
+            "social.drafts.attach_image" => "social.drafts.attach_image",
             "social.drafts.status" => "social.drafts.status",
             "media.refine.prepare" => "media.refine.prepare",
             "whatsapp.conversation.context" => "whatsapp.conversation.context",
@@ -347,6 +359,8 @@ pub fn registered_ids() -> &'static [&'static str] {
         "customer.tags.update",
         "social.posts.fetch",
         "social.draft.create",
+        "social.draft.compose",
+        "social.drafts.attach_image",
         "social.drafts.status",
         "media.refine.prepare",
         "whatsapp.conversation.context",
@@ -409,4 +423,48 @@ pub fn scoped_need(method: &str) -> Option<ScopedNeed> {
         }
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod soc32_tests {
+    use super::*;
+
+    #[test]
+    fn soc32_actions_are_registered_with_closed_schemas() {
+        for id in ["social.draft.compose", "social.drafts.attach_image"] {
+            let action = registered_action(id).unwrap();
+            assert_eq!(action.effect, "draft");
+            assert_eq!(action.confirmation, "none");
+            assert!(registered_ids().contains(&id));
+            assert!(schema_accepts(id, &action.input_schema));
+        }
+        validate_input(
+            &registered_action("social.draft.compose")
+                .unwrap()
+                .input_schema,
+            &json!({"caption": "A caption", "brief": "a brief"}),
+        )
+        .unwrap();
+        assert!(validate_input(
+            &registered_action("social.draft.compose")
+                .unwrap()
+                .input_schema,
+            &json!({"caption": ""}),
+        )
+        .is_err());
+        validate_input(
+            &registered_action("social.drafts.attach_image")
+                .unwrap()
+                .input_schema,
+            &json!({"draft_id": "soc-1", "expected_revision": 2, "asset_id": "up-1"}),
+        )
+        .unwrap();
+        assert!(validate_input(
+            &registered_action("social.drafts.attach_image")
+                .unwrap()
+                .input_schema,
+            &json!({"draft_id": "soc-1", "expected_revision": 0, "asset_id": "up-1"}),
+        )
+        .is_err());
+    }
 }

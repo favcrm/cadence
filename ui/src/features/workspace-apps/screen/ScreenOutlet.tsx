@@ -7,7 +7,7 @@ import type { ScreenFailure, ScreenPaneState } from "./screenFailure";
 import { invokeTool, revokeTool } from "./screenActions";
 import { type SlotView } from "./screenSlot";
 import ScreenSlotLayer from "./ScreenSlotLayer";
-import { parseDraftImageRef, type ScreenPush, type ScreenSurfaceRole } from "./screenProtocol";
+import { parseDraftImageRef, parseUploadImageRef, type ScreenPush, type ScreenSurfaceRole } from "./screenProtocol";
 import { workspaceApps } from "../workspaceApps";
 import { useLocale } from "../../../lib/locale";
 import { appliedFrameTheme, onAppliedThemeChange, type FrameTheme } from "../../../lib/theme";
@@ -285,8 +285,11 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
           () => { clearLeaveGuard(); frame.remove(); }, () => fail({ kind: "frame_unavailable" }), () => { if (isCurrent()) { clearTimeout(timer); setState("ready"); navigationCallbacks.current.onNavigation?.(receipt.navigation ?? null); } },
           async ref => {
             const draft=parseDraftImageRef(ref);
-            if(draft&&actionToken){
-              const image=await workspaceApps.socialDraftAsset({action_token:actionToken,alias:draft.alias,draft_id:draft.draftId});
+            const upload=parseUploadImageRef(ref);
+            if((draft||upload)&&actionToken){
+              const image=draft
+                ? await workspaceApps.socialDraftAsset({action_token:actionToken,alias:draft.alias,draft_id:draft.draftId})
+                : await workspaceApps.socialUploadedAsset({action_token:actionToken,alias:upload!.alias,asset_id:upload!.assetId});
               const bytes=new Uint8Array(image.bytes);let binary="";
               for(let offset=0;offset<bytes.length;offset+=0x8000) binary+=String.fromCharCode(...bytes.subarray(offset,offset+0x8000));
               return downscaleToDataUrl(btoa(binary),image.mime);
@@ -304,7 +307,7 @@ export default function ScreenOutlet({ projection, fallback, renderFailure, load
                 attachMedia: attach ? (selected, token) => attach(selected, token, isCurrent) : undefined,
               });
             },
-            planner: (verb, args) => services ? (RECORD_SLOT_VERBS as readonly string[]).includes(verb) ? services.planner(verb as RecordSlotVerb, args) : Promise.resolve({ code: "forbidden", text: "This operation is unavailable." }) : acting.current!.planner(verb, args, actionToken ? { actionToken } : undefined),
+            planner: (verb, args) => services ? (RECORD_SLOT_VERBS as readonly string[]).includes(verb) ? services.planner(verb as RecordSlotVerb, args) : Promise.resolve({ code: "forbidden", text: "This operation is unavailable." }) : acting.current!.planner(verb, args, actionToken ? { actionToken, allowAssetRef: ref => channel.current?.allowAssetRef(ref) } : undefined),
             onSlot: view => { if (isCurrent()) setSlot(view); },
             onLink: url => { if (isCurrent()) setLink(url); },
             onScreenDrawer: onScreenDrawer

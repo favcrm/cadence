@@ -461,6 +461,14 @@ export class ScreenChannel extends FrameChannel {
   tapSlot(token: string, trusted: boolean, pressedAt: number, input?: string): boolean {
     return !this.closed && (this.slots?.tap(token, trusted, pressedAt, input) ?? false);
   }
+  /** SOC-32: admit one host-minted ref for the asset channel after a host
+   *  upload slot. The ref grammar is closed; the loader still re-proves the
+   *  live action token and context before returning any bytes. */
+  allowAssetRef(ref: string): void {
+    if (this.closed || this.shape !== "v2" || !ASSET_REF.test(ref) || this.dynamicDraftRefs.size >= 128) return;
+    this.dynamicDraftRefs.add(ref);
+    this.refs.add(ref);
+  }
   /** The person closed the host-drawn confirm card. */
   cancelSlot(token: string): void {
     if (!this.closed) this.slots?.cancel(token);

@@ -31,7 +31,7 @@ export interface RecordCard {
 export type SlotPlan =
   | { records: true; label: string; run: (input?: string) => Promise<ActionResult>; card?: SlotCard; recordCard?: RecordCard }
   | { records?: false; label: string; run: (isCurrent?: () => boolean) => Promise<ActionResult>; card?: SlotCard; recordCard?: never };
-export type Planner = (verb: SlotVerb, args: Record<string, unknown>, ui?: { actionToken?: string; isCurrent?: () => boolean }) => Promise<SlotPlan | ActionRefusal>;
+export type Planner = (verb: SlotVerb, args: Record<string, unknown>, ui?: { actionToken?: string; isCurrent?: () => boolean; allowAssetRef?: (ref: string) => void }) => Promise<SlotPlan | ActionRefusal>;
 export interface SlotView { token: string; label: string; anchor: SlotAnchor; pending: boolean; card?: SlotCard; recordCard?: RecordCard }
 
 interface Live { id: string; key: string; verb: SlotVerb; view: SlotView; since: number; plan: SlotPlan; busy: boolean; timer: ReturnType<typeof setTimeout> }
@@ -107,7 +107,9 @@ export class SlotController {
         const receipt = live.verb === "run.start" ? parseRunSlotReceipt(result.data) : null;
         message = receipt
           ? { v: 2, op: "slot-state", id: live.id, state: "done", receipt }
-          : { v: 2, op: "slot-state", id: live.id, state: "done" };
+          : live.verb === "social.image.pick"
+            ? { v: 2, op: "slot-state", id: live.id, state: "done", data: result.data ?? null }
+            : { v: 2, op: "slot-state", id: live.id, state: "done" };
       } else {
         message = { v: 2, op: "slot-state", id: live.id, state: "refused", refusal: result.refusal };
       }

@@ -334,6 +334,19 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-social-drafts/asset",
         RouteClass::OperatorOnly,
     ),
+    // SOC-32: the composer's own-image upload — operator-only like the
+    // draft writes; the daemon re-proves the mount/context/slot and the
+    // route bounds/normalises the image.
+    route(
+        "POST",
+        "/api/app-social-drafts/image",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/uploaded",
+        RouteClass::OperatorOnly,
+    ),
     route(
         "POST",
         "/api/app-social-drafts/sources/show",
@@ -595,7 +608,10 @@ pub(super) fn admit(
     }
     let ct = if path.ends_with("/artifacts") {
         "application/octet-stream"
-    } else if path == "/api/wiki/upload" || path == "/api/chat/upload" {
+    } else if path == "/api/wiki/upload"
+        || path == "/api/chat/upload"
+        || path == "/api/app-social-drafts/image"
+    {
         // Multipart is the one non-exact rule — `write_guard` checks
         // the bounded `multipart/form-data; boundary=` prefix; the
         // header/origin/fetch-site guards still run exact.

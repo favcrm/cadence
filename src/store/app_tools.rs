@@ -39,6 +39,17 @@ CREATE TABLE IF NOT EXISTS app_tool_claims(
 pub const RESULT_BYTES: usize = 256 * 1024;
 pub const ASSET_BYTES: usize = 2 * 1024 * 1024;
 
+pub(crate) struct AppToolUpload<'a> {
+    pub id: &'a str,
+    pub request: &'a str,
+    pub install: &'a str,
+    pub alias: &'a str,
+    pub slot: &'a str,
+    pub result: &'a Value,
+    pub media_type: &'a str,
+    pub bytes: &'a [u8],
+}
+
 pub(crate) struct AppToolRecord<'a> {
     pub id: &'a str,
     pub request: &'a str,
@@ -299,6 +310,91 @@ impl Store {
                 Self::DAEMON_STREAM,
                 "app_tool_result_recorded",
                 json!({"install_id":install,"alias":alias,"receipt_id":id,"digest":digest}),
+            )?;
+            Self::app_tool_result_in(&tx, id)
+        })
+    }
+
+    /// Retain one operator-provided image as a standalone receipt. Unlike a
+    /// provider tool receipt this has no pre-call claim: the bytes arrived
+    /// from the board's authenticated upload, the caller has already
+    /// sniffed/decoded/normalised them, and the receipt is always attached
+    /// to one app context by the daemon. The id/request are daemon-minted;
+    /// the receipt is content-addressed and bounded exactly like a tool asset.
+    pub(crate) fn app_tool_upload_record(&self, upload: AppToolUpload<'_>) -> Result<Value> {
+        let AppToolUpload {
+            id,
+            request,
+            install,
+            alias,
+            slot,
+            result,
+            media_type,
+            bytes,
+        } = upload;
+        if id.is_empty() || request.is_empty() || alias.is_empty() || slot.is_empty() {
+            return Err(Error::rejected(
+                "uploaded image receipt is missing its identity",
+            ));
+        }
+        if bytes.is_empty() || bytes.len() > ASSET_BYTES {
+            return Err(Error::rejected(
+                "uploaded image is outside the custody size",
+            ));
+        }
+        if !matches!(media_type, "image/jpeg" | "image/png") {
+            return Err(Error::rejected("uploaded image is not a JPEG or PNG"));
+        }
+        let input = json!({"kind": "social.user_upload"});
+        let input_text =
+            serde_json::to_string(&input).map_err(|e| Error::internal(e.to_string()))?;
+        let result_text =
+            serde_json::to_string(result).map_err(|e| Error::internal(e.to_string()))?;
+        if result_text.len() > RESULT_BYTES {
+            return Err(Error::rejected("app tool result exceeds 256 KiB"));
+        }
+        let asset_digest = app_runs::artifact_digest(bytes);
+        let input_digest = app_runs::material_digest(&input);
+        let binding_digest = app_runs::material_digest(&json!({
+            "kind": "social.user_upload", "alias": alias, "slot": slot
+        }));
+        let digest = receipt_digest(&ReceiptFields {
+            request,
+            install,
+            alias,
+            slot,
+            binding_digest: &binding_digest,
+            input_digest: &input_digest,
+            result,
+            asset: Some((media_type, bytes.len(), &asset_digest)),
+        });
+        self.write_tx(|tx| {
+            tx.execute(
+                "INSERT INTO app_tool_results(id,request_id,install_id,alias,slot,
+                    binding_digest,input_digest,input,result,result_digest,asset_type,
+                    asset_digest,asset,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                params![
+                    id,
+                    request,
+                    install,
+                    alias,
+                    slot,
+                    binding_digest,
+                    input_digest,
+                    input_text,
+                    result_text,
+                    digest,
+                    media_type,
+                    asset_digest,
+                    bytes,
+                    now()
+                ],
+            )?;
+            Self::event(
+                &tx,
+                Self::DAEMON_STREAM,
+                "app_tool_upload_recorded",
+                json!({"install_id": install, "receipt_id": id, "digest": digest}),
             )?;
             Self::app_tool_result_in(&tx, id)
         })

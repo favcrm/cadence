@@ -468,7 +468,15 @@ impl Shared {
                 "waiting" => waiting += 1,
                 _ => failed += 1,
             }
-            rows.push(json!({"draft_id":id,"state":state,"image":image_state,"caption":clip(draft["caption"].as_str().unwrap_or_default(), 80)}));
+            rows.push(json!({
+                "draft_id": id,
+                "revision": draft["revision"],
+                "state": state,
+                "image": image_state,
+                "asset_id": draft["asset_id"],
+                "source_kind": draft.pointer("/source/kind"),
+                "caption": clip(draft["caption"].as_str().unwrap_or_default(), 80),
+            }));
         }
         Ok(json!({"ready":ready,"waiting":waiting,"failed":failed,"drafts":rows}))
     }
@@ -767,6 +775,95 @@ impl Shared {
             json!({"draft_id":draft_id,"state":"making_image","image":"making","estimated_cost_usd":usd(confirmed)}),
             refs,
         ))
+    }
+
+    /// SOC-32 — a local blank-post create. The assistant writes the caption
+    /// itself (optionally from the operator's brief) and may attach an image
+    /// that is already retained in this context by the UI upload door. No
+    /// provider is called and no charge is quoted; the same store validation
+    /// as a screen-created manual draft applies.
+    pub(super) fn social_compose(
+        &self,
+        records: &RecordStore,
+        install: &str,
+        context: &str,
+        operation_id: &str,
+        caller: &str,
+        input: &Value,
+    ) -> Result<Value> {
+        let caption = required_str(input, "caption")?;
+        if caption.trim().is_empty()
+            || caption.chars().count() > CAPTION_APP_MAX.min(CAPTION_MAX_SCALARS)
+        {
+            return Err(Error::rejected("the draft caption is empty or too long"));
+        }
+        let asset = input.get("asset_id").and_then(Value::as_str);
+        let source = DraftSource::Manual;
+        self.verify_source(install, context, &source, asset)?;
+        let actor = format!("assistant:{}", clip(caller, 48));
+        let draft = records.app_social_draft_create(
+            context,
+            caption,
+            &source,
+            asset,
+            &rid(install, context, operation_id, "cmp"),
+            &actor,
+        )?;
+        Ok(json!({
+            "draft_id": draft["draft_id"],
+            "revision": draft["revision"],
+            "state": "ready",
+            "image": if asset.is_some() { "attached" } else { "none" },
+            "source_kind": "manual",
+            "caption": clip(caption, 80),
+        }))
+    }
+
+    /// SOC-32 — attach one retained upload to an existing draft without
+    /// changing its caption or provenance. The image must be the same
+    /// context-owned receipt the UI sees; the draft revision is the CAS.
+    pub(super) fn social_drafts_attach_image(
+        &self,
+        records: &RecordStore,
+        install: &str,
+        context: &str,
+        operation_id: &str,
+        caller: &str,
+        input: &Value,
+    ) -> Result<Value> {
+        let draft_id = required_str(input, "draft_id")?;
+        let expected = input["expected_revision"]
+            .as_i64()
+            .filter(|revision| *revision >= 1)
+            .ok_or_else(|| Error::rejected("draft revision must be positive"))?;
+        let asset = required_str(input, "asset_id")?;
+        let old = records.app_social_draft_show(context, draft_id)?;
+        if old["revision"].as_i64() != Some(expected) {
+            return Err(Error::rejected("that draft changed; reload and try again"));
+        }
+        let source: DraftSource = serde_json::from_value(old["source"].clone())
+            .map_err(|_| Error::rejected("social draft provenance is corrupt"))?;
+        self.verify_source(install, context, &source, Some(asset))?;
+        let actor = format!("assistant:{}", clip(caller, 48));
+        let updated = records.app_social_draft_update(
+            context,
+            draft_id,
+            &SocialDraftEdit {
+                expected,
+                caption: required_str(&old, "caption")?,
+                asset_id: Some(Some(asset)),
+                request_id: &rid(install, context, operation_id, "att"),
+                actor: &actor,
+            },
+        )?;
+        Ok(json!({
+            "draft_id": updated["draft_id"],
+            "revision": updated["revision"],
+            "state": "ready",
+            "image": "attached",
+            "asset_id": updated["asset_id"],
+            "caption": clip(updated["caption"].as_str().unwrap_or_default(), 80),
+        }))
     }
 
     /// Best effort, from the image job worker once an assistant-requested

@@ -105,7 +105,7 @@ export function parseScreenDrawerCall(verb: ScreenDrawerVerb, args: ActionArgs):
  *  `slot` verb and waits for a tap on a host-drawn button. The `publish.*` slot
  *  verbs arrive with HP4: add them here and in the host's dispatch table. */
 export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "screen.drawer.open", "screen.drawer.close", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "media.read", "media.publish", "media.chat.attach"] as const;
-export const SLOT_VERBS = ["run.start", "publish.destination.use", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "publish.settings.save", "media.original.download"] as const;
+export const SLOT_VERBS = ["run.start", "publish.destination.use", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "publish.settings.save", "media.original.download", "social.image.pick"] as const;
 /** CAD-1365 — the protected original download slot. Qualified per mount
  *  (screen-media.v1 + media.read + live token); never a generic action verb. */
 export const ORIGINAL_DOWNLOAD_VERB = "media.original.download" as const;
@@ -297,12 +297,19 @@ export function mediaPublishArgs(args: ActionArgs): ActionArgs | null {
   return args;
 }
 /** An asset ref is host-minted (`image:<run id>`), never a receipt id. */
-export const ASSET_REF = /^(?:image:[A-Za-z0-9_-]{1,128}|draft-image:[A-Za-z0-9_-]{1,128}:[a-z][a-z0-9]{0,31}(?:\.[a-z][a-z0-9]{0,31}){0,3})$/;
+export const ASSET_REF = /^(?:image:[A-Za-z0-9_-]{1,128}|draft-image:[A-Za-z0-9_-]{1,128}:[a-z][a-z0-9]{0,31}(?:\.[a-z][a-z0-9]{0,31}){0,3}|upload-image:[A-Za-z0-9_-]{1,128}:[a-z][a-z0-9]{0,31}(?:\.[a-z][a-z0-9]{0,31}){0,3})$/;
 /** The host-held draft image ref: draft id and the tool alias that reads it. */
 const DRAFT_IMAGE_REF = /^draft-image:([A-Za-z0-9_-]{1,128}):([a-z][a-z0-9]{0,31}(?:\.[a-z][a-z0-9]{0,31}){0,3})$/;
 export function parseDraftImageRef(ref: string): { draftId: string; alias: string } | null {
   const match = DRAFT_IMAGE_REF.exec(ref);
   return match ? { draftId: match[1], alias: match[2] } : null;
+}
+/** SOC-32: the retained upload preview ref. The id is the host-minted asset
+ *  receipt, never a path; the alias names the live screen's image slot. */
+const UPLOAD_IMAGE_REF = /^upload-image:([A-Za-z0-9_-]{1,128}):([a-z][a-z0-9]{0,31}(?:\.[a-z][a-z0-9]{0,31}){0,3})$/;
+export function parseUploadImageRef(ref: string): { assetId: string; alias: string } | null {
+  const match = UPLOAD_IMAGE_REF.exec(ref);
+  return match ? { assetId: match[1], alias: match[2] } : null;
 }
 /** The host's one reply to an asset request: a downscaled data URL. A ref
  *  the host cannot load now gets no reply (the frame keeps its placeholder). */
