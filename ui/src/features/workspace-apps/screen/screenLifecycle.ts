@@ -1,8 +1,8 @@
 import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseChild, parseInit, pushedAssetRefs, shapeFor, shapeOf,
-  wantsActions, wantsMedia, isMediaVerb, SCREEN_MEDIA_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, CRM_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
+  wantsActions, wantsMedia, isMediaVerb, isScreenDrawerVerb, parseScreenDrawerCall, SCREEN_DRAWER_CLOSE, SCREEN_DRAWER_VERBS, SCREEN_MEDIA_V1, SCREEN_SURFACES_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, CRM_LOCALE_V1, SCREEN_PRESENTATION_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
   type ScreenNavigation,
   type ActionResult, type AssetReply, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenPush,
-  type ScreenPresentation, type ScreenPresentationMode, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
+  type ScreenDrawerVerb, type ScreenPresentation, type ScreenPresentationMode, type ScreenSurface, type ScreenSurfaceRole, type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
 
 /** Resolves one pushed asset ref to a downscaled `data:` URL, or `null`
@@ -48,9 +48,13 @@ export interface ScreenActions {
   /** The host-drawn slot to show (or hide, `null`). */
   onSlot(view: SlotView | null): void;
   onLink(url: string): void;
-  /** CAD-1615 — the shell presents this frame in the board-wide drawer
-   *  (`"drawer"`) or back in the app outlet (`"outlet"`). */
-  onScreenDrawer?(mode: ScreenPresentationMode, surface?: string): void;
+  /** CAD-1615 / CAD-1777 — the shell presents this frame in the
+   *  board-wide drawer (`"drawer"`) or back in the app outlet (`"outlet"`).
+   *  `independent` is stamped by the host from the negotiated
+   *  `screen-surfaces.v1` capability: an independent open mounts a separate
+   *  drawer frame in the shell's own fixed overlay instead of promoting
+   *  this frame. */
+  onScreenDrawer?(mode: ScreenPresentationMode, surface?: string, independent?: boolean): void;
   /** CAD-1177: invoke one declared tool alias under the operator's own
    *  session + this mount's server-bound action context. Absent (no tool
    *  context was minted, e.g. a v1/read-only screen) the `tool` op closes. */
@@ -183,6 +187,10 @@ export abstract class FrameChannel {
   protected slot(_request: SlotRequest): void { this.close(true); }
   protected tool(_request: ToolRequest): void { this.close(true); }
   protected recordsRights(): readonly string[] | undefined { return undefined; }
+  /** CAD-1777 — whether this frame may use the host's local drawer UI verbs,
+   *  and which of them. Only the records channel can ever say yes; a
+   *  primary admits both, a drawer frame only `close`. */
+  protected drawerCapable(): boolean | readonly ScreenDrawerVerb[] { return false; }
   /** Opaque state is ignored unless this frame kind explicitly understands it. */
   protected state(_data: string): void {}
   receive(event: Pick<MessageEvent, "origin" | "source" | "data" | "ports">): void {
@@ -199,7 +207,7 @@ export abstract class FrameChannel {
     this.port = event.ports[0];
     this.port.onmessage = event => {
       if (this.closed) return;
-      const child = parseChild(event.data, this.recordsRights());
+      const child = parseChild(event.data, this.recordsRights(), this.drawerCapable());
       if (!child || child.op === "state" && !this.ready) { this.close(true); return; }
       if (child.op === "ready") {
         if (this.ready || !this.accept(child)) { this.close(true); return; }
@@ -255,11 +263,37 @@ export class ScreenChannel extends FrameChannel {
   private records = false;
   private crmLocale = false;
   private wantsPresentation = false;
-  /** CAD-1615 — tell the child which surface its frame is in. The host
-   *  owns the geometry; the child draws its surface there. */
+  private wantsSurfaces = false;
+  /** CAD-1777 — the host-derived surface role of this mount. The outlet
+   *  sets it from its own mount request (a drawer only exists behind a
+   *  private parent token); the ready opt-in and call args cannot choose
+   *  it. */
+  surfaceRole: ScreenSurfaceRole = "primary";
+  private surfaceState: { role: ScreenSurfaceRole; modal: boolean } | null = null;
+  private surfaceSent: string | null = null;
+  /** CAD-1615 — tell the child which surface its frame is in (legacy). The
+   *  host owns the geometry; the child draws its surface there. */
   present(mode: ScreenPresentationMode): void {
     if (this.closed || !this.ready || !this.port || !this.wantsPresentation) return;
     const message: ScreenPresentation = { v: 1, op: "presentation", mode };
+    this.port.postMessage(message);
+  }
+  /** CAD-1777 — the host-owned role/modal state for a `screen-surfaces.v1`
+   *  child. `send()` posts it before the first projection, so a primary
+   *  never flashes list content when it is meant to draw a drawer; every
+   *  later change is posted once. */
+  surface(role: ScreenSurfaceRole, modal: boolean): void {
+    if (this.surfaceState?.role === role && this.surfaceState.modal === modal) return;
+    this.surfaceState = { role, modal };
+    this.postSurface();
+  }
+  private postSurface(): void {
+    if (this.closed || !this.ready || !this.port || !this.wantsSurfaces) return;
+    this.surfaceState ??= { role: this.surfaceRole, modal: false };
+    const key = `${this.surfaceState.role}:${this.surfaceState.modal ? 1 : 0}`;
+    if (this.surfaceSent === key) return;
+    this.surfaceSent = key;
+    const message: ScreenSurface = { v: 1, op: "surface", role: this.surfaceState.role, modal: this.surfaceState.modal };
     this.port.postMessage(message);
   }
   protected state(data: string): void {
@@ -281,6 +315,39 @@ export class ScreenChannel extends FrameChannel {
   private csvBusy = false;
   private csvSlot: string | null = null;
   protected recordsRights(): readonly string[] | undefined { return this.records ? this.receipt.operations ?? [] : undefined; }
+  /** CAD-1777 — the host-local presentation capability of THIS live mount:
+   *  a records frame that negotiated `screen-presentation.v1` or
+   *  `screen-surfaces.v1`, has an admitted action host and a live shell
+   *  drawer callback. A read-only viewer's shell withholds the callback, so
+   *  it never inherits geometry authority from a records receipt. A primary
+   *  admits both verbs; a drawer frame admits only its own close. */
+  private drawerVerbs(): readonly ScreenDrawerVerb[] | null {
+    if (!this.records || this.shape !== "v2" || !(this.wantsPresentation || this.wantsSurfaces) ||
+        !this.actions?.onScreenDrawer || !this.receipt.action_token) return null;
+    return this.surfaceRole === "drawer" ? [SCREEN_DRAWER_CLOSE] : SCREEN_DRAWER_VERBS;
+  }
+  protected drawerCapable(): readonly ScreenDrawerVerb[] | false { return this.drawerVerbs() ?? false; }
+  /** One validated host-local presentation request. It is never dispatched
+   *  to a records service, never spends and never widens rights; malformed
+   *  arguments are refused in place so the frame (and its draft) survives. */
+  private drawerCall(request: CallRequest & { verb: ScreenDrawerVerb }): void {
+    const onDrawer = this.actions?.onScreenDrawer;
+    if (!this.drawerVerbs() || !onDrawer) { this.close(true); return; }
+    const independent = this.wantsSurfaces;
+    const reply = (message: ReplyMessage) => { if (!this.closed) this.port?.postMessage(message); };
+    const parsed = parseScreenDrawerCall(request.verb, request.args);
+    if (!parsed) {
+      reply({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "bad_args", text: "That request is not valid." } });
+      return;
+    }
+    if (parsed.mode === "outlet") {
+      onDrawer("outlet", undefined, independent);
+      reply({ v: 2, op: "reply", id: request.id, ok: true, data: { mode: "outlet" } });
+      return;
+    }
+    onDrawer("drawer", parsed.surface, independent);
+    reply({ v: 2, op: "reply", id: request.id, ok: true, data: { mode: "drawer", surface: parsed.surface } });
+  }
   private calls = 0;
   /** In-flight call continuations. Close aborts them; resume does not restart them. */
   private callRetire: AbortController[] = [];
@@ -307,6 +374,9 @@ export class ScreenChannel extends FrameChannel {
     const actions = this.actions;
     if (this.crmLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
     if (this.shape !== "v2" || !actions || this.calls >= CALL_QUEUE_MAX) { this.close(true); return; }
+    // CAD-1777 — a records frame's drawer request is host-local UI, never a
+    // records operation: it is answered here and never reaches the services.
+    if (this.records && isScreenDrawerVerb(request.verb)) { this.drawerCall(request as CallRequest & { verb: ScreenDrawerVerb }); return; }
     const csv = this.records && request.verb === "records.csv.preview";
     if (csv && (this.csvBusy || this.csvSlot)) { this.close(true); return; }
     if (csv) this.csvBusy = true;
@@ -422,6 +492,11 @@ export class ScreenChannel extends FrameChannel {
     // Record the presentation opt-in: only a child that advertises it may
     // be told which surface its frame is in.
     this.wantsPresentation = accepts.includes(SCREEN_PRESENTATION_V1);
+    // CAD-1777 — the newer host-owned surface push (role + modal). It
+    // replaces the presentation token for packages that can draw as a
+    // primary or a drawer; a frame that does not advertise it never sees
+    // the message.
+    this.wantsSurfaces = accepts.includes(SCREEN_SURFACES_V1);
     return true;
   }
   /** Only a v2 child, for a ref the last PUSH carried; anything else closes. */
@@ -473,6 +548,16 @@ export class ScreenChannel extends FrameChannel {
     // CAD-1447: the marker also requires the child's `screen-media.v1` opt-in —
     // the released `screen-actions.v1` SDK rejects the unknown root field.
     const projection: ScreenPush = this.records ? { ...this.projection, actions: [...(this.receipt.operations ?? [])] } : { ...this.projection };
+    // CAD-1777 — the host-local presentation verbs are advertised beside
+    // the receipt's records operations, and only to a frame that has both
+    // the negotiated capability and the live shell drawer. A primary gets
+    // both; a drawer frame gets only its own close. They are UI, not
+    // records rights: a non-capable peer keeps exactly its old shape.
+    const drawerVerbs = this.drawerVerbs();
+    if (drawerVerbs) {
+      const advertised = projection.actions ?? [];
+      projection.actions = [...advertised, ...drawerVerbs.filter(verb => !advertised.includes(verb))];
+    }
     // Presentation negotiation grants no actions. Older/other peers retain their exact shape.
     if (!this.crmLocale || !["en", "zh-TW"].includes(projection.presentation_locale ?? "")) delete projection.presentation_locale;
     delete projection.run_receipts;
@@ -491,6 +576,10 @@ export class ScreenChannel extends FrameChannel {
     if (!push) { this.close(true); return; }
     this.refs = this.shape === "v2" ? pushedAssetRefs(push) : new Set();
     if(this.shape==="v2") for(const ref of this.dynamicDraftRefs) this.refs.add(ref);
+    // CAD-1777 — the host-owned surface arrives BEFORE the first projection
+    // (and before every later one, deduplicated), so a primary never draws
+    // list content when it is meant to draw the drawer.
+    this.postSurface();
     this.port?.postMessage(push);
   }
   private rememberDraftAssetRefs(data:unknown,args:Record<string,unknown>):void {

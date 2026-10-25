@@ -247,6 +247,7 @@ export default function WorkspaceApp({
   onScreenDrawer,
   presentation,
   onScreenClosed,
+  drawerTarget,
 }: {
   installId: string;
   viewer: Viewer;
@@ -257,10 +258,15 @@ export default function WorkspaceApp({
    *  `rememberContext`, and the owner hands the verified value back here. */
   contextId: string;
   onMediaAttach?: MediaChatAttach;
-  /** CAD-1615 — the board-wide drawer the screen may ask for, and the
-   *  surface the shell is presenting it in. */
-  onScreenDrawer?: (mode: "outlet" | "drawer", surface?: string) => void;
+  /** CAD-1615 / CAD-1777 — the board-wide drawer the screen may ask for,
+   *  and the surface the shell is presenting it in. `independent` marks a
+   *  negotiated `screen-surfaces.v1` open that the shell mounts as its own
+   *  fixed child overlay. */
+  onScreenDrawer?: (mode: "outlet" | "drawer", surface?: string, independent?: boolean) => void;
   presentation?: "outlet" | "drawer";
+  /** CAD-1777 — the shell-owned fixed overlay target for the primary's
+   *  child drawer frame; null while it is closed. */
+  drawerTarget?: HTMLElement | null;
   /** The screen went away (a refused push, a retired mount): close with it. */
   onScreenClosed?: () => void;
 }) {
@@ -1075,7 +1081,7 @@ export default function WorkspaceApp({
       onReinstall={data && reinstallSource ? reinstall(data.installation, reinstallSource) : undefined} />
   );
   const screen = (fallback: React.ReactNode) => projection
-    ? <><ScreenHost projection={projection} fallback={fallback} renderFailure={renderScreenFailure} loadAsset={screenExtras.loadAsset} actions={screenActions} onMediaAttach={onMediaAttach} onScreenDrawer={onScreenDrawer} presentation={presentation} onNavigation={(navigation) => { if (navigation === null) onScreenClosed?.(); }} /><Toast msg={connectToastMsg} /></> : <>{fallback}<Toast msg={connectToastMsg} /></>;
+    ? <><ScreenHost projection={projection} fallback={fallback} renderFailure={renderScreenFailure} loadAsset={screenExtras.loadAsset} actions={screenActions} onMediaAttach={onMediaAttach} onScreenDrawer={onScreenDrawer} presentation={presentation} drawerTarget={drawerTarget} onNavigation={(navigation) => { if (navigation === null) onScreenClosed?.(); }} /><Toast msg={connectToastMsg} /></> : <>{fallback}<Toast msg={connectToastMsg} /></>;
   if (data && !supportsSocialContentWorkspace(data.installation)) {
     return screen(<main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}<AppVersion version={data.installation.version} /></h1><Button href="/apps">All apps</Button></header>

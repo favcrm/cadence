@@ -30,6 +30,15 @@
 //! consume fails closed. The `bridge_nonce`/`generation`/`tag` rendered
 //! into the bootstrap are the cap's stored values, never child-chosen.
 //!
+//! CAD-1777: an optional host `parent_action_token` on mint pairs a
+//! DRAWER child with a live, consumed, non-read-only PRIMARY action
+//! context of the same records screen, install, digest, approval epoch
+//! and context — proven natively and re-proved at consume under the
+//! action-context lock. A child consume retires only a prior child of the
+//! same parent (one childslot) and never the parent; consuming or
+//! revoking the parent retires its live and pending children. The token
+//! never enters the frame, its bootstrap, a PUSH or a log.
+//!
 //! Token/key material is used only inside `Auth`; it is never stored in
 //! a cap, logged, or pushed to the frame.
 
@@ -49,11 +58,26 @@ pub(crate) struct ScreenCap {
     pub install_id: String,
     pub digest: String,
     pub tag: String,
+    /// Active app context this mount was proven for. Held so a drawer
+    /// child's parent re-proof compares the exact same context, not a
+    /// caller-supplied one.
+    pub context_id: Option<String>,
     /// Verified minting session's FULL credential hash (server-resolved
     /// at mint) — the cap's internal binding. Never the 8-hex display
     /// prefix, so a surviving prefix-colliding row cannot keep a revoked
     /// mint's cap live. Internal only — never rendered or transmitted.
     pub session: String,
+    /// Drawer child only: the bounded internal binding to the PRIMARY
+    /// action context proven at mint. `None` for a primary mount. Re-proved
+    /// at consume, so a parent replaced after mint refuses the child.
+    pub parent: Option<super::app_tools_rpc::ParentBinding>,
+    /// The exact server-minted pending action context this cap was issued
+    /// with. A drawer child's activation requires THIS context to still be
+    /// pending and matching, so a cap superseded by another child refuses
+    /// instead of disturbing the live childslot. Internal only — the same
+    /// value the host already receives as `action_token` in the receipt;
+    /// never rendered or transmitted by the frame path.
+    pub action_token: Option<String>,
     /// Host mount counter for this install — a superseded mount's mint
     /// is refused at consume.
     pub generation: u64,
@@ -138,6 +162,9 @@ struct ToolContextBinding<'a> {
     generation: u64,
     approval_epoch: i64,
     read_only: bool,
+    /// Drawer child only: the proved PRIMARY binding (host token derived
+    /// into an internal identity). `None` for a primary mount.
+    parent: Option<&'a super::app_tools_rpc::ParentBinding>,
 }
 
 impl Shared {
@@ -241,11 +268,16 @@ impl Shared {
     }
 
     /// `app_screen_mint {install_id, tag, token, key, origin,
-    /// generation, read_only?}` — a CLOSED param set: any other field
-    /// refuses, so a forged authority field cannot ride a valid credential.
+    /// generation, read_only?, parent_action_token?}` — a CLOSED param set:
+    /// any other field refuses, so a forged authority field cannot ride a
+    /// valid credential.
     /// `read_only` (CAD-1537) can only narrow: the `--read-only` board
     /// relays `true`; any other value refuses. A public `member` session
     /// is read-only whatever the host sends.
+    /// `parent_action_token` (CAD-1777) is the trusted host's optional
+    /// drawer pairing: the action token of the PRIMARY mount this child
+    /// is opened for. It is proven server-side here — never trusted as
+    /// authority — and never returned to, or accepted from, the child.
     /// `token`/`key`/`origin` are the consuming board request's own
     /// session credentials, relayed so the *daemon* proves them — never
     /// a caller-claimed session id. `generation` is the host's mount
@@ -261,6 +293,7 @@ impl Shared {
             "origin",
             "generation",
             "read_only",
+            "parent_action_token",
         ];
         let fields = params
             .as_object()
@@ -276,6 +309,15 @@ impl Shared {
             ));
         }
         let install_id = required_str(params, "install_id")?;
+        let parent_action_token = match fields.get("parent_action_token") {
+            None => None,
+            Some(Value::String(token)) if !token.is_empty() => Some(token.as_str()),
+            Some(_) => {
+                return Err(Error::rejected(
+                    "screen mint parent_action_token must be a non-empty string",
+                ))
+            }
+        };
         let context_id = params
             .get("context_id")
             .and_then(Value::as_str)
@@ -331,6 +373,44 @@ impl Shared {
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
         let (digest, approval_epoch, pkg) = self.screen_package_checked(&pm, install_id, tag)?;
+        // CAD-1777: a drawer child is admitted ONLY as a paired
+        // `screen-records.v1` screen over the same live, non-read-only
+        // primary action context. The host's token is a lookup key; every
+        // proof field below is native. Every other contract and every
+        // token-less mint keeps its existing primary behavior.
+        let parent = match parent_action_token {
+            None => None,
+            Some(parent_token) => {
+                if read_only {
+                    return Err(Error::rejected(
+                        "a read-only mount cannot host a drawer child",
+                    ));
+                }
+                if pkg.host_contract.as_deref()
+                    != Some(crate::issue::app_screen_decl::HOST_CONTRACT_RECORDS)
+                {
+                    return Err(Error::rejected(
+                        "only a records screen admits a drawer child",
+                    ));
+                }
+                let Some(context) = context_id.as_deref() else {
+                    return Err(Error::rejected(
+                        "a drawer child needs its primary active context",
+                    ));
+                };
+                Some(self.prove_drawer_parent(
+                    parent_token,
+                    &super::app_tools_rpc::DrawerParentScope {
+                        session: &session,
+                        install_id,
+                        context_id: Some(context),
+                        tag,
+                        digest: &digest,
+                        approval_epoch,
+                    },
+                )?)
+            }
+        };
 
         self.sweep_screen_caps();
         let mut caps = self.screen_caps.lock().unwrap_or_else(|e| e.into_inner());
@@ -384,9 +464,17 @@ impl Shared {
                 generation,
                 approval_epoch,
                 read_only,
+                parent: parent.as_ref(),
             },
             &pkg,
         );
+        // CAD-1777: a drawer child is only usable through its own exact
+        // pending action context. Refuse a child mint that produced none
+        // rather than issuing a cap that can never activate.
+        if parent.is_some() && action_token.is_null() {
+            return Err(Error::rejected("a drawer child needs an action context"));
+        }
+        let cap_action_token = action_token.as_str().map(str::to_owned);
         // Stable display partition, never service authorization. The full
         // session hash stays private; cache keys survive same-scope remounts.
         let display_scope_key = context_id.as_ref().map(|context| {
@@ -411,7 +499,10 @@ impl Shared {
                 install_id: install_id.to_string(),
                 digest,
                 tag: tag.to_string(),
+                context_id: context_id.clone(),
                 session,
+                parent,
+                action_token: cap_action_token,
                 generation,
                 approval_epoch,
                 bridge_nonce: bridge_nonce.clone(),
@@ -548,8 +639,11 @@ impl Shared {
         // CAD-1177: activate the pending action context for THIS consumed
         // mount — bind it to `cap.bridge_nonce` and retire every other
         // context the session holds for this install (a remount
-        // supersedes the stale action handle).
-        self.activate_tool_context(&cap);
+        // supersedes the stale action handle). CAD-1777: a drawer child's
+        // activation re-proves its PRIMARY under the same lock and fails
+        // the mount closed when the parent is gone; it never retires the
+        // parent, only a prior child of the same parent.
+        self.activate_tool_context(&cap)?;
         let mut result = json!({
             "tag": pkg.tag,
             "app": pkg.app,
@@ -596,6 +690,7 @@ impl Shared {
             generation,
             approval_epoch,
             read_only,
+            parent,
         } = *binding;
         let media_only = pkg.host_contract.as_deref()
             == Some(crate::issue::app_screen_decl::HOST_CONTRACT_MEDIA)
@@ -631,6 +726,8 @@ impl Shared {
                     pkg.tools.clone()
                 },
                 read_only,
+                parent: parent.cloned(),
+                exact_primary_active: false,
                 issued: now,
             },
         );
