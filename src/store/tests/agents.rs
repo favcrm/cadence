@@ -631,6 +631,18 @@
             "SessionInfo",
             serde_json::to_value(&opened.session).unwrap(),
         );
+        // A login-link session has no user and no account: both keys stay `null`.
+        let nonce = auth.mint(crate::operator_auth::Origin::Loopback, 1_000).unwrap();
+        let link = auth
+            .open(&nonce, crate::operator_auth::Origin::Loopback, "ua", 1_000)
+            .unwrap()
+            .unwrap();
+        assert!(link.session.user.is_none() && link.session.account_id.is_none());
+        assert_matches(
+            "meta.schema.json",
+            "SessionInfo",
+            serde_json::to_value(&link.session).unwrap(),
+        );
 
         let snapshot = json!({"source": "s", "data": {"accountId": "a", "rateLimits": {"x": 1}}});
         let available = super::quota::canonical_quota("w", "codex", "t", &snapshot, "2026-01-01T00:00:00Z");
