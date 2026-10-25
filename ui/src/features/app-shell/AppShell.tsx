@@ -413,12 +413,14 @@ export default function AppShell({
       // inside the frame and asks the host to close last; this listener only
       // sees Escape the host document owns.
       if (event.key !== "Escape" || event.defaultPrevented) return;
-      // CAD-1777: a host dialog opened over the drawer owns Escape first. The
-      // native `<dialog>` gets its cancel/close from the same keypress, so the
-      // drawer (and the child frame's draft) must survive it; the next Escape,
-      // with no dialog open, closes the drawer. The dialog may live inside the
-      // overlay (a child-generated confirmation) or outside it.
-      if (document.querySelector("dialog[open]")) return;
+      // CAD-1777: only a MODAL host dialog owns Escape. Its native cancel/close
+      // runs on the same keypress, so the drawer (and the child frame's draft)
+      // must survive it, and the next Escape closes the drawer. A nonmodal
+      // dialog left open elsewhere on the board (a popover in the chrome) is
+      // not modal and never swallows the drawer's dismissal.
+      const modal = Array.from(document.querySelectorAll("dialog[open]"))
+        .some((dialog) => dialog.matches(":modal"));
+      if (modal) return;
       setScreenDrawer(null);
       setIndependentDrawer(null);
     };

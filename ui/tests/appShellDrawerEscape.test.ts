@@ -32,6 +32,22 @@ for (const name of ["addEventListener", "removeEventListener", "dispatchEvent"])
   Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
 Object.defineProperty(globalThis, "crypto", { value: require("crypto").webcrypto, configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
+/** happy-dom does not implement the `:modal` pseudo-class, which a real browser
+ *  does. Track `showModal`/`close` and answer `:modal` from that, so AppShell's
+ *  guard is exercised exactly as written instead of being weakened for the
+ *  harness. */
+type DialogPrototype = { showModal(...args: unknown[]): void; close(...args: unknown[]): void };
+const shownModally = new WeakSet<Element>();
+const dialogPrototype = win.HTMLDialogElement.prototype as DialogPrototype;
+const nativeShowModal = dialogPrototype.showModal;
+dialogPrototype.showModal = function (this: Element, ...args: unknown[]) { shownModally.add(this); nativeShowModal.apply(this, args); };
+const nativeClose = dialogPrototype.close;
+dialogPrototype.close = function (this: Element, ...args: unknown[]) { shownModally.delete(this); nativeClose.apply(this, args); };
+const nativeMatches = win.Element.prototype.matches as (this: Element, selector: string) => boolean;
+win.Element.prototype.matches = function (this: Element, selector: string) {
+  if (selector !== ":modal") return nativeMatches.call(this, selector);
+  return (this as Partial<HTMLDialogElement>).tagName === "DIALOG" && (this as HTMLDialogElement).open && shownModally.has(this);
+};
 if (!("matchMedia" in win)) Object.defineProperty(win, "matchMedia", { value: () => ({ matches: false, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} }) });
 const loader = require("module"), originalRequire = loader.prototype.require;
 loader.prototype.require = function(this: unknown, id: string) {
@@ -152,6 +168,23 @@ async function main() {
   assert(host.querySelector(".app-shell-screen-drawer") === null, "the next Escape closes the drawer");
   assert(host.querySelector("[data-draft=customer]") === null, "closing the drawer drops the child surface");
   assert(host.querySelector("[data-open=details]") !== null, "the primary surface stayed mounted throughout");
+
+  // A NONMODAL dialog left open elsewhere on the board must not swallow the
+  // drawer's Escape: only a modal host dialog owns the first keypress.
+  await React.act(async () => {
+    (host.querySelector("[data-open=details]") as HTMLElement).dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+  });
+  await flush();
+  assert(host.querySelector(".app-shell-screen-drawer"), "the drawer reopens for the nonmodal case");
+  const popover = document.createElement("dialog");
+  popover.setAttribute("open", "");
+  document.body.append(popover);
+  assert(!popover.matches(":modal"), "the open popover dialog is not modal");
+  await React.act(async () => { escape(); });
+  await flush();
+  assert(host.querySelector(".app-shell-screen-drawer") === null, "a nonmodal open dialog does not swallow the drawer's Escape");
+  assert(popover.open, "the nonmodal dialog is left untouched");
+  popover.remove();
 
   await React.act(async () => root.unmount());
   await win.happyDOM.close();
