@@ -60,8 +60,15 @@ what was exercised, not certification of native steering for them.
 
 1. Instance and state, on a non-production board port:
    `cadence dev up --name <n> --build <cadence>` then
-   `eval "$(cadence dev env <n>)"`. Provider credentials stay in the
-   operator's own CLI configuration; nothing is copied into the store.
+   `eval "$(cadence dev env <n>)"`. Pin the destination explicitly on every
+   later command (`--state-dir <root>/state`) and confirm
+   `cadence dev status <n>` reports that same `root` (and the settings
+   revision you expect) before reading or mutating, so a previously sourced
+   `CADENCE_STATE_DIR`/`CADENCE_PROFILE` cannot retarget the instance. No
+   manual or exported credential copies are needed: provider CLIs read the
+   operator's own configuration, and a managed Pi worker's normal custody is
+   the adapter's private, scoped copy of that auth under the state dir
+   (`PI_CODING_AGENT_DIR`; never env/argv, never `~/.pi` inheritance).
 2. Provider readiness is separate from Cadence:
    `claude auth status`, `codex login status`,
    `pi auth check --provider <provider>`. A missing provider auth or quota is
@@ -76,9 +83,21 @@ what was exercised, not certification of native steering for them.
    policy default); the platform fallback is exempt at registration but is
    refused when the Pi adapter opens, so an unconfigured store lands in
    `attention` with that refusal rather than launching silently. Seed only
-   the intended row with the revision-bound commands
-   `cadence settings agents provider put pi --kind pi-extension` and
-   `cadence settings agents model put <id> --provider pi --scope worker`.
+   the intended row, as the operator, against the pinned destination, and
+   re-read the revision before each mutation:
+
+   ```sh
+   cadence --state-dir <sd> settings agents show    # take .revision
+   cadence --state-dir <sd> settings agents provider put pi \
+     --kind pi-extension --expected-revision <rev1>
+   cadence --state-dir <sd> settings agents show    # new .revision
+   cadence --state-dir <sd> settings agents model put <provider/model> \
+     --provider pi --scope worker --expected-revision <rev2>
+   ```
+
+   `--expected-revision` is required on both mutations; a stale token is
+   refused with a conflict, so take the fresh one instead of retrying the
+   same call.
 4. Send and correlate: `cadence send <alias> --message <id> --text '…'
    --wait`. The terminal receipt carries the provider's own `state`,
    `result.text` and `result.turn_id`; `agent show` reports the session id and
@@ -97,14 +116,18 @@ what was exercised, not certification of native steering for them.
    task traffic do not create a home-thread row: a CLI send is not the
    operator's chat, so a CLI-only exchange is visible in
    `agent show`/`inbox` but not in Threads. Agent↔agent traffic is a separate
-   pair conversation, listed when `include_system=true`.
+   pair conversation: ordinary peer messages are listed without a filter,
+   while routed `worker_result` and notice copies are system traffic and
+   appear only with `include_system=true`.
 7. Restart, dedup and unknown: `cadence dev reload` resumes registered agents
    on their stored session ids and keeps message ids. Retrying the same
    `--message` id with the same body answers `{"duplicate":true,…}` and starts
    no second turn; different content for a used id is refused. A provider
-   connection lost mid-turn records the message `unknown` (non-fencing) with
-   the inspection note and never replays it; `cadence agent unfence <alias>`
-   is the explicit operator reconcile (and resumes unless `--no-resume`).
+   connection lost mid-turn records the message `unknown` and fences the
+   agent in `attention` with the inspection note; the uncertain turn is never
+   replayed. `cadence agent unfence <alias>` is the explicit operator
+   reconcile (and resumes unless `--no-resume`). Turnless nudge uncertainty is
+   the non-fencing case and never fences the agent.
 
 Native steering on these versions: managed Claude refuses strict nudges;
 Codex refuses until its exact version is validated (0.160.0/0.161.0 above);
