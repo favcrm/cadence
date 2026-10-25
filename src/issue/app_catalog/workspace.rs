@@ -884,6 +884,11 @@ pub fn check_offline(source: &str) -> Result<Value> {
             report["title"] = json!(validated.manifest.title);
             report["version"] = json!(validated.manifest.version);
             report["summary"] = json!(validated.manifest.summary);
+            report["listing"] = json!(validated
+                .manifest
+                .listing
+                .as_ref()
+                .map(|listing| &listing.value));
             report["compatibility"] = validated.compatibility;
             report["notes"] = json!(validated.notes);
             report["secret_warnings"] = crate::secret::warnings_json(&validated.secret_warnings);
@@ -2693,6 +2698,7 @@ inputs:\n  topic: { ask: \"About what?\" }\n  keyword: { ask: \"Phrase\", option
 Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance\n- [ ] brief written\n\n\
 ## Write\nagent: dev-2\ndepends_on: 1\n\n### Acceptance\n- [ ] post done\n";
     const MANIFEST_A: &str = "---\napp: fixture-app\ntitle: Fixture\nversion: '1'\nneeds:\n  connections: [cms]\n  capabilities:\n    publication: {schema: 1, capability: text.publish, version: 1, action: publish, resource_kind: connection_account, effect: send}\n---\n\nGuide.\n";
+    const MANIFEST_LISTING: &str = "---\napp: fixture-app\ntitle: Fixture\nversion: '1'\nneeds:\n  connections: []\nlisting:\n  tagline: Fixture app\n  category: other\n---\n\nGuide.\n";
     const MANIFEST_B: &str = "---\napp: fixture-app\ntitle: Fixture\nversion: '2'\nneeds:\n  connections: []\n  capabilities:\n    publication: {schema: 1, capability: text.publish, version: 1, action: publish, resource_kind: connection_account, effect: send}\n    source: {schema: 1, capability: social.read, version: 1, action: list_posts, resource_kind: connection_account, effect: read}\n---\n\nGuide.\n";
 
     fn bundle(dir: &std::path::Path, manifest: &str) {
@@ -2724,6 +2730,27 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         .unwrap();
         let id = out["install_id"].as_str().unwrap().to_string();
         (pm_dir, state_dir, sources, id)
+    }
+
+    /// The catalogue's publish script builds its entry from this block; it
+    /// must be the parsed manifest value, not a copy kept elsewhere.
+    #[test]
+    fn offline_check_reports_the_manifest_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        bundle(dir.path(), MANIFEST_LISTING);
+        let report = check_offline(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(report["ok"], true, "{report}");
+        assert_eq!(report["listing"]["tagline"], "Fixture app");
+        assert_eq!(report["listing"]["category"], "other");
+    }
+
+    #[test]
+    fn offline_check_reports_no_listing_as_null() {
+        let dir = tempfile::tempdir().unwrap();
+        bundle(dir.path(), MANIFEST_A);
+        let report = check_offline(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(report["ok"], true, "{report}");
+        assert!(report["listing"].is_null(), "{report}");
     }
 
     /// CAD-1234: a hold over 1 s through `with_runtime_snapshot` reports the
