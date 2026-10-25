@@ -42,11 +42,20 @@ async function main() {
     app.app,
   );
   assert(versions.releases.length === 1 && versions.releases[0].version === release.version, "a well-formed versions document parses to its releases");
+  const hostBlocked = { ...release, version: "1.3.0", installable: false, unavailableReason: "host_incompatible" };
+  const withHostBlocked = directory.parsePublicVersions(
+    { app_id: app.id, app: app.app, recommended_version: "1.2.3", releases: [hostBlocked, release] },
+    app.id,
+    app.app,
+  );
+  assert(withHostBlocked.releases[0].unavailableReason === "host_incompatible", "a host-incompatible release remains a readable, non-installable row");
+  assert(withHostBlocked.recommended_version === "1.2.3", "the older compatible release stays recommended");
   for (const invalid of [
     { ok: true, data: { app_id: app.id, app: app.app, recommended_version: null, releases: [] } },
     { app_id: "another-app", app: app.app, recommended_version: null, releases: [] },
     { app_id: app.id, app: app.app, recommended_version: null, releases: [{ ...release, installable: false }] },
     { app_id: app.id, app: app.app, recommended_version: null, releases: [{ ...release, digest: "sha256:nope" }] },
+    { app_id: app.id, app: app.app, recommended_version: null, releases: [{ ...release, installable: false, unavailableReason: "other" }] },
   ]) {
     let refused = false;
     try { directory.parsePublicVersions(invalid, app.id, app.app); } catch { refused = true; }
