@@ -39,11 +39,16 @@ export function nextThemePref(pref: ThemePref): ThemePref {
 
 /**
  * The next pick for a control that must always change what is on screen.
- * "system" has no fixed successor: on a dark OS it gives light, on a light OS
- * it gives dark, so the first click is never a no-op.
+ *
+ * Two states, not three: "system" and the explicit theme opposite to what the
+ * OS renders. Two three-state cycles cannot both change every click and visit
+ * every state, because `system` renders identically to one of the fixed
+ * prefs — the transition into it would be invisible. Explicit prefs return to
+ * `system`; an explicit pref that renders the same as the OS is unreachable
+ * and would look identical anyway.
  */
 export function nextThemeFor(pref: ThemePref, systemDark: boolean): ThemePref {
-  return pref === "system" ? (systemDark ? "light" : "dark") : nextThemePref(pref);
+  return pref === "system" ? (systemDark ? "light" : "dark") : "system";
 }
 
 function browserStorage(): Storage | undefined {
