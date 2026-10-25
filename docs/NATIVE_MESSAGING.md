@@ -62,9 +62,10 @@ what was exercised, not certification of native steering for them.
    `cadence dev up --name <n> --build <cadence>` then
    `eval "$(cadence dev env <n>)"`. Pin the destination explicitly on every
    later command (`--state-dir <root>/state`) and confirm
-   `cadence dev status <n>` reports that same `root` (and the settings
-   revision you expect) before reading or mutating, so a previously sourced
-   `CADENCE_STATE_DIR`/`CADENCE_PROFILE` cannot retarget the instance. No
+   `cadence dev status <n>` reports that same `root` before reading or
+   mutating; `settings agents show` reports the settings revision separately
+   (step 3). This keeps a previously sourced
+   `CADENCE_STATE_DIR`/`CADENCE_PROFILE` from retargeting the instance. No
    manual or exported credential copies are needed: provider CLIs read the
    operator's own configuration, and a managed Pi worker's normal custody is
    the adapter's private, scoped copy of that auth under the state dir
