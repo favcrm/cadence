@@ -1,5 +1,5 @@
-import { useId, useState, type ReactNode } from "react";
-import { nextThemePref, setThemePref, type ThemePref } from "../lib/theme";
+import { useEffect, useId, useState, type ReactNode } from "react";
+import { nextThemeFor, setThemePref, type ThemePref } from "../lib/theme";
 import { useTranslate } from "../lib/locale";
 import { IconMoon, IconSun, IconTheme } from "./icons";
 
@@ -19,7 +19,20 @@ export default function ThemeToggle() {
     const applied = document.documentElement.getAttribute("data-theme");
     return applied === "light" || applied === "dark" ? applied : "system";
   });
-  const next = nextThemePref(pref);
+  // Track the OS scheme: a change between render and the click must not leave
+  // a stale "next" that renders the theme that is already on screen.
+  const [systemDark, setSystemDark] = useState(
+    () => typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: dark)").matches,
+  );
+  useEffect(() => {
+    if (typeof matchMedia !== "function") return;
+    const query = matchMedia("(prefers-color-scheme: dark)");
+    const update = () => setSystemDark(query.matches);
+    update();
+    query.addEventListener?.("change", update);
+    return () => query.removeEventListener?.("change", update);
+  }, []);
+  const next = nextThemeFor(pref, systemDark);
   const label = t(pref === "system" ? "System" : pref === "light" ? "Light" : "Dark").toLowerCase();
   const nextLabel = t(next === "system" ? "System" : next === "light" ? "Light" : "Dark").toLowerCase();
   const themeLabel = t("Theme:");

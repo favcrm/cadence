@@ -1,10 +1,9 @@
 /**
- * The colour theme: dark by default, unless the operator picked one.
- * A pick is stored per browser and applied as `data-theme` on <html>,
- * which styles.css reads; "system" is stored explicitly so the media
- * query decides instead of the dark fallback. Storage can throw
- * (private windows, locked-down web views) — then the pick lasts only
- * for the page.
+ * The colour theme: the system preference by default, unless the operator
+ * picked one. A pick is stored per browser and applied as `data-theme` on
+ * <html>, which styles.css reads; "system" is stored explicitly so the media
+ * query decides. Storage can throw (private windows, locked-down web views) —
+ * then the pick lasts only for the page.
  */
 
 export type ThemePref = "system" | "light" | "dark";
@@ -14,9 +13,9 @@ const THEME_KEY = "cadence-theme";
 export function readThemePref(storage: Pick<Storage, "getItem"> | undefined): ThemePref {
   try {
     const value = storage?.getItem(THEME_KEY);
-    return value === "light" || value === "dark" || value === "system" ? value : "dark";
+    return value === "light" || value === "dark" || value === "system" ? value : "system";
   } catch {
-    return "dark";
+    return "system";
   }
 }
 
@@ -26,7 +25,7 @@ export function writeThemePref(
 ): void {
   try {
     // "system" is a real pick, not an absence: it is stored explicitly so
-    // the next load does not conflate it with the dark default.
+    // the next load does not conflate it with the default.
     storage?.setItem(THEME_KEY, pref);
   } catch {
     // Unstorable: the theme still applies until the page reloads.
@@ -36,6 +35,20 @@ export function writeThemePref(
 /** system → light → dark → system. */
 export function nextThemePref(pref: ThemePref): ThemePref {
   return pref === "system" ? "light" : pref === "light" ? "dark" : "system";
+}
+
+/**
+ * The next pick for a control that must always change what is on screen.
+ *
+ * Derived from what is *rendered*, not from the pref's name: an explicit
+ * "light" on a light OS renders exactly like "system" does, so a successor
+ * computed from the pref alone can be invisible. Whatever the starting state,
+ * the toggle lands on the opposite of the current render. "System" remains
+ * selectable from the account menu; the header control is a light/dark switch.
+ */
+export function nextThemeFor(pref: ThemePref, systemDark: boolean): ThemePref {
+  const renderedDark = pref === "dark" || (pref === "system" && systemDark);
+  return renderedDark ? "light" : "dark";
 }
 
 function browserStorage(): Storage | undefined {
