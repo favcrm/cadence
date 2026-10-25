@@ -514,8 +514,8 @@ pub fn copy_pi_auth(dir: &Path, operator_config: &Path) -> Result<crate::master:
 /// `--no-extensions` there is none anyway; the flag is the belt).
 pub(super) const PI_WORKER_TOOLS: &[&str] =
     &["read", "bash", "edit", "write", "grep", "find", "ls"];
-const OMP_WORKER_TOOLS: &[&str] =
-    &["read", "bash", "edit", "write", "grep", "find", "glob"];
+// OMP's glob covers Pi's file find/ls; its semantic find needs extra services.
+const OMP_WORKER_TOOLS: &[&str] = &["read", "bash", "edit", "write", "grep", "glob"];
 
 /// An operator-supplied image file, never a company-configured extension.
 /// The managed master only exposes these two reviewed AgenticOS GET tools;
