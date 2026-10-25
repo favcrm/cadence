@@ -1455,3 +1455,76 @@ fn board_http_refuses_agent_decision_on_a_social_operation() {
     assert_eq!(door.spent(), (0, 0, 0));
     drop(guard);
 }
+
+#[test]
+fn soc32_manual_compose_and_attach_are_local_and_context_scoped() {
+    let fx = Fx::with_social(None);
+    let install = "manual-install";
+    let records = fx.records_of(install);
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        1200,
+        900,
+        image::Rgb([11, 22, 33]),
+    ))
+    .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+    .unwrap();
+    fx.shared
+        .store
+        .app_tool_upload_record(crate::store::app_tools::AppToolUpload {
+            id: "up-one",
+            request: "upload-one",
+            install,
+            alias: "social.draft",
+            slot: "image",
+            result: &json!({"kind":"social.uploaded_image","media_type":"image/png","width":1200,"height":900,"name":"one.png","digest":"sha256:one"}),
+            media_type: "image/png",
+            bytes: &png,
+        })
+        .unwrap();
+    records
+        .app_social_tool_receipt_attach("ctx-a", "up-one", 1.0)
+        .unwrap();
+    let draft = fx
+        .shared
+        .social_compose(
+            &records,
+            install,
+            "ctx-a",
+            "op-compose",
+            "agent:w1",
+            &json!({"caption":"A manual caption","brief":"a brief","asset_id":"up-one"}),
+        )
+        .unwrap();
+    assert_eq!(draft["source_kind"], "manual");
+    assert_eq!(draft["image"], "attached");
+    assert_eq!(draft["revision"], 1);
+    let draft_id = draft["draft_id"].as_str().unwrap().to_owned();
+    let attached = fx
+        .shared
+        .social_drafts_attach_image(
+            &records,
+            install,
+            "ctx-a",
+            "op-attach",
+            "agent:w1",
+            &json!({"draft_id":draft_id,"expected_revision":1,"asset_id":"up-one"}),
+        )
+        .unwrap();
+    assert_eq!(attached["image"], "attached");
+    assert_eq!(attached["revision"], 2);
+    // The same receipt is not a capability in another context.
+    let cross = fx.shared.social_compose(
+        &records,
+        install,
+        "ctx-b",
+        "op-cross",
+        "agent:w1",
+        &json!({"caption":"Cross-context","asset_id":"up-one"}),
+    );
+    let err = cross.unwrap_err().to_string();
+    assert!(
+        err.contains("not retained in this context"),
+        "cross-context upload must be refused: {err}"
+    );
+}

@@ -154,6 +154,8 @@ pub(super) fn image_prompt_for(
 pub(crate) enum ImageFault {
     Unsupported,
     NotSquare,
+    Aspect,
+    TooSmall,
     Decode,
     TooLarge,
 }
@@ -292,6 +294,155 @@ pub(crate) fn preview_jpeg(bytes: &[u8], media_type: &str) -> Result<Vec<u8>, Fa
         ));
     }
     Ok(out)
+}
+
+/// Operator-supplied image custody: JPEG or PNG only, decoded under a
+/// bounded allocation, checked against Instagram's 320 px floor and
+/// 4:5–1.91:1 aspect range, scaled down to at most 1440 px, re-encoded as
+/// JPEG (which drops EXIF and any other container metadata), and kept at or
+/// below the same two-MiB asset bound the generated image path uses.
+pub(crate) const UPLOAD_SIDE_MAX: u32 = 1440;
+pub(crate) const UPLOAD_SIDE_MIN: u32 = 320;
+pub(crate) const UPLOAD_DECODE_SIDE: u32 = 4096;
+pub(crate) const UPLOAD_PIXEL_LIMIT: u64 = 4096 * 4096;
+const UPLOAD_DECODE_ALLOC_LIMIT: u64 = 128 * 1024 * 1024;
+const UPLOAD_ASPECT_MIN: f64 = 4.0 / 5.0;
+const UPLOAD_ASPECT_MAX: f64 = 1.91;
+
+fn upload_format(bytes: &[u8]) -> Result<image::ImageFormat, Fault> {
+    let format = image::guess_format(bytes).map_err(|_| {
+        (
+            ImageFault::Unsupported,
+            "uploaded image has no supported image signature",
+        )
+    })?;
+    match format {
+        image::ImageFormat::Png | image::ImageFormat::Jpeg => Ok(format),
+        _ => Err((
+            ImageFault::Unsupported,
+            "uploaded image must be JPEG or PNG",
+        )),
+    }
+}
+
+fn upload_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(UPLOAD_DECODE_SIDE);
+    limits.max_image_height = Some(UPLOAD_DECODE_SIDE);
+    limits.max_alloc = Some(UPLOAD_DECODE_ALLOC_LIMIT);
+    limits
+}
+
+/// Check an image that is already retained by the upload door or the
+/// generated-image path. Unlike [`image_mime`], this accepts the full
+/// Instagram aspect range — the upload door normalises dimensions before
+/// custody — while still refusing non-JPEG/PNG, a mismatched stored media
+/// type, corrupt payloads and oversized decodes.
+pub(crate) fn uploaded_image_mime(bytes: &[u8], media_type: &str) -> Result<&'static str, Fault> {
+    if bytes.is_empty() || bytes.len() > ASSET_LIMIT {
+        return Err((
+            ImageFault::TooLarge,
+            "uploaded image is outside the custody size",
+        ));
+    }
+    let format = upload_format(bytes)?;
+    let mime = if format == image::ImageFormat::Png {
+        "image/png"
+    } else {
+        "image/jpeg"
+    };
+    if !media_type.is_empty() && media_type != mime {
+        return Err((
+            ImageFault::Unsupported,
+            "uploaded image media type disagrees with its bytes",
+        ));
+    }
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(upload_limits());
+    let decoded = reader.decode().map_err(|_| {
+        (
+            ImageFault::Decode,
+            "uploaded image cannot be decoded within the custody limit",
+        )
+    })?;
+    if decoded.width() < 1 || decoded.height() < 1 {
+        return Err((ImageFault::Decode, "uploaded image has no pixels"));
+    }
+    Ok(mime)
+}
+
+pub(crate) fn normalize_uploaded_image(
+    bytes: &[u8],
+) -> Result<(Vec<u8>, &'static str, u32, u32), Fault> {
+    if bytes.is_empty() || bytes.len() > ASSET_LIMIT {
+        return Err((
+            ImageFault::TooLarge,
+            "uploaded image is outside the custody size",
+        ));
+    }
+    let format = upload_format(bytes)?;
+    let limits = upload_limits();
+    let mut probe = image::ImageReader::with_format(Cursor::new(bytes), format);
+    probe.limits(limits.clone());
+    let (width, height) = probe.into_dimensions().map_err(|_| {
+        (
+            ImageFault::Decode,
+            "uploaded image dimensions are invalid or exceed the decode limit",
+        )
+    })?;
+    if width < UPLOAD_SIDE_MIN || height < UPLOAD_SIDE_MIN {
+        return Err((
+            ImageFault::TooSmall,
+            "uploaded image is smaller than 320 pixels on a side",
+        ));
+    }
+    let aspect = f64::from(width) / f64::from(height);
+    if !(UPLOAD_ASPECT_MIN..=UPLOAD_ASPECT_MAX).contains(&aspect) {
+        return Err((
+            ImageFault::Aspect,
+            "uploaded image is outside Instagram's 4:5 to 1.91:1 range",
+        ));
+    }
+    if u64::from(width) * u64::from(height) > UPLOAD_PIXEL_LIMIT {
+        return Err((ImageFault::Decode, "uploaded image exceeds the pixel limit"));
+    }
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(limits);
+    let decoded = reader.decode().map_err(|_| {
+        (
+            ImageFault::Decode,
+            "uploaded image cannot be decoded within the custody limit",
+        )
+    })?;
+    if decoded.width() != width || decoded.height() != height {
+        return Err((
+            ImageFault::Decode,
+            "uploaded image dimensions changed during decode",
+        ));
+    }
+    let resized = if width > UPLOAD_SIDE_MAX || height > UPLOAD_SIDE_MAX {
+        decoded.resize(
+            UPLOAD_SIDE_MAX,
+            UPLOAD_SIDE_MAX,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        decoded
+    };
+    let rgb = resized.to_rgb8();
+    for quality in [90u8, 82, 74, 66] {
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+            .encode_image(&rgb)
+            .map_err(|_| (ImageFault::Decode, "uploaded image could not be re-encoded"))?;
+        if out.len() <= ASSET_LIMIT {
+            return Ok((out, "image/jpeg", rgb.width(), rgb.height()));
+        }
+    }
+    Err((
+        ImageFault::TooLarge,
+        "uploaded image does not fit the custody bound after re-encoding",
+    ))
 }
 
 /// An artifact above the custody bound is re-encoded as a JPEG that fits it
@@ -542,5 +693,62 @@ mod tests {
         webp.extend(b"WEBPVP8 ");
         webp.extend([0; 8]);
         assert!(image_mime(&webp, "image/webp").is_err());
+    }
+
+    #[test]
+    fn uploaded_images_are_normalized_and_bounded() {
+        let source = encoded_png(2000, 1600);
+        let (bytes, mime, width, height) = normalize_uploaded_image(&source).unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert!(width <= UPLOAD_SIDE_MAX && height <= UPLOAD_SIDE_MAX);
+        assert!(width >= UPLOAD_SIDE_MIN && height >= UPLOAD_SIDE_MIN);
+        assert!(bytes.len() <= ASSET_LIMIT);
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (width, height));
+        assert_ne!(
+            bytes, source,
+            "upload custody re-encodes instead of retaining the original"
+        );
+
+        assert!(normalize_uploaded_image(&encoded_png(300, 300)).is_err());
+        assert!(matches!(
+            normalize_uploaded_image(&encoded_png(320, 1000))
+                .unwrap_err()
+                .0,
+            ImageFault::Aspect
+        ));
+        assert!(matches!(
+            normalize_uploaded_image(&encoded_png(2000, 1000))
+                .unwrap_err()
+                .0,
+            ImageFault::Aspect
+        ));
+        assert!(matches!(
+            normalize_uploaded_image(&encoded_webp(800, 640))
+                .unwrap_err()
+                .0,
+            ImageFault::Unsupported
+        ));
+        assert!(normalize_uploaded_image(b"<svg xmlns='http://www.w3.org/2000/svg'/>").is_err());
+        assert!(matches!(
+            normalize_uploaded_image(&vec![0u8; ASSET_LIMIT + 1])
+                .unwrap_err()
+                .0,
+            ImageFault::TooLarge
+        ));
+    }
+
+    #[test]
+    fn upload_mime_accepts_normalized_non_square_and_rejects_mismatch() {
+        let (jpeg, _, width, height) = normalize_uploaded_image(&encoded_png(1200, 900)).unwrap();
+        assert!(width > height);
+        assert_eq!(
+            uploaded_image_mime(&jpeg, "image/jpeg").unwrap(),
+            "image/jpeg"
+        );
+        assert!(uploaded_image_mime(&jpeg, "image/png").is_err());
+        assert!(uploaded_image_mime(&encoded_png(2, 1), "").is_ok());
+        assert!(uploaded_image_mime(b"not an image", "").is_err());
+        assert!(uploaded_image_mime(&encoded_webp(800, 640), "").is_err());
     }
 }

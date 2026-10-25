@@ -11,6 +11,7 @@ fn local_social_draft_classifier_is_an_exact_closed_allowlist() {
         "app_social_draft_list",
         "app_social_draft_show",
         "app_social_sources_show",
+        "app_social_upload_asset",
     ] {
         assert!(
             !super::local_social_draft_write(method).unwrap(),
@@ -22,6 +23,7 @@ fn local_social_draft_classifier_is_an_exact_closed_allowlist() {
     // that permission boundary; this boolean is not an IO-mutability claim.
     for method in [
         "app_social_draft_create",
+        "app_social_image_upload",
         "app_social_draft_update",
         "app_social_draft_discard",
         "app_social_draft_asset",

@@ -493,3 +493,95 @@ fn social_draft_discard_is_soft_revision_checked_and_refused_while_in_use() {
         assert!(store.app_social_draft_show("ctx", &used).is_ok(), "{step}");
     }
 }
+
+#[test]
+fn manual_source_persists_without_receipts() {
+    let root = tempfile::tempdir().unwrap();
+    let store = RecordStore::open(root.path(), "install-social").unwrap();
+    let created = store
+        .app_social_draft_create(
+            "ctx-one",
+            "A post written from scratch",
+            &DraftSource::Manual,
+            None,
+            "request-manual",
+            "session:test",
+        )
+        .unwrap();
+    assert_eq!(created["source"]["kind"], "manual");
+    assert!(created["source"].get("receipt_id").is_none());
+    let id = created["draft_id"].as_str().unwrap().to_owned();
+    drop(store);
+    let reload = RecordStore::open(root.path(), "install-social").unwrap();
+    let shown = reload.app_social_draft_show("ctx-one", &id).unwrap();
+    assert_eq!(shown["source"]["kind"], "manual");
+    assert_eq!(shown["caption"], "A post written from scratch");
+}
+
+#[test]
+fn uploaded_receipt_is_context_scoped_and_image_updates_are_revision_checked() {
+    let root = tempfile::tempdir().unwrap();
+    let store = RecordStore::open(root.path(), "install-social").unwrap();
+    store
+        .app_social_tool_receipt_attach("ctx-one", "up-image", 1.0)
+        .unwrap();
+    assert!(store
+        .app_social_tool_receipt_contains("ctx-one", "up-image")
+        .unwrap());
+    assert!(!store
+        .app_social_tool_receipt_contains("ctx-two", "up-image")
+        .unwrap());
+    let created = store
+        .app_social_draft_create(
+            "ctx-one",
+            "A manual post",
+            &DraftSource::Manual,
+            None,
+            "request-manual-image",
+            "session:test",
+        )
+        .unwrap();
+    let id = created["draft_id"].as_str().unwrap().to_owned();
+    let with_image = store
+        .app_social_draft_update(
+            "ctx-one",
+            &id,
+            &SocialDraftEdit {
+                expected: created["revision"].as_i64().unwrap(),
+                caption: "A manual post",
+                asset_id: Some(Some("up-image")),
+                request_id: "request-attach-image",
+                actor: "session:test",
+            },
+        )
+        .unwrap();
+    assert_eq!(with_image["asset_id"], "up-image");
+    assert_eq!(with_image["source"]["kind"], "manual");
+    let stale = store.app_social_draft_update(
+        "ctx-one",
+        &id,
+        &SocialDraftEdit {
+            expected: created["revision"].as_i64().unwrap(),
+            caption: "A manual post",
+            asset_id: Some(Some("up-image")),
+            request_id: "request-stale-image",
+            actor: "session:test",
+        },
+    );
+    assert!(stale.is_err());
+    let removed = store
+        .app_social_draft_update(
+            "ctx-one",
+            &id,
+            &SocialDraftEdit {
+                expected: with_image["revision"].as_i64().unwrap(),
+                caption: "A manual post",
+                asset_id: Some(None),
+                request_id: "request-remove-image",
+                actor: "session:test",
+            },
+        )
+        .unwrap();
+    assert!(removed["asset_id"].is_null());
+    assert_eq!(removed["source"]["kind"], "manual");
+}

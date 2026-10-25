@@ -970,6 +970,9 @@ impl AgenticosExternalAdapter {
                     ImageFault::Unsupported => R::UnsupportedImage,
                     ImageFault::NotSquare => R::NotSquare,
                     ImageFault::Decode => R::DecodeFailed,
+                    // Upload-only faults never arise from the generated-image
+                    // path; if one ever did it is an invalid image.
+                    ImageFault::Aspect | ImageFault::TooSmall => R::DecodeFailed,
                     ImageFault::TooLarge => R::ArtifactTooLarge,
                 },
                 detail,
@@ -1128,6 +1131,9 @@ impl AgenticosExternalAdapter {
                     ImageFault::Unsupported => R::UnsupportedImage,
                     ImageFault::NotSquare => R::NotSquare,
                     ImageFault::Decode => R::DecodeFailed,
+                    // Upload-only faults never arise from the generated-image
+                    // path; if one ever did it is an invalid image.
+                    ImageFault::Aspect | ImageFault::TooSmall => R::DecodeFailed,
                     ImageFault::TooLarge => R::ArtifactTooLarge,
                 },
                 detail,

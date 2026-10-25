@@ -3263,6 +3263,8 @@ impl Shared {
             "app_run_artifact" => self.rpc_app_local(method, params, peer_pid),
             "app_binding_quote" => self.rpc_app_capability(method, params, peer_pid),
             "app_social_draft_create"
+            | "app_social_image_upload"
+            | "app_social_upload_asset"
             | "app_social_draft_list"
             | "app_social_draft_show"
             | "app_social_draft_update"

@@ -599,6 +599,22 @@ impl Shared {
                 "segments.delete" => {
                     records.app_segment_delete(&scoped.context, required_str(input, "segment_id")?)
                 }
+                "social.draft.compose" => self.social_compose(
+                    &records,
+                    &scoped.install,
+                    &scoped.context,
+                    operation_id,
+                    &scoped.caller,
+                    input,
+                ),
+                "social.drafts.attach_image" => self.social_drafts_attach_image(
+                    &records,
+                    &scoped.install,
+                    &scoped.context,
+                    operation_id,
+                    &scoped.caller,
+                    input,
+                ),
                 "social.drafts.status" => self.social_status(&records, &scoped.context),
                 "campaigns.list" => records.app_content_list(&scoped.context),
                 "campaigns.show" => {
@@ -1686,6 +1702,13 @@ fn resource_refs(action: &str, result: &Value) -> Value {
             .pointer("/base/segment_id")
             .and_then(Value::as_str)
             .map(|id| json!([{"kind":"segment","id":id,"label":"Segment audience preview"}]))
+            .unwrap_or_else(|| json!([]));
+    }
+    if action == "social.draft.compose" || action == "social.drafts.attach_image" {
+        let id = result["draft_id"].as_str();
+        let label = result["caption"].as_str().unwrap_or("Draft");
+        return id
+            .map(|id| json!([{"kind": "social_draft", "id": id, "label": label}]))
             .unwrap_or_else(|| json!([]));
     }
     let (kind, id, label) = match action {

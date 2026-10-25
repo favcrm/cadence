@@ -725,6 +725,8 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     // read/draft only. A send effect is refused at this door.
     ("app_tool_invoke", Rule::Handler("operator_connection + live mount action context + declared read/draft slot (CAD-1177)")),
     ("app_social_draft_create", Rule::Handler("operator_connection + live mount + context + draft slot (CAD-1177)")),
+    ("app_social_image_upload", Rule::Handler("operator_connection + live mount + context + draft slot + bounded JPEG/PNG custody (SOC-32)")),
+    ("app_social_upload_asset", Rule::Handler("operator_connection + live mount + context + retained upload custody (SOC-32)")),
     ("app_social_draft_list", Rule::Handler("operator_connection + live mount + context + declared slot (CAD-1177)")),
     ("app_social_draft_show", Rule::Handler("operator_connection + live mount + context + declared slot (CAD-1177)")),
     ("app_social_draft_update", Rule::Handler("operator_connection + live mount + context + draft slot (CAD-1177)")),

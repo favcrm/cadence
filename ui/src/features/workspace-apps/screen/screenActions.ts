@@ -78,6 +78,11 @@ export function plainRefusal(error: unknown): ActionRefusal {
   if (error.code === "stale_revision") return { code: "stale_revision", text: "That changed somewhere else. Reload and try again." };
   if (error.code === "draft_not_found") return { code: "draft_not_found", text: "That draft is no longer here." };
   const text = error.message.toLowerCase();
+  if (text.includes("320 pixels")) return { code: "image_too_small", text: "Use a photo at least 320 pixels on each side." };
+  if (text.includes("4:5 to 1.91:1")) return { code: "image_aspect", text: "Use a photo between 4:5 and 1.91:1." };
+  if (text.includes("must be jpeg or png") || text.includes("not an intact owned jpeg or png") || text.includes("no supported image signature")) return { code: "image_type", text: "Use a JPEG or PNG photo." };
+  if (text.includes("outside the custody size") || text.includes("outside the size bound") || text.includes("does not fit the custody bound")) return { code: "image_too_large", text: "That photo is too large. Use one under 2 MB." };
+  if (text.includes("cannot be decoded") || text.includes("invalid or exceed the decode")) return { code: "image_unreadable", text: "That photo can't be read. Try a different one." };
   if (text.includes("price_changed")) return { code: "price_changed", text: "Something changed. Please try again." };
   if (text.includes("no default team")) return { code: "team_missing", text: "Set this app's team in Settings first." };
   if (text.includes("worker")) return { code: "team_unavailable", text: "A team member is unavailable right now." };
@@ -638,6 +643,57 @@ async function planOriginalDownload(get: () => ActionContext, args: Record<strin
   } };
 }
 
+const DRAFT_ALIAS = "social.draft";
+
+/** SOC-32: choose one local JPEG/PNG through a host-owned file control. The
+ *  picker is opened synchronously from the host slot's tap; the bytes go to
+ *  the board's multipart route, never through the screen port. The frame
+ *  receives only the durable asset receipt and a host-minted preview ref. */
+function chooseImageFile(): Promise<File | null> {
+  return new Promise(resolve => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/jpeg,image/png";
+    input.style.position = "fixed";
+    input.style.left = "-10000px";
+    input.style.top = "0";
+    let settled = false;
+    const finish = (file: File | null) => {
+      if (settled) return;
+      settled = true;
+      input.remove();
+      resolve(file);
+    };
+    input.addEventListener("change", () => finish(input.files?.[0] ?? null), { once: true });
+    input.addEventListener("cancel", () => finish(null), { once: true });
+    // Browsers without the `cancel` event still fire window focus when the
+    // dialog closes; a file selection has already populated `files` by then.
+    window.addEventListener("focus", () => { setTimeout(() => { if (!input.files?.length) finish(null); }, 0); }, { once: true });
+    document.body.appendChild(input);
+    input.click();
+  });
+}
+
+async function planImagePick(_args: Record<string, unknown>, ui?: { actionToken?: string; allowAssetRef?: (ref: string) => void }): Promise<SlotPlan | ActionRefusal> {
+  const actionToken = ui?.actionToken;
+  if (typeof actionToken !== "string" || !/^[a-f0-9]{64}$/.test(actionToken) || !ui?.allowAssetRef)
+    return { code: "unavailable", text: "That photo control is unavailable." };
+  const allowAssetRef = ui.allowAssetRef;
+  return { label: "Choose image", run: async (): Promise<ActionResult> => {
+    const file = await chooseImageFile();
+    if (!file) return refuse("cancelled", "Cancelled. Nothing was uploaded.");
+    if (!["image/jpeg", "image/png"].includes(file.type)) return refuse("image_type", "Use a JPEG or PNG photo.");
+    if (file.size > 2 * 1024 * 1024 + 64 * 1024) return refuse("image_too_large", "That photo is too large. Use one under 2 MB.");
+    let uploaded: { asset_id: string; mime: string; width: number; height: number; size_bytes: number; digest: string };
+    try {
+      uploaded = await workspaceApps.uploadSocialImage({ action_token: actionToken, alias: DRAFT_ALIAS, file });
+    } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+    const image_ref = `upload-image:${uploaded.asset_id}:${DRAFT_ALIAS}`;
+    allowAssetRef(image_ref);
+    return { ok: true, data: { ...uploaded, image_ref } };
+  } };
+}
+
 /** The spend/publish verbs. The set is closed in `screenProtocol`. */
 export function makePlanner(get: () => ActionContext): Planner {
   return (verb: SlotVerb, args, ui) => {
@@ -651,6 +707,7 @@ export function makePlanner(get: () => ActionContext): Planner {
       "publish.draft.cancel": () => planDraftEffectChange(get(), verb, args, ui?.actionToken),
       "publish.settings.save": () => planSavePublishSettings(get(), args),
       "media.original.download": () => planOriginalDownload(get, args, ui),
+      "social.image.pick": () => planImagePick(args, ui),
     };
     return table[verb as (typeof SLOT_VERBS)[number]]();
   };
