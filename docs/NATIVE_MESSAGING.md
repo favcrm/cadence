@@ -113,13 +113,20 @@ what was exercised, not certification of native steering for them.
    `POST /api/threads/<alias>/messages` (`thread_send`) starts the canonical
    home thread inside the enqueue transaction. `/api/threads/<alias>` and
    `/api/work-conversations` then return the same id with the operator
-   message and the agent's `turn_result`. Plain `cadence send`, dispatch and
-   task traffic do not create a home-thread row: a CLI send is not the
-   operator's chat, so a CLI-only exchange is visible in
-   `agent show`/`inbox` but not in Threads. Agent↔agent traffic is a separate
-   pair conversation: ordinary peer messages are listed without a filter,
-   while routed `worker_result` and notice copies are system traffic and
-   appear only with `include_system=true`.
+   message and the agent's `turn_result`.
+
+   A Home thread is per agent alias. Plain `cadence send`, dispatch and task
+   traffic do not create one; before it exists, read that work through
+   `agent show`/`inbox` (and agent↔agent pairs, below). Once the alias has a
+   Home thread, its timeline is alias-scoped: a CLI, dispatch, task or peer
+   turn that finishes for that alias is noted there too, so the thread can
+   show turns that were not started from the board. Full
+   conversation-scoped separation — only that conversation's traffic on a
+   conversation surface — is CAD-1812's later design and is not implemented
+   here. Agent↔agent traffic is a separate pair conversation: ordinary peer
+   messages are listed without a filter, while routed `worker_result` and
+   notice copies are system traffic and appear only with
+   `include_system=true`.
 7. Restart, dedup and unknown: `cadence dev reload` resumes registered agents
    on their stored session ids and keeps message ids. Retrying the same
    `--message` id with the same body answers `{"duplicate":true,…}` and starts
