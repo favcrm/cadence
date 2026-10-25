@@ -18,6 +18,7 @@ equal(hostedOrigin("10.0.0.5"), false, "private 10/8");
 equal(hostedOrigin("172.20.1.4"), false, "private 172.16/12");
 equal(hostedOrigin("100.101.102.103"), false, "tailnet");
 equal(hostedOrigin("0.0.0.0"), false, "unspecified ipv4");
+equal(hostedOrigin("[::]"), false, "unspecified ipv6");
 equal(hostedOrigin("169.254.1.1"), false, "ipv4 link-local");
 equal(hostedOrigin("box.local"), false, "mdns name");
 equal(hostedOrigin("[fd00::1]"), false, "ipv6 unique-local");
