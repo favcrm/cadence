@@ -7,7 +7,8 @@
   gap: 30px;
   align-items: start;
   max-width: 1180px;
-  margin-inline: auto;
+  /* CAD-1813: left-align the shell; the app shell supplies the page inset. */
+  margin-inline: 0;
   padding: 20px 0 40px;
 }
 
