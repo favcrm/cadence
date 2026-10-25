@@ -1149,9 +1149,13 @@ export default function ReleasePanel({
       )}
       {mode === "unavailable" && release && (
         <p className="pub-note">
-          {t(
-            "{version} is not available to install or update. The installation was not changed.",
-          ).replace("{version}", release.version)}
+          {release.unavailableReason === "host_incompatible"
+            ? t(
+                "This release was checked against a different Cadence host and cannot run here. {version} was not installed.",
+              ).replace("{version}", release.version)
+            : t(
+                "{version} is not available to install or update. The installation was not changed.",
+              ).replace("{version}", release.version)}
         </p>
       )}
       {isLocked && !note && (

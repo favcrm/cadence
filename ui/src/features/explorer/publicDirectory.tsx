@@ -79,7 +79,7 @@ const DIGEST = /^sha256:[0-9a-f]{64}$/;
  * pattern would reject releases the closed catalogue serves. */
 const CATALOG_ID = /^[A-Za-z0-9._-]{1,64}$/;
 const VERSION_TOKEN = /^[A-Za-z0-9._+-]{1,40}$/;
-const UNAVAILABLE_REASONS = new Set(["digest_unverified", "artifact_unavailable", "app_disabled", "release_disabled"]);
+const UNAVAILABLE_REASONS = new Set(["digest_unverified", "artifact_unavailable", "app_disabled", "release_disabled", "host_incompatible"]);
 
 function listingOf(value: unknown): PublicListing {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
