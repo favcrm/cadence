@@ -1,7 +1,7 @@
 //! One fixed owner-selected, path-only configuration for daemon and artifacts.
 //! This never opens a key or vault database and never grants Connection authority.
 use super::encrypted_fs::Directories;
-use super::encrypted_sqlite::{EncryptedCustodyConfig, TAG_PREFIX};
+use super::encrypted_sqlite::EncryptedCustodyConfig;
 use crate::error::{Error, Result};
 use std::ffi::OsStr;
 use std::fs::File;
@@ -106,8 +106,8 @@ fn private_directory(dirs: &Directories) -> Result<()> {
     Ok(())
 }
 
-/// Missing configuration is allowed only for positively classified legacy
-/// state. Read-only core metadata, no migration/writer or vault inspection.
+/// Missing configuration is allowed only without encrypted storage evidence.
+/// Read-only metadata, no migration/writer, credential use or vault inspection.
 fn missing_is_legacy(state: &Directories, state_path: &Path) -> Result<bool> {
     if state
         .stat(OsStr::new("vault"))
@@ -127,6 +127,19 @@ fn missing_is_legacy(state: &Directories, state_path: &Path) -> Result<bool> {
     }
     let core =
         crate::store::open_read_only(&state_path.join("cadence.sqlite3")).map_err(|_| refused())?;
+    // Pre-Connections stores have no credential references to classify. Leave
+    // their schema validation/migration to the existing core entrypoints.
+    let has_credentials: bool = core
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='platform_credentials')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| refused())?;
+    if !has_credentials {
+        state.check().map_err(|_| refused())?;
+        return Ok(true);
+    }
     let mut stmt = core
         .prepare("SELECT custody FROM platform_credentials")
         .map_err(|_| refused())?;
@@ -138,14 +151,11 @@ fn missing_is_legacy(state: &Directories, state_path: &Path) -> Result<bool> {
             }
             _ => return Err(refused()),
         };
-        if tag.starts_with(TAG_PREFIX) {
+        // Reserve the whole encrypted family, including malformed/future tags.
+        // Other opaque references remain untouched: legacy dispatch still
+        // refuses unknown backends, and exports discard credential authority.
+        if tag.starts_with("encrypted-sqlite") {
             return Ok(false);
-        }
-        if !matches!(
-            tag,
-            super::custody::FILE_TAG | super::custody::LIBSECRET_TAG
-        ) {
-            return Err(refused());
         }
     }
     state.check().map_err(|_| refused())?;

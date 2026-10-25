@@ -25,7 +25,7 @@ fn openat(parent: &File, name: &CString, flags: i32, mode: u32) -> Result<File> 
             parent.as_raw_fd(),
             name.as_ptr(),
             flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            mode as libc::mode_t,
+            mode as libc::c_uint,
         )
     };
     if fd < 0 {
@@ -82,8 +82,9 @@ impl Directories {
     pub(crate) fn artifact(path: &Path, fresh: bool) -> Result<(Self, bool)> {
         Self::open_mode(path, true, true, fresh, true)
     }
-    /// Legacy metadata/artifact compatibility below a private owner ancestor.
-    /// This does not relax key/config admission, which calls strict `open`.
+    /// Legacy metadata/artifact compatibility under owner-controlled paths,
+    /// including non-private children of sticky /tmp. Strict `open` remains
+    /// required before any key, vault or present encrypted config admission.
     pub(crate) fn legacy_metadata(path: &Path) -> Result<(Self, bool)> {
         Self::open_mode(path, false, false, false, true)
     }
@@ -151,7 +152,10 @@ impl Directories {
                 return Err(refused());
             }
             if private_child {
-                if meta.uid() != uid || meta.mode() & 0o7777 != 0o700 {
+                if meta.uid() != uid
+                    || (meta.mode() & 0o7777 != 0o700
+                        && !(private_descendants && meta.mode() & 0o022 == 0))
+                {
                     return Err(refused());
                 }
                 private_child = false;
@@ -242,7 +246,9 @@ impl Directories {
             if i > 0
                 && self.names[0].as_bytes() == b"tmp"
                 && i == 1
-                && (pinned.uid() != uid || pinned.mode() & 0o7777 != 0o700)
+                && (pinned.uid() != uid
+                    || (pinned.mode() & 0o7777 != 0o700
+                        && !(self.private_descendants && pinned.mode() & 0o022 == 0)))
             {
                 return Err(store_refused());
             }

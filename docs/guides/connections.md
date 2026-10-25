@@ -103,6 +103,11 @@ state, tracker, app and artifact trees. Symlink or untrusted writable traversal
 refuses. No key-generation, key-export, key-rotation or key-recovery command is provided.
 Absent configuration retains legacy selection; missing encrypted configuration
 or material never silently downgrades existing encrypted references.
+Legacy metadata and artifact inspection allows owner-controlled, non-private
+directories; it does not impose encrypted-key permissions on an unconfigured
+instance. A present vault or any `encrypted-sqlite` reference still refuses
+missing configuration. Opaque legacy references are not reinterpreted or made
+usable; portable coordination exports discard their credential authority.
 
 ```sh
 cadence --state-dir ISOLATED_STATE connection custody initialize --accept-same-uid-risk
