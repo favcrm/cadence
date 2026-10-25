@@ -848,7 +848,13 @@ fn cad1822_compaction_restores_the_bound_task_on_plain_worker_followups() {
     let first = supplied(dispatched["message"].as_str().unwrap());
     let followup = send("Continue the bound issue without changing its policy.");
     let retained = supplied(&followup);
-    assert_eq!(retained["appended_bytes"], 0);
+    eprintln!("[DEBUG-c1822-ci] first={first}; retained={retained}");
+    assert_eq!(
+        retained["appended_bytes"],
+        0,
+        "first={first}; retained={retained}; current={}",
+        fixture.op("agent_show", json!({"alias": CONTROL_WORKER}))
+    );
     let another = send("Continue the same task with the same acceptance.");
     assert_eq!(supplied(&another)["appended_bytes"], 0);
     let compact = send("COMPACT");
@@ -988,10 +994,20 @@ fn cad1822_uncertain_delivery_requires_reconciliation_not_replay() {
         "unexpected refusal instead of the operator guard: {error}"
     );
     assert_eq!(store.message(lost_id).unwrap().unwrap().state, "unknown");
-    fixture.op("agent_unfence", json!({
+    let reconciled = fixture.try_op("agent_unfence", json!({
         "alias": CONTROL_WORKER, "status": "interrupted", "resume": true,
         "note": "Isolated fake disconnected after acceptance; no external actions; settle without resend."
     }));
+    eprintln!(
+        "[DEBUG-c1822-ci] reconciliation={reconciled:?}; message={:?}",
+        store.message(lost_id).unwrap()
+    );
+    assert!(
+        reconciled.is_ok(),
+        "operator reconciliation={reconciled:?}; message={:?}; current={}",
+        store.message(lost_id).unwrap(),
+        fixture.op("agent_show", json!({"alias": CONTROL_WORKER}))
+    );
     let next = fixture.op("agent_send", json!({
         "alias": CONTROL_WORKER, "text": "Continue the current task after reconciliation; do not retry the disconnected turn."
     }));
