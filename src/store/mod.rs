@@ -107,6 +107,7 @@ pub mod app_content;
 pub mod app_content_html;
 pub use app_content::{Block, Draft};
 pub mod app_bindings;
+pub mod app_campaign_work;
 pub mod app_capabilities;
 pub mod app_contexts;
 pub mod app_effects;

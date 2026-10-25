@@ -27,7 +27,7 @@ fn required_i64(params: &Value, key: &str) -> Result<i64> {
 /// proof's company, or the local operator. `verified_owner_human`
 /// returns an object; reading it as a string would collapse every human
 /// into `operator`, losing authorship and the self-review fence.
-fn works_actor(human: Option<&Value>) -> Result<String> {
+pub(super) fn works_actor(human: Option<&Value>) -> Result<String> {
     let Some(human) = human else {
         return Ok("operator".to_string());
     };

@@ -347,6 +347,18 @@ args!(WorksRequestReviewArgs {
 });
 args!(WorksReviewArgs { id: String, revision: i64, decision: Option<String>, note: Option<String> });
 args!(WorksExportArgs { id: String, revision: i64, format: Option<String> });
+// CAD-1827: campaign work. Scope and the writing actor are host-derived;
+// the body carries only the campaign, the CAS token and the values. Nulls
+// are kept (a typed round-trip would drop an explicit clear), so `save`
+// decodes the raw object exactly like the route patch does.
+args!(CampaignWorkSaveArgs {
+    campaign_id: String,
+    expected_revision: i64,
+    assignee: Option<Value>,
+    due_at: Option<Value>,
+    status: Option<Value>,
+    blocked_reason: Option<Value>
+});
 
 fn typed<T: for<'de> Deserialize<'de> + Serialize>(value: &Value) -> Result<Value> {
     let body: T = serde_json::from_value(value.clone())
@@ -374,6 +386,15 @@ fn call_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
         WorksPatch => typed::<WorksPatchArgs>(value),
         WorksTrash | WorksRestore => typed::<WorksTrashArgs>(value),
         WorksRequestReview => typed::<WorksRequestReviewArgs>(value),
+        // CAD-1827: a campaign work read is the campaign alone; a save keeps
+        // its explicit nulls so `null` clears instead of disappearing.
+        CampaignWorkShow => typed::<CampaignId>(value),
+        CampaignWorkSave => {
+            let _: CampaignWorkSaveArgs = serde_json::from_value(value.clone()).map_err(|_| {
+                Error::rejected("screen service arguments exceed their closed shape")
+            })?;
+            Ok(value.clone())
+        }
         SegmentsList | ExclusionsList | SuppressionsList | ContentList | SenderBindingsList => {
             typed::<Empty>(value)
         }
@@ -434,6 +455,19 @@ fn call_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
             "operation is not an implemented non-protected screen CALL",
         )),
     }
+}
+
+/// The four value fields of a `campaign-work.save` body, exactly as the
+/// caller sent them: an absent key stays absent (untouched) and an explicit
+/// `null` stays a clear.
+fn campaign_work_values(params: &Value) -> Value {
+    let mut values = serde_json::Map::new();
+    for key in ["assignee", "due_at", "status", "blocked_reason"] {
+        if let Some(value) = params.get(key) {
+            values.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(values)
 }
 
 fn slot_args(operation: ScreenOperation, value: &Value) -> Result<Value> {
@@ -552,6 +586,9 @@ fn native_method(operation: ScreenOperation) -> Result<&'static str> {
         WorksRequestReview => "app_works_request_review",
         WorksReview => "app_works_review",
         WorksExport => "app_works_export",
+        // CAD-1827: the paired campaign-work contract's two operations.
+        CampaignWorkShow => "crm_campaign_work_show",
+        CampaignWorkSave => "crm_campaign_work_save",
         _ => {
             return Err(Error::rejected(
                 "screen operation has no implemented executor",
@@ -876,6 +913,9 @@ impl Shared {
                 | WorksRequestReview
                 | WorksReview
                 | WorksExport
+                // CAD-1827: a campaign work save records who made the
+                // assignment decision from the verified caller.
+                | CampaignWorkSave
         ) {
             if let Some(public_session) = &proof.public_session {
                 params["public_session"] = json!(public_session);
@@ -986,8 +1026,111 @@ impl Shared {
             | WorksRequestReview | WorksReview | WorksExport => {
                 self.rpc_app_works(method, &params, peer_pid, Some(proof))
             }
+            // CAD-1827: campaign work metadata is the paired contract's own
+            // scope; save is a direct CAS write, never a SLOT confirmation.
+            CampaignWorkShow | CampaignWorkSave => {
+                self.rpc_crm_campaign_work(method, &params, peer_pid, Some(proof))
+            }
             _ => self.rpc_app_content_with_proof(method, &params, peer_pid, Some(proof)),
         }
+    }
+
+    /// CAD-1827: the paired `crm-campaign-work/v1` operations. Scope is the
+    /// proven mount (install + context); `install_id`/`context_id` arrive
+    /// from the daemon, never from the frame. `save` is a direct revision-CAS
+    /// write: the actor is derived from the authenticated caller, and the
+    /// content revision is read inside the same transaction. Neither
+    /// operation approves, sends or publishes anything.
+    fn rpc_crm_campaign_work(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+        proof: Option<&ScreenServiceProof>,
+    ) -> Result<Value> {
+        use crate::issue::app_campaign_work::{self as work, WorkPatch};
+        Self::screen_service_method(proof, method)?;
+        self.operator_connection("campaign work", params, peer_pid)?;
+        let allowed: &[&str] = match method {
+            "crm_campaign_work_show" => &["install_id", "context_id", "campaign_id"],
+            "crm_campaign_work_save" => &[
+                "install_id",
+                "context_id",
+                "campaign_id",
+                "expected_revision",
+                "assignee",
+                "due_at",
+                "status",
+                "blocked_reason",
+                "public_session",
+            ],
+            _ => return Err(Error::invalid("invalid", "unknown campaign work method")),
+        };
+        let fields = params
+            .as_object()
+            .ok_or_else(|| Error::invalid("invalid", "campaign work payload must be an object"))?;
+        for key in fields.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(Error::invalid(
+                    "invalid",
+                    "campaign work payload has unsupported fields",
+                ));
+            }
+        }
+        // A screen call derives install/context from the private proof, never
+        // from frame fields; a native call takes them from the operator caller.
+        let install = match proof {
+            Some(proof) => proof.install().to_string(),
+            None => required_str(params, "install_id")?.to_string(),
+        };
+        let context = match proof {
+            Some(proof) => proof.context()?.to_string(),
+            None => required_str(params, "context_id")?.to_string(),
+        };
+        let campaign = required_str(params, "campaign_id")?.to_string();
+        work::check_campaign_id(&campaign)?;
+        // The source identity is the installed package's own app tag — never
+        // a frame field and never an app-name branch on the host.
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        let app = workspace::with_runtime_read(&pm, &install, |description, _| {
+            description
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| Error::rejected("installation app identity unavailable"))
+        })?;
+        if method == "crm_campaign_work_show" {
+            return self.screen_service_scope(&install, &context, true, proof, || {
+                let records =
+                    crate::store::app_records::RecordStore::open(&self.state_dir, &install)?;
+                records.app_campaign_work_facts(&context, &campaign, &app)
+            });
+        }
+        let expected_revision = params
+            .get("expected_revision")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                Error::invalid(
+                    "invalid_body",
+                    "a campaign work save needs the revision it was read at",
+                )
+            })?;
+        let human = self.verified_owner_human(params)?;
+        // Refuses before the installation/context or record file is touched.
+        let actor = super::app_works_rpc::works_actor(human.as_ref())?;
+        let patch = WorkPatch::from_body(&campaign_work_values(params))?;
+        self.screen_service_scope(&install, &context, true, proof, || {
+            let records = crate::store::app_records::RecordStore::open(&self.state_dir, &install)?;
+            records.app_campaign_work_save(
+                &context,
+                &campaign,
+                expected_revision,
+                &patch,
+                &actor,
+                &app,
+            )
+        })
     }
 
     pub(super) fn rpc_app_screen_service_call(

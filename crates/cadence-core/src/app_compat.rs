@@ -596,6 +596,14 @@ pub const SUPPORTED_CONTRACTS: &[(&str, &[u64], ContractStage)] = &[
     // Closed screen service operations with current native scope proof and
     // host-owned confirmation, route and inert-preview consumers.
     ("screen-records", &[1], ContractStage::Sandboxed),
+    // CAD-1827: `crm-campaign-work/v1` — src/issue/app_campaign_work.rs
+    // holds the strict rules and read adapter,
+    // src/daemon/app_screen_services_rpc.rs serves the two screen
+    // operations, and src/store/app_campaign_work.rs persists the scoped
+    // row. The host serves this contract before the CRM package requires
+    // it; a host without the entry refuses the package at install rather
+    // than mounting inert work actions.
+    ("crm-campaign-work", &[1], ContractStage::Sandboxed),
     // Opt-in, integrity-checked script order consumed by the frame renderer.
     ("screen-startup", &[1], ContractStage::Sandboxed),
     // contracts/app-views/v1 — schema + the board's strict consumer.
@@ -773,4 +781,63 @@ pub fn parse_requires(needs: Option<&serde_yaml::Mapping>) -> Result<Compat> {
         core,
         contracts,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn required(contracts: &[(&str, &[u64])]) -> Compat {
+        let mut map = BTreeMap::new();
+        for (name, majors) in contracts {
+            map.insert((*name).to_string(), majors.to_vec());
+        }
+        Compat {
+            core_range_text: None,
+            core: None,
+            contracts: map,
+        }
+    }
+
+    #[test]
+    fn cad1827_campaign_work_contract_is_host_first() {
+        let host = host("0.3.0").expect("this build's version parses");
+        let (majors, stage) = host
+            .entry("crm-campaign-work")
+            .expect("the host must serve the paired contract");
+        assert_eq!(majors, &[1]);
+        assert_eq!(stage, ContractStage::Sandboxed);
+
+        let compat = required(&[("crm-campaign-work", &[1])]);
+        let receipt = compat.check(&host).expect("major 1 is served");
+        let check = receipt["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["contract"] == "crm-campaign-work")
+            .expect("the receipt names the contract");
+        assert_eq!(check["ok"], true);
+        assert_eq!(check["stage"], "sandboxed");
+
+        // A host built before this entry refuses the package, so the CRM
+        // app cannot install where its work operations would be inert.
+        let before = HostContracts {
+            core: SemVer::parse("0.3.0").unwrap(),
+            supported: &[],
+        };
+        assert!(before.entry("crm-campaign-work").is_none());
+        let refusal = compat
+            .check(&before)
+            .expect_err("an older host must refuse the package");
+        assert_eq!(refusal.kind(), "rejected");
+        assert!(
+            refusal.to_string().contains("crm-campaign-work"),
+            "the refusal names the unmet contract: {refusal}"
+        );
+
+        // A later major is not this host's contract either.
+        assert!(required(&[("crm-campaign-work", &[2])])
+            .check(&host)
+            .is_err());
+    }
 }

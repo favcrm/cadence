@@ -206,6 +206,35 @@ pub fn extract(files: &BTreeMap<String, String>, tag: &str) -> Result<ScreenPack
             ));
         }
     }
+    // CAD-1827: the campaign work operations are served only under the
+    // contract the manifest declares — the same pairing the startup
+    // feature uses. A package that lists the operations without requiring
+    // `crm-campaign-work` refuses here, instead of mounting a screen whose
+    // work actions would be inert.
+    if checked
+        .operations()
+        .iter()
+        .any(|operation| operation.is_campaign_work())
+    {
+        let metadata = crate::issue::app::parse_manifest(
+            files
+                .get("app.md")
+                .ok_or_else(|| Error::rejected("campaign work requires app.md metadata"))?,
+        )?;
+        if metadata.app != checked.app()
+            || metadata
+                .requires
+                .contracts
+                .get(crate::issue::app_campaign_work::CONTRACT_NAME)
+                .map(Vec::as_slice)
+                != Some(&[crate::issue::app_campaign_work::CONTRACT_MAJOR][..])
+        {
+            return Err(Error::rejected(
+                "campaign-work operations require matching app.md and \
+                 needs.requires.contracts.crm-campaign-work: [1]",
+            ));
+        }
+    }
     Ok(ScreenPackage {
         tag: tag.to_string(),
         manifest,
@@ -401,5 +430,73 @@ mod tests {
         v1["may"] = json!(["tools.invoke"]);
         let v1files = bundle_with("a", &v1.to_string(), &[("client.js", js)]);
         assert!(extract(&v1files, "a").is_err());
+    }
+
+    fn decl_records(assets: &[(&str, &str)], operations: &[&str]) -> String {
+        let mut decl: serde_json::Value = serde_json::from_str(&decl(assets)).unwrap();
+        decl["contract"] = json!("app-screens/v2");
+        decl["host_contract"] = json!("screen-records.v1");
+        decl["may"] = json!(["records.call", "records.slot"]);
+        decl["operations"] = json!(operations);
+        decl.to_string()
+    }
+
+    fn declared_manifest(contracts: &str) -> String {
+        format!(
+            "---\napp: crm\ntitle: t\nversion: '1'\nneeds:\n  requires:\n    \
+             contracts: {contracts}\n---\n\nG\n"
+        )
+    }
+
+    #[test]
+    fn cad1827_campaign_work_operations_pair_with_the_declared_contract() {
+        let js = "x";
+        let paired =
+            declared_manifest("{app-screens: [1], screen-records: [1], crm-campaign-work: [1]}");
+        let unpaired = declared_manifest("{app-screens: [1], screen-records: [1]}");
+        let wrong_major =
+            declared_manifest("{app-screens: [1], screen-records: [1], crm-campaign-work: [2]}");
+        let with = |metadata: &str, operations: &[&str], decl_app: Option<&str>| {
+            let mut declaration = decl_records(&[("client.js", js)], operations);
+            if let Some(app) = decl_app {
+                let mut value: serde_json::Value = serde_json::from_str(&declaration).unwrap();
+                value["app"] = json!(app);
+                declaration = value.to_string();
+            }
+            let mut files = bundle_with("a", &declaration, &[("client.js", js)]);
+            files.insert("app.md".to_string(), metadata.to_string());
+            files
+        };
+        let ops = ["campaign-work.show", "campaign-work.save"];
+        let pkg = extract(&with(&paired, &ops, None), "a").unwrap();
+        assert_eq!(
+            pkg.operations,
+            vec![
+                app_screen_decl::ScreenOperation::CampaignWorkShow,
+                app_screen_decl::ScreenOperation::CampaignWorkSave,
+            ]
+        );
+        // Show is a read; save is a direct write, never a host confirmation.
+        assert!(app_screen_decl::ScreenOperation::CampaignWorkShow.is_screen_read());
+        assert!(!app_screen_decl::ScreenOperation::CampaignWorkSave.is_screen_read());
+        assert!(!app_screen_decl::ScreenOperation::CampaignWorkShow.is_slot());
+        assert!(!app_screen_decl::ScreenOperation::CampaignWorkSave.is_slot());
+        assert!(app_screen_decl::ScreenOperation::CampaignWorkSave.is_campaign_work());
+
+        // The operations without the declared contract refuse: a host would
+        // otherwise mount a screen whose work actions cannot run.
+        assert!(extract(&with(&unpaired, &ops, None), "a").is_err());
+        // The contract at another major is not this host's contract.
+        assert!(extract(&with(&wrong_major, &ops, None), "a").is_err());
+        // A package cannot claim the pairing under a foreign app tag.
+        assert!(extract(&with(&paired, &ops, Some("other")), "a").is_err());
+        // A package with no campaign operation needs no contract.
+        let plain = extract(&with(&unpaired, &["records.list"], None), "a").unwrap();
+        assert_eq!(
+            plain.operations,
+            vec![app_screen_decl::ScreenOperation::RecordsList]
+        );
+        // An unknown operation still refuses at parse time.
+        assert!(extract(&with(&paired, &["campaign-work.send"], None), "a").is_err());
     }
 }

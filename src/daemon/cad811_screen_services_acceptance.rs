@@ -755,3 +755,6 @@ mod independent_public_owner_attribution;
 
 #[path = "cad811_works_acceptance.rs"]
 mod independent_works;
+
+#[path = "cad1827_campaign_work_acceptance.rs"]
+mod campaign_work;
