@@ -1,3 +1,4 @@
+import { canOpenInstall } from "../explorer/installAccess";
 import { useEffect, useMemo, useState } from "react";
 import { resources } from "../../lib/resources";
 import { useTranslate } from "../../lib/locale";
@@ -501,7 +502,11 @@ function AppCard({
   const appName = row.name;
   const legacyHref = appName ? appHref(row.project, appName) : null;
   const screenHref = appName ? screenInstallHref(installs, row.project, appName) : null;
-  const href = screenHref ?? legacyHref;
+  // A row whose installs are all non-active has no openable page: the legacy
+  // project route lands on "Unknown installation" just the same.
+  const sameName = appName ? (installs ?? []).filter((i) => i.name === appName) : [];
+  const blocked = sameName.length > 0 && sameName.every((i) => !canOpenInstall(i.state, i.removed));
+  const href = blocked ? null : (screenHref ?? legacyHref);
   return (
     <li className="card px-3.5 py-3 min-w-0" data-app={row.name ?? undefined}>
       <div className="app-card-layout">
