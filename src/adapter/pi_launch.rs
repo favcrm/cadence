@@ -382,7 +382,27 @@ fn fork_session_id(alias: &str, workdir: &Path, source: &Path) -> String {
 /// no fresh-session fallback.
 pub(super) fn worker_session_args(state_dir: &Path, agent: &Agent) -> Result<Vec<String>> {
     let current = pi_current_session(state_dir, &agent.alias)?;
-    let resume = |path: &Path| vec!["--session".to_string(), path.to_string_lossy().to_string()];
+    // OMP requires an existing file for resume; let it mint its first file.
+    // The adapter records the reported path once the first turn persists it.
+    if agent.provider == "omp" && !current.exists() {
+        return Ok(vec![
+            "--session-dir".to_string(),
+            pi_worker_dir(state_dir, &agent.alias)?
+                .to_string_lossy()
+                .to_string(),
+        ]);
+    }
+    let resume = |path: &Path| {
+        vec![
+            if agent.provider == "omp" {
+                "--resume"
+            } else {
+                "--session"
+            }
+            .to_string(),
+            path.to_string_lossy().to_string(),
+        ]
+    };
     let is_hire = crate::agent_roles::is_catalogue_hire(agent.params.as_ref());
     let workdir = launch_workdir(agent);
     let same = |a: &Path, b: &Path| {

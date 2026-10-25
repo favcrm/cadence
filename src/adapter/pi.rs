@@ -355,6 +355,8 @@ pub struct PiAdapter {
     agent_uid: Option<u32>,
     /// CAD-1098: the tool profile the next `open` launches with.
     profile: Mutex<crate::master::Profile>,
+    /// OMP mints its session path before creating the file on its first turn.
+    pending_session_file: Mutex<Option<(String, String)>>,
 }
 
 /// Identity evidence must include an actual namespace and model id;
@@ -451,7 +453,20 @@ impl PiAdapter {
                 .unwrap_or_else(|| PathBuf::from(".")),
             agent_uid,
             profile: Mutex::new(crate::master::Profile::Home),
+            pending_session_file: Mutex::new(None),
         }
+    }
+
+    fn persist_pending_session_file(&self) {
+        let mut pending = self.pending_session_file.lock().unwrap();
+        let Some((alias, file)) = pending.as_ref() else {
+            return;
+        };
+        if !Path::new(file).is_file() {
+            return;
+        }
+        record_current_session(&self.state_dir, alias, file);
+        *pending = None;
     }
 
     /// The emitted confinement, appended to the provider log so an
@@ -1328,11 +1343,16 @@ impl ProviderAdapter for PiAdapter {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
+            *self.pending_session_file.lock().unwrap() = None;
             // CAD-1752: the session file Pi actually opened (a lane
             // relaunch forks into a new one) is this worker's current one.
             if !master {
                 if let Some(file) = data.get("sessionFile").and_then(Value::as_str) {
                     record_current_session(&self.state_dir, &agent.alias, file);
+                    if agent.provider == "omp" && !Path::new(file).is_file() {
+                        *self.pending_session_file.lock().unwrap() =
+                            Some((agent.alias.clone(), file.to_string()));
+                    }
                 }
             }
             let Some((reported_full, reported_id)) = resolved_pi_model(&data) else {
@@ -1582,6 +1602,7 @@ impl ProviderAdapter for PiAdapter {
             }
         })();
         *self.shared.active_turn.lock().unwrap() = None;
+        self.persist_pending_session_file();
         let mut acc = match waited {
             Ok(acc) => acc,
             Err(error) => {
@@ -1776,6 +1797,7 @@ impl ProviderAdapter for PiAdapter {
         transport.close_stdin();
         transport.wait_exit(Duration::from_secs(3));
         transport.close();
+        self.persist_pending_session_file();
         self.shared.on_disconnect();
     }
 }
