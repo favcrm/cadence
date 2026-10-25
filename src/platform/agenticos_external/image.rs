@@ -362,7 +362,7 @@ pub(crate) fn uploaded_image_mime(bytes: &[u8], media_type: &str) -> Result<&'st
     let decoded = reader.decode().map_err(|_| {
         (
             ImageFault::Decode,
-            "uploaded image cannot be decoded within the custody limit",
+            "uploaded image cannot be decoded within custody limits",
         )
     })?;
     if decoded.width() < 1 || decoded.height() < 1 {
@@ -411,7 +411,7 @@ pub(crate) fn normalize_uploaded_image(
     let decoded = reader.decode().map_err(|_| {
         (
             ImageFault::Decode,
-            "uploaded image cannot be decoded within the custody limit",
+            "uploaded image cannot be decoded within custody limits",
         )
     })?;
     if decoded.width() != width || decoded.height() != height {

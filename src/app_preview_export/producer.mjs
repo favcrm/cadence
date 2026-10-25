@@ -118,7 +118,8 @@ var SLOT_VERBS = [
 	"publish.draft.reschedule",
 	"publish.draft.cancel",
 	"publish.settings.save",
-	"media.original.download"
+	"media.original.download",
+	"social.image.pick"
 ];
 /** CAD-1365 — the protected original download slot. Qualified per mount
 *  (screen-media.v1 + media.read + live token); never a generic action verb. */
@@ -755,7 +756,7 @@ function screenProjection(installation, tag, contextId, contexts, runs, effects,
 //#region scripts/app-fixtures/producer.ts
 var MAX_INPUT = 1048576;
 var MAX_OUTPUT = 8388608;
-var CONTRACT = "app-screen-projection-fixtures/3";
+var CONTRACT = "app-screen-projection-fixtures/4";
 var NOW = 1799999e3;
 var SCENARIOS = [
 	"empty",
