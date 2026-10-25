@@ -287,9 +287,24 @@ pub enum ScreenOperation {
     WorksReview,
     #[serde(rename = "works.export")]
     WorksExport,
+    // CAD-1827: CRM campaign work metadata (`crm-campaign-work/v1`). The
+    // show operation is a read; save is a *direct* write with revision
+    // CAS and caller-derived attribution, not a host confirmation slot.
+    // Neither grants approval, send or publish authority.
+    #[serde(rename = "campaign-work.show")]
+    CampaignWorkShow,
+    #[serde(rename = "campaign-work.save")]
+    CampaignWorkSave,
 }
 
 impl ScreenOperation {
+    /// CAD-1827: an operation of the paired `crm-campaign-work/v1`
+    /// contract. A package that declares one must also declare the
+    /// contract in its manifest, and vice versa.
+    pub fn is_campaign_work(self) -> bool {
+        matches!(self, Self::CampaignWorkShow | Self::CampaignWorkSave)
+    }
+
     pub fn is_slot(self) -> bool {
         matches!(
             self,
@@ -395,6 +410,9 @@ impl ScreenOperation {
                 | Self::WhatsappBroadcastResults
                 // CAD-1636: members read the parked draft only.
                 | Self::WhatsappDraftShow
+                // CAD-1827: recorded campaign work facts are a read; the
+                // work write stays operator-only.
+                | Self::CampaignWorkShow
         )
     }
     pub fn args_limit(self) -> usize {

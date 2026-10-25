@@ -309,10 +309,19 @@ pub(super) fn service(
         {
             super::coded_response(404, "not_found", &error.to_string(), None)
         }
-        // CAD-1656: only the confirm-time facts refusal keeps its own code;
-        // every other conflict still reaches the frame as `conflict`.
+        // CAD-1656: only the confirm-time facts refusal keeps its own code.
+        // CAD-1827: a campaign-work stale revision keeps `stale_revision`
+        // too — the app's stale-save recovery is keyed on it, and rewriting
+        // it to a generic conflict would strand the panel's conflict state.
+        // Every other conflict still reaches the frame as `conflict`.
         Err(error) if error.kind() == "conflict" => {
-            let code = if error.code() == Some("facts_changed") {
+            let campaign_work_stale = operation
+                .as_deref()
+                .is_some_and(|op| op.starts_with("campaign-work."))
+                && error.code() == Some("stale_revision");
+            let code = if campaign_work_stale {
+                "stale_revision"
+            } else if error.code() == Some("facts_changed") {
                 "facts_changed"
             } else {
                 "conflict"

@@ -815,6 +815,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     ("app_works_review", Rule::Handler("operator_connection (CAD-1649)")),
     ("app_works_export", Rule::Handler("operator_connection (CAD-1649)")),
+    // CAD-1827: the read derives authorization and scope from the live
+    // install/context; discovery enumerates installed packages by contract.
+    ("crm_campaign_work_read", Rule::Handler("operator_connection + verified live campaign-work source and context (CAD-1827)")),
+    ("crm_campaign_work_sources", Rule::Handler("operator_connection; declarative discovery of sources that require crm-campaign-work (CAD-1827)")),
     ("app_content_show", Rule::Handler("operator_connection (CAD-782)")),
     ("app_content_clone", Rule::Handler("operator_connection (CAD-1182)")),
     ("app_content_list", Rule::Handler("operator_connection (CAD-782)")),

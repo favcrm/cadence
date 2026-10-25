@@ -1078,6 +1078,8 @@ impl RecordStore {
             }
         }
         super::app_social_drafts::ensure_schema(&conn)?;
+        // CAD-1827: additive campaign work table; the file schema is unchanged.
+        super::app_campaign_work::ensure_schema(&conn)?;
         Ok(Self {
             install_id: install_id.to_string(),
             conn: Mutex::new(conn),
