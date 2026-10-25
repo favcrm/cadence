@@ -30,14 +30,15 @@ export function tailTop(scrollHeight: number, clientHeight: number): number {
 }
 
 /** The scroller itself resized (window height, a notice mounting above
- *  it): re-pin only when the reader was on the tail BEFORE the change —
- *  a measurement after a shrink is already short of the tail. */
+ *  it): re-pin only when the reader was pinned to the tail BEFORE the change
+ *  (`pinned` is the flag, not a fresh measurement: a measurement after a
+ *  shrink is already short of the tail). */
 export function repinOnResize(
-  wasOnTail: boolean,
+  pinned: boolean,
   prevClientHeight: number,
   clientHeight: number,
 ): boolean {
-  return wasOnTail && prevClientHeight !== clientHeight;
+  return pinned && prevClientHeight !== clientHeight;
 }
 
 /** The jump pill's words: the count rides along while there is one.

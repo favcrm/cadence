@@ -68,6 +68,7 @@ function proof(id: string, sub: string): Meta {
       expires_at: 4_102_444_800,
       user_agent: "acceptance",
       user: { sub, handle: sub, name: "Operator", email: "operator@example.test", role: "operator" },
+      account_id: null,
     },
   };
 }

@@ -381,8 +381,18 @@ pub struct SessionScope {
     pub organization_id: String,
 }
 
+/// `user` and `account_id` are always sent, `null` when absent, so the schema
+/// requires the keys and keeps them nullable (`schemars(required)` would drop
+/// the null). `scope` is skipped when `None`, so it stays optional.
+fn require_session_keys(schema: &mut schemars::Schema) {
+    if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+        required.extend([Value::from("user"), Value::from("account_id")]);
+    }
+}
+
 /// A live board session as the daemon reports it; never the token.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
+#[schemars(transform = require_session_keys)]
 pub struct SessionInfo {
     pub id: String,
     pub origin: SessionOrigin,

@@ -568,7 +568,7 @@ export interface RunningMessage {
 /** A live board session as the daemon reports it; never the token. */
 export interface SessionInfo {
   /** Non-secret durable account handle; null on legacy sessions. */
-  account_id?: string | null;
+  account_id: string | null;
   created: number;
   expires_at: number;
   id: string;
@@ -576,7 +576,7 @@ export interface SessionInfo {
   last_used: number;
   origin: SessionOrigin;
   scope?: SessionScope | null;
-  user?: SessionUser | null;
+  user: SessionUser | null;
   user_agent: string;
 }
 

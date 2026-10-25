@@ -12,7 +12,7 @@ function equal(actual: unknown, expected: unknown, why: string): void {
   if (a !== e) throw new Error(`${why}: expected ${e}, got ${a}`);
 }
 
-const session = { id: "s", origin: "loopback" as const, created: 0, last_used: 0, idle_expires_at: 0, expires_at: 0, user_agent: "t" };
+const session = { id: "s", origin: "loopback" as const, created: 0, last_used: 0, idle_expires_at: 0, expires_at: 0, user_agent: "t", user: null, account_id: null };
 
 equal(humanThreadsAvailable({ hosted: true }), true, "a hosted board serves human threads");
 equal(

@@ -445,7 +445,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // An unsigned reader (admitted only by --allow-anonymous-reads) is a
   // resolved non-operator: the server omits `operator` for it. Only a
   // claimed session whose proof is missing is genuinely unavailable.
-  const { metaUnavailable } = metaAccess(meta);
+  const access = metaAccess(meta);
+  const { metaUnavailable } = access;
   const [recheckFinished, setRecheckFinished] = useState(false);
   useEffect(() => {
     setRecheckFinished(false);
@@ -878,7 +879,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // could not answer), and `onRetryAccess` gives the surfaces a real
   // re-check instead of a reload. `operator === true` stays the only
   // grant; both unknowns and every failure grant nothing.
-  const access = metaAccess(meta);
   const viewer = {
     readOnly,
     operator: access.operator,
