@@ -1948,3 +1948,8 @@ mod native_macos {
         );
     }
 }
+
+// Independently owned OMP CAD-1128 legacy artifact compatibility oracles.
+// Keep these on the existing macOS/ARM integration target, with no lib mount.
+#[path = "cad1425_client_update_refusal_acceptance/omp_security_compatibility.rs"]
+mod omp_cad1128_security_compatibility;

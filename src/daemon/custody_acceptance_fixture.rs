@@ -806,6 +806,10 @@ mod authority5;
 #[cfg(all(test, target_os = "linux", feature = "test-seam"))]
 mod custody6;
 #[cfg(all(test, target_os = "linux", feature = "test-seam"))]
+mod omp_review_regressions;
+#[cfg(all(test, target_os = "linux", feature = "test-seam"))]
+mod omp_security_regressions;
+#[cfg(all(test, target_os = "linux", feature = "test-seam"))]
 mod r2_gap_regressions;
 
 #[cfg(all(test, target_os = "linux", feature = "test-seam"))]
