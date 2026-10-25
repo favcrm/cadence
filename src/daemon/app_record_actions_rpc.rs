@@ -324,6 +324,22 @@ fn build_preview(
             (current["record"]["profile"].clone(), revision)
         }
     };
+    // A standing tags-only deny is a statement about this customer's
+    // tags, not about one action id: a declared record update that
+    // carries tags must not route around it.
+    if action.operation == Operation::RecordUpdate
+        && admitted.fields.contains_key("tags")
+        && records
+            .app_assistant_permission_find(
+                context,
+                "customer.tags.update",
+                &admitted.record_id,
+                "deny",
+            )?
+            .is_some_and(|permission| permission["state"].as_str() == Some("active"))
+    {
+        return Err(Error::rejected("this action is blocked for this customer"));
+    }
     let base = if before.is_null() {
         None
     } else {

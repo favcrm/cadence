@@ -1279,3 +1279,39 @@ fn cad1808_full_autonomy_applies_record_actions_with_agent_actor() {
     );
     fx.finish("m-assisted-record");
 }
+
+/// CAD-1808 review fix: a standing tags-only deny also covers a declared
+/// record update that carries tags; a phone-only update still works.
+#[test]
+fn cad1808_tags_deny_blocks_alternate_record_update() {
+    let fx = Fx::new();
+    fx.operator("crm_autonomy_set", json!({"mode":"full"}));
+    fx.operator(
+        "app_assistant_permission_block",
+        json!({"install_id":fx.install,"context_id":fx.context,"action_id":"customer.tags.update","resource_id":"cust-a"}),
+    );
+    let token = fx.create_turn("m-deny-route");
+    refusal(
+        fx.invoke(
+            "m-deny-route",
+            &token,
+            "crm.customer.update",
+            "op-deny-tags",
+            json!({"record_id":"cust-a","expected_revision":1,"tags":["blocked"]}),
+        ),
+        "record.update tags route around the standing deny",
+    );
+    assert_eq!(fx.customer("cust-a")["revision"], 1);
+    let phone = fx
+        .invoke(
+            "m-deny-route",
+            &token,
+            "crm.customer.update",
+            "op-deny-phone",
+            json!({"record_id":"cust-a","expected_revision":1,"phone":"+15550001003"}),
+        )
+        .unwrap();
+    assert_eq!(phone["operation"]["status"], "succeeded");
+    assert_eq!(fx.customer("cust-a")["revision"], 2);
+    fx.finish("m-deny-route");
+}

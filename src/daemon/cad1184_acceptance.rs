@@ -151,6 +151,9 @@ impl Fx {
             .unwrap()["record"]
             .clone()
     }
+    fn records(&self) -> RecordStore {
+        RecordStore::open(self.dir.path(), &self.install).unwrap()
+    }
     fn create_turn(&self, message: &str) -> String {
         let params = json!({"alias":"master", "install_id":self.install,
             "context_id":self.context, "general":true});
@@ -176,6 +179,36 @@ impl Fx {
         self.shared.store.mark_running(message, &token).unwrap();
         token
     }
+    /// Start a campaign-scoped chat turn. The conversation subject is
+    /// the verified campaign the assistant actions must stay inside.
+    fn create_campaign_turn(&self, message: &str, campaign: &str) -> String {
+        let params = json!({"alias":"master", "install_id":self.install,
+            "context_id":self.context, "subject":format!("campaign:{campaign}")});
+        let made = scoped(Asserted::Operator, || {
+            self.shared
+                .dispatch("conversation_create", &params, std::process::id())
+        })
+        .unwrap();
+        let conversation = made["conversation"]["id"].as_str().unwrap().to_string();
+        let sent = json!({"alias":"master", "text":"Perform the requested CRM action",
+            "message":message, "conversation":conversation,
+            "app":{"install_id":self.install,"context_id":self.context}});
+        scoped(Asserted::Operator, || {
+            self.shared
+                .dispatch("thread_send", &sent, std::process::id())
+        })
+        .unwrap();
+        let token = crate::adapter::registry::PI_MANAGED_TURN_TOKENS.mint(MASTER_GENERATION);
+        self.db()
+            .execute(
+                "UPDATE messages SET state='submitting', started=1.0 WHERE id=?",
+                [message],
+            )
+            .unwrap();
+        self.shared.store.mark_running(message, &token).unwrap();
+        token
+    }
+
     fn invoke(
         &self,
         message: &str,
@@ -1511,4 +1544,126 @@ fn cad1808_full_autonomy_applies_tag_update_with_agent_actor() {
     refusal(blocked, "standing deny at full autonomy");
     assert_eq!(fx.customer("cust-a")["profile"]["tags"], json!(["auto"]));
     fx.finish("m-auto-blocked");
+}
+
+/// CAD-1808 review fix: a campaign-scoped turn cannot discard or read
+/// another campaign's proposal/send inside the same installation.
+#[test]
+fn cad1808_campaign_turn_cannot_reach_another_campaign() {
+    use crate::store::app_sends::{send_digest, SendDraft};
+
+    let fx = Fx::new();
+    let seed = fx.create_turn("m-cad1808-campaigns");
+    for campaign in ["c1", "c2"] {
+        fx.invoke(
+            "m-cad1808-campaigns",
+            &seed,
+            "campaigns.create_draft",
+            &format!("op-{campaign}"),
+            json!({"campaign_id":campaign,"name":campaign}),
+        )
+        .unwrap();
+    }
+    fx.invoke(
+        "m-cad1808-campaigns",
+        &seed,
+        "email.draft",
+        "op-p2",
+        json!({
+            "campaign_id":"c2",
+            "proposal_id":"p2",
+            "draft":{"subject":"Other campaign","blocks":[{"type":"paragraph","text":"Keep me."}]}
+        }),
+    )
+    .unwrap();
+    fx.finish("m-cad1808-campaigns");
+
+    // Seed a prepared send for c2 so a context-wide list would expose it.
+    let records = fx.records();
+    let mut draft = SendDraft {
+        send_id: "send-c2".into(),
+        campaign_id: "c2".into(),
+        request_id: "req-c2".into(),
+        content_revision: 1,
+        content_digest: format!("sha256:{}", "1".repeat(64)),
+        audience_freeze_id: "freeze-c2".into(),
+        audience_digest: format!("sha256:{}", "2".repeat(64)),
+        connection_id: "conn-c2".into(),
+        auth_revision: 1,
+        link_revision: 1,
+        link_digest: format!("sha256:{}", "3".repeat(64)),
+        max_recipients: 10,
+        unsubscribe_origin: "https://example.test".into(),
+        send_digest: String::new(),
+    };
+    draft.send_digest = send_digest(&fx.install, &fx.context, &draft);
+    records
+        .app_campaign_send_prepare(&fx.context, &draft)
+        .unwrap();
+
+    let token = fx.create_campaign_turn("m-cad1808-c1", "c1");
+    refusal(
+        fx.invoke(
+            "m-cad1808-c1",
+            &token,
+            "campaigns.discard",
+            "op-discard-c2",
+            json!({"proposal_id":"p2"}),
+        ),
+        "cross-campaign discard",
+    );
+    let proposal = records
+        .app_content_proposal_show(&fx.context, "p2")
+        .unwrap();
+    assert_eq!(proposal["proposal"]["state"], "pending");
+
+    let listed = fx
+        .invoke(
+            "m-cad1808-c1",
+            &token,
+            "sends.list",
+            "op-sends-c1",
+            json!({}),
+        )
+        .unwrap();
+    assert_eq!(
+        listed["operation"]["result"]["sends"],
+        json!([]),
+        "a c1 conversation must not list c2 sends"
+    );
+    refusal(
+        fx.invoke(
+            "m-cad1808-c1",
+            &token,
+            "sends.list",
+            "op-sends-c2-explicit",
+            json!({"campaign_id":"c2"}),
+        ),
+        "cross-campaign explicit send list",
+    );
+    refusal(
+        fx.invoke(
+            "m-cad1808-c1",
+            &token,
+            "sends.show",
+            "op-send-c2-show",
+            json!({"send_id":"send-c2"}),
+        ),
+        "cross-campaign send show",
+    );
+    fx.finish("m-cad1808-c1");
+
+    // A General conversation may still see the context's sends.
+    let general = fx.create_turn("m-cad1808-general-sends");
+    let all = fx
+        .invoke(
+            "m-cad1808-general-sends",
+            &general,
+            "sends.list",
+            "op-all-sends",
+            json!({}),
+        )
+        .unwrap();
+    assert_eq!(all["operation"]["result"]["sends"][0]["send_id"], "send-c2");
+    fx.finish("m-cad1808-general-sends");
 }

@@ -597,10 +597,17 @@ impl Shared {
                         input.get("expected_revision").and_then(Value::as_i64),
                     )
                 }
-                "campaigns.discard" => records.app_content_proposal_discard(
-                    &scoped.context,
-                    required_str(input, "proposal_id")?,
-                ),
+                "campaigns.discard" => {
+                    let proposal = required_str(input, "proposal_id")?;
+                    let shown = records.app_content_proposal_show(&scoped.context, proposal)?;
+                    if let Some(campaign) = shown
+                        .pointer("/proposal/campaign_id")
+                        .and_then(Value::as_str)
+                    {
+                        scoped.require_campaign(campaign)?;
+                    }
+                    records.app_content_proposal_discard(&scoped.context, proposal)
+                }
                 "campaigns.approve" => records.app_content_approve(
                     &scoped.context,
                     required_str(input, "campaign_id")?,
@@ -633,10 +640,17 @@ impl Shared {
                     records.app_audience_show(&scoped.context, required_str(input, "freeze_id")?)
                 }
                 "sends.list" => {
-                    let campaign = input.get("campaign_id").and_then(Value::as_str);
-                    if let Some(campaign) = campaign {
+                    let requested = input.get("campaign_id").and_then(Value::as_str);
+                    if let Some(campaign) = requested {
                         scoped.require_campaign(campaign)?;
                     }
+                    // A campaign-scoped conversation defaults to its own
+                    // campaign; only a General chat may list the context.
+                    let campaign = requested.or_else(|| {
+                        scoped.subject.as_deref().and_then(|subject| {
+                            subject.strip_prefix(crate::store::SUBJECT_CAMPAIGN)
+                        })
+                    });
                     let sends = records.app_campaign_sends(&scoped.context, campaign)?;
                     let mut out = Vec::with_capacity(sends.len());
                     for send in &sends {
@@ -664,6 +678,7 @@ impl Shared {
                                 "campaign send is unavailable for this installation and context",
                             )
                         })?;
+                    scoped.require_campaign(&send.campaign_id)?;
                     let deliveries = records.app_campaign_deliveries(&scoped.context, send_id)?;
                     let counts = records.app_campaign_delivery_counts(&scoped.context, send_id)?;
                     Ok(send_view(
