@@ -131,7 +131,7 @@ fn missing_is_legacy(state: &Directories, state_path: &Path) -> Result<bool> {
     // their schema validation/migration to the existing core entrypoints.
     let has_credentials: bool = core
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='platform_credentials')",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='platform_credentials' COLLATE NOCASE)",
             [],
             |row| row.get(0),
         )
