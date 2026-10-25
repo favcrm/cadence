@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { ApiError, api } from "../../lib/api";
 import { onPrivateSessionReset, withPrivateOperation } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
@@ -14,7 +14,7 @@ import NewHumanConversation from "./NewHumanConversation";
 import Link from "../../ui/Link";
 import PageState from "../../ui/PageState";
 import { issuePath } from "../issues/model";
-import { opensWorkItem } from "../../lib/workItems";
+import { IssueRefLink, OpenWorkItem } from "./IssueRefLink";
 import { IconClose, IconRefresh, IconSearch, IconThreads } from "../../ui/icons";
 import type { Agent } from "../../lib/types";
 import Composer from "../app-shell/chat/Composer";
@@ -137,32 +137,6 @@ interface ReplyIntent {
  *  never land on the plain DM draft or another message's reply. */
 function replyScope(intent: Pick<ReplyIntent, "senderUid" | "messageId">): string {
   return `threads-reply:${intent.senderUid}:${intent.messageId}`;
-}
-
-/** The App's opener for the shared work-item detail; absent in a bare frame. */
-const OpenWorkItem = createContext<((id: string) => void) | null>(null);
-
-/**
- * One issue reference. It stays a real link (copyable, openable in a new tab)
- * and a plain left click opens the same shared detail every other surface
- * uses; a modified click keeps the canonical issue page (CAD-1811).
- */
-function IssueRefLink({ id, project }: { id: string; project: string | null | undefined }) {
-  const open = useContext(OpenWorkItem);
-  if (!project) return <span className="threads-ref">{id}</span>;
-  return (
-    <Link
-      href={issuePath(project, id)}
-      className="threads-ref"
-      onClick={(event) => {
-        if (!open || !opensWorkItem(event)) return;
-        event.preventDefault();
-        open(id);
-      }}
-    >
-      {id}
-    </Link>
-  );
 }
 
 /** Drop one composer's draft bundle: text/refs and every queued row. Used

@@ -20,7 +20,8 @@ import { appLoadErrorCopy } from "./features/explorer/appErrors";
 import WorkspaceApp from "./features/workspace-apps/WorkspaceApp";
 import Board from "./features/projects/Board";
 import WorkItemDetail from "./features/work-items/WorkItemDetail";
-import { homeNeedIssueId, type HomeDecisionOpen, type MyWorkDraft, type WorkItemOrigin } from "./lib/workItems";
+import { restoreDetailFocus } from "./features/work-items/focus";
+import { applyDecisionDone, homeNeedIssueId, type HomeDecisionOpen, type MyWorkDraft, type WorkItemOrigin } from "./lib/workItems";
 import ProjectsOverview from "./features/projects/ProjectsOverview";
 import IssuePage from "./features/issues/IssuePage";
 import { issuePath, laneFollowsStream, refreshIssueIds } from "./features/issues/model";
@@ -118,7 +119,7 @@ function currentLocation(): AppLocation {
 function update(fn: (current: AppLocation) => AppLocation, opts?: { replace?: boolean }): void {
   const current = currentLocation();
   const next = fn(current);
-  navigate(locationHref(next, contextNavigationSearch(current.route, next.route, location.search)), opts);
+  navigate(locationHref(next, contextNavigationSearch(current.route, next.route, location.search), current.route), opts);
 }
 
 const SCREEN_LABEL: Record<Screen, string> = {
@@ -189,7 +190,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     (route.screen === "projects" && route.section === "context" && Boolean(route.slug));
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
   /** The href of a route, carrying the scope and drawer like `goTo`. */
-  const hrefFor = (r: Route) => locationHref(goTo(loc, r), contextNavigationSearch(route, r, search));
+  const hrefFor = (r: Route) => locationHref(goTo(loc, r), contextNavigationSearch(route, r, search), route);
   const setView = useCallback(
     (v: ProjectView) => update((c) => ({ ...c, view: v }), { replace: true }),
     [],
@@ -222,9 +223,18 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const detailState = useMaybeResource(openId ? resources.issue(openId) : null);
   // CAD-1811: one shared work-item detail. `openId` (the URL) names the
   // issue; the origin and any hosted Home decision are mount state.
-  const [workOrigin, setWorkOrigin] = useState<WorkItemOrigin>("issue");
+  const [workOrigin, setWorkOrigin] = useState<WorkItemOrigin | null>(null);
   const [decision, setDecision] = useState<HomeDecisionOpen | null>(null);
   const workOpener = useRef<Element | null>(null);
+  // Late decision replies read the live selection, never the render they
+  // were created in (CAD-1811 review): a dismissed/replaced decision must
+  // not close or replace what the operator is looking at now.
+  const decisionRef = useRef<HomeDecisionOpen | null>(null);
+  decisionRef.current = decision;
+  // A deep-linked `?issue=` has no opener in this session: its origin is the
+  // screen showing it. An explicit open records its own origin.
+  const effectiveOrigin: WorkItemOrigin = workOrigin ??
+    (screen === "home" ? "home" : screen === "myWork" ? "myWork" : screen === "threads" ? "threads" : "issue");
   const personalState = useMaybeResource(screen === "myWork" ? resources.myWork : null);
   // The peek's membership: one issue, asked of the server (the list holds one page).
   const membershipState = useMaybeResource(screen === "myWork" && openId ? resources.myWorkIssue(openId) : null);
@@ -355,6 +365,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   useEffect(() => {
     if (openId) void resources.issue(openId).revalidate();
   }, [openId]);
+  useEffect(() => {
+    setWorkOrigin(null);
+  }, [screen]);
 
   const invalidatePersonal = useCallback(() => {
     if (personalWanted.current) void resources.myWork.invalidate();
@@ -699,30 +712,25 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   }, [openWorkItem]);
   /** Close the shared detail; My work gets its reading position back. */
   const closeWorkItem = useCallback(() => {
-    const origin = workOrigin;
-    const saved = origin === "myWork" ? personalReturn.current : null;
+    const saved = effectiveOrigin === "myWork" ? personalReturn.current : null;
     setDecision(null);
     closeIssue();
+    restoreDetailFocus(workOpener.current);
     if (saved !== null) requestAnimationFrame(() => window.scrollTo(0, saved.scroll));
-  }, [workOrigin, closeIssue]);
+  }, [effectiveOrigin, closeIssue]);
   /** A Home decision landed: mark the card, then move to the next reading item. */
-  const finishDecision = useCallback((_key: string, text: string) => {
-    if (decision === null) return;
-    const next = decision.next(text);
-    if (next === null) {
+  const finishDecision = useCallback((done: HomeDecisionOpen, _key: string, text: string) => {
+    const outcome = applyDecisionDone(done, text, decisionRef.current);
+    if (outcome.kind === "ignored") return;
+    if (outcome.kind === "closed") {
       closeWorkItem();
-      // This close bypasses DrawerShell's exit, so hand focus back here.
-      const opener = workOpener.current;
-      requestAnimationFrame(() => {
-        if (opener instanceof HTMLElement && opener.isConnected) opener.focus({ preventScroll: true });
-      });
       return;
     }
-    setDecision(next);
-    const id = homeNeedIssueId(next.need);
+    setDecision(outcome.next);
+    const id = homeNeedIssueId(outcome.next.need);
     if (id === null) closeWorkItem();
     else openWorkItem(id, "home");
-  }, [decision, closeWorkItem, openWorkItem]);
+  }, [closeWorkItem, openWorkItem]);
   const openAgent = useCallback(
     (alias: string | null) => update((c) => ({ ...c, route: { screen: "agents", alias } })),
     [],
@@ -1376,7 +1384,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         <WorkItemDetail
           key={`${openId}:${decision?.need.key ?? ""}`}
           id={openId}
-          origin={workOrigin}
+          origin={effectiveOrigin}
           detail={detailState?.data?.id === openId ? detailState.data : null}
           readState={detailState}
           onRetry={() => {
@@ -1384,9 +1392,6 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             if (screen === "myWork") void resources.myWorkIssue(openId).refresh();
           }}
           readOnly={readOnly}
-          writeBlock={block}
-          onWrite={applyWrite}
-          onError={writeError}
           onOpen={openIssue}
           card={screen === "myWork" ? personalState?.data?.issues.find((row) => row.id === openId) ?? null : null}
           home={decision && homeNeedIssueId(decision.need) === openId ? {

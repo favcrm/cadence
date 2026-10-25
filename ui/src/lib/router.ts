@@ -445,7 +445,7 @@ function scopedRoute(route: Route, project: string): Route {
 const CRM_APP_PARAMS = ["crm", "record", "ctx", "appview", "segment", "install"] as const;
 
 /** Path plus query for a location, keeping query parameters the app does not own. */
-export function locationHref(loc: AppLocation, search = ""): string {
+export function locationHref(loc: AppLocation, search = "", from: Route | null = null): string {
   const q = new URLSearchParams(search);
   // `run` is owned by the Workflows section — it opens one row's form
   // there — and `new` by an app page (it opens the New post drawer on
@@ -453,6 +453,11 @@ export function locationHref(loc: AppLocation, search = ""): string {
   // an app page's too (CAD-1040: the operator's back door to native
   // controls instead of the mounted app screen); it never carries over to
   // another installation.
+  // CAD-1811: Threads owns its list scope in `?project=` (threadsView). It is
+  // not a board filter, so opening or closing the shared issue detail there
+  // must carry it across the delete below. Only a Threads → Threads move
+  // keeps it: another screen's `?project=` is that screen's filter.
+  const threadsProject = from?.screen === "threads" && loc.route.screen === "threads" ? q.get("project") : null;
   for (const key of ["tab", "view", "project", "issue", "run", "new", "screen", "at", "section", "page", "recruit", "ask"]) q.delete(key);
   // CAD-1703: My work's view belongs to its own route.
   for (const key of MY_WORK_URL_KEYS) q.delete(key);
@@ -480,6 +485,7 @@ export function locationHref(loc: AppLocation, search = ""): string {
   } else if (projectFilter(route) && loc.project !== "all") {
     q.set("project", loc.project);
   }
+  if (threadsProject !== null) q.set("project", threadsProject);
   if (loc.openId) q.set("issue", loc.openId);
   if (route.screen === "myWork" && route.view) writeMyWorkView(q, route.view);
   if (route.screen === "wiki") {

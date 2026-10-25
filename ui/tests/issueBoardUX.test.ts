@@ -209,7 +209,7 @@ async function run() {
     const retry = () => { retried++; };
     const href = "/projects/cadence/issues/CAD-1";
     const detailProps = { id: card.id, origin: "issue" as const, href, onClose: close, onRetry: retry,
-      readOnly: false, writeBlock: null, onWrite: () => {}, onError: () => {}, onOpen: () => {} };
+      readOnly: false, onOpen: () => {} };
     await React.act(() => drawerRoot.render(React.createElement(Detail, {
       ...detailProps,
       detail: null,

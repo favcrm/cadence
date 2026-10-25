@@ -1,9 +1,10 @@
-import { useEffect, useState, type ComponentProps } from "react";
+import { useEffect, useRef, useState, type ComponentProps } from "react";
 import NeedsRail from "../src/features/home/NeedsRail";
 import WorkItemDetail from "../src/features/work-items/WorkItemDetail";
 import { resources } from "../src/lib/resources";
 import { useMaybeResource } from "../src/lib/useResource";
-import { homeNeedIssueId, type HomeDecisionOpen } from "../src/lib/workItems";
+import { applyDecisionDone, homeNeedIssueId, type HomeDecisionOpen } from "../src/lib/workItems";
+import { restoreDetailFocus } from "../src/features/work-items/focus";
 import { LocaleProvider } from "../src/lib/locale";
 
 type RailProps = Omit<ComponentProps<typeof NeedsRail>, "onOpenDecision">;
@@ -15,14 +16,25 @@ type RailProps = Omit<ComponentProps<typeof NeedsRail>, "onOpenDecision">;
  */
 export default function RailWithDetail(props: RailProps) {
   const [decision, setDecision] = useState<HomeDecisionOpen | null>(null);
+  const decisionRef = useRef<HomeDecisionOpen | null>(null);
+  decisionRef.current = decision;
+  const opener = useRef<Element | null>(null);
   const id = decision ? homeNeedIssueId(decision.need) : null;
   const state = useMaybeResource(id ? resources.issue(id) : null);
   useEffect(() => {
     if (id) void resources.issue(id).revalidate();
   }, [id]);
+  const open = (next: HomeDecisionOpen) => {
+    if (decisionRef.current === null) opener.current = document.activeElement;
+    setDecision(next);
+  };
+  const close = () => {
+    setDecision(null);
+    restoreDetailFocus(opener.current);
+  };
   return (
     <LocaleProvider>
-      <NeedsRail {...props} onOpenDecision={setDecision} />
+      <NeedsRail {...props} onOpenDecision={open} />
       {decision && id && (
         <WorkItemDetail
           key={`${id}:${decision.need.key}`}
@@ -32,15 +44,20 @@ export default function RailWithDetail(props: RailProps) {
           readState={state}
           onRetry={() => void resources.issue(id).refresh()}
           href={`/projects/demo/issues/${id}`}
-          onClose={() => setDecision(null)}
+          onClose={close}
           readOnly={props.readOnly}
-          writeBlock={null}
-          onWrite={() => {}}
-          onError={() => {}}
           onOpen={() => {}}
           home={{
             open: decision,
-            onDone: (_key, text) => setDecision(decision.next(text)),
+            onDone: (done, _key, text) => {
+              const outcome = applyDecisionDone(done, text, decisionRef.current);
+              if (outcome.kind === "ignored") return;
+              if (outcome.kind === "closed") {
+                close();
+                return;
+              }
+              setDecision(outcome.next);
+            },
             onAsk: (_need, lead) => decision.ask(lead),
           }}
         />

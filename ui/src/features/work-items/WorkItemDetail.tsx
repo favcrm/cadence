@@ -4,7 +4,7 @@ import Button from "../../ui/Button";
 import Md from "../../ui/Md";
 import Select from "../../ui/Select";
 import type { ResourceState } from "../../lib/cache";
-import { api, ApiError, type MyWorkIssue, type WriteResp } from "../../lib/api";
+import { api, ApiError, type MyWorkIssue } from "../../lib/api";
 import type { IssueDetail } from "../../lib/types";
 import { useLocale } from "../../lib/locale";
 import { fmtTime } from "../../lib/fmt";
@@ -53,10 +53,8 @@ export interface WorkItemDetailProps {
   /** Full issue page. Null when the project is unknown. */
   href: string | null;
   onClose: () => void;
+  /** The write gate for the hosted Home decision panels; artifacts stay on the issue page. */
   readOnly: boolean;
-  writeBlock: string | null;
-  onWrite: (resp: WriteResp, verb: string) => void;
-  onError: (error: unknown, verb: string) => void;
   /** Open another issue inside this detail (body links). */
   onOpen: (id: string) => void;
   /** The My work row that opened it, when one did. */
@@ -66,7 +64,8 @@ export interface WorkItemDetailProps {
   /** A Home decision hosted above the facts; its own guards stay in charge. */
   home?: {
     open: HomeDecisionOpen;
-    onDone: (key: string, text: string) => void;
+    /** `done` is the decision that completed — a late reply may not be the current one. */
+    onDone: (done: HomeDecisionOpen, key: string, text: string) => void;
     onAsk: (need: HomeNeed, lead: string) => void;
   };
 }
@@ -82,7 +81,7 @@ export interface WorkItemDetailProps {
  */
 export default function WorkItemDetail(props: WorkItemDetailProps) {
   const { t } = useLocale();
-  const { id, origin, detail, readState, onRetry, href, onClose, readOnly, onWrite, onError, onOpen, card, myWork, home } = props;
+  const { id, origin, detail, readState, onRetry, href, onClose, readOnly, onOpen, card, myWork, home } = props;
   const facts = useMemo(() => workItemFacts(detail, card ?? null), [detail, card]);
   const known = detail !== null && detail.id === id;
   const title = facts.title ?? (home ? home.open.need.shortTitle ?? t("Decision") : t("Work item"));
@@ -114,7 +113,7 @@ export default function WorkItemDetail(props: WorkItemDetailProps) {
       ) : tabId === "code" ? (
         <CodePanel detail={known ? detail : null} />
       ) : tabId === "evidence" ? (
-        <EvidencePanel detail={known ? detail : null} readOnly={readOnly} onWrite={onWrite} onError={onError} />
+        <EvidencePanel detail={known ? detail : null} />
       ) : tabId === "approvals" ? (
         <ApprovalsPanel detail={known ? detail : null} />
       ) : tabId === "activity" ? (
@@ -268,7 +267,7 @@ function OverviewPanel({
           readOnly={readOnly}
           index={home.open.index}
           total={home.open.total}
-          onDone={home.onDone}
+          onDone={(key, text) => home.onDone(home.open, key, text)}
           onClose={onClose}
           onAsk={home.onAsk}
         />
@@ -416,17 +415,8 @@ function CodePanel({ detail }: { detail: IssueDetail | null }) {
   );
 }
 
-function EvidencePanel({
-  detail,
-  readOnly,
-  onWrite,
-  onError,
-}: {
-  detail: IssueDetail | null;
-  readOnly: boolean;
-  onWrite: WorkItemDetailProps["onWrite"];
-  onError: WorkItemDetailProps["onError"];
-}) {
+/** Recorded evidence only: artifact authoring stays on the canonical issue page. */
+function EvidencePanel({ detail }: { detail: IssueDetail | null }) {
   const { t } = useLocale();
   if (!detail) return <p className="issue-peek-note dim m-0">{t("Evidence is listed once the item loads.")}</p>;
   const artifacts = detail.artifacts ?? [];
@@ -436,9 +426,7 @@ function EvidencePanel({
         id={detail.id}
         images={artifacts.filter((file) => IMG.test(file.name))}
         files={artifacts.filter((file) => !IMG.test(file.name))}
-        readOnly={readOnly}
-        onWrite={onWrite}
-        onError={onError}
+        readOnly
       />
     </div>
   );

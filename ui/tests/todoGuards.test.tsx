@@ -48,7 +48,7 @@ const issue = (id: string, extra: Record<string, unknown>) => ({
   id, project: "demo", title: `Ticket ${id}`, body: "", status: "review", status_source: "direct", priority: "P3",
   tags: [], blocked_by: [], relates: [], refs: [], container: false, ready: false, blocked: false,
   created: "2026-09-29T00:00:00Z", rev: "fnv1a:0123456789abcdef", counts: { comments: 0, artifacts: 0, refs: 0 },
-  checks: { done: 0, total: 0 }, ...extra,
+  comments: [], checks: { done: 0, total: 0 }, ...extra,
 });
 const issues: Record<string, unknown> = {
   "D-1": issue("D-1", {

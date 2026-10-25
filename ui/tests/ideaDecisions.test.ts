@@ -89,6 +89,7 @@ await (resources.issue("D-9") as { refreshUsing: (f: () => Promise<unknown>) => 
   created: "2026-09-29T00:00:00Z",
   rev: "fnv1a:0123456789abcdef",
   counts: { comments: 0, artifacts: 0, refs: 0 },
+  comments: [],
   checks: { done: 0, total: 0 },
 }));
 
@@ -110,6 +111,7 @@ await (resources.issue("D-2") as { refreshUsing: (f: () => Promise<unknown>) => 
   created: "2026-09-29T00:00:00Z",
   rev: "fnv1a:00000000000000d2",
   counts: { comments: 0, artifacts: 0, refs: 0 },
+  comments: [],
   checks: { done: 0, total: 0 },
 }));
 

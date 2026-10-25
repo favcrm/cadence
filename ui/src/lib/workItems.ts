@@ -84,6 +84,29 @@ export interface HomeDecisionOpen {
   ask: (lead: string) => void;
 }
 
+/**
+ * What a completed Home decision does to the host's selection. `done.next`
+ * records the decision on its own queue either way; only a decision that is
+ * still selected may advance the shared detail or close it. A late reply for
+ * a decision the operator already dismissed (or replaced with another item)
+ * is recorded and then ignored, so it can never close or replace the newer
+ * selection.
+ */
+export type DecisionDone =
+  | { kind: "ignored" }
+  | { kind: "advanced"; next: HomeDecisionOpen }
+  | { kind: "closed" };
+
+export function applyDecisionDone(
+  done: HomeDecisionOpen,
+  text: string,
+  current: HomeDecisionOpen | null,
+): DecisionDone {
+  const next = done.next(text);
+  if (current === null || current.need.key !== done.need.key) return { kind: "ignored" };
+  return next === null ? { kind: "closed" } : { kind: "advanced", next };
+}
+
 /** The issue behind a Home reading item, or null when it has none. */
 export function homeNeedIssueId(need: HomeNeed): string | null {
   const action = need.action;
@@ -137,7 +160,7 @@ export function workItemFacts(
     blocked: detail?.blocked ?? card?.blocked ?? false,
     blockedReason: detail?.blocked_reason ?? card?.blocked_reason ?? null,
     checks: detail?.checks ?? card?.checks ?? { done: 0, total: 0 },
-    comments: detail?.counts.comments ?? card?.counts.comments ?? 0,
+    comments: detail ? detail.comments.length : card?.counts.comments ?? 0,
     recorded: detail !== null,
   };
 }
