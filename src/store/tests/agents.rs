@@ -579,3 +579,63 @@
         assert!(err.to_string().contains("unknown team role"), "{err}");
         assert!(s.agent_opt("sneak").unwrap().is_none());
     }
+
+    /// CAD-1809: `SessionInfo` and `AgentQuota` exist in the core crate only
+    /// as schema documentation (`schemars(with)`). The live producers —
+    /// `SessionView` and `canonical_quota` — must match the committed
+    /// contract exactly: no field the schema lacks, none it requires missing.
+    #[test]
+    fn schema_only_board_types_match_their_producers() {
+        fn assert_matches(file: &str, def: &str, producer: serde_json::Value) {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("contracts/board-api/v1")
+                .join(file);
+            let doc: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            // Close every typed object so an unknown producer field is refused.
+            let mut defs = doc["$defs"].clone();
+            for d in defs.as_object_mut().unwrap().values_mut() {
+                if d.get("properties").is_some() {
+                    d["additionalProperties"] = json!(false);
+                }
+            }
+            let schema = json!({"$ref": format!("#/$defs/{def}"), "$defs": defs});
+            let validator = jsonschema::validator_for(&schema).unwrap();
+            let errors: Vec<String> = validator
+                .iter_errors(&producer)
+                .map(|e| e.to_string())
+                .collect();
+            assert!(errors.is_empty(), "{def} drifted from its producer: {errors:?}\n{producer}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut auth = crate::operator_auth::Auth::load(dir.path());
+        let user = crate::operator_auth::BoardUser {
+            sub: "s".into(),
+            email: "e@example.test".into(),
+            name: "n".into(),
+            role: "member".into(),
+            handle: "h".into(),
+        };
+        let realm = crate::operator_auth::PublicRealm {
+            issuer: "https://issuer.example.test".into(),
+            company: "co".into(),
+            host: "h.example.test".into(),
+        };
+        let opened = auth
+            .open_public_bound_with_intent(user, ("jti", 4_000_000_000), "ua", realm, 1_000, |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert_matches(
+            "meta.schema.json",
+            "SessionInfo",
+            serde_json::to_value(&opened.session).unwrap(),
+        );
+
+        let snapshot = json!({"source": "s", "data": {"accountId": "a", "rateLimits": {"x": 1}}});
+        let available = super::quota::canonical_quota("w", "codex", "t", &snapshot, "2026-01-01T00:00:00Z");
+        let unknown = super::quota::canonical_quota("w", "codex", "t", &json!({}), "2026-01-01T00:00:00Z");
+        assert!(unknown.get("reason").is_some(), "the reason branch is covered");
+        assert_matches("agents.schema.json", "AgentQuota", available);
+        assert_matches("agents.schema.json", "AgentQuota", unknown);
+    }
