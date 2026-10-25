@@ -7,8 +7,8 @@ import AgentUpdates from "./AgentUpdates";
 import type { AgentUpdate } from "./agentUpdateModel";
 import { useTranslate } from "../../lib/locale";
 import { READ_ONLY_COPY } from "./AnswerForm";
-import ReviewDrawer from "./ReviewDrawer";
 import TodoCard from "./TodoCard";
+import { decisionReviewHead, nextDecisionToken, type HomeDecisionOpen } from "../../lib/workItems";
 import { beginTodoVisit, doneTodo, hideTodo, marksFor, useTodoLocal } from "./todoLocal";
 import Link from "../../ui/Link";
 
@@ -20,8 +20,10 @@ export { NeedMenu } from "./NeedMenu";
  * informational rows and the team's recent work. It collapses to a slim
  * rail with the count (persisted per viewer) and, under ~1100px, is a
  * slide-over opened from the floating button. Reading items (plans,
- * ideas, merge decisions) open the review drawer from the right edge;
- * the count and the sidebar's Home badge include pending items only.
+ * ideas, merge decisions) open inside the one shared work-item detail,
+ * mounted by App (CAD-1811); the rail hands it the reading queue as it
+ * stood when the item opened. The count and the sidebar's Home badge
+ * include pending items only.
  */
 export default function NeedsRail({
   overview,
@@ -30,6 +32,7 @@ export default function NeedsRail({
   overviewHref,
   permissionsHref,
   onAsk,
+  onOpenDecision,
   collapsed,
   onToggleCollapse,
   onAskAgent,
@@ -42,6 +45,8 @@ export default function NeedsRail({
   /** Settings → Master permissions, where the standing "Always" rules live. */
   permissionsHref: string;
   onAsk: (need: HomeNeed, lead?: string) => void;
+  /** Open a reading item in the shared detail (App owns the one mount). */
+  onOpenDecision: (open: HomeDecisionOpen) => void;
   collapsed: boolean;
   onToggleCollapse: () => void;
   onAskAgent: (agent: Agent, update?: AgentUpdate) => void;
@@ -83,46 +88,38 @@ export default function NeedsRail({
     setDrawer(false);
     onOpenIssue(id);
   };
-  const [review, setReview] = useState<string | null>(null);
-  // The reading items, as they stood when the drawer opened: "n of m" does
-  // not recount when the overview refreshes mid-run.
-  const [queue, setQueue] = useState<string[]>([]);
   const [showDecided, setShowDecided] = useState(false);
-  const hits = useRef(new Map<string, HTMLElement>());
-  const [refocus, setRefocus] = useState<string | null>(null);
 
   const cards = todo.filter((n) => !marksFor(local, n).hidden);
   const isDone = (n: HomeNeed) => marksFor(local, n).doneText !== undefined;
   const count = cards.filter((n) => !isDone(n)).length;
   const readers = cards.filter((n) => kindSpec(n).place === "drawer");
-  const reading = review === null ? undefined : readers.find((n) => n.key === review);
   const firstPermission = cards.findIndex((n) => !isDone(n) && n.kind === "master_permission");
-
-  const openReview = (key: string) => {
-    setQueue(readers.filter((n) => n.key === key || !isDone(n)).map((n) => n.key));
-    setReview(key);
-  };
-  /** A review decision landed: mark the card, then move on to the next reading item. */
-  const reviewed = (key: string, text: string) => {
-    const need = readers.find((n) => n.key === key);
-    if (need) doneTodo(need, text);
-    const next = queue.slice(queue.indexOf(key) + 1).find((k) => readers.some((n) => n.key === k && !isDone(n)));
-    setReview(next ?? null);
-  };
   const ask = (need: HomeNeed, lead?: string) => {
     setDrawer(false);
     onAsk(need, lead);
   };
-  const closeReview = () => {
-    setRefocus(review);
-    setReview(null);
+  /** One reading item, with the queue as it stood when the detail opened:
+   *  "n of m" does not recount when the overview refreshes mid-run. */
+  const decisionFor = (need: HomeNeed, queue: HomeNeed[]): HomeDecisionOpen => ({
+    need,
+    index: Math.max(queue.findIndex((n) => n.key === need.key), 0) + 1,
+    total: Math.max(queue.length, 1),
+    token: nextDecisionToken(),
+    reviewHead: decisionReviewHead(need),
+    next: (text) => {
+      doneTodo(need, text);
+      const at = queue.findIndex((n) => n.key === need.key);
+      const following = queue.slice(at + 1).find((n) => !isDone(n));
+      return following ? decisionFor(following, queue) : null;
+    },
+    ask: (lead) => ask(need, lead),
+  });
+  const openDecision = (key: string) => {
+    const need = readers.find((n) => n.key === key);
+    if (!need) return;
+    onOpenDecision(decisionFor(need, readers.filter((n) => n.key === key || !isDone(n))));
   };
-  // Hand focus back to the card that opened the drawer, once the drawer is gone.
-  useEffect(() => {
-    if (refocus === null || review !== null) return;
-    hits.current.get(refocus)?.focus();
-    setRefocus(null);
-  }, [refocus, review]);
   const todoBody = (
     <>
       {block && <p className="todo-note">{t(READ_ONLY_COPY)}</p>}
@@ -143,18 +140,11 @@ export default function NeedsRail({
             readOnly={readOnly}
             defaultOpen={i === firstPermission}
             doneText={marksFor(local, n).doneText}
-            onReview={openReview}
+            onReview={openDecision}
             onOpenIssue={openIssue}
             onAsk={(need) => ask(need)}
             onHide={hideTodo}
             onDone={doneTodo}
-            hitRef={(el) => {
-              if (!el) return;
-              hits.current.set(n.key, el);
-              return () => {
-                if (hits.current.get(n.key) === el) hits.current.delete(n.key);
-              };
-            }}
             onSent={() => {
               setDrawer(false);
               onSent?.();
@@ -315,18 +305,6 @@ export default function NeedsRail({
         </>
       )}
 
-      {reading && (
-        <ReviewDrawer
-          key={reading.key}
-          need={reading}
-          readOnly={readOnly}
-          index={Math.max(queue.indexOf(reading.key), 0) + 1}
-          total={Math.max(queue.length, 1)}
-          onDone={reviewed}
-          onClose={closeReview}
-          onAsk={(need, lead) => ask(need, lead)}
-        />
-      )}
     </>
   );
 }

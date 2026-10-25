@@ -1,4 +1,4 @@
-import { useEffect, useState, type KeyboardEvent, type ReactNode, type RefCallback } from "react";
+import { useEffect, useState, type KeyboardEvent, type ReactNode } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
 import { api } from "../../lib/api";
 import { privateSessionGeneration } from "../../lib/privateSession";
@@ -134,7 +134,6 @@ export default function TodoCard({
   onHide,
   onDone,
   onSent,
-  hitRef,
 }: {
   need: HomeNeed;
   readOnly: boolean;
@@ -148,8 +147,6 @@ export default function TodoCard({
   onDone: (need: HomeNeed, text: string) => void;
   /** Fired after "Fix it" sends, so a slide-over can make room for the chat. */
   onSent: () => void;
-  /** The card's tap target, so the review drawer can hand focus back to it. */
-  hitRef: RefCallback<HTMLElement>;
 }) {
   const block = useWriteBlock(readOnly);
   const t = useTranslate();
@@ -346,7 +343,6 @@ export default function TodoCard({
             role={activates && !done ? "button" : undefined}
             tabIndex={activates && !done ? 0 : undefined}
             aria-expanded={expandable && !done ? open : undefined}
-            ref={hitRef}
             onClick={activate}
             onKeyDown={onKey}
           >

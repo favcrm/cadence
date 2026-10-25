@@ -68,7 +68,7 @@ const detail = (id: string): Detail => ({
   blocked: false,
   created: "2026-09-26T00:00:00Z",
   rev: "r1",
-  counts: { comments: 0, artifacts: 0, refs: 0 }, paths: [], tags: [], work: { type: "task", type_source: "implicit", weight: 1 },
+  paths: [], tags: [], work: { type: "task", type_source: "implicit", weight: 1 },
   checks: { done: 0, total: 1 },
   frontmatter: {},
   body: "Goal text.\n\n## Acceptance\n- [ ] Unique criterion",

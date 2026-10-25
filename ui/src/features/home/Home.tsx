@@ -28,6 +28,7 @@ import { atTail, jumpLabel, repinOnResize, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
 import NeedsRail from "./NeedsRail";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
+import type { HomeDecisionOpen } from "../../lib/workItems";
 import PlanCard from "./PlanCard";
 import Conversation from "../app-shell/chat/Conversation";
 import { TurnBar } from "../app-shell/chat/TurnBar";
@@ -574,6 +575,7 @@ export default function Home({
   sessionId = null,
   overview,
   onOpenIssue,
+  onOpenDecision,
   overviewHref,
   permissionsHref,
   resolveAppPath,
@@ -595,6 +597,8 @@ export default function Home({
   sessionId?: string | null;
   overview: ResourceState<Overview>;
   onOpenIssue: (id: string) => void;
+  /** Open a reading item in the shared work-item detail (App owns the mount). */
+  onOpenDecision: (open: HomeDecisionOpen) => void;
   overviewHref: string;
   /** Settings → Master permissions (the standing "Always" rules). */
   permissionsHref: string;
@@ -631,6 +635,7 @@ export default function Home({
       hosted={hosted}
       overview={overview}
       onOpenIssue={onOpenIssue}
+      onOpenDecision={onOpenDecision}
       overviewHref={overviewHref}
       permissionsHref={permissionsHref}
       resolveAppPath={resolveAppPath}
@@ -646,6 +651,7 @@ function MasterHome({
   hosted = null,
   overview,
   onOpenIssue,
+  onOpenDecision,
   overviewHref,
   permissionsHref,
   resolveAppPath,
@@ -655,6 +661,7 @@ function MasterHome({
   hosted?: boolean | null;
   overview: ResourceState<Overview>;
   onOpenIssue: (id: string) => void;
+  onOpenDecision: (open: HomeDecisionOpen) => void;
   overviewHref: string;
   permissionsHref: string;
   resolveAppPath: (installId: string) => string | null;
@@ -1155,6 +1162,7 @@ function MasterHome({
           overviewHref={overviewHref}
           permissionsHref={permissionsHref}
           onAsk={onAsk}
+          onOpenDecision={onOpenDecision}
           onAskAgent={(agent, update) => setSeed((s) => ({
             text: `Check in with ${agent.alias}${agent.on.length ? ` on ${agent.on.join(", ")}` : ""}. ${update ? `Their latest update: ${update.label}${update.text ? ` — ${update.text.slice(0, 1200)}` : ""}. ` : ""}What is the current progress, and does anything need my input?`,
             refs: [], n: s.n + 1,

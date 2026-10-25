@@ -1,8 +1,8 @@
 import { streamFixture } from "./streamFixture";
 export {};
 /**
- * CAD-1273: the To do rail and review drawer's safety behaviour, checked
- * on the rendered NeedsRail. The server enforces all of it; each check
+ * CAD-1273: the To do rail and its decision detail's safety behaviour,
+ * checked on the rendered rail plus the shared work-item detail (CAD-1811). The server enforces all of it; each check
  * here starts from a state where only the UI guard stands in the way, so
  * deleting the guard fails the check:
  *  - a read-only board disables every write control on cards and in the drawer;
@@ -38,7 +38,7 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const NeedsRail = (require("../src/features/home/NeedsRail") as typeof import("../src/features/home/NeedsRail")).default;
+const RailWithDetail = (require("./railHarness") as typeof import("./railHarness")).default;
 const { resetTodoLocal, useHomeCount } = require("../src/features/home/todoLocal") as typeof import("../src/features/home/todoLocal");
 const { HEAD_MOVED_COPY } = require("../src/features/home/MergeForm") as typeof import("../src/features/home/MergeForm");
 
@@ -48,7 +48,7 @@ const issue = (id: string, extra: Record<string, unknown>) => ({
   id, project: "demo", title: `Ticket ${id}`, body: "", status: "review", status_source: "direct", priority: "P3",
   tags: [], blocked_by: [], relates: [], refs: [], container: false, ready: false, blocked: false,
   created: "2026-09-29T00:00:00Z", rev: "fnv1a:0123456789abcdef", counts: { comments: 0, artifacts: 0, refs: 0 },
-  checks: { done: 0, total: 0 }, ...extra,
+  comments: [], checks: { done: 0, total: 0 }, ...extra,
 });
 const issues: Record<string, unknown> = {
   "D-1": issue("D-1", {
@@ -82,9 +82,14 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
 }) as typeof fetch;
 
 const flush = () => React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+// The shared detail closes through DrawerShell's exit transition (its 320ms
+// fallback when no transition runs, as in happy-dom), so a settle that waits
+// for it must let real time pass inside act.
+const tick = () => React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 12)); });
 async function settle(check: () => void) {
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < 80; i++) {
     await flush();
+    await tick();
     try { check(); return; } catch { /* keep polling */ }
   }
   await flush();
@@ -168,7 +173,7 @@ async function render(needs: unknown[], readOnly: boolean, opts: { keepLocal?: b
           null,
           // Without the badge nothing reconciles: the marks alone must not hide a changed need.
           opts.noBadge ? null : React.createElement(Badge, { needs: rows }),
-          React.createElement(NeedsRail, {
+          React.createElement(RailWithDetail, {
             overview, readOnly: ro, onOpenIssue: () => {}, overviewHref: "/overview", permissionsHref: "/settings/permissions",
             onAsk: () => {}, collapsed: false, onToggleCollapse: () => {}, onAskAgent: () => {},
           }),

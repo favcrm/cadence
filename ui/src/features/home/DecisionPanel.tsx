@@ -1,6 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
-import DrawerShell from "../app-shell/shared/DrawerShell";
 import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import Button from "../../ui/Button";
@@ -13,22 +12,23 @@ import { usePlanDecision } from "./PlanCard";
 import { ageWords, changeSize, firstSentence, type HomeNeed } from "./needs";
 
 /**
- * The review drawer (CAD-1216): plans, ideas and merge decisions open
- * from the right edge over the whole board. One fixed order: title +
- * where/age, a one-sentence outcome, the content, "Checked" ticks, a
- * hidden Details link, and a pinned footer (primary, secondary, Not now,
+ * The Home decision panel (CAD-1216, hosted by the shared work-item detail
+ * since CAD-1811): plans, ideas and merge decisions render inside the one
+ * detail drawer, above the issue's recorded facts. One fixed order: title +
+ * where/age, a one-sentence outcome, the content, "Checked" ticks, a hidden
+ * Details link, and the decision footer (primary, secondary, Not now,
  * "n of m"). Only facts the row carries are shown. The decisions run
  * through the same hooks the plan, idea and merge cards use, so the
  * operator-only routes, the revision binding and the pinned head are
- * unchanged.
+ * unchanged; the shared detail adds no approval path.
  */
-export interface ReviewProps {
+export interface DecisionPanelProps {
   need: HomeNeed;
   readOnly: boolean;
   /** 1-based position among the reading items, and how many there are. */
   index: number;
   total: number;
-  /** Done: the card is marked and the drawer advances (or closes after the last). */
+  /** Done: the card is marked and the detail advances (or closes after the last). */
   onDone: (key: string, text: string) => void;
   onClose: () => void;
   /** "Change something…": hand the thing to Master as a composer draft. */
@@ -141,6 +141,7 @@ function Foot({
   );
 }
 
+/** The decision, rendered inside the shared detail's Overview panel. */
 function Shell({
   need,
   verb,
@@ -148,7 +149,6 @@ function Shell({
   subtitle,
   body,
   foot,
-  onClose,
 }: {
   need: HomeNeed;
   verb: string;
@@ -156,27 +156,22 @@ function Shell({
   subtitle: string;
   body: ReactNode;
   foot: ReactNode;
-  onClose: () => void;
 }) {
   const t = useTranslate();
   return (
-    <DrawerShell
-      kind="review"
-      scrim="board"
-      label={t(verb)}
-      kicker={kicker(t(verb), need)}
-      title={title}
-      subtitle={subtitle}
-      tabs={[{ id: "review", label: t(verb), panel: <div className="rv-body">{body}</div> }]}
-      foot={foot}
-      onClose={onClose}
-    />
+    <section className="rv-embedded" aria-label={t(verb)} data-review-verb={verb}>
+      <div className="kicker">{kicker(t(verb), need)}</div>
+      <h4 className="rv-embedded-title">{title}</h4>
+      <p className="rv-embedded-sub">{subtitle}</p>
+      <div className="rv-body">{body}</div>
+      {foot}
+    </section>
   );
 }
 
 const waiting = (need: HomeNeed, t: (s: string) => string) => `${t(ageWords(need.age))}${need.age < 60 ? "" : ` ${t("ago")}`}`;
 
-function PlanReview({ need, readOnly, index, total, onDone, onClose, onAsk }: ReviewProps) {
+function PlanReview({ need, readOnly, index, total, onDone, onClose, onAsk }: DecisionPanelProps) {
   const epic = need.action.type === "plan" ? need.action.epic : "";
   const block = useWriteBlock(readOnly);
   const t = useTranslate();
@@ -239,7 +234,6 @@ function PlanReview({ need, readOnly, index, total, onDone, onClose, onAsk }: Re
       title={title}
       subtitle={`${t("Proposed by")} ${view?.proposedBy === "master" ? t("Master") : t("your team")} · ${waiting(need, t)}`}
       body={body}
-      onClose={onClose}
       foot={
         <Foot
           block={block}
@@ -274,7 +268,7 @@ function PlanReview({ need, readOnly, index, total, onDone, onClose, onAsk }: Re
   );
 }
 
-function IdeaReview({ need, readOnly, index, total, onDone, onClose }: ReviewProps) {
+function IdeaReview({ need, readOnly, index, total, onDone, onClose }: DecisionPanelProps) {
   const issue = need.action.type === "idea" ? need.action.issue : "";
   const block = useWriteBlock(readOnly);
   const t = useTranslate();
@@ -292,7 +286,6 @@ function IdeaReview({ need, readOnly, index, total, onDone, onClose }: ReviewPro
       verb="Approve idea"
       title={detail?.title ?? "Idea"}
       subtitle={`${t("Waiting")} ${t(ageWords(need.age))}`}
-      onClose={onClose}
       body={
         !detail ? (
           <p className="rv-note">{d.state.status === "failed" ? t("This idea could not be read.") : t("Reading the idea…")}</p>
@@ -352,7 +345,7 @@ function IdeaReview({ need, readOnly, index, total, onDone, onClose }: ReviewPro
   );
 }
 
-function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewProps) {
+function MergeReview({ need, readOnly, index, total, onDone, onClose }: DecisionPanelProps) {
   const action = need.action as HomeNeed["action"] & { type: "merge" };
   const block = useWriteBlock(readOnly);
   const t = useTranslate();
@@ -379,7 +372,6 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
       verb="Approve change"
       title={issue?.title ?? need.shortTitle ?? "Publish a change"}
       subtitle={`${t("Ready")} ${waiting(need, t)}`}
-      onClose={onClose}
       body={
         <>
           {lead && <p className="rv-lead">{lead}</p>}
@@ -470,8 +462,8 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
   );
 }
 
-/** The drawer for one reading item; the caller keys it by the item so each starts fresh. */
-export default function ReviewDrawer(props: ReviewProps) {
+/** One reading item's decision; the shared detail keys it by the item so each starts fresh. */
+export default function DecisionPanel(props: DecisionPanelProps) {
   const t = props.need.action.type;
   if (t === "plan") return <PlanReview {...props} />;
   if (t === "idea") return <IdeaReview {...props} />;

@@ -24,7 +24,7 @@ interface Props {
 }
 
 /** Why a card is not draggable — surfaced on hover. */
-export function noDragReason(t: IssueCard): string | null {
+export function noDragReason(t: Pick<IssueCard, "container" | "status_source">): string | null {
   if (t.container) return "container — status rolls up from its children";
   if (t.status_source !== "file")
     return `status is derived from ${t.status_source} — set it there`;

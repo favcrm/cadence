@@ -132,9 +132,10 @@ export function Evidence({
   id: string;
   images: { name: string; size: number }[];
   files: { name: string; size: number }[];
+  /** Read-only hosts (the shared work-item detail) omit the write callbacks. */
   readOnly: boolean;
-  onWrite: Props["onWrite"];
-  onError: Props["onError"];
+  onWrite?: Props["onWrite"];
+  onError?: Props["onError"];
 }) {
   const empty = images.length === 0 && files.length === 0;
   return (
@@ -189,7 +190,7 @@ export function Evidence({
           </ul>
         </div>
       )}
-      {!readOnly && <Attach id={id} onWrite={onWrite} onError={onError} />}
+      {!readOnly && onWrite && onError && <Attach id={id} onWrite={onWrite} onError={onError} />}
     </section>
   );
 }

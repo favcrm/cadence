@@ -131,7 +131,9 @@ export interface IssueHistoryEntry {
   note?: string | null;
 }
 
-export interface IssueDetail extends IssueCard {
+/** `GET /api/issues/<id>`: the issue-detail contract. Unlike a board card it
+ *  has no `counts`; its comments are the recorded `comments` rows. */
+export interface IssueDetail extends Omit<IssueCard, "counts"> {
   frontmatter: Record<string, unknown>;
   body: string;
   path: string;

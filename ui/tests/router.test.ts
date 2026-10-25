@@ -1,4 +1,5 @@
 import { NO_FILTERS } from "../src/lib/filters";
+import { readThreadsUrl } from "../src/features/threads/threadsView";
 import {
   goTo,
   legacyRedirect,
@@ -87,6 +88,24 @@ equal(matchRoute("/my-work/extra").screen, "notFound", "My work has no nested ro
   equal(locationHref({ ...loc, route: { screen: "myWork", view: {} } }, search), "/my-work", "the default view has a bare URL");
 }
 
+
+// CAD-1811: the shared issue detail opens over Threads through `?issue=`.
+// Threads owns its list scope in `?project=`, so opening and closing the
+// detail must keep the conversation, agent, kind, system flag and project.
+{
+  const search = "?c=conv-1&project=cadence&agent=cc-1&kind=agents&system=1";
+  const loc = readLocation("/threads", search);
+  const params = (href: string) => {
+    const q = new URLSearchParams(href.slice(href.indexOf("?") + 1));
+    return [...q].sort(([a], [b]) => a.localeCompare(b));
+  };
+  const openedHref = locationHref({ ...loc, openId: "CAD-77" }, search, { screen: "threads" });
+  equal(params(openedHref), params("/threads?c=conv-1&project=cadence&agent=cc-1&kind=agents&system=1&issue=CAD-77"), "the detail URL keeps Threads scope");
+  const openedSearch = openedHref.slice(openedHref.indexOf("?"));
+  equal(readThreadsUrl(openedSearch), { conversation: "conv-1", kind: "agents", project: "cadence", agent: "cc-1", includeSystem: true }, "Threads reads unchanged list scope with the detail open");
+  const reopened = readLocation("/threads", openedSearch);
+  equal(params(locationHref({ ...reopened, openId: null }, openedSearch, { screen: "threads" })), params("/threads?c=conv-1&project=cadence&agent=cc-1&kind=agents&system=1"), "closing the detail keeps Threads scope");
+}
 
 // Which screens keep a project. One table.
 equal(projectScope({ screen: "projects", slug: "cadence", section: "issues" }), "slug", "projects are the slug");

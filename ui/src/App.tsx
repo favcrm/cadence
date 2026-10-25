@@ -19,7 +19,9 @@ import { APPS_CHANGED_EVENT } from "./features/workspace-apps/workspaceApps";
 import { appLoadErrorCopy } from "./features/explorer/appErrors";
 import WorkspaceApp from "./features/workspace-apps/WorkspaceApp";
 import Board from "./features/projects/Board";
-import Drawer, { type MyWorkDraft } from "./features/projects/Drawer";
+import WorkItemDetail from "./features/work-items/WorkItemDetail";
+import { restoreDetailFocus } from "./features/work-items/focus";
+import { applyDecisionDone, homeNeedIssueId, type HomeDecisionOpen, type MyWorkDraft, type WorkItemOrigin } from "./lib/workItems";
 import ProjectsOverview from "./features/projects/ProjectsOverview";
 import IssuePage from "./features/issues/IssuePage";
 import { issuePath, laneFollowsStream, refreshIssueIds } from "./features/issues/model";
@@ -117,7 +119,7 @@ function currentLocation(): AppLocation {
 function update(fn: (current: AppLocation) => AppLocation, opts?: { replace?: boolean }): void {
   const current = currentLocation();
   const next = fn(current);
-  navigate(locationHref(next, contextNavigationSearch(current.route, next.route, location.search)), opts);
+  navigate(locationHref(next, contextNavigationSearch(current.route, next.route, location.search), current.route), opts);
 }
 
 const SCREEN_LABEL: Record<Screen, string> = {
@@ -188,7 +190,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     (route.screen === "projects" && route.section === "context" && Boolean(route.slug));
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
   /** The href of a route, carrying the scope and drawer like `goTo`. */
-  const hrefFor = (r: Route) => locationHref(goTo(loc, r), contextNavigationSearch(route, r, search));
+  const hrefFor = (r: Route) => locationHref(goTo(loc, r), contextNavigationSearch(route, r, search), route);
   const setView = useCallback(
     (v: ProjectView) => update((c) => ({ ...c, view: v }), { replace: true }),
     [],
@@ -219,6 +221,20 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // The open drawer's detail, cached per id: reopening a drawer paints
   // the last payload while it revalidates.
   const detailState = useMaybeResource(openId ? resources.issue(openId) : null);
+  // CAD-1811: one shared work-item detail. `openId` (the URL) names the
+  // issue; the origin and any hosted Home decision are mount state.
+  const [workOrigin, setWorkOrigin] = useState<WorkItemOrigin | null>(null);
+  const [decision, setDecision] = useState<HomeDecisionOpen | null>(null);
+  const workOpener = useRef<Element | null>(null);
+  // Late decision replies read the live selection, never the render they
+  // were created in (CAD-1811 review): a dismissed/replaced decision must
+  // not close or replace what the operator is looking at now.
+  const decisionRef = useRef<HomeDecisionOpen | null>(null);
+  decisionRef.current = decision;
+  // A deep-linked `?issue=` has no opener in this session: its origin is the
+  // screen showing it. An explicit open records its own origin.
+  const effectiveOrigin: WorkItemOrigin = workOrigin ??
+    (screen === "home" ? "home" : screen === "myWork" ? "myWork" : screen === "threads" ? "threads" : "issue");
   const personalState = useMaybeResource(screen === "myWork" ? resources.myWork : null);
   // The peek's membership: one issue, asked of the server (the list holds one page).
   const membershipState = useMaybeResource(screen === "myWork" && openId ? resources.myWorkIssue(openId) : null);
@@ -349,6 +365,18 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   useEffect(() => {
     if (openId) void resources.issue(openId).revalidate();
   }, [openId]);
+  useEffect(() => {
+    setWorkOrigin(null);
+  }, [screen]);
+  // A route change, Back/Forward, "Open full issue" or any other selection
+  // replaces or removes the hosted decision: retire it at once so a late
+  // reply for that opening cannot close or advance what is shown now.
+  useEffect(() => {
+    if (decision === null) return;
+    if (homeNeedIssueId(decision.need) === openId && effectiveOrigin === "home") return;
+    decisionRef.current = null;
+    setDecision(null);
+  }, [decision, openId, effectiveOrigin]);
 
   const invalidatePersonal = useCallback(() => {
     if (personalWanted.current) void resources.myWork.invalidate();
@@ -664,15 +692,57 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     [applyWrite, writeError, block, say],
   );
 
-  const openIssue = useCallback((id: string) => update((c) => ({ ...c, openId: id })), []);
+  /**
+   * Open the shared detail for one issue. `nextDecision` carries the Home
+   * decision that owns this opening; every other opener retires any hosted
+   * decision immediately, so a late reply can never touch its successor.
+   */
+  const openWorkItem = useCallback((id: string, origin: WorkItemOrigin, nextDecision: HomeDecisionOpen | null = null) => {
+    if (!openIdRef.current) workOpener.current = document.activeElement;
+    decisionRef.current = nextDecision;
+    setDecision(nextDecision);
+    setWorkOrigin(origin);
+    update((c) => ({ ...c, openId: id }));
+  }, []);
+  const openIssue = useCallback((id: string) => openWorkItem(id, "issue"), [openWorkItem]);
+  const openHomeWork = useCallback((id: string) => openWorkItem(id, "home"), [openWorkItem]);
   const closeIssue = useCallback(() => update((c) => ({ ...c, openId: null })), []);
   const rememberPersonal = useCallback((id: string) => {
     personalReturn.current = { id, scroll: window.scrollY };
   }, []);
   const openPersonal = useCallback((id: string) => {
     rememberPersonal(id);
-    openIssue(id);
-  }, [rememberPersonal, openIssue]);
+    openWorkItem(id, "myWork");
+  }, [rememberPersonal, openWorkItem]);
+  const openDecision = useCallback((open: HomeDecisionOpen) => {
+    const id = homeNeedIssueId(open.need);
+    if (id === null) return;
+    openWorkItem(id, "home", open);
+  }, [openWorkItem]);
+  /** Close the shared detail; My work gets its reading position back. */
+  const closeWorkItem = useCallback(() => {
+    const saved = effectiveOrigin === "myWork" ? personalReturn.current : null;
+    setDecision(null);
+    closeIssue();
+    restoreDetailFocus(workOpener.current);
+    if (saved !== null) requestAnimationFrame(() => window.scrollTo(0, saved.scroll));
+  }, [effectiveOrigin, closeIssue]);
+  /** A Home decision landed: mark the card, then move to the next reading item. */
+  const finishDecision = useCallback((done: HomeDecisionOpen, _key: string, text: string) => {
+    const outcome = applyDecisionDone(done, text, {
+      decision: decisionRef.current,
+      issueId: openIdRef.current,
+      origin: effectiveOrigin,
+    });
+    if (outcome.kind === "ignored") return;
+    if (outcome.kind === "closed") {
+      closeWorkItem();
+      return;
+    }
+    const id = homeNeedIssueId(outcome.next.need);
+    if (id === null) closeWorkItem();
+    else openWorkItem(id, "home", outcome.next);
+  }, [effectiveOrigin, closeWorkItem, openWorkItem]);
   const openAgent = useCallback(
     (alias: string | null) => update((c) => ({ ...c, route: { screen: "agents", alias } })),
     [],
@@ -1038,7 +1108,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             viewerIsMember={meta?.session?.user?.role === "member"}
             sessionId={meta?.session?.id ?? null}
             overview={overviewState}
-            onOpenIssue={openIssue}
+            onOpenIssue={openHomeWork}
+            onOpenDecision={openDecision}
             overviewHref={hrefFor({ screen: "overview" })}
             permissionsHref={hrefFor({ screen: "settings", section: "permissions" })}
             resolveAppPath={resolveAppPath}
@@ -1269,7 +1340,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             onToast={say}
           />
         )}
-        {route.screen === "threads" && <ThreadsPage key={meta.session?.id ?? ""} operator={meta.operator === true} />}
+        {route.screen === "threads" && (
+          <ThreadsPage
+            key={meta.session?.id ?? ""}
+            operator={meta.operator === true}
+            onOpenWorkItem={(id) => openWorkItem(id, "threads")}
+          />
+        )}
         {screen === "outbox" && <Outbox operator={meta?.operator === true} onOpenIssue={openIssue} />}
         {screen === "setup" && (
           <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? boardReadOnly : null} />
@@ -1323,15 +1400,24 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       </div>
 
       {openId && route.screen !== "issue" && (
-        <Drawer
-          key={openId}
+        <WorkItemDetail
+          key={`${openId}:${decision?.need.key ?? ""}`}
           id={openId}
+          origin={effectiveOrigin}
           detail={detailState?.data?.id === openId ? detailState.data : null}
           readState={detailState}
           onRetry={() => {
             void resources.issue(openId).refresh();
             if (screen === "myWork") void resources.myWorkIssue(openId).refresh();
           }}
+          readOnly={readOnly}
+          onOpen={openIssue}
+          card={screen === "myWork" ? personalState?.data?.issues.find((row) => row.id === openId) ?? null : null}
+          home={decision && homeNeedIssueId(decision.need) === openId ? {
+            open: decision,
+            onDone: finishDecision,
+            onAsk: (_need, lead) => decision.ask(lead),
+          } : undefined}
           myWork={screen === "myWork" ? {
             owner: membershipState?.data?.owner ?? "",
             assignment: membershipState?.data?.id === openId ? membershipState.data.assignment : null,
@@ -1363,7 +1449,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             const key = fromDetail ?? fromCard ?? (project !== "all" ? project : null);
             return key ? issuePath(key, openId) : null;
           })()}
-          onClose={closeIssue}
+          onClose={closeWorkItem}
         />
       )}
 

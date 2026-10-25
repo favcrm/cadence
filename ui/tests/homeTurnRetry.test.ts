@@ -56,7 +56,8 @@ async function main() {
     await React.act(async () => {
       root.render(React.createElement(LocaleProvider, null, React.createElement(Home, {
         readOnly, hosted: false, overview: resources.overview.get(),
-        onOpenIssue: () => undefined, overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
+        onOpenIssue: () => undefined, onOpenDecision: () => undefined,
+        overviewHref: "/overview", permissionsHref: "/permissions", resolveAppPath: () => null,
       })));
     });
     await settle();
