@@ -34,12 +34,14 @@ equal(readThemePref(undefined), "system", "no storage → system default");
 equal(nextThemePref("system"), "light", "cycle 1");
 equal(nextThemePref("light"), "dark", "cycle 2");
 equal(nextThemePref("dark"), "system", "cycle 3");
-// Two states: system and the opposite of what the OS renders. Every click
-// changes the rendered theme on either OS; an explicit pref equal to the OS
-// render is unreachable because it looks identical to system.
-equal(nextThemeFor("system", true), "light", "system on a dark OS → light");
-equal(nextThemeFor("system", false), "dark", "system on a light OS → dark");
-equal(nextThemeFor("light", true), "system", "explicit light → system");
-equal(nextThemeFor("dark", false), "system", "explicit dark → system");
+// The successor is the opposite of what is rendered, whatever the pref says —
+// an explicit light on a light OS is reachable from the account menu and must
+// still change on click.
+equal(nextThemeFor("system", true), "light", "system renders dark → light");
+equal(nextThemeFor("system", false), "dark", "system renders light → dark");
+equal(nextThemeFor("light", true), "dark", "explicit light renders light → dark");
+equal(nextThemeFor("light", false), "dark", "explicit light on a light OS → dark");
+equal(nextThemeFor("dark", true), "light", "explicit dark renders dark → light");
+equal(nextThemeFor("dark", false), "light", "explicit dark on a light OS → light");
 
 console.log("theme checks passed");
