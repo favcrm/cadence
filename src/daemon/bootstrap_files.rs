@@ -95,7 +95,13 @@ impl Profile {
                     )))
                 }
             };
-            *slot = Some(crate::managed_section::clean(text));
+            let cleaned = crate::managed_section::clean(text);
+            if cleaned.len() > crate::managed_section::VALUE_MAX {
+                return Err(Error::rejected(
+                    "bootstrap profile field is too long after escaping",
+                ));
+            }
+            *slot = Some(cleaned);
         }
         if total > PROFILE_MAX {
             return Err(Error::rejected("bootstrap profile is too long"));

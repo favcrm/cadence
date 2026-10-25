@@ -9,8 +9,9 @@
 
 use crate::error::{Error, Result};
 
-/// Longest scalar a managed block may carry (one line, bounded).
-pub const VALUE_MAX: usize = 4_096;
+/// Escaping can double an existing 4 KiB raw bootstrap field. Keep those
+/// persisted values readable without truncation or a profile migration.
+pub const VALUE_MAX: usize = 2 * 4_096;
 
 /// Values the seeded templates use to mean "nothing agreed yet".
 pub const UNSET_PLACEHOLDERS: [&str; 2] = ["(not set yet)", "(none recorded yet)"];

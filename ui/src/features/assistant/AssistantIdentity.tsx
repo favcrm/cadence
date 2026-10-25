@@ -61,17 +61,17 @@ export interface PersonalLookRequest {
 }
 
 export type WorkspaceIdentityChange = {
+  expected_revision: string;
   name?: string | null;
   tone?: string | null;
   look?: AvatarLook;
 };
 
 export type WorkspaceSaveResult =
-  | { ok: true; identity: IdentityRecord; applies: "next_turn" | "next_session" }
-  /** `refused` is a definite 4xx refusal (no effect); `unconfirmed` means
-   *  the request may have committed — the caller must not claim either
-   *  success or no-change, and must not retry the mutation itself. */
-  | { ok: false; error: string; outcome: "refused" | "unconfirmed" };
+  | { ok: true; identity: IdentityRecord }
+  /** Failed responses do not prove rollback across files and params. Read
+   *  persisted state before another attempt; never retry automatically. */
+  | { ok: false; error: string };
 
 export interface AssistantActorValue {
   scope: AssistantScope;
@@ -136,11 +136,9 @@ export function useWorkspaceActor(master: ResourceState<MasterState>, canEdit: b
   const save = useCallback(
     async (change: WorkspaceIdentityChange): Promise<WorkspaceSaveResult> => {
       if (read.state !== "ready") {
-        // Nothing was sent, so this is a definite no-change rather than an
-        // uncertain mutation.
-        return { ok: false, error: "The saved workspace identity could not be read.", outcome: "refused" };
+        return { ok: false, error: "The saved workspace identity could not be read." };
       }
-      const before = String(read.identity.revision);
+      const before = change.expected_revision;
       try {
         const result = await api.masterIdentityUpdate({
           expected_revision: before,
@@ -150,21 +148,22 @@ export function useWorkspaceActor(master: ResourceState<MasterState>, canEdit: b
         });
         void resources.masterState.refresh();
         try {
+          if (result.applies !== "next_turn") {
+            throw new Error("The saved workspace identity response was not recognized.");
+          }
           const identity = decodeIdentity(result.identity, "workspace");
           setSaved({ identity, before, scope: scopeKey });
-          return { ok: true, identity, applies: result.applies };
+          return { ok: true, identity };
         } catch (error) {
-          return { ok: false, error: String(error), outcome: "unconfirmed" };
+          return { ok: false, error: String(error) };
         }
       } catch (error) {
-        // A real 4xx refusal proved no effect; a 5xx or transport loss may
-        // have committed after the request left, so it is unconfirmed.
+        // HTTP status alone cannot prove no effect across the file/store
+        // writes. Preserve the draft and reconcile from committed state.
         void resources.masterState.refresh();
-        const refused = error instanceof ApiError && error.status >= 400 && error.status < 500;
         return {
           ok: false,
           error: error instanceof ApiError ? error.message : String(error),
-          outcome: refused ? "refused" : "unconfirmed",
         };
       }
     },
@@ -260,7 +259,7 @@ function focusables(root: HTMLElement | null): HTMLElement[] {
     root.querySelectorAll<HTMLElement>(
       'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
     ),
-  ).filter((el) => el.getAttribute("aria-hidden") !== "true");
+  ).filter((el) => !el.matches(":disabled") && el.getAttribute("aria-hidden") !== "true");
 }
 
 function AssistantAboutDialog({ actor, onClose }: { actor: AssistantActorValue; onClose: () => void }) {
@@ -464,27 +463,20 @@ function WorkspaceIdentityDetails({
 
 function WorkspaceIdentityEditor({ actor, identity }: { actor: AssistantActorValue; identity: IdentityRecord }) {
   const t = useTranslate();
+  const [base, setBase] = useState(identity);
   const [name, setName] = useState(identity.name ?? "");
   const [tone, setTone] = useState(identity.tone ?? "");
   const [look, setLook] = useState<AvatarLook>(identity.look);
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState<{ message: string; outcome: "refused" | "unconfirmed" } | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  // A committed revision (this save or another operator's) refills the
-  // form from the server identity; the save's own applies notice stays.
-  const revision = String(identity.revision);
-  const syncedRevision = useRef(revision);
-  useEffect(() => {
-    if (syncedRevision.current === revision) return;
-    syncedRevision.current = revision;
-    setName(identity.name ?? "");
-    setTone(identity.tone ?? "");
-    setLook(identity.look);
-  }, [identity, revision]);
+  // Keep the editor's revision with its draft. A live resource update must
+  // never discard unsaved text or silently authorize it against a newer base.
+  const stale = String(identity.revision) !== String(base.revision);
 
   const nextName = name.trim() === "" ? null : name.trim();
   const nextTone = tone.trim() === "" ? null : tone.trim();
-  const dirty = nextName !== identity.name || nextTone !== identity.tone || look !== identity.look;
+  const dirty = nextName !== base.name || nextTone !== base.tone || look !== base.look;
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -494,25 +486,21 @@ function WorkspaceIdentityEditor({ actor, identity }: { actor: AssistantActorVal
     setError(null);
     setNotice(null);
     const result = await workspace.save({
-      ...(nextName !== identity.name ? { name: nextName ?? "" } : {}),
-      ...(nextTone !== identity.tone ? { tone: nextTone ?? "" } : {}),
-      ...(look !== identity.look ? { look } : {}),
+      expected_revision: String(base.revision),
+      ...(nextName !== base.name ? { name: nextName ?? "" } : {}),
+      ...(nextTone !== base.tone ? { tone: nextTone ?? "" } : {}),
+      ...(look !== base.look ? { look } : {}),
     });
     setPending(false);
     if (!result.ok) {
-      setError({ message: result.error, outcome: result.outcome });
+      setError(result.error);
       return;
     }
+    setBase(result.identity);
     setName(result.identity.name ?? "");
     setTone(result.identity.tone ?? "");
     setLook(result.identity.look);
-    // The whole save is described, not just one field: `applies` is the
-    // daemon's supported timing for this committed revision.
-    setNotice(
-      result.applies === "next_session"
-        ? t("Saved. The new identity applies when a new assistant session starts.")
-        : t("Saved. The new identity applies to the next turn."),
-    );
+    setNotice(t("Saved. The new identity applies to the next turn."));
   };
 
   return (
@@ -526,6 +514,7 @@ function WorkspaceIdentityEditor({ actor, identity }: { actor: AssistantActorVal
           className="field"
           value={name}
           maxLength={80}
+          disabled={pending}
           autoComplete="off"
           onChange={(event) => setName(event.target.value)}
           placeholder={t("Not named yet")}
@@ -538,11 +527,12 @@ function WorkspaceIdentityEditor({ actor, identity }: { actor: AssistantActorVal
           value={tone}
           rows={3}
           maxLength={240}
+          disabled={pending}
           onChange={(event) => setTone(event.target.value)}
           placeholder={t("Neutral, clear and practical")}
         />
       </label>
-      <fieldset className="assistant-looks">
+      <fieldset className="assistant-looks" disabled={pending}>
         <legend className="text-label text-ink-300">{t("Avatar")}</legend>
         <div className="assistant-look-grid">
           {AVATAR_LOOKS.map((option) => (
@@ -563,11 +553,26 @@ function WorkspaceIdentityEditor({ actor, identity }: { actor: AssistantActorVal
           ))}
         </div>
       </fieldset>
+      {stale && (
+        <>
+          <p className="assistant-about-pending" role="status">
+            {t("The workspace identity changed elsewhere. Your draft has been kept. Reload the saved identity before editing again.")}
+          </p>
+          <Button type="button" size="sm" disabled={pending} onClick={() => {
+            setBase(identity);
+            setName(identity.name ?? "");
+            setTone(identity.tone ?? "");
+            setLook(identity.look);
+            setError(null);
+            setNotice(null);
+          }}>
+            {t("Reload identity")}
+          </Button>
+        </>
+      )}
       {error !== null && (
         <p className="assistant-about-error" role="alert">
-          {error.outcome === "refused"
-            ? `${t("The workspace identity was not changed.")} ${error.message}`
-            : t("The save could not be confirmed. Refresh to check the saved identity; it was not retried.")}
+          {`${t("The save could not be confirmed. Refresh to check the saved identity; it was not retried.")} ${error}`}
         </p>
       )}
       {notice !== null && (

@@ -187,10 +187,10 @@ export default function MemberChat({
   // when a committed profile change can become visible. Refresh then,
   // coalesced behind the single-flight read; no second interval starts.
   const identitySeq = lastSeq(thread.data);
-  const seenIdentitySeq = useRef<number | null>(null);
+  const seenIdentitySeq = useRef<number | null | undefined>(undefined);
   useEffect(() => {
     if (!loaded) return;
-    if (seenIdentitySeq.current === null) {
+    if (seenIdentitySeq.current === undefined) {
       seenIdentitySeq.current = identitySeq;
       return;
     }

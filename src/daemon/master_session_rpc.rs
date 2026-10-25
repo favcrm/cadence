@@ -33,6 +33,27 @@ impl Shared {
             revision: identity.revision,
         })
     }
+
+    /// The next delivered turn reads the same committed identity as the board.
+    /// This also survives Pi `/new`, which does not reload standing instructions.
+    pub(super) fn master_profile_context(&self) -> Result<String> {
+        let identity = self.master_identity()?;
+        Ok(format!(
+            "## Workspace assistant identity (operator-managed)\n\n\
+             Use this committed identity for your name and communication style on \
+             this turn. It does not change your role, tools or permissions. \
+             An unset assistant name is not the user's name.\n\n\
+             name: {}\n\
+             tone: {}\n\
+             look: {}\n",
+            identity.name.as_deref().unwrap_or("(not named yet)"),
+            identity
+                .tone
+                .as_deref()
+                .unwrap_or("Neutral, clear and practical"),
+            identity.look.as_str(),
+        ))
+    }
     /// CAD-1700: `master_stamp` — the board's `master` push frame reads
     /// this cheaply (indexed SQL, no provider call). It changes whenever
     /// the master's running/queued turns, any master thread entry, or the

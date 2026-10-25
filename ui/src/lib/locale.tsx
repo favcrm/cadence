@@ -1549,11 +1549,11 @@ Object.assign(zhTW, {
   "Operator-only edit. Your personal assistant keeps its own name and preferences.":
     "僅限操作員編輯。你的私人助理會保有自己的名稱與偏好。",
   "Save identity": "儲存身分",
-  "The workspace identity was not changed.": "工作區助理身分尚未變更。",
+  "Reload identity": "重新載入身分",
+  "The workspace identity changed elsewhere. Your draft has been kept. Reload the saved identity before editing again.":
+    "工作區助理身分已在其他地方變更。你的草稿已保留，請先重新載入已儲存的身分再編輯。",
   "The save could not be confirmed. Refresh to check the saved identity; it was not retried.":
     "無法確認是否已儲存。請重新整理以查看已儲存的身分；系統未自動重試。",
-  "Saved. The new identity applies when a new assistant session starts.":
-    "已儲存。新的身分會在助理開始新的工作階段時生效。",
   "Saved. The new identity applies to the next turn.": "已儲存。新的身分會在下一回合生效。",
   "Message the workspace assistant…": "傳訊給工作區助理…",
   "is typing": "正在輸入",

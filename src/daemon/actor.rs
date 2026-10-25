@@ -590,16 +590,20 @@ impl Shared {
                             &message,
                             slot.as_deref(),
                         );
-                        // CAD-1420: the stamped member's profile context is
-                        // appended AFTER the turn's own body, so the user's
-                        // request leads. An unreadable or unknown profile fails
-                        // the turn closed rather than sending a silent empty one.
-                        let body = match self.member_profile_context(&message)? {
+                        // The committed actor profile follows the request on
+                        // every real turn, including after provider `/new`.
+                        // Missing or unreadable profiles fail closed.
+                        let profile = if crate::master::is_master(alias) {
+                            Some(self.master_profile_context()?)
+                        } else {
+                            self.member_profile_context(&message)?
+                        };
+                        let body = match profile {
                             Some(context) => format!("{base}\n\n{context}"),
                             None => base,
                         };
                         // CAD-1822: mandatory task context is planned against
-                        // the delivery body and member profile first; optional
+                        // the delivery body and actor profile first; optional
                         // continuity history is budgeted from what remains.
                         let context = match self
                             .context_delivery(&agent, &message, &body, false, compacted)

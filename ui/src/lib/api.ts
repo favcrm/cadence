@@ -173,7 +173,7 @@ export interface MasterIdentityUpdate {
 /** The committed result and when it takes effect for the coordinator. */
 export interface MasterIdentityUpdateResult {
   identity: MasterIdentity;
-  applies: "next_turn" | "next_session";
+  applies: "next_turn";
 }
 
 /** `POST /api/member-assistant/history` — the member's bound conversation

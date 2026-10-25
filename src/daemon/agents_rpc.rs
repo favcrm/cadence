@@ -810,22 +810,7 @@ impl Shared {
             self.wake();
             return Ok(json!({"alias": alias, "state": "updated", "gc_keep": gc_keep}));
         }
-        {
-            let master_look = alias == crate::master::ALIAS && patch.get("look").is_some();
-            let _identity_guard = if master_look {
-                Some(
-                    super::master_rpc::MASTER_IDENTITY_LOCK
-                        .lock()
-                        .map_err(|_| Error::internal("master identity lock poisoned"))?,
-                )
-            } else {
-                None
-            };
-            self.store.set_params_by(&alias, &patch, &audit)?;
-            if master_look {
-                self.bump_master_rev();
-            }
-        }
+        self.store.set_params_by(&alias, &patch, &audit)?;
         if next_launch {
             self.wake();
             return Ok(json!({"alias": alias, "state": "updated", "applies": "next launch"}));

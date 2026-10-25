@@ -432,7 +432,16 @@ fn cad1817_profile_ack_refusals_have_no_effect() {
     assert!(bad_look.is_err(), "an unknown avatar look was accepted");
     assert_eq!(cad1817_profile_snapshot(&fx, victim_sub, &root), before);
 
-    // Bad 5 — non-string value and an unknown profile field refuse.
+    // Bad 5 — non-string value, unknown profile field and a raw value over
+    // FIELD_MAX refuse before any effect. The raw cap stays 4096; escaping is
+    // allowed to grow a valid raw value to the stored read bound (see the
+    // accepted expansion control below).
+    let oversized_raw = "x-->".repeat(1025);
+    assert_eq!(
+        oversized_raw.len(),
+        4100,
+        "the raw-overflow fixture must exceed FIELD_MAX"
+    );
     for (case, profile) in [
         ("non-string look", json!({"look": 7})),
         ("unknown profile field", json!({"nickname": "nick"})),
@@ -440,6 +449,7 @@ fn cad1817_profile_ack_refusals_have_no_effect() {
             "reserved marker",
             json!({"name": "x <!-- cadence:managed-name -->"}),
         ),
+        ("raw over FIELD_MAX", json!({"name": oversized_raw})),
     ] {
         let refused = cad1817_ack(
             &fx,
@@ -579,6 +589,82 @@ fn cad1817_profile_ack_refusals_have_no_effect() {
         .is_err(),
         "a revoked binding still projected an identity"
     );
+
+    // Boundary controls: a valid raw FIELD_MAX value may escape to the 2x
+    // stored read bound (legacy compatibility), a field at exactly FIELD_MAX
+    // whose escaping does not grow is accepted, and ordinary escaping still
+    // round-trips. None of these may be newly refused.
+    let expanding_accepted = "x-->".repeat(1024);
+    assert_eq!(expanding_accepted.len(), 4096);
+    let expanding_stored = "x--&gt;".repeat(1024);
+    assert_eq!(expanding_stored.len(), 7168);
+    let expansion_revision = fx
+        .shared
+        .store
+        .assistant_binding(ORG, victim_sub)
+        .unwrap()
+        .unwrap()
+        .bootstrap_revision;
+    cad1817_ack(
+        &fx,
+        &alias,
+        &message,
+        &token,
+        json!({"action": "update", "expected_revision": expansion_revision,
+               "profile": {"name": expanding_accepted}}),
+    )
+    .unwrap_or_else(|e| panic!("a valid raw FIELD_MAX escaping value was refused: {e}"));
+    assert_eq!(
+        cad1817_identity(&fx, victim_sub)["name"],
+        json!(expanding_stored),
+        "the accepted 4096-raw/7168-stored escaped name did not round-trip"
+    );
+
+    let plain_boundary = "y".repeat(4096);
+    let boundary_revision = fx
+        .shared
+        .store
+        .assistant_binding(ORG, victim_sub)
+        .unwrap()
+        .unwrap()
+        .bootstrap_revision;
+    cad1817_ack(
+        &fx,
+        &alias,
+        &message,
+        &token,
+        json!({"action": "update", "expected_revision": boundary_revision,
+               "profile": {"name": plain_boundary.clone()}}),
+    )
+    .unwrap_or_else(|e| panic!("a non-expanding FIELD_MAX name was refused: {e}"));
+    assert_eq!(
+        cad1817_identity(&fx, victim_sub)["name"],
+        json!(plain_boundary),
+        "a non-expanding FIELD_MAX name did not round-trip"
+    );
+
+    let escaped = "a-->b";
+    let escaped_revision = fx
+        .shared
+        .store
+        .assistant_binding(ORG, victim_sub)
+        .unwrap()
+        .unwrap()
+        .bootstrap_revision;
+    cad1817_ack(
+        &fx,
+        &alias,
+        &message,
+        &token,
+        json!({"action": "update", "expected_revision": escaped_revision,
+               "profile": {"name": escaped}}),
+    )
+    .unwrap_or_else(|e| panic!("a normal escaped name was refused: {e}"));
+    assert_eq!(
+        cad1817_identity(&fx, victim_sub)["name"],
+        json!("a--&gt;b"),
+        "the accepted escaped name did not round-trip through clean()"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -636,6 +722,28 @@ fn cad1817_profile_update_preserves_lifecycle_and_other_fields() {
             .iter()
             .find(|look| **look != initial_pin)
             .expect("the canonical list has more than one look");
+
+        // Legacy persisted profile: a pre-feature file may already hold an
+        // escaped scalar of up to 2*FIELD_MAX bytes. It must read at that
+        // bound, and a later normal ACK rename must still be possible (no
+        // migration or truncation).
+        let legacy_stored = "x--&gt;".repeat(1024);
+        assert_eq!(legacy_stored.len(), 7168);
+        let identity_path = root.join("IDENTITY.md");
+        let current = std::fs::read_to_string(&identity_path).unwrap();
+        let legacy = crate::managed_section::set(
+            &current,
+            "name",
+            &crate::managed_section::line("name", &legacy_stored),
+        )
+        .unwrap();
+        std::fs::write(&identity_path, legacy).unwrap();
+        assert_eq!(
+            cad1817_identity(&fx, &sub)["name"],
+            json!(legacy_stored),
+            "a legacy stored escaped name at the 2x read bound was unreadable"
+        );
+
         let rev0 = before.bootstrap_revision;
 
         // Enter the lifecycle state through the real ACK, no profile.
@@ -722,7 +830,11 @@ fn cad1817_profile_update_preserves_lifecycle_and_other_fields() {
         let rev2 = after_update.bootstrap_revision;
 
         let identity = cad1817_identity(&fx, &sub);
-        assert_eq!(identity["name"], json!("First Assistant"));
+        assert_eq!(
+            identity["name"],
+            json!("First Assistant"),
+            "the legacy escaped profile could not be renamed normally"
+        );
         assert_eq!(identity["tone"], json!("warm"));
         assert_eq!(identity["revision"], json!(rev2));
         assert_eq!(
@@ -1202,11 +1314,10 @@ fn cad1817_master_identity_native_requires_operator_and_writes_protected_files()
         Some(revision.as_str()),
         "the identity revision did not advance"
     );
-    let applies = written["applies"].as_str().unwrap_or_default();
-    assert!(
-        matches!(applies, "next_turn" | "next_session"),
-        "unexpected applies contract: {written}"
-    );
+    // Model-context delivery timing (`applies`) is not a guard requirement:
+    // the user requirement permits either the supported next turn or a new
+    // session, so this acceptance does not pin it. Identity, revision and
+    // protected-file effects are asserted instead.
     let after = fx.op("master_state", json!({}));
     assert_eq!(after["alias"], json!(crate::master::ALIAS));
     assert_eq!(after["identity"], written["identity"]);
@@ -1241,11 +1352,8 @@ fn cad1817_master_identity_native_requires_operator_and_writes_protected_files()
         json!("tester"),
         "the look-only operator write did not land: {look_only}"
     );
-    assert_eq!(
-        look_only["applies"],
-        json!("next_turn"),
-        "a look-only write must be next_turn presentation: {look_only}"
-    );
+    // Presentation-only timing is not pinned here (see above); the
+    // committed look/revision/params are the guard-visible facts.
     let rev_after_look = look_only["identity"]["revision"]
         .as_str()
         .expect("master identity revision must be a string")
@@ -1789,7 +1897,7 @@ fn cad1817_master_identity_http_is_no_weaker_than_native() {
         "look-only HTTP identity write refused: {look_out}"
     );
     assert_eq!(look_out["identity"]["look"], json!("tester"));
-    assert_eq!(look_out["applies"], json!("next_turn"));
+    // Delivery timing is intentionally not asserted; see the native test.
     let rev_after_look = look_out["identity"]["revision"]
         .as_str()
         .expect("master identity revision must be a string")

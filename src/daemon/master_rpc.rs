@@ -26,15 +26,14 @@ use super::{
     optional_str, optional_strs, reject_identity_fields, required_str, Caller, Shared, DAEMON_ALIAS,
 };
 
-// Serialize every native writer of the workspace identity, including ordinary
-// operator avatar/file edits, across the file and params stores.
-pub(super) static MASTER_IDENTITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::{self, task_report};
 use crate::master::{self, ALIAS};
 use crate::peer::AgentCaller;
 use crate::store;
+// Serialize workspace identity writers across the protected files and params.
+static MASTER_IDENTITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The daemon methods a master connection may call — everything else is
 /// refused (review round 1, C2). Reads, proposing a plan, registering a
@@ -767,10 +766,8 @@ impl Shared {
     /// `agent_file_write`; `look` is the master's ordinary `params.look` and
     /// requires a registered master. Every write is fenced on the identity
     /// revision, so a stale editor never overwrites a newer identity. The
-    /// response says when the model context picks the change up: a name/tone
-    /// change is `next_session` (the briefing is rebuilt and stored, but a
-    /// live provider session keeps its prompt), a look-only change is
-    /// `next_turn` (presentation only).
+    /// response reports `next_turn`: the actor briefs each new turn from the
+    /// committed name/tone, including after a provider session reset.
     pub(super) fn rpc_master_identity_set(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection("master identity", params, peer_pid)?;
         const FIELDS: [&str; 4] = ["expected_revision", "name", "tone", "look"];
@@ -854,9 +851,8 @@ impl Shared {
                 "operator",
             )?;
             master::record_identity(&self.state_dir, &pm.dir)?;
-            // Rebuild the briefing this writer would brief from and store it,
-            // so the supported new-session refresh reads the committed text
-            // instead of the previous launch's copy.
+            // Keep the launch briefing and stored instructions current too;
+            // per-turn identity context is the live provider's refresh path.
             let files = master::read_files(&pm.dir, ALIAS, false)?;
             let briefing = master::compose(&files);
             let file = client::briefing_path(&self.state_dir, &Value::Null, ALIAS);
@@ -885,7 +881,7 @@ impl Shared {
         self.bump_master_rev();
         Ok(json!({
             "identity": identity,
-            "applies": if files_changed { "next_session" } else { "next_turn" },
+            "applies": "next_turn",
         }))
     }
 
