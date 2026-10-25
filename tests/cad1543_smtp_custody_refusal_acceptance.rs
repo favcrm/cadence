@@ -553,6 +553,37 @@ fn send_prepare_freezes_the_audience_inside_the_approved_send() {
         "{unwritten}"
     );
 
+    // Replaying the same request with a changed audience (a saved exclusion
+    // list) refuses before the snapshot is rewritten: the original freeze
+    // digest and membership stay as the approved send recorded them.
+    fx.op(
+        "app_exclusion_save",
+        json!({"install_id": install, "context_id": context, "list_id": "exc-1",
+            "name": "Exclude A", "member_ids": ["customer-a"]}),
+    );
+    let digest_before = frozen["freeze"]["digest"].clone();
+    let replay_changed = fx
+        .rpc(
+            Asserted::Operator,
+            "crm_send_prepare",
+            json!({"install_id": install, "context_id": context, "campaign_id": "launch-1",
+                "audience_freeze_id": "freeze-1", "request_id": "send-1",
+                "base": {"mode": "all"}, "exclusion_list_id": "exc-1", "max_recipients": 50}),
+        )
+        .expect_err("a replay with a changed audience must refuse");
+    assert!(
+        replay_changed
+            .to_string()
+            .contains("request id is already used for a different audience"),
+        "{replay_changed}"
+    );
+    let after = fx.op(
+        "app_audience_show",
+        json!({"install_id": install, "context_id": context, "freeze_id": "freeze-1"}),
+    );
+    assert_eq!(after["freeze"]["digest"], digest_before, "{after}");
+    assert_eq!(after["freeze"]["final_count"], 1, "{after}");
+
     // Reusing the freeze id for a different audience refuses instead of
     // silently sending the old snapshot.
     let mismatch = fx
