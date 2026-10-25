@@ -463,6 +463,21 @@ fn send_prepare_freezes_the_audience_inside_the_approved_send() {
             .contains("max_recipients is required with the audience selection"),
         "{partial}"
     );
+    let reverse_partial = fx
+        .rpc(
+            Asserted::Operator,
+            "crm_send_prepare",
+            json!({"install_id": install, "context_id": context, "campaign_id": "launch-1",
+                "audience_freeze_id": "freeze-1", "request_id": "send-1",
+                "max_recipients": 50}),
+        )
+        .expect_err("a ceiling without a selection must refuse");
+    assert!(
+        reverse_partial
+            .to_string()
+            .contains("base is required with max_recipients"),
+        "{reverse_partial}"
+    );
     let still_missing = fx
         .rpc(
             Asserted::Operator,
@@ -506,6 +521,36 @@ fn send_prepare_freezes_the_audience_inside_the_approved_send() {
     assert_eq!(
         shown["send"]["audience_digest"], frozen["freeze"]["digest"],
         "{shown}"
+    );
+
+    // Reusing the request id with a fresh freeze writes nothing.
+    let reused_request = fx
+        .rpc(
+            Asserted::Operator,
+            "crm_send_prepare",
+            json!({"install_id": install, "context_id": context, "campaign_id": "launch-1",
+                "audience_freeze_id": "freeze-2", "request_id": "send-1",
+                "base": {"mode": "all"}, "max_recipients": 50}),
+        )
+        .expect_err("a reused request id must refuse before freezing");
+    assert!(
+        reused_request
+            .to_string()
+            .contains("request id is already used for a different send"),
+        "{reused_request}"
+    );
+    let unwritten = fx
+        .rpc(
+            Asserted::Operator,
+            "app_audience_show",
+            json!({"install_id": install, "context_id": context, "freeze_id": "freeze-2"}),
+        )
+        .expect_err("a refused request must not write its freeze");
+    assert!(
+        unwritten
+            .to_string()
+            .contains("audience freeze is unavailable"),
+        "{unwritten}"
     );
 
     // Reusing the freeze id for a different audience refuses instead of

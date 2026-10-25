@@ -410,6 +410,7 @@ impl Shared {
         records: &RecordStore,
         campaign: &str,
     ) -> Result<()> {
+        self.crm_send_origin()?;
         let (_, content_digest) = records.app_content_approved(context, campaign)?;
         let link = self.store.crm_smtp_link(install, context)?.ok_or_else(|| {
             Error::rejected("no SMTP sender is bound to this installation and context")
@@ -499,14 +500,38 @@ impl Shared {
             // send cannot commit first, then freeze the supplied selection —
             // the store replays an identical freeze, refreshes a moved one at
             // the same base, and refuses an id reused for another audience.
-            if let Some(base) = base {
-                let max = max_recipients.ok_or_else(|| {
-                    Error::rejected("max_recipients is required with the audience selection")
-                })?;
-                self.crm_send_preflight(install, context, &records, campaign)?;
-                let base = crate::store::app_audiences::AudienceBase::parse(base)
-                    .map_err(|_| Error::rejected("audience base is invalid"))?;
-                records.app_audience_prepare(context, freeze, &base, exclusion_list_id, max)?;
+            match (base, max_recipients) {
+                (None, None) => {}
+                (Some(_), None) => {
+                    return Err(Error::rejected(
+                        "max_recipients is required with the audience selection",
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(Error::rejected(
+                        "base is required with max_recipients",
+                    ));
+                }
+                (Some(base), Some(max)) => {
+                    self.crm_send_preflight(install, context, &records, campaign)?;
+                    // A reused request names one send (send-<request>); if it
+                    // already points at another audience, refuse before the
+                    // snapshot is written rather than after the store
+                    // compares the draft.
+                    let send_id = format!("send-{request_id}");
+                    if let Some(existing) = records.app_campaign_send(context, &send_id)? {
+                        if existing.campaign_id != campaign
+                            || existing.audience_freeze_id != freeze
+                        {
+                            return Err(Error::rejected(
+                                "request id is already used for a different send; use a new request id",
+                            ));
+                        }
+                    }
+                    let base = crate::store::app_audiences::AudienceBase::parse(base)
+                        .map_err(|_| Error::rejected("audience base is invalid"))?;
+                    records.app_audience_prepare(context, freeze, &base, exclusion_list_id, max)?;
+                }
             }
             let facts = self.crm_send_facts(install, context, &records, campaign, freeze, proof.is_some())?;
             if (facts.frozen_member_ids.len() as i64) > facts.max_recipients {
