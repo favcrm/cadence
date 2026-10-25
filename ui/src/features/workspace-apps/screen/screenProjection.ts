@@ -309,7 +309,8 @@ function readinessOf(installation: Installation, contextId: string, extras: Scre
       b.state === "configured" && b.config.bundle_digest === installation.digest);
     if (!bound && SLOT.test(slot) && slot.length <= 50) blockers.push(`slot_unbound.${slot}`);
   }
-  if (extras?.workers === 0) blockers.push("no_workers");
+  // Workers are optional for native app actions; the user can delegate AI work
+  // to another agent. Do not block the screen readiness on an empty worker group.
   const kept = blockers.slice(0, KEYS_MAX);
   return { ok: kept.length === 0, blockers: kept };
 }

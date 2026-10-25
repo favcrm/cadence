@@ -685,7 +685,8 @@ function readinessOf(installation, contextId, extras) {
 	const blockers = [];
 	if (!installation.approved) blockers.push("install_unapproved");
 	for (const slot of Object.keys(installation.capabilities ?? {})) if (!extras?.bindings.some((b) => b.slot === slot && (b.context_id ?? "") === contextId && b.state === "configured" && b.config.bundle_digest === installation.digest) && SLOT.test(slot) && slot.length <= 50) blockers.push(`slot_unbound.${slot}`);
-	if (extras?.workers === 0) blockers.push("no_workers");
+	// Workers are optional for native app actions; the user can delegate AI work
+	// to another agent. Do not block preview readiness on an empty worker group.
 	const kept = blockers.slice(0, KEYS_MAX);
 	return {
 		ok: kept.length === 0,
