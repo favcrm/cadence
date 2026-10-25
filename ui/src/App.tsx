@@ -1231,6 +1231,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             query={query}
             readOnly={readOnly || meta === null}
             sessionId={meta === null ? undefined : meta.session?.id ?? null}
+            hosted={meta?.hosted === true}
             actor={actor}
             onQuery={setQuery}
             filters={filters}

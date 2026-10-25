@@ -19,7 +19,14 @@ const nowSecs = () => Math.floor(Date.now() / 1000);
  * counts read at a glance and the section detail (with its real issue
  * links) opens on tap — never auto-dismissed, never hidden.
  */
-export default function SinceCard({ onOpenIssue }: { onOpenIssue: (id: string) => void }) {
+export default function SinceCard({
+  onOpenIssue,
+  hosted = null,
+}: {
+  onOpenIssue: (id: string) => void;
+  /** True on a hosted board: there is no operator daemon to summarise from. */
+  hosted?: boolean | null;
+}) {
   const t = useTranslate();
   // Read once, before this visit overwrites it.
   const [since] = useState(() => awaySince(readLastSeen(), nowSecs()));
@@ -28,6 +35,7 @@ export default function SinceCard({ onOpenIssue }: { onOpenIssue: (id: string) =
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
+    if (hosted === true) return;
     const mark = () => {
       if (document.visibilityState === "visible") writeLastSeen(nowSecs());
     };
@@ -42,10 +50,10 @@ export default function SinceCard({ onOpenIssue }: { onOpenIssue: (id: string) =
       document.removeEventListener("visibilitychange", mark);
       removeEventListener("pagehide", onHide);
     };
-  }, []);
+  }, [hosted]);
 
   useEffect(() => {
-    if (since === null) return;
+    if (hosted === true || since === null) return;
     let live = true;
     api
       .masterSummary(since)
@@ -58,9 +66,11 @@ export default function SinceCard({ onOpenIssue }: { onOpenIssue: (id: string) =
     return () => {
       live = false;
     };
-  }, [since]);
+  }, [since, hosted]);
 
-  if (since === null || dismissed) return null;
+  // A hosted board has no daemon `master_summary`; the card's premise is the
+  // local operator's last-visit span, so it does not render there at all.
+  if (hosted === true || since === null || dismissed) return null;
   const away = awayLabel(nowSecs() - since);
   // The collapsed strip's one-line description — a count per section
   // when the summary read, else the load state's own words.

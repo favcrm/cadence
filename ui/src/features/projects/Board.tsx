@@ -157,6 +157,8 @@ interface Props {
   readOnly: boolean;
   /** Undefined while metadata is unresolved; null when resolved without a session. */
   sessionId?: string | null;
+  /** A hosted board writes to its own store; the local source/daemon footer is not true there. */
+  hosted?: boolean;
   actor: string;
   onQuery: (q: string) => void;
   filters: BoardFilters;
@@ -180,6 +182,7 @@ export default function Board({
   query,
   readOnly,
   sessionId,
+  hosted = false,
   actor,
   onQuery,
   filters,
@@ -663,13 +666,15 @@ export default function Board({
         </div>
       )}
 
-      <footer className="mt-8 pt-4 border-t border-ink-700 text-label text-ink-500 num">
-        {t("source:")} {(health !== null && health !== "unavailable" ? health.pm_dir : null) ?? "~/pm"} {t("issue folders")} ·{" "}
-        /var/www/agent-notes {t("chains")} · {t("cadence daemon socket")} ·{" "}
-        {readOnly
-          ? `${t("writes are disabled")} — ${block}`
-          : `${t("writes commit as")} ${actor}.`}
-      </footer>
+      {!hosted && (
+        <footer className="mt-8 pt-4 border-t border-ink-700 text-label text-ink-500 num">
+          {t("source:")} {(health !== null && health !== "unavailable" ? health.pm_dir : null) ?? "~/pm"} {t("issue folders")} ·{" "}
+          /var/www/agent-notes {t("chains")} · {t("cadence daemon socket")} ·{" "}
+          {readOnly
+            ? `${t("writes are disabled")} — ${block}`
+            : `${t("writes commit as")} ${actor}.`}
+        </footer>
+      )}
     </main>
   );
 }
