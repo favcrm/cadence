@@ -352,14 +352,27 @@ pub(super) fn record_current_session(state_dir: &Path, alias: &str, reported: &s
     }
 }
 
-/// The `cwd` in a Pi session file's header line.
-fn session_header_cwd(path: &Path) -> Option<PathBuf> {
+/// OMP places a fixed title slot before its session header; Pi does not.
+fn session_header(path: &Path, omp: bool) -> Option<Value> {
     use std::io::BufRead;
     let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
     let mut line = String::new();
-    std::io::BufReader::new(file).read_line(&mut line).ok()?;
-    let header: Value = serde_json::from_str(line.trim()).ok()?;
-    header.get("cwd").and_then(Value::as_str).map(PathBuf::from)
+    reader.read_line(&mut line).ok()?;
+    let mut header: Value = serde_json::from_str(line.trim()).ok()?;
+    if omp && header.get("type").and_then(Value::as_str) == Some("title") {
+        line.clear();
+        reader.read_line(&mut line).ok()?;
+        header = serde_json::from_str(line.trim()).ok()?;
+    }
+    Some(header)
+}
+
+fn session_header_cwd(path: &Path) -> Option<PathBuf> {
+    session_header(path, false)?
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
 }
 
 /// The deterministic id of the fork that carries `source` into `workdir`:
@@ -372,6 +385,63 @@ fn fork_session_id(alias: &str, workdir: &Path, source: &Path) -> String {
     format!("lane-{}", &digest[..24])
 }
 
+fn omp_worker_session_args(state_dir: &Path, agent: &Agent) -> Result<Vec<String>> {
+    let dir = pi_worker_dir(state_dir, &agent.alias)?;
+    if agent.thread_id.is_none() && agent.session_id.is_none() {
+        return Ok(vec![
+            "--session-dir".to_string(),
+            dir.to_string_lossy().into_owned(),
+        ]);
+    }
+    let pointer = pi_session_pointer(state_dir, &agent.alias)?;
+    let pointed = std::fs::read_to_string(&pointer).map_err(|_| {
+        Error::rejected("OMP owned session pointer is unavailable; refusing a fresh replacement")
+    })?;
+    let current = Path::new(pointed.trim());
+    if !real_file_inside(&dir, current) {
+        return Err(Error::rejected(
+            "OMP owned session must be an existing file inside its worker directory",
+        ));
+    }
+    let header = session_header(current, true)
+        .filter(|header| header.get("type").and_then(Value::as_str) == Some("session"))
+        .ok_or_else(|| Error::rejected("OMP owned session header is unreadable"))?;
+    let id = header
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Error::rejected("OMP owned session header has no native identity"))?;
+    if [agent.thread_id.as_deref(), agent.session_id.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|owned| owned != id)
+    {
+        return Err(Error::rejected(
+            "OMP saved session does not match its recorded native identity",
+        ));
+    }
+    let recorded = header
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.is_empty())
+        .map(Path::new)
+        .ok_or_else(|| Error::rejected("OMP owned session header has no working directory"))?;
+    let workdir = launch_workdir(agent);
+    if recorded
+        .canonicalize()
+        .unwrap_or_else(|_| recorded.to_path_buf())
+        != workdir.canonicalize().unwrap_or(workdir)
+    {
+        return Err(Error::rejected(
+            "OMP saved working directory differs from this launch; native relocation is unsupported",
+        ));
+    }
+    Ok(vec![
+        "--resume".to_string(),
+        current.to_string_lossy().into_owned(),
+    ])
+}
+
 /// The session argv of a Pi WORKER. Pi takes a resumed session's cwd from
 /// the FILE HEADER, not the process cwd, so a catalogue agent launched in
 /// a different workdir than its session file records is moved with
@@ -381,28 +451,11 @@ fn fork_session_id(alias: &str, workdir: &Path, source: &Path) -> String {
 /// with `--session`. A fork failure ends the launch (Pi exits); there is
 /// no fresh-session fallback.
 pub(super) fn worker_session_args(state_dir: &Path, agent: &Agent) -> Result<Vec<String>> {
-    let current = pi_current_session(state_dir, &agent.alias)?;
-    // OMP requires an existing file for resume; let it mint its first file.
-    // The adapter records the reported path once the first turn persists it.
-    if agent.provider == "omp" && !current.exists() {
-        return Ok(vec![
-            "--session-dir".to_string(),
-            pi_worker_dir(state_dir, &agent.alias)?
-                .to_string_lossy()
-                .to_string(),
-        ]);
+    if agent.provider == "omp" {
+        return omp_worker_session_args(state_dir, agent);
     }
-    let resume = |path: &Path| {
-        vec![
-            if agent.provider == "omp" {
-                "--resume"
-            } else {
-                "--session"
-            }
-            .to_string(),
-            path.to_string_lossy().to_string(),
-        ]
-    };
+    let current = pi_current_session(state_dir, &agent.alias)?;
+    let resume = |path: &Path| vec!["--session".to_string(), path.to_string_lossy().to_string()];
     let is_hire = crate::agent_roles::is_catalogue_hire(agent.params.as_ref());
     let workdir = launch_workdir(agent);
     let same = |a: &Path, b: &Path| {

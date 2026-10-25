@@ -821,6 +821,22 @@ impl Shared {
         // Any parsed line is proof of life.
         *self.last_activity.lock().unwrap() = Instant::now();
         if method == "response" {
+            if self.omp.load(Ordering::SeqCst)
+                && params.get("command").and_then(Value::as_str) == Some("prompt")
+                && params.get("success").and_then(Value::as_bool) == Some(true)
+                && params
+                    .pointer("/data/agentInvoked")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+            {
+                let mut pending = self.omp_prompt.lock().unwrap();
+                if pending.as_ref().is_some_and(|prompt| {
+                    params.get("id").and_then(Value::as_str) == Some(prompt.id.as_str())
+                }) {
+                    *pending = None;
+                    self.finish_turn();
+                }
+            }
             self.pending.resolve(&params);
             return;
         }
@@ -1404,12 +1420,30 @@ impl ProviderAdapter for PiAdapter {
                 return Err(self.command_error("get_state", &state));
             }
             let data = state.get("data").cloned().unwrap_or(Value::Null);
-            let session_id = data
+            let session_id = match data
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            {
+                Some(id) => id.to_string(),
+                None if agent.provider == "omp" => {
+                    return Err(Error::provider(
+                        "OMP did not report its native session identity",
+                    ));
+                }
+                None => Uuid::new_v4().to_string(),
+            };
+            if agent.provider == "omp"
+                && !master
+                && [agent.thread_id.as_deref(), agent.session_id.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|owned| owned != session_id)
+            {
+                return Err(Error::rejected(
+                    "OMP reopened with a different native identity; refusing session replacement",
+                ));
+            }
             *self.pending_session_file.lock().unwrap() = None;
             // CAD-1752: the session file Pi actually opened (a lane
             // relaunch forks into a new one) is this worker's current one.
@@ -2591,4 +2625,33 @@ mod cad1814_tests {
         event(shared, "session_settled", json!({}));
         assert!(shared.outcomes.lock().unwrap().is_empty());
     }
+
+    #[test]
+    fn omp_local_completion_does_not_wait_for_a_nonexistent_model_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let adapter = adapter(root.path());
+        let shared = &adapter.shared;
+        let mut response = json!({
+            "id": "previous",
+            "command": "prompt",
+            "success": true,
+            "data": {"agentInvoked": false}
+        });
+        event(shared, "response", response.clone());
+        assert!(shared.outcomes.lock().unwrap().is_empty());
+        response["id"] = json!("current");
+        event(shared, "response", response.clone());
+        let mut result = shared.outcomes.lock().unwrap().pop_front().unwrap();
+        assert_eq!(
+            settle_pi_turn(&mut result, false, false).status,
+            "completed"
+        );
+        event(shared, "response", response);
+        event(shared, "session_settled", json!({}));
+        assert!(shared.outcomes.lock().unwrap().is_empty());
+    }
 }
+
+#[cfg(test)]
+#[path = "pi_omp_acceptance.rs"]
+mod cad1814_independent_acceptance;

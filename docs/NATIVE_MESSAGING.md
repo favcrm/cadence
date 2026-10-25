@@ -158,17 +158,31 @@ Ordinary queued delivery and observation are unaffected.
 
 OMP startup uses its own CLI flags and core-tool names, not Pi's
 `--offline`/`--no-themes`/`--no-prompt-templates` or `find`/`ls`. Fresh
-workers use `--session-dir`; persisted sessions use `--resume`. The current
-session pointer is recorded only once its file exists inside that worker's
-directory; a nonexistent initial path is not proof of resumability.
+workers use `--session-dir` only when no native identity has been recorded.
+Once owned, a worker must resume its exact in-worker `session.current` file;
+a missing, dangling, outside-worker or mismatched-identity pointer refuses
+instead of adopting `session.jsonl` or silently creating another session.
+OMP's leading title slot is skipped when reading its actual session header.
+The saved working directory must match the requested launch directory:
+native OMP relocation is unsupported, so a home-to-lane move refuses rather
+than using Pi's fork switches or executing in the old home directory.
 
-OMP's prompt acknowledgment is not completion. Its matching `prompt_result`
-reports completed/aborted/error; when `sessionSettled` is false, the adapter
-waits for `session_settled` before dispatching the next durable task. An
-asynchronous native auth rejection must become a failed receipt, not a
+The current-session pointer is recorded only once its file exists inside
+that worker's directory; a nonexistent initial path is not proof of
+resumability. A first session that never materialized cannot be resumed
+after shutdown. Preserve its history and refusal; do not delete pointers
+or replay uncertain input to obtain a fresh launch.
+
+OMP's ordinary prompt acknowledgment is not completion. Its matching
+`prompt_result` reports completed/aborted/error; when `sessionSettled` is
+false, the adapter waits for `session_settled` before dispatching the next
+durable task. A synchronous response with `data.agentInvoked=false` instead
+completes that local command immediately; no model turn or `prompt_result`
+will follow. This is command completion, not proof of model inference.
+An asynchronous native auth rejection becomes a failed receipt, not a
 permanently running task. Strict nudges remain disabled without verified
-runtime guard admission. Successful omp replies, persistence/restart and
-peer routing still require authenticated end-to-end evidence.
+runtime guard admission. Successful omp replies, authenticated
+persistence/restart and peer routing still require end-to-end evidence.
 
 ## Disposition is not task completion
 
