@@ -12,6 +12,7 @@ import LocalLanguage from "../../ui/LocalLanguage";
 import DeviceSignIn from "./DeviceSignIn";
 import Login from "./Login";
 import { SIGN_IN_COMMAND } from "./gate";
+import { hostedOrigin } from "./hosted";
 import "./auth.css";
 import { captureLoginNonce } from "./session";
 
@@ -53,7 +54,7 @@ export default function AuthBoundary({ children }: {
       try { sessionStorage.setItem(RETURN_STORE, destination); } catch { /* Same-tab return is optional when storage is unavailable. */ }
     }
   }, [href]);
-  const [state, setState] = useState<BoundaryState>({ status: "checking", meta: null, accepted: null, generation: privateSessionGeneration(), hosted: false });
+  const [state, setState] = useState<BoundaryState>({ status: "checking", meta: null, accepted: null, generation: privateSessionGeneration(), hosted: hostedOrigin(typeof window === "undefined" ? null : window.location.hostname) });
   const stateRef = useRef(state);
   const [loginExchanged, setLoginExchanged] = useState(false);
   const identity = useRef<string | null>(rememberedIdentity());

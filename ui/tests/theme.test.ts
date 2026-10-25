@@ -10,13 +10,13 @@ const storage = {
   setItem: (k: string, v: string) => void store.set(k, v),
   removeItem: (k: string) => void store.delete(k),
 };
-equal(readThemePref(storage), "dark", "nothing stored → dark default");
+equal(readThemePref(storage), "system", "nothing stored → system default");
 writeThemePref("light", storage);
 equal(readThemePref(storage), "light", "stored light");
 writeThemePref("system", storage);
 equal(readThemePref(storage), "system", "system is stored explicitly, not cleared");
 store.set("cadence-theme", "sepia");
-equal(readThemePref(storage), "dark", "unknown value → dark default");
+equal(readThemePref(storage), "system", "unknown value → system default");
 const blocked = {
   getItem: () => {
     throw new Error("blocked");
@@ -28,9 +28,9 @@ const blocked = {
     throw new Error("blocked");
   },
 };
-equal(readThemePref(blocked), "dark", "blocked storage reads as the dark default");
+equal(readThemePref(blocked), "system", "blocked storage reads as the system default");
 writeThemePref("dark", blocked); // must not throw
-equal(readThemePref(undefined), "dark", "no storage → dark default");
+equal(readThemePref(undefined), "system", "no storage → system default");
 equal(nextThemePref("system"), "light", "cycle 1");
 equal(nextThemePref("light"), "dark", "cycle 2");
 equal(nextThemePref("dark"), "system", "cycle 3");

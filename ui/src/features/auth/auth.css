@@ -3,6 +3,8 @@
 .auth-wordmark { display: inline-flex; align-items: center; gap: 9px; color: var(--color-ink-100); font-size: 17px; font-weight: 600; letter-spacing: -.6px; white-space: nowrap; }
 .auth-wordmark small { margin-left: 5px; color: var(--color-ink-500); font-size: 13px; font-weight: 400; letter-spacing: 0; }
 .auth-header-tools { display: flex; align-items: center; gap: 12px; }
+.auth-header-tools .header-icon { width: 2rem; height: 2rem; }
+.auth-header-tools select { min-height: 2rem; }
 .auth-private-label { display: flex; align-items: center; gap: 7px; color: var(--color-ink-500); font-size: 12px; }
 .auth-private-label svg { width: 13px; height: 13px; }
 .auth-stage { min-height: calc(100dvh - 128px); display: grid; place-items: center; padding: 40px 24px 80px; }
@@ -12,7 +14,11 @@
 .auth-state-icon.auth-warn { color: var(--color-warn); }
 .auth-eyebrow { font-size: 11px; letter-spacing: .07em; text-transform: uppercase; color: var(--color-ink-500); margin-bottom: 10px; }
 .auth-card h1 { font-size: 29px; line-height: 1.2; letter-spacing: -.9px; font-weight: 500; color: var(--color-ink-100); max-width: 390px; }
+/* Focus is moved here for the status announcement. Show the indicator only
+   when the browser would show one for keyboard focus, so the gate does not
+   open with a ring boxed around its title. */
 .auth-card h1:focus { outline: none; }
+.auth-card h1:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 4px; border-radius: 3px; }
 .auth-intro { font-size: 14px; line-height: 1.75; color: var(--color-ink-400); margin-top: 15px; max-width: 365px; overflow-wrap: anywhere; }
 .auth-actions { width: 100%; margin-top: 28px; display: flex; flex-direction: column; gap: 10px; }
 .auth-actions .btn { min-height: 42px; border-radius: 8px; font-size: 13px; gap: 9px; white-space: normal; text-align: center; }
@@ -38,6 +44,10 @@
   .auth-stage { min-height: calc(100dvh - 120px); padding: 32px 24px 64px; }
   .auth-card { min-height: 365px; }
   .auth-card h1 { font-size: 27px; }
+}
+@media (max-width: 640px) {
+  .auth-header-tools .header-icon { width: 2.5rem; height: 2.5rem; }
+  .auth-header-tools select { min-height: 2.5rem; }
 }
 @media (max-width: 440px) {
   .auth-private-label { display: none; }
