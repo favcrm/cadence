@@ -43,3 +43,14 @@ The parent origin must be the actual frame parent; the kit accepts HTTPS or an
 HTTP `localhost`/`*.localhost` origin with a port, not a loopback IP literal.
 
 The packaged files are canonical host output, not a copied editable renderer. The default offline frame is an empty reference, not an app-mounted harness. This toolchain alone does not establish Social, native API, or frame-harness integration.
+
+## Shared UI design
+
+The separate `@cadence/screen-ui` package owns reusable visual primitives and
+styles, not bridge transport or authority. Its
+[`DESIGN.md`](../../ui/screen-ui/DESIGN.md) defines the compact app design
+guidance, composition ownership, accessibility and host-versus-app drawer
+boundary. The screen-ui packaging script includes that file and hashes it in
+both source provenance and the archive inventory. Consumers of older pinned
+archives should consult the source guide until they adopt a release containing
+it; adding the guide does not silently upgrade an installed package.
