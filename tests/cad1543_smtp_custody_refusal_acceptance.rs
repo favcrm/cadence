@@ -431,7 +431,7 @@ fn send_prepare_freezes_the_audience_inside_the_approved_send() {
     );
     assert_eq!(sent["receipt"]["accepted"], true, "{sent}");
 
-    // No selection and no freeze: refused, exactly as before.
+    // No selection and no freeze: the legacy refusal, message included.
     let refused = fx
         .rpc(
             Asserted::Operator,
@@ -443,8 +443,38 @@ fn send_prepare_freezes_the_audience_inside_the_approved_send() {
     assert!(
         refused
             .to_string()
-            .contains("audience freeze is unavailable"),
+            .contains("audience freeze is unavailable for this installation and context"),
         "{refused}"
+    );
+
+    // A selection without its ceiling refuses before any audience write.
+    let partial = fx
+        .rpc(
+            Asserted::Operator,
+            "crm_send_prepare",
+            json!({"install_id": install, "context_id": context, "campaign_id": "launch-1",
+                "audience_freeze_id": "freeze-1", "request_id": "send-1",
+                "base": {"mode": "all"}}),
+        )
+        .expect_err("a selection without max_recipients must refuse");
+    assert!(
+        partial
+            .to_string()
+            .contains("max_recipients is required with the audience selection"),
+        "{partial}"
+    );
+    let still_missing = fx
+        .rpc(
+            Asserted::Operator,
+            "app_audience_show",
+            json!({"install_id": install, "context_id": context, "freeze_id": "freeze-1"}),
+        )
+        .expect_err("a refused prepare must not write the freeze");
+    assert!(
+        still_missing
+            .to_string()
+            .contains("audience freeze is unavailable"),
+        "{still_missing}"
     );
 
     // The selection freezes the audience inside the same prepare.
@@ -465,4 +495,34 @@ fn send_prepare_freezes_the_audience_inside_the_approved_send() {
     );
     assert_eq!(frozen["freeze"]["final_count"], 1, "{frozen}");
     assert_eq!(frozen["valid"], true, "{frozen}");
+
+    // The prepared send names that snapshot, not an earlier one.
+    let shown = fx.op(
+        "crm_send_show",
+        json!({"install_id": install, "context_id": context, "send_id": "send-send-1"}),
+    );
+    assert_eq!(shown["send"]["state"], "prepared", "{shown}");
+    assert_eq!(shown["send"]["audience_freeze_id"], "freeze-1", "{shown}");
+    assert_eq!(
+        shown["send"]["audience_digest"], frozen["freeze"]["digest"],
+        "{shown}"
+    );
+
+    // Reusing the freeze id for a different audience refuses instead of
+    // silently sending the old snapshot.
+    let mismatch = fx
+        .rpc(
+            Asserted::Operator,
+            "crm_send_prepare",
+            json!({"install_id": install, "context_id": context, "campaign_id": "launch-1",
+                "audience_freeze_id": "freeze-1", "request_id": "send-2",
+                "base": {"mode": "custom", "customer_ids": ["customer-a"]}, "max_recipients": 50}),
+        )
+        .expect_err("a different selection under the same freeze id must refuse");
+    assert!(
+        mismatch
+            .to_string()
+            .contains("audience freeze ID is already used"),
+        "{mismatch}"
+    );
 }

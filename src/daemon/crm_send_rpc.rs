@@ -160,11 +160,19 @@ impl Shared {
             }
             // CAD-1836: prepare carries the audience selection that lets the
             // send own its freeze. Those two fields are structured, not text.
-            let structured = method == "crm_send_prepare"
-                && ((key == "base" && value.is_object())
-                    || (key == "max_recipients" && value.is_i64()));
+            if method == "crm_send_prepare" && key == "base" {
+                if !value.is_object() {
+                    return Err(Error::rejected("base must be an object"));
+                }
+                continue;
+            }
+            if method == "crm_send_prepare" && key == "max_recipients" {
+                if !value.is_i64() {
+                    return Err(Error::rejected("max_recipients must be an integer"));
+                }
+                continue;
+            }
             if !value.is_string()
-                && !structured
                 && !(method == "crm_send_origin_set"
                     && key == "unsubscribe_origin"
                     && value.is_null())
@@ -391,6 +399,40 @@ impl Shared {
     /// content at its approved revision, the live audience freeze,
     /// the live sender link and the authority behind it. Drift since
     /// the approve click refuses — never sends stale inputs.
+    /// The refusals that do not need the audience freeze: approved content,
+    /// a live SMTP link under the held authority, and an accepted test send.
+    /// CAD-1836 runs these before the send may write its snapshot, so a
+    /// refused preparation never mutates audience state.
+    fn crm_send_preflight(
+        self: &Arc<Self>,
+        install: &str,
+        context: &str,
+        records: &RecordStore,
+        campaign: &str,
+    ) -> Result<()> {
+        let (_, content_digest) = records.app_content_approved(context, campaign)?;
+        let link = self.store.crm_smtp_link(install, context)?.ok_or_else(|| {
+            Error::rejected("no SMTP sender is bound to this installation and context")
+        })?;
+        if link.state != "live" {
+            return Err(Error::rejected(
+                "SMTP sender binding is revoked; bind it again instead",
+            ));
+        }
+        self.crm_smtp_authority(&link.connection_id, link.auth_revision)?;
+        if !records.app_campaign_test_send_accepted(
+            context,
+            campaign,
+            &content_digest,
+            &link.digest,
+        )? {
+            return Err(Error::rejected(
+                "an SMTP-accepted test send of this exact content and binding is required first",
+            ));
+        }
+        Ok(())
+    }
+
     fn crm_send_facts(
         self: &Arc<Self>,
         install: &str,
@@ -451,29 +493,20 @@ impl Shared {
     ) -> Result<Value> {
         self.crm_smtp_scope_with_proof(install, context, true, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
-            // CAD-1836: the send owns its audience snapshot. A caller that
-            // supplies the selection gets the freeze created (or refreshed)
-            // inside this one approved action; without a selection the
-            // pre-existing freeze requirement stands unchanged.
-            let frozen_valid = records
-                .app_audience_show(context, freeze)
-                .map(|audience| audience["valid"] == json!(true))
-                .unwrap_or(false);
-            if !frozen_valid {
-                let (Some(base), Some(max)) = (base, max_recipients) else {
-                    return Err(Error::rejected(
-                        "audience freeze is unavailable; prepare the audience first",
-                    ));
-                };
+            // CAD-1836: the send owns its audience snapshot. Without a
+            // selection the pre-existing freeze requirement stands exactly as
+            // before (its messages included). With one, refuse anything the
+            // send cannot commit first, then freeze the supplied selection —
+            // the store replays an identical freeze, refreshes a moved one at
+            // the same base, and refuses an id reused for another audience.
+            if let Some(base) = base {
+                let max = max_recipients.ok_or_else(|| {
+                    Error::rejected("max_recipients is required with the audience selection")
+                })?;
+                self.crm_send_preflight(install, context, &records, campaign)?;
                 let base = crate::store::app_audiences::AudienceBase::parse(base)
                     .map_err(|_| Error::rejected("audience base is invalid"))?;
-                records.app_audience_prepare(
-                    context,
-                    freeze,
-                    &base,
-                    exclusion_list_id,
-                    max,
-                )?;
+                records.app_audience_prepare(context, freeze, &base, exclusion_list_id, max)?;
             }
             let facts = self.crm_send_facts(install, context, &records, campaign, freeze, proof.is_some())?;
             if (facts.frozen_member_ids.len() as i64) > facts.max_recipients {
