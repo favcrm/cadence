@@ -547,23 +547,62 @@ fn cad1827_campaign_work_member_reads_but_never_saves() {
     assert_eq!(after["work"]["due_at"], Value::Null);
 }
 
+/// Corrupt one installed screen asset under the PM's bundle directory, the
+/// way a hand-edited or half-written install looks: app.md and the catalog
+/// stay valid, the declaration's asset digest no longer matches.
+fn invalidate_installed_screen(native: &Native, install: &str) {
+    let root = native
+        .fx
+        .root
+        .path()
+        .join("pm/.apps/installations")
+        .join(install);
+    let mut stack = vec![root];
+    let mut target = None;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.ends_with("screens/main/client.js") {
+                target = Some(path);
+            }
+        }
+    }
+    let path = target.expect("an installed screen asset is on disk");
+    let mut bytes = std::fs::read(&path).expect("installed screen asset bytes");
+    bytes.extend_from_slice(b"\n");
+    std::fs::write(&path, bytes).expect("invalidate the installed screen asset");
+}
+
 #[test]
 fn cad1827_campaign_work_core_read_is_authorized_and_stateful() {
     let native = Native::new();
     let scope = install(&native, "core-read", OPERATIONS, true).expect("paired install");
     let (owner, _) = native.owner();
+    // Every discovery fixture exists before the query: a healthy paired
+    // source, a valid non-source, and a paired source whose installed screen
+    // asset is then invalidated on disk.
+    let plain = native.fx.install("core-read-plain", &["records.list"]);
+    let broken = install(&native, "core-read-broken", OPERATIONS, true).expect("paired install");
+    invalidate_installed_screen(&native, &broken.install);
 
-    // Discovery names the packages that require the contract, and only the
-    // contexts that are still live. No app name is consulted.
     let sources = native
         .rpc("crm_campaign_work_sources", json!({}))
         .expect("source discovery");
     assert_eq!(sources["contract"], "crm-campaign-work/v1");
+    assert_eq!(
+        sources["state"], "partial",
+        "a source that cannot be inspected makes the inventory partial"
+    );
     let rows = sources["sources"].as_array().expect("a source list");
     let row = rows
         .iter()
         .find(|row| row["install_id"] == scope.install)
-        .expect("the paired install is a source");
+        .expect("the healthy paired install is a source");
     assert_eq!(row["app"], "crm-cw-core-read");
     assert!(
         row["contexts"]
@@ -573,11 +612,30 @@ fn cad1827_campaign_work_core_read_is_authorized_and_stateful() {
             .any(|context| context == &json!(scope.context)),
         "the live context is named"
     );
-    // A package that does not serve the contract is not a source.
-    let plain = native.fx.install("core-read-plain", &["records.list"]);
+    // The valid non-source was installed before this query: it must be absent
+    // from the same response, so a bypassed filter fails this test.
     assert!(
         rows.iter().all(|row| row["install_id"] != plain.install),
-        "an install without the operations is not a source"
+        "a package without the operations is not a source"
+    );
+    // A declared source whose package no longer passes integrity is reported
+    // as unavailable, never silently dropped, and carries no values.
+    let gaps = sources["unavailable"]
+        .as_array()
+        .expect("an unavailable list");
+    let gap = gaps
+        .iter()
+        .find(|row| row["install_id"] == broken.install)
+        .expect("the invalidated source stays visible");
+    assert_eq!(gap["app"], "crm-cw-core-read-broken");
+    assert!(
+        gap["reason"].as_str().unwrap().contains("integrity"),
+        "the gap names the failed inspection: {}",
+        gap["reason"]
+    );
+    assert!(
+        gap.get("contexts").is_none(),
+        "an uninspectable source reports no contexts"
     );
 
     // No recorded work: unavailable, never an inferred row.
@@ -659,11 +717,47 @@ fn cad1827_campaign_work_core_read_is_authorized_and_stateful() {
         );
     }
 
-    // A revoked (unknown) context on a real source is forbidden too.
-    let revoked =
-        read(&native, &scope.install, "ctx-missing", CAMPAIGN, None).expect("revoked context read");
-    assert_eq!(revoked["state"], "forbidden");
-    assert_eq!(revoked["revision"], Value::Null);
+    // An invalidated live source is refused the same way: the read re-proves
+    // the package declaration inside its fence instead of trusting discovery.
+    let invalid = read(&native, &broken.install, &broken.context, CAMPAIGN, None)
+        .expect("invalid source read");
+    assert_eq!(invalid["state"], "forbidden");
+    assert_eq!(invalid["revision"], Value::Null);
+
+    // Real revocation: archive the live context, then the same read is
+    // forbidden with no values — not a never-existing id.
+    let shown = native
+        .rpc(
+            "app_context_show",
+            json!({"install_id": scope.install, "context_id": scope.context}),
+        )
+        .expect("context show");
+    let revision = shown["context"]["revision"]
+        .as_i64()
+        .expect("context revision");
+    native
+        .rpc(
+            "app_context_archive",
+            json!({"install_id": scope.install, "context_id": scope.context,
+                "expected_revision": revision}),
+        )
+        .expect("context archive");
+    let archived = read(&native, &scope.install, &scope.context, CAMPAIGN, None)
+        .expect("archived context read");
+    assert_eq!(archived["state"], "forbidden");
+    for key in [
+        "revision",
+        "content_revision",
+        "assignment",
+        "due_at",
+        "lifecycle",
+    ] {
+        assert_eq!(
+            archived[key],
+            Value::Null,
+            "{key} must not leak after archival"
+        );
+    }
 
     // The source itself must exist: an unknown installation is a request
     // error, not a source that could be read or labelled forbidden.

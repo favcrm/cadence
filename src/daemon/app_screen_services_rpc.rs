@@ -1165,6 +1165,9 @@ impl Shared {
             ));
         }
         let mut sources = Vec::new();
+        // A source whose inspection fails is reported, never dropped: the
+        // inventory says `partial` and names it without any recorded values.
+        let mut unavailable = Vec::new();
         for row in rows {
             if row.get("removed").is_some_and(|removed| !removed.is_null()) {
                 continue;
@@ -1173,28 +1176,51 @@ impl Shared {
             else {
                 continue;
             };
-            // A removed, changed or unreadable install is not a source.
-            let declared = workspace::with_runtime_read(&pm, install, |_, files| {
-                Ok(app_screen_pkg::declares_campaign_work(files))
-            })
-            .unwrap_or(false);
-            if !declared {
-                continue;
+            let inspected = workspace::with_runtime_read(&pm, install, |_, files| {
+                Ok(app_screen_pkg::campaign_work_source(files))
+            });
+            match inspected {
+                // Valid non-participation: the package never claimed the
+                // contract, so it is simply not a source.
+                Ok(app_screen_pkg::CampaignWorkSource::NotDeclared) => continue,
+                Ok(app_screen_pkg::CampaignWorkSource::Served) => {
+                    let contexts = self
+                        .store
+                        .app_context_list(install)?
+                        .get("contexts")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|context| context["state"] == "active")
+                        .filter_map(|context| context["id"].as_str().map(str::to_string))
+                        .collect::<Vec<String>>();
+                    sources.push(json!({"install_id": install, "app": app, "contexts": contexts}));
+                }
+                Ok(app_screen_pkg::CampaignWorkSource::Unavailable(reason)) => {
+                    unavailable.push(json!({"install_id": install, "app": app, "reason": reason}));
+                }
+                // The installation changed or disappeared after the catalog
+                // read: it cannot be inspected, so it cannot be called a
+                // non-source either.
+                Err(_) => unavailable.push(json!({
+                    "install_id": install,
+                    "app": app,
+                    "reason": "installation changed during discovery",
+                })),
             }
-            let contexts = self
-                .store
-                .app_context_list(install)?
-                .get("contexts")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|context| context["state"] == "active")
-                .filter_map(|context| context["id"].as_str().map(str::to_string))
-                .collect::<Vec<String>>();
-            sources.push(json!({"install_id": install, "app": app, "contexts": contexts}));
         }
-        Ok(json!({"contract": work::CONTRACT, "sources": sources}))
+        let state = if unavailable.is_empty() {
+            "ok"
+        } else {
+            "partial"
+        };
+        Ok(json!({
+            "contract": work::CONTRACT,
+            "state": state,
+            "sources": sources,
+            "unavailable": unavailable,
+        }))
     }
 
     /// CAD-1827: the authorized core-facing read. Scope comes from verified
@@ -1248,33 +1274,30 @@ impl Shared {
             ),
         };
         let pm = self.pm_at(&self.pm_dir()?)?;
-        // The source is the installation's own live bundle: a package that
-        // does not serve the operation is not a campaign-work source.
-        let (app, declared) = workspace::with_runtime_read(&pm, install, |description, files| {
+        // PM snapshot -> release fence -> active-context proof -> live package
+        // declaration, all held through the record open and read, exactly like
+        // `screen_service_scope`. A context archived, an installation removed
+        // or a bundle updated after the proof therefore cannot be read as an
+        // authorized source.
+        workspace::with_runtime_snapshot(&pm, install, |description, files| {
             let app = description["name"]
                 .as_str()
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| Error::rejected("installation app identity unavailable"))?
                 .to_string();
-            Ok((app, app_screen_pkg::declares_campaign_work(files)))
-        })?;
-        if !declared {
-            return Ok(work::read(ReadInput {
-                app: &app,
-                install,
-                context: Some(context),
-                campaign,
-                work: None,
-                content: None,
-                readiness: None,
-                access: Access::Forbidden,
-                expected_revision: None,
-            }));
-        }
-        match self.store.app_context_proof(install, context) {
-            Ok(_) => {}
-            // An unknown or archived context is not an authorized source.
-            Err(error) if error.kind() == "rejected" => {
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let context_live = match self.store.app_context_proof(install, context) {
+                Ok(_) => true,
+                // An unknown or archived context is not an authorized source.
+                Err(error) if error.kind() == "rejected" => false,
+                Err(error) => return Err(error),
+            };
+            let declared = app_screen_pkg::campaign_work_source(files)
+                == app_screen_pkg::CampaignWorkSource::Served;
+            if !context_live || !declared {
                 return Ok(work::read(ReadInput {
                     app: &app,
                     install,
@@ -1285,12 +1308,11 @@ impl Shared {
                     readiness: None,
                     access: Access::Forbidden,
                     expected_revision: None,
-                }))
+                }));
             }
-            Err(error) => return Err(error),
-        }
-        let records = crate::store::app_records::RecordStore::open(&self.state_dir, install)?;
-        records.app_campaign_work_read(context, campaign, &app, Access::Authorized, expected)
+            let records = crate::store::app_records::RecordStore::open(&self.state_dir, install)?;
+            records.app_campaign_work_read(context, campaign, &app, Access::Authorized, expected)
+        })
     }
 
     pub(super) fn rpc_app_screen_service_call(

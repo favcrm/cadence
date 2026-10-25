@@ -141,19 +141,40 @@ pub fn declares_whatsapp_door(files: &BTreeMap<String, String>, app: &str) -> bo
     })
 }
 
-/// CAD-1827: declarative discovery — the package is a campaign-work source
-/// when its manifest requires `crm-campaign-work` major 1 *and* one of its
-/// integrity-checked screen packages, declared for the same app, serves
-/// `campaign-work.show`. Discovery is by contract and declaration only:
-/// there is no app-name branch, and any scan or parse failure reads as not
-/// a source rather than a partial answer.
-pub fn declares_campaign_work(files: &BTreeMap<String, String>) -> bool {
+/// CAD-1827: how one installed bundle relates to the campaign-work contract.
+///
+/// Discovery must never read a failed inspection as "not a source": a
+/// package that *declares* the contract but cannot be inspected is a
+/// participating source with an unavailable outcome, while a package that
+/// simply does not require the contract is valid non-participation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CampaignWorkSource {
+    /// The manifest requires the contract and a live screen package declares
+    /// `campaign-work.show` for the same app: a usable source.
+    Served,
+    /// The manifest is readable and does not require the contract at this
+    /// major: a valid non-source that discovery omits entirely.
+    NotDeclared,
+    /// The manifest requires the contract, but the package could not be
+    /// inspected (unreadable declaration, failed integrity, or no package
+    /// serving the operation). The reason is a bounded plain line; no
+    /// recorded values are implied.
+    Unavailable(&'static str),
+}
+
+/// Classify one installed bundle for campaign-work discovery. Every failure
+/// after the manifest proves participation is `Unavailable`, never
+/// `NotDeclared`: a broken source stays visible instead of disappearing from
+/// an otherwise successful list.
+pub fn campaign_work_source(files: &BTreeMap<String, String>) -> CampaignWorkSource {
     let metadata = match files
         .get("app.md")
         .map(|text| crate::issue::app::parse_manifest(text))
     {
         Some(Ok(metadata)) => metadata,
-        _ => return false,
+        _ => {
+            return CampaignWorkSource::Unavailable("installation manifest is unreadable");
+        }
     };
     if metadata
         .requires
@@ -162,21 +183,34 @@ pub fn declares_campaign_work(files: &BTreeMap<String, String>) -> bool {
         .map(Vec::as_slice)
         != Some(&[crate::issue::app_campaign_work::CONTRACT_MAJOR][..])
     {
-        return false;
+        return CampaignWorkSource::NotDeclared;
     }
-    tags_in(files).is_ok_and(|tags| {
-        tags.iter().any(|tag| {
-            extract(files, tag).is_ok_and(|pkg| {
-                pkg.app == metadata.app
+    let tags = match tags_in(files) {
+        Ok(tags) => tags,
+        Err(_) => return CampaignWorkSource::Unavailable("screen package set is unreadable"),
+    };
+    for tag in &tags {
+        match extract(files, tag) {
+            Ok(pkg)
+                if pkg.app == metadata.app
                     && pkg
                         .operations
-                        .contains(&app_screen_decl::ScreenOperation::CampaignWorkShow)
-            })
-        })
-    })
+                        .contains(&app_screen_decl::ScreenOperation::CampaignWorkShow) =>
+            {
+                return CampaignWorkSource::Served;
+            }
+            Ok(_) => {}
+            // A declared package that fails integrity is a source we cannot
+            // inspect; reporting it keeps the inventory truthful.
+            Err(_) => {
+                return CampaignWorkSource::Unavailable("a screen package failed integrity");
+            }
+        }
+    }
+    CampaignWorkSource::Unavailable("no screen package declares campaign-work.show")
 }
 
-/// Re-prove one screen package against the live bundle snapshot.
+/// Re-prove one screen package against the live bundle snapshot./// Re-prove one screen package against the live bundle snapshot.
 ///
 /// Collects the `screens/<tag>/` members from `files`, refuses when the
 /// `screens.json` declaration is absent, then runs
@@ -533,5 +567,60 @@ mod tests {
         );
         // An unknown operation still refuses at parse time.
         assert!(extract(&with(&paired, &["campaign-work.send"], None), "a").is_err());
+    }
+
+    #[test]
+    fn cad1827_campaign_work_source_is_a_three_way_classification() {
+        let js = "x";
+        let ops = ["campaign-work.show", "campaign-work.save"];
+        let manifest = |with_contract: bool| {
+            let mut list = String::from("app-screens: [1], screen-records: [1]");
+            if with_contract {
+                list.push_str(", crm-campaign-work: [1]");
+            }
+            declared_manifest(&format!("{{{list}}}"))
+        };
+        let bundle = |metadata: &str, declaration: &str, body: &str| {
+            let mut files = bundle_with("a", declaration, &[("client.js", body)]);
+            files.insert("app.md".to_string(), metadata.to_string());
+            files
+        };
+        let paired = decl_records(&[("client.js", js)], &ops);
+
+        assert_eq!(
+            campaign_work_source(&bundle(&manifest(true), &paired, js)),
+            CampaignWorkSource::Served
+        );
+        // Valid non-participation: the manifest never required the contract.
+        assert_eq!(
+            campaign_work_source(&bundle(&manifest(false), &paired, js)),
+            CampaignWorkSource::NotDeclared
+        );
+        // A declared source whose asset bytes no longer match its digest is
+        // unavailable, not a non-source.
+        assert_eq!(
+            campaign_work_source(&bundle(&manifest(true), &paired, "tampered")),
+            CampaignWorkSource::Unavailable("a screen package failed integrity")
+        );
+        // Declared, but no package serves the operation.
+        let plain = decl_records(&[("client.js", js)], &["records.list"]);
+        assert_eq!(
+            campaign_work_source(&bundle(&manifest(true), &plain, js)),
+            CampaignWorkSource::Unavailable("no screen package declares campaign-work.show")
+        );
+        // Declared with no screen package at all.
+        let mut bare = BTreeMap::new();
+        bare.insert("app.md".to_string(), manifest(true));
+        assert_eq!(
+            campaign_work_source(&bare),
+            CampaignWorkSource::Unavailable("no screen package declares campaign-work.show")
+        );
+        // An unreadable manifest cannot be called a non-source.
+        let mut no_manifest = bundle_with("a", &paired, &[("client.js", js)]);
+        no_manifest.insert("app.md".to_string(), "not a manifest".to_string());
+        assert_eq!(
+            campaign_work_source(&no_manifest),
+            CampaignWorkSource::Unavailable("installation manifest is unreadable")
+        );
     }
 }
