@@ -24,7 +24,7 @@ import {
 import { useCanvasFeed } from "../canvas/feed";
 import Composer from "./Composer";
 import type { AttachDestination } from "../app-shell/chat/attach";
-import { atTail, jumpLabel, repinOnResize, tailTop } from "./dock";
+import { atTail, jumpLabel, repinOnResize, showJumpPill, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
 import NeedsRail from "./NeedsRail";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
@@ -874,14 +874,10 @@ function MasterHome({
     },
     [engage],
   );
-  // The last on-tail state seen by the scroll handler, for the scroller's
-  // own resize observer below.
-  const onTailRef = useRef(true);
   const onPanelScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
     const near = atTail(el.scrollTop, el.scrollHeight, el.clientHeight);
-    onTailRef.current = near;
     if (near) setActivity(false);
     applyFollow(onViewportScroll(follow.current, near));
   }, []);
@@ -969,7 +965,7 @@ function MasterHome({
     let prev = el.clientHeight;
     const ro = new ResizeObserver(() => {
       const next = el.clientHeight;
-      const repin = repinOnResize(onTailRef.current, prev, next);
+      const repin = repinOnResize(follow.current.pinned, prev, next);
       prev = next;
       if (repin) scrollPanel("jump");
     });
@@ -1242,9 +1238,14 @@ function MasterHome({
             ))}
           </div>
 
-          {(unseen > 0 || activity) && (
+          {/* The status node stays mounted so a screen reader announces the
+              pill's arrival (a live region added with its text is not). */}
+          <span role="status" aria-live="polite" className="sr-only">
+            {showJumpPill(unseen, activity) ? jumpLabel(unseen, t) : ""}
+          </span>
+          {showJumpPill(unseen, activity) && (
             <button type="button" className="newpill num" onClick={jumpToLatest} data-jump-to-latest>
-              ↓ {jumpLabel(unseen, t)}
+              <span aria-hidden="true">↓</span> {jumpLabel(unseen, t)}
             </button>
           )}
 

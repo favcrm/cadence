@@ -48,3 +48,10 @@ export function jumpLabel(unseen: number, t: (english: string) => string = (engl
   const base = t("Jump to latest");
   return unseen > 0 ? `${base} · ${unseen} ${t("new")}` : base;
 }
+
+/** The jump pill shows while rows arrived unseen (the reader is in
+ *  history) or the tail's own row kept growing; reaching the tail
+ *  clears both (Home's scroll handler), so the pill hides there. */
+export function showJumpPill(unseen: number, activity: boolean): boolean {
+  return unseen > 0 || activity;
+}

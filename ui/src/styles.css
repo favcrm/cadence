@@ -926,6 +926,7 @@ pre {
   transform: translateX(-50%);
   bottom: calc(var(--dock-h, 7rem) + .6rem);
   z-index: 25;
+  white-space: nowrap;
   padding: .35rem .9rem;
   border-radius: 9999px;
   border: 1px solid color-mix(in srgb, var(--color-accent) 45%, var(--color-ink-700));
