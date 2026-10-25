@@ -11,6 +11,7 @@ import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { IconRefresh, IconWarning } from "../../ui/icons";
 import PageState from "../../ui/PageState";
 import {
+  acceptsHosted,
   acceptsSmtp,
   acceptsToken,
   canManage,
@@ -90,6 +91,38 @@ function enrollErrorMessage(e: unknown): string {
   // daemon can commit before a lost response), so do not claim 'nothing
   // was saved' — ask the operator to confirm before retrying instead.
   return UI_ENROLL_UNCERTAIN;
+}
+
+/**
+ * CAD-1839 hosted connect. The worker's success envelope is exactly
+ * `{ok:true, hosted:true, url:<https>}`; any other shape — a falsy flag,
+ * a missing or relative URL, a non-https scheme — is a refusal, never a
+ * link to open. The credential and OAuth state never reach this board.
+ */
+const UI_HOSTED_REFUSED =
+  "The deployment did not return a secure sign-in link — nothing was changed.";
+const UI_HOSTED_UNAVAILABLE =
+  "Hosted connections are not available for this service here — nothing was changed.";
+const UI_HOSTED_FAILED =
+  "Could not start the hosted sign-in. Reload the board and try again — nothing was changed.";
+
+function hostedConnectUrl(reply: unknown): string | null {
+  if (reply === null || typeof reply !== "object") return null;
+  const body = reply as { ok?: unknown; hosted?: unknown; url?: unknown };
+  if (body.ok !== true || body.hosted !== true || typeof body.url !== "string") return null;
+  try {
+    const url = new URL(body.url);
+    return url.protocol === "https:" ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function hostedConnectError(e: unknown): string {
+  // 404 is the deployment saying this provider has no hosted connect
+  // route; any other refusal keeps the generic retry line. Raw server
+  // text is never rendered on this path.
+  return e instanceof ApiError && e.status === 404 ? UI_HOSTED_UNAVAILABLE : UI_HOSTED_FAILED;
 }
 
 /** The add/setup/detail routes under the connections section. */
@@ -513,6 +546,16 @@ function ConnectionsAdd({
                       <Link href={connectionAddHref()} className="lnk">{t("Choose a different service")}</Link>
                     </span>
                   </PageState>
+                ) : acceptsHosted(chosen) ? (
+                  // CAD-1839: a hosted provider has no token/SMTP form —
+                  // the deployment runs the sign-in and the board only
+                  // opens the returned URL. Returning to Connections
+                  // revalidates the list like any other enrollment.
+                  <HostedConnect
+                    key={chosen.provider}
+                    provider={chosen}
+                    onClose={() => navigate(connectionsIndexHref())}
+                  />
                 ) : (
                   <>
                     <AddConnection
@@ -570,7 +613,11 @@ function ServiceChooser({ providers }: { providers: ConnectionProvider[] }) {
                   )}
                 </span>
                 <span className="conn-row-sub text-micro text-ink-500 break-words">
-                  {t("Connects with {shapes}").replace("{shapes}", () => enrollmentSupport(p).shapes.join(" or "))}
+                  {t("Connects with {shapes}").replace("{shapes}", () =>
+                    enrollmentSupport(p)
+                      .shapes.map((shape) => (shape === "hosted" ? t("a hosted sign-in") : shape))
+                      .join(" or "),
+                  )}
                 </span>
               </Link>
             </li>
@@ -1422,6 +1469,73 @@ function RevokeConfirm({
         <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>{t("Cancel")}</Button>
       </div>
     </div>
+  );
+}
+
+/**
+ * CAD-1839: connect a provider whose reviewed descriptor declares the
+ * `hosted` enrollment shape. The tenant deployment's worker starts the
+ * provider sign-in and returns an https URL; this board only opens it in
+ * a new tab and never sees the credential or the OAuth state. Host mode
+ * declares no hosted providers, so this page exists only on a tenant
+ * deployment.
+ */
+function HostedConnect({
+  provider,
+  onClose,
+}: {
+  provider: ConnectionProvider;
+  onClose: () => void;
+}) {
+  const t = useTranslate();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const connect = () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    api
+      .connectionProviderConnect(provider.provider)
+      .then((reply) => {
+        const url = hostedConnectUrl(reply);
+        if (url === null) {
+          setError(UI_HOSTED_REFUSED);
+          return;
+        }
+        // `noopener,noreferrer` keeps the sign-in tab from reaching back
+        // into the board; the board keeps its own operator session.
+        window.open(url, "_blank", "noopener,noreferrer");
+      })
+      .catch((e: unknown) => setError(hostedConnectError(e)))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <section className="min-w-0" aria-label={t("hosted connection")}>
+      <p className="text-label text-ink-400 break-words">
+        {t("This service connects through a secure sign-in on your deployment — no credential is entered on this board.")}
+      </p>
+      {capabilityWords(provider) && (
+        <p className="text-micro text-ink-500 mt-1 break-words">
+          {t("Permissions")}: {capabilityWords(provider)}
+        </p>
+      )}
+      {error && (
+        <p className="text-label text-fail break-words mt-3" role="alert">
+          {t(error)}
+        </p>
+      )}
+      <div className="flex flex-wrap gap-2 mt-4">
+        <Button variant="primary" loading={busy} onClick={connect}>
+          {busy
+            ? t("Opening sign-in…")
+            : t("Connect {label}").replace("{label}", () => serviceLabel(provider.provider))}
+        </Button>
+        <Button variant="ghost" onClick={onClose} disabled={busy}>{t("Cancel")}</Button>
+      </div>
+      <p className="text-micro text-ink-500 mt-3 break-words">
+        {t("Finish the sign-in in the new tab, then return here — connections refresh when you come back.")}
+      </p>
+    </section>
   );
 }
 

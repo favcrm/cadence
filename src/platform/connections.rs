@@ -153,13 +153,16 @@ impl ProviderDescriptor {
             || self.revision.is_empty()
             || self.capabilities.is_empty()
             // Enrollment shapes are an exact allowlist, not a prefix
-            // or pattern: `token` (operator-minted scoped tokens) and
+            // or pattern: `token` (operator-minted scoped tokens),
             // `smtp` (CAD-785 typed host/port/TLS/sender plus secret
-            // custody). Anything else refuses.
+            // custody) and `hosted` (CAD-1839: the deployment's own
+            // OAuth sign-in — the board never sees the credential or
+            // the OAuth state; the tenant worker owns both). Anything
+            // else refuses.
             || self
                 .enrollment_shapes
                 .iter()
-                .any(|s| s != "token" && s != "smtp")
+                .any(|s| s != "token" && s != "smtp" && s != "hosted")
         {
             return Err(Error::rejected(
                 "provider connection descriptor is unavailable",
@@ -293,6 +296,65 @@ mod tests {
             }
             assert!(bad.validate(adapter.table()).is_err(), "{field}");
         }
+    }
+    // CAD-1839: a hosted provider's reviewed descriptor is exactly the
+    // tenant worker's metadata — one `hosted` enrollment shape and the
+    // two social capabilities the social-content app needs, with their
+    // tools/scopes/effects declared by the reviewed tool table.
+    #[test]
+    fn hosted_enrollment_shape_is_admitted_for_reviewed_capabilities() {
+        use super::{CapabilityDescriptor, CapabilitySemantics, ProviderDescriptor};
+        use crate::contract_fixture::{ToolDecl, ToolTable};
+        let table = ToolTable {
+            platform: "instagram".into(),
+            manifest_version: Some("hosted-social/1".into()),
+            tools: vec![
+                ToolDecl {
+                    tool: "list_posts".into(),
+                    effect: Some("read".into()),
+                    scopes: vec!["provider.read".into()],
+                    label: None,
+                },
+                ToolDecl {
+                    tool: "generate_image".into(),
+                    effect: Some("draft".into()),
+                    scopes: vec!["provider.draft".into()],
+                    label: None,
+                },
+            ],
+        };
+        let descriptor = ProviderDescriptor {
+            schema: 1,
+            provider: "instagram".into(),
+            revision: "hosted-social/1".into(),
+            enrollment_shapes: vec!["hosted".into()],
+            builtin_accounts: vec![],
+            capabilities: vec![
+                CapabilityDescriptor {
+                    id: "social.read".into(),
+                    version: 1,
+                    tools: vec!["list_posts".into()],
+                    scopes: vec!["provider.read".into()],
+                    effect: "read".into(),
+                    semantics: CapabilitySemantics::MetadataRead,
+                },
+                CapabilityDescriptor {
+                    id: "media.generate".into(),
+                    version: 1,
+                    tools: vec!["generate_image".into()],
+                    scopes: vec!["provider.draft".into()],
+                    effect: "draft".into(),
+                    semantics: CapabilitySemantics::PreviewOnly,
+                },
+            ],
+            action_mappings: vec![],
+        };
+        descriptor.validate(&table).unwrap();
+        // The allowlist stays exact: an unknown shape refuses even
+        // alongside a reviewed one.
+        let mut unknown = descriptor;
+        unknown.enrollment_shapes = vec!["hosted".into(), "oauth".into()];
+        assert!(unknown.validate(&table).is_err());
     }
     #[test]
     fn local_registration_changes_with_actual_outbox_destination() {

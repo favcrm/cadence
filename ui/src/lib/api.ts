@@ -932,6 +932,18 @@ export const api = {
    * operator, so a viewer without the read never sees a 403.
    */
   connectionProviders: () => get<ConnectionProvidersPayload>("/api/connection-providers"),
+  /**
+   * `POST /api/connection-providers/<provider>/connect` (CAD-1839) —
+   * start a hosted provider's sign-in. The tenant worker owns the
+   * credential and the OAuth state; this board sends an empty body and
+   * receives only `{ok, hosted, url}`. Operator-only, same board
+   * headers/credentials as every other connection write.
+   */
+  connectionProviderConnect: (provider: string) =>
+    post<{ ok: boolean; hosted: boolean; url?: string }>(
+      `/api/connection-providers/${encodeURIComponent(provider)}/connect`,
+      {},
+    ),
   /** `GET /api/connections` — every exact provider account (operator-only). */
   connections: () => get<ConnectionsPayload>("/api/connections"),
   /** `GET /api/connections/<id>` — one connection's metadata (operator-only). */

@@ -76,6 +76,16 @@ export function acceptsSmtp(provider: ConnectionProvider): boolean {
   return (provider.descriptor?.enrollment_shapes ?? []).includes("smtp");
 }
 
+/**
+ * Can this provider connect through the deployment's hosted sign-in
+ * (CAD-1839)? That flow is started by the tenant worker, which owns the
+ * credential and the OAuth state — the board only opens the returned URL.
+ * Host mode declares no hosted providers.
+ */
+export function acceptsHosted(provider: ConnectionProvider): boolean {
+  return (provider.descriptor?.enrollment_shapes ?? []).includes("hosted");
+}
+
 /** The wizard's enrollment shapes for one provider, in stable order. */
 export function enrollmentShapes(provider: ConnectionProvider): string[] {
   const shapes = provider.descriptor?.enrollment_shapes ?? [];
@@ -223,6 +233,10 @@ export function enrollmentSupport(provider: ConnectionProvider | null): {
     };
   }
   const shapes = enrollmentShapes(provider);
+  // CAD-1839: the deployment's hosted sign-in is its own setup path, not
+  // a wizard shape — but it is still a reviewed enrollment this page can
+  // offer, so it counts as support without joining the token/SMTP list.
+  if (acceptsHosted(provider)) shapes.push("hosted");
   if (shapes.length === 0) {
     return {
       shapes,
