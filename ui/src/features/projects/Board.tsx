@@ -53,7 +53,7 @@ const byPriority = (a: IssueCard, b: IssueCard) =>
   a.priority.localeCompare(b.priority) ||
   a.id.localeCompare(b.id, undefined, { numeric: true });
 
-function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: string; onOpen: (id: string) => void }) {
+export function IssueList({ issues, project, onOpen, trackerEmpty }: { issues: IssueCard[]; project: string; onOpen: (id: string) => void; trackerEmpty: boolean }) {
   const { t, formatNumber } = useLocale();
   const [sort, setSort] = useState<{ key: "id" | "title" | "status" | "priority" | "owner"; direction: "asc" | "desc" }>({ key: "status", direction: "asc" });
   const sortRows = (key: typeof sort.key) => setSort((current) => ({
@@ -91,7 +91,7 @@ function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: 
             </div>
           </div>
         ))}
-        {rows.length === 0 && <div className="px-4 py-10 text-center text-ink-500">{t("No issues match this view.")}</div>}
+        {rows.length === 0 && !trackerEmpty && <div className="px-4 py-10 text-center text-ink-500">{t("No issues match this view.")}</div>}
       </div>
       <div className="hidden sm:block overflow-x-auto">
         <table className="w-full min-w-[46rem] text-label">
@@ -136,7 +136,7 @@ function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: 
                 </td>
               </tr>
             ))}
-            {rows.length === 0 && <tr><td colSpan={project === "all" ? 7 : 6} className="px-4 py-10 text-center text-ink-500">{t("No issues match this view.")}</td></tr>}
+            {rows.length === 0 && !trackerEmpty && <tr><td colSpan={project === "all" ? 7 : 6} className="px-4 py-10 text-center text-ink-500">{t("No issues match this view.")}</td></tr>}
           </tbody>
         </table>
       </div>
@@ -603,7 +603,7 @@ export default function Board({
       )}
 
       {!loaded ? null : view === "list" ? (
-        <IssueList issues={visible} project={project} onOpen={onOpen} />
+        <IssueList issues={visible} project={project} onOpen={onOpen} trackerEmpty={issues.length === 0} />
       ) : !filters.groupByEpic ? (
         columns(visible, "")
       ) : (
