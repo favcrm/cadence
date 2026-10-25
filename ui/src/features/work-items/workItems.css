@@ -2,8 +2,10 @@
    DrawerShell layout and the issue/review copy styles; only the panel
    rhythm and the narrow tab strip are new. */
 
-/* Six tabs at 360px must wrap, never scroll sideways. */
-.crm-drawer[data-drawer="work-item"] .crm-drawer-tabs {
+/* Six tabs at 360px must wrap, never scroll sideways. The Home origin keeps
+   the review drawer kind (`data-drawer="review"`), so both variants wrap. */
+.crm-drawer[data-drawer="work-item"] .crm-drawer-tabs,
+.crm-drawer[data-drawer="review"] .crm-drawer-tabs {
   flex-wrap: wrap;
   gap: 0.15rem 0.9rem;
   min-width: 0;
