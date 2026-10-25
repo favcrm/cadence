@@ -85,11 +85,11 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const method = init?.method ?? "GET";
   if (url.pathname.endsWith("/stream")) {
     if (!controlledTranscript || url.pathname !== "/api/threads/master/stream")
-      return streamFixture(url.href, { alias: "master", provider: "p", endpoint_kind: "k", live: true, turn, queue }, init?.signal);
+      return streamFixture(url.href, { alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "p", endpoint_kind: "k", live: true, turn, queue }, init?.signal);
     if (holdReconnect) return new Response(null, { status: 503 });
     let closed = false;
     const body = new ReadableStream<Uint8Array>({ start(controller) {
-      controller.enqueue(new TextEncoder().encode(`event: master\ndata: ${JSON.stringify({ alias: "master", provider: "p", endpoint_kind: "k", live: true, turn, queue })}\n\n`));
+      controller.enqueue(new TextEncoder().encode(`event: master\ndata: ${JSON.stringify({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "p", endpoint_kind: "k", live: true, turn, queue })}\n\n`));
       const close = () => { if (!closed) { closed = true; controller.close(); } };
       disconnectTranscript = close;
       init?.signal?.addEventListener("abort", close, { once: true });
@@ -127,7 +127,7 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const id = url.searchParams.get("conversation") ?? "";
     return json({ thread: { id: id || "home-thread", alias: "master" }, entries: threads[id] ?? [], more_before: false });
   }
-  if (url.pathname === "/api/master/state") return json({ alias: "master", provider: "p", endpoint_kind: "k", live: true, turn, queue });
+  if (url.pathname === "/api/master/state") return json({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "p", endpoint_kind: "k", live: true, turn, queue });
   if (url.pathname === "/api/master/command") {
     commandPosts.push(JSON.parse(String(init!.body)));
     return json({ command: "x", ok: true, result: {} });

@@ -2,10 +2,37 @@
 
 use super::*;
 use cadence_core::board_api::{
-    AppOrigin, MasterContext, MasterQueued, MasterSession, MasterState, MasterTurn,
+    AppOrigin, AvatarLook, MasterContext, MasterIdentity, MasterQueued, MasterSession, MasterState,
+    MasterTurn,
 };
 
 impl Shared {
+    /// The coordinator's committed identity: the protected IDENTITY.md/SOUL.md
+    /// values plus the master agent's pinned look (the existing robot when
+    /// unpinned). A malformed or refused file read is an error, never a silent
+    /// unset; a missing file is genuinely unset.
+    pub(super) fn master_identity(&self) -> Result<MasterIdentity> {
+        let pm_dir = self.pm_dir()?;
+        let pinned = self
+            .store
+            .agent_opt(crate::master::ALIAS)?
+            .and_then(|agent| agent.params)
+            .and_then(|params| {
+                params
+                    .get("look")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        let look = crate::agent_roles::effective_look(crate::master::ALIAS, pinned.as_deref());
+        let identity = crate::master::read_identity(&pm_dir, look)?;
+        Ok(MasterIdentity {
+            name: identity.name,
+            tone: identity.tone,
+            look: AvatarLook::parse(look)
+                .ok_or_else(|| Error::internal("the effective master look is not canonical"))?,
+            revision: identity.revision,
+        })
+    }
     /// CAD-1700: `master_stamp` — the board's `master` push frame reads
     /// this cheaply (indexed SQL, no provider call). It changes whenever
     /// the master's running/queued turns, any master thread entry, or the
@@ -174,6 +201,7 @@ impl Shared {
             .collect::<Vec<_>>();
         Ok(serde_json::to_value(MasterState {
             alias: alias.to_string(),
+            identity: self.master_identity()?,
             provider: agent.provider.clone(),
             endpoint_kind: agent.endpoint_kind.clone(),
             live,

@@ -196,9 +196,9 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (method === "GET" && path === "/api/threads/master") {
     return json({ entries: [], more_before: false, thread: null });
   }
-  if (method === "GET" && path === "/api/threads/master/stream") return streamFixture(path, { alias: "master", provider: "pi", endpoint_kind: "pi", live: false, turn: null }, init?.signal);
+  if (method === "GET" && path === "/api/threads/master/stream") return streamFixture(path, { alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "pi", endpoint_kind: "pi", live: false, turn: null }, init?.signal);
   if (method === "GET" && path === "/api/master/state") {
-    return json({ alias: "master", provider: "pi", endpoint_kind: "pi", live: false, turn: null });
+    return json({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "pi", endpoint_kind: "pi", live: false, turn: null });
   }
   if (method === "GET" && path === `/api/app-installations/${INSTALL}/assistant/actions`) {
     return json({ contract: "app-assistant/v1", actions: [], descriptor_digest: "recovery-fixture" });

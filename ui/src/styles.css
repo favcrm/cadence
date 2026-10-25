@@ -612,19 +612,6 @@ pre {
   color: var(--color-ink-500);
   font-size: var(--text-micro);
 }
-.turn-avatar {
-  display: inline-grid;
-  flex: none;
-  place-items: center;
-  width: 1.125rem;
-  height: 1.125rem;
-  border: 1px solid color-mix(in srgb, var(--color-accent) 30%, var(--color-ink-700));
-  border-radius: .375rem;
-  background: color-mix(in srgb, var(--color-accent) 8%, var(--color-ink-850));
-  color: var(--color-accent);
-  font-size: .625rem;
-  line-height: 1;
-}
 .turn-name {
   color: var(--color-ink-200);
   font-size: var(--text-label);

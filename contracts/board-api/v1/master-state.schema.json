@@ -33,6 +33,9 @@
     "endpoint_kind": {
       "type": "string"
     },
+    "identity": {
+      "$ref": "#/$defs/MasterIdentity"
+    },
     "live": {
       "type": "boolean"
     },
@@ -84,6 +87,7 @@
   },
   "required": [
     "alias",
+    "identity",
     "provider",
     "endpoint_kind",
     "live",
@@ -112,6 +116,23 @@
         "conversation_id"
       ]
     },
+    "AvatarLook": {
+      "description": "A canonical avatar look (the board's eleven `AgentAvatar` palettes).",
+      "type": "string",
+      "enum": [
+        "builder",
+        "guard",
+        "bookkeeper",
+        "content",
+        "designer",
+        "reception",
+        "operations",
+        "support",
+        "tester",
+        "robot",
+        "custom"
+      ]
+    },
     "MasterContext": {
       "description": "The live session's context usage, when the provider answers `stats`.",
       "type": "object",
@@ -135,6 +156,34 @@
           ]
         }
       }
+    },
+    "MasterIdentity": {
+      "description": "The workspace coordinator's effective identity (`master_state.identity`).\n\n`name`/`tone` are the operator-owned protected files' agreed values (`null`\n= unset); `look` is the pinned `params.look` (the existing robot when\nunpinned); `revision` fences the next protected update.",
+      "type": "object",
+      "properties": {
+        "look": {
+          "$ref": "#/$defs/AvatarLook"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "type": "string"
+        },
+        "tone": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "look",
+        "revision"
+      ]
     },
     "MasterQueued": {
       "description": "One queued turn's routing metadata; never its body.",

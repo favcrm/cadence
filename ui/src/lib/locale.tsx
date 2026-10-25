@@ -1518,3 +1518,54 @@ Object.assign(zhTW, {
   "Reinstall": "重新安裝",
   "Check for update": "檢查更新",
 });
+
+/** CAD-1817: assistant identity chrome. Custom names never pass through
+ *  this map — only the role fallback, scope descriptors and editing copy. */
+Object.assign(zhTW, {
+  "Workspace assistant": "工作區助理",
+  "Personal assistant · private to you": "你的私人助理 · 僅你可見",
+  "Workspace assistant · shared with this workspace": "工作區助理 · 與此工作區共用身分",
+  "About your assistant": "關於你的助理",
+  "About the workspace assistant": "關於工作區助理",
+  "Close assistant details": "關閉助理資料",
+  "Display name": "顯示名稱",
+  "Personality": "個性與溝通風格",
+  "Belongs to": "屬於",
+  "This workspace": "此工作區",
+  "Not named yet": "尚未命名",
+  "Neutral, clear and practical": "中性、清楚且務實",
+  "The saved identity couldn’t be read. This is not the same as an unnamed assistant.":
+    "無法讀取已儲存的名稱與個性。這並不等同於尚未命名。",
+  "Ask me in this conversation to change my name or how I communicate. Your history and access stay the same.":
+    "直接在此對話中告訴我想更改的名稱或溝通風格。你的對話紀錄與存取權限維持不變。",
+  "Avatar": "頭像",
+  "Avatar change requested. It appears here only after the assistant confirms and saves it.":
+    "已提出頭像變更要求。助理確認並儲存後，才會顯示在這裡。",
+  "The avatar request was not sent.": "頭像變更要求未送出。",
+  "Avatar changes are unavailable on a read-only board.": "唯讀看板無法變更頭像。",
+  "This identity belongs to the workspace, not to its current owner. Changing it never changes permissions.":
+    "此身分屬於工作區，而非目前的擁有者。變更它不會改變任何權限。",
+  "Only an operator can change the workspace identity.": "僅操作員可以變更工作區助理身分。",
+  "Operator-only edit. Your personal assistant keeps its own name and preferences.":
+    "僅限操作員編輯。你的私人助理會保有自己的名稱與偏好。",
+  "Save identity": "儲存身分",
+  "The workspace identity was not changed.": "工作區助理身分尚未變更。",
+  "The save could not be confirmed. Refresh to check the saved identity; it was not retried.":
+    "無法確認是否已儲存。請重新整理以查看已儲存的身分；系統未自動重試。",
+  "Saved. The new identity applies when a new assistant session starts.":
+    "已儲存。新的身分會在助理開始新的工作階段時生效。",
+  "Saved. The new identity applies to the next turn.": "已儲存。新的身分會在下一回合生效。",
+  "Message the workspace assistant…": "傳訊給工作區助理…",
+  "is typing": "正在輸入",
+  "Builder": "建造者",
+  "Guard": "守衛",
+  "Bookkeeper": "記帳",
+  "Content": "內容",
+  "Designer": "設計",
+  "Reception": "接待",
+  "Operations": "營運",
+  "Support": "支援",
+  "Tester": "測試",
+  "Robot": "機器人",
+  "Custom": "自訂",
+});

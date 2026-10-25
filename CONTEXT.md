@@ -6,6 +6,14 @@ Cadence coordinates people and agents doing work through apps and projects.
 
 **Workspace**: The ownership and access boundary for a person's or organization's work. A workspace contains app installations and projects.
 
+**Personal assistant**: A user's private assistant within one workspace. An owner's personal assistant is not a separate type, and ownership does not transfer private conversations to the workspace.
+
+**Workspace coordinator**: The workspace-owned agent that coordinates authorized shared work. Its identity and shared work belong to the workspace rather than its current owner.
+
+**Assistant display name**: The user-facing name of an assistant, distinct from the user's preferred name and the workspace's name. Changing it does not change ownership or permissions.
+
+**Assistant personality**: Agreed communication style and manner, not permission to access information, approve work or perform actions.
+
 **App**: A reusable capability with its own workflows and user experience, such as Social Content or Open Slide.
 
 **App installation**: A workspace's configured instance of an app, with its own identity, team defaults and approved capabilities. Updating the app does not change who owns its work.

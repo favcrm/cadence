@@ -170,6 +170,9 @@ export interface ArtifactRow {
   size: number;
 }
 
+/** A canonical avatar look (the board's eleven `AgentAvatar` palettes). */
+export type AvatarLook = "builder" | "guard" | "bookkeeper" | "content" | "designer" | "reception" | "operations" | "support" | "tester" | "robot" | "custom";
+
 /** One bound agent on an issue card or drawer — from the job binding. */
 export interface CardAgent {
   alias: string;
@@ -374,6 +377,18 @@ export interface MasterContext {
   window?: number | null;
 }
 
+/** The workspace coordinator's effective identity (`master_state.identity`).
+ * 
+ * `name`/`tone` are the operator-owned protected files' agreed values (`null`
+ * = unset); `look` is the pinned `params.look` (the existing robot when
+ * unpinned); `revision` fences the next protected update. */
+export interface MasterIdentity {
+  look: AvatarLook;
+  name?: string | null;
+  revision: string;
+  tone?: string | null;
+}
+
 /** One queued turn's routing metadata; never its body. */
 export interface MasterQueued {
   conversation?: string | null;
@@ -397,6 +412,7 @@ export interface MasterState {
   context?: MasterContext | null;
   effort?: string | null;
   endpoint_kind: string;
+  identity: MasterIdentity;
   live: boolean;
   model?: string | null;
   model_label?: string | null;

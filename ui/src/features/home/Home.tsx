@@ -23,6 +23,14 @@ import {
 } from "./master";
 import { useCanvasFeed } from "../canvas/feed";
 import Composer from "./Composer";
+import {
+  AssistantAboutButton,
+  AssistantActorProvider,
+  AssistantFace,
+  useAssistantActor,
+  useWorkspaceActor,
+} from "../assistant/AssistantIdentity";
+import { displayName, scopeDescriptor } from "../assistant/identity";
 import type { AttachDestination } from "../app-shell/chat/attach";
 import { atTail, jumpLabel, repinOnResize, showJumpPill, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
@@ -144,9 +152,10 @@ function AssistantActivity({ since }: { since: number | null }) {
  *  one header. `at` is the anchored entry's own timestamp. */
 function AssistantNameRow({ at, live }: { at?: string; live: ReactNode }) {
   const t = useTranslate();
+  const actor = useAssistantActor();
   return (
     <div className="flex gap-2 items-center text-micro text-ink-400" data-kind="assistant-name">
-      <span className="text-ink-100 font-medium">{t("Assistant")}</span>
+      <span className="text-ink-100 font-medium">{displayName(actor.read, actor.scope, t)}</span>
       {at ? <span>{at}</span> : null}
       {/* The same `.chat-live` wrapper Bubble uses: right-aligned accent. */}
       <span className="chat-live num">{live}</span>
@@ -581,9 +590,14 @@ export default function Home({
   permissionsHref,
   resolveAppPath,
   setupNotice = null,
+  operator = null,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
+  /** CAD-1817: the verified session proves operator authority, the only
+   *  viewer that may edit the workspace coordinator's identity. `null`
+   *  is unproven, never an operator. */
+  operator?: boolean | null;
   /** CAD-1485: the verified public session's subject — member or
    *  operator/owner — when the session names one. `?chat=assistant`
    *  keys the owner's private chat on it; a member's default view is
@@ -641,6 +655,7 @@ export default function Home({
       permissionsHref={permissionsHref}
       resolveAppPath={resolveAppPath}
       setupNotice={setupNotice}
+      operator={operator}
     />
   );
 }
@@ -657,9 +672,11 @@ function MasterHome({
   permissionsHref,
   resolveAppPath,
   setupNotice = null,
+  operator = null,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
+  operator?: boolean | null;
   overview: ResourceState<Overview>;
   onOpenIssue: (id: string) => void;
   onOpenDecision: (open: HomeDecisionOpen) => void;
@@ -672,6 +689,7 @@ function MasterHome({
   const thread = useQuery(resources.masterThread);
   const agents = useResource(resources.agents);
   const master = useQuery(resources.masterState);
+  const actor = useWorkspaceActor(master, operator === true && !readOnly);
   const [seed, setSeed] = useState<{ text: string; n: number; refs?: ThreadRef[] }>({
     text: "",
     n: 0,
@@ -1148,6 +1166,7 @@ function MasterHome({
   };
 
   return (
+    <AssistantActorProvider actor={actor}>
     <main
       className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
         railCollapsed
@@ -1185,24 +1204,36 @@ function MasterHome({
             bottom. It fills the height below the board header; the page
             itself never scrolls for the chat. */}
         <div className="relative flex-1 min-h-0 flex flex-col" data-chat-panel>
-          <div className="master-heading flex items-center gap-2 flex-wrap pb-2.5 border-b border-ink-700/70">
-            <span className="text-accent text-section" aria-hidden>✳</span>
-            <h1 className="text-section font-semibold text-ink-100">{t("Assistant")}</h1>
-            <span
-              className={`chip ${
-                status.kind === "running"
-                  ? "bg-ok/15 text-ok"
-                  : status.kind === "unknown"
-                    ? "bg-ink-800 text-ink-400"
-                    : "bg-warn/10 text-warn"
-              }`}
-            >
-              {status.kind === "running" ? status.state : status.kind === "absent" ? t("not started") : status.kind}
-            </span>
-            <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
-            {streamReconnecting && activeTurn && status.kind === "running" && (
-              <span className="text-micro text-ink-500">{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
-            )}
+          <div
+            className="master-heading assistant-heading pb-2.5 border-b border-ink-700/70"
+            data-assistant-identity="workspace"
+            data-identity-state={actor.read.state}
+          >
+            <AssistantFace size={30} active={status.kind === "running"} />
+            <div className="assistant-heading-text">
+              <div className="assistant-heading-name">
+                <h1 className="text-section font-semibold text-ink-100" data-assistant-name>{displayName(actor.read, "workspace", t)}</h1>
+                <span
+                  className={`chip ${
+                    status.kind === "running"
+                      ? "bg-ok/15 text-ok"
+                      : status.kind === "unknown"
+                        ? "bg-ink-800 text-ink-400"
+                        : "bg-warn/10 text-warn"
+                  }`}
+                >
+                  {status.kind === "running" ? status.state : status.kind === "absent" ? t("not started") : status.kind}
+                </span>
+                <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
+                {streamReconnecting && activeTurn && status.kind === "running" && (
+                  <span className="text-micro text-ink-500">{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
+                )}
+              </div>
+              <p className="assistant-scope">{scopeDescriptor("workspace", t)}</p>
+            </div>
+            <div className="assistant-heading-actions">
+              <AssistantAboutButton />
+            </div>
           </div>
 
           {setupNotice}
@@ -1340,5 +1371,6 @@ function MasterHome({
         </div>
       </section>
     </main>
+    </AssistantActorProvider>
   );
 }

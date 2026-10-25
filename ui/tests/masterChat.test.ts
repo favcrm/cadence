@@ -82,6 +82,7 @@ const masterRow: Agent = {
 };
 
 const liveWorking: MasterState = {
+  identity: { name: null, tone: null, look: "robot", revision: "fixture" },
   alias: "master",
   provider: "pi",
   endpoint_kind: "worker",

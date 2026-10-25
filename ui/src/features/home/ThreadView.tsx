@@ -1,5 +1,7 @@
 import { useId, useMemo, useState, type ReactNode } from "react";
 import { useTranslate } from "../../lib/locale";
+import { AssistantFace, useAssistantActor } from "../assistant/AssistantIdentity";
+import { displayName } from "../assistant/identity";
 import type { ThreadRef } from "../../lib/types";
 import Md from "../../ui/Md";
 import { attachMeta } from "../app-shell/chat/attach";
@@ -153,6 +155,7 @@ export function ThreadItemView({
   activity?: ReactNode;
 }) {
   const t = useTranslate();
+  const actor = useAssistantActor();
   const compact = density === "compact";
   const bodyText = compact ? "text-secondary" : "text-body";
   switch (item.type) {
@@ -243,7 +246,7 @@ export function ThreadItemView({
       // why, instead of an empty bubble. No Retry here — the turn ran.
       const failure = turnFailure(item.entry, t);
       return (
-        <Bubble who={t("Assistant")} at={time(item.entry.created)} live={activity}>
+        <Bubble who={displayName(actor.read, actor.scope, t)} at={time(item.entry.created)} live={activity}>
           {failure && (
             <div className={`mt-0.5 ${bodyText} text-fail break-words`} role="alert" data-kind="turn-failure">
               {failure}
@@ -550,6 +553,7 @@ function lastCreated(items: ThreadItem[]): string | null {
  *  announce the same row twice. */
 function TypingDots() {
   const t = useTranslate();
+  const actor = useAssistantActor();
   return (
     <div className="typing" data-kind="typing">
       <span className="typing-dots" aria-hidden>
@@ -557,7 +561,7 @@ function TypingDots() {
         <i />
         <i />
       </span>
-      <span className="sr-only">{t("Assistant is typing")}</span>
+      <span className="sr-only">{`${displayName(actor.read, actor.scope, t)} ${t("is typing")}`}</span>
     </div>
   );
 }
@@ -754,6 +758,7 @@ export function ThreadTurn({
   after?: ReactNode;
 }) {
   const t = useTranslate();
+  const actor = useAssistantActor();
   const traceItems = items.filter(
     (item) => item.type === "thinking" || item.type === "commentary" || item.type === "tools",
   );
@@ -788,10 +793,8 @@ export function ThreadTurn({
   return (
     <div className="turn min-w-0" data-kind="turn" data-turn-state={streaming ? "running" : "complete"}>
       <div className="turn-head">
-        <span className="turn-avatar" aria-hidden>
-          ✳
-        </span>
-        <span className="turn-name">{t("Assistant")}</span>
+        <AssistantFace size={16} />
+        <span className="turn-name">{displayName(actor.read, actor.scope, t)}</span>
         <span className="turn-time num">{streaming ? t("now") : time(headAt)}</span>
         {shown && shown.entry.text.trim() !== "" && <CopyControl text={shown.entry.text} />}
       </div>

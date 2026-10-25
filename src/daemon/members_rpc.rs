@@ -923,6 +923,24 @@ impl Shared {
                 model_policy: None,
             })?;
         }
+        // REQ-011: pin the initial avatar look once, from the IMMUTABLE
+        // registered alias (never the display name), so a later catalogue
+        // addition cannot reroll it. An existing pin is preserved untouched.
+        let pinned = self
+            .store
+            .agent_opt(&binding.alias)?
+            .and_then(|agent| agent.params)
+            .and_then(|params| {
+                params
+                    .get("look")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        if pinned.is_none() {
+            let look = crate::agent_roles::look_for_alias(&binding.alias);
+            self.store
+                .set_params(&binding.alias, &json!({ "look": look }))?;
+        }
         // Bind the private conversation: the alias's home thread is the
         // member's own principal-private conversation. Never a shared app
         // installation or a cloned `install_id` — that would leak other
@@ -1639,6 +1657,12 @@ impl Shared {
     }
 
     /// `member_assist_state` — the member's own assistant surface state.
+    ///
+    /// The identity is a bounded read of the verified binding's private
+    /// profile files plus the owning agent's pinned avatar look. A read failure
+    /// (symlink, oversize, malformed block) propagates: an unreadable profile
+    /// is never presented as an unnamed assistant. The private user address and
+    /// preferences stay in USER.md and never enter this payload.
     pub(super) fn rpc_member_assist_state(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         reject_unknown_fields(params, &["member_envelope"], "member assist state")?;
         let member = self.member_caller(
@@ -1653,8 +1677,28 @@ impl Shared {
             .store
             .assistant_binding(&member.org, &member.sub)?
             .ok_or_else(|| Error::rejected("assistant binding vanished"))?;
+        let root = self.assistant_principal_cwd(&binding.org, &binding.sub);
+        let identity = super::bootstrap_files::read_identity(&root)?;
+        let pinned = self
+            .store
+            .agent_opt(&binding.alias)?
+            .and_then(|agent| agent.params)
+            .and_then(|params| {
+                params
+                    .get("look")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        let look = crate::agent_roles::effective_look(&binding.alias, pinned.as_deref());
+        let mut assistant = binding.to_json();
+        assistant["identity"] = json!({
+            "name": identity.name,
+            "tone": identity.tone,
+            "look": look,
+            "revision": binding.bootstrap_revision,
+        });
         Ok(json!({
-            "assistant": binding.to_json(),
+            "assistant": assistant,
             "conversation_id": member.conversation_id,
         }))
     }
@@ -2555,6 +2599,21 @@ impl Shared {
             }
         };
         let root = self.assistant_principal_cwd(&binding.org, &binding.sub);
+        // The same effective identity the authorized UI projection reads: the
+        // files are the authority, so an unreadable/malformed profile errors
+        // here too rather than briefing the model with a guessed name.
+        let identity = super::bootstrap_files::read_identity(&root)?;
+        let pinned = self
+            .store
+            .agent_opt(&binding.alias)?
+            .and_then(|agent| agent.params)
+            .and_then(|params| {
+                params
+                    .get("look")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        let look = crate::agent_roles::effective_look(&binding.alias, pinned.as_deref());
         let mut out = String::from("## Your private assistant profile\n\n");
         for name in [
             super::bootstrap_files::IDENTITY,
@@ -2565,13 +2624,28 @@ impl Shared {
             out.push_str("\n\n");
         }
         out.push_str(&format!(
+            "## Effective identity\n\n\
+             name (YOUR display name): {name}\n\
+             tone (how you communicate): {tone}\n\
+             look (your avatar): {look}\n\n\
+             `name` is never the user's name. The user's preferred address is \
+             `user_name` in USER.md; `preferences` holds other agreed user \
+             preferences. Both stay in USER.md and are never your identity.\n\n",
+            name = identity.name.as_deref().unwrap_or("(unset)"),
+            tone = identity.tone.as_deref().unwrap_or("(unset)"),
+        ));
+        out.push_str(&format!(
             "## Profile state\n\nstate: {state}\nrevision: {rev}\n\n\
              Your reply already answers the user's request above. Setup is optional.\n\n\
              To record an agreed change on this turn, ACK with a JSON object on stdin, \
              for example: `cadence message ack --bootstrap-file -` with \
              {{\"action\":\"update\",\"expected_revision\":{rev},\"profile\":{{\"name\":\"Ana\"}}}}\n\
-             Allowed actions in this state: {allowed}. Profile keys: name, tone, preferences.\n\n",
+             Allowed actions in this state: {allowed}.\n\
+             Profile keys: name (your name), tone, user_name (the user's preferred \
+             address), preferences, look. An empty string clears a value.\n\
+             look must be one of: {looks}.\n\n",
             rev = binding.bootstrap_revision,
+            looks = crate::agent_roles::LOOKS.join(", "),
         ));
         if state == "pending" {
             out.push_str("## Bootstrap (pending)\n\n");

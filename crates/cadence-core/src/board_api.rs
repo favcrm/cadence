@@ -520,11 +520,79 @@ pub struct MasterSession {
     pub compacting: Value,
 }
 
+/// A canonical avatar look (the board's eleven `AgentAvatar` palettes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AvatarLook {
+    Builder,
+    Guard,
+    Bookkeeper,
+    Content,
+    Designer,
+    Reception,
+    Operations,
+    Support,
+    Tester,
+    Robot,
+    Custom,
+}
+
+impl AvatarLook {
+    /// The canonical slug, as the board's catalogue spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AvatarLook::Builder => "builder",
+            AvatarLook::Guard => "guard",
+            AvatarLook::Bookkeeper => "bookkeeper",
+            AvatarLook::Content => "content",
+            AvatarLook::Designer => "designer",
+            AvatarLook::Reception => "reception",
+            AvatarLook::Operations => "operations",
+            AvatarLook::Support => "support",
+            AvatarLook::Tester => "tester",
+            AvatarLook::Robot => "robot",
+            AvatarLook::Custom => "custom",
+        }
+    }
+
+    /// Parse one catalogued slug; anything else is not a look.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "builder" => AvatarLook::Builder,
+            "guard" => AvatarLook::Guard,
+            "bookkeeper" => AvatarLook::Bookkeeper,
+            "content" => AvatarLook::Content,
+            "designer" => AvatarLook::Designer,
+            "reception" => AvatarLook::Reception,
+            "operations" => AvatarLook::Operations,
+            "support" => AvatarLook::Support,
+            "tester" => AvatarLook::Tester,
+            "robot" => AvatarLook::Robot,
+            "custom" => AvatarLook::Custom,
+            _ => return None,
+        })
+    }
+}
+
+/// The workspace coordinator's effective identity (`master_state.identity`).
+///
+/// `name`/`tone` are the operator-owned protected files' agreed values (`null`
+/// = unset); `look` is the pinned `params.look` (the existing robot when
+/// unpinned); `revision` fences the next protected update.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct MasterIdentity {
+    pub name: Option<String>,
+    pub tone: Option<String>,
+    pub look: AvatarLook,
+    pub revision: String,
+}
+
 /// `master_state` (daemon RPC; `GET /api/master/state` relays it): what the
 /// master header shows. A member's copy drops the turn's `summary`.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct MasterState {
     pub alias: String,
+    pub identity: MasterIdentity,
     pub provider: String,
     pub endpoint_kind: String,
     pub live: bool,

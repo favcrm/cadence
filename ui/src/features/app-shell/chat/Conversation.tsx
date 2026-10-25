@@ -90,6 +90,13 @@ import type { AppChat } from "./contract";
 import ChatFrame from "./ChatFrame";
 import DirectiveCard, { ConfirmationCard } from "./DirectiveCard";
 import AssistantOperations from "./AssistantOperations";
+import {
+  AssistantAboutButton,
+  AssistantActorProvider,
+  AssistantFace,
+  useWorkspaceActor,
+} from "../../assistant/AssistantIdentity";
+import { displayName, messageLabel, messagePlaceholder, scopeDescriptor } from "../../assistant/identity";
 import { carriesSecret, hideIds, matchDirective, type Directive } from "./directive";
 import { planFrames, type FrameRow } from "./frames";
 import type { FileUploadProjection } from "./descriptorClient";
@@ -488,6 +495,16 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const convId = active.state === "ready" ? (active.selected?.id ?? null) : null;
   const thread = useResource(store);
   const masterState = useQuery(resources.masterState);
+  // CAD-1817: this pane's actor is the workspace coordinator. The owner's
+  // private profile never labels a Master-backed app conversation.
+  const workspaceActor = useWorkspaceActor(masterState, viewer.operator === true && !viewer.readOnly);
+  const composerLabels = useMemo(
+    () => ({
+      placeholder: messagePlaceholder(workspaceActor.read, "workspace", t),
+      ariaLabel: messageLabel(workspaceActor.read, "workspace", t),
+    }),
+    [workspaceActor.read, t],
+  );
   const homeThread = useResource(resources.masterThread);
   // One draft per conversation: the composer remounts per store, so
   // switching conversations keeps each one's typed text (the stores and
@@ -1535,6 +1552,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           : null;
 
   return (
+    <AssistantActorProvider actor={workspaceActor}>
     <div className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
       <button
         type="button"
@@ -1548,9 +1566,16 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         <span className="app-chat-rail-label text-micro text-ink-400">{t("ASSISTANT")}</span>
       </button>
       <div className="app-chat-head">
-        <div className="app-chat-title min-w-0">
-          <span className="app-chat-mark" aria-hidden>✳</span>
-          <strong>{t("Assistant")}</strong>
+        <div
+          className="app-chat-title min-w-0"
+          data-assistant-identity="workspace"
+          data-identity-state={workspaceActor.read.state}
+        >
+          <AssistantFace size={20} />
+          <strong className="truncate" title={`${displayName(workspaceActor.read, "workspace", t)} — ${scopeDescriptor("workspace", t)}`} data-assistant-name>
+            {displayName(workspaceActor.read, "workspace", t)}
+          </strong>
+          <span className="sr-only">{scopeDescriptor("workspace", t)}</span>
           {(convLabel !== null || streamDown) && (
             <span
               className="app-chat-conv truncate text-ink-500 text-label"
@@ -1601,6 +1626,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
               {hasUnreadOther && <span className="app-chat-iconbtn-dot" aria-hidden />}
             </button>
           )}
+          <AssistantAboutButton />
           <span className="app-chat-sep" aria-hidden />
           <button
             type="button"
@@ -1913,10 +1939,11 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         onResolveOriginal={() => outboxRef.current?.scrollIntoView?.({ block: "nearest" })}
         textareaId={COMPOSER_ID}
         actions={csvActions}
-        ariaLabel={t("Message to Assistant")}
-        placeholder={t("Message Assistant…")}
+        ariaLabel={composerLabels.ariaLabel}
+        placeholder={composerLabels.placeholder}
         className="app-chat-form"
       />
     </div>
+    </AssistantActorProvider>
   );
 }
