@@ -50,13 +50,17 @@ actor queue cannot claim it. A duplicate durable envelope returns its original
 disposition, without another provider call. Reusing an id with changed content
 is a conflict. This is broker idempotency, not a claim of provider idempotency.
 
-## Local connect recipe (Claude, Codex, Pi)
+## Local connect recipe (Codex, Pi, Cursor, omp)
 
-Observed 2026-10-25 on Claude Code 2.1.310, codex-cli 0.163.0 and Pi 1.4.0
-with managed endpoints, in a disposable `cadence dev` instance. This is the
-owned local runtime-to-daemon route; `agent connect` keeps its separate
-hosted meaning (bind a local actor to a hosted workspace). The versions state
-what was exercised, not certification of native steering for them.
+CAD-1814's first wave is Codex, Pi, native Cursor (`agent`) and omp. Claude
+is deferred while its usage is unavailable; cloud/hosted runtimes and custom
+skills/MCP/memory are later work. On 2026-10-25, codex-cli 0.163.0 and Pi
+1.4.0 produced real replies and routed peer results in disposable state.
+Cursor is blocked on native login; omp 18.12.6 launches but its private
+native store has no `openai-codex` login. Neither is a model-reply PASS.
+The owned local runtime-to-daemon route below is separate from
+`agent connect`, which binds a local actor to a hosted workspace. Runtime
+versions are evidence, not certification of native steering.
 
 1. Instance and state, on a non-production board port:
    `cadence dev up --name <n> --build <cadence>` then
@@ -66,25 +70,33 @@ what was exercised, not certification of native steering for them.
    mutating; `settings agents show` reports the settings revision separately
    (step 3). This keeps a previously sourced
    `CADENCE_STATE_DIR`/`CADENCE_PROFILE` from retargeting the instance. No
-   manual or exported credential copies are needed: provider CLIs read the
-   operator's own configuration, and a managed Pi worker's normal custody is
-   the adapter's private, scoped copy of that auth under the state dir
+   manual or exported credential copies are needed for the exercised
+   Codex/Pi route: Codex reads its normal configuration, while a managed Pi
+   worker gets the adapter's private auth.json copy under the state dir
    (`PI_CODING_AGENT_DIR`; never env/argv, never `~/.pi` inheritance).
 2. Provider readiness is separate from Cadence:
-   `claude auth status`, `codex login status`,
-   `pi auth check --provider <provider>`. A missing provider auth or quota is
-   a blocker, not a failed delivery to substitute around.
+   `codex login status`, `pi auth check --provider <provider>`. For native
+   Cursor, `agent status` alone is insufficient: this host reported a
+   successful cached login while both `agent models` and real inference
+   refused authentication. The operator must complete `agent login`.
+   OMP uses its native `agent.db`, not Pi's auth.json. Do not copy an entire
+   operator database or export credentials to the command line. After its
+   private worker dir exists, the operator can authenticate that store with
+   `PI_CODING_AGENT_DIR=<sd>/agents/<omp>/pi omp login openai-codex`.
+   Missing native auth or quota is a blocker, not a delivery failure to
+   substitute another account/provider around.
 3. Launch (no profile, skill, messaging MCP or memory service required):
-   `cadence claude --alias <claude> --role worker --cwd <repo> --detach`,
-   `cadence codex --alias <codex> --role pm --cwd <repo> --detach`, and for a
-   managed Pi worker `cadence join <group> pi --alias <pi>
-   --model <provider/model> --no-bootstrap --detach` — there is no standalone
-   `cadence pi` verb. A managed Pi worker's model must be on the operator's
-   `Settings > Agents` allowlist for the worker role (or be the effective
-   policy default); the platform fallback is exempt at registration but is
-   refused when the Pi adapter opens, so an unconfigured store lands in
-   `attention` with that refusal rather than launching silently. Seed only
-   the intended row, as the operator, against the pinned destination, and
+   `cadence codex --alias <codex> --role pm --cwd <repo> --detach`,
+   `cadence cursor --alias <cursor> --role pm --cwd <repo> --model <native-model> --detach`,
+   and `cadence join <group> pi --alias <pi>
+   --model <provider/model> --no-bootstrap --detach`. OMP uses
+   `cadence join <group> omp --alias <omp> --model <provider/model>
+   --no-bootstrap --detach`. There is no standalone `cadence pi` verb.
+   Pi/OMP workers require an operator-authorized worker model in
+   `Settings > Agents`; no silent provider fallback is used. Cursor uses
+   the native `agent` harness, not Cursor through Pi: the unsafe Pi
+   transport remains refused. A startup refusal lands in `attention`.
+   Seed only the intended row against the pinned destination as the operator;
    re-read the revision before each mutation:
 
    ```sh
@@ -143,6 +155,20 @@ Pi's generated guard opens turn admission only on Pi 1.0.0, so 1.4.0 serves
 ordinary turns and refuses strict nudges (`agent show` distinguishes
 `capabilities.native_turn_steering` from `native_turn_steering_enabled`).
 Ordinary queued delivery and observation are unaffected.
+
+OMP startup uses its own CLI flags and core-tool names, not Pi's
+`--offline`/`--no-themes`/`--no-prompt-templates` or `find`/`ls`. Fresh
+workers use `--session-dir`; persisted sessions use `--resume`. The current
+session pointer is recorded only once its file exists inside that worker's
+directory; a nonexistent initial path is not proof of resumability.
+
+OMP's prompt acknowledgment is not completion. Its matching `prompt_result`
+reports completed/aborted/error; when `sessionSettled` is false, the adapter
+waits for `session_settled` before dispatching the next durable task. An
+asynchronous native auth rejection must become a failed receipt, not a
+permanently running task. Strict nudges remain disabled without verified
+runtime guard admission. Successful omp replies, persistence/restart and
+peer routing still require authenticated end-to-end evidence.
 
 ## Disposition is not task completion
 
