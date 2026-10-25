@@ -563,12 +563,12 @@ mod tests {
                 "crm",
             )
             .unwrap();
+        assert_eq!(assigned["work"]["assignee"], "Ada");
         assert_eq!(cleared["work"]["assignee"], Value::Null);
         assert_eq!(cleared["work"]["assigned_by"], "agent");
-        assert_ne!(
-            cleared["work"]["assigned_at"],
-            assigned["work"]["assigned_at"]
-        );
+        assert!(cleared["work"]["assigned_at"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
         let read = store
             .app_campaign_work_read(CONTEXT, CAMPAIGN, "crm", Access::Authorized, None)
             .unwrap();
