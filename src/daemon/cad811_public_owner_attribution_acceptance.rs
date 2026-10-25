@@ -64,6 +64,28 @@ impl Native {
     }
 
     pub(super) fn new_with_roles(allowed: &[(&str, Role)]) -> Self {
+        Self::new_with_roles_after_reservation(allowed, |_| {})
+    }
+
+    fn new_with_roles_after_reservation(
+        allowed: &[(&str, Role)],
+        mut before_bind: impl FnMut(u16),
+    ) -> Self {
+        // reserve_board_port's saturating cursor bounds the attempts and never
+        // reissues a port in this process. Only a real AddrInUse starts over.
+        loop {
+            match Self::try_new_with_roles(allowed, &mut before_bind) {
+                Ok(native) => return native,
+                Err(std::io::ErrorKind::AddrInUse) => {}
+                Err(kind) => panic!("fixture BLOCKED: real board startup failed: {kind:?}"),
+            }
+        }
+    }
+
+    fn try_new_with_roles(
+        allowed: &[(&str, Role)],
+        before_bind: &mut impl FnMut(u16),
+    ) -> std::result::Result<Self, std::io::ErrorKind> {
         let allowed: Vec<(String, Role)> = allowed
             .iter()
             .map(|(sub, role)| ((*sub).to_owned(), *role))
@@ -217,9 +239,10 @@ impl Native {
             }),
             ..Default::default()
         };
-        // A concurrent bind wins => BLOCKED, never kill/adopt it or change ports
-        // outside the approved range. Servers RAII still joins our own socket.
+        // A lost reservation refuses this attempt. Servers RAII joins only our
+        // own threads before a fresh state/realm may try another permitted port.
         drop(reservation);
+        before_bind(port);
         servers.threads.push(std::thread::spawn(move || {
             drop(crate::ui::serve(&state, &pm, &board_opts))
         }));
@@ -227,10 +250,7 @@ impl Native {
             receipt.recv_timeout(Duration::from_secs(10)),
             "board startup receipt",
         );
-        assert!(
-            bound.is_ok(),
-            "fixture BLOCKED: real board could not bind reserved port"
-        );
+        bound?;
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_global(Some(Duration::from_secs(10)))
@@ -244,13 +264,13 @@ impl Native {
             host,
             seam,
         };
-        Self {
+        Ok(Self {
             fx,
             shared,
             member_live,
             lookups,
             issuer,
-        }
+        })
     }
 
     pub(super) fn rpc(&self, method: &str, params: Value) -> crate::Result<Value> {
@@ -858,3 +878,48 @@ fn cad811_public_owner_attribution_survives_native_delegation_and_retirement_ref
 
 #[path = "cad811_missing_state_acceptance.rs"]
 mod independent_missing_state;
+
+#[test]
+fn cad1838_a_contended_board_start_preserves_the_competing_listener_and_native_authority() {
+    let mut competing = None;
+    let native = Native::new_with_roles_after_reservation(&[(OWNER, Role::Operator)], |port| {
+        if competing.is_none() {
+            competing = Some(
+                std::net::TcpListener::bind(("127.0.0.1", port))
+                    .expect("occupy the released reservation before the real board bind"),
+            );
+        }
+    });
+    let competing = competing.expect("the competing listener must have been installed");
+    let occupied = competing.local_addr().unwrap();
+    assert_ne!(
+        native.fx.base,
+        format!("http://{occupied}"),
+        "a failed start must not adopt the competing listener"
+    );
+    assert_eq!(
+        std::net::TcpListener::bind(occupied)
+            .expect_err("the original competing listener must still own its port")
+            .kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+
+    let scope = native.fx.install("startup-owner", OPERATIONS);
+    let (owner, expected) = native.owner();
+    let action = native.mount(&owner, "public", &scope, 1);
+    let created = native.service(
+        &owner,
+        "public",
+        &action,
+        "records.create",
+        json!({"record_id": "startup-control",
+            "profile": profile("Startup control", "startup-control@example.test")}),
+        true,
+    );
+    assert_eq!(created["record"]["revision"], 1);
+    assert_eq!(
+        native.revision_human(&scope, "record", "startup-control", 1),
+        Some(expected),
+        "the successful fresh board must preserve actual Native owner attribution"
+    );
+}

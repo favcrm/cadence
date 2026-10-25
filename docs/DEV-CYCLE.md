@@ -244,6 +244,15 @@ that proof.
 Host Rust builds use four jobs and normal build-slot admission. If admission
 is unavailable, report that limitation rather than claiming local validation.
 
+The CAD-811 public-owner fixture uses the board's typed startup receipt, not a
+health probe. Its `Native::try_new_with_roles` refuses a lost bind; only native
+`AddrInUse` starts a fresh state/realm on the next candidate from
+`test_ports::reserve_board_port`. That helper's saturating per-process cursor
+bounds attempts but is not a cross-process lease. Other startup errors and
+missing receipts remain blocked. CAD-1838's competing-listener check proves the
+original listener stays owned while a fresh real board preserves Native owner
+attribution over HTTP; the retired-reviewer refusal is unchanged.
+
 ### Queueing without a pane (subagents, operator shells)
 
 A caller with no registered pane or managed endpoint queues through the same
