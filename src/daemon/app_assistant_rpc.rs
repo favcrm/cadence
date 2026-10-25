@@ -12,6 +12,26 @@ use crate::store::app_audiences::AudienceBase;
 use crate::store::app_records::{AssistantOperationUpdate, AssistantPermissionWrite, RecordStore};
 use crate::store::app_sends::send_view;
 
+/// Resolve the campaign a send read is allowed to name. An explicit
+/// request is checked by `require_campaign` at the call site; an
+/// omitted request inherits a campaign subject, allows a General chat
+/// (no subject), and refuses every other subject kind.
+fn campaign_scope<'a>(
+    requested: Option<&'a str>,
+    subject: Option<&'a str>,
+) -> Result<Option<&'a str>> {
+    if requested.is_some() {
+        return Ok(requested);
+    }
+    match subject {
+        None => Ok(None),
+        Some(subject) => subject
+            .strip_prefix(crate::store::SUBJECT_CAMPAIGN)
+            .map(Some)
+            .ok_or_else(|| Error::rejected("this conversation is not about a campaign")),
+    }
+}
+
 fn exact(params: &Value, allowed: &[&str]) -> Result<()> {
     let fields = params
         .as_object()
@@ -646,11 +666,8 @@ impl Shared {
                     }
                     // A campaign-scoped conversation defaults to its own
                     // campaign; only a General chat may list the context.
-                    let campaign = requested.or_else(|| {
-                        scoped.subject.as_deref().and_then(|subject| {
-                            subject.strip_prefix(crate::store::SUBJECT_CAMPAIGN)
-                        })
-                    });
+                    // Any other subject kind fails closed.
+                    let campaign = campaign_scope(requested, scoped.subject.as_deref())?;
                     let sends = records.app_campaign_sends(&scoped.context, campaign)?;
                     let mut out = Vec::with_capacity(sends.len());
                     for send in &sends {
@@ -1693,4 +1710,37 @@ fn resource_refs(action: &str, result: &Value) -> Value {
     };
     id.map(|id| json!([{"kind":kind,"id":id,"label":label.unwrap_or(kind)}]))
         .unwrap_or_else(|| json!([]))
+}
+
+#[cfg(test)]
+mod campaign_scope_tests {
+    use super::campaign_scope;
+
+    #[test]
+    fn general_chat_may_list_the_context() {
+        assert_eq!(campaign_scope(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn campaign_subject_inherits_its_campaign() {
+        assert_eq!(
+            campaign_scope(None, Some("campaign:c1")).unwrap(),
+            Some("c1")
+        );
+    }
+
+    #[test]
+    fn other_subject_kinds_fail_closed() {
+        assert!(campaign_scope(None, Some("whatsapp:conv-1")).is_err());
+        assert!(campaign_scope(None, Some("customer:cust-1")).is_err());
+    }
+
+    #[test]
+    fn explicit_campaign_is_passed_through_for_the_caller_check() {
+        assert_eq!(
+            campaign_scope(Some("c2"), Some("campaign:c1")).unwrap(),
+            Some("c2")
+        );
+        assert_eq!(campaign_scope(Some("c2"), None).unwrap(), Some("c2"));
+    }
 }
