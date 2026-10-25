@@ -1,4 +1,5 @@
 import { api, ApiError, type MyWorkMembership, type MyWorkPayload } from "./api";
+import { normalizeAgentsPayload } from "./agentOn";
 import { myWorkApiQuery, myWorkViewKey, type MyWorkView } from "./myWorkQuery";
 import { QueryCache, type Resource } from "./cache";
 import { loadThread, type PageReader, type ThreadState } from "../features/home/thread";
@@ -180,7 +181,7 @@ export const resources = {
     isEmpty: (rows) => rows.length === 0,
   }),
   /** `GET /api/agents` — agent rows, task bindings and `by_issue`. */
-  agents: cache.resource<AgentsPayload>("agents", () => api.agents(), {
+  agents: cache.resource<AgentsPayload>("agents", () => api.agents().then(normalizeAgentsPayload), {
     isEmpty: (p) => p.agents.length === 0,
   }),
   /**

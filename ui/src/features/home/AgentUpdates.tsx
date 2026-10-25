@@ -8,6 +8,7 @@ import { activityTimeMs } from "../../lib/fmt";
 import { useTranslate } from "../../lib/locale";
 import { recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates, type AgentUpdate } from "./agentUpdateModel";
 import { ageLabel } from "./needs";
+import { agentOn } from "../../lib/agentOn";
 
 // Cap concurrent history reads across the rail. Thread tails are small, so a
 // freed slot goes to a waiting thread before a waiting agent detail: notes
@@ -152,7 +153,7 @@ function AgentCard({ agent, reports, onAsk, onOpenIssue }: {
       <span className={`text-micro ${agent.fenced ? "text-warn" : "text-ink-400"}`}>{state}</span>
     </div>
     <div className="flex flex-wrap gap-2 mt-1 text-micro text-ink-500">
-      {agent.on.map((id) => <button key={id} className="lnk num" onClick={() => onOpenIssue(id)}>{id}</button>)}
+      {agentOn(agent).map((id) => <button key={id} className="lnk num" onClick={() => onOpenIssue(id)}>{id}</button>)}
       <UpdatedAt at={agent.last_activity ?? null} />
     </div>
     {context && <p className="agent-context">{context}</p>}

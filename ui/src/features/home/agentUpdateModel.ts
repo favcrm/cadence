@@ -1,3 +1,4 @@
+import { agentOn } from "../../lib/agentOn";
 import type { Agent, AgentDetail } from "../../lib/types";
 import { activityTimeMs } from "../../lib/fmt";
 import { asEntry } from "./thread";
@@ -40,7 +41,7 @@ export function recentAgentUpdates(detail: AgentDetail | null, entries: unknown[
 
 export function recentWorkingAgents(agents: Agent[]): Agent[] {
   return agents.filter((a) => a.alias !== "master" &&
-    (a.running > 0 || a.queued > 0 || a.on.length > 0 || !!a.last_activity || (a.event_cursor ?? 0) > 0),
+    (a.running > 0 || a.queued > 0 || agentOn(a).length > 0 || !!a.last_activity || (a.event_cursor ?? 0) > 0),
   ).sort((a, b) => activityTimeMs(b.last_activity) - activityTimeMs(a.last_activity) ||
     (b.event_cursor ?? 0) - (a.event_cursor ?? 0))
     .slice(0, 12);

@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import type { WriteResp } from "../../lib/api";
 import { boardHeadline, boardScope, boardVisible, issueCounts } from "../../lib/counts";
 import { activeCount, epicProgress, matches, type BoardFilters } from "../../lib/filters";
+import { agentOn } from "../../lib/agentOn";
 import type { ResourceState } from "../../lib/cache";
 import { issuePath } from "../issues/model";
 import { STATUS_CHIP } from "../issues/chips";
@@ -233,7 +234,7 @@ export default function Board({
   // issue id → agent aliases currently running a turn that names it
   const busy = new Map<string, string[]>();
   for (const a of scopedAgents) {
-    for (const id of a.on) {
+    for (const id of agentOn(a)) {
       busy.set(id, [...(busy.get(id) ?? []), a.alias]);
     }
   }
@@ -535,7 +536,7 @@ export default function Board({
                 <span className="text-ink-500">
                   {t(a.fenced ? "fenced" : "busy")}
                 </span>
-                {a.on.map((id) => (
+                {agentOn(a).map((id) => (
                   <button
                     key={id}
                     className="lnk"
