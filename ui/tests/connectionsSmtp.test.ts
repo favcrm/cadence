@@ -540,6 +540,22 @@ async function main() {
   assert(!text5().includes("Check configuration"), "index carries no expanded detail");
   assert(!host5.querySelector('section[aria-label="add connection"]'), "index carries no credential form");
 
+  // CAD-1810: the group count is translated, not a raw template string.
+  window.localStorage.setItem("cadence-locale", "zh-TW");
+  const host7 = document.createElement("div");
+  document.body.appendChild(host7);
+  const root7 = createRoot(host7);
+  act(() => {
+    root7.render(withLocale(React.createElement(ConnectionsPage, { viewer: { operator: true, readOnly: false } })));
+  });
+  await settle(() => {
+    const text7 = host7.textContent ?? "";
+    assert(text7.includes("已連接 1 個"), "Chinese Connections count is translated");
+    assert(!text7.includes("1 connected"), "Chinese view does not leak the English count");
+  }, 30000);
+  await act(async () => root7.unmount());
+  window.localStorage.removeItem("cadence-locale");
+
   // Account rows are links to their own detail pages — the smtp row
   // names its exact /account/<id> URL.
   const smtpRowLink = Array.from(host5.querySelectorAll("a")).find((a) => (a.textContent ?? "").includes("news")) as HTMLAnchorElement | undefined;
