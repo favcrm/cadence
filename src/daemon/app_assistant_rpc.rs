@@ -8,7 +8,29 @@ use super::{required_str, Shared};
 use crate::app_assistant::Declared;
 use crate::error::{Error, Result};
 use crate::issue::app_catalog::workspace;
+use crate::store::app_audiences::AudienceBase;
 use crate::store::app_records::{AssistantOperationUpdate, AssistantPermissionWrite, RecordStore};
+use crate::store::app_sends::send_view;
+
+/// Resolve the campaign a send read is allowed to name. An explicit
+/// request is checked by `require_campaign` at the call site; an
+/// omitted request inherits a campaign subject, allows a General chat
+/// (no subject), and refuses every other subject kind.
+fn campaign_scope<'a>(
+    requested: Option<&'a str>,
+    subject: Option<&'a str>,
+) -> Result<Option<&'a str>> {
+    if requested.is_some() {
+        return Ok(requested);
+    }
+    match subject {
+        None => Ok(None),
+        Some(subject) => subject
+            .strip_prefix(crate::store::SUBJECT_CAMPAIGN)
+            .map(Some)
+            .ok_or_else(|| Error::rejected("this conversation is not about a campaign")),
+    }
+}
 
 fn exact(params: &Value, allowed: &[&str]) -> Result<()> {
     let fields = params
@@ -237,6 +259,7 @@ impl Shared {
                 .and_then(Value::as_array)
                 .ok_or_else(|| Error::rejected("assistant descriptor actions are invalid"))?;
             let mut actions = Vec::new();
+            let full = self.store.crm_autonomy_is_full()?;
             for row in declared {
                 let Some(id) = row.get("id").and_then(Value::as_str) else {
                     continue;
@@ -244,7 +267,12 @@ impl Shared {
                 let Some(meta) = crate::app_assistant::registered_action(id) else {
                     continue;
                 };
-                actions.push(json!({"id":id,"description":row["description"],"input_schema":meta.input_schema,"effect":meta.effect,"confirmation":meta.confirmation,"availability":"available"}));
+                let confirmation = if full && id == "customer.tags.update" {
+                    "none"
+                } else {
+                    meta.confirmation
+                };
+                actions.push(json!({"id":id,"description":row["description"],"input_schema":meta.input_schema,"effect":meta.effect,"confirmation":confirmation,"availability":"available"}));
             }
             actions.extend(super::app_record_actions_rpc::declared_record_actions(
                 self,
@@ -285,7 +313,7 @@ impl Shared {
         crate::app_assistant::validate_input(&meta.input_schema, input)?;
         if matches!(
             action_id,
-            "campaigns.show" | "campaigns.create_draft" | "email.draft"
+            "campaigns.show" | "campaigns.create_draft" | "campaigns.approve" | "email.draft"
         ) {
             scoped.require_campaign(required_str(input, "campaign_id")?)?;
         }
@@ -360,6 +388,49 @@ impl Shared {
                     .ok_or_else(|| Error::rejected("customer record revision unavailable"))?;
                 if input.get("expected_revision").and_then(Value::as_i64) != Some(old_revision) {
                     return Err(Error::rejected("customer record revision is stale"));
+                }
+                if records
+                    .app_assistant_permission_find(&scoped.context, action_id, customer, "deny")?
+                    .is_some_and(|p| p["state"].as_str() == Some("active"))
+                {
+                    return Err(Error::rejected("this action is blocked for this customer"));
+                }
+                if self.store.crm_autonomy_is_full()? {
+                    let mut profile = crate::store::app_records::CustomerProfile::parse(
+                        &old["record"]["profile"],
+                    )
+                    .map_err(|_| Error::rejected("customer profile cannot be safely updated"))?;
+                    profile.tags = serde_json::from_value(input["tags"].clone())
+                        .map_err(|_| Error::rejected("customer tags are invalid"))?;
+                    let updated = records.app_record_update_as_actor(
+                        &scoped.context,
+                        customer,
+                        old_revision,
+                        &profile,
+                        None,
+                        &format!("agent:{}", scoped.caller),
+                        None,
+                    )?;
+                    let op = records.app_assistant_operation_set(AssistantOperationUpdate {
+                        operation_id,
+                        context: &scoped.context,
+                        expected_revision: 1,
+                        status: "succeeded",
+                        summary: "Updated tags on one customer",
+                        result: &json!({
+                            "customer_id": customer,
+                            "tags": updated.pointer("/record/profile/tags").cloned().unwrap_or(json!([])),
+                            "revision": updated.pointer("/record/revision"),
+                        }),
+                        resource_refs: &json!([{
+                            "kind": "customer",
+                            "id": customer,
+                            "label": old.pointer("/record/profile/display_name").and_then(Value::as_str).unwrap_or("Customer"),
+                        }]),
+                        permission_request: &Value::Null,
+                        error: None,
+                    })?;
+                    return Ok(json!({"operation": op}));
                 }
                 let mut refs = vec![
                     json!({"kind":"customer","id":customer,"label":old.pointer("/record/profile/display_name").and_then(Value::as_str).unwrap_or("Customer")}),
@@ -466,6 +537,27 @@ impl Shared {
                 "customers.show" => {
                     records.app_record_show(&scoped.context, required_str(input, "customer_id")?)
                 }
+                "customers.notes.list" => records.app_note_list(
+                    &scoped.context,
+                    required_str(input, "customer_id")?,
+                    input
+                        .get("limit")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(crate::store::app_records::NOTE_PAGE_MAX),
+                ),
+                "customers.notes.create" => records.app_note_create(
+                    &scoped.context,
+                    required_str(input, "customer_id")?,
+                    required_str(input, "note_id")?,
+                    required_str(input, "body")?,
+                    &format!("agent:{}", scoped.caller),
+                ),
+                "customers.notes.delete" => records.app_note_delete(
+                    &scoped.context,
+                    required_str(input, "customer_id")?,
+                    required_str(input, "note_id")?,
+                    &format!("agent:{}", scoped.caller),
+                ),
                 "segments.list" => records.app_segment_list(&scoped.context),
                 "segments.show" => {
                     records.app_segment_show(&scoped.context, required_str(input, "segment_id")?)
@@ -487,6 +579,25 @@ impl Shared {
                         segment_params["expected_revision"] = expected_revision.clone();
                     }
                     self.rpc_app_segment_assistant_save(&segment_params, peer_pid)
+                }
+                "segments.save_static" => {
+                    let mut segment_params = json!({
+                        "install_id": &scoped.install,
+                        "context_id": &scoped.context,
+                        "segment_id": required_str(input, "segment_id")?,
+                        "name": super::app_audiences_rpc::audience_name(input)?,
+                        "segment_type": "static",
+                        "member_ids": input.get("member_ids").cloned().unwrap_or_else(|| json!([])),
+                        "message": required_str(params, "message")?,
+                        "token": required_str(params, "token")?,
+                    });
+                    if let Some(expected_revision) = input.get("expected_revision") {
+                        segment_params["expected_revision"] = expected_revision.clone();
+                    }
+                    self.rpc_app_segment_assistant_save(&segment_params, peer_pid)
+                }
+                "segments.delete" => {
+                    records.app_segment_delete(&scoped.context, required_str(input, "segment_id")?)
                 }
                 "social.drafts.status" => self.social_status(&records, &scoped.context),
                 "campaigns.list" => records.app_content_list(&scoped.context),
@@ -511,6 +622,110 @@ impl Shared {
                         &draft,
                         input.get("segment_id").and_then(Value::as_str),
                     )
+                }
+                "campaigns.apply" => {
+                    let proposal = required_str(input, "proposal_id")?;
+                    let shown = records.app_content_proposal_show(&scoped.context, proposal)?;
+                    if let Some(campaign) = shown
+                        .pointer("/proposal/campaign_id")
+                        .and_then(Value::as_str)
+                    {
+                        scoped.require_campaign(campaign)?;
+                    }
+                    records.app_content_proposal_apply(
+                        &scoped.context,
+                        proposal,
+                        input.get("expected_revision").and_then(Value::as_i64),
+                    )
+                }
+                "campaigns.discard" => {
+                    let proposal = required_str(input, "proposal_id")?;
+                    let shown = records.app_content_proposal_show(&scoped.context, proposal)?;
+                    if let Some(campaign) = shown
+                        .pointer("/proposal/campaign_id")
+                        .and_then(Value::as_str)
+                    {
+                        scoped.require_campaign(campaign)?;
+                    }
+                    records.app_content_proposal_discard(&scoped.context, proposal)
+                }
+                "campaigns.approve" => records.app_content_approve(
+                    &scoped.context,
+                    required_str(input, "campaign_id")?,
+                    input
+                        .get("expected_revision")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| Error::rejected("expected content revision is required"))?,
+                ),
+                "audiences.prepare" => {
+                    let base = AudienceBase::parse(
+                        input
+                            .get("base")
+                            .ok_or_else(|| Error::rejected("audience base is required"))?,
+                    )
+                    .map_err(|_| Error::rejected("audience base exceeds its supported grammar"))?;
+                    records.app_audience_prepare(
+                        &scoped.context,
+                        required_str(input, "freeze_id")?,
+                        &base,
+                        input.get("exclusion_list_id").and_then(Value::as_str),
+                        input
+                            .get("max_recipients")
+                            .and_then(Value::as_i64)
+                            .ok_or_else(|| {
+                                Error::rejected("audience maximum recipients is required")
+                            })?,
+                    )
+                }
+                "audiences.show" => {
+                    records.app_audience_show(&scoped.context, required_str(input, "freeze_id")?)
+                }
+                "sends.list" => {
+                    let requested = input.get("campaign_id").and_then(Value::as_str);
+                    if let Some(campaign) = requested {
+                        scoped.require_campaign(campaign)?;
+                    }
+                    // A campaign-scoped conversation defaults to its own
+                    // campaign; only a General chat may list the context.
+                    // Any other subject kind fails closed.
+                    let campaign = campaign_scope(requested, scoped.subject.as_deref())?;
+                    let sends = records.app_campaign_sends(&scoped.context, campaign)?;
+                    let mut out = Vec::with_capacity(sends.len());
+                    for send in &sends {
+                        let counts =
+                            records.app_campaign_delivery_counts(&scoped.context, &send.send_id)?;
+                        out.push(json!({
+                            "send_id": send.send_id,
+                            "campaign_id": send.campaign_id,
+                            "state": send.state,
+                            "send_digest": send.send_digest,
+                            "created": send.created,
+                            "approved_at": send.approved_at,
+                            "counts": counts,
+                            "delivery_claim": "smtp-acceptance-only",
+                        }));
+                    }
+                    Ok(json!({"sends": out}))
+                }
+                "sends.show" => {
+                    let send_id = required_str(input, "send_id")?;
+                    let send = records
+                        .app_campaign_send(&scoped.context, send_id)?
+                        .ok_or_else(|| {
+                            Error::rejected(
+                                "campaign send is unavailable for this installation and context",
+                            )
+                        })?;
+                    scoped.require_campaign(&send.campaign_id)?;
+                    let deliveries = records.app_campaign_deliveries(&scoped.context, send_id)?;
+                    let counts = records.app_campaign_delivery_counts(&scoped.context, send_id)?;
+                    Ok(send_view(
+                        &scoped.install,
+                        &scoped.context,
+                        &send,
+                        &deliveries,
+                        counts,
+                    ))
                 }
                 "email.draft" => {
                     let draft_value = input
@@ -1474,24 +1689,43 @@ fn resource_refs(action: &str, result: &Value) -> Value {
             .unwrap_or_else(|| json!([]));
     }
     let (kind, id, label) = match action {
-        "customers.show" => (
+        "customers.show"
+        | "customers.notes.list"
+        | "customers.notes.create"
+        | "customers.notes.delete" => (
             "customer",
-            result.pointer("/record/id").and_then(Value::as_str),
+            result
+                .pointer("/record/id")
+                .or_else(|| result.pointer("/note/record_id"))
+                .or_else(|| result.get("record_id"))
+                .and_then(Value::as_str),
             result
                 .pointer("/record/profile/display_name")
                 .and_then(Value::as_str),
         ),
-        "segments.show" | "segments.save" => (
+        "segments.show" | "segments.save" | "segments.save_static" => (
             "segment",
             result.pointer("/segment/id").and_then(Value::as_str),
             result.pointer("/segment/name").and_then(Value::as_str),
         ),
-        "campaigns.show" | "campaigns.create_draft" => (
+        "campaigns.show" | "campaigns.create_draft" | "campaigns.approve" => (
             "campaign",
             result
                 .pointer("/content/campaign_id")
                 .and_then(Value::as_str),
             result.pointer("/content/name").and_then(Value::as_str),
+        ),
+        "campaigns.apply" => (
+            "campaign",
+            result
+                .pointer("/content/campaign_id")
+                .and_then(Value::as_str),
+            Some("Campaign content"),
+        ),
+        "sends.show" => (
+            "send",
+            result.pointer("/send/send_id").and_then(Value::as_str),
+            Some("Campaign send"),
         ),
         "email.draft" => (
             "campaign",
@@ -1504,4 +1738,37 @@ fn resource_refs(action: &str, result: &Value) -> Value {
     };
     id.map(|id| json!([{"kind":kind,"id":id,"label":label.unwrap_or(kind)}]))
         .unwrap_or_else(|| json!([]))
+}
+
+#[cfg(test)]
+mod campaign_scope_tests {
+    use super::campaign_scope;
+
+    #[test]
+    fn general_chat_may_list_the_context() {
+        assert_eq!(campaign_scope(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn campaign_subject_inherits_its_campaign() {
+        assert_eq!(
+            campaign_scope(None, Some("campaign:c1")).unwrap(),
+            Some("c1")
+        );
+    }
+
+    #[test]
+    fn other_subject_kinds_fail_closed() {
+        assert!(campaign_scope(None, Some("whatsapp:conv-1")).is_err());
+        assert!(campaign_scope(None, Some("customer:cust-1")).is_err());
+    }
+
+    #[test]
+    fn explicit_campaign_is_passed_through_for_the_caller_check() {
+        assert_eq!(
+            campaign_scope(Some("c2"), Some("campaign:c1")).unwrap(),
+            Some("c2")
+        );
+        assert_eq!(campaign_scope(Some("c2"), None).unwrap(), Some("c2"));
+    }
 }

@@ -89,6 +89,102 @@
       "effect": "write",
       "confirmation": "permission_required",
       "availability": "requires_context"
+    },
+    {
+      "id": "segments.save_static",
+      "description": "Save a static segment from an explicit customer member list.",
+      "input_schema": {"type":"object","properties":{"segment_id":{"type":"string","minLength":1,"maxLength":128},"name":{"type":"string","minLength":1,"maxLength":120},"member_ids":{"type":"array","maxItems":1000,"items":{"type":"string","minLength":1,"maxLength":128}},"expected_revision":{"type":"integer","minimum":1}},"required":["segment_id","name","member_ids"],"additionalProperties":false},
+      "effect": "write",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "segments.delete",
+      "description": "Delete a saved segment. The revision log is retained.",
+      "input_schema": {"type":"object","properties":{"segment_id":{"type":"string","minLength":1,"maxLength":128}},"required":["segment_id"],"additionalProperties":false},
+      "effect": "delete",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "campaigns.apply",
+      "description": "Apply a pending assistant email proposal to the campaign draft.",
+      "input_schema": {"type":"object","properties":{"proposal_id":{"type":"string","minLength":1,"maxLength":128},"expected_revision":{"type":"integer","minimum":1}},"required":["proposal_id"],"additionalProperties":false},
+      "effect": "write",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "campaigns.discard",
+      "description": "Discard a pending assistant email proposal without changing the draft.",
+      "input_schema": {"type":"object","properties":{"proposal_id":{"type":"string","minLength":1,"maxLength":128}},"required":["proposal_id"],"additionalProperties":false},
+      "effect": "write",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "campaigns.approve",
+      "description": "Approve the campaign content at its exact current revision.",
+      "input_schema": {"type":"object","properties":{"campaign_id":{"type":"string","minLength":1,"maxLength":128},"expected_revision":{"type":"integer","minimum":1}},"required":["campaign_id","expected_revision"],"additionalProperties":false},
+      "effect": "write",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "audiences.prepare",
+      "description": "Freeze an exact audience for a campaign without sending.",
+      "input_schema": {"type":"object","properties":{"freeze_id":{"type":"string","minLength":1,"maxLength":128},"base":{"type":"object"},"exclusion_list_id":{"type":"string","maxLength":128},"max_recipients":{"type":"integer","minimum":1,"maximum":500}},"required":["freeze_id","base","max_recipients"],"additionalProperties":false},
+      "effect": "write",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "audiences.show",
+      "description": "Read a frozen audience and its live validity.",
+      "input_schema": {"type":"object","properties":{"freeze_id":{"type":"string","minLength":1,"maxLength":128}},"required":["freeze_id"],"additionalProperties":false},
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "sends.list",
+      "description": "List campaign sends and delivery counts.",
+      "input_schema": {"type":"object","properties":{"campaign_id":{"type":"string","minLength":1,"maxLength":128}},"required":[],"additionalProperties":false},
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "sends.show",
+      "description": "Read one campaign send and its delivery status.",
+      "input_schema": {"type":"object","properties":{"send_id":{"type":"string","minLength":1,"maxLength":128}},"required":["send_id"],"additionalProperties":false},
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "customers.notes.list",
+      "description": "List customer notes in the current CRM context.",
+      "input_schema": {"type":"object","properties":{"customer_id":{"type":"string","minLength":1,"maxLength":128},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["customer_id"],"additionalProperties":false},
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "customers.notes.create",
+      "description": "Append a plain-text note to a customer timeline.",
+      "input_schema": {"type":"object","properties":{"customer_id":{"type":"string","minLength":1,"maxLength":128},"note_id":{"type":"string","minLength":1,"maxLength":128},"body":{"type":"string","minLength":1,"maxLength":4000}},"required":["customer_id","note_id","body"],"additionalProperties":false},
+      "effect": "write",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "customers.notes.delete",
+      "description": "Soft-delete one customer note.",
+      "input_schema": {"type":"object","properties":{"customer_id":{"type":"string","minLength":1,"maxLength":128},"note_id":{"type":"string","minLength":1,"maxLength":128}},"required":["customer_id","note_id"],"additionalProperties":false},
+      "effect": "delete",
+      "confirmation": "none",
+      "availability": "requires_context"
     }
   ]
 }

@@ -151,6 +151,9 @@ impl Fx {
             .unwrap()["record"]
             .clone()
     }
+    fn records(&self) -> RecordStore {
+        RecordStore::open(self.dir.path(), &self.install).unwrap()
+    }
     fn create_turn(&self, message: &str) -> String {
         let params = json!({"alias":"master", "install_id":self.install,
             "context_id":self.context, "general":true});
@@ -176,6 +179,36 @@ impl Fx {
         self.shared.store.mark_running(message, &token).unwrap();
         token
     }
+    /// Start a campaign-scoped chat turn. The conversation subject is
+    /// the verified campaign the assistant actions must stay inside.
+    fn create_campaign_turn(&self, message: &str, campaign: &str) -> String {
+        let params = json!({"alias":"master", "install_id":self.install,
+            "context_id":self.context, "subject":format!("campaign:{campaign}")});
+        let made = scoped(Asserted::Operator, || {
+            self.shared
+                .dispatch("conversation_create", &params, std::process::id())
+        })
+        .unwrap();
+        let conversation = made["conversation"]["id"].as_str().unwrap().to_string();
+        let sent = json!({"alias":"master", "text":"Perform the requested CRM action",
+            "message":message, "conversation":conversation,
+            "app":{"install_id":self.install,"context_id":self.context}});
+        scoped(Asserted::Operator, || {
+            self.shared
+                .dispatch("thread_send", &sent, std::process::id())
+        })
+        .unwrap();
+        let token = crate::adapter::registry::PI_MANAGED_TURN_TOKENS.mint(MASTER_GENERATION);
+        self.db()
+            .execute(
+                "UPDATE messages SET state='submitting', started=1.0 WHERE id=?",
+                [message],
+            )
+            .unwrap();
+        self.shared.store.mark_running(message, &token).unwrap();
+        token
+    }
+
     fn invoke(
         &self,
         message: &str,
@@ -1312,4 +1345,397 @@ fn interrupted_running_operation_replay_is_unknown_without_duplicate_write() {
         "operation listing must not leave the interrupted operation running: {listed}"
     );
     fx.finish("m-crash-after-write");
+}
+
+/// CAD-1808 batch 1: a live scoped turn can save a static segment, apply
+/// and approve its own campaign content, and freeze the audience without
+/// an operator decision. Send and SMTP remain outside this batch.
+#[test]
+fn cad1808_scoped_turn_runs_internal_campaign_workflow() {
+    let fx = Fx::new();
+    let token = fx.create_turn("m-cad1808-workflow");
+
+    let segment = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "segments.save_static",
+            "op-1808-segment",
+            json!({
+                "segment_id":"seg-selected",
+                "name":"Selected accounts",
+                "member_ids":["cust-a","cust-b"]
+            }),
+        )
+        .unwrap();
+    assert_eq!(segment["operation"]["status"], "succeeded");
+    assert_eq!(
+        segment["operation"]["result"]["segment"]["segment_type"],
+        "static"
+    );
+    assert_eq!(
+        segment["operation"]["result"]["segment"]["member_ids"],
+        json!(["cust-a", "cust-b"])
+    );
+
+    let preview = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "segments.preview",
+            "op-1808-preview",
+            json!({"segment_id":"seg-selected"}),
+        )
+        .unwrap();
+    assert_eq!(preview["operation"]["result"]["base_count"], 2);
+    assert_eq!(
+        preview["operation"]["result"]["final_count"], 0,
+        "both seeded customers have unknown email consent"
+    );
+
+    let draft = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "campaigns.create_draft",
+            "op-1808-campaign",
+            json!({"campaign_id":"c1","name":"Launch","segment_id":"seg-selected"}),
+        )
+        .unwrap();
+    assert_eq!(draft["operation"]["status"], "succeeded");
+
+    let proposal = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "email.draft",
+            "op-1808-proposal",
+            json!({
+                "campaign_id":"c1",
+                "proposal_id":"p1",
+                "draft":{"subject":"Hello","blocks":[{"type":"paragraph","text":"A real draft."}]}
+            }),
+        )
+        .unwrap();
+    assert_eq!(proposal["operation"]["status"], "succeeded");
+
+    let applied = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "campaigns.apply",
+            "op-1808-apply",
+            json!({"proposal_id":"p1"}),
+        )
+        .unwrap();
+    assert_eq!(applied["operation"]["status"], "succeeded");
+    assert_eq!(
+        applied["operation"]["result"]["content"]["revision"], 2,
+        "the blank draft is revision 1 and applying the proposal writes revision 2"
+    );
+
+    let approved = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "campaigns.approve",
+            "op-1808-approve",
+            json!({"campaign_id":"c1","expected_revision":2}),
+        )
+        .unwrap();
+    assert_eq!(approved["operation"]["status"], "succeeded");
+    assert_eq!(
+        approved["operation"]["result"]["content"]["approval"]["valid"],
+        true
+    );
+
+    let frozen = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "audiences.prepare",
+            "op-1808-freeze",
+            json!({
+                "freeze_id":"f1",
+                "base":{"mode":"segment","segment_id":"seg-selected"},
+                "max_recipients":10
+            }),
+        )
+        .unwrap();
+    assert_eq!(frozen["operation"]["status"], "succeeded");
+    assert_eq!(frozen["operation"]["result"]["freeze"]["final_count"], 0);
+
+    let shown = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "audiences.show",
+            "op-1808-show",
+            json!({"freeze_id":"f1"}),
+        )
+        .unwrap();
+    assert_eq!(shown["operation"]["status"], "succeeded");
+    assert_eq!(shown["operation"]["result"]["valid"], true);
+
+    let sends = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "sends.list",
+            "op-1808-sends",
+            json!({"campaign_id":"c1"}),
+        )
+        .unwrap();
+    assert_eq!(sends["operation"]["status"], "succeeded");
+    assert_eq!(sends["operation"]["result"]["sends"], json!([]));
+
+    let deleted = fx
+        .invoke(
+            "m-cad1808-workflow",
+            &token,
+            "segments.delete",
+            "op-1808-delete",
+            json!({"segment_id":"seg-selected"}),
+        )
+        .unwrap();
+    assert_eq!(deleted["operation"]["status"], "succeeded");
+    assert_eq!(deleted["operation"]["result"]["deleted"], true);
+    fx.finish("m-cad1808-workflow");
+}
+
+/// CAD-1808 batch 2: at `full`, a tags-only update runs directly and
+/// records the agent. A standing deny still blocks it.
+#[test]
+fn cad1808_full_autonomy_applies_tag_update_with_agent_actor() {
+    let fx = Fx::new();
+    fx.operator("crm_autonomy_set", json!({"mode":"full"}));
+    let token = fx.create_turn("m-auto-tags");
+    let updated = fx
+        .invoke(
+            "m-auto-tags",
+            &token,
+            "customer.tags.update",
+            "op-auto-tags",
+            json!({"customer_id":"cust-a","tags":["auto"],"expected_revision":1}),
+        )
+        .unwrap();
+    assert_eq!(updated["operation"]["status"], "succeeded");
+    let shown = fx.customer("cust-a");
+    assert_eq!(shown["revision"], 2);
+    assert_eq!(shown["profile"]["tags"], json!(["auto"]));
+    assert_eq!(
+        shown["history"].as_array().unwrap().last().unwrap()["actor"],
+        "agent:master"
+    );
+    fx.finish("m-auto-tags");
+
+    fx.operator(
+        "app_assistant_permission_block",
+        json!({"install_id":fx.install,"context_id":fx.context,"action_id":"customer.tags.update","resource_id":"cust-a"}),
+    );
+    let token = fx.create_turn("m-auto-blocked");
+    let blocked = fx.invoke(
+        "m-auto-blocked",
+        &token,
+        "customer.tags.update",
+        "op-auto-blocked",
+        json!({"customer_id":"cust-a","tags":["blocked"],"expected_revision":2}),
+    );
+    refusal(blocked, "standing deny at full autonomy");
+    assert_eq!(fx.customer("cust-a")["profile"]["tags"], json!(["auto"]));
+    fx.finish("m-auto-blocked");
+}
+
+/// CAD-1808 review fix: a campaign-scoped turn cannot discard or read
+/// another campaign's proposal/send inside the same installation.
+#[test]
+fn cad1808_campaign_turn_cannot_reach_another_campaign() {
+    use crate::store::app_sends::{send_digest, SendDraft};
+
+    let fx = Fx::new();
+    let seed = fx.create_turn("m-cad1808-campaigns");
+    for campaign in ["c1", "c2"] {
+        fx.invoke(
+            "m-cad1808-campaigns",
+            &seed,
+            "campaigns.create_draft",
+            &format!("op-{campaign}"),
+            json!({"campaign_id":campaign,"name":campaign}),
+        )
+        .unwrap();
+    }
+    fx.invoke(
+        "m-cad1808-campaigns",
+        &seed,
+        "email.draft",
+        "op-p2",
+        json!({
+            "campaign_id":"c2",
+            "proposal_id":"p2",
+            "draft":{"subject":"Other campaign","blocks":[{"type":"paragraph","text":"Keep me."}]}
+        }),
+    )
+    .unwrap();
+    fx.finish("m-cad1808-campaigns");
+
+    // Seed a prepared send for c2 so a context-wide list would expose it.
+    let records = fx.records();
+    let mut draft = SendDraft {
+        send_id: "send-c2".into(),
+        campaign_id: "c2".into(),
+        request_id: "req-c2".into(),
+        content_revision: 1,
+        content_digest: format!("sha256:{}", "1".repeat(64)),
+        audience_freeze_id: "freeze-c2".into(),
+        audience_digest: format!("sha256:{}", "2".repeat(64)),
+        connection_id: "conn-c2".into(),
+        auth_revision: 1,
+        link_revision: 1,
+        link_digest: format!("sha256:{}", "3".repeat(64)),
+        max_recipients: 10,
+        unsubscribe_origin: "https://example.test".into(),
+        send_digest: String::new(),
+    };
+    draft.send_digest = send_digest(&fx.install, &fx.context, &draft);
+    records
+        .app_campaign_send_prepare(&fx.context, &draft)
+        .unwrap();
+
+    let token = fx.create_campaign_turn("m-cad1808-c1", "c1");
+    refusal(
+        fx.invoke(
+            "m-cad1808-c1",
+            &token,
+            "campaigns.discard",
+            "op-discard-c2",
+            json!({"proposal_id":"p2"}),
+        ),
+        "cross-campaign discard",
+    );
+    let proposal = records
+        .app_content_proposal_show(&fx.context, "p2")
+        .unwrap();
+    assert_eq!(proposal["proposal"]["state"], "pending");
+
+    let listed = fx
+        .invoke(
+            "m-cad1808-c1",
+            &token,
+            "sends.list",
+            "op-sends-c1",
+            json!({}),
+        )
+        .unwrap();
+    assert_eq!(
+        listed["operation"]["result"]["sends"],
+        json!([]),
+        "a c1 conversation must not list c2 sends"
+    );
+    refusal(
+        fx.invoke(
+            "m-cad1808-c1",
+            &token,
+            "sends.list",
+            "op-sends-c2-explicit",
+            json!({"campaign_id":"c2"}),
+        ),
+        "cross-campaign explicit send list",
+    );
+    refusal(
+        fx.invoke(
+            "m-cad1808-c1",
+            &token,
+            "sends.show",
+            "op-send-c2-show",
+            json!({"send_id":"send-c2"}),
+        ),
+        "cross-campaign send show",
+    );
+    fx.finish("m-cad1808-c1");
+
+    // A General conversation may still see the context's sends.
+    let general = fx.create_turn("m-cad1808-general-sends");
+    let all = fx
+        .invoke(
+            "m-cad1808-general-sends",
+            &general,
+            "sends.list",
+            "op-all-sends",
+            json!({}),
+        )
+        .unwrap();
+    assert_eq!(all["operation"]["result"]["sends"][0]["send_id"], "send-c2");
+    fx.finish("m-cad1808-general-sends");
+}
+
+/// CAD-1808 notes: a scoped turn appends, lists and soft-deletes a
+/// customer note; the record receipt carries the live notes.
+#[test]
+fn cad1808_scoped_turn_manages_customer_notes() {
+    let fx = Fx::new();
+    let token = fx.create_turn("m-cad1808-notes");
+    let created = fx
+        .invoke(
+            "m-cad1808-notes",
+            &token,
+            "customers.notes.create",
+            "op-note-create",
+            json!({"customer_id":"cust-a","note_id":"n1","body":"Called about renewal."}),
+        )
+        .unwrap();
+    assert_eq!(created["operation"]["status"], "succeeded");
+    assert_eq!(
+        created["operation"]["result"]["note"]["actor"],
+        "agent:master"
+    );
+    let listed = fx
+        .invoke(
+            "m-cad1808-notes",
+            &token,
+            "customers.notes.list",
+            "op-note-list",
+            json!({"customer_id":"cust-a"}),
+        )
+        .unwrap();
+    assert_eq!(listed["operation"]["result"]["count"], 1);
+    assert_eq!(
+        listed["operation"]["result"]["notes"][0]["body"],
+        "Called about renewal."
+    );
+    let shown = fx
+        .invoke(
+            "m-cad1808-notes",
+            &token,
+            "customers.show",
+            "op-note-show",
+            json!({"customer_id":"cust-a"}),
+        )
+        .unwrap();
+    assert_eq!(
+        shown["operation"]["result"]["record"]["notes"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    let deleted = fx
+        .invoke(
+            "m-cad1808-notes",
+            &token,
+            "customers.notes.delete",
+            "op-note-delete",
+            json!({"customer_id":"cust-a","note_id":"n1"}),
+        )
+        .unwrap();
+    assert_eq!(deleted["operation"]["status"], "succeeded");
+    let after = fx
+        .invoke(
+            "m-cad1808-notes",
+            &token,
+            "customers.notes.list",
+            "op-note-list-after",
+            json!({"customer_id":"cust-a"}),
+        )
+        .unwrap();
+    assert_eq!(after["operation"]["result"]["count"], 0);
+    fx.finish("m-cad1808-notes");
 }

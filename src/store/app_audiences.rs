@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const SEGMENT_PREDICATES_MAX: usize = 8;
+pub const SEGMENT_MEMBERS_MAX: usize = 1000;
 pub const SEGMENT_NAME_BYTES: usize = 80;
 pub const PREDICATE_VALUE_BYTES: usize = 120;
 pub const EXCLUSION_MEMBERS_MAX: usize = 100;
@@ -130,6 +131,146 @@ impl Predicate {
             !hit
         } else {
             hit
+        }
+    }
+}
+
+/// A saved segment is either a rule set evaluated live over the
+/// context's customers, or an explicit stable-ID member list. The
+/// two shapes share the segment row and revision log so a segment
+/// keeps one identity, one revision CAS and one freeze pin.
+#[derive(Clone, Debug)]
+pub enum SegmentDefinition {
+    Dynamic(Vec<Predicate>),
+    Static(Vec<String>),
+}
+
+impl SegmentDefinition {
+    pub fn is_static(&self) -> bool {
+        matches!(self, Self::Static(_))
+    }
+
+    pub fn member_ids(&self) -> &[String] {
+        match self {
+            Self::Static(ids) => ids,
+            Self::Dynamic(_) => &[],
+        }
+    }
+
+    pub fn predicates(&self) -> &[Predicate] {
+        match self {
+            Self::Dynamic(rules) => rules,
+            Self::Static(_) => &[],
+        }
+    }
+
+    /// Stored shape. Dynamic keeps the historical bare array so
+    /// existing rows, digests and pinned freezes stay valid.
+    fn to_stored(&self) -> Value {
+        match self {
+            Self::Dynamic(rules) => Value::Array(
+                rules
+                    .iter()
+                    .map(|rule| json!({"field": rule.field, "op": rule.op, "value": rule.value}))
+                    .collect(),
+            ),
+            Self::Static(ids) => json!({"kind": "static", "member_ids": ids}),
+        }
+    }
+
+    fn parse_stored(raw: &Value) -> Result<Self> {
+        match raw {
+            Value::Array(items) => {
+                let mut rules = Vec::with_capacity(items.len());
+                for item in items {
+                    rules.push(
+                        Predicate::parse(item).map_err(|_| {
+                            Error::rejected("audience segment definition is corrupt")
+                        })?,
+                    );
+                }
+                Ok(Self::Dynamic(rules))
+            }
+            Value::Object(fields)
+                if fields.get("kind").and_then(Value::as_str) == Some("static") =>
+            {
+                let items = fields
+                    .get("member_ids")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| Error::rejected("audience segment definition is corrupt"))?;
+                let mut ids = Vec::with_capacity(items.len());
+                for item in items {
+                    let id = item
+                        .as_str()
+                        .ok_or_else(|| Error::rejected("audience segment definition is corrupt"))?;
+                    crate::proto::identifier(id, "record ID")
+                        .map_err(|_| Error::rejected("audience segment definition is corrupt"))?;
+                    ids.push(id.to_string());
+                }
+                Ok(Self::Static(ids))
+            }
+            _ => Err(Error::rejected("audience segment definition is corrupt")),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Dynamic(rules) => {
+                if rules.is_empty() || rules.len() > SEGMENT_PREDICATES_MAX {
+                    return Err(Error::rejected(
+                        "audience segment predicates exceed their bound",
+                    ));
+                }
+                for rule in rules {
+                    rule.validate()?;
+                }
+            }
+            Self::Static(ids) => {
+                if ids.len() > SEGMENT_MEMBERS_MAX {
+                    return Err(Error::rejected(
+                        "audience segment member list exceeds its bound",
+                    ));
+                }
+                let mut sorted = ids.clone();
+                sorted.sort();
+                sorted.dedup();
+                if sorted.len() != ids.len() {
+                    return Err(Error::rejected(
+                        "audience segment member list contains duplicates",
+                    ));
+                }
+                for id in ids {
+                    crate::proto::identifier(id, "record ID")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Dynamic digests stay on the historical domain. Static digests
+    /// bind the member list itself, so a membership edit is a new
+    /// revision and a stale freeze cannot follow it.
+    fn digest(&self, install_id: &str, context: &str, segment_id: &str, name: &str) -> String {
+        match self {
+            Self::Dynamic(rules) => material_digest(&json!({
+                "domain": "cadence-app-segment-v1",
+                "install_id": install_id,
+                "context_id": context,
+                "segment_id": segment_id,
+                "name": name,
+                "definition": rules
+                    .iter()
+                    .map(|rule| json!({"field": rule.field, "op": rule.op, "value": rule.value}))
+                    .collect::<Vec<_>>(),
+            })),
+            Self::Static(ids) => material_digest(&json!({
+                "domain": "cadence-app-segment-static-v1",
+                "install_id": install_id,
+                "context_id": context,
+                "segment_id": segment_id,
+                "name": name,
+                "member_ids": ids,
+            })),
         }
     }
 }
@@ -319,7 +460,7 @@ impl RecordStore {
         conn: &impl super::StoreConn,
         context: &str,
         segment_id: &str,
-    ) -> Result<(i64, String, Vec<Predicate>, String)> {
+    ) -> Result<(i64, String, SegmentDefinition, String)> {
         let (revision, name, definition, digest): (i64, String, String, String) = conn
             .query_row(
                 "SELECT revision,name,definition,digest FROM app_segments WHERE context_id=? AND id=?",
@@ -331,17 +472,8 @@ impl RecordStore {
             .ok_or_else(|| Error::rejected("audience segment is unavailable for this installation and context"))?;
         let raw: Value = serde_json::from_str(&definition)
             .map_err(|_| Error::rejected("audience segment definition is corrupt"))?;
-        let items = raw
-            .as_array()
-            .ok_or_else(|| Error::rejected("audience segment definition is corrupt"))?;
-        let mut predicates = Vec::with_capacity(items.len());
-        for item in items {
-            predicates.push(
-                Predicate::parse(item)
-                    .map_err(|_| Error::rejected("audience segment definition is corrupt"))?,
-            );
-        }
-        Ok((revision, name, predicates, digest))
+        let parsed = SegmentDefinition::parse_stored(&raw)?;
+        Ok((revision, name, parsed, digest))
     }
 
     fn exclusion_in(
@@ -398,15 +530,29 @@ impl RecordStore {
                 Value::Null,
             ),
             AudienceBase::Segment { segment_id } => {
-                let (revision, _, predicates, digest) =
+                let (revision, _, definition, digest) =
                     Self::segment_in(conn, context, segment_id)?;
                 let mut ids = Vec::new();
-                for row in &customers {
-                    if predicates
-                        .iter()
-                        .all(|rule| rule.matches(row.profile.as_ref()))
-                    {
-                        ids.push(row.id.clone());
+                match &definition {
+                    SegmentDefinition::Dynamic(predicates) => {
+                        for row in &customers {
+                            if predicates
+                                .iter()
+                                .all(|rule| rule.matches(row.profile.as_ref()))
+                            {
+                                ids.push(row.id.clone());
+                            }
+                        }
+                    }
+                    SegmentDefinition::Static(members) => {
+                        for id in members {
+                            if !by_id.contains_key(id.as_str()) {
+                                return Err(Error::rejected(
+                                    "audience segment names a customer that no longer exists",
+                                ));
+                            }
+                            ids.push(id.clone());
+                        }
                     }
                 }
                 (
@@ -583,39 +729,57 @@ impl RecordStore {
         name: &str,
         predicates: &[Predicate],
     ) -> Result<Value> {
+        self.app_segment_save_definition(
+            context,
+            segment_id,
+            expected_revision,
+            name,
+            &SegmentDefinition::Dynamic(predicates.to_vec()),
+        )
+    }
+
+    /// Save either a rule-based or an explicit-member segment. The
+    /// identity, revision CAS and digest are shared; only the stored
+    /// definition differs. A static save verifies every named record
+    /// exists in this context before the transaction commits.
+    pub fn app_segment_save_definition(
+        &self,
+        context: &str,
+        segment_id: &str,
+        expected_revision: Option<i64>,
+        name: &str,
+        definition: &SegmentDefinition,
+    ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(segment_id, "segment ID")?;
         if !segment_name_valid(name) {
             return Err(Error::rejected("audience segment name exceeds its bounds"));
         }
-        if predicates.is_empty() || predicates.len() > SEGMENT_PREDICATES_MAX {
-            return Err(Error::rejected(
-                "audience segment predicates exceed their bound",
-            ));
-        }
-        for rule in predicates {
-            rule.validate()?;
-        }
-        let definition = Value::Array(
-            predicates
-                .iter()
-                .map(|rule| json!({"field": rule.field, "op": rule.op, "value": rule.value}))
-                .collect(),
-        );
-        let digest = material_digest(&json!({
-            "domain": "cadence-app-segment-v1",
-            "install_id": self.install(),
-            "context_id": context,
-            "segment_id": segment_id,
-            "name": name,
-            "definition": definition,
-        }));
+        definition.validate()?;
+        let stored_value = definition.to_stored();
+        let digest = definition.digest(self.install(), context, segment_id, name);
         let stored =
-            serde_json::to_string(&definition).map_err(|e| Error::internal(e.to_string()))?;
+            serde_json::to_string(&stored_value).map_err(|e| Error::internal(e.to_string()))?;
         // `write_tx` holds `BEGIN IMMEDIATE` across the check + writes:
         // a racing saver blocks on the write lock first, so exactly one
         // revision wins and the loser is stale.
         self.write_tx(|tx| {
+            if let SegmentDefinition::Static(members) = definition {
+                for id in members {
+                    let exists: Option<i64> = tx
+                        .query_opt(
+                            "SELECT 1 FROM app_records WHERE context_id=? AND id=?",
+                            params![context, id],
+                            |_row| Ok(1i64),
+                        )
+                        .map_err(|e| Error::internal(e.to_string()))?;
+                    if exists.is_none() {
+                        return Err(Error::rejected(
+                            "audience segment member is unavailable in this context",
+                        ));
+                    }
+                }
+            }
             let current: Option<i64> = tx
                 .query_opt(
                     "SELECT revision FROM app_segments WHERE context_id=? AND id=?",
@@ -668,23 +832,76 @@ impl RecordStore {
             .map_err(|e| Error::internal(e.to_string()))?;
             Ok(revision)
         })?;
-        Ok(json!({"segment": self.app_segment_show(context, segment_id)?["segment"]}))
+        Ok(json!({"segment": self.segment_view(context, segment_id)?}))
     }
 
-    pub fn app_segment_show(&self, context: &str, segment_id: &str) -> Result<Value> {
-        crate::proto::identifier(context, "context ID")?;
-        crate::proto::identifier(segment_id, "segment ID")?;
+    fn segment_view(&self, context: &str, segment_id: &str) -> Result<Value> {
         let conn = self.conn();
-        let (revision, name, predicates, digest) = Self::segment_in(&conn, context, segment_id)?;
-        Ok(json!({"segment": {
+        let (revision, name, definition, digest) = Self::segment_in(&conn, context, segment_id)?;
+        let mut view = json!({
             "id": segment_id,
             "install_id": self.install(),
             "context_id": context,
             "revision": revision,
             "name": name,
-            "predicates": predicates.iter().map(|rule| json!({"field": rule.field, "op": rule.op, "value": rule.value})).collect::<Vec<_>>(),
             "digest": digest,
-        }}))
+        });
+        match definition {
+            SegmentDefinition::Dynamic(predicates) => {
+                view["segment_type"] = json!("dynamic");
+                view["predicates"] = json!(predicates
+                    .iter()
+                    .map(|rule| json!({"field": rule.field, "op": rule.op, "value": rule.value}))
+                    .collect::<Vec<_>>());
+                view["member_ids"] = json!([]);
+            }
+            SegmentDefinition::Static(members) => {
+                view["segment_type"] = json!("static");
+                view["predicates"] = json!([]);
+                view["member_ids"] = json!(members);
+            }
+        }
+        Ok(view)
+    }
+
+    /// Remove a saved segment. The revision log remains as the
+    /// tombstone; a frozen audience or prepared send that pinned this
+    /// segment's digest can no longer recompute, so it refuses on the
+    /// next validity check rather than silently following a new set.
+    pub fn app_segment_delete(&self, context: &str, segment_id: &str) -> Result<Value> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(segment_id, "segment ID")?;
+        let (revision, digest) = self.write_tx(|tx| {
+            let row: Option<(i64, String)> = tx
+                .query_opt(
+                    "SELECT revision,digest FROM app_segments WHERE context_id=? AND id=?",
+                    params![context, segment_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            let (revision, digest) = row.ok_or_else(|| {
+                Error::rejected("audience segment is unavailable for this installation and context")
+            })?;
+            let changed = tx
+                .execute(
+                    "DELETE FROM app_segments WHERE context_id=? AND id=? AND revision=?",
+                    params![context, segment_id, revision],
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            if changed != 1 {
+                return Err(Error::rejected("audience segment revision is stale"));
+            }
+            Ok((revision, digest))
+        })?;
+        Ok(
+            json!({"deleted": true, "segment_id": segment_id, "revision": revision, "digest": digest}),
+        )
+    }
+
+    pub fn app_segment_show(&self, context: &str, segment_id: &str) -> Result<Value> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(segment_id, "segment ID")?;
+        Ok(json!({"segment": self.segment_view(context, segment_id)?}))
     }
 
     pub fn app_segment_list(&self, context: &str) -> Result<Value> {
@@ -701,15 +918,10 @@ impl RecordStore {
             ids.push(row.map_err(|e| Error::internal(e.to_string()))?);
         }
         drop(stmt);
+        drop(conn);
         let mut segments = Vec::with_capacity(ids.len());
         for id in &ids {
-            let (revision, name, predicates, digest) = Self::segment_in(&conn, context, id)?;
-            segments.push(json!({
-                "id": id, "install_id": self.install(), "context_id": context,
-                "revision": revision, "name": name,
-                "predicates": predicates.iter().map(|rule| json!({"field": rule.field, "op": rule.op, "value": rule.value})).collect::<Vec<_>>(),
-                "digest": digest,
-            }));
+            segments.push(self.segment_view(context, id)?);
         }
         Ok(json!({"segments": segments}))
     }

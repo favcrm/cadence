@@ -18,7 +18,7 @@
 //! transport grammar, POST-only writes).
 use super::app_screen_services_rpc::ScreenServiceProof;
 use super::*;
-use crate::store::app_audiences::{AudienceBase, Predicate};
+use crate::store::app_audiences::{AudienceBase, Predicate, SegmentDefinition};
 use crate::store::app_records::RecordStore;
 
 pub(super) fn audience_predicates(params: &Value) -> Result<Vec<Predicate>> {
@@ -49,6 +49,46 @@ pub(super) fn audience_predicates(params: &Value) -> Result<Vec<Predicate>> {
         })?);
     }
     Ok(predicates)
+}
+
+pub(super) fn audience_segment_definition(params: &Value) -> Result<SegmentDefinition> {
+    match params
+        .get("segment_type")
+        .and_then(Value::as_str)
+        .unwrap_or("dynamic")
+    {
+        "dynamic" => Ok(SegmentDefinition::Dynamic(audience_predicates(params)?)),
+        "static" => {
+            let list = params
+                .get("member_ids")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if list.len() > crate::store::app_audiences::SEGMENT_MEMBERS_MAX {
+                return Err(Error::rejected(
+                    "audience segment members exceed their bound",
+                ));
+            }
+            let mut members = Vec::with_capacity(list.len());
+            for id in list {
+                let id = id
+                    .as_str()
+                    .ok_or_else(|| Error::rejected("audience segment member must be a string"))?;
+                crate::proto::identifier(id, "record ID")?;
+                members.push(id.to_string());
+            }
+            let mut sorted = members.clone();
+            sorted.sort();
+            sorted.dedup();
+            if sorted.len() != members.len() {
+                return Err(Error::rejected("audience segment members must not repeat"));
+            }
+            Ok(SegmentDefinition::Static(members))
+        }
+        _ => Err(Error::rejected(
+            "audience segment type must be dynamic or static",
+        )),
+    }
 }
 
 pub(super) fn audience_name(params: &Value) -> Result<String> {
@@ -196,11 +236,14 @@ impl Shared {
                 "context_id",
                 "segment_id",
                 "name",
+                "segment_type",
                 "predicates",
+                "member_ids",
                 "expected_revision",
             ],
             "app_segment_show" => &["install_id", "context_id", "segment_id"],
             "app_segment_list" => &["install_id", "context_id"],
+            "app_segment_delete" => &["install_id", "context_id", "segment_id"],
             "app_exclusion_save" => &[
                 "install_id",
                 "context_id",
@@ -242,6 +285,7 @@ impl Shared {
         let write = matches!(
             method,
             "app_segment_save"
+                | "app_segment_delete"
                 | "app_exclusion_save"
                 | "app_suppression_add"
                 | "app_suppression_remove"
@@ -250,13 +294,16 @@ impl Shared {
         let result = self.screen_service_scope(install, context, true, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
             match method {
-                "app_segment_save" => records.app_segment_save(
+                "app_segment_save" => records.app_segment_save_definition(
                     context,
                     required_str(params, "segment_id")?,
                     audience_expected(params)?,
                     &audience_name(params)?,
-                    &audience_predicates(params)?,
+                    &audience_segment_definition(params)?,
                 ),
+                "app_segment_delete" => {
+                    records.app_segment_delete(context, required_str(params, "segment_id")?)
+                }
                 "app_segment_show" => {
                     records.app_segment_show(context, required_str(params, "segment_id")?)
                 }

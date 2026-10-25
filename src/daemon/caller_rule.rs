@@ -782,6 +782,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_record_csv_import", Rule::Handler("operator_connection (CAD-779)")),
     ("app_record_csv_confirm", Rule::Handler("operator_connection (CAD-1014: host-bound confirm receipt mint)")),
     ("app_segment_save", Rule::Handler("operator_connection (CAD-780)")),
+    ("app_segment_delete", Rule::Handler("operator_connection (CAD-780)")),
     ("app_segment_show", Rule::Handler("operator_connection (CAD-780)")),
     ("app_segment_list", Rule::Handler("operator_connection (CAD-780)")),
     ("app_exclusion_save", Rule::Handler("operator_connection (CAD-780)")),
@@ -1327,6 +1328,8 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("crm_send_resolve", Rule::Handler("rpc_crm_send")),
     ("crm_send_origin_set", Rule::Handler("rpc_crm_send")),
     ("crm_send_origin_show", Rule::Handler("rpc_crm_send")),
+    ("crm_autonomy_set", Rule::Handler("rpc_crm_send")),
+    ("crm_autonomy_show", Rule::Handler("rpc_crm_send")),
     // CAD-786: the unsubscribe token is the credential — the verb
     // can only add a suppression.
     ("crm_unsubscribe_redeem", Rule::Bearer),

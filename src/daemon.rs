@@ -3330,6 +3330,7 @@ impl Shared {
             "app_record_csv_import" => self.rpc_app_record(method, params, peer_pid),
             "app_record_csv_confirm" => self.rpc_app_record(method, params, peer_pid),
             "app_segment_save" => self.rpc_app_audience(method, params, peer_pid),
+            "app_segment_delete" => self.rpc_app_audience(method, params, peer_pid),
             "app_record_csv_assistant_import" => {
                 self.rpc_app_record_csv_assistant_import(params, peer_pid)
             }
@@ -3581,6 +3582,8 @@ impl Shared {
             "crm_send_resolve" => self.rpc_crm_send(method, params, peer_pid),
             "crm_send_origin_set" => self.rpc_crm_send(method, params, peer_pid),
             "crm_send_origin_show" => self.rpc_crm_send(method, params, peer_pid),
+            "crm_autonomy_set" => self.rpc_crm_send(method, params, peer_pid),
+            "crm_autonomy_show" => self.rpc_crm_send(method, params, peer_pid),
             // CAD-786: the token is the credential — deliberately NOT
             // operator-gated, and the answer reveals nothing.
             "crm_unsubscribe_redeem" => self.rpc_crm_unsubscribe_redeem(params),

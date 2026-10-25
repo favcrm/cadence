@@ -484,6 +484,14 @@ pub(crate) enum ContentAction {
         #[arg(long, requires = "message")]
         token: String,
     },
+    /// Set CRM action autonomy: `assisted` keeps the operator decision
+    /// on record writes and campaign sends; `full` lets a scoped agent
+    /// turn run them directly. Operator only.
+    #[command(name = "autonomy-set")]
+    AutonomySet { mode: String },
+    /// Show the current CRM action autonomy.
+    #[command(name = "autonomy-show")]
+    AutonomyShow,
 }
 
 /// CAD-1662 native Works verbs. Each takes an explicit install and
@@ -1368,6 +1376,8 @@ fn content_params(action: &ContentAction) -> Result<(&'static str, serde_json::V
             "app_content_assistant_proposal_show",
             json!({"install_id":install_id,"context_id":context_id,"proposal_id":proposal_id,"message":message,"token":token}),
         ),
+        ContentAction::AutonomySet { mode } => ("crm_autonomy_set", json!({"mode":mode})),
+        ContentAction::AutonomyShow => ("crm_autonomy_show", json!({})),
     })
 }
 

@@ -281,12 +281,13 @@ pub(super) fn declared_record_actions(shared: &Shared, install: &str) -> Result<
             return Ok(Vec::new());
         }
         let app = shared.install_app_slug(install)?;
+        let full = shared.store.crm_autonomy_is_full()?;
         let descriptor = crate::issue::app_action::validate_customer_bundle(text, &app)?;
         Ok(descriptor
             .actions
             .iter()
             .map(|action| {
-                json!({"id":action.id,"description":action.title,"input_schema":input_schema(action),"effect":"write","confirmation":"permission_required","availability":"available"})
+                json!({"id":action.id,"description":action.title,"input_schema":input_schema(action),"effect":"write","confirmation":if full {"none"} else {"permission_required"},"availability":"available"})
             })
             .collect())
     })
@@ -323,6 +324,22 @@ fn build_preview(
             (current["record"]["profile"].clone(), revision)
         }
     };
+    // A standing tags-only deny is a statement about this customer's
+    // tags, not about one action id: a declared record update that
+    // carries tags must not route around it.
+    if action.operation == Operation::RecordUpdate
+        && admitted.fields.contains_key("tags")
+        && records
+            .app_assistant_permission_find(
+                context,
+                "customer.tags.update",
+                &admitted.record_id,
+                "deny",
+            )?
+            .is_some_and(|permission| permission["state"].as_str() == Some("active"))
+    {
+        return Err(Error::rejected("this action is blocked for this customer"));
+    }
     let base = if before.is_null() {
         None
     } else {
@@ -368,6 +385,16 @@ pub(super) fn invoke_record_action(
             if !is_new || op.get("status").and_then(Value::as_str) != Some("running") {
                 return Ok(json!({"operation": super::app_assistant_rpc::public_operation(op)}));
             }
+            if shared.store.crm_autonomy_is_full()? {
+                return apply_record_action_auto(
+                    records,
+                    &scoped.context,
+                    operation_id,
+                    action,
+                    input,
+                    &scoped.caller,
+                );
+            }
             let proposed = admit(action, input).and_then(|admitted| {
                 let preview = build_preview(records, &scoped.context, action, &admitted)?;
                 Ok((admitted.record_id, preview))
@@ -409,6 +436,100 @@ pub(super) fn invoke_record_action(
             }
         },
     )
+}
+
+/// Autonomous record write at `full` autonomy: the same admission,
+/// preview and compare-and-set as the operator path, but the scoped
+/// agent turn is the actor. No permission row is created.
+fn apply_record_action_auto(
+    records: &RecordStore,
+    context: &str,
+    operation_id: &str,
+    action: &Action,
+    input: &Value,
+    caller: &str,
+) -> Result<Value> {
+    let actor = format!("agent:{caller}");
+    let attempt = (|| -> Result<(String, CustomerProfile, Value)> {
+        let admitted = admit(action, input)?;
+        let preview = build_preview(records, context, action, &admitted)?;
+        let base = match action.operation {
+            Operation::RecordCreate => None,
+            Operation::RecordUpdate => Some(
+                CustomerProfile::parse(&preview["before"])
+                    .map_err(|_| Error::rejected("record profile cannot be safely updated"))?,
+            ),
+        };
+        let profile = patched_profile(base.as_ref(), &admitted.fields)?;
+        match action.operation {
+            Operation::RecordCreate => records.app_record_create_as_actor(
+                context,
+                &admitted.record_id,
+                &profile,
+                None,
+                &actor,
+                None,
+            ),
+            Operation::RecordUpdate => records.app_record_update_as_actor(
+                context,
+                &admitted.record_id,
+                admitted.expected.unwrap_or_default(),
+                &profile,
+                None,
+                &actor,
+                None,
+            ),
+        }
+        .map(|stored| (admitted.record_id, profile, stored))
+    })();
+    match attempt {
+        Ok((record_id, profile, stored)) => {
+            let revision = stored
+                .pointer("/record/revision")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let op = records.app_assistant_operation_set(AssistantOperationUpdate {
+                operation_id,
+                context,
+                expected_revision: 1,
+                status: "succeeded",
+                summary: "Record change applied",
+                result: &json!({"record_id": record_id, "revision": revision}),
+                resource_refs: &json!([{"kind":"customer","id":record_id,"label":profile.display_name}]),
+                permission_request: &Value::Null,
+                error: None,
+            })?;
+            Ok(json!({"operation": super::app_assistant_rpc::public_operation(op)}))
+        }
+        Err(error) => {
+            let definite = super::app_assistant_rpc::assistant_error_is_definite_refusal(&error);
+            let (status, summary, detail) = if definite {
+                (
+                    "failed",
+                    "Record change was refused; no change was made",
+                    "Action was refused without a recorded change",
+                )
+            } else {
+                (
+                    "unknown",
+                    "Outcome uncertain; operator must verify the record before any retry",
+                    "Outcome may be uncertain; do not retry automatically",
+                )
+            };
+            let _ = records.app_assistant_operation_set(AssistantOperationUpdate {
+                operation_id,
+                context,
+                expected_revision: 1,
+                status,
+                summary,
+                result: &Value::Null,
+                resource_refs: &json!([]),
+                permission_request: &Value::Null,
+                error: Some(detail),
+            });
+            Err(error)
+        }
+    }
 }
 
 /// Native operator decision for a declared record action (`allow_once` only).
