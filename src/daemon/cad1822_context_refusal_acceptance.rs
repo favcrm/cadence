@@ -353,7 +353,6 @@ impl Fixture {
         }
         fixture.token = Seam::token_at(&fixture.state).expect("fixture seam token");
 
-        fixture.start_board();
         fixture.register_agents();
         fixture
     }
@@ -501,7 +500,9 @@ impl Fixture {
     /// fixture's SQLite file only observes what the served daemon recorded;
     /// it cannot fabricate a pin or borrow another message's pin.
     fn context_pin(&self, alias: &str, message: &str) -> Value {
-        let store = crate::store::Store::open(&self.state.join("cadence.sqlite3"))
+        // open_side preserves the live daemon's identity and in-flight turns;
+        // Store::open is the owner boot path and would run restart recovery.
+        let store = crate::store::Store::open_side(&self.state.join("cadence.sqlite3"))
             .expect("open fixture store for the pin receipt");
         store
             .context_pin(alias, message)
@@ -613,7 +614,8 @@ fn expect_refused(
 
 #[test]
 fn cad1822_mandatory_issue_context_refuses_before_adapter_submission() {
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
+    fixture.start_board();
     let session = fixture.session();
 
     // Positive control: the same live path, the same worker shape and a
@@ -820,7 +822,17 @@ fn cad1822_compaction_restores_the_bound_task_on_plain_worker_followups() {
         &[(POLICY, policy.as_str())],
     );
     let dispatched = fixture.kickoff_rpc(CONTROL, CONTROL_WORKER).unwrap();
-    let store = crate::store::Store::open(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let expected_generation = fixture.op("agent_show", json!({"alias": CONTROL_WORKER}))["agent"]
+        ["generation"]
+        .as_str()
+        .expect("the fixture must launch a generation-reporting endpoint")
+        .to_string();
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
+    assert_eq!(
+        store.agent(CONTROL_WORKER).unwrap().generation.as_deref(),
+        Some(expected_generation.as_str()),
+        "opening an observation handle must not recover or invalidate the live endpoint"
+    );
     let supplied = |message: &str| {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -846,9 +858,18 @@ fn cad1822_compaction_restores_the_bound_task_on_plain_worker_followups() {
             .to_string()
     };
     let first = supplied(dispatched["message"].as_str().unwrap());
+    fixture.wait_state(CONTROL_WORKER, "idle");
+    let active = fixture.op("agent_show", json!({"alias": CONTROL_WORKER}));
+    assert_eq!(
+        first["session"], active["agent"]["thread_id"],
+        "retention requires the same confirmed live provider session: {active}"
+    );
+    assert_eq!(
+        first["generation"], active["agent"]["generation"],
+        "retention requires the same confirmed live endpoint generation: {active}"
+    );
     let followup = send("Continue the bound issue without changing its policy.");
     let retained = supplied(&followup);
-    eprintln!("[DEBUG-c1822-ci] first={first}; retained={retained}");
     assert_eq!(
         retained["appended_bytes"],
         0,
@@ -886,7 +907,7 @@ fn cad1822_receipt_loss_preserves_task_without_replaying_the_turn() {
          BEGIN SELECT RAISE(FAIL, 'CAD1822 injected receipt failure'); END;",
         )
         .unwrap();
-    let store = crate::store::Store::open(&path).unwrap();
+    let store = crate::store::Store::open_side(&path).unwrap();
     let event = |kind: &str, message: &str| {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -953,7 +974,7 @@ fn cad1822_uncertain_delivery_requires_reconciliation_not_replay() {
         json!({"alias": CONTROL_WORKER, "text": "DISCONNECT"}),
     );
     let lost_id = lost["message"].as_str().unwrap();
-    let store = crate::store::Store::open(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     while store.message(lost_id).unwrap().unwrap().state != "unknown" {
         assert!(
@@ -962,6 +983,7 @@ fn cad1822_uncertain_delivery_requires_reconciliation_not_replay() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    fixture.wait_state(CONTROL_WORKER, "attention");
     assert_eq!(store.message(lost_id).unwrap().unwrap().state, "unknown");
     let events = store.events_tail(CONTROL_WORKER, 100).unwrap();
     assert!(events.iter().any(|entry| {
@@ -998,10 +1020,6 @@ fn cad1822_uncertain_delivery_requires_reconciliation_not_replay() {
         "alias": CONTROL_WORKER, "status": "interrupted", "resume": true,
         "note": "Isolated fake disconnected after acceptance; no external actions; settle without resend."
     }));
-    eprintln!(
-        "[DEBUG-c1822-ci] reconciliation={reconciled:?}; message={:?}",
-        store.message(lost_id).unwrap()
-    );
     assert!(
         reconciled.is_ok(),
         "operator reconciliation={reconciled:?}; message={:?}; current={}",
@@ -1066,7 +1084,7 @@ fn cad1822_activation_write_failure_refuses_before_provider_acceptance() {
         .unwrap();
     let kickoff = fixture.kickoff_rpc(CONTROL, CONTROL_WORKER).unwrap();
     let id = kickoff["message"].as_str().unwrap();
-    let store = crate::store::Store::open(&path).unwrap();
+    let store = crate::store::Store::open_side(&path).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let failed = loop {
         let message = store.message(id).unwrap().unwrap();
@@ -1099,7 +1117,7 @@ fn cad1822_activation_write_failure_refuses_before_provider_acceptance() {
 #[test]
 fn cad1822_non_context_turn_keeps_legacy_continuity_above_pilot_cap() {
     let fixture = Fixture::new();
-    let store = crate::store::Store::open(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
     let completed = |id: &str| {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -1176,7 +1194,7 @@ fn opt_out_assignment_does_not_restore_prior_context(
     blocked_event: Option<&str>,
 ) {
     let fixture = Fixture::new();
-    let store = crate::store::Store::open(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
     let event = |kind: &str, id: &str| {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -1312,7 +1330,7 @@ fn cad1822_failed_scope_invalidation_cannot_submit_the_new_assignment() {
 #[test]
 fn cad1822_rejected_message_collision_cannot_retarget_queued_context() {
     let fixture = Fixture::new();
-    let store = crate::store::Store::open(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
     let event = |kind: &str, id: &str| {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -1431,7 +1449,7 @@ fn cad1822_accepted_legacy_retry_does_not_recapture_new_project_context() {
     );
     let first = fixture.kickoff_rpc(CONTROL, CONTROL_WORKER).unwrap();
     let id = first["message"].as_str().unwrap();
-    let store = crate::store::Store::open(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let original = loop {
         let message = store.message(id).unwrap().unwrap();
@@ -1475,7 +1493,7 @@ fn cad1822_accepted_legacy_retry_does_not_recapture_new_project_context() {
 }
 
 fn context_event(fixture: &Fixture, alias: &str, kind: &str, message: &str) -> Value {
-    let store = crate::store::Store::open(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(entry) = store
@@ -1538,7 +1556,7 @@ fn cad1822_retained_peer_envelope_overflow_refuses_before_provider() {
     })
     .unwrap();
     let id = sent["message"].as_str().unwrap();
-    let store = crate::store::Store::open(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let settled = loop {
         let message = store.message(id).unwrap().unwrap();
