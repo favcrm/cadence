@@ -1572,19 +1572,23 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           data-identity-state={workspaceActor.read.state}
         >
           <AssistantFace size={20} />
-          <strong className="truncate" title={`${displayName(workspaceActor.read, "workspace", t)} — ${scopeDescriptor("workspace", t)}`} data-assistant-name>
-            {displayName(workspaceActor.read, "workspace", t)}
-          </strong>
-          <span className="sr-only">{scopeDescriptor("workspace", t)}</span>
-          {(convLabel !== null || streamDown) && (
-            <span
-              className="app-chat-conv truncate text-ink-500 text-label"
-              data-chat-conv-label
-              data-state={streamDown ? "offline" : undefined}
-            >
-              · {streamDown ? t("Reconnecting…") : convLabel}
-            </span>
-          )}
+          <div className="assistant-heading-text">
+            <div className="flex min-w-0 items-baseline gap-2">
+              <strong className="truncate" title={`${displayName(workspaceActor.read, "workspace", t)} — ${scopeDescriptor("workspace", t)}`} data-assistant-name>
+                {displayName(workspaceActor.read, "workspace", t)}
+              </strong>
+              {(convLabel !== null || streamDown) && (
+                <span
+                  className="app-chat-conv truncate text-ink-500 text-label"
+                  data-chat-conv-label
+                  data-state={streamDown ? "offline" : undefined}
+                >
+                  · {streamDown ? t("Reconnecting…") : convLabel}
+                </span>
+              )}
+            </div>
+            <span className="assistant-scope truncate">{scopeDescriptor("workspace", t)}</span>
+          </div>
         </div>
         <div className="app-chat-head-tools" role="toolbar" aria-label={t("Assistant tools")}>
           {lastAnswer !== null && (

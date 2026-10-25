@@ -2258,8 +2258,9 @@ A new personal assistant pins its immutable alias-derived look once in
 `params.look`; renaming, setup deferral, reload and login never reroll it.
 Existing pins win, and an unpinned Master keeps the robot.
 
-Master-backed Home/app conversations are still workspace-owned. Their About
-panel offers proven operators a bounded name/personality/avatar editor through
+Master-backed Home/app conversations are still workspace-owned. Their headers
+keep that scope visible at narrow widths too. The About panel offers proven
+operators a bounded name/personality/avatar editor through
 `POST /api/master/identity` (`master_identity_set` natively). IDENTITY.md and
 SOUL.md use the protected writer and digest record, never agent self-edit.
 `Shared::prompt_with_profile` includes committed name/personality in the initial
