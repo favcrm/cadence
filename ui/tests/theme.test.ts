@@ -1,4 +1,4 @@
-import { nextThemePref, readThemePref, writeThemePref } from "../src/lib/theme";
+import { nextThemeFor, nextThemePref, readThemePref, writeThemePref } from "../src/lib/theme";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   if (actual !== expected) throw new Error(`${what}: expected ${String(expected)}, got ${String(actual)}`);
@@ -34,5 +34,10 @@ equal(readThemePref(undefined), "system", "no storage → system default");
 equal(nextThemePref("system"), "light", "cycle 1");
 equal(nextThemePref("light"), "dark", "cycle 2");
 equal(nextThemePref("dark"), "system", "cycle 3");
+// The first click must change the rendered theme on either OS.
+equal(nextThemeFor("system", true), "light", "system on a dark OS → light");
+equal(nextThemeFor("system", false), "dark", "system on a light OS → dark");
+equal(nextThemeFor("light", true), "dark", "explicit light → dark");
+equal(nextThemeFor("dark", false), "system", "explicit dark → system");
 
 console.log("theme checks passed");

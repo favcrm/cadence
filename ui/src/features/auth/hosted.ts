@@ -8,7 +8,7 @@
  * everything else is hosted. A successful meta answer still replaces this hint.
  */
 const LOCAL_HOST =
-  /^(?:localhost|127(?:\.\d{1,3}){3}|\[::1\]|::1|0\.0\.0\.0|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|169\.254(?:\.\d{1,3}){2}|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2}|.*\.localhost|.*\.local)$/i;
+  /^(?:localhost|127(?:\.\d{1,3}){3}|\[::1\]|::1|0\.0\.0\.0|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|169\.254(?:\.\d{1,3}){2}|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])(?:\.\d{1,3}){2}|.*\.localhost|.*\.local|.*\.ts\.net|.*\.tailscale\.net)$/i;
 
 export function hostedOrigin(hostname: string | null | undefined): boolean {
   if (typeof hostname !== "string") return true;

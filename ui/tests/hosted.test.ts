@@ -18,6 +18,8 @@ equal(hostedOrigin("10.0.0.5"), false, "private 10/8");
 equal(hostedOrigin("172.20.1.4"), false, "private 172.16/12");
 equal(hostedOrigin("100.101.102.103"), false, "tailnet");
 equal(hostedOrigin("box.local"), false, "mdns name");
+equal(hostedOrigin("ip-172-31-1-32.tail9fcf30.ts.net"), false, "tailnet MagicDNS");
+equal(hostedOrigin("host.tailscale.net"), false, "tailscale DNS");
 // No readable location: hosted is the safer copy (retry + sign-in, no CLI).
 equal(hostedOrigin(undefined), true, "no location");
 equal(hostedOrigin(""), true, "empty host");

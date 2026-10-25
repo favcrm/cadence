@@ -1,5 +1,5 @@
 import { useId, useState, type ReactNode } from "react";
-import { nextThemePref, setThemePref, type ThemePref } from "../lib/theme";
+import { nextThemeFor, setThemePref, type ThemePref } from "../lib/theme";
 import { useTranslate } from "../lib/locale";
 import { IconMoon, IconSun, IconTheme } from "./icons";
 
@@ -19,7 +19,8 @@ export default function ThemeToggle() {
     const applied = document.documentElement.getAttribute("data-theme");
     return applied === "light" || applied === "dark" ? applied : "system";
   });
-  const next = nextThemePref(pref);
+  const systemDark = typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: dark)").matches;
+  const next = nextThemeFor(pref, systemDark);
   const label = t(pref === "system" ? "System" : pref === "light" ? "Light" : "Dark").toLowerCase();
   const nextLabel = t(next === "system" ? "System" : next === "light" ? "Light" : "Dark").toLowerCase();
   const themeLabel = t("Theme:");

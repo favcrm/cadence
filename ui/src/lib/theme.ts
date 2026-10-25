@@ -37,6 +37,15 @@ export function nextThemePref(pref: ThemePref): ThemePref {
   return pref === "system" ? "light" : pref === "light" ? "dark" : "system";
 }
 
+/**
+ * The next pick for a control that must always change what is on screen.
+ * "system" has no fixed successor: on a dark OS it gives light, on a light OS
+ * it gives dark, so the first click is never a no-op.
+ */
+export function nextThemeFor(pref: ThemePref, systemDark: boolean): ThemePref {
+  return pref === "system" ? (systemDark ? "light" : "dark") : nextThemePref(pref);
+}
+
 function browserStorage(): Storage | undefined {
   try {
     return typeof window === "undefined" ? undefined : window.localStorage;
