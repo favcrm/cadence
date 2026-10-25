@@ -339,11 +339,23 @@ fn issue_detail_with_history_notes_and_plan_bytes_are_unchanged() {
             detail
         })
         .collect();
-    // Newer git prints a UTC `%aI` as `Z`, older git as `+00:00`.
-    let details = serde_json::to_string(&details)
-        .unwrap()
-        .replace("+00:00\"", "Z\"");
-    golden("issue_details_history.json", &parse(&details));
+    // Newer git prints a UTC `%aI` as `Z`, older git as `+00:00`. Only the
+    // git-derived stamps are normalized: `history[].at` and the commit
+    // entries of `activity`.
+    let mut details = details;
+    for detail in &mut details {
+        for key in ["history", "activity"] {
+            for entry in detail[key].as_array_mut().into_iter().flatten() {
+                let git = key == "history" || entry["kind"] == "commit";
+                if let Some(at) = entry["at"].as_str().and_then(|a| a.strip_suffix("+00:00")) {
+                    if git {
+                        entry["at"] = Value::from(format!("{at}Z"));
+                    }
+                }
+            }
+        }
+    }
+    golden("issue_details_history.json", &Value::Array(details));
 }
 
 /// `/api/meta`: the typed body equals the `json!` literal it replaced
