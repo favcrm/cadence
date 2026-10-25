@@ -963,9 +963,10 @@ function MasterHome({
     return () => ro.disconnect();
   }, [scrollPanel, items.length, nameRowShown, turn.kind, cmds.length]);
 
-  // The scroller's own box shrinking (a shorter window, a notice mounting
-  // above it) leaves the tail under the dock: re-pin when the reader was
-  // on the tail before the change, never when they scrolled up.
+  // The scroller's own box changing height (a shorter window, a notice
+  // mounting above it) can leave the tail under the dock: on any change
+  // while the pinned flag is set, jump back to the tail; a reader who
+  // scrolled up is not pinned and keeps their place.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;

@@ -41,6 +41,11 @@ equal(wakingBanner(unknown), true, "signed-in with operator null shows the banne
 const missing = metaAccess({ ...base, signed_in: true });
 equal(missing.access, "unavailable", "operator omitted for a signed-in session is unavailable");
 
+const nullSignedIn = metaAccess({ ...base, signed_in: null });
+equal(nullSignedIn.operator, null, "signed_in null leaves operator unknown");
+equal(nullSignedIn.access, "unavailable", "signed_in null is unavailable");
+equal(wakingBanner(nullSignedIn), true, "signed_in null shows the banner");
+
 const operator = metaAccess({ ...base, signed_in: true, operator: true });
 equal(operator.operator, true, "operator");
 equal(wakingBanner(operator), false, "operator sees no banner");

@@ -222,7 +222,9 @@
         "last_used",
         "idle_expires_at",
         "expires_at",
-        "user_agent"
+        "user_agent",
+        "user",
+        "account_id"
       ]
     },
     "SessionOrigin": {
