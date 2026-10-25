@@ -513,48 +513,21 @@ impl Shared {
                     ));
                 }
                 (Some(base), Some(max)) => {
-                    self.crm_send_preflight(install, context, &records, campaign)?;
-                    // A reused request names one send (send-<request>): it may
-                    // only replay the same audience. Compare the digest the
-                    // selection would freeze with the send's committed digest
-                    // before touching the snapshot, so a refused replay cannot
-                    // rewrite the freeze the original send depends on.
+                    // A selection always freezes; a request that already
+                    // names a send is a replay and may not carry one. The
+                    // complete committed material is therefore never
+                    // re-checked after an audience write: a new snapshot needs
+                    // a new request id, which needs a new approval.
                     let send_id = format!("send-{request_id}");
-                    if let Some(existing) = records.app_campaign_send(context, &send_id)? {
-                        if existing.campaign_id != campaign
-                            || existing.audience_freeze_id != freeze
-                        {
-                            return Err(Error::rejected(
-                                "request id is already used for a different send; use a new request id",
-                            ));
-                        }
-                        let base = crate::store::app_audiences::AudienceBase::parse(base)
-                            .map_err(|_| Error::rejected("audience base is invalid"))?;
-                        let digest =
-                            records.app_audience_digest(context, &base, exclusion_list_id)?;
-                        if digest != existing.audience_digest {
-                            return Err(Error::rejected(
-                                "request id is already used for a different audience; use a new request id",
-                            ));
-                        }
-                        records.app_audience_prepare(
-                            context,
-                            freeze,
-                            &base,
-                            exclusion_list_id,
-                            max,
-                        )?;
-                    } else {
-                        let base = crate::store::app_audiences::AudienceBase::parse(base)
-                            .map_err(|_| Error::rejected("audience base is invalid"))?;
-                        records.app_audience_prepare(
-                            context,
-                            freeze,
-                            &base,
-                            exclusion_list_id,
-                            max,
-                        )?;
+                    if records.app_campaign_send(context, &send_id)?.is_some() {
+                        return Err(Error::rejected(
+                            "request id is already used; a new confirmation needs a new request id",
+                        ));
                     }
+                    self.crm_send_preflight(install, context, &records, campaign)?;
+                    let base = crate::store::app_audiences::AudienceBase::parse(base)
+                        .map_err(|_| Error::rejected("audience base is invalid"))?;
+                    records.app_audience_prepare(context, freeze, &base, exclusion_list_id, max)?;
                 }
             }
             let facts = self.crm_send_facts(install, context, &records, campaign, freeze, proof.is_some())?;

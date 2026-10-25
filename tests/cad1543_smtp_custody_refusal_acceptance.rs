@@ -536,7 +536,7 @@ fn send_prepare_freezes_the_audience_inside_the_approved_send() {
     assert!(
         reused_request
             .to_string()
-            .contains("request id is already used for a different send"),
+            .contains("request id is already used; a new confirmation needs a new request id"),
         "{reused_request}"
     );
     let unwritten = fx
@@ -574,7 +574,7 @@ fn send_prepare_freezes_the_audience_inside_the_approved_send() {
     assert!(
         replay_changed
             .to_string()
-            .contains("request id is already used for a different audience"),
+            .contains("request id is already used; a new confirmation needs a new request id"),
         "{replay_changed}"
     );
     let after = fx.op(

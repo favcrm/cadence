@@ -1202,25 +1202,6 @@ impl RecordStore {
     /// ceiling. A reused freeze ID behind identical bytes and ceiling
     /// replays; behind different bytes or a different ceiling it
     /// refuses before anything mutates.
-    /// The digest the selection would freeze, computed without writing.
-    /// CAD-1836 uses it to prove a replayed request still names the same
-    /// audience before any snapshot row is touched.
-    pub fn app_audience_digest(
-        &self,
-        context: &str,
-        base: &AudienceBase,
-        exclusion_list_id: Option<&str>,
-    ) -> Result<String> {
-        crate::proto::identifier(context, "context ID")?;
-        if let Some(list) = exclusion_list_id {
-            crate::proto::identifier(list, "exclusion list ID")?;
-        }
-        let conn = self.conn();
-        Ok(self
-            .compute_audience(&conn, context, base, exclusion_list_id)?
-            .digest)
-    }
-
     pub fn app_audience_prepare(
         &self,
         context: &str,
