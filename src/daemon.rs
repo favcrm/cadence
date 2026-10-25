@@ -3582,6 +3582,8 @@ impl Shared {
             "crm_send_resolve" => self.rpc_crm_send(method, params, peer_pid),
             "crm_send_origin_set" => self.rpc_crm_send(method, params, peer_pid),
             "crm_send_origin_show" => self.rpc_crm_send(method, params, peer_pid),
+            "crm_autonomy_set" => self.rpc_crm_send(method, params, peer_pid),
+            "crm_autonomy_show" => self.rpc_crm_send(method, params, peer_pid),
             // CAD-786: the token is the credential — deliberately NOT
             // operator-gated, and the answer reveals nothing.
             "crm_unsubscribe_redeem" => self.rpc_crm_unsubscribe_redeem(params),

@@ -144,6 +144,8 @@ impl Shared {
             ],
             "crm_send_origin_set" => &["unsubscribe_origin"],
             "crm_send_origin_show" => &[],
+            "crm_autonomy_set" => &["mode"],
+            "crm_autonomy_show" => &[],
             _ => return Err(Error::rejected("unknown CRM send method")),
         };
         let fields = params
@@ -160,6 +162,24 @@ impl Shared {
             {
                 return Err(Error::rejected(format!("{key} must be a string")));
             }
+        }
+        // The autonomy setting is daemon-global — no installation or
+        // context on the wire. It is operator-only by the connection
+        // proof above; a scoped agent turn cannot raise its own level.
+        if method == "crm_autonomy_set" || method == "crm_autonomy_show" {
+            let execute = || match method {
+                "crm_autonomy_set" => {
+                    let mode = required_str(params, "mode")?;
+                    self.store.crm_autonomy_set(mode, "operator")?;
+                    Ok(json!({"crm_autonomy": self.store.crm_autonomy()?}))
+                }
+                _ => Ok(json!({"crm_autonomy": self.store.crm_autonomy()?})),
+            };
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            return execute();
         }
         // The origin verbs are daemon-global — no installation or
         // context on the wire.

@@ -1328,6 +1328,8 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("crm_send_resolve", Rule::Handler("rpc_crm_send")),
     ("crm_send_origin_set", Rule::Handler("rpc_crm_send")),
     ("crm_send_origin_show", Rule::Handler("rpc_crm_send")),
+    ("crm_autonomy_set", Rule::Handler("rpc_crm_send")),
+    ("crm_autonomy_show", Rule::Handler("rpc_crm_send")),
     // CAD-786: the unsubscribe token is the credential — the verb
     // can only add a suppression.
     ("crm_unsubscribe_redeem", Rule::Bearer),

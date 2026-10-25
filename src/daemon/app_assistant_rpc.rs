@@ -239,6 +239,7 @@ impl Shared {
                 .and_then(Value::as_array)
                 .ok_or_else(|| Error::rejected("assistant descriptor actions are invalid"))?;
             let mut actions = Vec::new();
+            let full = self.store.crm_autonomy_is_full()?;
             for row in declared {
                 let Some(id) = row.get("id").and_then(Value::as_str) else {
                     continue;
@@ -246,7 +247,12 @@ impl Shared {
                 let Some(meta) = crate::app_assistant::registered_action(id) else {
                     continue;
                 };
-                actions.push(json!({"id":id,"description":row["description"],"input_schema":meta.input_schema,"effect":meta.effect,"confirmation":meta.confirmation,"availability":"available"}));
+                let confirmation = if full && id == "customer.tags.update" {
+                    "none"
+                } else {
+                    meta.confirmation
+                };
+                actions.push(json!({"id":id,"description":row["description"],"input_schema":meta.input_schema,"effect":meta.effect,"confirmation":confirmation,"availability":"available"}));
             }
             actions.extend(super::app_record_actions_rpc::declared_record_actions(
                 self,
@@ -362,6 +368,49 @@ impl Shared {
                     .ok_or_else(|| Error::rejected("customer record revision unavailable"))?;
                 if input.get("expected_revision").and_then(Value::as_i64) != Some(old_revision) {
                     return Err(Error::rejected("customer record revision is stale"));
+                }
+                if records
+                    .app_assistant_permission_find(&scoped.context, action_id, customer, "deny")?
+                    .is_some_and(|p| p["state"].as_str() == Some("active"))
+                {
+                    return Err(Error::rejected("this action is blocked for this customer"));
+                }
+                if self.store.crm_autonomy_is_full()? {
+                    let mut profile = crate::store::app_records::CustomerProfile::parse(
+                        &old["record"]["profile"],
+                    )
+                    .map_err(|_| Error::rejected("customer profile cannot be safely updated"))?;
+                    profile.tags = serde_json::from_value(input["tags"].clone())
+                        .map_err(|_| Error::rejected("customer tags are invalid"))?;
+                    let updated = records.app_record_update_as_actor(
+                        &scoped.context,
+                        customer,
+                        old_revision,
+                        &profile,
+                        None,
+                        &format!("agent:{}", scoped.caller),
+                        None,
+                    )?;
+                    let op = records.app_assistant_operation_set(AssistantOperationUpdate {
+                        operation_id,
+                        context: &scoped.context,
+                        expected_revision: 1,
+                        status: "succeeded",
+                        summary: "Updated tags on one customer",
+                        result: &json!({
+                            "customer_id": customer,
+                            "tags": updated.pointer("/record/profile/tags").cloned().unwrap_or(json!([])),
+                            "revision": updated.pointer("/record/revision"),
+                        }),
+                        resource_refs: &json!([{
+                            "kind": "customer",
+                            "id": customer,
+                            "label": old.pointer("/record/profile/display_name").and_then(Value::as_str).unwrap_or("Customer"),
+                        }]),
+                        permission_request: &Value::Null,
+                        error: None,
+                    })?;
+                    return Ok(json!({"operation": op}));
                 }
                 let mut refs = vec![
                     json!({"kind":"customer","id":customer,"label":old.pointer("/record/profile/display_name").and_then(Value::as_str).unwrap_or("Customer")}),

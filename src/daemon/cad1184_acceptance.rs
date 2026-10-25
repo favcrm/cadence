@@ -1469,3 +1469,46 @@ fn cad1808_scoped_turn_runs_internal_campaign_workflow() {
     assert_eq!(deleted["operation"]["result"]["deleted"], true);
     fx.finish("m-cad1808-workflow");
 }
+
+/// CAD-1808 batch 2: at `full`, a tags-only update runs directly and
+/// records the agent. A standing deny still blocks it.
+#[test]
+fn cad1808_full_autonomy_applies_tag_update_with_agent_actor() {
+    let fx = Fx::new();
+    fx.operator("crm_autonomy_set", json!({"mode":"full"}));
+    let token = fx.create_turn("m-auto-tags");
+    let updated = fx
+        .invoke(
+            "m-auto-tags",
+            &token,
+            "customer.tags.update",
+            "op-auto-tags",
+            json!({"customer_id":"cust-a","tags":["auto"],"expected_revision":1}),
+        )
+        .unwrap();
+    assert_eq!(updated["operation"]["status"], "succeeded");
+    let shown = fx.customer("cust-a");
+    assert_eq!(shown["revision"], 2);
+    assert_eq!(shown["profile"]["tags"], json!(["auto"]));
+    assert_eq!(
+        shown["history"].as_array().unwrap().last().unwrap()["actor"],
+        "agent:master"
+    );
+    fx.finish("m-auto-tags");
+
+    fx.operator(
+        "app_assistant_permission_block",
+        json!({"install_id":fx.install,"context_id":fx.context,"action_id":"customer.tags.update","resource_id":"cust-a"}),
+    );
+    let token = fx.create_turn("m-auto-blocked");
+    let blocked = fx.invoke(
+        "m-auto-blocked",
+        &token,
+        "customer.tags.update",
+        "op-auto-blocked",
+        json!({"customer_id":"cust-a","tags":["blocked"],"expected_revision":2}),
+    );
+    refusal(blocked, "standing deny at full autonomy");
+    assert_eq!(fx.customer("cust-a")["profile"]["tags"], json!(["auto"]));
+    fx.finish("m-auto-blocked");
+}

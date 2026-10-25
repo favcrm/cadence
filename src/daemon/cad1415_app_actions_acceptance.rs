@@ -1200,3 +1200,82 @@ impl Drop for ServerGuard {
         }
     }
 }
+
+/// CAD-1808 batch 2: at `full` autonomy a scoped turn applies record
+/// actions directly and the revision names the agent; `assisted` keeps
+/// the existing allow-once proposal path.
+#[test]
+fn cad1808_full_autonomy_applies_record_actions_with_agent_actor() {
+    let fx = Fx::new();
+    let full = fx.operator("crm_autonomy_set", json!({"mode":"full"}));
+    assert_eq!(full["crm_autonomy"], "full");
+    assert!(fx
+        .call(
+            Asserted::Agent("master".into()),
+            "crm_autonomy_set",
+            json!({"mode":"assisted"})
+        )
+        .is_err());
+    let token = fx.create_turn("m-auto-record");
+
+    let updated = fx
+        .invoke(
+            "m-auto-record",
+            &token,
+            "crm.customer.update",
+            "op-auto-update",
+            json!({"record_id":"cust-a","expected_revision":1,"phone":"+15550001001","tags":["auto"]}),
+        )
+        .unwrap();
+    assert_eq!(updated["operation"]["status"], "succeeded");
+    assert_eq!(fx.op_status("op-auto-update"), "succeeded");
+    let shown = fx.customer("cust-a");
+    assert_eq!(shown["revision"], 2);
+    assert_eq!(shown["profile"]["tags"], json!(["auto"]));
+    let history = shown["history"].as_array().unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(
+        history.last().unwrap()["actor"],
+        "agent:master",
+        "the automatic write records the agent, not operator"
+    );
+
+    let created = fx
+        .invoke(
+            "m-auto-record",
+            &token,
+            "crm.customer.create",
+            "op-auto-create",
+            json!({"record_id":"cust-auto","display_name":"Auto Customer","email":"auto@example.test"}),
+        )
+        .unwrap();
+    assert_eq!(created["operation"]["status"], "succeeded");
+    let auto = fx.customer("cust-auto");
+    assert_eq!(auto["revision"], 1);
+    assert_eq!(
+        auto["history"].as_array().unwrap()[0]["actor"],
+        "agent:master"
+    );
+
+    fx.finish("m-auto-record");
+
+    let assisted = fx.operator("crm_autonomy_set", json!({"mode":"assisted"}));
+    assert_eq!(assisted["crm_autonomy"], "assisted");
+    let token = fx.create_turn("m-assisted-record");
+    let pending = fx
+        .invoke(
+            "m-assisted-record",
+            &token,
+            "crm.customer.update",
+            "op-assisted-update",
+            json!({"record_id":"cust-a","expected_revision":2,"phone":"+15550001002"}),
+        )
+        .unwrap();
+    assert_eq!(pending["operation"]["status"], "pending_permission");
+    assert_eq!(
+        fx.customer("cust-a")["revision"],
+        2,
+        "assisted made no write"
+    );
+    fx.finish("m-assisted-record");
+}

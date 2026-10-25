@@ -1251,7 +1251,25 @@ impl RecordStore {
         provenance: Option<&ConsentProvenance>,
         human: Option<&Value>,
     ) -> Result<Value> {
+        self.app_record_create_as_actor(context, record_id, profile, provenance, "operator", human)
+    }
+
+    /// Actor-aware create. The daemon derives `actor` from the caller
+    /// (`agent:<alias>` for an autonomous turn, `operator` for a native
+    /// owner write); it is never request text.
+    pub fn app_record_create_as_actor(
+        &self,
+        context: &str,
+        record_id: &str,
+        profile: &CustomerProfile,
+        provenance: Option<&ConsentProvenance>,
+        actor: &str,
+        human: Option<&Value>,
+    ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
+        if !record_actor_valid(actor) {
+            return Err(Error::rejected("record actor is invalid"));
+        }
         let unset = CustomerConsent {
             email: ConsentState::Unknown,
             sms: None,
@@ -1302,8 +1320,8 @@ impl RecordStore {
             )
             .map_err(|e| Error::internal(e.to_string()))?;
             tx.execute(
-                "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at,human) VALUES(?, ?, 1, ?, ?, 'operator', ?, ?)",
-                params![context, record_id, body, digest, now(), human.map(Value::to_string)],
+                "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at,human) VALUES(?, ?, 1, ?, ?, ?, ?, ?)",
+                params![context, record_id, body, digest, actor, now(), human.map(Value::to_string)],
             )
             .map_err(|e| Error::internal(e.to_string()))?;
             if let Some(provenance) = provenance {
@@ -1454,7 +1472,24 @@ impl RecordStore {
         human: Option<&Value>,
     ) -> Result<Value> {
         self.update_record(
-            context, record_id, expected, profile, provenance, false, human,
+            context, record_id, expected, profile, provenance, false, "operator", human,
+        )
+    }
+
+    /// Actor-aware update. `actor` is daemon-derived, never request text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn app_record_update_as_actor(
+        &self,
+        context: &str,
+        record_id: &str,
+        expected: i64,
+        profile: &CustomerProfile,
+        provenance: Option<&ConsentProvenance>,
+        actor: &str,
+        human: Option<&Value>,
+    ) -> Result<Value> {
+        self.update_record(
+            context, record_id, expected, profile, provenance, false, actor, human,
         )
     }
 
@@ -1469,10 +1504,14 @@ impl RecordStore {
         profile: &CustomerProfile,
         provenance: Option<&ConsentProvenance>,
         from_import: bool,
+        actor: &str,
         human: Option<&Value>,
     ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(record_id, "record ID")?;
+        if !record_actor_valid(actor) {
+            return Err(Error::rejected("record actor is invalid"));
+        }
         if expected < 1 {
             return Err(Error::rejected("expected record revision must be positive"));
         }
@@ -1516,8 +1555,8 @@ impl RecordStore {
                 return Err(Error::rejected("record revision is stale"));
             }
             tx.execute(
-                "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at,human) VALUES(?, ?, ?, ?, ?, 'operator', ?, ?)",
-                params![context, record_id, revision, body, digest, now(), human.map(Value::to_string)],
+                "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at,human) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                params![context, record_id, revision, body, digest, actor, now(), human.map(Value::to_string)],
             )
             .map_err(|e| Error::internal(e.to_string()))?;
             if let Some(provenance) = provenance {
@@ -1727,6 +1766,12 @@ pub fn tag_valid(tag: &str) -> bool {
         && tag
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+/// Revision actor: `operator` or `agent:<alias>`. Derive it from the
+/// caller, never from request text; bound it and refuse control bytes.
+pub fn record_actor_valid(actor: &str) -> bool {
+    !actor.is_empty() && actor.len() <= 128 && !actor.chars().any(char::is_control)
 }
 
 impl CustomerProfile {
@@ -3095,6 +3140,7 @@ impl RecordStore {
                         profile,
                         None,
                         true,
+                        "operator",
                         human,
                     );
                     match stored {
