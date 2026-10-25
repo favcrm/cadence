@@ -238,9 +238,9 @@ impl Fx {
         self.rpc(Asserted::Operator, method, params)
             .unwrap_or_else(|e| panic!("operator {method}: {e}"))
     }
-    /// Install, context, one consenting customer, an approved campaign,
-    /// a frozen audience and an enrolled SMTP connection.
-    fn setup(&self) -> (String, String, String) {
+    /// Install, context, one consenting customer, an approved campaign
+    /// and an enrolled SMTP connection — no audience freeze.
+    fn setup_unfrozen(&self) -> (String, String, String) {
         let install = self.op(
             "app_workspace_install",
             json!({"source": self.root.path().join("source")}),
@@ -276,11 +276,6 @@ impl Fx {
             "app_content_approve",
             json!({"install_id": install, "context_id": context, "campaign_id": "launch-1", "expected_revision": revision}),
         );
-        self.op(
-            "app_audience_prepare",
-            json!({"install_id": install, "context_id": context, "freeze_id": "freeze-1",
-                "base": {"mode": "all"}, "max_recipients": 50}),
-        );
         let secret = format!("pw-{}", uuid::Uuid::new_v4().simple());
         let connection = self.op(
             "connection_create",
@@ -295,6 +290,16 @@ impl Fx {
             .as_str()
             .unwrap()
             .to_string();
+        (install, context, connection)
+    }
+    /// `setup_unfrozen` plus the audience freeze the old flow required.
+    fn setup(&self) -> (String, String, String) {
+        let (install, context, connection) = self.setup_unfrozen();
+        self.op(
+            "app_audience_prepare",
+            json!({"install_id": install, "context_id": context, "freeze_id": "freeze-1",
+                "base": {"mode": "all"}, "max_recipients": 50}),
+        );
         (install, context, connection)
     }
     /// `smtp_custody` on both the show and the list receipt.
@@ -406,4 +411,58 @@ fn smtp_custody_is_refused_to_an_install_that_does_not_declare_smtp_bind() {
     assert_eq!(relay.sends(), sends + 1);
     let prepared = fx.op(verbs[2].0, verbs[2].1.clone());
     assert!(prepared["send_digest"].is_string(), "{prepared}");
+}
+
+/// CAD-1836: the approved send creates its own audience snapshot. A caller
+/// that supplies the selection never has to run a separate freeze approval;
+/// without a selection the old freeze requirement still refuses.
+#[test]
+fn send_prepare_freezes_the_audience_inside_the_approved_send() {
+    let relay = Fake::start();
+    let fx = Fx::start(&relay, Screen::Declares);
+    let (install, context, connection) = fx.setup_unfrozen();
+    fx.op(
+        "crm_smtp_bind",
+        json!({"install_id": install, "context_id": context, "connection_id": connection, "request_id": "bind-1"}),
+    );
+    let sent = fx.op(
+        "crm_smtp_test_send",
+        json!({"install_id": install, "context_id": context, "campaign_id": "launch-1", "to_email": RECIPIENT}),
+    );
+    assert_eq!(sent["receipt"]["accepted"], true, "{sent}");
+
+    // No selection and no freeze: refused, exactly as before.
+    let refused = fx
+        .rpc(
+            Asserted::Operator,
+            "crm_send_prepare",
+            json!({"install_id": install, "context_id": context, "campaign_id": "launch-1",
+                "audience_freeze_id": "freeze-1", "request_id": "send-1"}),
+        )
+        .expect_err("a send without a selection or a freeze must refuse");
+    assert!(
+        refused
+            .to_string()
+            .contains("audience freeze is unavailable"),
+        "{refused}"
+    );
+
+    // The selection freezes the audience inside the same prepare.
+    let prepared = match fx.rpc(
+        Asserted::Operator,
+        "crm_send_prepare",
+        json!({"install_id": install, "context_id": context, "campaign_id": "launch-1",
+            "audience_freeze_id": "freeze-1", "request_id": "send-1",
+            "base": {"mode": "all"}, "max_recipients": 50}),
+    ) {
+        Ok(value) => value,
+        Err(error) => panic!("prepare failed: {error:?}"),
+    };
+    assert!(prepared["send_digest"].is_string(), "{prepared}");
+    let frozen = fx.op(
+        "app_audience_show",
+        json!({"install_id": install, "context_id": context, "freeze_id": "freeze-1"}),
+    );
+    assert_eq!(frozen["freeze"]["final_count"], 1, "{frozen}");
+    assert_eq!(frozen["valid"], true, "{frozen}");
 }

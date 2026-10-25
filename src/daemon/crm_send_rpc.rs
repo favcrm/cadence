@@ -131,6 +131,9 @@ impl Shared {
                 "campaign_id",
                 "audience_freeze_id",
                 "request_id",
+                "base",
+                "exclusion_list_id",
+                "max_recipients",
             ],
             "crm_send_approve" => &["install_id", "context_id", "send_id", "send_digest"],
             "crm_send_show" => &["install_id", "context_id", "send_id"],
@@ -155,7 +158,13 @@ impl Shared {
             if !allowed.contains(&key.as_str()) {
                 return Err(Error::rejected(format!("{key} is not a {method} field")));
             }
+            // CAD-1836: prepare carries the audience selection that lets the
+            // send own its freeze. Those two fields are structured, not text.
+            let structured = method == "crm_send_prepare"
+                && ((key == "base" && value.is_object())
+                    || (key == "max_recipients" && value.is_i64()));
             if !value.is_string()
+                && !structured
                 && !(method == "crm_send_origin_set"
                     && key == "unsubscribe_origin"
                     && value.is_null())
@@ -226,7 +235,20 @@ impl Shared {
                 let request = send_request_id(params)?;
                 crate::proto::identifier(campaign, "campaign ID")?;
                 crate::proto::identifier(freeze, "audience freeze ID")?;
-                self.crm_send_prepare(install, context, campaign, freeze, &request, proof)
+                let base = params.get("base");
+                let exclusion = params.get("exclusion_list_id").and_then(Value::as_str);
+                let max_recipients = params.get("max_recipients").and_then(Value::as_i64);
+                self.crm_send_prepare(
+                    install,
+                    context,
+                    campaign,
+                    freeze,
+                    &request,
+                    base,
+                    exclusion,
+                    max_recipients,
+                    proof,
+                )
             }
             "crm_send_approve" => {
                 let send_id = required_str(params, "send_id")?;
@@ -412,6 +434,9 @@ impl Shared {
         })
     }
 
+    // The send's inputs are all required to commit one digest; the freeze
+    // selection joined them in CAD-1836.
+    #[allow(clippy::too_many_arguments)]
     fn crm_send_prepare(
         self: &Arc<Self>,
         install: &str,
@@ -419,10 +444,37 @@ impl Shared {
         campaign: &str,
         freeze: &str,
         request_id: &str,
+        base: Option<&Value>,
+        exclusion_list_id: Option<&str>,
+        max_recipients: Option<i64>,
         proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
         self.crm_smtp_scope_with_proof(install, context, true, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
+            // CAD-1836: the send owns its audience snapshot. A caller that
+            // supplies the selection gets the freeze created (or refreshed)
+            // inside this one approved action; without a selection the
+            // pre-existing freeze requirement stands unchanged.
+            let frozen_valid = records
+                .app_audience_show(context, freeze)
+                .map(|audience| audience["valid"] == json!(true))
+                .unwrap_or(false);
+            if !frozen_valid {
+                let (Some(base), Some(max)) = (base, max_recipients) else {
+                    return Err(Error::rejected(
+                        "audience freeze is unavailable; prepare the audience first",
+                    ));
+                };
+                let base = crate::store::app_audiences::AudienceBase::parse(base)
+                    .map_err(|_| Error::rejected("audience base is invalid"))?;
+                records.app_audience_prepare(
+                    context,
+                    freeze,
+                    &base,
+                    exclusion_list_id,
+                    max,
+                )?;
+            }
             let facts = self.crm_send_facts(install, context, &records, campaign, freeze, proof.is_some())?;
             if (facts.frozen_member_ids.len() as i64) > facts.max_recipients {
                 return Err(Error::rejected(
