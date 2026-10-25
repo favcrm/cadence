@@ -25,6 +25,7 @@ pub mod business_templates;
 pub mod cli_actor;
 pub mod client;
 pub mod confine;
+pub mod context_pack;
 pub mod continuity;
 pub mod hosted_app_cli;
 pub mod notify_bridge;

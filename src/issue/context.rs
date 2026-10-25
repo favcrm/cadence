@@ -77,6 +77,11 @@ const DENIED_COMPONENTS: &[&str] = &[
 pub struct ContextManifest {
     pub schema: u32,
     pub project: String,
+    /// CAD-1822: explicit opt-in for task-context delivery to issue-bound
+    /// workers. Absent or false keeps every existing dispatch path unchanged;
+    /// the board's Project Context reader ignores it.
+    #[serde(default)]
+    pub agent_delivery: bool,
     pub documents: Vec<ManifestDocument>,
 }
 
@@ -235,10 +240,7 @@ fn dirty_probe(root: &Path) -> (Option<bool>, bool, Option<String>) {
     }
 }
 
-fn resolve_source(
-    selected: &project::Project,
-    expected: Option<&str>,
-) -> Result<RepoSource, SourceError> {
+fn resolve_root(selected: &project::Project) -> Result<(PathBuf, &project::Repo), SourceError> {
     let local: Vec<&project::Repo> = selected
         .repos
         .iter()
@@ -311,8 +313,12 @@ fn resolve_source(
             "declared path is not the repository root",
         ));
     }
+    Ok((root, repo))
+}
+
+fn head_of(root: &Path) -> Result<String, SourceError> {
     let head = git_text(
-        &root,
+        root,
         &[
             "rev-parse".to_string(),
             "--verify".to_string(),
@@ -328,6 +334,15 @@ fn resolve_source(
             "repository HEAD is not a full SHA-1 revision",
         ));
     }
+    Ok(head)
+}
+
+fn resolve_source(
+    selected: &project::Project,
+    expected: Option<&str>,
+) -> Result<RepoSource, SourceError> {
+    let (root, repo) = resolve_root(selected)?;
+    let head = head_of(&root)?;
     let (dirty, dirty_truncated, dirty_error) = dirty_probe(&root);
     let revision_state = match expected {
         Some(value) if value != head => "stale",
@@ -363,6 +378,232 @@ fn resolve_source(
             error: dirty_error,
         },
     })
+}
+
+/// A project document read at the repository's pinned HEAD for task delivery.
+/// The body is not stored here: [`read_pinned_blob`] re-reads the exact blob
+/// and checks its digest, so a pinned reference is not a source cache that can
+/// outlive the repository or pass for authority.
+#[derive(Clone, Debug)]
+pub struct PinnedDocument {
+    pub id: String,
+    pub kind: String,
+    pub path: String,
+    pub title: String,
+    pub required: bool,
+    pub roles: Vec<String>,
+    pub selected: bool,
+    pub selection_reason: String,
+    pub state: &'static str,
+    pub reason: Option<String>,
+    pub digest: Option<String>,
+    pub bytes: Option<usize>,
+}
+
+/// One project's manifest and documents at HEAD, or the reason it is not
+/// usable. `unconfigured` means delivery is not enabled: no declared local
+/// repository, no readable and parseable tracked manifest, or
+/// `agent_delivery` absent/false. `conflict` is an opted-in manifest that
+/// fails validation.
+#[derive(Clone, Debug)]
+pub struct PinnedContext {
+    pub state: &'static str,
+    pub project: String,
+    pub revision: Option<String>,
+    pub documents: Vec<PinnedDocument>,
+    pub errors: Vec<String>,
+}
+
+fn unconfigured(project: &str, revision: Option<String>) -> PinnedContext {
+    PinnedContext {
+        state: "unconfigured",
+        project: project.to_string(),
+        revision,
+        documents: Vec::new(),
+        errors: Vec::new(),
+    }
+}
+
+/// Pin the selected project's tracked context manifest and documents at its
+/// current HEAD, but only when that committed manifest sets
+/// `agent_delivery: true`. An unprovable opt-in (no repo, no HEAD, no
+/// manifest, unreadable or unparseable YAML) returns `unconfigured`, so
+/// existing dispatch behavior is untouched. Reuses the bounded readers and
+/// allowlist the board's context query uses; never accepts a caller-supplied
+/// path or revision.
+pub fn pin(selected: &project::Project, role: Option<&str>) -> PinnedContext {
+    let local: Vec<&project::Repo> = selected
+        .repos
+        .iter()
+        .filter(|repo| {
+            repo.path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty())
+        })
+        .collect();
+    if local.len() != 1 {
+        // No declared local repository, or several: no committed opt-in can
+        // be proven, so every existing dispatch path stays unchanged.
+        return unconfigured(&selected.key, None);
+    }
+    let declared = project::expand_home(local[0].path.as_deref().unwrap_or_default());
+    if !declared.is_absolute() {
+        return unconfigured(&selected.key, None);
+    }
+    let Ok((root, _)) = resolve_root(selected) else {
+        return unconfigured(&selected.key, None);
+    };
+    let Ok(head) = head_of(&root) else {
+        return unconfigured(&selected.key, None);
+    };
+    let Ok(Some(text)) = read_blob(&root, &head, DEFAULT_MANIFEST_PATH) else {
+        // Absent, unreadable or oversized: the opt-in cannot be proven, so
+        // delivery stays off and dispatch behaves exactly as before. The
+        // board's context view reports an unusable manifest separately.
+        return unconfigured(&selected.key, Some(head));
+    };
+    if text.len() > MAX_MANIFEST_BYTES {
+        return unconfigured(&selected.key, Some(head));
+    }
+    let Ok(manifest) = serde_yaml::from_str::<ContextManifest>(&text) else {
+        return unconfigured(&selected.key, Some(head));
+    };
+    if !manifest.agent_delivery {
+        // Explicit opt-in is required. An existing Overview/Project Context
+        // manifest without it must not change dispatch behavior, and the
+        // board reader keeps using the manifest as before.
+        return unconfigured(&selected.key, Some(head));
+    }
+    let errors = validate_manifest(&manifest, &selected.key);
+    if !errors.is_empty() {
+        return PinnedContext {
+            state: "conflict",
+            project: selected.key.clone(),
+            revision: Some(head),
+            documents: Vec::new(),
+            errors: errors
+                .into_iter()
+                .map(|error| shorten(&error, 512).0)
+                .collect(),
+        };
+    }
+    let canonical = role.map(canonical_role);
+    let mut documents = Vec::new();
+    for document in manifest.documents.iter().take(MAX_MANIFEST_ENTRIES) {
+        let selected_here = canonical.is_none()
+            || document.required
+            || document.roles.is_empty()
+            || canonical.is_some_and(|role| {
+                document
+                    .roles
+                    .iter()
+                    .any(|candidate| candidate.as_str() == role)
+            });
+        let selection_reason = if document.required {
+            "required".to_string()
+        } else if let Some(role) = canonical {
+            if document.roles.is_empty() {
+                "optional-default".to_string()
+            } else if document
+                .roles
+                .iter()
+                .any(|candidate| candidate.as_str() == role)
+            {
+                format!("role:{role}")
+            } else {
+                "excluded:role-mismatch".to_string()
+            }
+        } else {
+            "optional-default".to_string()
+        };
+        let (state, reason, digest, bytes) = if !selected_here {
+            ("not_selected", None, None, None)
+        } else if let Some(reason) = path_error(&document.path) {
+            ("invalid_path", Some(reason), None, None)
+        } else {
+            match read_blob(&root, &head, &document.path) {
+                Ok(Some(blob)) => (
+                    "ready",
+                    None,
+                    Some(crate::delegation::sha256_hex(blob.as_bytes())),
+                    Some(blob.len()),
+                ),
+                Ok(None) => (
+                    "missing",
+                    Some("tracked blob is absent at HEAD".to_string()),
+                    None,
+                    None,
+                ),
+                Err(error) => (error.state(), Some(error.reason()), None, None),
+            }
+        };
+        documents.push(PinnedDocument {
+            id: shorten(&document.id, 48).0,
+            kind: shorten(&document.kind, 32).0,
+            path: shorten(&document.path, MAX_PATH_BYTES).0,
+            title: shorten(&document.title, MAX_TITLE_BYTES).0,
+            required: document.required,
+            roles: document.roles.clone(),
+            selected: selected_here,
+            selection_reason,
+            state,
+            reason,
+            digest,
+            bytes,
+        });
+    }
+    PinnedContext {
+        state: "ready",
+        project: selected.key.clone(),
+        revision: Some(head),
+        documents,
+        errors: Vec::new(),
+    }
+}
+
+/// The declared repository root for a project, for re-reading pinned blobs
+/// without re-resolving HEAD.
+pub fn repository_root(selected: &project::Project) -> Result<PathBuf, (String, String)> {
+    resolve_root(selected)
+        .map(|(root, _)| root)
+        .map_err(|error| (error.state.to_string(), error.message))
+}
+
+/// Re-read `path` at the exact pinned `revision` and verify the recorded
+/// digest. Missing, unreadable, oversized, symlinked, non-UTF-8 and
+/// digest-mismatched blobs all refuse — a pinned reference never falls back to
+/// another revision or to the working tree.
+pub fn read_pinned_blob(
+    root: &Path,
+    revision: &str,
+    path: &str,
+    digest: &str,
+) -> Result<String, (String, String)> {
+    if !valid_revision(revision) {
+        return Err((
+            "invalid_revision".to_string(),
+            "pinned revision is not a full SHA-1".to_string(),
+        ));
+    }
+    if let Some(reason) = path_error(path) {
+        return Err(("invalid_path".to_string(), reason));
+    }
+    match read_blob(root, revision, path) {
+        Ok(Some(text)) => {
+            if crate::delegation::sha256_hex(text.as_bytes()) != digest {
+                return Err((
+                    "revision_changed".to_string(),
+                    "the pinned blob's digest does not match its recorded digest".to_string(),
+                ));
+            }
+            Ok(text)
+        }
+        Ok(None) => Err((
+            "missing".to_string(),
+            "the pinned blob is absent at its revision".to_string(),
+        )),
+        Err(error) => Err((error.state().to_string(), error.reason())),
+    }
 }
 
 fn path_error(path: &str) -> Option<String> {
@@ -1059,6 +1300,7 @@ mod tests {
         let manifest = ContextManifest {
             schema: 1,
             project: "cadence".to_string(),
+            agent_delivery: false,
             documents: vec![
                 ManifestDocument {
                     id: "scope".to_string(),

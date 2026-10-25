@@ -4,8 +4,9 @@
 //! Shared control state and RPC/auth dispatch remain in the daemon root.
 
 use super::{
-    epoch_secs, fmt_duration, format_unknown_fence, gate_backoff, AgentCtl, Lifecycle, Notify,
-    Shared, StallWatch, AUTO_RESUME_EVENT, AUTO_STOP_MARKER_KINDS, UNKNOWN_GENERIC_REASON,
+    epoch_secs, fmt_duration, format_unknown_fence, gate_backoff, AgentCtl, ContextDelivery,
+    Lifecycle, Notify, Shared, StallWatch, AUTO_RESUME_EVENT, AUTO_STOP_MARKER_KINDS,
+    UNKNOWN_GENERIC_REASON,
 };
 use crate::adapter::{self, registry, AdapterHooks, ProviderAdapter, SettledPoll, TurnResult};
 use crate::error::{Error, Result};
@@ -578,10 +579,12 @@ impl Shared {
                     } else {
                         self.turn_slot(&agent, &message)
                     };
+                    let mut pending_context: Option<ContextDelivery> = None;
                     let prompt = if nudge {
                         message.body.clone()
                     } else {
-                        let body = self.continuity_prompt_slotted(
+                        let compacted = self.context_compacted(&message);
+                        let (base, pack) = self.continuity_parts(
                             alias,
                             &agent.endpoint_kind,
                             &message,
@@ -591,10 +594,61 @@ impl Shared {
                         // appended AFTER the turn's own body, so the user's
                         // request leads. An unreadable or unknown profile fails
                         // the turn closed rather than sending a silent empty one.
-                        match self.member_profile_context(&message)? {
-                            Some(context) => format!("{body}\n\n{context}"),
+                        let body = match self.member_profile_context(&message)? {
+                            Some(context) => format!("{base}\n\n{context}"),
+                            None => base,
+                        };
+                        // CAD-1822: mandatory task context is planned against
+                        // the delivery body and member profile first; optional
+                        // continuity history is budgeted from what remains.
+                        let context = match self.context_delivery(
+                            &agent,
+                            &message,
+                            body.len(),
+                            false,
+                            compacted,
+                        ) {
+                            Ok(context) => context,
+                            Err(Error::PreWrite(reason)) => {
+                                let failed = json!({"status": "failed", "text": "",
+                                                    "error": reason});
+                                self.store
+                                    .finish(&message, "failed", &failed, Some(&reason))?;
+                                self.notify_routed_target(&message, &failed);
+                                gate_notice = None;
+                                self.wake();
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        let mut text = match context {
+                            Some(delivery) => {
+                                let text = if delivery.plan.text.is_empty() {
+                                    body
+                                } else {
+                                    format!("{body}\n\n{}", delivery.plan.text)
+                                };
+                                pending_context = Some(delivery);
+                                text
+                            }
                             None => body,
+                        };
+                        // CAD-1822: the optional continuity prefix yields
+                        // first. Include it whole only when it still fits;
+                        // otherwise omit it whole with a recorded reason and
+                        // keep the mandatory task contract and sources.
+                        if let Some(pack) = pack {
+                            let combined = text.len() + pack.text.len() + 2;
+                            if pending_context.is_some()
+                                && combined > crate::context_pack::MAX_COMBINED_BYTES
+                            {
+                                self.omit_continuity(alias, &message, &pack, combined);
+                            } else {
+                                self.record_continuity(alias, &message, &pack);
+                                text = pack.wrap(&text);
+                            }
                         }
+                        text
                     };
                     adapter.set_unclaimed_ok(message.is_routed() || nudge);
                     // CAD-520: a nudge may also enter through a busy
@@ -606,54 +660,99 @@ impl Shared {
                     // notice — the stored body still faces the
                     // endpoint's own screen (a pty profile's
                     // literal-only checks) before it may deliver.
-                    let outcome = self
-                        .admit_app_submission(&message)
-                        .and_then(|()| adapter.check_body(&message.body))
-                        .and_then(|()| {
-                            if !nudge {
-                                let images =
-                                    self.turn_images_for(&message).map_err(
+                    let outcome =
+                        self.admit_app_submission(&message)
+                            .and_then(|()| adapter.check_body(&message.body))
+                            .and_then(|()| {
+                                if !nudge {
+                                    let images = self.turn_images_for(&message).map_err(
                                         |error| match error {
                                             Error::Rejected(reason) => Error::PreWrite(reason),
                                             error => error,
                                         },
                                     )?;
-                                adapter.bind_turn_images(&images)?;
-                            }
-                            let on_started = move |turn: &str| {
-                                // CAD-250: a nudge owns no turn — it never
-                                // becomes `running`, and its paste is not the
-                                // held turn's proof of life.
-                                if !nudge {
-                                    let _ = shared.store.mark_running(&started_id, turn);
-                                    watch.bump_activity();
+                                    adapter.bind_turn_images(&images)?;
                                 }
-                                shared.wake();
-                            };
-                            let first = adapter.run_turn_slotted(
-                                &prompt,
-                                slot.as_deref(),
-                                &message.id,
-                                &on_started,
-                            )?;
-                            if nudge || !adapter.reset_rejected_session(&first)? {
-                                return Ok(first);
-                            }
-                            // CAD-1076: one retry on a fresh session.
-                            // Offered only for a master history refusal
-                            // before any tool. A serialized-body refusal
-                            // after a tool is not offered — retrying
-                            // would replay work that already ran, and
-                            // that turn stays failed with its limitation.
-                            let prompt =
-                                self.after_session_reset(&agent, &message, slot.as_deref(), &first);
-                            adapter.run_turn_slotted(
-                                &prompt,
-                                slot.as_deref(),
-                                &message.id,
-                                &on_started,
-                            )
-                        });
+                                let on_started = move |turn: &str| {
+                                    // CAD-250: a nudge owns no turn — it never
+                                    // becomes `running`, and its paste is not the
+                                    // held turn's proof of life.
+                                    if !nudge {
+                                        let _ = shared.store.mark_running(&started_id, turn);
+                                        watch.bump_activity();
+                                    }
+                                    shared.wake();
+                                };
+                                let first = adapter.run_turn_slotted(
+                                    &prompt,
+                                    slot.as_deref(),
+                                    &message.id,
+                                    &on_started,
+                                )?;
+                                if nudge || !adapter.reset_rejected_session(&first)? {
+                                    return Ok(first);
+                                }
+                                // CAD-1076: one retry on a fresh session.
+                                // Offered only for a master history refusal
+                                // before any tool. A serialized-body refusal
+                                // after a tool is not offered — retrying
+                                // would replay work that already ran, and
+                                // that turn stays failed with its limitation.
+                                let (base, pack) = self.after_session_reset_parts(
+                                    &agent,
+                                    &message,
+                                    slot.as_deref(),
+                                    &first,
+                                );
+                                // Same priority as the first attempt: the member
+                                // profile and mandatory task context are planned
+                                // against the base body; optional history yields.
+                                let base = match self.member_profile_context(&message)? {
+                                    Some(context) => format!("{base}\n\n{context}"),
+                                    None => base,
+                                };
+                                pending_context = None;
+                                let prompt = match self.context_delivery(
+                                    &agent,
+                                    &message,
+                                    base.len(),
+                                    true,
+                                    false,
+                                ) {
+                                    Ok(Some(delivery)) => {
+                                        let text = if delivery.plan.text.is_empty() {
+                                            base
+                                        } else {
+                                            format!("{base}\n\n{}", delivery.plan.text)
+                                        };
+                                        pending_context = Some(delivery);
+                                        text
+                                    }
+                                    Ok(None) => base,
+                                    Err(error) => return Err(error),
+                                };
+                                let prompt = match pack {
+                                    Some(pack) => {
+                                        let combined = prompt.len() + pack.text.len() + 2;
+                                        if pending_context.is_some()
+                                            && combined > crate::context_pack::MAX_COMBINED_BYTES
+                                        {
+                                            self.omit_continuity(alias, &message, &pack, combined);
+                                            prompt
+                                        } else {
+                                            self.record_continuity(alias, &message, &pack);
+                                            pack.wrap(&prompt)
+                                        }
+                                    }
+                                    None => prompt,
+                                };
+                                adapter.run_turn_slotted(
+                                    &prompt,
+                                    slot.as_deref(),
+                                    &message.id,
+                                    &on_started,
+                                )
+                            });
                     adapter.set_unclaimed_ok(false);
                     adapter.set_steer_ok(false);
                     // CAD-250: an unconfirmed nudge paste ends `unknown`,
@@ -693,6 +792,19 @@ impl Shared {
                                     &message,
                                     &format!("reported outcome could not be applied: {error}"),
                                 );
+                            }
+                            // CAD-1822: only a definite provider result
+                            // confirms supply. The receipt names the actual
+                            // session/generation and newly appended bytes.
+                            if let Some(delivery) = pending_context.take() {
+                                if let Err(error) = delivery.record(&self.store, &message) {
+                                    let _ = self.store.event_public(
+                                        alias,
+                                        "context_supply_failed",
+                                        json!({"message": message.id,
+                                               "error": error.to_string()}),
+                                    );
+                                }
                             }
                             gate_notice = None;
                             gate_waits = 0;

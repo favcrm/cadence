@@ -34,6 +34,19 @@ pub(crate) struct WorkerTurn {
     pub sha: Option<String>,
 }
 
+/// CAD-1822: the context selection committed atomically with a dispatch
+/// enqueue. Only an accepted NEW message row persists it; a duplicate or a
+/// rejected envelope writes nothing, so a colliding request cannot retarget a
+/// queued turn's context.
+pub enum IssueSelection {
+    /// The accepted kickoff's `context_pin` payload.
+    Pin(Value),
+    /// The accepted assignment carries no opted-in pin. A `context_disabled`
+    /// marker is written only when the alias already has feature state at this
+    /// transaction's commit.
+    Disabled { task: String, reason: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub seq: i64,
@@ -651,6 +664,7 @@ impl Store {
             human,
             None,
             None,
+            None,
         )
     }
 
@@ -677,6 +691,7 @@ impl Store {
         human: Option<&Value>,
         media_refs: Option<&Value>,
         authorized_until: Option<f64>,
+        selection: Option<IssueSelection>,
     ) -> Result<(bool, String)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
@@ -742,6 +757,7 @@ impl Store {
                 human,
                 conversation,
                 media_refs,
+                selection,
             )?;
             for old in &superseded {
                 self.supersede_in(&tx, old, id, steer)?;
@@ -1346,6 +1362,7 @@ impl Store {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1388,6 +1405,7 @@ impl Store {
             human,
             None,
             None,
+            None,
         )
     }
 
@@ -1413,6 +1431,7 @@ impl Store {
         human: Option<&Value>,
         conversation: Option<&str>,
         media_refs: Option<&Value>,
+        selection: Option<IssueSelection>,
     ) -> Result<(bool, String)> {
         if !daemon {
             crate::proto::caller_message(id, source)?;
@@ -1544,6 +1563,27 @@ impl Store {
                 media_refs,
             )?;
         }
+        // CAD-1822: the context selection commits with the accepted NEW row.
+        // The existing-id comparison above returns before this point, so a
+        // duplicate or rejected envelope can never write or retarget
+        // selection; a failure here rolls the message row back too.
+        if let Some(selection) = selection {
+            match selection {
+                IssueSelection::Pin(payload) => {
+                    Self::event(tx, alias, crate::context_pack::PIN_EVENT, payload)?;
+                }
+                IssueSelection::Disabled { task, reason } => {
+                    if Self::has_context_state_in(tx, alias)? {
+                        Self::event(
+                            tx,
+                            alias,
+                            crate::context_pack::DISABLED_EVENT,
+                            json!({"message": id, "task": task, "reason": reason}),
+                        )?;
+                    }
+                }
+            }
+        }
         Ok((false, "queued".to_string()))
     }
     /// CAD-819: the uid of a live agent row, `None` when the alias is gone
@@ -1618,6 +1658,7 @@ impl Store {
             app,
             attachments,
             human,
+            None,
             None,
             None,
         )

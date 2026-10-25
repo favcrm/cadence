@@ -837,6 +837,7 @@ impl Shared {
             human,
             media_refs.as_ref(),
             bound_lane.map(|(_, _, until)| until),
+            None,
         )?;
         // Each superseded row's `reply_to` got a notice in the same
         // transaction — wake those recipients like `message cancel` does.

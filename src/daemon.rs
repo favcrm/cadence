@@ -217,6 +217,8 @@ mod board_producer_golden;
 mod cad1700_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1777_drawer_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1822_context_refusal_acceptance;
 mod connection_test;
 mod connections_rpc;
 #[cfg(all(test, feature = "test-seam"))]
@@ -873,6 +875,65 @@ pub struct Shared {
     after_done_write_failure: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(feature = "test-seam")]
     after_done_retry_saved: Option<DoneRetrySavedHook>,
+}
+
+/// CAD-1822: one planned task-context append for a managed turn.
+pub(super) struct ContextDelivery {
+    pub(super) plan: crate::context_pack::Plan,
+    pin: String,
+    task: String,
+    task_revision: String,
+    manifest: String,
+    project_revision: String,
+    role: String,
+    assigned_role: Option<String>,
+    conversation: String,
+    body_bytes: usize,
+    limit: usize,
+}
+
+impl ContextDelivery {
+    /// Record supply after a definite provider result for this turn. A
+    /// pre-submission refusal, an uncertain outcome or a not-rendered paste
+    /// writes nothing. A returned result — completed, failed or interrupted —
+    /// confirms the local conversation append (the provider accepted and
+    /// answered the request), not model success. The identity is re-read from
+    /// the store, so the receipt names the session/generation that actually
+    /// served it; no confirmation means no residency, and the next turn
+    /// restores.
+    pub(super) fn record(&self, store: &Store, message: &Message) -> Result<()> {
+        let agent = store.agent(&message.alias)?;
+        let receipt = crate::context_pack::Receipt {
+            message: message.id.clone(),
+            pin: self.pin.clone(),
+            task: self.task.clone(),
+            task_revision: self.task_revision.clone(),
+            manifest: self.manifest.clone(),
+            project_revision: self.project_revision.clone(),
+            role: self.role.clone(),
+            assigned_role: self.assigned_role.clone(),
+            conversation: self.conversation.clone(),
+            session: agent.thread_id,
+            generation: agent.generation,
+            appended_bytes: self.plan.bytes,
+            body_bytes: self.body_bytes,
+            limit: self.limit,
+            mode: self.plan.mode.as_str().to_string(),
+            sources: self.plan.included.clone(),
+            withheld: self.plan.withheld.clone(),
+        };
+        store.event_public(
+            &message.alias,
+            crate::context_pack::SUPPLY_EVENT,
+            serde_json::to_value(receipt)?,
+        )
+    }
+}
+
+/// The manifest a `context_pin` event recorded. A malformed pin reads as
+/// `None`; delivery refuses rather than guessing a contract.
+fn pinned_manifest(pin: &Value) -> Option<crate::context_pack::Manifest> {
+    serde_json::from_value(pin.get("manifest")?.clone()).ok()
 }
 
 impl Shared {
@@ -1661,15 +1722,18 @@ impl Shared {
         self.continuity_prompt_slotted(alias, endpoint_kind, message, None)
     }
 
-    /// CAD-1009: [`Self::continuity_prompt`] with the scoped-turn token
-    /// `slot` (see [`Self::turn_slot`]) after the App hint.
-    fn continuity_prompt_slotted(
+    /// The assembled continuity pack and the base delivery body, without
+    /// recording delivery. Due-ness is consumed here exactly as a delivery
+    /// would. The actor splits them so the mandatory task contract and
+    /// required sources keep budget priority; [`Self::continuity_prompt_slotted`]
+    /// retains the combined shape for existing callers.
+    fn continuity_parts(
         &self,
         alias: &str,
         endpoint_kind: &str,
         message: &Message,
         slot: Option<&str>,
-    ) -> String {
+    ) -> (String, Option<crate::continuity::Pack>) {
         let body = self.delivery_body(alias, endpoint_kind, message, slot);
         // A new or lost session is decided at open (in memory: the next
         // open decides again); a compaction is a thread note, pending
@@ -1694,10 +1758,10 @@ impl Shared {
                     .then_some(crate::continuity::Reason::Compacted)
             });
         let Some(reason) = due else {
-            return body;
+            return (body, None);
         };
         if !crate::continuity::endpoint_takes_packs(endpoint_kind) {
-            return body;
+            return (body, None);
         }
         let pm_dir = self.pm_dir().ok().filter(|d| d.is_dir());
         let built = crate::continuity::assemble(
@@ -1723,7 +1787,7 @@ impl Shared {
                         None,
                     );
                 }
-                return body;
+                return (body, None);
             }
             Err(e) => {
                 // One failure per trigger: the note settles it, so a
@@ -1744,9 +1808,45 @@ impl Shared {
                     "failed",
                     Some(&error),
                 );
-                return body;
+                return (body, None);
             }
         };
+        (body, Some(pack))
+    }
+
+    /// CAD-1009: the combined prompt existing callers use — the due pack (if
+    /// any) wrapped ahead of the delivery body. The actor calls
+    /// [`Self::continuity_parts`] directly so mandatory task context is
+    /// planned before optional history.
+    #[cfg(test)]
+    fn continuity_prompt_slotted(
+        &self,
+        alias: &str,
+        endpoint_kind: &str,
+        message: &Message,
+        slot: Option<&str>,
+    ) -> String {
+        let (body, pack) = self.continuity_parts(alias, endpoint_kind, message, slot);
+        let Some(pack) = pack else {
+            return body;
+        };
+        self.record_continuity(alias, message, &pack);
+        pack.wrap(&body)
+    }
+
+    /// The native conversation a message belongs to, home when it has none.
+    fn message_thread(&self, alias: &str, message: &Message) -> Option<store::Thread> {
+        self.store
+            .message_conversation(alias, &message.id)
+            .ok()
+            .flatten()
+            .or_else(|| self.store.thread(alias).ok().flatten())
+    }
+
+    /// Record that a pack was delivered: the thread note (counts, never
+    /// content) and the public event.
+    fn record_continuity(&self, alias: &str, message: &Message, pack: &crate::continuity::Pack) {
+        let thread = self.message_thread(alias, message);
         let payload = pack.payload(&message.id);
         if let Err(e) = self.note_in(
             alias,
@@ -1765,28 +1865,391 @@ impl Shared {
             .store
             .event_public(alias, crate::continuity::PACK_EVENT, payload);
         self.wake();
-        pack.wrap(&body)
+    }
+
+    /// An assembled optional continuity pack cannot fit beside the mandatory
+    /// task context. Record the omission with its reason and settle the
+    /// trigger (the note is a pack note), so later turns do not retry it.
+    fn omit_continuity(
+        &self,
+        alias: &str,
+        message: &Message,
+        pack: &crate::continuity::Pack,
+        combined: usize,
+    ) {
+        let thread = self.message_thread(alias, message);
+        let reason = format!(
+            "optional continuity history needs {combined} combined bytes, over the \
+             {}-byte cap; it was omitted whole so the mandatory task contract and \
+             required sources stay intact",
+            crate::context_pack::MAX_COMBINED_BYTES
+        );
+        let _ = self.store.event_public(
+            alias,
+            crate::context_pack::GAP_EVENT,
+            json!({
+                "message": message.id,
+                "state": "continuity-omitted",
+                "reason": reason,
+                "pack_bytes": pack.text.len(),
+                "combined_bytes": combined,
+                "limit": crate::context_pack::MAX_COMBINED_BYTES,
+            }),
+        );
+        self.continuity_settle(
+            alias,
+            thread.as_ref(),
+            pack.reason,
+            &message.id,
+            "omitted",
+            Some(&reason),
+        );
+    }
+
+    fn context_refusal(
+        &self,
+        alias: &str,
+        message: &Message,
+        refusal: crate::context_pack::Refusal,
+    ) -> Error {
+        let _ = self.store.event_public(
+            alias,
+            "context_refused",
+            json!({
+                "message": message.id,
+                "task": message.issue,
+                "code": refusal.code(),
+                "reason": refusal.detail(),
+            }),
+        );
+        Error::pre_write(format!(
+            "context refused: {}: {}",
+            refusal.code(),
+            refusal.detail()
+        ))
+    }
+
+    /// Whether this turn's conversation has an observed provider compaction
+    /// pending. Read before the continuity prompt consumes the marker, so the
+    /// mandatory task contract is restored on the compaction turn too.
+    fn context_compacted(&self, message: &Message) -> bool {
+        self.store
+            .message_conversation(&message.alias, &message.id)
+            .ok()
+            .flatten()
+            .or_else(|| self.store.thread(&message.alias).ok().flatten())
+            .is_some_and(|thread| {
+                self.store
+                    .compaction_pending_of(&thread.id)
+                    .unwrap_or(false)
+            })
+    }
+
+    /// CAD-1822: the task contract and pinned project sources for this turn.
+    ///
+    /// The pin belongs to one exact kickoff message — never to an alias's
+    /// latest event — so two queued dispatches cannot borrow each other's
+    /// contract. An unbound message (an ordinary follow-up) may continue only
+    /// the active task of its own native conversation: recovery reads that
+    /// conversation's last confirmed receipt and restores its exact pin. A
+    /// confirmed retained session with the same task and contract appends
+    /// nothing; a new, lost or compacted session restores the complete
+    /// mandatory payload. `force_restore` is the session-reset retry's proof
+    /// that the session it will use is fresh.
+    fn context_delivery(
+        &self,
+        agent: &Agent,
+        message: &Message,
+        body_bytes: usize,
+        force_restore: bool,
+        compacted: bool,
+    ) -> Result<Option<ContextDelivery>> {
+        if message.is_nudge() || !crate::continuity::endpoint_takes_packs(&agent.endpoint_kind) {
+            return Ok(None);
+        }
+        // The identity that will serve this turn — re-read after the
+        // conversation switch, which opens a new provider session and
+        // rewrites thread_id/generation in the store.
+        let current = self.store.agent(&agent.alias)?;
+        let expected_task = message.issue.as_deref();
+        // A task-bound kickoff's own pin proves opt-in. Its delivery shares
+        // the alias's native home conversation, so the enqueue note, provider
+        // compaction notes and this receipt all name one real thread id
+        // rather than a synthetic sentinel.
+        let task_pin = match expected_task {
+            Some(_) => self.store.context_pin(&agent.alias, &message.id)?,
+            None => None,
+        };
+        if task_pin.is_some() {
+            self.store.ensure_thread(&agent.alias)?;
+        }
+        let thread = self
+            .store
+            .message_conversation(&agent.alias, &message.id)
+            .ok()
+            .flatten()
+            .or_else(|| self.store.thread(&agent.alias).ok().flatten());
+        let conversation = thread
+            .as_ref()
+            .map(|thread| thread.id.clone())
+            .unwrap_or_else(|| "home".to_string());
+        let previous: Option<crate::context_pack::Receipt> = self
+            .store
+            .last_context_supply(&agent.alias, &conversation)?
+            .and_then(|value| serde_json::from_value(value).ok());
+        // The conversation's durable active-task binding. It is task identity,
+        // not residency: the latest activation in THIS native conversation
+        // names the exact pin a follow-up restores, even when the first turn's
+        // supply receipt was lost. An alias-wide "latest" pin is never used.
+        let activation = self
+            .store
+            .last_context_activation(&agent.alias, &conversation)?;
+        // A native assignment whose scope is not opted in carries an
+        // exact-mid disabled marker. Clear any previous task binding before
+        // delivering it; a clear that cannot be persisted fails the turn
+        // before the provider, never leaving the old task authoritative.
+        if self
+            .store
+            .context_disabled(&agent.alias, &message.id)?
+            .is_some()
+        {
+            self.clear_context_binding(&agent.alias, &conversation, message, activation.as_ref())?;
+            return Ok(None);
+        }
+        let pin_message = match expected_task {
+            Some(_) if task_pin.is_some() => message.id.clone(),
+            Some(task) => match activation
+                .as_ref()
+                .filter(|activation| activation.get("task").and_then(Value::as_str) == Some(task))
+                .and_then(|activation| activation.get("pin").and_then(Value::as_str))
+            {
+                Some(pin) => pin.to_string(),
+                None => return Ok(None),
+            },
+            None => match activation
+                .as_ref()
+                .and_then(|activation| activation.get("pin").and_then(Value::as_str))
+            {
+                Some(pin) => pin.to_string(),
+                None => return Ok(None),
+            },
+        };
+        let pin = match task_pin {
+            Some(pin) => pin,
+            None => {
+                let Some(pin) = self.store.context_pin(&agent.alias, &pin_message)? else {
+                    // The conversation's active task cannot be restored; never
+                    // fall back to an older task or deliver without it.
+                    return Err(self.context_refusal(
+                        &agent.alias,
+                        message,
+                        crate::context_pack::Refusal::MissingRequiredSource {
+                            id: "active-task-pin".to_string(),
+                            state: "unavailable".to_string(),
+                            reason: "the active task's durable pin is unavailable".to_string(),
+                        },
+                    ));
+                };
+                pin
+            }
+        };
+        let Some(manifest) = pinned_manifest(&pin) else {
+            return Err(self.context_refusal(
+                &agent.alias,
+                message,
+                crate::context_pack::Refusal::ScopeConflict {
+                    detail: "the pinned manifest is malformed".to_string(),
+                },
+            ));
+        };
+        if let Some(task) = expected_task {
+            if manifest.task.task != task {
+                return Err(self.context_refusal(
+                    &agent.alias,
+                    message,
+                    crate::context_pack::Refusal::CrossTaskBinding {
+                        pin: pin_message,
+                        expected: task.to_string(),
+                        found: manifest.task.task.clone(),
+                    },
+                ));
+            }
+        }
+        // Record the durable active-task binding for this exact pin before
+        // anything is delivered. One event per pin change; a write failure
+        // refuses the turn before the provider so a follow-up cannot silently
+        // lose the task.
+        self.activate_context(
+            &agent.alias,
+            &conversation,
+            &pin_message,
+            &manifest,
+            message,
+            activation.as_ref(),
+        )?;
+        let session = current.thread_id.clone();
+        let generation = current.generation.clone();
+        let provable = session.as_deref().is_some_and(|value| !value.is_empty())
+            || generation.as_deref().is_some_and(|value| !value.is_empty());
+        let compacted = compacted
+            || thread.as_ref().is_some_and(|thread| {
+                self.store
+                    .compaction_pending_of(&thread.id)
+                    .unwrap_or(false)
+            });
+        let resident = !force_restore
+            && !compacted
+            && provable
+            && previous.as_ref().is_some_and(|previous| {
+                previous.conversation == conversation
+                    && previous.task == manifest.task.task
+                    && previous.session == session
+                    && previous.generation == generation
+            });
+        let pm = self.pm()?;
+        let (project, _) =
+            crate::issue::write::issue_dir(&pm, &manifest.task.task).map_err(|_| {
+                self.context_refusal(
+                    &agent.alias,
+                    message,
+                    crate::context_pack::Refusal::UnavailableProject {
+                        state: "missing_issue".to_string(),
+                        detail: "the pinned task's issue is unavailable".to_string(),
+                    },
+                )
+            })?;
+        let root =
+            crate::issue::context::repository_root(&project).map_err(|(state, detail)| {
+                self.context_refusal(
+                    &agent.alias,
+                    message,
+                    crate::context_pack::Refusal::UnavailableProject { state, detail },
+                )
+            })?;
+        let mut reader = |document: &crate::context_pack::Source| {
+            crate::issue::context::read_pinned_blob(
+                &root,
+                &document.revision,
+                &document.path,
+                &document.digest,
+            )
+        };
+        let plan = crate::context_pack::plan(
+            &manifest,
+            previous.as_ref(),
+            resident,
+            body_bytes,
+            message.source == "dispatch"
+                && message.issue.is_some()
+                && !manifest.task.acceptance.is_empty(),
+            &mut reader,
+        )
+        .map_err(|refusal| self.context_refusal(&agent.alias, message, refusal))?;
+        Ok(Some(ContextDelivery {
+            plan,
+            pin: pin_message,
+            task: manifest.task.task.clone(),
+            task_revision: manifest.task.revision.clone(),
+            manifest: manifest.digest.clone(),
+            project_revision: manifest.project_revision.clone(),
+            role: manifest.role.clone(),
+            assigned_role: manifest.assigned_role.clone(),
+            conversation,
+            body_bytes,
+            limit: crate::context_pack::MAX_COMBINED_BYTES,
+        }))
+    }
+
+    /// Clear the conversation's durable active-task binding because a later
+    /// native assignment carries no opted-in pin. Written only when a binding
+    /// was actually active; failure refuses the turn before the provider.
+    fn clear_context_binding(
+        &self,
+        alias: &str,
+        conversation: &str,
+        message: &Message,
+        active: Option<&Value>,
+    ) -> Result<()> {
+        let Some(active) = active else {
+            return Ok(());
+        };
+        self.store
+            .event_public(
+                alias,
+                crate::context_pack::DEACTIVATED_EVENT,
+                json!({
+                    "message": message.id,
+                    "conversation": conversation,
+                    "prior_pin": active.get("pin").and_then(Value::as_str),
+                    "prior_task": active.get("task").and_then(Value::as_str),
+                    "task": message.issue,
+                    "reason": "a native assignment without an opted-in context pin \
+                               cleared the previous task binding",
+                }),
+            )
+            .map_err(|error| {
+                Error::pre_write(format!(
+                    "context refused: activation-failed: the previous task binding \
+                     could not be cleared: {error}"
+                ))
+            })
+    }
+
+    /// Record the conversation's durable active-task binding for
+    /// `pin_message` before any provider delivery. One event per pin change,
+    /// never per turn; failure refuses the turn so a follow-up cannot silently
+    /// lose its task. This is task identity, not proof of residency.
+    fn activate_context(
+        &self,
+        alias: &str,
+        conversation: &str,
+        pin_message: &str,
+        manifest: &crate::context_pack::Manifest,
+        message: &Message,
+        current: Option<&Value>,
+    ) -> Result<()> {
+        if current.and_then(|value| value.get("pin").and_then(Value::as_str)) == Some(pin_message) {
+            return Ok(());
+        }
+        self.store
+            .event_public(
+                alias,
+                crate::context_pack::ACTIVATED_EVENT,
+                json!({
+                    "message": message.id,
+                    "conversation": conversation,
+                    "pin": pin_message,
+                    "task": manifest.task.task,
+                    "task_revision": manifest.task.revision,
+                    "manifest": manifest.digest,
+                    "role": manifest.role,
+                    "assigned_role": manifest.assigned_role,
+                }),
+            )
+            .map_err(|error| {
+                Error::pre_write(format!(
+                    "context refused: activation-failed: the active task binding \
+                     could not be recorded: {error}"
+                ))
+            })
     }
 
     /// CAD-1076: the provider refused this session's history and the
-    /// adapter started a fresh session. Record why, and answer the
-    /// retry's prompt: the same message behind a continuity pack.
+    /// adapter started a fresh session. Record why, and answer the retry with
+    /// the base body plus the due continuity pack; the actor plans the
+    /// mandatory task context against the base first and includes the pack
+    /// only when it fits the combined cap (otherwise it is omitted whole).
     ///
-    /// Known limit: a body near the 48 000-byte enqueue cap plus the
-    /// pack (up to `continuity::PACK_MAX`) can exceed the gateway's
-    /// 64 000-character per-message limit, so that one retry is refused
-    /// too and the message fails with the provider's 400. It never
-    /// loops. Lifting the limit depends on AOS-136 (gateway limits).
     /// This is only the pre-tool continuation. A serialized-body refusal
     /// after a tool does not reach here: the adapter leaves the turn
     /// failed instead of replaying work that already ran.
-    fn after_session_reset(
+    fn after_session_reset_parts(
         &self,
         agent: &store::Agent,
         message: &Message,
         slot: Option<&str>,
         refused: &TurnResult,
-    ) -> String {
+    ) -> (String, Option<crate::continuity::Pack>) {
         let alias = agent.alias.as_str();
         let error = refused
             .error
@@ -1811,7 +2274,7 @@ impl Shared {
                 role: store::ROLE_SYSTEM,
                 kind: store::KIND_MESSAGE,
                 text: &format!(
-                    "The provider refused this session's history ({error}). Started a new provider session with a continuity pack and retried the turn once."
+                    "The provider refused this session's history ({error}). Started a new provider session and retried the turn once with the mandatory task context; optional continuity history is included only when it fits."
                 ),
                 payload: Some(json!({"event": "provider_session_reset", "message": message.id})),
                 message_id: None,
@@ -1823,7 +2286,7 @@ impl Shared {
             .lock()
             .unwrap()
             .insert(alias.to_string(), crate::continuity::Reason::New);
-        self.continuity_prompt_slotted(alias, &agent.endpoint_kind, message, slot)
+        self.continuity_parts(alias, &agent.endpoint_kind, message, slot)
     }
 
     /// CAD-324: record in the thread that a due pack was not delivered

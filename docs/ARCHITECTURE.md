@@ -59,7 +59,7 @@ existing authority recheck and absolute deadline.
 | [src/backup/](../src/backup/) | Online-backup manifests, secret-scanned exports, restore with repository remap. |
 | [src/adapter/mod.rs](../src/adapter/mod.rs), [src/adapter/registry.rs](../src/adapter/registry.rs) | Common adapter types and provider capability descriptors. |
 | [src/adapter/](../src/adapter/), [src/adapter/pty/](../src/adapter/pty/) | Structured provider transports and owned terminal lifecycle. Check the registry for accepted combinations; screen classification is not provider approval. |
-| [src/issue/](../src/issue/) | Project/issue files, start/dispatch/finish, history, report intake, relay and read-only retros. |
+| [src/issue/](../src/issue/), [src/context_pack.rs](../src/context_pack.rs) | Project/issue files, start/dispatch/finish, history, report intake, relay and read-only retros. Context planner: deterministic task manifest, source dispositions, delivery/restore plan and supply receipts for issue-bound turns. |
 | [src/memory/](../src/memory/) | Proposal/curation CLI, scoped matching, bounded rendering and staleness observations. |
 | [src/review.rs](../src/review.rs), [src/audit/](../src/audit/mod.rs) | Revision-bound review evidence and merge/audit reconstruction. |
 | [src/slots.rs](../src/slots.rs), [src/slots/persistence.rs](../src/slots/persistence.rs), [src/doctor/host/mod.rs](../src/doctor/host/mod.rs), [src/doctor/host/](../src/doctor/host/) | Slots: live build/test admission and coordination; persistence: serialization, strict commit, rejected-file evidence preservation and restart recovery. Doctor: partitioned host/session ownership/resource checks. |
@@ -87,6 +87,64 @@ binary rollout and database migration.
 Resource admission and provider quota are also different. A free build slot does
 not prove provider allowance, and attaching/detaching a terminal does not prove
 its provider process ended. Reclamation must prove ownership at action time.
+
+### Task context delivery (CAD-1822)
+
+A project opts in by setting `agent_delivery: true` in its tracked
+`docs/cadence/project-context.yaml` at HEAD; absent or false leaves every
+existing dispatch path unchanged. A manifest the daemon cannot read or parse
+cannot prove the opt-in, so delivery stays off; once `agent_delivery: true` is
+parsed, an invalid manifest, a missing required source or an over-cap payload
+refuses. An
+opted-in issue-bound managed dispatch pins one deterministic task manifest
+(`src/context_pack.rs`) before the kickoff becomes claimable: the issue id,
+SHA-256 of the issue source, complete acceptance, the assigned project's HEAD
+and each selected tracked document's path/revision/digest/bytes, plus the
+selection role and explicit gaps. Selection reuses the bounded project-context
+reader and its documentation allowlist (`src/issue/context.rs`) against the
+project's declared repository — never a client-supplied path or revision.
+Required sources are mandatory; optional ones are best-effort. The pin is an
+event on the target alias bound to the exact message id. Opting in
+also establishes the alias's native home conversation when the pin is written,
+so enqueue notes, provider compaction notes and receipts share one thread.
+Before delivery the actor records one durable activation binding per pin in
+that conversation (exact pin, task and task revision); a follow-up without its
+own pin restores from it, never from an alias-latest pin or optional rollups,
+so a lost supply receipt cannot lose the task. The activation is task identity,
+not residency: only `context_supplied` proves supply, and its absence forces a
+full restore. An activation write failure refuses the turn before the provider.
+The pin (or a disabled selection) commits in the same admission transaction as
+the accepted message row: a rejected or duplicate envelope writes nothing, and
+the assignment is claimable only after both are durable. A native dispatch
+whose assigned scope is not opted in passes a disabled selection that persists
+one exact-message `context_disabled` marker only if the alias already has
+feature state at that commit (never for a never-opted-in alias); before
+delivering it the actor clears the conversation's active binding (one
+`context_deactivated` marker, only for a real prior binding), and a failed
+clear refuses the turn before the provider. An already-accepted id is decided
+by the store's exact-envelope comparison: an exact lost-acknowledgement retry
+returns the known accepted outcome without re-capturing project context or
+adding metadata, and only a genuinely new id is evaluated for required sources.
+A same-issue
+re-dispatch after opt-out cannot reuse the old pin; a legitimate issue follow-up
+without a marker keeps the immutable current pin. These markers are metadata
+only (no source bodies, not per-turn).
+Pre-turn delivery
+(`src/daemon.rs`, `src/daemon/actor.rs`) appends the full payload when the
+provider session is new, lost or compacted, and appends nothing when the same
+contract is confirmed resident in the same conversation, task and provider
+session/generation. The mandatory task context is planned against the delivery
+body and member profile first (adapter-owned guard material is untouched); an
+assembled optional continuity pack is included only when the whole prefix fits
+the remaining combined budget, otherwise it is omitted whole with a recorded
+reason. A definite provider result — completed, failed or interrupted — writes
+a supply receipt (the local append is confirmed, not model success); a
+pre-submission refusal, an uncertain outcome or a not-rendered paste writes
+none, so the next turn restores instead of claiming
+residency. Required-source failure, an unusable manifest and a combined payload
+over the local 48 000-byte cap refuse before provider submission; a required
+document over the reader's 64 KiB cap refuses rather than being truncated.
+Source text is quoted data, never instruction or authorization.
 
 ### Bounded workflow preauthorization
 

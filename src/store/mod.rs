@@ -80,7 +80,7 @@ mod messages;
 #[cfg(test)]
 pub(crate) use messages::take_decoded_messages;
 pub use messages::{
-    report_timeout_secs, Message, MessageIndex, MessageIndexQuery, Priority, Steer,
+    report_timeout_secs, IssueSelection, Message, MessageIndex, MessageIndexQuery, Priority, Steer,
     DEFAULT_REPORT_TIMEOUT_SECS, ENQUEUE_BYTES, NUDGE_SOURCE,
 };
 mod monitors;

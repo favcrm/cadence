@@ -125,7 +125,7 @@ impl Shared {
         .map_err(Error::rejected)?;
         let pm = self.pm()?;
         let (project, dir) = issue::write::issue_dir(&pm, &id)?;
-        let (front, _) = issue::write::load_front(&dir)?;
+        let (front, issue_body) = issue::write::load_front(&dir)?;
         // The dispatch-side claim check `dispatch::run` runs before
         // `issue start`, repeated here against the connection-bound
         // caller (never `reply_to`, which is a request field): an issue
@@ -157,11 +157,64 @@ impl Shared {
             }
         }
         let sender = self.thread_sender(&alias, peer_pid)?;
+        // CAD-1822: an already-accepted id is decided by the Store's exact
+        // envelope comparison. A lost-ACK retry must see the known accepted
+        // outcome, so it never re-captures project context or adds metadata;
+        // only an existing pinned selection keeps its conversation real.
+        let already_accepted = self.store.message_exists(&mid)?;
+        // Keep an accepted pinned selection's native conversation real; a
+        // legacy accepted mid gains no new metadata.
+        if already_accepted && self.store.context_pin(&alias, &mid)?.is_some() {
+            self.store.ensure_thread(&alias)?;
+        }
+        // Derive the context selection for a genuinely new dispatch and pass
+        // it into the store's admission transaction. The selection commits
+        // only with an accepted NEW row: a rejected or duplicate envelope
+        // writes nothing, so a colliding same-id request cannot retarget a
+        // queued turn's context.
+        let selection = if already_accepted {
+            None
+        } else {
+            let items = issue::parse::acceptance_items(&issue_body);
+            match issue::dispatch::context_guard(
+                &project,
+                &dir,
+                &front,
+                &items,
+                target.team_role.as_deref(),
+                &target.endpoint_kind,
+                text,
+            )? {
+                Some(manifest) => {
+                    // Opted-in delivery shares the alias's native home
+                    // conversation from the first send onward: the enqueue
+                    // note, provider compaction notes and later receipts must
+                    // name one real thread id.
+                    self.store.ensure_thread(&alias)?;
+                    let manifest_value = serde_json::to_value(&manifest)?;
+                    Some(store::IssueSelection::Pin(json!({
+                        "message": mid,
+                        "task": manifest.task.task,
+                        "task_revision": manifest.task.revision,
+                        "project": manifest.project,
+                        "project_revision": manifest.project_revision,
+                        "role": manifest.role,
+                        "assigned_role": manifest.assigned_role,
+                        "manifest_digest": manifest.digest,
+                        "manifest": manifest_value,
+                    })))
+                }
+                None => Some(store::IssueSelection::Disabled {
+                    task: id.clone(),
+                    reason: "the assigned project is not opted in to agent delivery".to_string(),
+                }),
+            }
+        };
         // CAD-1586: a dispatch is a master-target send too — the same
         // configuration-unlaunchable refusal, before the enqueue.
         // A retry of an ID that already names a row is decided by the
         // store's exact-envelope comparison; the refusal is for new sends.
-        if crate::master::is_master(&alias) && !self.store.message_exists(&mid)? {
+        if crate::master::is_master(&alias) && !already_accepted {
             self.master_send_preflight(&alias)?;
         }
         let gated = (matches!(&caller, AgentCaller::Agent(_)) || automatic)
@@ -213,6 +266,7 @@ impl Shared {
             None,
             None,
             authorized_until,
+            selection,
         )?;
         self.notify_agent(&alias);
         self.wake();
