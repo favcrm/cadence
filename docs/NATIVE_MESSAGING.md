@@ -54,10 +54,10 @@ is a conflict. This is broker idempotency, not a claim of provider idempotency.
 
 CAD-1814's first wave is Codex, Pi, native Cursor (`agent`) and omp. Claude
 is deferred while its usage is unavailable; cloud/hosted runtimes and custom
-skills/MCP/memory are later work. On 2026-10-25, codex-cli 0.163.0 and Pi
-1.4.0 produced real replies and routed peer results in disposable state.
-Cursor is blocked on native login; omp 18.12.6 launches but its private
-native store has no `openai-codex` login. Neither is a model-reply PASS.
+skills/MCP/memory are later work. On 2026-10-25, codex-cli 0.163.0, Pi
+1.4.0, native Cursor 2026.10.22-27dcf5f and omp 18.12.6 produced real replies
+in disposable state. Cursor -> omp and omp -> Codex peer requests produced
+model replies with recorded identities and one automatic return hop.
 The owned local runtime-to-daemon route below is separate from
 `agent connect`, which binds a local actor to a hosted workspace. Runtime
 versions are evidence, not certification of native steering.
@@ -76,13 +76,18 @@ versions are evidence, not certification of native steering.
    (`PI_CODING_AGENT_DIR`; never env/argv, never `~/.pi` inheritance).
 2. Provider readiness is separate from Cadence:
    `codex login status`, `pi auth check --provider <provider>`. For native
-   Cursor, `agent status` alone is insufficient: this host reported a
-   successful cached login while both `agent models` and real inference
-   refused authentication. The operator must complete `agent login`.
+   Cursor, check `agent models` as well as `agent status`: cached login
+   previously succeeded while catalog access and real inference refused.
+   Complete `agent login` when required, then prove an actual model reply.
    OMP uses its native `agent.db`, not Pi's auth.json. Do not copy an entire
-   operator database or export credentials to the command line. After its
-   private worker dir exists, the operator can authenticate that store with
+   operator database or export credentials to the command line. Authenticate
+   a fresh private store BEFORE that worker's first Cadence launch:
    `PI_CODING_AGENT_DIR=<sd>/agents/<omp>/pi omp login openai-codex`.
+   For SSH with a browser on another machine, the exercised native
+   `omp login openai-codex-device` method needs no localhost callback and
+   stores credentials under the same `openai-codex` provider. Keep the same
+   `PI_CODING_AGENT_DIR` on that command; approve in the browser, never paste
+   tokens into messages or logs.
    Missing native auth or quota is a blocker, not a delivery failure to
    substitute another account/provider around.
 3. Launch (no profile, skill, messaging MCP or memory service required):
@@ -120,6 +125,14 @@ versions are evidence, not certification of native steering.
    that peer as a `worker_result` message with the recorded sender and
    recipient uids. The routed copy has no `reply_to`, so it cannot loop; one
    send produces the reply hop without a second manual delivery.
+
+   Peers read their own mailbox, not another actor's private mail. An
+   enrolled Cursor or omp actor can originate peer sends with its native
+   Cadence CLI. Codex's confined shell cannot open the daemon's Unix socket;
+   its adapter installs a curated local MCP bridge automatically, but the
+   observed bridge exposes no peer-send tool. Incoming peer requests and
+   automatic replies work; arbitrary Codex-originated peer sends are not
+   proved here. Do not widen confinement to work around this limitation.
 6. Operator surface: the Agent page's Message action opens
    `/threads?dm=<alias>`, and the board's
    `POST /api/threads/<alias>/messages` (`thread_send`) starts the canonical
@@ -181,8 +194,10 @@ completes that local command immediately; no model turn or `prompt_result`
 will follow. This is command completion, not proof of model inference.
 An asynchronous native auth rejection becomes a failed receipt, not a
 permanently running task. Strict nudges remain disabled without verified
-runtime guard admission. Successful omp replies, authenticated
-persistence/restart and peer routing still require end-to-end evidence.
+runtime guard admission. Authenticated omp replies, materialized native
+session/header identity, serialized busy sends, peer routing and saved-history
+recall after actor and coordinator restarts were exercised on 18.12.6.
+This does not certify future native versions or cloud/hosted execution.
 
 ## Disposition is not task completion
 
