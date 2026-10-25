@@ -481,6 +481,11 @@ struct Preflight {
     endpoint_kind: String,
     cwd_override: Option<String>,
     body: Option<String>,
+    /// CAD-1822: this plain dispatch's assigned project is opted in to task
+    /// context delivery. Only then may a changed kickoff body supersede a
+    /// reported duplicate; `--job` and non-opted projects keep the legacy
+    /// duplicate behavior.
+    context_active: bool,
 }
 
 /// The one pre-dispatch gate every caller shares: resolve the issue, read
@@ -622,15 +627,8 @@ pub(crate) fn context_guard(
             &document.digest,
         )
     };
-    crate::context_pack::plan(
-        &manifest,
-        None,
-        false,
-        body.len(),
-        !manifest.task.acceptance.is_empty(),
-        &mut reader,
-    )
-    .map_err(|refusal| refusal.error())?;
+    crate::context_pack::plan(&manifest, None, false, body, &mut reader)
+        .map_err(|refusal| refusal.error())?;
     Ok(Some(manifest))
 }
 
@@ -758,8 +756,9 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
     // validated before `issue start`, so a refusal leaves no lane, branch or
     // queued message behind. `--job` kickoffs are daemon-templated and keep
     // their existing path.
+    let mut context_active = false;
     if let Some(body) = body.as_deref() {
-        context_guard(
+        context_active = context_guard(
             &project,
             &dir,
             &front,
@@ -767,7 +766,8 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
             agent["team_role"].as_str(),
             &endpoint_kind,
             body,
-        )?;
+        )?
+        .is_some();
     }
 
     // `issue start` — idempotent; --owner <worker>, and for --job the
@@ -786,6 +786,7 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
         endpoint_kind,
         cwd_override,
         body,
+        context_active,
     })
 }
 
@@ -1083,6 +1084,7 @@ fn duplicate(
     show_now: &Value,
     items: &[AcceptanceItem],
     next_body: Option<&str>,
+    context_active: bool,
     out: &mut Value,
 ) -> Result<bool> {
     let mut live: Option<Value> = None;
@@ -1150,11 +1152,12 @@ fn duplicate(
         return Ok(true);
     }
     if let Some(msg) = reported {
-        // A body that differs from what this worker/lane already reported is
-        // an explicit task revision, not a duplicate. History is preserved:
-        // the old message and its ref stay, and the new kickoff is added
-        // beside them. A live duplicate above still suppresses, so an
-        // in-flight task is never silently retargeted.
+        // An opted-in task's changed kickoff body is an explicit revision, not
+        // a duplicate. History is preserved: the old message and its ref stay,
+        // and the new kickoff is added beside them. A live duplicate above
+        // still suppresses, so an in-flight task is never silently retargeted,
+        // and a non-opted project keeps the legacy reported-duplicate outcome
+        // even when `--summary` changes the body.
         if let Some(next) = next_body {
             let same = msg["body"].as_str().is_some_and(|previous| {
                 previous == next
@@ -1162,7 +1165,7 @@ fn duplicate(
                         .strip_prefix(next)
                         .is_some_and(|suffix| suffix.starts_with(" Lessons:"))
             });
-            if !same {
+            if context_active && !same {
                 out["revised"] = json!(true);
                 out["previous_message"] = msg["id"].clone();
                 let _ = write::add_comment(
@@ -1256,6 +1259,7 @@ pub fn run(
         endpoint_kind,
         cwd_override,
         body,
+        context_active,
     } = preflight(pm, id, args, state_dir)?;
     let agent = &show["agent"];
     let start_args = start::StartArgs {
@@ -1343,6 +1347,7 @@ pub fn run(
         &show_now,
         &items,
         body.as_deref(),
+        context_active,
         &mut out,
     )? {
         return Ok(out);

@@ -1960,7 +1960,7 @@ impl Shared {
         &self,
         agent: &Agent,
         message: &Message,
-        body_bytes: usize,
+        body: &str,
         force_restore: bool,
         compacted: bool,
     ) -> Result<Option<ContextDelivery>> {
@@ -2134,17 +2134,9 @@ impl Shared {
                 &document.digest,
             )
         };
-        let plan = crate::context_pack::plan(
-            &manifest,
-            previous.as_ref(),
-            resident,
-            body_bytes,
-            message.source == "dispatch"
-                && message.issue.is_some()
-                && !manifest.task.acceptance.is_empty(),
-            &mut reader,
-        )
-        .map_err(|refusal| self.context_refusal(&agent.alias, message, refusal))?;
+        let plan =
+            crate::context_pack::plan(&manifest, previous.as_ref(), resident, body, &mut reader)
+                .map_err(|refusal| self.context_refusal(&agent.alias, message, refusal))?;
         Ok(Some(ContextDelivery {
             plan,
             pin: pin_message,
@@ -2155,7 +2147,7 @@ impl Shared {
             role: manifest.role.clone(),
             assigned_role: manifest.assigned_role.clone(),
             conversation,
-            body_bytes,
+            body_bytes: body.len(),
             limit: crate::context_pack::MAX_COMBINED_BYTES,
         }))
     }

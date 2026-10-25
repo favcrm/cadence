@@ -1457,3 +1457,297 @@ fn cad1822_accepted_legacy_retry_does_not_recapture_new_project_context() {
         "a retry cannot replay an accepted task and the new invalid task cannot run"
     );
 }
+
+fn context_event(fixture: &Fixture, alias: &str, kind: &str, message: &str) -> Value {
+    let store = crate::store::Store::open(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(entry) = store
+            .events_tail(alias, 100)
+            .unwrap()
+            .iter()
+            .find(|entry| entry.kind == kind && entry.payload["message"] == message)
+        {
+            return entry.payload.clone();
+        }
+        assert!(Instant::now() < deadline, "missing {kind} for {message}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn cad1822_custom_dispatch_carries_the_canonical_acceptance() {
+    let fixture = Fixture::new();
+    // Open the genuine lane on another seat; this target has never received
+    // the contract, so retained history cannot conceal an omitted criterion.
+    fixture.kickoff_rpc(CONTROL, RESTORED_WORKER).unwrap();
+    let sent = fixture.op(
+        "dispatch_send",
+        json!({
+            "alias": CONTROL_WORKER, "issue": CONTROL, "reply_to": GROUP,
+            "text": "Execute the assigned task using the supplied policy."
+        }),
+    );
+    let finished = context_event(
+        &fixture,
+        CONTROL_WORKER,
+        "turn_finished",
+        sent["message"].as_str().unwrap(),
+    );
+    assert!(
+        finished["result"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("The supplied required policy is delivered whole."),
+        "dispatch provenance is not proof that the actual input carries acceptance: {finished}"
+    );
+}
+
+#[test]
+fn cad1822_retained_peer_envelope_overflow_refuses_before_provider() {
+    let fixture = Fixture::new();
+    let first = fixture.kickoff_rpc(CONTROL, CONTROL_WORKER).unwrap();
+    context_event(
+        &fixture,
+        CONTROL_WORKER,
+        "context_supplied",
+        first["message"].as_str().unwrap(),
+    );
+    let sent = scoped(Asserted::Agent(CONTROL_WORKER.into()), || {
+        crate::client::rpc(
+            &fixture.state,
+            "agent_send",
+            json!({"alias": CONTROL_WORKER, "text": "\"".repeat(30_000)}),
+        )
+    })
+    .unwrap();
+    let id = sent["message"].as_str().unwrap();
+    let store = crate::store::Store::open(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let settled = loop {
+        let message = store.message(id).unwrap().unwrap();
+        if message.result.is_some() {
+            break message;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expanded peer turn did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        settled.state, "failed",
+        "the expanded mandatory body must refuse even when source bodies are retained"
+    );
+    assert!(settled.result.as_ref().unwrap()["error"]
+        .as_str()
+        .unwrap()
+        .contains("mandatory-overflow"));
+    assert!(
+        !store
+            .events_tail(CONTROL_WORKER, 100)
+            .unwrap()
+            .iter()
+            .any(|entry| { entry.kind == "turn_started" && entry.payload["message"] == id }),
+        "expanded overflow must be refused before provider acceptance"
+    );
+}
+
+#[test]
+fn cad1822_context_join_is_inside_the_combined_byte_cap() {
+    let fixture = Fixture::new();
+    let sent = fixture.kickoff_rpc(CONTROL, RESTORED_WORKER).unwrap();
+    let manifest: crate::context_pack::Manifest = serde_json::from_value(
+        fixture.context_pin(RESTORED_WORKER, sent["message"].as_str().unwrap())["manifest"].clone(),
+    )
+    .unwrap();
+    let mut reader = |source: &crate::context_pack::Source| {
+        crate::issue::context::read_pinned_blob(
+            &fixture.repo,
+            &source.revision,
+            &source.path,
+            &source.digest,
+        )
+    };
+    let baseline = crate::context_pack::plan(&manifest, None, false, "", &mut reader).unwrap();
+    let exact_body = 48_000 - baseline.text.len() - 2;
+    let body = "x".repeat(exact_body + 1);
+    let exact = crate::context_pack::plan(&manifest, None, false, &body[..exact_body], &mut reader)
+        .unwrap();
+    assert_eq!(exact_body + 2 + exact.text.len(), 48_000);
+    assert!(
+        matches!(
+            crate::context_pack::plan(&manifest, None, false, &body, &mut reader),
+            Err(crate::context_pack::Refusal::MandatoryOverflow { .. })
+        ),
+        "one byte beyond the actual body + join + context cap must refuse, not reach the adapter"
+    );
+}
+
+fn receipt_from_plan(
+    manifest: &crate::context_pack::Manifest,
+    plan: crate::context_pack::Plan,
+) -> crate::context_pack::Receipt {
+    crate::context_pack::Receipt {
+        task: manifest.task.task.clone(),
+        task_revision: manifest.task.revision.clone(),
+        manifest: manifest.digest.clone(),
+        sources: plan.included,
+        withheld: plan.withheld,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn cad1822_omitted_optional_source_is_not_resident_when_promoted() {
+    let fixture = Fixture::new();
+    let guide = format!(
+        "REQUIRED_GUIDE_BEGIN{}REQUIRED_GUIDE_END",
+        "g".repeat(10_000)
+    );
+    set_sources(
+        &fixture.repo,
+        PROJECT,
+        &[
+            ("policy", POLICY, "Required policy", true),
+            ("guide", "docs/guide.md", "Guide", false),
+        ],
+        &[
+            (POLICY, "The required policy body is present.\n"),
+            ("docs/guide.md", &guide),
+        ],
+    );
+    let first = fixture.kickoff_rpc(CONTROL, RESTORED_WORKER).unwrap();
+    let original: crate::context_pack::Manifest = serde_json::from_value(
+        fixture.context_pin(RESTORED_WORKER, first["message"].as_str().unwrap())["manifest"]
+            .clone(),
+    )
+    .unwrap();
+    let mut reader = |source: &crate::context_pack::Source| {
+        crate::issue::context::read_pinned_blob(
+            &fixture.repo,
+            &source.revision,
+            &source.path,
+            &source.digest,
+        )
+    };
+    let mut initial_body = String::with_capacity(40_000);
+    initial_body.push_str(r#"Acceptance: "The supplied required policy is delivered whole.""#);
+    initial_body.extend(std::iter::repeat_n('x', 40_000 - initial_body.len()));
+    let full =
+        crate::context_pack::plan(&original, None, false, &initial_body, &mut reader).unwrap();
+    assert!(full
+        .withheld
+        .iter()
+        .any(|gap| gap["id"] == "guide" && gap["state"] == "overflow"));
+    let previous = receipt_from_plan(&original, full);
+    let retained = crate::context_pack::plan(
+        &original,
+        Some(&previous),
+        true,
+        "Continue the unchanged task.",
+        &mut reader,
+    )
+    .unwrap();
+    assert!(
+        !retained
+            .included
+            .iter()
+            .any(|source| source["id"] == "guide"),
+        "a retained receipt cannot claim a never-delivered document is unchanged/resident"
+    );
+    assert!(
+        retained
+            .withheld
+            .iter()
+            .any(|gap| gap["id"] == "guide" && gap["state"] == "overflow"),
+        "the actual overflow reason must survive an unchanged turn"
+    );
+    let previous = receipt_from_plan(&original, retained);
+    set_sources(
+        &fixture.repo,
+        PROJECT,
+        &[
+            ("policy", POLICY, "Required policy", true),
+            ("guide", "docs/guide.md", "Guide", true),
+        ],
+        &[
+            (POLICY, "The required policy body is present.\n"),
+            ("docs/guide.md", &guide),
+        ],
+    );
+    let revised = fixture.op(
+        "dispatch_send",
+        json!({
+            "alias": RESTORED_WORKER, "issue": CONTROL, "reply_to": GROUP,
+            "text": fixture.acceptance(CONTROL)
+        }),
+    );
+    let current: crate::context_pack::Manifest = serde_json::from_value(
+        fixture.context_pin(RESTORED_WORKER, revised["message"].as_str().unwrap())["manifest"]
+            .clone(),
+    )
+    .unwrap();
+    let promoted = crate::context_pack::plan(
+        &current,
+        Some(&previous),
+        true,
+        "Apply the current task.",
+        &mut reader,
+    )
+    .unwrap();
+    assert!(
+        promoted.text.contains(&guide),
+        "promoting a never-supplied optional guide to required must send its complete body"
+    );
+}
+
+#[test]
+fn cad1822_legacy_summary_change_keeps_the_reported_duplicate() {
+    let fixture = Fixture::new();
+    let manifest = fixture.repo.join("docs/cadence/project-context.yaml");
+    let current = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        &manifest,
+        current.replacen("agent_delivery: true", "agent_delivery: false", 1),
+    )
+    .unwrap();
+    commit_all(&fixture.repo, "leave the legacy dispatch path opted out");
+    let first = fixture.kickoff_rpc(CONTROL, CONTROL_WORKER).unwrap();
+    context_event(
+        &fixture,
+        CONTROL_WORKER,
+        "turn_finished",
+        first["message"].as_str().unwrap(),
+    );
+    let pm = crate::issue::Pm::at(&fixture.pm).unwrap();
+    let args = crate::issue::dispatch::DispatchArgs {
+        to: CONTROL_WORKER.into(),
+        note: None,
+        name: None,
+        base: None,
+        repo: Some(fixture.repo.clone()),
+        reply_to: Some(GROUP.into()),
+        summary: Some("A changed summary is not a new legacy task assignment.".into()),
+        job_spec: None,
+        no_lessons: true,
+        force: false,
+        take_over: None,
+    };
+    let repeated = scoped(Asserted::Operator, || {
+        crate::issue::dispatch::run(
+            &pm,
+            CONTROL,
+            &args,
+            "operator",
+            &fixture.state,
+            None,
+            crate::issue::dispatch::DispatchOrigin::Explicit,
+        )
+    })
+    .unwrap();
+    assert_eq!(repeated["dispatched"], false,
+        "changing summary alone must not execute another task in a non-opted-in project: {repeated}");
+    assert_eq!(repeated["duplicate_kind"], "reported");
+    assert_eq!(repeated["message"], first["message"]);
+}

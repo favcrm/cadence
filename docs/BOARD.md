@@ -1004,7 +1004,17 @@ genuinely new id is still evaluated for required sources. Same-issue
 re-dispatch after opt-out therefore
 cannot reuse the previous pin, while a legitimate issue follow-up
 without a disabled marker keeps the immutable current pin. These
-markers carry no source bodies and are not written per turn. A
+markers carry no source bodies and are not written per turn. Delivery
+planning verifies acceptance presence against the actual delivered body
+in order — never inferred from the message source or a non-empty
+manifest; a body that does not carry every criterion gets the complete
+canonical acceptance. A retained turn reports only sources confirmed
+resident by an earlier receipt, plus the actual prior gap
+state/reason for anything still undelivered; if a required source is
+not confirmed resident the turn degrades to a delta and appends it.
+The body itself must fit the combined cap, and the actor's two-byte
+join is counted in every budget. Only an opted-in project's changed
+kickoff body supersedes a reported duplicate. A
 missing
 required source, an unusable manifest, a combined payload over 48 000
 bytes, a pinned project context on an endpoint that cannot receive

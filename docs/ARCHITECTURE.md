@@ -128,7 +128,14 @@ adding metadata, and only a genuinely new id is evaluated for required sources.
 A same-issue
 re-dispatch after opt-out cannot reuse the old pin; a legitimate issue follow-up
 without a marker keeps the immutable current pin. These markers are metadata
-only (no source bodies, not per-turn).
+only (no source bodies, not per-turn). Acceptance presence is verified against
+the actual delivered body in order, never inferred from the message source; a
+body missing any criterion gets the complete canonical acceptance. A retained
+turn reports only sources confirmed resident by an earlier receipt plus the
+actual prior gap state for anything undelivered; a required source that is not
+confirmed resident degrades the turn to a delta and is appended. The body
+itself must fit the combined cap, and the actor's two-byte join is counted.
+Only an opted-in project's changed kickoff body supersedes a reported duplicate.
 Pre-turn delivery
 (`src/daemon.rs`, `src/daemon/actor.rs`) appends the full payload when the
 provider session is new, lost or compacted, and appends nothing when the same

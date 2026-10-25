@@ -458,42 +458,80 @@ fn manifest_digest(
     digest(canonical.to_string().as_bytes())
 }
 
-/// Plan the append for `manifest` against the last confirmed receipt.
+/// Plan the context block for `manifest` against the last confirmed receipt.
 ///
 /// `resident` is the caller's proof that the receipt's session/generation is
 /// the one this turn will use, in the same conversation, for the same task.
-/// `body_bytes` is the size of the rest of the delivered prompt (body,
-/// continuity pack, guard material) that the combined cap must cover.
-/// `reader` returns the exact pinned bytes for a source, or `(state, reason)`.
-/// `contract_in_body` says the delivered message already carries the complete
-/// acceptance listing (a plain dispatch kickoff): restating it in the payload
-/// would double the mandatory budget without adding information, so the
-/// payload names the revision and leaves the criteria in the body. Follow-ups
-/// and restores pass `false` and get the complete acceptance.
+/// `body` is the actual delivered body for this turn: its bytes, the actor's
+/// two-byte join and the context block must fit the combined cap. Acceptance
+/// presence is verified against these actual bytes, never inferred from the
+/// message source or a non-empty manifest. `reader` returns the exact pinned
+/// bytes for a source, or `(state, reason)`.
 pub fn plan(
     manifest: &Manifest,
     previous: Option<&Receipt>,
     resident: bool,
-    body_bytes: usize,
-    contract_in_body: bool,
+    body: &str,
     reader: SourceReader<'_>,
 ) -> std::result::Result<Plan, Refusal> {
+    let body_bytes = body.len();
+    if body_bytes > MAX_COMBINED_BYTES {
+        // The turn's own body already exceeds the local cap; appending nothing
+        // cannot make it deliverable.
+        return Err(Refusal::MandatoryOverflow {
+            limit: MAX_COMBINED_BYTES,
+            needed: body_bytes,
+        });
+    }
+    let required_resident = |previous: &Receipt| {
+        manifest
+            .documents
+            .iter()
+            .filter(|document| document.required)
+            .all(|document| {
+                previous
+                    .sources
+                    .iter()
+                    .any(|entry| resident_source(entry, document))
+            })
+    };
     let retained = previous.filter(|_| resident).filter(|previous| {
         previous.task == manifest.task.task
             && previous.manifest == manifest.digest
             && previous.task_revision == manifest.task.revision
+            && required_resident(previous)
     });
-    if retained.is_some() {
+    if let Some(previous) = retained {
+        let mut included = Vec::new();
+        let mut withheld: Vec<Value> = manifest.withheld.iter().map(gap_value).collect();
+        for document in &manifest.documents {
+            if previous
+                .sources
+                .iter()
+                .any(|entry| resident_source(entry, document))
+            {
+                included.push(source_receipt(document, "unchanged"));
+            } else if let Some(prior) = previous.withheld.iter().find(|gap| {
+                gap.get("id").and_then(Value::as_str) == Some(document.id.as_str())
+                    && gap.get("path").and_then(Value::as_str) == Some(document.path.as_str())
+            }) {
+                // Carry the actual prior runtime gap (overflow, read failure).
+                withheld.push(prior.clone());
+            } else {
+                withheld.push(json!({
+                    "id": document.id, "path": document.path,
+                    "state": "not_resident",
+                    "reason": "not confirmed as delivered in this conversation",
+                    "required": document.required,
+                }));
+            }
+        }
         return Ok(Plan {
             text: String::new(),
             bytes: 0,
             mode: Mode::Retained,
-            included: manifest
-                .documents
-                .iter()
-                .map(|document| source_receipt(document, "unchanged"))
-                .collect(),
-            withheld: manifest.withheld.iter().map(gap_value).collect(),
+            included,
+            withheld,
         });
     }
     let delta = previous
@@ -508,6 +546,11 @@ pub fn plan(
     let supersedes = delta.map(|previous| previous.manifest.as_str());
     let acceptance_changed =
         delta.is_some_and(|previous| previous.task_revision != manifest.task.revision);
+    // The contract is only rendered for a full delivery or a changed
+    // acceptance. Verify it against the actual body at that point; retained and
+    // unchanged-delta turns never scan.
+    let contract_in_body = (mode == Mode::Full || acceptance_changed)
+        && acceptance_present(&manifest.task.acceptance, body);
 
     let mut required = String::new();
     render_contract(
@@ -570,15 +613,16 @@ pub fn plan(
     // Header/footer overhead is constant for this manifest and mode (the
     // nonce is fixed-width), so budgets are checked by length without building
     // a throwaway copy of the accumulated payload for every optional source.
+    // The actor joins body and context with two newlines; that join counts.
     let overhead = envelope(manifest, supersedes, mode, "", "0000000000000000").len();
-    let needed = body_bytes + overhead + required.len();
+    let needed = body_bytes + 2 + overhead + required.len();
     if needed > MAX_COMBINED_BYTES {
         return Err(Refusal::MandatoryOverflow {
             limit: MAX_COMBINED_BYTES,
             needed,
         });
     }
-    let mut body = required;
+    let mut context = required;
     for document in optional {
         let text = match reader(document) {
             Ok(text) => text,
@@ -591,7 +635,7 @@ pub fn plan(
             }
         };
         let block = source_block(document, supersedes, &text);
-        if body_bytes + overhead + body.len() + block.len() > MAX_COMBINED_BYTES {
+        if body_bytes + 2 + overhead + context.len() + block.len() > MAX_COMBINED_BYTES {
             withheld.push(json!({
                 "id": document.id, "path": document.path, "state": "overflow",
                 "reason": "optional source omitted to keep the combined payload under its cap",
@@ -599,13 +643,13 @@ pub fn plan(
             }));
             continue;
         }
-        body.push_str(&block);
+        context.push_str(&block);
         included.push(source_receipt(document, "appended"));
     }
 
-    let nonce = nonce(&body);
-    let text = envelope(manifest, supersedes, mode, &body, &nonce);
-    let needed = body_bytes + text.len();
+    let nonce = nonce(&context);
+    let text = envelope(manifest, supersedes, mode, &context, &nonce);
+    let needed = body_bytes + 2 + text.len();
     if needed > MAX_COMBINED_BYTES {
         return Err(Refusal::MandatoryOverflow {
             limit: MAX_COMBINED_BYTES,
@@ -613,12 +657,32 @@ pub fn plan(
         });
     }
     Ok(Plan {
+        bytes: text.len(),
         text,
-        bytes: needed.saturating_sub(body_bytes),
         mode,
         included,
         withheld,
     })
+}
+
+/// True when every criterion's canonical JSON string literal appears in
+/// `body` in order. Acceptance is verified against actual delivered content;
+/// an empty acceptance is never "present".
+pub fn acceptance_present(acceptance: &[String], body: &str) -> bool {
+    if acceptance.is_empty() {
+        return false;
+    }
+    let mut offset = 0usize;
+    for text in acceptance {
+        let Ok(quoted) = serde_json::to_string(text) else {
+            return false;
+        };
+        let Some(found) = body[offset..].find(&quoted) else {
+            return false;
+        };
+        offset += found + quoted.len();
+    }
+    true
 }
 
 fn gap_value(gap: &Gap) -> Value {
@@ -627,14 +691,24 @@ fn gap_value(gap: &Gap) -> Value {
 }
 
 fn unchanged_source(previous: &Receipt, document: &Source) -> bool {
-    // Content identity is the path + digest. The recorded `revision` is the
-    // project HEAD the blob was read at, so a commit that leaves this
-    // document untouched must not make it look changed.
-    previous.sources.iter().any(|entry| {
-        entry.get("id").and_then(Value::as_str) == Some(document.id.as_str())
-            && entry.get("path").and_then(Value::as_str) == Some(document.path.as_str())
-            && entry.get("digest").and_then(Value::as_str) == Some(document.digest.as_str())
-    })
+    previous
+        .sources
+        .iter()
+        .any(|entry| resident_source(entry, document))
+}
+
+/// A source is resident only when the prior receipt confirms it was actually
+/// appended (or was already unchanged) for this exact id, path and content
+/// digest. Withheld/gap metadata never counts as residency.
+fn resident_source(entry: &Value, document: &Source) -> bool {
+    let confirmed = entry
+        .get("disposition")
+        .and_then(Value::as_str)
+        .is_some_and(|disposition| matches!(disposition, "appended" | "unchanged"));
+    confirmed
+        && entry.get("id").and_then(Value::as_str) == Some(document.id.as_str())
+        && entry.get("path").and_then(Value::as_str) == Some(document.path.as_str())
+        && entry.get("digest").and_then(Value::as_str) == Some(document.digest.as_str())
 }
 
 fn source_receipt(document: &Source, disposition: &str) -> Value {
@@ -881,16 +955,45 @@ mod tests {
             task: "CAD-9".to_string(),
             task_revision: manifest.task.revision.clone(),
             manifest: manifest.digest.clone(),
+            sources: vec![source_receipt(&manifest.documents[0], "appended")],
             ..Receipt::default()
         };
         let mut read =
             |document: &Source| Ok::<_, (String, String)>(format!("body {}", document.id));
-        let retained = plan(&manifest, Some(&receipt), true, 10, false, &mut read).unwrap();
+        let retained = plan(&manifest, Some(&receipt), true, "", &mut read).unwrap();
         assert_eq!(retained.mode, Mode::Retained);
         assert!(retained.text.is_empty());
-        let restored = plan(&manifest, Some(&receipt), false, 10, false, &mut read).unwrap();
+        let restored = plan(&manifest, Some(&receipt), false, "", &mut read).unwrap();
         assert_eq!(restored.mode, Mode::Full);
         assert!(restored.text.contains("Acceptance (complete, verbatim)"));
+    }
+
+    #[test]
+    fn retained_preserves_prior_runtime_gaps_and_never_marks_them_resident() {
+        let mut manifest = manifest();
+        manifest.documents.push(document("guide", false));
+        let receipt = Receipt {
+            pin: "m1".to_string(),
+            task: "CAD-9".to_string(),
+            task_revision: manifest.task.revision.clone(),
+            manifest: manifest.digest.clone(),
+            sources: vec![source_receipt(&manifest.documents[0], "appended")],
+            withheld: vec![serde_json::json!({
+                "id": "guide", "path": "docs/guide.md", "state": "overflow",
+                "reason": "optional source omitted to keep the combined payload under its cap",
+                "required": false,
+            })],
+            ..Receipt::default()
+        };
+        let mut read =
+            |document: &Source| Ok::<_, (String, String)>(format!("body {}", document.id));
+        let retained = plan(&manifest, Some(&receipt), true, "", &mut read).unwrap();
+        assert_eq!(retained.mode, Mode::Retained);
+        assert_eq!(retained.included.len(), 1);
+        assert_eq!(retained.included[0]["id"], "policy");
+        assert_eq!(retained.withheld.len(), 1);
+        assert_eq!(retained.withheld[0]["id"], "guide");
+        assert_eq!(retained.withheld[0]["state"], "overflow");
     }
 
     #[test]
@@ -910,7 +1013,7 @@ mod tests {
         after.digest = "b".repeat(64);
         let mut read =
             |document: &Source| Ok::<_, (String, String)>(format!("body {}", document.id));
-        let delta = plan(&after, Some(&receipt), true, 10, false, &mut read).unwrap();
+        let delta = plan(&after, Some(&receipt), true, "", &mut read).unwrap();
         assert_eq!(delta.mode, Mode::Delta);
         assert!(delta.text.contains("Supersedes"));
         assert!(delta.text.contains("Acceptance (complete, verbatim)"));
@@ -923,7 +1026,7 @@ mod tests {
         manifest.task.acceptance = vec!["x".repeat(MAX_COMBINED_BYTES)];
         let mut read =
             |document: &Source| Ok::<_, (String, String)>(format!("body {}", document.id));
-        let refusal = plan(&manifest, None, false, 0, false, &mut read).unwrap_err();
+        let refusal = plan(&manifest, None, false, "", &mut read).unwrap_err();
         match refusal {
             Refusal::MandatoryOverflow { limit, needed } => {
                 assert_eq!(limit, MAX_COMBINED_BYTES);
