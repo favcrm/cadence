@@ -1151,7 +1151,7 @@ export default function ReleasePanel({
         <p className="pub-note">
           {release.unavailableReason === "host_incompatible"
             ? t(
-                "This release was checked against a different Cadence host and cannot run here. {version} was not installed.",
+                "This release did not pass its target Cadence host's compatibility check. {version} was not installed.",
               ).replace("{version}", release.version)
             : t(
                 "{version} is not available to install or update. The installation was not changed.",
