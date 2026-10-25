@@ -766,13 +766,20 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // operator-only installed-app list.
   const memberHome = screenReader && !boardReadOnly;
   const installations = useInstallations(listReader, `${route.screen}:${appsTick}`, memberHome ? "home" : "list");
-  // A soft-removed app is not an app to open: drop it from the menu.
+  // A removed or disabled app is not an app to open: drop it from the menu.
+  // It stays visible on the Apps surface, which is where it is managed.
   const installed: VerifiedApp[] = useMemo(
-    () => (installations.list ?? []).filter((i) => i.removed == null).map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })),
+    () => (installations.list ?? [])
+      .filter((i) => i.removed == null && (i.state ?? "active") === "active")
+      .map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })),
     [installations.list],
   );
   const keyInstallations = route.screen === "workspaceAppKey"
-    ? (installations.list ?? []).filter((installation) => installation.name === route.appKey && installation.removed == null)
+    ? (installations.list ?? []).filter((installation) =>
+        installation.name === route.appKey &&
+        installation.removed == null &&
+        (installation.state ?? "active") === "active",
+      )
     : [];
   let routeInstallId: string | null = null;
   if (route.screen === "workspaceApp") routeInstallId = route.installId;
