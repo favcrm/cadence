@@ -307,11 +307,11 @@ pub fn selection_role(team_role: Option<&str>) -> (&'static str, Option<String>)
 }
 
 /// The known local prompt material an adapter adds after the daemon plans the
-/// payload. Pi prepends its fixed guard line; reserve it unconditionally for
-/// that provider because guard readiness can change between planning and the
-/// turn. This is a local byte bound, never a provider-window estimate.
+/// payload. The Pi adapter prepends its fixed guard line; reserve it for its
+/// entire registry-defined provider family because readiness can change before
+/// the turn. This is a local byte bound, never a provider-window estimate.
 pub fn adapter_reserved_bytes(provider: &str) -> usize {
-    if provider == "pi" {
+    if crate::adapter::registry::pi_family_provider(provider) {
         crate::adapter::pi::TASK_INPUT_PREFIX.len()
     } else {
         0

@@ -1015,8 +1015,8 @@ not confirmed resident the turn degrades to a delta and appends it.
 The body itself must fit the combined cap, and the actor's two-byte
 join is counted in every budget. Known local adapter-added prompt
 material is reserved conservatively in the same cap — currently the
-44-byte guarded Pi task prefix, reserved even while that guard is
-currently off. This is a local byte reservation, not provider-window
+44-byte guarded Pi-adapter task prefix for every registry-defined Pi-family
+provider, even while its guard is off. This is a local byte reservation, not provider-window
 accounting; the receipt records it as `adapter_reserved_bytes`, never as
 appended source. Only an opted-in project's changed
 kickoff body supersedes a reported duplicate. A

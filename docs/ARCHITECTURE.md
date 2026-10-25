@@ -136,8 +136,8 @@ actual prior gap state for anything undelivered; a required source that is not
 confirmed resident degrades the turn to a delta and is appended. The body
 itself must fit the combined cap, and the actor's two-byte join is counted.
 Known local adapter-added prompt material is reserved in the same cap — the
-44-byte guarded Pi task prefix, reserved even while the guard is currently off
-(guard readiness can change before submission). This is a local byte
+44-byte guarded Pi-adapter task prefix for every registry-defined Pi-family
+provider, even while the guard is off (readiness can change). This is a local byte
 reservation, not provider-window accounting; the receipt carries
 `adapter_reserved_bytes`, never as appended source. Only an opted-in project's
 changed kickoff body supersedes a reported duplicate.

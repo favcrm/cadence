@@ -1772,18 +1772,19 @@ fn cad1822_pi_guard_is_inside_the_full_combined_cap() {
         )
     };
     let guard = crate::adapter::pi::TASK_INPUT_PREFIX;
+    let reserved = crate::context_pack::adapter_reserved_bytes("omp");
     let baseline =
-        crate::context_pack::plan(&manifest, None, false, "", guard.len(), &mut reader).unwrap();
+        crate::context_pack::plan(&manifest, None, false, "", reserved, &mut reader).unwrap();
     let body_bytes = 48_000 - guard.len() - baseline.text.len() - 2;
     let mut body = "界".repeat(body_bytes / 3);
     body.extend(std::iter::repeat_n('x', body_bytes % 3));
     let exact =
-        crate::context_pack::plan(&manifest, None, false, &body, guard.len(), &mut reader).unwrap();
+        crate::context_pack::plan(&manifest, None, false, &body, reserved, &mut reader).unwrap();
     assert_eq!(guard.len() + body.len() + 2 + exact.text.len(), 48_000);
     body.push('x');
     assert!(
         matches!(
-            crate::context_pack::plan(&manifest, None, false, &body, guard.len(), &mut reader),
+            crate::context_pack::plan(&manifest, None, false, &body, reserved, &mut reader),
             Err(crate::context_pack::Refusal::MandatoryOverflow { .. })
         ),
         "one byte above the complete local Pi text, including its real guard and Unicode, must refuse"
