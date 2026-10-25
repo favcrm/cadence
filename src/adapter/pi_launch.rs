@@ -514,6 +514,8 @@ pub fn copy_pi_auth(dir: &Path, operator_config: &Path) -> Result<crate::master:
 /// `--no-extensions` there is none anyway; the flag is the belt).
 pub(super) const PI_WORKER_TOOLS: &[&str] =
     &["read", "bash", "edit", "write", "grep", "find", "ls"];
+const OMP_WORKER_TOOLS: &[&str] =
+    &["read", "bash", "edit", "write", "grep", "find", "glob"];
 
 /// An operator-supplied image file, never a company-configured extension.
 /// The managed master only exposes these two reviewed AgenticOS GET tools;
@@ -612,16 +614,28 @@ pub(super) fn build_command(
     } else {
         cmd.extend(worker_session_args(state_dir, agent)?);
     }
-    for flag in [
-        "--offline",
-        "--no-themes",
-        "--no-skills",
-        "--no-prompt-templates",
-    ] {
+    let flags: &[&str] = if agent.provider == "omp" {
+        &["--no-skills", "--no-ui", "--no-title"]
+    } else {
+        &[
+            "--offline",
+            "--no-themes",
+            "--no-skills",
+            "--no-prompt-templates",
+        ]
+    };
+    for flag in flags {
         cmd.push(flag.to_string());
     }
     if crate::master::is_master(&agent.alias) {
-        cmd.push("--no-context-files".to_string());
+        cmd.push(
+            if agent.provider == "omp" {
+                "--no-rules"
+            } else {
+                "--no-context-files"
+            }
+            .to_string(),
+        );
     }
     // CAD-559: the only extensions loaded are the generated guard
     // (master) plus the operator's pinned `[pi].providers` packages —
@@ -675,7 +689,12 @@ pub(super) fn build_command(
                 ]);
             }
         }
-        cmd.extend(["--tools".to_string(), PI_WORKER_TOOLS.join(",")]);
+        let tools = if agent.provider == "omp" {
+            OMP_WORKER_TOOLS
+        } else {
+            PI_WORKER_TOOLS
+        };
+        cmd.extend(["--tools".to_string(), tools.join(",")]);
     }
     // `agent.model` is the provider's report, never a launch param —
     // only the configured param is replayed (same rule as Claude).
