@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { ApiError, api } from "../../lib/api";
 import { onPrivateSessionReset, withPrivateOperation } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
@@ -14,6 +14,7 @@ import NewHumanConversation from "./NewHumanConversation";
 import Link from "../../ui/Link";
 import PageState from "../../ui/PageState";
 import { issuePath } from "../issues/model";
+import { opensWorkItem } from "../../lib/workItems";
 import { IconClose, IconRefresh, IconSearch, IconThreads } from "../../ui/icons";
 import type { Agent } from "../../lib/types";
 import Composer from "../app-shell/chat/Composer";
@@ -138,13 +139,39 @@ function replyScope(intent: Pick<ReplyIntent, "senderUid" | "messageId">): strin
   return `threads-reply:${intent.senderUid}:${intent.messageId}`;
 }
 
+/** The App's opener for the shared work-item detail; absent in a bare frame. */
+const OpenWorkItem = createContext<((id: string) => void) | null>(null);
+
+/**
+ * One issue reference. It stays a real link (copyable, openable in a new tab)
+ * and a plain left click opens the same shared detail every other surface
+ * uses; a modified click keeps the canonical issue page (CAD-1811).
+ */
+function IssueRefLink({ id, project }: { id: string; project: string | null | undefined }) {
+  const open = useContext(OpenWorkItem);
+  if (!project) return <span className="threads-ref">{id}</span>;
+  return (
+    <Link
+      href={issuePath(project, id)}
+      className="threads-ref"
+      onClick={(event) => {
+        if (!open || !opensWorkItem(event)) return;
+        event.preventDefault();
+        open(id);
+      }}
+    >
+      {id}
+    </Link>
+  );
+}
+
 /** Drop one composer's draft bundle: text/refs and every queued row. Used
  *  only for a scoped reply the operator explicitly cancels. */
 function clearScopedDraft(scope: string): void {
   setComposerContent(scope, "", []);
   for (const item of attachItems(scope)) removeAttach(scope, item.key);
 }
-export default function ThreadsPage({ operator }: { operator: boolean }) {
+export default function ThreadsPage({ operator, onOpenWorkItem }: { operator: boolean; onOpenWorkItem?: (id: string) => void }) {
   const href = useHref();
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
   const url = useMemo(() => readThreadsUrl(search), [search]);
@@ -370,7 +397,7 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
     <ContextPanel row={open} writeBlock={writeBlock} onChanged={() => void loadList()} />
   ) : null;
 
-  return (
+  const page = (
     <section className="threads-page" aria-labelledby="threads-title">
       <div className="threads-layout">
         <aside className="threads-list" aria-label={t("Conversations")}>
@@ -569,6 +596,7 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
       </SheetDialog>
     </section>
   );
+  return <OpenWorkItem.Provider value={onOpenWorkItem ?? null}>{page}</OpenWorkItem.Provider>;
 }
 
 /** `?h=<room>`: an open human room (CAD-1412). */
@@ -954,13 +982,12 @@ function EntryRow({ entry, issueProjects }: { entry: ThreadEntry; issueProjects:
       {refs.length > 0 && (
         <div className="threads-refs">
           {refs.map((r) => {
-            const project = r.kind === "issue" ? issueProjects.get(r.id) : undefined;
+            const project = issueProjects.get(r.id);
+            if (r.kind === "issue") return <IssueRefLink key={`issue:${r.id}`} id={r.id} project={project} />;
             return project ? (
               <Link key={`${r.kind}:${r.id}`} href={issuePath(project, r.id)} className="threads-ref">{r.id}</Link>
             ) : (
-              <span key={`${r.kind}:${r.id}`} className="threads-ref">
-                {r.kind === "issue" ? r.id : `${r.kind}:${r.id}`}
-              </span>
+              <span key={`${r.kind}:${r.id}`} className="threads-ref">{`${r.kind}:${r.id}`}</span>
             );
           })}
         </div>
@@ -1013,11 +1040,7 @@ function MessageRow({
               {t("Reply to message {id}").replace("{id}", () => message.origin as string)}
             </span>
           )}
-          {message.issue && (issueProject ? (
-            <Link href={issuePath(issueProject, message.issue)} className="threads-ref">{message.issue}</Link>
-          ) : (
-            <span className="threads-ref">{message.issue}</span>
-          ))}
+          {message.issue && <IssueRefLink id={message.issue} project={issueProject} />}
           {message.task_id && <span className="threads-ref">{t("task {task}").replace("{task}", () => String(message.task_id))}</span>}
           {routed.map((r) => (
             <span key={r.id} className="threads-ref">
@@ -1310,11 +1333,7 @@ function DmContext({
       <span className="threads-recipient-work">
         {task ? (
           <>
-            {task.issue && issueProject ? (
-              <Link href={issuePath(issueProject, task.issue)} className="threads-ref">{task.issue}</Link>
-            ) : task.issue ? (
-              <span className="threads-ref">{task.issue}</span>
-            ) : null}
+            {task.issue ? <IssueRefLink id={task.issue} project={issueProject} /> : null}
             <span className="threads-ref">{task.title ?? task.task}</span>
           </>
         ) : agent ? (

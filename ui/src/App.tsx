@@ -19,7 +19,8 @@ import { APPS_CHANGED_EVENT } from "./features/workspace-apps/workspaceApps";
 import { appLoadErrorCopy } from "./features/explorer/appErrors";
 import WorkspaceApp from "./features/workspace-apps/WorkspaceApp";
 import Board from "./features/projects/Board";
-import Drawer, { type MyWorkDraft } from "./features/projects/Drawer";
+import WorkItemDetail from "./features/work-items/WorkItemDetail";
+import { homeNeedIssueId, type HomeDecisionOpen, type MyWorkDraft, type WorkItemOrigin } from "./lib/workItems";
 import ProjectsOverview from "./features/projects/ProjectsOverview";
 import IssuePage from "./features/issues/IssuePage";
 import { issuePath, laneFollowsStream, refreshIssueIds } from "./features/issues/model";
@@ -219,6 +220,11 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // The open drawer's detail, cached per id: reopening a drawer paints
   // the last payload while it revalidates.
   const detailState = useMaybeResource(openId ? resources.issue(openId) : null);
+  // CAD-1811: one shared work-item detail. `openId` (the URL) names the
+  // issue; the origin and any hosted Home decision are mount state.
+  const [workOrigin, setWorkOrigin] = useState<WorkItemOrigin>("issue");
+  const [decision, setDecision] = useState<HomeDecisionOpen | null>(null);
+  const workOpener = useRef<Element | null>(null);
   const personalState = useMaybeResource(screen === "myWork" ? resources.myWork : null);
   // The peek's membership: one issue, asked of the server (the list holds one page).
   const membershipState = useMaybeResource(screen === "myWork" && openId ? resources.myWorkIssue(openId) : null);
@@ -664,15 +670,59 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     [applyWrite, writeError, block, say],
   );
 
-  const openIssue = useCallback((id: string) => update((c) => ({ ...c, openId: id })), []);
+  const openWorkItem = useCallback((id: string, origin: WorkItemOrigin) => {
+    if (!openIdRef.current) workOpener.current = document.activeElement;
+    setWorkOrigin(origin);
+    update((c) => ({ ...c, openId: id }));
+  }, []);
+  const openIssue = useCallback((id: string) => {
+    setDecision(null);
+    openWorkItem(id, "issue");
+  }, [openWorkItem]);
+  const openHomeWork = useCallback((id: string) => {
+    setDecision(null);
+    openWorkItem(id, "home");
+  }, [openWorkItem]);
   const closeIssue = useCallback(() => update((c) => ({ ...c, openId: null })), []);
   const rememberPersonal = useCallback((id: string) => {
     personalReturn.current = { id, scroll: window.scrollY };
   }, []);
   const openPersonal = useCallback((id: string) => {
     rememberPersonal(id);
-    openIssue(id);
-  }, [rememberPersonal, openIssue]);
+    openWorkItem(id, "myWork");
+  }, [rememberPersonal, openWorkItem]);
+  const openDecision = useCallback((open: HomeDecisionOpen) => {
+    const id = homeNeedIssueId(open.need);
+    if (id === null) return;
+    setDecision(open);
+    openWorkItem(id, "home");
+  }, [openWorkItem]);
+  /** Close the shared detail; My work gets its reading position back. */
+  const closeWorkItem = useCallback(() => {
+    const origin = workOrigin;
+    const saved = origin === "myWork" ? personalReturn.current : null;
+    setDecision(null);
+    closeIssue();
+    if (saved !== null) requestAnimationFrame(() => window.scrollTo(0, saved.scroll));
+  }, [workOrigin, closeIssue]);
+  /** A Home decision landed: mark the card, then move to the next reading item. */
+  const finishDecision = useCallback((_key: string, text: string) => {
+    if (decision === null) return;
+    const next = decision.next(text);
+    if (next === null) {
+      closeWorkItem();
+      // This close bypasses DrawerShell's exit, so hand focus back here.
+      const opener = workOpener.current;
+      requestAnimationFrame(() => {
+        if (opener instanceof HTMLElement && opener.isConnected) opener.focus({ preventScroll: true });
+      });
+      return;
+    }
+    setDecision(next);
+    const id = homeNeedIssueId(next.need);
+    if (id === null) closeWorkItem();
+    else openWorkItem(id, "home");
+  }, [decision, closeWorkItem, openWorkItem]);
   const openAgent = useCallback(
     (alias: string | null) => update((c) => ({ ...c, route: { screen: "agents", alias } })),
     [],
@@ -1031,7 +1081,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             viewerIsMember={meta?.session?.user?.role === "member"}
             sessionId={meta?.session?.id ?? null}
             overview={overviewState}
-            onOpenIssue={openIssue}
+            onOpenIssue={openHomeWork}
+            onOpenDecision={openDecision}
             overviewHref={hrefFor({ screen: "overview" })}
             permissionsHref={hrefFor({ screen: "settings", section: "permissions" })}
             resolveAppPath={resolveAppPath}
@@ -1262,7 +1313,13 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             onToast={say}
           />
         )}
-        {route.screen === "threads" && <ThreadsPage key={meta.session?.id ?? ""} operator={meta.operator === true} />}
+        {route.screen === "threads" && (
+          <ThreadsPage
+            key={meta.session?.id ?? ""}
+            operator={meta.operator === true}
+            onOpenWorkItem={(id) => openWorkItem(id, "threads")}
+          />
+        )}
         {screen === "outbox" && <Outbox operator={meta?.operator === true} onOpenIssue={openIssue} />}
         {screen === "setup" && (
           <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? boardReadOnly : null} />
@@ -1316,15 +1373,27 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       </div>
 
       {openId && route.screen !== "issue" && (
-        <Drawer
-          key={openId}
+        <WorkItemDetail
+          key={`${openId}:${decision?.need.key ?? ""}`}
           id={openId}
+          origin={workOrigin}
           detail={detailState?.data?.id === openId ? detailState.data : null}
           readState={detailState}
           onRetry={() => {
             void resources.issue(openId).refresh();
             if (screen === "myWork") void resources.myWorkIssue(openId).refresh();
           }}
+          readOnly={readOnly}
+          writeBlock={block}
+          onWrite={applyWrite}
+          onError={writeError}
+          onOpen={openIssue}
+          card={screen === "myWork" ? personalState?.data?.issues.find((row) => row.id === openId) ?? null : null}
+          home={decision && homeNeedIssueId(decision.need) === openId ? {
+            open: decision,
+            onDone: finishDecision,
+            onAsk: (_need, lead) => decision.ask(lead),
+          } : undefined}
           myWork={screen === "myWork" ? {
             owner: membershipState?.data?.owner ?? "",
             assignment: membershipState?.data?.id === openId ? membershipState.data.assignment : null,
@@ -1356,7 +1425,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             const key = fromDetail ?? fromCard ?? (project !== "all" ? project : null);
             return key ? issuePath(key, openId) : null;
           })()}
-          onClose={closeIssue}
+          onClose={closeWorkItem}
         />
       )}
 

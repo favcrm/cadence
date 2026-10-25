@@ -44,7 +44,7 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const NeedsRail = (require("../src/features/home/NeedsRail") as typeof import("../src/features/home/NeedsRail")).default;
+const RailWithDetail = (require("./railHarness") as typeof import("./railHarness")).default;
 const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
 
 const host = document.createElement("div");
@@ -52,9 +52,13 @@ host.setAttribute("style", "width:390px;overflow:hidden;");
 document.body.append(host);
 const root = createRoot(host);
 const flush = () => React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+// The shared detail closes through DrawerShell's exit transition (its 320ms
+// fallback when no transition runs, as in happy-dom).
+const tick = () => React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 12)); });
 async function settle(check: () => void) {
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < 80; i++) {
     await flush();
+    await tick();
     try { check(); return; } catch { /* keep polling */ }
   }
   await flush();
@@ -141,7 +145,7 @@ const overview = {
 
 await React.act(async () => {
   root.render(
-    React.createElement(NeedsRail, {
+    React.createElement(RailWithDetail, {
       overview,
       readOnly: false,
       onOpenIssue: () => {},
