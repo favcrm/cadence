@@ -17,5 +17,9 @@ export function hostedOrigin(hostname: string | null | undefined): boolean {
   // No readable location (locked-down webview): a hosted answer is the safe
   // default — it offers a retry and a real sign-in rather than a CLI command.
   if (host.length === 0) return true;
+  // IPv4-mapped IPv6 (`::ffff:127.0.0.1`) is the IPv4 address in another
+  // notation; classify the address it maps to.
+  const mapped = /^\[::ffff:(\d{1,3}(?:\.\d{1,3}){3})\]$/i.exec(host);
+  if (mapped) return !LOCAL_HOST.test(mapped[1]);
   return !LOCAL_HOST.test(host);
 }
