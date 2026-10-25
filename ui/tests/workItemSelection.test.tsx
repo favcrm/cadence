@@ -39,7 +39,7 @@ async function main() {
   const AppComponent = (require("../src/App") as typeof import("../src/App")).default;
   const App = () => React.createElement(LocaleProvider, null, React.createElement(AppComponent));
   const { setSessionKey } = require("../src/lib/sessionKey") as typeof import("../src/lib/sessionKey");
-  const { resetTodoLocal } = require("../src/features/home/todoLocal") as typeof import("../src/features/home/todoLocal");
+  const { beginTodoVisit, resetTodoLocal } = require("../src/features/home/todoLocal") as typeof import("../src/features/home/todoLocal");
 
   const json = (data: unknown, status = 200) =>
     new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
@@ -105,6 +105,10 @@ async function main() {
     }
     const issue = /^\/api\/issues\/([\w-]+)$/.exec(path);
     if (issue && issues[issue[1]]) return json(issues[issue[1]]);
+    const lane = /^\/api\/issues\/([\w-]+)\/lane$/.exec(path);
+    if (lane) return json({ issue: lane[1], lane: null, providers: [] });
+    const history = /^\/api\/issues\/([\w-]+)\/history$/.exec(path);
+    if (history) return json({ id: history[1], history: [] });
     if (path === "/api/projects") return json({ projects: [{ key: "demo", prefix: "D", components: [], repos: [], issues: 2 }] });
     if (path === "/api/agents") return json({ agents: [], by_issue: {}, daemon: "reachable" });
     if (path === "/api/master/state") return json({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] });
@@ -159,6 +163,9 @@ async function main() {
   await settle(() => assert(document.querySelector('[data-need="plan"]'), "the Home rail renders the plan card"));
 
   const openPlan = async () => {
+    // A new Home visit: a decided mark belongs to the visit it was made in.
+    await React.act(async () => { beginTodoVisit(); });
+    await flush();
     const review = labelled(document.querySelector('[data-need="plan"]')!, "Review");
     assert(review, "the plan card offers Review");
     review.focus();
@@ -223,6 +230,71 @@ async function main() {
   assert(drawer("work-item"), "an exhausted late approval does not close the newer selection");
   assert(drawer("work-item")!.textContent?.includes("Ship the queue"), "an exhausted late approval keeps the newer item");
   assert(window.location.search.includes("issue=D-5"), "an exhausted late approval keeps the newer URL");
+
+  // 4. "Open full issue" replaces the selection without any dismissal: the
+  //    pending approval must not touch the My work item opened afterwards.
+  await click(document.querySelector('[aria-label="Close work item"]'));
+  await settle(() => assert(document.querySelector("[data-drawer]") === null, "the My work detail closes"));
+  await click(navLink("/"));
+  await settle(() => assert(document.querySelector('[data-need="plan"]'), "Home returns for the full-issue case"));
+  planGate = null;
+  await openPlan();
+  await click(labelled(drawer("review")!, "Approve plan"));
+  await settle(() => assert(planGate, "the third approval is in flight"));
+  const full = drawer("review")!.querySelector('a[href="/projects/demo/issues/D-1"]');
+  assert(full, "the decision offers the full issue");
+  await click(full);
+  await settle(() => assert(window.location.pathname === "/projects/demo/issues/D-1", "the full issue opens"));
+  await openMyWorkIssue();
+  await React.act(async () => { planGate?.(); });
+  await settleLate();
+  assert(drawer("work-item"), "replacing the decision with the full issue does not close the newer selection");
+  assert(window.location.search.includes("issue=D-5"), "replacing the decision keeps the newer URL");
+
+  // 5. A route change (Back) retires the hosted decision; the late reply is
+  //    recorded but cannot reopen or replace anything.
+  await click(document.querySelector('[aria-label="Close work item"]'));
+  await settle(() => assert(document.querySelector("[data-drawer]") === null, "the detail closes before Back"));
+  await click(navLink("/"));
+  await settle(() => assert(document.querySelector('[data-need="plan"]'), "Home returns for the Back case"));
+  planGate = null;
+  await openPlan();
+  await click(labelled(drawer("review")!, "Approve plan"));
+  await settle(() => assert(planGate, "the fourth approval is in flight"));
+  // Navigate away (a non-decision route change), then Back to the decision URL.
+  await React.act(async () => {
+    window.history.pushState(null, "", "/my-work");
+    window.dispatchEvent(new Event("popstate"));
+  });
+  await settle(() => assert(window.location.pathname === "/my-work", "the route left Home"));
+  assert(!document.querySelector("[data-review-verb]"), "leaving the decision route retires it");
+  await React.act(async () => {
+    window.history.replaceState(null, "", "/?issue=D-1");
+    window.dispatchEvent(new Event("popstate"));
+  });
+  await settle(() => assert(window.location.pathname === "/", "Back returns to the decision URL"));
+  await settle(() => assert(!document.querySelector("[data-review-verb]"), "Back does not resurrect the retired decision"));
+  await React.act(async () => { planGate?.(); });
+  await settleLate();
+  assert(!document.querySelector("[data-review-verb]"), "a late reply after Back does not reopen the decision");
+  assert(window.location.search.includes("issue=D-1"), "a late reply after Back leaves the selection alone");
+
+  // 6. Same subject reopened: the old opening's reply is recorded but cannot
+  //    close or advance the new instance.
+  await click(document.querySelector('[aria-label="Close work item"]'));
+  await settle(() => assert(document.querySelector("[data-drawer]") === null, "the detail closes before reopening"));
+  planGate = null;
+  await openPlan();
+  await click(labelled(drawer("review")!, "Approve plan"));
+  await settle(() => assert(planGate, "the fifth approval is in flight"));
+  await click(labelled(drawer("review")!, "Not now"));
+  await settle(() => assert(document.querySelector("[data-drawer]") === null, "the decision is dismissed"));
+  await openPlan();
+  assert(document.querySelector("[data-review-verb]"), "the same decision reopens on a new opening");
+  await React.act(async () => { planGate?.(); });
+  await settleLate();
+  assert(document.querySelector("[data-review-verb]"), "the old opening's reply does not close the reopened decision");
+  assert(window.location.search.includes("issue=D-1"), "the old opening's reply keeps the reopened selection");
 
   await React.act(async () => { root.unmount(); });
   console.log("work-item selection checks passed");

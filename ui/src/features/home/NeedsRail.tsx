@@ -8,7 +8,7 @@ import type { AgentUpdate } from "./agentUpdateModel";
 import { useTranslate } from "../../lib/locale";
 import { READ_ONLY_COPY } from "./AnswerForm";
 import TodoCard from "./TodoCard";
-import type { HomeDecisionOpen } from "../../lib/workItems";
+import { decisionReviewHead, nextDecisionToken, type HomeDecisionOpen } from "../../lib/workItems";
 import { beginTodoVisit, doneTodo, hideTodo, marksFor, useTodoLocal } from "./todoLocal";
 import Link from "../../ui/Link";
 
@@ -105,6 +105,8 @@ export default function NeedsRail({
     need,
     index: Math.max(queue.findIndex((n) => n.key === need.key), 0) + 1,
     total: Math.max(queue.length, 1),
+    token: nextDecisionToken(),
+    reviewHead: decisionReviewHead(need),
     next: (text) => {
       doneTodo(need, text);
       const at = queue.findIndex((n) => n.key === need.key);

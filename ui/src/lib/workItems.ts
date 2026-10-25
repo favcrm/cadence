@@ -79,9 +79,30 @@ export interface HomeDecisionOpen {
   need: HomeNeed;
   index: number;
   total: number;
+  /**
+   * The identity of this opening (a new value on every open and every queue
+   * advance). A late reply is fenced to its own instance, not to a subject
+   * that may have been reopened, re-headed or replaced.
+   */
+  token: number;
+  /** The reviewed head a merge decision is pinned to, when it names one. */
+  reviewHead: string | null;
   next: (text: string) => HomeDecisionOpen | null;
   /** Hand the item to Master as a composer draft; the detail then closes. */
   ask: (lead: string) => void;
+}
+
+let decisionTokenSeq = 0;
+
+/** Allocate the identity of one decision opening (or queue advance). */
+export function nextDecisionToken(): number {
+  decisionTokenSeq += 1;
+  return decisionTokenSeq;
+}
+
+/** The reviewed head a decision is pinned to, when it names one. */
+export function decisionReviewHead(need: HomeNeed): string | null {
+  return need.action.type === "merge" && need.action.sha ? need.action.sha : null;
 }
 
 /**
@@ -97,13 +118,25 @@ export type DecisionDone =
   | { kind: "advanced"; next: HomeDecisionOpen }
   | { kind: "closed" };
 
+/** What the host is showing right now, as the fence sees it. */
+export interface DecisionSelection {
+  decision: HomeDecisionOpen | null;
+  issueId: string | null;
+  origin: string;
+}
+
 export function applyDecisionDone(
   done: HomeDecisionOpen,
   text: string,
-  current: HomeDecisionOpen | null,
+  selection: DecisionSelection,
 ): DecisionDone {
   const next = done.next(text);
-  if (current === null || current.need.key !== done.need.key) return { kind: "ignored" };
+  const current = selection.decision;
+  // Only the exact instance that opened may close or advance the detail:
+  // same opening token, same issue, same origin and same reviewed head.
+  if (current === null || current.token !== done.token) return { kind: "ignored" };
+  if (selection.origin !== "home" || selection.issueId !== homeNeedIssueId(done.need)) return { kind: "ignored" };
+  if (current.reviewHead !== done.reviewHead) return { kind: "ignored" };
   return next === null ? { kind: "closed" } : { kind: "advanced", next };
 }
 

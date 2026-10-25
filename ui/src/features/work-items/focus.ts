@@ -10,6 +10,16 @@
  */
 export function restoreDetailFocus(opener: Element | null): void {
   const run = () => {
+    // An action may have moved focus somewhere deliberate (the Home composer
+    // after "Change something…"): never overwrite a live control outside the
+    // close. Only an unclaimed focus (body) or the removed drawer is ours.
+    const active = document.activeElement;
+    const claimed =
+      active instanceof HTMLElement &&
+      active !== document.body &&
+      active.isConnected &&
+      !active.closest("[data-drawer]");
+    if (claimed) return;
     const back =
       opener instanceof HTMLElement && opener !== document.body && opener.isConnected && !opener.closest("[data-drawer]")
         ? opener
@@ -23,8 +33,9 @@ export function restoreDetailFocus(opener: Element | null): void {
     if (!heading.hasAttribute("tabindex")) heading.tabIndex = -1;
     heading.focus({ preventScroll: true });
   };
-  // Browsers schedule after the removed drawer's layout; a frame-less host
-  // (the test DOM) still needs the restore to run.
-  if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
+  // Browsers schedule after the removed drawer's layout and after any
+  // explicit focus request from the closing action; a frame-less host (the
+  // test DOM) still needs the restore to run.
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => window.setTimeout(run, 0));
   else window.setTimeout(run, 0);
 }

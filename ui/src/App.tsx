@@ -368,6 +368,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   useEffect(() => {
     setWorkOrigin(null);
   }, [screen]);
+  // A route change, Back/Forward, "Open full issue" or any other selection
+  // replaces or removes the hosted decision: retire it at once so a late
+  // reply for that opening cannot close or advance what is shown now.
+  useEffect(() => {
+    if (decision === null) return;
+    if (homeNeedIssueId(decision.need) === openId && effectiveOrigin === "home") return;
+    decisionRef.current = null;
+    setDecision(null);
+  }, [decision, openId, effectiveOrigin]);
 
   const invalidatePersonal = useCallback(() => {
     if (personalWanted.current) void resources.myWork.invalidate();
@@ -683,19 +692,20 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     [applyWrite, writeError, block, say],
   );
 
-  const openWorkItem = useCallback((id: string, origin: WorkItemOrigin) => {
+  /**
+   * Open the shared detail for one issue. `nextDecision` carries the Home
+   * decision that owns this opening; every other opener retires any hosted
+   * decision immediately, so a late reply can never touch its successor.
+   */
+  const openWorkItem = useCallback((id: string, origin: WorkItemOrigin, nextDecision: HomeDecisionOpen | null = null) => {
     if (!openIdRef.current) workOpener.current = document.activeElement;
+    decisionRef.current = nextDecision;
+    setDecision(nextDecision);
     setWorkOrigin(origin);
     update((c) => ({ ...c, openId: id }));
   }, []);
-  const openIssue = useCallback((id: string) => {
-    setDecision(null);
-    openWorkItem(id, "issue");
-  }, [openWorkItem]);
-  const openHomeWork = useCallback((id: string) => {
-    setDecision(null);
-    openWorkItem(id, "home");
-  }, [openWorkItem]);
+  const openIssue = useCallback((id: string) => openWorkItem(id, "issue"), [openWorkItem]);
+  const openHomeWork = useCallback((id: string) => openWorkItem(id, "home"), [openWorkItem]);
   const closeIssue = useCallback(() => update((c) => ({ ...c, openId: null })), []);
   const rememberPersonal = useCallback((id: string) => {
     personalReturn.current = { id, scroll: window.scrollY };
@@ -707,8 +717,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const openDecision = useCallback((open: HomeDecisionOpen) => {
     const id = homeNeedIssueId(open.need);
     if (id === null) return;
-    setDecision(open);
-    openWorkItem(id, "home");
+    openWorkItem(id, "home", open);
   }, [openWorkItem]);
   /** Close the shared detail; My work gets its reading position back. */
   const closeWorkItem = useCallback(() => {
@@ -720,17 +729,20 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   }, [effectiveOrigin, closeIssue]);
   /** A Home decision landed: mark the card, then move to the next reading item. */
   const finishDecision = useCallback((done: HomeDecisionOpen, _key: string, text: string) => {
-    const outcome = applyDecisionDone(done, text, decisionRef.current);
+    const outcome = applyDecisionDone(done, text, {
+      decision: decisionRef.current,
+      issueId: openIdRef.current,
+      origin: effectiveOrigin,
+    });
     if (outcome.kind === "ignored") return;
     if (outcome.kind === "closed") {
       closeWorkItem();
       return;
     }
-    setDecision(outcome.next);
     const id = homeNeedIssueId(outcome.next.need);
     if (id === null) closeWorkItem();
-    else openWorkItem(id, "home");
-  }, [closeWorkItem, openWorkItem]);
+    else openWorkItem(id, "home", outcome.next);
+  }, [effectiveOrigin, closeWorkItem, openWorkItem]);
   const openAgent = useCallback(
     (alias: string | null) => update((c) => ({ ...c, route: { screen: "agents", alias } })),
     [],

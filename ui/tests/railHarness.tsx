@@ -50,7 +50,7 @@ export default function RailWithDetail(props: RailProps) {
           home={{
             open: decision,
             onDone: (done, _key, text) => {
-              const outcome = applyDecisionDone(done, text, decisionRef.current);
+              const outcome = applyDecisionDone(done, text, { decision: decisionRef.current, issueId: id, origin: "home" });
               if (outcome.kind === "ignored") return;
               if (outcome.kind === "closed") {
                 close();
