@@ -21,7 +21,6 @@ import {
   useRef,
   useState,
   type FormEvent,
-  type KeyboardEvent,
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
@@ -280,33 +279,42 @@ function AssistantAboutDialog({ actor, onClose }: { actor: AssistantActorValue; 
     };
   }, []);
 
-  const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      event.stopPropagation();
-      onClose();
-      return;
-    }
-    if (event.key !== "Tab") return;
-    const items = focusables(panelRef.current);
-    if (items.length === 0) {
-      event.preventDefault();
-      panelRef.current?.focus();
-      return;
-    }
-    const first = items[0];
-    const last = items[items.length - 1];
-    const active = document.activeElement;
-    if (event.shiftKey) {
-      if (active === first || active === panelRef.current) {
+  // Saving can disable the focused submit button and leave focus on body.
+  // The open dialog still owns Escape and Tab in that state.
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
         event.preventDefault();
-        last.focus();
+        event.stopPropagation();
+        onClose();
+        return;
       }
-    } else if (active === last || active === panelRef.current) {
-      event.preventDefault();
-      first.focus();
-    }
-  };
+      if (event.key !== "Tab") return;
+      const items = focusables(panelRef.current);
+      if (items.length === 0) {
+        event.preventDefault();
+        panelRef.current?.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      if (!panelRef.current?.contains(active)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey) {
+        if (active === first || active === panelRef.current) {
+          event.preventDefault();
+          last.focus();
+        }
+      } else if (active === last || active === panelRef.current) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => document.removeEventListener("keydown", onKeyDown, true);
+  }, [onClose]);
 
   return createPortal(
     <div className="assistant-about-wrap">
@@ -318,7 +326,6 @@ function AssistantAboutDialog({ actor, onClose }: { actor: AssistantActorValue; 
         aria-modal="true"
         aria-labelledby={titleId}
         tabIndex={-1}
-        onKeyDown={onKeyDown}
         data-assistant-identity={actor.scope}
         data-identity-state={read.state}
       >

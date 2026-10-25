@@ -18,6 +18,22 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 impl Shared {
+    /// Initial submissions and fresh-session retries use the same committed
+    /// profile. A provider reset must not discard the actor's current identity.
+    fn prompt_with_profile(&self, message: &Message, mut body: String) -> Result<String> {
+        let context = if crate::master::is_master(&message.alias) {
+            Some(self.master_profile_context()?)
+        } else {
+            self.member_profile_context(message)?
+        };
+        if let Some(context) = context {
+            body.reserve(2 + context.len());
+            body.push_str("\n\n");
+            body.push_str(&context);
+        }
+        Ok(body)
+    }
+
     /// Spawn the actor for `alias` unless it is already owned (running or
     /// stopping) or fenced by an unknown outcome.
     pub fn launch_actor(self: &Arc<Self>, alias: &str) -> Result<()> {
@@ -593,15 +609,7 @@ impl Shared {
                         // The committed actor profile follows the request on
                         // every real turn, including after provider `/new`.
                         // Missing or unreadable profiles fail closed.
-                        let profile = if crate::master::is_master(alias) {
-                            Some(self.master_profile_context()?)
-                        } else {
-                            self.member_profile_context(&message)?
-                        };
-                        let body = match profile {
-                            Some(context) => format!("{base}\n\n{context}"),
-                            None => base,
-                        };
+                        let body = self.prompt_with_profile(&message, base)?;
                         // CAD-1822: mandatory task context is planned against
                         // the delivery body and actor profile first; optional
                         // continuity history is budgeted from what remains.
@@ -709,13 +717,10 @@ impl Shared {
                                 slot.as_deref(),
                                 &first,
                             );
-                            // Same priority as the first attempt: the member
+                            // Same priority as the first attempt: the actor
                             // profile and mandatory task context are planned
                             // against the base body; optional history yields.
-                            let base = match self.member_profile_context(&message)? {
-                                Some(context) => format!("{base}\n\n{context}"),
-                                None => base,
-                            };
+                            let base = self.prompt_with_profile(&message, base)?;
                             pending_context = None;
                             let prompt =
                                 match self.context_delivery(&agent, &message, &base, true, false) {

@@ -2262,10 +2262,12 @@ Master-backed Home/app conversations are still workspace-owned. Their About
 panel offers proven operators a bounded name/personality/avatar editor through
 `POST /api/master/identity` (`master_identity_set` natively). IDENTITY.md and
 SOUL.md use the protected writer and digest record, never agent self-edit.
-The actor includes the committed name/personality in each new turn, including
-after Pi `/new`; the UI truthfully reports next-turn application, not a change
-to an already-running turn. An editor retains its draft and base revision on a
+`Shared::prompt_with_profile` includes committed name/personality in the initial
+prompt and any permitted fresh-session retry, including Pi `/new` and pre-tool
+history recovery. The UI reports next-turn application, not a change to an
+already-running turn. An editor retains its draft and base revision on a
 concurrent update; explicitly reload the saved identity to edit the newer base.
+The About panel preserves Escape dismissal and returns focus after a save.
 A rename does not change the `master` routing alias, ownership, permissions or
 retained history. Personal-assistant Home/app routing
 and scoped assistant-to-Master queries remain the separate CAD-1818 phase.
