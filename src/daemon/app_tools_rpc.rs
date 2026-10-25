@@ -17,6 +17,10 @@
 //!   and bound server-side to the verified session + install + digest +
 //!   tag + generation + declared tool map) is matched — a stale,
 //!   foreign or missing token refuses;
+//! - CAD-1777: a drawer child's context additionally carries its proved
+//!   PRIMARY binding, re-proven on every call — a replaced, revoked,
+//!   read-only or aged-out parent refuses the child (no recursion, no
+//!   independent child grant);
 //! - the install's LIVE digest and approval pin are re-proven and must
 //!   still equal the context's minted digest — a revoke or a package
 //!   swap between mount and call fails closed;
@@ -54,6 +58,36 @@ use crate::issue::app_catalog::workspace;
 use crate::operator_auth::Origin;
 use crate::platform::{AppCapabilityError, ImageReason};
 use crate::store::app_runs;
+
+/// A drawer child mount's internal binding to the PRIMARY action context
+/// it was admitted against. Derived server-side from the parent context
+/// the trusted host named at mint — the child frame, its call arguments
+/// and any receipt never carry it. `mount`/`generation` pin the exact
+/// consumed mount that was live at mint, so a replaced parent cannot
+/// re-authorize the child.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ParentBinding {
+    /// Parent action-context token — an in-memory lookup key only.
+    pub token: String,
+    /// Parent's consumed mount identity (`bridge_nonce`) at mint.
+    pub mount: String,
+    /// Parent's host mount generation at mint.
+    pub generation: u64,
+}
+
+/// The server-derived expected scope a drawer child's PRIMARY must match:
+/// the verified session, install, screen tag, active context, bundle
+/// digest and approval epoch this mount was proven for. Borrowed for the
+/// duration of the proof; never wire data and never caller-supplied.
+#[derive(Clone, Copy)]
+pub(crate) struct DrawerParentScope<'a> {
+    pub session: &'a str,
+    pub install_id: &'a str,
+    pub context_id: Option<&'a str>,
+    pub tag: &'a str,
+    pub digest: &'a str,
+    pub approval_epoch: i64,
+}
 
 /// One mounted screen's action context. Minted at `app_screen_mint`
 /// against the cap's proven (session, install, tag, generation) — but
@@ -93,6 +127,17 @@ pub(crate) struct ToolContext {
     /// CAD-1537: minted for a member or a `--read-only` board — only
     /// read operations (`ScreenOperation::is_screen_read`), no tools.
     pub read_only: bool,
+    /// Drawer child only: the PRIMARY action context this mount was
+    /// admitted against. `None` for a normal primary mount. Re-proved on
+    /// every action, so a retired or replaced parent fails the child
+    /// closed instead of leaving it with an independent grant.
+    pub parent: Option<ParentBinding>,
+    /// True only while this context is the exact action context minted
+    /// for the PRIMARY cap whose consume most recently bound its tag/
+    /// generation group; every other alias in that group is explicitly
+    /// cleared false. Current own-cap eligibility, never a historical
+    /// consumption record. Paired drawer admission requires it.
+    pub exact_primary_active: bool,
     pub issued: Instant,
 }
 
@@ -125,6 +170,33 @@ fn session_hash_ok(hash: &str) -> bool {
         && hash
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Whether `parent` is still the EXACT consumed PRIMARY context a drawer
+/// child was admitted against: same verified session, install, tag,
+/// context, digest, approval epoch and mount identity, non-read-only and
+/// not itself a child (no recursion). The caller holds the context map,
+/// so the check and the action it authorizes cannot race an activation or
+/// revoke.
+fn parent_context_current(
+    map: &std::collections::HashMap<String, ToolContext>,
+    parent: &ParentBinding,
+    child: &ToolContext,
+) -> bool {
+    map.get(&parent.token).is_some_and(|ctx| {
+        ctx.parent.is_none()
+            && !ctx.read_only
+            && ctx.mount.as_deref() == Some(parent.mount.as_str())
+            && ctx.generation == parent.generation
+            && ctx.session == child.session
+            && ctx.install_id == child.install_id
+            && ctx.tag == child.tag
+            && ctx.context_id == child.context_id
+            && ctx.digest == child.digest
+            && ctx.approval_epoch == child.approval_epoch
+            && ctx.exact_primary_active
+            && ctx.issued.elapsed() < TOOL_CTX_TTL
+    })
 }
 
 /// How a failed generation call settles its intent, from the adapter's
@@ -244,6 +316,22 @@ impl Shared {
                 "tool action context has no live mount — the screen is not consumed",
             ));
         }
+        // A drawer child is only as live as the PRIMARY context it was
+        // admitted against. Re-prove that exact consumed mount now; a
+        // parent that was replaced, revoked, narrowed or aged out retires
+        // the child (fail closed) instead of leaving it with its own grant.
+        if let Some(parent) = &ctx.parent {
+            let current = {
+                let map = self.tool_contexts.lock().unwrap_or_else(|e| e.into_inner());
+                parent_context_current(&map, parent, &ctx)
+            };
+            if !current {
+                self.revoke_tool_context(token);
+                return Err(Error::rejected(
+                    "screen drawer parent mount is no longer live",
+                ));
+            }
+        }
         // The installation must still be approved at the consent epoch the
         // context was minted under. A removed, restored or re-approved
         // install moves the epoch, so an old token cannot resume authority.
@@ -263,37 +351,188 @@ impl Shared {
         Ok(ctx)
     }
 
+    /// Prove the PRIMARY action context a trusted-host drawer mount names
+    /// and derive its bounded internal binding. The host supplies only the
+    /// token; every proof field is server-derived. Refuses a pending
+    /// (never-consumed), read-only, foreign-session, other-install/-tag/
+    /// -context/-digest/-approval parent, an expired one, a same-tag/
+    /// generation alias bound by another primary's consume (not eligible
+    /// for its own cap), and any child-as-parent (no recursion). Re-run at
+    /// consume and on every child action, so a parent that moves later
+    /// fails closed.
+    pub(super) fn prove_drawer_parent(
+        &self,
+        token: &str,
+        scope: &DrawerParentScope<'_>,
+    ) -> Result<ParentBinding> {
+        if !session_hash_ok(token) {
+            return Err(Error::rejected("invalid drawer parent action context"));
+        }
+        let map = self.tool_contexts.lock().unwrap_or_else(|e| e.into_inner());
+        let parent = map
+            .get(token)
+            .ok_or_else(|| Error::rejected("drawer parent mount is not live"))?;
+        if parent.issued.elapsed() >= TOOL_CTX_TTL {
+            return Err(Error::rejected("drawer parent mount expired"));
+        }
+        if parent.parent.is_some() {
+            return Err(Error::rejected("a drawer child cannot be a parent"));
+        }
+        if parent.read_only {
+            return Err(Error::rejected("a read-only mount has no drawer"));
+        }
+        let Some(mount) = parent.mount.as_ref() else {
+            return Err(Error::rejected("drawer parent mount is not consumed"));
+        };
+        // Paired admission requires CURRENT own-cap eligibility, not a
+        // legacy coactivation binding: a same-generation alias bound by
+        // another primary's consume is not a parent.
+        if !parent.exact_primary_active {
+            return Err(Error::rejected(
+                "drawer parent mount was not consumed by its own capability",
+            ));
+        }
+        if parent.session != scope.session
+            || parent.install_id != scope.install_id
+            || parent.tag != scope.tag
+            || parent.context_id.as_deref() != scope.context_id
+            || parent.digest != scope.digest
+            || parent.approval_epoch != scope.approval_epoch
+        {
+            return Err(Error::rejected("drawer parent does not match this mount"));
+        }
+        Ok(ParentBinding {
+            token: token.to_owned(),
+            mount: mount.clone(),
+            generation: parent.generation,
+        })
+    }
+
     /// Activate the pending action context for a freshly consumed mount,
     /// binding it to the consumed mount's `mount` identity
-    /// (`bridge_nonce`), and retire every OTHER context for the same
-    /// (session, install) — a superseded or remounted screen's old
-    /// action handle must refuse. Called by `app_screen_consume` once
-    /// the mount's own proofs pass; returns the action token the host
-    /// continues to hold.
-    pub(crate) fn activate_tool_context(&self, cap: &crate::daemon::app_screens_rpc::ScreenCap) {
+    /// (`bridge_nonce`). A PRIMARY consume keeps its old supersession
+    /// rules: retire every other context this session holds for the
+    /// install, including all drawer children of the replaced primary.
+    /// Legacy alias coactivation still binds the whole same-tag/generation
+    /// group, but only the cap's own exact action context becomes
+    /// parent-eligible; every other alias is explicitly cleared.
+    /// A drawer CHILD consume re-proves its parent AND its own exact
+    /// server-minted pending context under the same lock that mutates the
+    /// map, retires only prior children of that same parent (one
+    /// childslot) and never touches the parent. A cap whose own context
+    /// was already superseded or revoked refuses without disturbing the
+    /// live child.
+    pub(crate) fn activate_tool_context(
+        &self,
+        cap: &crate::daemon::app_screens_rpc::ScreenCap,
+    ) -> Result<()> {
         let mut map = self.tool_contexts.lock().unwrap_or_else(|e| e.into_inner());
-        // Keep ONLY this mount's own context — a remount/generation bump
-        // or a same-install remount supersedes every other context this
-        // session holds for the install. The kept one (same session,
-        // install, tag and generation) is then bound to the consumed
-        // mount identity.
-        map.retain(|_, ctx| {
-            !(ctx.session == cap.session && ctx.install_id == cap.install_id)
-                || (ctx.tag == cap.tag && ctx.generation == cap.generation)
-        });
+        let mut child_own: Option<&str> = None;
+        if let Some(parent) = &cap.parent {
+            // The parent must still be the exact consumed primary this
+            // child was minted against — a replace/revoke between mint and
+            // consume refuses the child instead of reviving a stale drawer.
+            let live = map.get(&parent.token).is_some_and(|ctx| {
+                ctx.parent.is_none()
+                    && !ctx.read_only
+                    && ctx.mount.as_deref() == Some(parent.mount.as_str())
+                    && ctx.generation == parent.generation
+                    && ctx.session == cap.session
+                    && ctx.install_id == cap.install_id
+                    && ctx.tag == cap.tag
+                    && ctx.context_id == cap.context_id
+                    && ctx.digest == cap.digest
+                    && ctx.approval_epoch == cap.approval_epoch
+                    && ctx.exact_primary_active
+                    && ctx.issued.elapsed() < TOOL_CTX_TTL
+            });
+            if !live {
+                return Err(Error::rejected(
+                    "drawer parent mount is no longer live — mount refused",
+                ));
+            }
+            // THIS cap's own server-minted pending action context is its
+            // identity. It must still exist, still be unbound, and still
+            // match every binding before any slot mutation: a cap whose
+            // context an earlier child consume already superseded (or a
+            // host revoke removed) refuses here and leaves the current
+            // child untouched. Caller-supplied generations are never
+            // identity.
+            let own = cap
+                .action_token
+                .as_deref()
+                .ok_or_else(|| Error::rejected("drawer child mount has no action context"))?;
+            let own_current = map.get(own).is_some_and(|ctx| {
+                ctx.mount.is_none()
+                    && ctx.issued.elapsed() < TOOL_CTX_TTL
+                    && ctx.session == cap.session
+                    && ctx.install_id == cap.install_id
+                    && ctx.tag == cap.tag
+                    && ctx.context_id == cap.context_id
+                    && ctx.digest == cap.digest
+                    && ctx.approval_epoch == cap.approval_epoch
+                    && ctx.generation == cap.generation
+                    && ctx.parent.as_ref() == cap.parent.as_ref()
+            });
+            if !own_current {
+                return Err(Error::rejected(
+                    "drawer child action context is no longer current — mount refused",
+                ));
+            }
+            // One live child per parent: retire the previous child only.
+            // Keep exactly THIS cap's pending context — never a group that
+            // merely shares a caller-supplied generation.
+            map.retain(|key, ctx| {
+                key.as_str() == own
+                    || !ctx
+                        .parent
+                        .as_ref()
+                        .is_some_and(|binding| binding.token == parent.token)
+            });
+            child_own = Some(own);
+        } else {
+            // Keep ONLY this mount's own context — a remount/generation
+            // bump or a same-install remount supersedes every other context
+            // this session holds for the install. Drawer children never
+            // ride a primary activation, so a parent replacement always
+            // retires its live and pending children.
+            map.retain(|_, ctx| {
+                if ctx.parent.is_some() {
+                    return !(ctx.session == cap.session && ctx.install_id == cap.install_id);
+                }
+                !(ctx.session == cap.session && ctx.install_id == cap.install_id)
+                    || (ctx.tag == cap.tag && ctx.generation == cap.generation)
+            });
+        }
         self.screen_service_confirmations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|_, confirmation| confirmation.current_in(&map));
-        for ctx in map.values_mut() {
-            if ctx.session == cap.session
-                && ctx.install_id == cap.install_id
-                && ctx.tag == cap.tag
-                && ctx.generation == cap.generation
-            {
+        if let Some(own) = child_own {
+            if let Some(ctx) = map.get_mut(own) {
                 ctx.mount = Some(cap.bridge_nonce.clone());
             }
+        } else {
+            // Legacy primary coactivation: every same-tag/generation alias
+            // is (re)bound, preserving existing primary action semantics.
+            // Only the cap's own exact action context is parent-eligible;
+            // every other alias is explicitly cleared, so a formerly
+            // consumed sibling cannot borrow this consume's mount.
+            let own = cap.action_token.as_deref();
+            for (key, ctx) in map.iter_mut() {
+                if ctx.session == cap.session
+                    && ctx.install_id == cap.install_id
+                    && ctx.tag == cap.tag
+                    && ctx.generation == cap.generation
+                    && ctx.parent.as_ref().map(|binding| &binding.token)
+                        == cap.parent.as_ref().map(|binding| &binding.token)
+                {
+                    ctx.mount = Some(cap.bridge_nonce.clone());
+                    ctx.exact_primary_active = own == Some(key.as_str());
+                }
+            }
         }
+        Ok(())
     }
 
     /// Revoke the action context bound to a mount the host is tearing
@@ -304,6 +543,13 @@ impl Shared {
     pub(crate) fn revoke_tool_context(&self, token: &str) {
         let mut map = self.tool_contexts.lock().unwrap_or_else(|e| e.into_inner());
         map.remove(token);
+        // Retiring a PRIMARY retires every drawer child admitted against
+        // it, live or still pending. Retiring a child removes only itself.
+        map.retain(|_, ctx| {
+            !ctx.parent
+                .as_ref()
+                .is_some_and(|parent| parent.token == token)
+        });
         self.screen_service_confirmations
             .lock()
             .unwrap_or_else(|e| e.into_inner())

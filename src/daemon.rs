@@ -215,6 +215,8 @@ pub(crate) use cli_rpc::prime_jwks_for_test as prime_cli_jwks_for_test;
 mod board_producer_golden;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1700_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1777_drawer_acceptance;
 mod connection_test;
 mod connections_rpc;
 #[cfg(all(test, feature = "test-seam"))]

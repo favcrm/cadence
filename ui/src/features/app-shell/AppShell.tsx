@@ -147,10 +147,16 @@ export default function AppShell({
   /** Installed screen receives only the trusted native chat handoff and
    *  the shell's one verified app scope (CAD-1560). */
   children?: (onMediaAttach: MediaChatAttach, contextId: string, screen: {
-    /** CAD-1615 — the board-wide drawer the app screen may ask for. Absent
-     *  for a read-only or screen-reader view, so its frames cannot drive it. */
-    onScreenDrawer?: (mode: "outlet" | "drawer", surface?: string) => void;
+    /** CAD-1615 / CAD-1777 — the board-wide drawer the app screen may ask
+     *  for. Absent for a read-only or screen-reader view, so its frames
+     *  cannot drive it. `independent` marks a negotiated
+     *  `screen-surfaces.v1` request, which the shell mounts as its own
+     *  fixed child overlay instead of promoting the primary. */
+    onScreenDrawer?: (mode: "outlet" | "drawer", surface?: string, independent?: boolean) => void;
     presentation: "outlet" | "drawer";
+    /** CAD-1777 — the fixed overlay target the primary portals its child
+     *  drawer frame into; null while the overlay is closed. */
+    drawerTarget: HTMLElement | null;
     /** The screen went away: the drawer closes with it. */
     onScreenClosed: () => void;
   }) => React.ReactNode;
@@ -200,29 +206,227 @@ export default function AppShell({
   const [generalSetup, setGeneralSetup] = useState<{ key: string; error: string | null } | null>(null);
   const [generalSetupAttempt, setGeneralSetupAttempt] = useState(0);
   const [contextId, setContextId] = useState("");
-  // CAD-1615 — the board-wide drawer for an app screen. The app asks for
-  // it with its own verb; the shell owns the geometry and the scrim, and
-  // Escape or the scrim puts the screen back in the outlet.
+  // CAD-1615 — the legacy embedded drawer: an older presentation peer asks
+  // for it, and the shell promotes the app outlet (kept unchanged).
   const [screenDrawer, setScreenDrawer] = useState<string | null>(null);
-  const onScreenDrawer = useCallback((mode: "outlet" | "drawer", surface?: string) => {
-    setScreenDrawer(mode === "drawer" ? (surface ?? "") : null);
-  }, []);
-  const closeScreenDrawer = useCallback(() => setScreenDrawer(null), []);
+  // CAD-1777 — the independent drawer: a `screen-surfaces.v1` frame asks
+  // for a detail surface. The primary list frame never moves; the shell
+  // owns a fixed panel/scrim and hands the primary its portal target, so the
+  // drawer is a separate child mount.
+  const [independentDrawer, setIndependentDrawer] = useState<string | null>(null);
+  const [drawerTarget, setDrawerTarget] = useState<HTMLElement | null>(null);
+  const attachDrawerTarget = useCallback((node: HTMLElement | null) => setDrawerTarget(node), []);
   // CAD-1615: the drawer is a write-shaped action. A read-only or
   // screen-reader view may render the screen, but it never drives the shell
   // drawer — the frame's callback and the presentation are withheld, so the
   // verb refuses at the host instead of presenting a surface for a viewer
   // who cannot act on it.
   const canDriveScreen = viewer.operator === true && !viewer.readOnly;
+  const onScreenDrawer = useCallback((mode: "outlet" | "drawer", surface?: string, independent?: boolean) => {
+    // The callback re-checks the capability, so a frame mounted while the
+    // operator could drive one never leaves a drawer behind once access drops.
+    if (!canDriveScreen) return;
+    // `independent` is stamped by the channel from the frame's negotiated
+    // capability; it is never a caller choice. The two drawers are
+    // exclusive: the new mechanism never promotes the primary frame.
+    if (independent) {
+      setScreenDrawer(null);
+      setIndependentDrawer(mode === "drawer" ? (surface ?? "") : null);
+      return;
+    }
+    setIndependentDrawer(null);
+    setScreenDrawer(mode === "drawer" ? (surface ?? "") : null);
+  }, [canDriveScreen]);
+  const closeScreenDrawer = useCallback(() => setScreenDrawer(null), []);
+  const closeIndependentDrawer = useCallback(() => setIndependentDrawer(null), []);
   // A different installation or scope is a different screen: the drawer never
   // outlives the frame that opened it.
-  useEffect(() => { setScreenDrawer(null); }, [installId, contextId]);
+  useEffect(() => { setScreenDrawer(null); setIndependentDrawer(null); }, [installId, contextId]);
+  // A read-only or signed-out view lends no drawer callback, so any drawer a
+  // stale frame asked for closes with that capability.
+  useEffect(() => { if (!canDriveScreen) { setScreenDrawer(null); setIndependentDrawer(null); } }, [canDriveScreen]);
+  const outletRef = useRef<HTMLElement | null>(null);
+  const drawerPanelRef = useRef<HTMLDivElement | null>(null);
+  const drawerScrimRef = useRef<HTMLDivElement | null>(null);
+  const drawerReturn = useRef<{ focus: HTMLElement | null; windowX: number; windowY: number; outletTop: number } | null>(null);
+  const independentReturn = useRef<{ focus: HTMLElement | null; windowX: number; windowY: number; outletTop: number } | null>(null);
+  const restoringFocus = useRef(false);
+  const drawerOpen = screenDrawer !== null;
+  const independentOpen = independentDrawer !== null;
+  // CAD-1777 — remember where the operator was (both board and outlet
+  // scroll, and focus) when the app asked for the drawer, and put it back
+  // exactly once the drawer closes. Promotion never moves focus: the frame
+  // is the same mounted node, so the app keeps its own focus, draft and its
+  // in-frame Escape chain (menu, then edit, then the drawer).
+  useLayoutEffect(() => {
+    if (!drawerOpen) return;
+    const outlet = outletRef.current;
+    const active = document.activeElement;
+    drawerReturn.current = {
+      focus: active instanceof HTMLElement && active !== document.body ? active : null,
+      windowX: window.scrollX,
+      windowY: window.scrollY,
+      outletTop: outlet?.scrollTop ?? 0,
+    };
+    // CAD-1777 — the drawer is modal over the WHOLE board, not only this
+    // shell: every sibling along the chain from the shell up to the board
+    // root (the app rail, the header, any workspace peers) is inert while it
+    // is open, and the document cannot scroll behind the scrim. Only
+    // attributes on OTHER nodes change — the promoted outlet, its mounted
+    // iframe and the app's own scrolling are untouched.
+    const boardChrome: HTMLElement[] = [];
+    for (let node: Element | null = outlet?.closest(".app-shell") ?? null;
+         node && node !== document.body; node = node.parentElement) {
+      if ((node as HTMLElement).hasAttribute("data-app-shell")) break;
+      for (const sibling of Array.from(node.parentElement?.children ?? [])) {
+        if (sibling === node || !(sibling instanceof HTMLElement) || sibling.hasAttribute("inert")) continue;
+        sibling.setAttribute("inert", "");
+        boardChrome.push(sibling);
+      }
+    }
+    const rootOverflow = document.documentElement.style.overflow;
+    const bodyOverflow = document.body.style.overflow;
+    document.documentElement.style.overflow = "hidden";
+    document.body.style.overflow = "hidden";
+    return () => {
+      for (const node of boardChrome) node.removeAttribute("inert");
+      document.documentElement.style.overflow = rootOverflow;
+      document.body.style.overflow = bodyOverflow;
+      const saved = drawerReturn.current;
+      drawerReturn.current = null;
+      if (!saved) return;
+      const node = outletRef.current;
+      if (node && node.scrollTop !== saved.outletTop) node.scrollTop = saved.outletTop;
+      if (window.scrollX !== saved.windowX || window.scrollY !== saved.windowY) window.scrollTo(saved.windowX, saved.windowY);
+      if (saved.focus?.isConnected) saved.focus.focus({ preventScroll: true });
+    };
+  }, [drawerOpen]);
+  // Background interaction exclusion for the keyboard: the board's own panes
+  // are inert, and this pulls focus back if anything outside the promoted
+  // panel (the rail or header) still takes it. Focus INSIDE the frame is
+  // within the panel, so the app's own controls and draft keep working.
   useEffect(() => {
-    if (screenDrawer === null) return;
-    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setScreenDrawer(null); };
+    if (!drawerOpen) return;
+    const outlet = outletRef.current;
+    if (!outlet) return;
+    const contain = (event: FocusEvent) => {
+      const target = event.target;
+      if (target instanceof Node && outlet.contains(target)) return;
+      outlet.focus({ preventScroll: true });
+    };
+    document.addEventListener("focusin", contain);
+    return () => document.removeEventListener("focusin", contain);
+  }, [drawerOpen]);
+  // CAD-1777 — the independent drawer is modal over the whole board while
+  // the primary list keeps its exact box. The shell saves focus/scroll,
+  // marks the board chrome (and the workspace outlet itself) inert,
+  // reserves the scrollbar gutter so hiding document scroll does not jump
+  // the layout, and puts focus + scroll back on close.
+  useLayoutEffect(() => {
+    if (!independentOpen) return;
+    const outlet = outletRef.current;
+    const active = document.activeElement;
+    independentReturn.current = {
+      focus: active instanceof HTMLElement && active !== document.body ? active : null,
+      windowX: window.scrollX,
+      windowY: window.scrollY,
+      outletTop: outlet?.scrollTop ?? 0,
+    };
+    const boardChrome: HTMLElement[] = [];
+    for (let node: Element | null = outlet?.closest(".app-shell") ?? null;
+         node && node !== document.body; node = node.parentElement) {
+      if ((node as HTMLElement).hasAttribute("data-app-shell")) break;
+      for (const sibling of Array.from(node.parentElement?.children ?? [])) {
+        if (sibling === node || !(sibling instanceof HTMLElement) || sibling.hasAttribute("inert")) continue;
+        sibling.setAttribute("inert", "");
+        boardChrome.push(sibling);
+      }
+    }
+    const root = document.documentElement;
+    const body = document.body;
+    const gutter = Math.max(0, window.innerWidth - root.clientWidth);
+    const rootOverflow = root.style.overflow;
+    const bodyOverflow = body.style.overflow;
+    const bodyPad = body.style.paddingRight;
+    root.style.overflow = "hidden";
+    body.style.overflow = "hidden";
+    if (gutter > 0) body.style.paddingRight = `${(Number.parseFloat(getComputedStyle(body).paddingRight) || 0) + gutter}px`;
+    drawerPanelRef.current?.focus({ preventScroll: true });
+    return () => {
+      for (const node of boardChrome) node.removeAttribute("inert");
+      root.style.overflow = rootOverflow;
+      body.style.overflow = bodyOverflow;
+      body.style.paddingRight = bodyPad;
+      const saved = independentReturn.current;
+      independentReturn.current = null;
+      if (!saved) return;
+      const node = outletRef.current;
+      if (node && node.scrollTop !== saved.outletTop) node.scrollTop = saved.outletTop;
+      if (window.scrollX !== saved.windowX || window.scrollY !== saved.windowY) window.scrollTo(saved.windowX, saved.windowY);
+      // The passive focus guard is still attached during this layout
+      // cleanup; let the operator's opener take focus back.
+      restoringFocus.current = true;
+      if (saved.focus?.isConnected) saved.focus.focus({ preventScroll: true });
+      restoringFocus.current = false;
+    };
+  }, [independentOpen]);
+  // Keyboard containment targets the overlay panel (the child frame is
+  // inside it); the primary outlet stays untouched and inert.
+  useEffect(() => {
+    if (!independentOpen) return;
+    const contain = (event: FocusEvent) => {
+      if (restoringFocus.current) return;
+      const panel = drawerPanelRef.current;
+      if (!panel) return;
+      const target = event.target;
+      if (target instanceof Node && panel.contains(target)) return;
+      panel.focus({ preventScroll: true });
+    };
+    document.addEventListener("focusin", contain);
+    return () => document.removeEventListener("focusin", contain);
+  }, [independentOpen]);
+  // The shell itself may be a scroll container (`.app-shell` in a bounded
+  // workspace). A wheel or touch over the scrim/panel must not chain into
+  // it: the primary list keeps its scroll position untouched, and only the
+  // child frame scrolls. React's wheel listener is passive, so this is a
+  // native non-passive guard on the two host-owned nodes.
+  useEffect(() => {
+    if (!independentOpen) return;
+    const roots = [drawerScrimRef.current, drawerPanelRef.current].filter((node): node is HTMLDivElement => node !== null);
+    if (!roots.length) return;
+    const block = (event: Event) => event.preventDefault();
+    for (const node of roots) {
+      node.addEventListener("wheel", block, { passive: false });
+      node.addEventListener("touchmove", block, { passive: false });
+    }
+    return () => {
+      for (const node of roots) {
+        node.removeEventListener("wheel", block);
+        node.removeEventListener("touchmove", block);
+      }
+    };
+  }, [independentOpen]);
+  useEffect(() => {
+    if (screenDrawer === null && !independentOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      // The app's own Escape chain (menu, then edit, then the drawer) runs
+      // inside the frame and asks the host to close last; this listener only
+      // sees Escape the host document owns.
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      // CAD-1777: only a MODAL host dialog owns Escape. Its native cancel/close
+      // runs on the same keypress, so the drawer (and the child frame's draft)
+      // must survive it, and the next Escape closes the drawer. A nonmodal
+      // dialog left open elsewhere on the board (a popover in the chrome) is
+      // not modal and never swallows the drawer's dismissal.
+      const modal = Array.from(document.querySelectorAll("dialog[open]"))
+        .some((dialog) => dialog.matches(":modal"));
+      if (modal) return;
+      setScreenDrawer(null);
+      setIndependentDrawer(null);
+    };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [screenDrawer]);
+  }, [screenDrawer, independentOpen]);
   const [linkNotice, setLinkNotice] = useState<string | null>(null);
   // CAD-1560: one shell-owned scope for every active app view. The
   // in-workspace selection (Social's picker, a screen's saved-context
@@ -884,9 +1088,9 @@ export default function AppShell({
   }, [launcherRun, launcherIsCurrent]);
 
   return (
-    <div className="app-shell" data-app-shell-outlet={installId} data-screen-drawer={screenDrawer !== null ? "true" : undefined}>
-      {screenDrawer !== null && <div className="app-shell-screen-scrim" aria-hidden="true" onClick={() => setScreenDrawer(null)} />}
-      <div className="app-shell-crumb">
+    <div className="app-shell" data-app-shell-outlet={installId} data-screen-drawer={drawerOpen ? "true" : undefined} data-screen-drawer-surface={screenDrawer || undefined}>
+      {(drawerOpen || independentOpen) && <div ref={independentOpen ? drawerScrimRef : undefined} className="app-shell-screen-scrim" aria-hidden="true" onClick={independentOpen ? closeIndependentDrawer : closeScreenDrawer} />}
+      <div className="app-shell-crumb" inert={drawerOpen || independentOpen}>
         <Link href="/apps" className="lnk text-label">
           ← {t("All apps")}
         </Link>
@@ -935,7 +1139,7 @@ export default function AppShell({
         )}
       </div>
 
-      <div className="app-shell-panels" role="group" aria-label={t("Panel")}>
+      <div className="app-shell-panels" role="group" aria-label={t("Panel")} inert={drawerOpen || independentOpen}>
         {(["chat", "work"] as const).map((p) => (
           <button
             key={p}
@@ -951,7 +1155,7 @@ export default function AppShell({
       </div>
 
       <div className="app-shell-grid" data-chat-collapsed={chatCollapsed || undefined} data-shell-panel={panel}>
-        <div id="app-shell-chat" className="app-shell-chat" aria-label={t("Assistant chat")}>
+        <div id="app-shell-chat" className="app-shell-chat" aria-label={t("Assistant chat")} inert={drawerOpen || independentOpen}>
           <Conversation
             mode={{
               kind: "app",
@@ -982,7 +1186,7 @@ export default function AppShell({
             onOpenView={openView}
           />
         </div>
-        <section id="app-shell-workspace" className="app-shell-outlet" data-screen-drawer={screenDrawer !== null ? "true" : undefined} aria-label={`${title} ${t("workspace")}`}>
+        <section id="app-shell-workspace" ref={outletRef} className="app-shell-outlet" data-screen-drawer={drawerOpen ? "true" : undefined} inert={independentOpen} aria-label={`${title} ${t("workspace")}`} role={drawerOpen ? "dialog" : undefined} aria-modal={drawerOpen ? true : undefined} tabIndex={drawerOpen ? -1 : undefined}>
           {cachedPreviewSnapshot?.installation.install_id === installId &&
             isSocialContent(cachedPreviewSnapshot.installation) && loading ? (
               <WorkspaceAppCachedPreview
@@ -1089,10 +1293,11 @@ export default function AppShell({
                 // the social-only workspace, which then rendered its
                 // "no supported board workspace" guide instead of the
                 // screen the package declared.
-                children(attachMediaReference, scope.contextId, { onScreenDrawer: canDriveScreen ? onScreenDrawer : undefined, presentation: canDriveScreen && screenDrawer !== null ? "drawer" : "outlet", onScreenClosed: closeScreenDrawer })
+                children(attachMediaReference, scope.contextId, { onScreenDrawer: canDriveScreen ? onScreenDrawer : undefined, presentation: canDriveScreen && screenDrawer !== null ? "drawer" : "outlet", drawerTarget: independentOpen ? drawerTarget : null, onScreenClosed: closeScreenDrawer })
               ) : (
                 <InstalledScreenOutlet installation={installation} contexts={contexts} contextId={scope.contextId}
                   onScreenDrawer={canDriveScreen ? onScreenDrawer : undefined} presentation={canDriveScreen && screenDrawer !== null ? "drawer" : "outlet"}
+                  drawerTarget={independentOpen ? drawerTarget : null}
                   admitted={receiptReady && contextAdoptionReady && (viewer.operator === true && !viewer.readOnly || viewer.screenReader === true)}
                   onRoute={screenRoute} onCommand={screenCommand} onNavigation={(navigation) => { setScreenNavigation(navigation); if (navigation === null) closeScreenDrawer(); }} onMediaAttach={attachMediaReference}
                   fallback={contextAdoptionReady
@@ -1104,6 +1309,20 @@ export default function AppShell({
           )}
         </section>
       </div>
+      {/* CAD-1777 — the one trusted host overlay for an independent drawer.
+          The primary list keeps its normal box; only this fixed panel (and
+          the scrim above) is modal. The close control lives above the child
+          frame, so it survives a failed child mount. */}
+      {independentOpen && (
+        <div ref={drawerPanelRef} className="app-shell-screen-drawer" role="dialog" aria-modal="true" tabIndex={-1}
+             aria-label={`${title} ${t("Details")}`}>
+          <div className="app-shell-screen-drawer-bar">
+            <span className="truncate text-label text-ink-300">{t("Details")}</span>
+            <Button size="sm" variant="ghost" onClick={closeIndependentDrawer} aria-label={t("Close")}>×</Button>
+          </div>
+          <div ref={attachDrawerTarget} className="app-shell-screen-drawer-body" />
+        </div>
+      )}
       {receiptReady && installation && !needsSetup && launcherIsCurrent && launchFlow !== null && launcherRun !== null && (
         <RunLauncher
           key={`${installId}:${launcherRun.name}:${launcherRun.contextId}:${launcherRun.installDigest}:${launcherRun.contextRevision}`}

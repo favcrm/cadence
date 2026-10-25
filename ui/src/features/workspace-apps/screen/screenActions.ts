@@ -6,7 +6,7 @@ import { workspaceApps, type AppContext, type CapabilityQuote, type Installation
 import { contextDefaultKeys, instagramLink } from "./screenProjection";
 import { accountLabel, connectReturnTo, publicationBinding, sendSlot } from "../socialConnect";
 import { dueLabel } from "../socialPublish";
-import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, mediaChatAttachArgs, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
+import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE, parseScreenDrawerCall, mediaChatAttachArgs, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
 import type { ScreenActions } from "./screenLifecycle";
 import { downscaleToDataUrl } from "./screenAssets";
 import type { Planner, SlotPlan } from "./screenSlot";
@@ -240,22 +240,24 @@ async function socialDraftCall(verb: CallVerb,args:Record<string,unknown>,ui:{ac
 }
 
 /** Board paths an app may send the operator to. Exact paths only, never a caller-built route. */
-/** CAD-1615 — the app asks the board to present its screen in the
+/** CAD-1615 / CAD-1777 — the app asks the board to present its screen in the
  *  board-wide drawer. The host owns the geometry (whole window height, the
- *  board under a scrim); the surface the app draws there is the app's. A
- *  malformed request changes nothing. */
+ *  board under a scrim); the surface the app draws there is the app's. The
+ *  arguments are the protocol's one closed shape, so a malformed request
+ *  changes nothing on either the generic or the records dispatch path. */
 function openScreenDrawer(args: Record<string, unknown>, ui: Parameters<ScreenActions["call"]>[2]): ActionResult {
-  const surface = args.surface;
-  if (!exact(args, ["surface"]) || typeof surface !== "string" || !/^[a-z0-9_-]{1,64}$/.test(surface)) return refuse("bad_args", "That request is not valid.");
+  const request = parseScreenDrawerCall(SCREEN_DRAWER_OPEN, args);
+  if (!request || request.mode !== "drawer") return refuse("bad_args", "That request is not valid.");
   if (!ui.openScreenDrawer) return refuse("unavailable", "This app cannot open a board drawer here.");
-  ui.openScreenDrawer(surface);
-  return { ok: true, data: { mode: "drawer", surface } };
+  ui.openScreenDrawer(request.surface);
+  return { ok: true, data: request };
 }
 function closeScreenDrawer(args: Record<string, unknown>, ui: Parameters<ScreenActions["call"]>[2]): ActionResult {
-  if (!exact(args, [])) return refuse("bad_args", "That request is not valid.");
+  const request = parseScreenDrawerCall(SCREEN_DRAWER_CLOSE, args);
+  if (!request) return refuse("bad_args", "That request is not valid.");
   if (!ui.closeScreenDrawer) return refuse("unavailable", "This app cannot open a board drawer here.");
   ui.closeScreenDrawer();
-  return { ok: true, data: { mode: "outlet" } };
+  return { ok: true, data: request };
 }
 
 export const BOARD_LINK_PATHS: readonly string[] = ["/settings/connections"];

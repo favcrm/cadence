@@ -63,6 +63,43 @@ export type ChildToHost =
 export type ScreenPresentationMode = "outlet" | "drawer";
 export type ScreenPresentation = { v: 1; op: "presentation"; mode: ScreenPresentationMode };
 
+/** CAD-1777 — the host-owned surface a frame is mounted as. A `primary`
+ *  frame stays in its normal layout box; a `drawer` frame lives in the
+ *  shell's own fixed overlay. The role is derived by the host from which
+ *  mount it performed (a private parent token), never claimed by the
+ *  frame: a ready opt-in and call arguments cannot choose it. `modal` is
+ *  the frame's own overlay state — a primary is modal while its child
+ *  drawer is open; a drawer hosts no further overlay. */
+export type ScreenSurfaceRole = "primary" | "drawer";
+export type ScreenSurface = { v: 1; op: "surface"; role: ScreenSurfaceRole; modal: boolean };
+
+/** CAD-1777 — the two host-local presentation verbs. They are UI
+ *  capabilities of the shell (which surface this frame's geometry shows
+ *  in), never records operations or authority grants: a records frame is
+ *  admitted to them only when it negotiated `screen-presentation.v1`, the
+ *  live shell lends a drawer callback, and the frame has an action host. */
+export const SCREEN_DRAWER_OPEN = "screen.drawer.open" as const;
+export const SCREEN_DRAWER_CLOSE = "screen.drawer.close" as const;
+export const SCREEN_DRAWER_VERBS = [SCREEN_DRAWER_OPEN, SCREEN_DRAWER_CLOSE] as const;
+export type ScreenDrawerVerb = (typeof SCREEN_DRAWER_VERBS)[number];
+export const isScreenDrawerVerb = (verb: string): verb is ScreenDrawerVerb =>
+  (SCREEN_DRAWER_VERBS as readonly string[]).includes(verb);
+/** The closed surface idiom a drawer request may name. */
+export const DRAWER_SURFACE = /^[a-z0-9_-]{1,64}$/;
+/** What a validated drawer request asks the shell to do. */
+export type ScreenDrawerRequest = { mode: "drawer"; surface: string } | { mode: "outlet" };
+/** Parse one drawer request's EXACT arguments, or `null` when they are not
+ *  the closed shape (`{surface}` for open, `{}` for close). The host's
+ *  argument guard and the records dispatch share this one parser, so a
+ *  malformed request can never change geometry on either path. */
+export function parseScreenDrawerCall(verb: ScreenDrawerVerb, args: ActionArgs): ScreenDrawerRequest | null {
+  if (verb === SCREEN_DRAWER_OPEN) {
+    if (Object.keys(args).sort().join() !== "surface" || typeof args.surface !== "string" || !DRAWER_SURFACE.test(args.surface)) return null;
+    return { mode: "drawer", surface: args.surface };
+  }
+  return Object.keys(args).length === 0 ? { mode: "outlet" } : null;
+}
+
 /** CAD-1123 HP3 — the closed verb sets. A verb outside its set closes the
  *  port. `call` verbs never spend or publish; every spend or publish verb is a
  *  `slot` verb and waits for a tap on a host-drawn button. The `publish.*` slot
@@ -179,12 +216,17 @@ export const SCREEN_ACTIONS_V1 = "screen-actions.v1";
  *  in. A frame that does not advertise it never receives a presentation
  *  message, so an older package is never shown an op it cannot parse. */
 export const SCREEN_PRESENTATION_V1 = "screen-presentation.v1";
+/** CAD-1777 — the child opts in to the host-owned surface push (role and
+ *  modal state), replacing `screen-presentation.v1` for a package that can
+ *  draw as a primary or a drawer. A frame that does not advertise it never
+ *  receives a surface message. */
+export const SCREEN_SURFACES_V1 = "screen-surfaces.v1";
 /** CAD-1365 — the media catalog/curation channel a media-contract
  *  screen's child opts into alongside `screen.v2`. Opting in grants
  *  nothing: dispatch still needs the minted receipt's declared
  *  `media.may` permission and its action token. */
 export const SCREEN_MEDIA_V1 = "screen-media.v1";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof CRM_LOCALE_V1 | typeof SCREEN_PRESENTATION_V1;
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof CRM_LOCALE_V1 | typeof SCREEN_PRESENTATION_V1 | typeof SCREEN_SURFACES_V1;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -460,7 +502,7 @@ export interface ScreenPush {
   presentation_locale?: "en" | "zh-TW";
 }
 
-export type HostToChild = ScreenPush | AssetReply | ReplyMessage;
+export type HostToChild = ScreenPush | AssetReply | ReplyMessage | ScreenSurface;
 
 /** Parse a window message into a `ScreenInit`, or `null`. The port is a
  *  `MessagePort` in `event.ports[0]` — the caller checks `event.origin`
@@ -519,8 +561,14 @@ function slotAnchor(value: unknown): SlotAnchor | null {
 
 /** Parse a port message into a `ChildToHost`, or `null` (caller closes
  *  the port). `state.data` is bounded at ≤ 32 KiB here so a hostile or
- *  buggy child cannot push an unbounded snapshot. */
-export function parseChild(data: unknown, records?: readonly string[]): ChildToHost | null {
+ *  buggy child cannot push an unbounded snapshot. `drawer` is the live
+ *  host presentation capability; it is only ever true (or a verb subset)
+ *  for a records frame that negotiated `screen-presentation.v1` or
+ *  `screen-surfaces.v1` behind a shell drawer. A primary admits both
+ *  closed presentation verbs; a drawer frame admits only
+ *  `screen.drawer.close`, so it can never open another drawer. The verbs
+ *  are never the generic call set and never a records operation. */
+export function parseChild(data: unknown, records?: readonly string[], drawer: boolean | readonly ScreenDrawerVerb[] = false): ChildToHost | null {
   if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
   const d = data as Record<string, unknown>;
   if (Object.keys(d).sort().join() === "op,v" && d.v === 1 && d.op === "ready") {
@@ -530,7 +578,7 @@ export function parseChild(data: unknown, records?: readonly string[]): ChildToH
     Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
     Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 4 &&
     new Set(d.accepts).size === d.accepts.length &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === CRM_LOCALE_V1 || a === SCREEN_PRESENTATION_V1)
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === CRM_LOCALE_V1 || a === SCREEN_PRESENTATION_V1 || a === SCREEN_SURFACES_V1)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
   }
@@ -539,10 +587,25 @@ export function parseChild(data: unknown, records?: readonly string[]): ChildToH
     return { v: 2, op: "asset", ref: d.ref };
   }
   if (d.v === 2 && d.op === "call" && Object.keys(d).sort().join() === "args,id,op,v,verb") {
+    // CAD-1777: the two host-local presentation verbs parse for a records
+    // frame only when the host presentation capability is live. The minted
+    // receipt's records operations never include them, so they are admitted
+    // beside (never from) the receipt's rights — and the generic call set
+    // stays closed to a records frame either way.
+    const drawerVerbs: readonly ScreenDrawerVerb[] = drawer === true ? SCREEN_DRAWER_VERBS : drawer === false ? [] : drawer;
+    // A drawer frame's admitted subset is exactly `[close]`, so
+    // `screen.drawer.open` from one never parses and cannot recurse.
+    const hostVerb = drawerVerbs.length > 0 && records !== undefined && typeof d.verb === "string" &&
+      isScreenDrawerVerb(d.verb) && drawerVerbs.includes(d.verb);
     const allowed = records ? RECORD_CALL_VERBS.filter(v => records.includes(v)) : CALL_VERBS;
-    const admitted = (allowed as readonly unknown[]).includes(d.verb);
-    const args = actionArgs(d.args, records && admitted ? recordArgsLimit(d.verb as string) : ACTION_ARGS_BYTES);
+    const admitted = hostVerb || (allowed as readonly unknown[]).includes(d.verb);
+    const args = actionArgs(d.args, records && admitted && !hostVerb ? recordArgsLimit(d.verb as string) : ACTION_ARGS_BYTES);
     if (typeof d.id !== "string" || !ACTION_ID.test(d.id) || !admitted || !args) return null;
+    // A host-local presentation verb's exact argument shape is enforced by
+    // the dispatch guard (`parseScreenDrawerCall`), so a malformed request is
+    // refused with `bad_args` and the live frame survives — it never changes
+    // geometry and never retires the records bridge.
+    if (hostVerb) return { v: 2, op: "call", id: d.id, verb: d.verb as ScreenDrawerVerb, args };
     // Media verbs carry their own CLOSED arg shapes — parsed exactly,
     // refused outright otherwise (unadmitted kinds, unbounded values and
     // forged authority fields never reach the channel's call path).

@@ -560,6 +560,8 @@ impl Shared {
             session: String::new(),
             tools: BTreeMap::new(),
             read_only: false,
+            exact_primary_active: false,
+            parent: None,
             issued: Instant::now(),
         }
     }

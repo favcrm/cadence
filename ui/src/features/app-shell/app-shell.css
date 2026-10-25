@@ -152,27 +152,125 @@
   flex-direction: column;
 }
 
-/* CAD-1615 — the app screen presented in the board-wide drawer: the whole
-   window height on the right, the rest of the board under a scrim. The host
-   owns the geometry; the app draws its surface inside the frame. */
+/* CAD-1615 / CAD-1777 — the app screen presented in the board-wide drawer:
+   the whole window height on the right, the rest of the board under the one
+   host scrim. The host promotes the OUTLET ITSELF (the same DOM node that
+   already holds the mounted frame), so a geometry change never reloads the
+   frame or discards an in-progress draft; the app draws its own header,
+   footer and body scrolling inside this box. */
+.app-shell[data-screen-drawer="true"] {
+  /* The promoted panel is fixed and owns its own scroll; freezing the
+     shell's scroller keeps the board (and its scrollbar) still behind the
+     scrim. Scrolling is restored from the shell's saved position on close. */
+  overflow: hidden;
+}
+.app-workspace .app-shell[data-screen-drawer="true"] {
+  overflow: hidden;
+}
 .app-shell[data-screen-drawer="true"] .app-shell-outlet {
   display: flex;
   flex-direction: column;
   position: fixed;
   top: 0;
   right: 0;
-  bottom: 0;
+  bottom: auto;
   width: min(30rem, 100dvw);
+  height: 100vh;
+  height: 100dvh;
+  max-height: 100dvh;
   z-index: 51;
   background: var(--color-ink-875);
   border-left: 1px solid var(--color-ink-700);
+  box-shadow: -12px 0 32px rgb(0 0 0 / .35);
   overflow: hidden;
+  overscroll-behavior: contain;
+}
+/* The frame fills the panel; everything inside is the app's to draw. */
+.app-shell[data-screen-drawer="true"] .app-shell-outlet > [aria-label="Installed app screen"] {
+  flex: 1 1 0%;
+  min-height: 0;
+}
+/* The board's narrow layout (single pane, no second column) gets the whole
+   viewport rather than a slice of it — the same breakpoint the shell uses to
+   switch from two panes to one. */
+@media (max-width: 1023.98px) {
+  .app-shell[data-screen-drawer="true"] .app-shell-outlet {
+    width: 100dvw;
+    max-width: 100dvw;
+    border-left: 0;
+    box-shadow: none;
+  }
 }
 .app-shell-screen-scrim {
   position: fixed;
   inset: 0;
   z-index: 50;
   background: var(--color-scrim);
+  overscroll-behavior: contain;
+}
+/* Background interaction exclusion: the promoted panel is the only live
+   region — the scrim takes pointer input and AppShell marks the other panes
+   inert, so neither a click nor a tab can reach the board behind it. */
+.app-shell[data-screen-drawer="true"] .app-shell-crumb,
+.app-shell[data-screen-drawer="true"] .app-shell-panels,
+.app-shell[data-screen-drawer="true"] .app-shell-chat {
+  pointer-events: none;
+}
+
+/* CAD-1777 — the independent drawer. This is the ONLY thing that becomes
+   fixed: a shell-owned panel on the right (the whole viewport at the board's
+   narrow breakpoint), with one host scrim behind it. The primary app frame
+   stays in `.app-shell-outlet` in normal flow at its exact bounds and is
+   merely inert while the panel is open; nothing is promoted, moved or
+   measured. The core bar keeps a trusted close above the child frame. */
+.app-shell-screen-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(30rem, 100dvw);
+  z-index: 51;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--color-ink-875);
+  border-left: 1px solid var(--color-ink-700);
+  box-shadow: -12px 0 32px rgb(0 0 0 / .35);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+.app-shell-screen-drawer:focus {
+  outline: none;
+}
+.app-shell-screen-drawer-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-height: 2.75rem;
+  padding: 0.25rem 0.75rem;
+  border-bottom: 1px solid var(--color-ink-700);
+}
+.app-shell-screen-drawer-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0%;
+  min-height: 0;
+}
+.app-shell-screen-drawer-error {
+  display: grid;
+  gap: 0.75rem;
+  justify-items: start;
+  padding: 1rem;
+}
+@media (max-width: 1023.98px) {
+  .app-shell-screen-drawer {
+    width: 100dvw;
+    max-width: 100dvw;
+    border-left: 0;
+    box-shadow: none;
+  }
 }
 
 .app-shell-context {

@@ -7,11 +7,13 @@
 //!
 //! - `POST /api/app-installations/<id>/screens/<tag>/mount` —
 //!   `RouteClass::ScreenRead` (CAD-1537: a member or `--read-only` board
-//!   mounts read-only), body `{}`. The board takes the request's
-//!   session cookie token + `X-Cadence-Session` key (the same credentials
-//!   `check_session` already proves) and relays them to `app_screen_mint`,
-//!   which runs `Auth::check`/`check_public` itself and binds the minted
-//!   cap to the *resolved* session id. Returns `{mount: path}`.
+//!   mounts read-only), body `{context_id?, parent_action_token?}`. The
+//!   board takes the request's session cookie token + `X-Cadence-Session`
+//!   key (the same credentials `check_session` already proves) and relays
+//!   them, with the host-held drawer pairing token, to `app_screen_mint`,
+//!   which runs `Auth::check`/`check_public` itself, binds the minted cap
+//!   to the *resolved* session id and re-proves the pairing against live
+//!   native state. Returns `{mount: path}`.
 //!
 //! - `GET /api/app-screen/<nonce>` — the frame document. A navigation
 //!   is headerless (no `X-Cadence-Session` page key), so it never runs
@@ -60,10 +62,13 @@ pub(super) fn request_credentials(
     Some((token, key, origin.as_str()))
 }
 
-/// The mint handler — body `{context_id?}` only; install/tag are from the
-/// URL and the optional context is re-proven by the daemon for that install.
-/// Session credentials are relayed from the proven request. The child frame
-/// never supplies or receives this authority.
+/// The mint handler — body `{context_id?, parent_action_token?}` only;
+/// install/tag are from the URL, the optional context is re-proven by the
+/// daemon for that install, and the optional parent action token is the
+/// trusted host's drawer pairing for a child mount (proven natively to be
+/// a live, consumed, non-read-only PRIMARY of the same records screen and
+/// context). Session credentials are relayed from the proven request. The
+/// child frame never supplies or receives any of this authority.
 pub(super) fn mount(
     request: &mut Request,
     state_dir: &std::path::Path,
@@ -75,16 +80,36 @@ pub(super) fn mount(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let body: Value = match serde_json::from_slice::<Value>(&bytes) {
-        Ok(v) if v.is_object() => v,
+    // Duplicate fields refuse: the closed body must not let a second
+    // `parent_action_token`/`context_id` override the first.
+    let body = match serde_json::from_slice::<UniqueServiceJson>(&bytes) {
+        Ok(UniqueServiceJson(v)) if v.is_object() => v,
         _ => return err_response(400, "screen mount body must be an object"),
     };
-    if body.as_object().unwrap().keys().any(|k| k != "context_id") {
+    let fields = body.as_object().expect("checked object");
+    if fields
+        .keys()
+        .any(|k| k != "context_id" && k != "parent_action_token")
+    {
         return err_response(400, "screen mount has unsupported fields");
     }
-    let context_id = body.get("context_id").and_then(Value::as_str).unwrap_or("");
+    let context_id = match fields.get("context_id") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(value)) => value.as_str(),
+        Some(_) => return err_response(400, "screen context ID must be a string"),
+    };
     if context_id.len() > 128 {
         return err_response(400, "screen context ID exceeds its bound");
+    }
+    let parent_action_token = match fields.get("parent_action_token") {
+        None => None,
+        Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+        Some(_) => {
+            return err_response(400, "screen parent action token must be a non-empty string")
+        }
+    };
+    if parent_action_token.is_some_and(|token| token.len() > 128) {
+        return err_response(400, "screen parent action token exceeds its bound");
     }
     let Some((token, key, origin)) = request_credentials(request, opts) else {
         return err_response(403, "screen mount needs a live operator session");
@@ -99,8 +124,12 @@ pub(super) fn mount(
         "origin": origin,
         "generation": generation,
     });
+    if let Some(parent) = parent_action_token {
+        params["parent_action_token"] = json!(parent);
+    }
     // CAD-1537: the `--read-only` board can only narrow its mounts; the
-    // daemon makes a member's mount read-only on its own.
+    // daemon makes a member's mount read-only on its own. A read-only
+    // board cannot open a drawer child — the daemon refuses it too.
     if opts.read_only {
         params["read_only"] = json!(true);
     }
