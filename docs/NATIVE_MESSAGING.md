@@ -50,6 +50,69 @@ actor queue cannot claim it. A duplicate durable envelope returns its original
 disposition, without another provider call. Reusing an id with changed content
 is a conflict. This is broker idempotency, not a claim of provider idempotency.
 
+## Local connect recipe (Claude, Codex, Pi)
+
+Observed 2026-10-25 on Claude Code 2.1.310, codex-cli 0.163.0 and Pi 1.4.0
+with managed endpoints, in a disposable `cadence dev` instance. This is the
+owned local runtime-to-daemon route; `agent connect` keeps its separate
+hosted meaning (bind a local actor to a hosted workspace). The versions state
+what was exercised, not certification of native steering for them.
+
+1. Instance and state, on a non-production board port:
+   `cadence dev up --name <n> --build <cadence>` then
+   `eval "$(cadence dev env <n>)"`. Provider credentials stay in the
+   operator's own CLI configuration; nothing is copied into the store.
+2. Provider readiness is separate from Cadence:
+   `claude auth status`, `codex login status`,
+   `pi auth check --provider <provider>`. A missing provider auth or quota is
+   a blocker, not a failed delivery to substitute around.
+3. Launch (no profile, skill, messaging MCP or memory service required):
+   `cadence claude --alias <claude> --role worker --cwd <repo> --detach`,
+   `cadence codex --alias <codex> --role pm --cwd <repo> --detach`, and for a
+   managed Pi worker `cadence join <group> pi --alias <pi>
+   --model <provider/model> --no-bootstrap --detach` — there is no standalone
+   `cadence pi` verb. A managed Pi worker's model must be on the operator's
+   `Settings > Agents` allowlist for the worker role (or be the effective
+   policy default); the platform fallback is exempt at registration but is
+   refused when the Pi adapter opens, so an unconfigured store lands in
+   `attention` with that refusal rather than launching silently. Seed only
+   the intended row with the revision-bound commands
+   `cadence settings agents provider put pi --kind pi-extension` and
+   `cadence settings agents model put <id> --provider pi --scope worker`.
+4. Send and correlate: `cadence send <alias> --message <id> --text '…'
+   --wait`. The terminal receipt carries the provider's own `state`,
+   `result.text` and `result.turn_id`; `agent show` reports the session id and
+   `model_effective`/`model_reported`. `cadence message send` without
+   `--wait` answers once the envelope is durable (`queued`).
+5. Reply routing: `--reply-to <peer>` routes the finished turn's result to
+   that peer as a `worker_result` message with the recorded sender and
+   recipient uids. The routed copy has no `reply_to`, so it cannot loop; one
+   send produces the reply hop without a second manual delivery.
+6. Operator surface: the Agent page's Message action opens
+   `/threads?dm=<alias>`, and the board's
+   `POST /api/threads/<alias>/messages` (`thread_send`) starts the canonical
+   home thread inside the enqueue transaction. `/api/threads/<alias>` and
+   `/api/work-conversations` then return the same id with the operator
+   message and the agent's `turn_result`. Plain `cadence send`, dispatch and
+   task traffic do not create a home-thread row: a CLI send is not the
+   operator's chat, so a CLI-only exchange is visible in
+   `agent show`/`inbox` but not in Threads. Agent↔agent traffic is a separate
+   pair conversation, listed when `include_system=true`.
+7. Restart, dedup and unknown: `cadence dev reload` resumes registered agents
+   on their stored session ids and keeps message ids. Retrying the same
+   `--message` id with the same body answers `{"duplicate":true,…}` and starts
+   no second turn; different content for a used id is refused. A provider
+   connection lost mid-turn records the message `unknown` (non-fencing) with
+   the inspection note and never replays it; `cadence agent unfence <alias>`
+   is the explicit operator reconcile (and resumes unless `--no-resume`).
+
+Native steering on these versions: managed Claude refuses strict nudges;
+Codex refuses until its exact version is validated (0.160.0/0.161.0 above);
+Pi's generated guard opens turn admission only on Pi 1.0.0, so 1.4.0 serves
+ordinary turns and refuses strict nudges (`agent show` distinguishes
+`capabilities.native_turn_steering` from `native_turn_steering_enabled`).
+Ordinary queued delivery and observation are unaffected.
+
 ## Disposition is not task completion
 
 A native receipt can have message state `completed` with:
