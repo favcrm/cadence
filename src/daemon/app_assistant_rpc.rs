@@ -537,6 +537,27 @@ impl Shared {
                 "customers.show" => {
                     records.app_record_show(&scoped.context, required_str(input, "customer_id")?)
                 }
+                "customers.notes.list" => records.app_note_list(
+                    &scoped.context,
+                    required_str(input, "customer_id")?,
+                    input
+                        .get("limit")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(crate::store::app_records::NOTE_PAGE_MAX),
+                ),
+                "customers.notes.create" => records.app_note_create(
+                    &scoped.context,
+                    required_str(input, "customer_id")?,
+                    required_str(input, "note_id")?,
+                    required_str(input, "body")?,
+                    &format!("agent:{}", scoped.caller),
+                ),
+                "customers.notes.delete" => records.app_note_delete(
+                    &scoped.context,
+                    required_str(input, "customer_id")?,
+                    required_str(input, "note_id")?,
+                    &format!("agent:{}", scoped.caller),
+                ),
                 "segments.list" => records.app_segment_list(&scoped.context),
                 "segments.show" => {
                     records.app_segment_show(&scoped.context, required_str(input, "segment_id")?)
@@ -1668,9 +1689,16 @@ fn resource_refs(action: &str, result: &Value) -> Value {
             .unwrap_or_else(|| json!([]));
     }
     let (kind, id, label) = match action {
-        "customers.show" => (
+        "customers.show"
+        | "customers.notes.list"
+        | "customers.notes.create"
+        | "customers.notes.delete" => (
             "customer",
-            result.pointer("/record/id").and_then(Value::as_str),
+            result
+                .pointer("/record/id")
+                .or_else(|| result.pointer("/note/record_id"))
+                .or_else(|| result.get("record_id"))
+                .and_then(Value::as_str),
             result
                 .pointer("/record/profile/display_name")
                 .and_then(Value::as_str),

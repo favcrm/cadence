@@ -1667,3 +1667,75 @@ fn cad1808_campaign_turn_cannot_reach_another_campaign() {
     assert_eq!(all["operation"]["result"]["sends"][0]["send_id"], "send-c2");
     fx.finish("m-cad1808-general-sends");
 }
+
+/// CAD-1808 notes: a scoped turn appends, lists and soft-deletes a
+/// customer note; the record receipt carries the live notes.
+#[test]
+fn cad1808_scoped_turn_manages_customer_notes() {
+    let fx = Fx::new();
+    let token = fx.create_turn("m-cad1808-notes");
+    let created = fx
+        .invoke(
+            "m-cad1808-notes",
+            &token,
+            "customers.notes.create",
+            "op-note-create",
+            json!({"customer_id":"cust-a","note_id":"n1","body":"Called about renewal."}),
+        )
+        .unwrap();
+    assert_eq!(created["operation"]["status"], "succeeded");
+    assert_eq!(
+        created["operation"]["result"]["note"]["actor"],
+        "agent:master"
+    );
+    let listed = fx
+        .invoke(
+            "m-cad1808-notes",
+            &token,
+            "customers.notes.list",
+            "op-note-list",
+            json!({"customer_id":"cust-a"}),
+        )
+        .unwrap();
+    assert_eq!(listed["operation"]["result"]["count"], 1);
+    assert_eq!(
+        listed["operation"]["result"]["notes"][0]["body"],
+        "Called about renewal."
+    );
+    let shown = fx
+        .invoke(
+            "m-cad1808-notes",
+            &token,
+            "customers.show",
+            "op-note-show",
+            json!({"customer_id":"cust-a"}),
+        )
+        .unwrap();
+    assert_eq!(
+        shown["operation"]["result"]["record"]["notes"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    let deleted = fx
+        .invoke(
+            "m-cad1808-notes",
+            &token,
+            "customers.notes.delete",
+            "op-note-delete",
+            json!({"customer_id":"cust-a","note_id":"n1"}),
+        )
+        .unwrap();
+    assert_eq!(deleted["operation"]["status"], "succeeded");
+    let after = fx
+        .invoke(
+            "m-cad1808-notes",
+            &token,
+            "customers.notes.list",
+            "op-note-list-after",
+            json!({"customer_id":"cust-a"}),
+        )
+        .unwrap();
+    assert_eq!(after["operation"]["result"]["count"], 0);
+    fx.finish("m-cad1808-notes");
+}

@@ -161,6 +161,30 @@
       "effect": "read",
       "confirmation": "none",
       "availability": "requires_context"
+    },
+    {
+      "id": "customers.notes.list",
+      "description": "List customer notes in the current CRM context.",
+      "input_schema": {"type":"object","properties":{"customer_id":{"type":"string","minLength":1,"maxLength":128},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["customer_id"],"additionalProperties":false},
+      "effect": "read",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "customers.notes.create",
+      "description": "Append a plain-text note to a customer timeline.",
+      "input_schema": {"type":"object","properties":{"customer_id":{"type":"string","minLength":1,"maxLength":128},"note_id":{"type":"string","minLength":1,"maxLength":128},"body":{"type":"string","minLength":1,"maxLength":4000}},"required":["customer_id","note_id","body"],"additionalProperties":false},
+      "effect": "write",
+      "confirmation": "none",
+      "availability": "requires_context"
+    },
+    {
+      "id": "customers.notes.delete",
+      "description": "Soft-delete one customer note.",
+      "input_schema": {"type":"object","properties":{"customer_id":{"type":"string","minLength":1,"maxLength":128},"note_id":{"type":"string","minLength":1,"maxLength":128}},"required":["customer_id","note_id"],"additionalProperties":false},
+      "effect": "delete",
+      "confirmation": "none",
+      "availability": "requires_context"
     }
   ]
 }

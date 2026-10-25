@@ -26,6 +26,18 @@ fn schema(id: &str) -> Option<Value> {
             json!({"customer_id":{"type":"string","minLength":1,"maxLength":128}}),
             &["customer_id"],
         ),
+        "customers.notes.list" => object(
+            json!({"customer_id":{"type":"string","minLength":1,"maxLength":128},"limit":{"type":"integer","minimum":1,"maximum":50}}),
+            &["customer_id"],
+        ),
+        "customers.notes.create" => object(
+            json!({"customer_id":{"type":"string","minLength":1,"maxLength":128},"note_id":{"type":"string","minLength":1,"maxLength":128},"body":{"type":"string","minLength":1,"maxLength":4000}}),
+            &["customer_id", "note_id", "body"],
+        ),
+        "customers.notes.delete" => object(
+            json!({"customer_id":{"type":"string","minLength":1,"maxLength":128},"note_id":{"type":"string","minLength":1,"maxLength":128}}),
+            &["customer_id", "note_id"],
+        ),
         "segments.list" | "campaigns.list" => object(json!({}), &[]),
         "segments.show" => object(
             json!({"segment_id":{"type":"string","minLength":1,"maxLength":128}}),
@@ -247,6 +259,9 @@ pub fn registered_action(id: &str) -> Option<RegisteredAction> {
     let (effect, confirmation) = match id {
         "customers.search" | "customers.show" | "segments.list" | "segments.show"
         | "segments.preview" | "campaigns.list" | "campaigns.show" => ("read", "none"),
+        "customers.notes.list" => ("read", "none"),
+        "customers.notes.create" => ("write", "none"),
+        "customers.notes.delete" => ("delete", "none"),
         "segments.save" | "segments.save_static" => ("write", "none"),
         "segments.delete" => ("delete", "none"),
         "campaigns.create_draft" => ("draft", "none"),
@@ -272,6 +287,9 @@ pub fn registered_action(id: &str) -> Option<RegisteredAction> {
             "segments.list" => "segments.list",
             "segments.show" => "segments.show",
             "segments.preview" => "segments.preview",
+            "customers.notes.list" => "customers.notes.list",
+            "customers.notes.create" => "customers.notes.create",
+            "customers.notes.delete" => "customers.notes.delete",
             "segments.save" => "segments.save",
             "segments.save_static" => "segments.save_static",
             "segments.delete" => "segments.delete",
@@ -309,6 +327,9 @@ pub fn registered_ids() -> &'static [&'static str] {
         "segments.list",
         "segments.show",
         "segments.preview",
+        "customers.notes.list",
+        "customers.notes.create",
+        "customers.notes.delete",
         "segments.save",
         "segments.save_static",
         "segments.delete",

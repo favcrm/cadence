@@ -1087,3 +1087,69 @@ fn cad1374_owner_human_is_stored_on_the_revision_in_the_same_write() {
         "legacy write must stay honestly unknown"
     );
 }
+
+#[test]
+fn cad1808_notes_are_idempotent_and_soft_deleted() {
+    let dir = TempDir::new().unwrap();
+    let store = record_file(&dir, "install-notes");
+    let profile = CustomerProfile::parse(&json!({
+        "schema":1,"display_name":"Ada","email":"ada@example.test","tags":[],
+        "consent":{"email":"granted"}
+    }))
+    .unwrap();
+    store.app_record_create("ctx", "cust-a", &profile).unwrap();
+
+    let first = store
+        .app_note_create(
+            "ctx",
+            "cust-a",
+            "note-1",
+            "Called about the renewal.",
+            "agent:master",
+        )
+        .unwrap();
+    assert_eq!(first["note"]["body"], "Called about the renewal.");
+    assert_eq!(first["note"]["actor"], "agent:master");
+
+    let replay = store
+        .app_note_create(
+            "ctx",
+            "cust-a",
+            "note-1",
+            "Called about the renewal.",
+            "agent:master",
+        )
+        .unwrap();
+    assert_eq!(replay["note"]["created"], first["note"]["created"]);
+    assert!(store
+        .app_note_create(
+            "ctx",
+            "cust-a",
+            "note-1",
+            "A different note.",
+            "agent:master",
+        )
+        .is_err());
+
+    let listed = store.app_note_list("ctx", "cust-a", 50).unwrap();
+    assert_eq!(listed["count"], 1);
+    let shown = store.app_record_show("ctx", "cust-a").unwrap();
+    assert_eq!(shown["record"]["notes"].as_array().map(Vec::len), Some(1));
+
+    store
+        .app_note_delete("ctx", "cust-a", "note-1", "agent:master")
+        .unwrap();
+    assert_eq!(
+        store.app_note_list("ctx", "cust-a", 50).unwrap()["count"],
+        0
+    );
+    assert_eq!(
+        store.app_record_show("ctx", "cust-a").unwrap()["record"]["notes"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+    assert!(store
+        .app_note_create("ctx", "cust-z", "note-2", "unknown record", "agent:master")
+        .is_err());
+}
