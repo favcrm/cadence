@@ -1,5 +1,5 @@
 import type { Agent, AgentsPayload } from "../src/lib/types";
-import { agentOn, normalizeAgent, normalizeAgentsPayload } from "../src/lib/agentOn";
+import { agentOn, agentRowForEvent, normalizeAgent, normalizeAgentsPayload } from "../src/lib/agentOn";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -51,5 +51,9 @@ const payload = normalizeAgentsPayload({
 } as unknown as AgentsPayload);
 equal(payload.agents.length, 1, "payload keeps its rows");
 equal(payload.agents[0].on, [], "payload rows are normalized");
+
+// A delete event is { op, id } with no row; it must pass through untouched.
+equal(agentRowForEvent("delete", undefined), undefined, "a delete tombstone is never normalized");
+equal(agentRowForEvent("upsert", minimal)?.on, [], "an upsert row is normalized");
 
 console.log("agent-on checks passed");

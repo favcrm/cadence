@@ -86,7 +86,7 @@ import { AssistantUnreadProbes } from "./features/app-shell/chat/unreadShell";
 import { LiveUpdates, patchRows } from "./lib/liveUpdates";
 import type { Agent, AgentsPayload } from "./lib/types";
 import { cache, onIssueUnavailable, resources, type MyWorkList } from "./lib/resources";
-import { normalizeAgent } from "./lib/agentOn";
+import { agentRowForEvent } from "./lib/agentOn";
 import { useMaybeResource, useResource } from "./lib/useResource";
 import {
   goTo,
@@ -513,9 +513,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
               value.agents,
               data.id as string,
               data.op,
-              // A delete tombstone is { op, id } with no row; normalizing it
-              // would dereference nothing before patchRows removes it.
-              data.op === "upsert" ? normalizeAgent(data.agent as Agent) : (data.agent as Agent),
+              // A delete tombstone is { op, id } with no row; only an upsert
+              // carries a row worth normalizing.
+              agentRowForEvent(data.op as "upsert" | "delete", data.agent as Agent | undefined) as Agent,
               (row) => row.alias,
             ),
           }));

@@ -32,6 +32,18 @@ export function normalizeAgent(agent: Agent): Agent {
   };
 }
 
+/**
+ * The row a stream event carries into the cache. A delete is `{ op, id }` with
+ * no row at all, so only an upsert is normalized; passing the tombstone through
+ * keeps `patchRows` free to remove it.
+ */
+export function agentRowForEvent(
+  op: "upsert" | "delete",
+  row: Agent | undefined,
+): Agent | undefined {
+  return op === "upsert" ? normalizeAgent(row as Agent) : row;
+}
+
 export function normalizeAgentsPayload(payload: AgentsPayload): AgentsPayload {
   // A missing roster is a malformed response, not an empty workspace: throwing
   // keeps the resource's last-good data instead of publishing "no agents".
