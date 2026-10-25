@@ -175,6 +175,12 @@ chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # CAD-1423: P-256 point check for push subscription keys (already in the lock).
 p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+# CAD-1128: dedicated encrypted-SQLite custody — XChaCha20-Poly1305
+# envelope (RustCrypto AEAD, alloc-only) over zeroized key handling.
+# `ring` above stays the JWS verifier; no second crypto stack is
+# introduced for custody.
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 
 # CAD-1073: the legacy e2e target was retired with the suite; the
 # safety-floor binary in tests/ is autodiscovered and needs no entry.

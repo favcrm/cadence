@@ -82,6 +82,56 @@ impl Shared {
             json!({"id":id,"provider":provider,"account":account,"kind":if builtin{"builtin"}else{"enrolled"},"revision":record.map(|r|r.credential_revision),"registration_digest":registration,"descriptor":descriptor,"scopes":record.map(|r|r.scopes.clone()).unwrap_or_default(),"smtp":smtp,"smtp_sender":smtp_sender,"smtp_error":smtp_error,"verification_support":verification_support,"status":{"adapter_registered":adapter.is_some(),"descriptor_available":descriptor.is_some(),"custody_available":custody_available,"manifest_status":pin,"reviewed_pin":reviewed,"reported_pin":reported,"execution_authority":false,"network_checked":false}}),
         )
     }
+    pub(super) fn connection_record_metadata(&self, record: &CredentialRecord) -> Result<Value> {
+        self.connection_record(&record.platform, &record.account, Some(record))
+    }
+
+    /// Real admitted metadata projection. Integrity/fingerprint verification is
+    /// mandatory before marking encrypted custody available; no default-loader bypass.
+    pub(super) fn connection_record_admitted(
+        &self,
+        record: &CredentialRecord,
+        operation: &super::custody_rpc::CustodyOperation<'_>,
+    ) -> Result<Value> {
+        let mut row = self.connection_record_metadata(record)?;
+        if record
+            .custody
+            .starts_with(platform::encrypted_sqlite::TAG_PREFIX)
+        {
+            let projection = (|| -> Result<Value> {
+                let permit =
+                    operation.witness(super::custody_rpc::CustodyUse::Connections, record)?;
+                let bytes = platform::load_credential_witnessed(
+                    &self.store,
+                    &self.platform_custody,
+                    &permit,
+                )?;
+                let (envelope, projection) = platform::smtp::custody_decode(&bytes)?;
+                let mut projected = row.clone();
+                projected["smtp"] = projection.to_json();
+                platform::refuse_leak(
+                    "connection projection",
+                    &projected.to_string(),
+                    envelope.secret(),
+                )?;
+                Ok(projection.to_json())
+            })();
+            match projection {
+                Ok(projection) => {
+                    row["smtp"] = projection;
+                    row["smtp_error"] = Value::Null;
+                    row["status"]["custody_available"] = json!(true);
+                }
+                Err(error) => {
+                    row["smtp"] = Value::Null;
+                    row["smtp_error"] = json!(error.code().unwrap_or("integrity_failure"));
+                    row["status"]["custody_available"] = json!(false);
+                }
+            }
+        }
+        Ok(row)
+    }
+
     /// The id of a built-in (credential-less) connection row.
     pub(super) fn builtin_connection_id(&self, provider: &str, account: &str) -> Result<String> {
         Ok(format!(
@@ -153,6 +203,23 @@ impl Shared {
         .map_err(|_| ProjectionFault::Unavailable)?;
         platform::smtp::project_custody(&bytes)
     }
+    fn smtp_projection_admitted(
+        &self,
+        record: &CredentialRecord,
+        operation: &super::custody_rpc::CustodyOperation<'_>,
+    ) -> std::result::Result<platform::smtp::SmtpProjection, platform::smtp::ProjectionFault> {
+        use platform::smtp::ProjectionFault;
+        if record.exchange != platform::smtp::ENROLLMENT_SHAPE {
+            return Err(ProjectionFault::Unavailable);
+        }
+        let permit = operation
+            .witness(super::custody_rpc::CustodyUse::Connections, record)
+            .map_err(|_| ProjectionFault::Unavailable)?;
+        let bytes =
+            platform::load_credential_witnessed(&self.store, &self.platform_custody, &permit)
+                .map_err(|_| ProjectionFault::Unavailable)?;
+        platform::smtp::project_custody(&bytes)
+    }
     fn connection_metadata_projection(&self, record: &CredentialRecord) -> Result<Value> {
         let mut projection =
             self.connection_record(&record.platform, &record.account, Some(record))?;
@@ -187,7 +254,12 @@ impl Shared {
         self.operator_connection("connection management", params, peer_pid)?;
         let allowed: &[&str] = match method {
             "connection_providers" | "connection_list" => &[],
-            "connection_show" | "connection_check" | "connection_revoke" => &["connection_id"],
+            "connection_show" | "connection_check" => &["connection_id"],
+            "connection_revoke" => &[
+                "connection_id",
+                "expected_connection_id",
+                "expected_revision",
+            ],
             "connection_test" => &[
                 "connection_id",
                 "expected_revision",
@@ -214,6 +286,8 @@ impl Shared {
             ],
             "connection_rotate" => &[
                 "connection_id",
+                "expected_connection_id",
+                "expected_revision",
                 "token",
                 "host",
                 "port",
@@ -254,11 +328,15 @@ impl Shared {
                 Ok(json!({"providers":rows}))
             }
             "connection_list" | "connection_show" | "connection_check" => {
-                let _guard = self
-                    .platform_custody_lock
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let rows = self.connection_list_locked()?;
+                let operation = self.custody_operation()?;
+                let mut rows = self.connection_list_locked()?;
+                for row in &mut rows {
+                    if let Some(id) = row["id"].as_str() {
+                        if let Some(record) = self.store.connection_credential(id)? {
+                            *row = self.connection_record_admitted(&record, &operation)?;
+                        }
+                    }
+                }
                 if method == "connection_list" {
                     // `hosted_smtp`: enrolled senders send through the
                     // hosted `smtp.internal` pass-through (CAD-1126).
@@ -303,6 +381,12 @@ impl Shared {
                         ));
                     }
                     let shapeliness = smtp_create_params(&provider, &account, params)?;
+                    // CAD-1128: encrypted admission refuses BEFORE the
+                    // hosted verification reads key material or sends
+                    // relay traffic — the ordering is the contract's.
+                    if self.platform_custody.encrypted().is_some() {
+                        self.refuse_hosted_encrypted()?;
+                    }
                     self.verify_hosted_smtp(&shapeliness)?;
                     let enrolled = self
                         .enroll_inner(
@@ -324,21 +408,7 @@ impl Shared {
                                 params.get("secret").and_then(Value::as_str).unwrap_or(""),
                             )
                         })?;
-                    let _guard = self
-                        .platform_custody_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let record = self
-                        .store
-                        .connection_credential(
-                            enrolled["account"]["connection_id"]
-                                .as_str()
-                                .ok_or_else(|| Error::internal("missing connection identity"))?,
-                        )?
-                        .ok_or_else(|| Error::rejected("connection was concurrently removed"))?;
-                    return Ok(
-                        json!({"connection":self.connection_record(&provider,&account,Some(&record))?}),
-                    );
+                    return Ok(json!({"connection": enrolled["connection"]}));
                 }
                 if params.get("secret").is_some()
                     || params.get("host").is_some()
@@ -375,9 +445,26 @@ impl Shared {
                     .connection_credential(id)?
                     .ok_or_else(|| Error::rejected("connection is unavailable or stale"))?;
                 if method == "connection_revoke" {
-                    self.revoke_inner(
+                    // CAD-1128: an encrypted revoke requires the exact
+                    // incarnation+revision CAS. Legacy callers may omit
+                    // the pair; supplied expectations are never rewritten
+                    // into a different identity or execution authority.
+                    let expected_id = optional_str(params, "expected_connection_id");
+                    let expected_rev = params.get("expected_revision").and_then(Value::as_u64);
+                    if record
+                        .custody
+                        .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX)
+                        && (expected_id != Some(id) || expected_rev.is_none())
+                    {
+                        return Err(Error::invalid(
+                            "stale_revision",
+                            "an encrypted revoke requires exact expected_connection_id and expected_revision",
+                        ));
+                    }
+                    self.revoke_inner_expected(
                         &json!({"platform":record.platform,"account":record.account}),
-                        Some(id),
+                        expected_id.or(Some(id)),
+                        expected_rev,
                     )?;
                     return Ok(json!({"connection_id":id,"revoked":true}));
                 }
@@ -400,10 +487,50 @@ impl Shared {
                             "SMTP rotation carries the fresh secret — no token",
                         ));
                     }
-                    // With a readable projection absent fields inherit.
-                    // With none (corrupt, withheld or unavailable) the
-                    // operator re-enters every transport field.
-                    let mut mapped = match self.smtp_projection_typed(&record) {
+                    let encrypted = record
+                        .custody
+                        .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX);
+                    let expected_id = optional_str(params, "expected_connection_id");
+                    let expected_rev = params.get("expected_revision").and_then(Value::as_u64);
+                    let operation = encrypted.then(|| self.custody_operation()).transpose()?;
+                    let record = if operation.is_some() {
+                        let current = self.store.connection_credential(id)?.ok_or_else(|| {
+                            Error::invalid("stale_revision", "connection is unavailable or stale")
+                        })?;
+                        if current.platform != record.platform
+                            || current.account != record.account
+                            || current.exchange != record.exchange
+                            || !current
+                                .custody
+                                .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX)
+                        {
+                            return Err(Error::invalid(
+                                "stale_revision",
+                                "connection identity changed before rotation",
+                            ));
+                        }
+                        current
+                    } else {
+                        record
+                    };
+                    if encrypted {
+                        self.refuse_hosted_encrypted()?;
+                        if expected_id != Some(id)
+                            || expected_rev != Some(record.credential_revision)
+                        {
+                            return Err(Error::invalid(
+                                "stale_revision",
+                                "encrypted rotation requires the exact current connection and revision",
+                            ));
+                        }
+                    }
+                    // Inherit only from the caller-pinned encrypted revision while
+                    // retaining the same custody section through publication.
+                    let current = match operation.as_ref() {
+                        Some(operation) => self.smtp_projection_admitted(&record, operation),
+                        None => self.smtp_projection_typed(&record),
+                    };
+                    let mut mapped = match current {
                         Ok(current) => smtp_rotate_params(&record, params, &current)?,
                         Err(_) => smtp_rotate_full_params(params)?,
                     };
@@ -412,31 +539,28 @@ impl Shared {
                     mapped["shape"] = json!(record.exchange);
                     self.verify_hosted_smtp(&mapped)?;
                     let secret = params.get("secret").and_then(Value::as_str).unwrap_or("");
-                    self.enroll_inner(
-                        &mapped,
-                        true,
-                        Some(id),
-                        Some(
-                            &descriptor
-                                .capabilities
-                                .iter()
-                                .flat_map(|c| c.scopes.clone())
-                                .collect::<Vec<_>>(),
-                        ),
-                        Some(&|record| self.connection_metadata_projection(record)),
-                    )
-                    .map_err(|error| connection_error(error, secret))?;
-                    let _guard = self
-                        .platform_custody_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let current = self
-                        .store
-                        .connection_credential(id)?
-                        .ok_or_else(|| Error::rejected("connection was concurrently removed"))?;
-                    return Ok(
-                        json!({"connection":self.connection_record(&current.platform,&current.account,Some(&current))?}),
-                    );
+                    let operation = match operation {
+                        Some(operation) => operation,
+                        None => self.custody_operation()?,
+                    };
+                    let enrolled = self
+                        .enroll_inner_expected(
+                            &operation,
+                            &mapped,
+                            true,
+                            expected_id.or(Some(id)),
+                            expected_rev,
+                            Some(
+                                &descriptor
+                                    .capabilities
+                                    .iter()
+                                    .flat_map(|c| c.scopes.clone())
+                                    .collect::<Vec<_>>(),
+                            ),
+                            Some(&|record| self.connection_metadata_projection(record)),
+                        )
+                        .map_err(|error| connection_error(error, secret))?;
+                    return Ok(json!({"connection": enrolled["connection"]}));
                 }
                 if params.get("secret").is_some() {
                     return Err(Error::rejected(
@@ -449,31 +573,27 @@ impl Shared {
                 mapped["account"] = json!(record.account);
                 let token = required_str(params, "token")?;
                 mapped["shape"] = json!(record.exchange);
-                self.enroll_inner(
-                    &mapped,
-                    true,
-                    Some(id),
-                    Some(
-                        &descriptor
-                            .capabilities
-                            .iter()
-                            .flat_map(|c| c.scopes.clone())
-                            .collect::<Vec<_>>(),
-                    ),
-                    Some(&|record| self.connection_metadata_projection(record)),
-                )
-                .map_err(|error| connection_error(error, token))?;
-                let _guard = self
-                    .platform_custody_lock
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let current = self
-                    .store
-                    .connection_credential(id)?
-                    .ok_or_else(|| Error::rejected("connection was concurrently removed"))?;
-                Ok(
-                    json!({"connection":self.connection_record(&current.platform,&current.account,Some(&current))?}),
-                )
+                let operation = self.custody_operation()?;
+                let enrolled = self
+                    .enroll_inner_expected(
+                        &operation,
+                        &mapped,
+                        true,
+                        optional_str(params, "expected_connection_id").or(Some(id)),
+                        params.get("expected_revision").and_then(Value::as_u64),
+                        Some(
+                            &descriptor
+                                .capabilities
+                                .iter()
+                                .flat_map(|c| c.scopes.clone())
+                                .collect::<Vec<_>>(),
+                        ),
+                        Some(&|record| self.connection_metadata_projection(record)),
+                    )
+                    .map_err(|error| connection_error(error, token))?;
+                // Return the attempted committed snapshot, not a later read
+                // that could report a concurrent winner's incarnation.
+                Ok(json!({"connection": enrolled["connection"]}))
             }
             _ => unreachable!(),
         }

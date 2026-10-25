@@ -137,6 +137,9 @@ impl Shared {
         proof: &BindingProof,
     ) -> Result<CapabilityQuoteRequest> {
         let config = &proof.config;
+        // Called under the broker's custody/release section. Refuse before
+        // quoting, input digests, claims and cached-success return paths.
+        self.refuse_encrypted_binding(config)?;
         let provider = required_str(config, "provider")?;
         let tool = required_str(&config["mapping"], "tool")?;
         let effect = required_str(&config["mapping"], "effect")?;
@@ -731,10 +734,7 @@ impl Shared {
                     return Err(Error::rejected("capability quote native actor changed"));
                 }
                 workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
-                    let _custody = self
-                        .platform_custody_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let _custody = self.custody_operation()?;
                     let _release = self
                         .app_release_lock
                         .lock()
@@ -807,13 +807,10 @@ impl Shared {
                     );
                 }
                 let pm = self.pm_at(&self.pm_dir()?)?;
-                // CAD-1258: lock 1 verifies and claims; the provider call runs
-                // with NO lock; lock 2 re-verifies and records.
+                // Claim under the runtime/custody/release guards; provider I/O
+                // remains outside them, followed by a fresh result check.
                 let prepared = workspace::with_runtime_snapshot(&pm, &install, |bundle, files| {
-                    let _custody = self
-                        .platform_custody_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let _custody = self.custody_operation()?;
                     let _release = self
                         .app_release_lock
                         .lock()
@@ -1100,10 +1097,7 @@ impl Shared {
                         &pm,
                         required_str(&run, "install_id")?,
                         |bundle, files| {
-                            let _custody = self
-                                .platform_custody_lock
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
+                            let _custody = self.custody_operation()?;
                             let _release = self
                                 .app_release_lock
                                 .lock()
@@ -1128,6 +1122,42 @@ impl Shared {
                     return Err(Error::rejected("token requires its assigned message"));
                 }
                 self.operator_connection("app capability receipt", params, pid)?;
+                // Historical operator reads must not turn an unsupported
+                // encrypted binding into a cache-return bypass. Only classify
+                // the stored routing targets: no provider quote, credential
+                // load, execution grant, or legacy historical revalidation.
+                let _custody = self.custody_operation()?;
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let run_id = if method == "app_run_capability_results" {
+                    required_str(params, "run_id")?.to_string()
+                } else {
+                    let receipt = self
+                        .store
+                        .app_capability_result(required_str(params, "receipt_id")?)
+                        .map_err(|error| match error {
+                            Error::Rejected(message)
+                                if method == "app_run_capability_asset"
+                                    && message == "app capability result unavailable" =>
+                            {
+                                Error::rejected("app capability asset unavailable")
+                            }
+                            other => other,
+                        })?;
+                    required_str(&receipt, "run_id")?.to_string()
+                };
+                let run = self.store.app_run_show(&run_id)?;
+                if let Some(capabilities) = run["snapshot"]["capabilities"].as_object() {
+                    for value in capabilities.values() {
+                        let proof: crate::store::app_bindings::BindingProof =
+                            serde_json::from_value(value.clone()).map_err(|_| {
+                                Error::rejected("run capability binding receipt is invalid")
+                            })?;
+                        self.refuse_encrypted_binding(&proof.config)?;
+                    }
+                }
                 match method {
                     "app_run_capability_results" => self
                         .store
@@ -1144,3 +1174,6 @@ impl Shared {
         }
     }
 }
+
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod early_app_quote_tests;

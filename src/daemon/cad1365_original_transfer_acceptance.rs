@@ -312,7 +312,7 @@ fn media_door(
 /// whenever `secret-tool` is absent; the suite contract isolates HOME
 /// so the keychain probe cannot resolve. The enrollment row is written
 /// through `store.platform_enroll` before the `Arc` escapes, with
-/// `platform_custody` pinned to `Custody::File` inside the tempdir —
+/// `platform_custody` pinned to `Custody::file` inside the tempdir —
 /// never a real credential.
 struct Fx {
     _dir: tempfile::TempDir,
@@ -491,7 +491,7 @@ impl Fx {
         // uses; the fixture socket below dispatches into THIS Shared.
         let mut shared = shared;
         Arc::get_mut(&mut shared).unwrap().platform_custody =
-            Custody::File(dir.path().join("fixture-custody"));
+            Custody::file(dir.path().join("fixture-custody"));
         if trust.is_none() {
             let token = b"synthetic-cad1365-orig-token";
             let key = Key {

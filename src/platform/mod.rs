@@ -15,6 +15,13 @@ pub mod agenticos_web;
 pub mod connections;
 pub mod custody;
 pub mod deployments;
+pub(crate) mod encrypted_config;
+mod encrypted_fs;
+pub(crate) use encrypted_fs::Directories as ControlledDirectories;
+/// CAD-1128: the encrypted-SQLite custody vault. `pub(crate)` — the
+/// manager and its key material are daemon-internal; no public
+/// platform/custody re-export exposes them.
+pub(crate) mod encrypted_sqlite;
 pub mod hosted_email;
 pub mod hosted_whatsapp;
 pub mod local;
@@ -146,7 +153,9 @@ pub struct AppCapabilityAsset {
 use crate::error::{Error, Result};
 use crate::store::{Grant, Store};
 
-pub use custody::{Custody, Key};
+pub(crate) use custody::{Custody, Key};
+
+pub(crate) use crate::daemon::custody_rpc::CustodyWitness;
 
 pub struct OpDeadline {
     end: std::time::Instant,
@@ -676,7 +685,9 @@ pub(crate) fn credential_enrollment_missing(err: &Error) -> bool {
     )
 }
 
-pub fn load_credential(
+/// Refuses encrypted custody records. Supported consumers require a fresh
+/// `CustodyWitness` and `load_credential_witnessed`.
+pub(crate) fn load_credential(
     store: &Store,
     custody: &Custody,
     platform: &str,
@@ -701,6 +712,29 @@ pub fn load_credential(
             "custody bytes for {platform}/{account} no longer match the recorded \
              fingerprint — re-enroll or rotate"
         )));
+    }
+    Ok(bytes)
+}
+
+/// The witnessed encrypted read — the ONLY way an encrypted record's
+/// bytes leave custody. `expected` carries the live core identity the
+/// caller resolved (connection_id/provider/account/revision/exchange
+/// plus the workspace and the configured key id); `read_exact`
+/// authenticates the stored row against exactly that before any
+/// plaintext returns. The core fingerprint is still checked after
+/// decrypt, so a torn vault/core pair refuses.
+pub(crate) fn load_credential_witnessed(
+    store: &Store,
+    custody: &Custody,
+    witness: &CustodyWitness<'_>,
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    witness.validate(store)?;
+    let bytes = custody.load_encrypted(witness)?;
+    if crate::secret::fingerprint(&bytes) != witness.record().fingerprint {
+        return Err(Error::invalid(
+            "integrity_failure",
+            "custody fingerprint mismatch",
+        ));
     }
     Ok(bytes)
 }

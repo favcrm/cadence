@@ -452,11 +452,11 @@ impl Shared {
             ));
         }
         let frozen = records.app_audience_frozen(context, freeze)?;
-        let _custody = (!custody_held).then(|| {
-            self.platform_custody_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-        });
+        let _custody = if custody_held {
+            None
+        } else {
+            Some(self.custody_operation()?)
+        };
         let link = self.store.crm_smtp_link(install, context)?.ok_or_else(|| {
             Error::rejected("no SMTP sender is bound to this installation and context")
         })?;
@@ -465,6 +465,7 @@ impl Shared {
                 "SMTP sender binding is revoked; bind it again instead",
             ));
         }
+        self.refuse_encrypted_connection(&link.connection_id)?;
         self.crm_smtp_authority(&link.connection_id, link.auth_revision)?;
         Ok(SendFacts {
             origin,
@@ -836,6 +837,22 @@ impl Shared {
         })
     }
 
+    /// Read-only admission under C, checking both the frozen target and
+    /// the current link. A changed link must not turn a legacy queued row
+    /// into a route to an encrypted sender before its later proof fails.
+    fn refuse_encrypted_campaign_sender(
+        &self,
+        install: &str,
+        context: &str,
+        connection_id: &str,
+    ) -> Result<()> {
+        self.refuse_encrypted_connection(connection_id)?;
+        if let Some(link) = self.store.crm_smtp_link(install, context)? {
+            self.refuse_encrypted_connection(&link.connection_id)?;
+        }
+        Ok(())
+    }
+
     /// One worker per live send: the registry refuses a second
     /// runner for the same `(install, context, send)`, so a restart
     /// or a double approve can never double-submit.
@@ -845,6 +862,20 @@ impl Shared {
         context: &str,
         send_id: &str,
     ) {
+        // Boot/explicit resume gets no worker for an encrypted target,
+        // even while custody is locked. Release C before registry work.
+        let admission = (|| -> Result<()> {
+            let _custody = self.custody_operation()?;
+            let records = RecordStore::open(&self.state_dir, install)?;
+            let send = records
+                .app_campaign_send(context, send_id)?
+                .ok_or_else(|| Error::rejected("campaign send is unavailable"))?;
+            self.refuse_encrypted_campaign_sender(install, context, &send.connection_id)
+        })();
+        if admission.is_err() {
+            eprintln!("crm send worker admission refused");
+            return;
+        }
         let key = format!("{install}/{context}/{send_id}");
         {
             let mut workers = self
@@ -874,7 +905,8 @@ impl Shared {
     /// Boot reconciliation: every send whose durable intent is still
     /// `sending` gets its `submitting` leftovers marked `uncertain`
     /// (they may have been delivered before the crash — never
-    /// resend) and a worker respawned for the still-`queued` rest.
+    /// resend). Only supported legacy targets get a worker for the
+    /// still-`queued` rest; encrypted history stays uncertain/non-resumed.
     pub(super) fn reconcile_crm_sends(self: &Arc<Self>) {
         let Ok(sends) = self.store.crm_sends_sending() else {
             return;
@@ -987,7 +1019,15 @@ impl Shared {
                 break;
             };
             let customer_id = next.customer_id.clone();
-            if !records.app_campaign_delivery_claim(context, send_id, &customer_id)? {
+            // Classify and claim in one short C -> D section, before the
+            // scope proof (P) and before any token write. Encrypted use
+            // must not become a submitting row even if the loader refuses.
+            let claimed = {
+                let _custody = self.custody_operation()?;
+                self.refuse_encrypted_campaign_sender(install, context, &send.connection_id)?;
+                records.app_campaign_delivery_claim(context, send_id, &customer_id)?
+            };
+            if !claimed {
                 continue;
             }
             // Every check again, right before submission: context
@@ -1139,6 +1179,11 @@ impl Shared {
         customer_id: &str,
         reuse_token: Option<String>,
     ) -> Result<Step> {
+        // Repeat admission at the internal submission entry. Hold the
+        // existing submission custody section from before token writes;
+        // never reenter it below, and never mint a campaign decrypt witness.
+        let _custody = self.custody_operation()?;
+        self.refuse_encrypted_campaign_sender(install, context, &send.connection_id)?;
         // Mint this attempt's unsubscribe token and land its sha256
         // in the App token table plus the core index BEFORE any
         // socket opens — a submitted message's token must always be
@@ -1180,10 +1225,6 @@ impl Shared {
             // pass claims and re-mints it.
             return Ok(Step::Requeue);
         }
-        let _custody = self
-            .platform_custody_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let link = self
             .store
             .crm_smtp_link(install, context)?
@@ -1362,6 +1403,10 @@ fn send_request_id(params: &Value) -> Result<String> {
     let id = required_str(params, "request_id")?;
     crate::proto::identifier(id, "request ID")
 }
+
+#[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "crm_send_rpc_worker_tests.rs"]
+mod custody_worker_checks;
 
 #[cfg(test)]
 mod backoff_tests {

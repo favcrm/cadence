@@ -128,6 +128,12 @@ mod portable_selftest;
 #[cfg(test)]
 mod portable_activate_selftest;
 
+mod namespace;
+use namespace::ArtifactDir;
+#[cfg(test)]
+mod artifact4;
+#[cfg(test)]
+mod cad1128_portable_custody_acceptance;
 #[cfg(test)]
 mod tests;
 
@@ -178,6 +184,7 @@ const EXPORT_EXCLUDES: &[&str] = &[
     "every other state-dir file: ui.json, slots.json, daemon-instance, logs, cadence.lock, the socket",
     "app record files: <state dir>/app-records/*.sqlite3 (per-installation SQLite, covered by `cadence backup`, never exported)",
     "operator config: secret-allowlist.toml, intake-relay.yaml",
+    "encrypted Connections custody: vault/ (DB, rollback journal, WAL/SHM); external key and provisioning scratch: never inventoried or read",
     ".env files",
     "state-dir folders: private/, sessions/, briefings/, reviews/, agents/, roles/, backups/",
     "provider auth (Claude, Codex, Devin, Cursor sign-in state in their own dirs): never read",
@@ -454,9 +461,9 @@ fn core_installations(db: &Path) -> Result<Vec<String>> {
 /// A file created after `inventoried` refuses the backup so a partial set
 /// never appears complete. Each entry stamps `core_sha256` with the core
 /// copy's hash. Staged copies are caller-cleaned on error (see `backup`).
-fn snapshot_app_records(
+fn snapshot_app_records_into(
     state_dir: &Path,
-    dir: &Path,
+    output: &mut ArtifactDir,
     stem: &str,
     inventoried: &[String],
     catalog: &[String],
@@ -473,8 +480,9 @@ fn snapshot_app_records(
     for install_id in inventoried {
         let live = crate::store::app_records::record_db_path(state_dir, install_id)?;
         let db_name = format!("{stem}.app-{install_id}.sqlite3");
-        let partial = dir.join(format!(".{db_name}.partial"));
-        let dest = dir.join(&db_name);
+        let temp_name = format!(".{db_name}.partial");
+        let partial = output.file_path(temp_name.as_ref())?;
+        let dest = output.file_path(db_name.as_ref())?;
         // snapshot() maps a missing source to a rejected open; name the
         // installation explicitly so the refusal is actionable.
         if !live.is_file() {
@@ -482,8 +490,7 @@ fn snapshot_app_records(
                 "record file for installation {install_id:?} disappeared during backup; retry the backup"
             )));
         }
-        snapshot(&live, &partial).map_err(|e| {
-            let _ = fs::remove_file(&partial);
+        artifact_snapshot(&live, output, temp_name.as_ref()).map_err(|e| {
             Error::rejected(format!(
                 "cannot snapshot record file for installation {install_id:?}: {e}"
             ))
@@ -502,7 +509,8 @@ fn snapshot_app_records(
                     "record file schema for installation {install_id:?} is unsupported; restore the installation backup or remove the file after inspection"
                 )));
             }
-            fs::rename(&partial, &dest)?;
+            output.clean_sidecars(temp_name.as_ref())?;
+            output.publish(temp_name.as_ref(), db_name.as_ref())?;
             let (sha256, bytes) = hash_file(&dest)?;
             Ok(AppRecordFile {
                 install_id: install_id.clone(),
@@ -514,22 +522,12 @@ fn snapshot_app_records(
                 core_sha256: core_sha256.to_string(),
             })
         })();
-        match staged {
-            Ok(entry) => out.push(entry),
-            Err(error) => {
-                let _ = fs::remove_file(&partial);
-                let _ = fs::remove_file(&dest);
-                return Err(error);
-            }
-        }
+        out.push(staged?);
     }
     // A file created after the inventory is a partial set: refuse rather
     // than report complete without it.
     let current = inventory_app_records(state_dir)?;
     if current != inventoried {
-        for entry in &out {
-            let _ = fs::remove_file(dir.join(&entry.db_file));
-        }
         return Err(Error::rejected(
             "record files changed during backup; retry the backup".to_string(),
         ));
@@ -537,21 +535,28 @@ fn snapshot_app_records(
     Ok(out)
 }
 
-/// Staged app-record copies (plus their partials) for `stem` in `dir`,
-/// for failure cleanup. Matches only files `snapshot_app_records` writes.
-fn manifest_app_candidates(dir: &Path, stem: &str) -> Vec<PathBuf> {
-    let prefix = format!("{stem}.app-");
-    fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            (name.starts_with(&prefix) && name.ends_with(".sqlite3"))
-                || (name.starts_with(&format!(".{prefix}")) && name.ends_with(".partial"))
-        })
-        .map(|e| e.path())
-        .collect()
+// Retain the existing focused guard's real entry point, without changing
+// its fixture/assertions or restoring any retired test inventory.
+#[cfg(test)]
+fn snapshot_app_records(
+    state_dir: &Path,
+    dir: &Path,
+    stem: &str,
+    inventoried: &[String],
+    catalog: &[String],
+    core_sha256: &str,
+) -> Result<Vec<AppRecordFile>> {
+    let mut output = ArtifactDir::open(dir, false)?;
+    let entries = snapshot_app_records_into(
+        state_dir,
+        &mut output,
+        stem,
+        inventoried,
+        catalog,
+        core_sha256,
+    )?;
+    output.commit()?;
+    Ok(entries)
 }
 
 // ---------- backup ----------
@@ -573,7 +578,31 @@ fn manifest_app_candidates(dir: &Path, stem: &str) -> Vec<PathBuf> {
 /// the installation ID, never a record body — and everything staged is
 /// removed, so a partial backup never appears complete. A state with no
 /// `app-records/` backs up core-only.
+// Resolve even a not-yet-created output through its existing ancestor so a
+// symlink alias cannot place artifact writes inside the protected vault. The
+// inventory remains explicit core/app only; this adds no custody/key reader.
+fn refuse_custody_output(
+    state_dir: &Path,
+    output: &Path,
+) -> Result<Option<crate::platform::encrypted_config::Config>> {
+    // Shared path-only admission before output creation, inspection/pruning
+    // or cleanup. Never construct custody or open its key/vault database.
+    let configured = crate::platform::encrypted_config::load(state_dir, None)?;
+    if let Some(config) = &configured {
+        config.refuse_output(output)?;
+    }
+    let protected = crate::platform::encrypted_config::resolve_output(&state_dir.join("vault"))?;
+    let resolved = crate::platform::encrypted_config::resolve_output(output)?;
+    if resolved.starts_with(&protected) || protected.starts_with(resolved) {
+        return Err(Error::rejected(
+            "artifact output overlaps encrypted custody",
+        ));
+    }
+    Ok(configured)
+}
+
 pub fn backup(state_dir: &Path, dir: &Path, keep: usize, reason: &str) -> Result<Value> {
+    let _custody_paths = refuse_custody_output(state_dir, dir)?;
     validate_reason(reason)?;
     if keep == 0 {
         return Err(Error::rejected("--keep must be at least 1"));
@@ -585,7 +614,8 @@ pub fn backup(state_dir: &Path, dir: &Path, keep: usize, reason: &str) -> Result
             live.display()
         )));
     }
-    ensure_private_dir(dir)?;
+    let mut output = ArtifactDir::open(dir, false)?;
+    let dir = output.view();
     let now = epoch_now();
     let stem = format!(
         "cadence-{reason}-{}-{}",
@@ -593,24 +623,33 @@ pub fn backup(state_dir: &Path, dir: &Path, keep: usize, reason: &str) -> Result
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
     let db_name = format!("{stem}.sqlite3");
-    let partial = dir.join(format!(".{db_name}.partial"));
-    let db = dir.join(&db_name);
-    let manifest_path = dir.join(format!("{stem}.manifest.json"));
+    let temp_name = format!(".{db_name}.partial");
+    let partial = output.file_path(temp_name.as_ref())?;
+    let db = output.file_path(db_name.as_ref())?;
+    let manifest_name = format!("{stem}.manifest.json");
+    let manifest_path = output.file_path(manifest_name.as_ref())?;
     // The live inventory: files created after this point refuse the
     // backup below instead of silently missing from it.
     let inventoried = inventory_app_records(state_dir)?;
     let taken = (|| -> Result<Manifest> {
-        snapshot(&live, &partial)?;
+        artifact_snapshot(&live, &mut output, temp_name.as_ref())?;
         let (integrity, schema) = inspect(&partial)?;
         require_ok(&partial, &integrity)?;
         let repos = discover_repos(&partial)?;
-        fs::rename(&partial, &db)?;
+        output.clean_sidecars(temp_name.as_ref())?;
+        output.publish(temp_name.as_ref(), db_name.as_ref())?;
         let (sha256, bytes) = hash_file(&db)?;
         // The catalog comes from the snapshot copy, so it describes the
         // exact core generation the record files are bound to.
         let catalog = core_installations(&db)?;
-        let app_records =
-            snapshot_app_records(state_dir, dir, &stem, &inventoried, &catalog, &sha256)?;
+        let app_records = snapshot_app_records_into(
+            state_dir,
+            &mut output,
+            &stem,
+            &inventoried,
+            &catalog,
+            &sha256,
+        )?;
         let manifest = Manifest {
             format: FORMAT.into(),
             kind: Kind::Backup,
@@ -628,25 +667,18 @@ pub fn backup(state_dir: &Path, dir: &Path, keep: usize, reason: &str) -> Result
             app_records,
             app_installations: catalog,
         };
-        write_private(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
-        sync_dir(dir);
+        artifact_write(
+            &mut output,
+            manifest_name.as_ref(),
+            &serde_json::to_vec_pretty(&manifest)?,
+        )?;
         verify(&manifest_path)?;
         Ok(manifest)
     })();
-    let manifest = match taken {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            let mut staged: Vec<PathBuf> = vec![partial, db, manifest_path];
-            for entry in manifest_app_candidates(dir, &stem) {
-                staged.push(entry);
-            }
-            for path in &staged {
-                let _ = fs::remove_file(path);
-            }
-            return Err(error);
-        }
-    };
-    let pruned = prune(dir, reason, keep, &manifest_path).map_err(|e| {
+    let manifest = taken?;
+    // A verified completed set remains if retention subsequently refuses.
+    output.commit()?;
+    let pruned = prune(&dir, reason, keep, &manifest_path).map_err(|e| {
         Error::rejected(format!(
             "backup {} was written and verified, but pruning old {reason:?} backups in {} \
              failed: {e}",
@@ -670,8 +702,8 @@ pub fn backup(state_dir: &Path, dir: &Path, keep: usize, reason: &str) -> Result
     }
     Ok(json!({
         "backup": true,
-        "manifest": promised[1],
-        "db": promised[0],
+        "manifest": output.public_path(manifest_name.as_ref()),
+        "db": output.public_path(db_name.as_ref()),
         "sha256": manifest.sha256,
         "bytes": manifest.bytes,
         "schema_version": manifest.schema_version,
@@ -1110,6 +1142,7 @@ fn newer_schema_refusal(schema: i64) -> Result<()> {
 /// new directory `out`. Fails closed: a blocking secret-scan finding, or
 /// any other error, removes `out` again.
 pub fn export(state_dir: &Path, out: &Path) -> Result<Value> {
+    let _custody_paths = refuse_custody_output(state_dir, out)?;
     let live = db_file(state_dir);
     if !live.is_file() {
         return Err(Error::rejected(format!(
@@ -1117,28 +1150,18 @@ pub fn export(state_dir: &Path, out: &Path) -> Result<Value> {
             live.display()
         )));
     }
-    if out.symlink_metadata().is_ok() {
-        return Err(Error::rejected(format!(
-            "{} already exists; export writes a new directory",
-            out.display()
-        )));
-    }
-    // A malformed allowlist refuses here, before anything is written.
+    // A malformed allowlist refuses before any namespace allocation.
     let allow = Allowlist::load(state_dir)?;
-    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    fs::DirBuilder::new().mode(0o700).create(out)?;
-    let result = export_into(&live, out, &allow);
-    if result.is_err() {
-        let _ = fs::remove_dir_all(out);
-    }
-    result
+    let mut output = ArtifactDir::open(out, true)?;
+    export_into(&live, &mut output, &allow)
 }
 
-fn export_into(live: &Path, out: &Path, allow: &Allowlist) -> Result<Value> {
-    let partial = out.join(format!(".{BUNDLE_DB}.partial"));
-    snapshot(live, &partial)?;
+fn export_into(live: &Path, output: &mut ArtifactDir, allow: &Allowlist) -> Result<Value> {
+    let out = output.view();
+    let temp_name = format!(".{BUNDLE_DB}.partial");
+    let partial = output.file_path(temp_name.as_ref())?;
+    artifact_snapshot(live, output, temp_name.as_ref())?;
+    output.sqlite_sidecars(temp_name.as_ref())?;
     let scrub = scrub(&partial, false)?;
     let scrubbed = scrub.columns.clone();
     let scan = scan_db(&partial, allow)?;
@@ -1146,7 +1169,8 @@ fn export_into(live: &Path, out: &Path, allow: &Allowlist) -> Result<Value> {
     require_ok(&partial, &integrity)?;
     let repos = discover_repos(&partial)?;
     let db = out.join(BUNDLE_DB);
-    fs::rename(&partial, &db)?;
+    output.clean_sidecars(temp_name.as_ref())?;
+    output.publish(temp_name.as_ref(), BUNDLE_DB.as_ref())?;
     let (sha256, bytes) = hash_file(&db)?;
     let now = epoch_now();
     let manifest = Manifest {
@@ -1177,13 +1201,13 @@ fn export_into(live: &Path, out: &Path, allow: &Allowlist) -> Result<Value> {
     let text = serde_json::to_string_pretty(&manifest)?;
     secret::guard_with("export manifest", &text, allow)?;
     let manifest_path = out.join(BUNDLE_MANIFEST);
-    write_private(&manifest_path, text.as_bytes())?;
-    sync_dir(out);
+    artifact_write(output, BUNDLE_MANIFEST.as_ref(), text.as_bytes())?;
     verify(&manifest_path)?;
+    output.commit()?;
     Ok(json!({
         "export": true,
-        "bundle": out,
-        "manifest": manifest_path,
+        "bundle": output.public_path(std::ffi::OsStr::new("")),
+        "manifest": output.public_path(BUNDLE_MANIFEST.as_ref()),
         "sha256": manifest.sha256,
         "bytes": manifest.bytes,
         "schema_version": manifest.schema_version,
@@ -2489,16 +2513,17 @@ pub fn remote_key(url: &str) -> String {
 
 /// Copy `src` into the new file `dst` with the online backup API, from a
 /// read-only connection, then make `dst` a single rollback-journal file.
-fn snapshot(src: &Path, dst: &Path) -> Result<()> {
+fn artifact_snapshot(src: &Path, output: &mut ArtifactDir, name: &std::ffi::OsStr) -> Result<()> {
+    // Every derived name is reserved before SQLite can touch it. All data
+    // writes address the held directory; no prospective-name cleanup.
+    drop(output.create(name)?);
+    output.sqlite_sidecars(name)?;
+    let dst = output.file_path(name)?;
+    snapshot_reserved(src, &dst)
+}
+fn snapshot_reserved(src: &Path, dst: &Path) -> Result<()> {
     let from = crate::store::open_read_only(src)
         .map_err(|e| Error::rejected(format!("cannot open {} read-only: {e}", src.display())))?;
-    drop(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(dst)?,
-    );
     let mut to = Connection::open(dst)?;
     {
         // -1: every page in one step, so the copy is one read snapshot
@@ -2585,22 +2610,31 @@ fn hash_file(path: &Path) -> Result<(String, u64)> {
     Ok((format!("{:x}", hasher.finalize()), total))
 }
 
-/// Write `bytes` to `path` atomically, owner-only.
+/// Owner-only data and final name, both exclusive in the admitted namespace.
+fn artifact_write(output: &mut ArtifactDir, name: &std::ffi::OsStr, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut temp = name.to_os_string();
+    temp.push(".partial");
+    let mut file = output.create(&temp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    output.publish(&temp, name)
+}
+#[cfg(test)]
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = sidecar(path, ".partial");
-    let _ = fs::remove_file(&tmp);
-    {
-        use std::io::Write;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    Ok(())
+    let mut output = ArtifactDir::open(
+        path.parent()
+            .ok_or_else(|| Error::rejected("artifact parent unavailable"))?,
+        false,
+    )?;
+    artifact_write(
+        &mut output,
+        path.file_name()
+            .ok_or_else(|| Error::rejected("artifact name unavailable"))?,
+        bytes,
+    )?;
+    output.commit()
 }
 
 fn copy_private(src: &Path, dst: &Path) -> Result<()> {

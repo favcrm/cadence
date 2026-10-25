@@ -120,11 +120,13 @@ impl Shared {
             return Err(Error::rejected("this reviewed tool requires an exact accepted app artifact and explicit app release"));
         }
         if let Some(agent) = agent.as_deref() {
-            // The §5.3 grant check gates even staging — a caller holding no
-            // grant on the account learns that before a row exists.
             self.check_grant(agent, &platform, &account, &adapter, tool)?;
-            // The §5.4 cancel scan runs on every touchpoint: a source edit
-            // since the row staged cancels it before this call proceeds.
+        }
+        {
+            let _admission = self.custody_operation()?;
+            self.refuse_encrypted_target(&platform, &account)?;
+        }
+        if let Some(agent) = agent.as_deref() {
             self.scan_effect_sources(Some(agent));
         }
 
@@ -559,9 +561,7 @@ impl Shared {
             Some(r) => EffectKey::Request(identifier(r, "Request handle")?),
             None => EffectKey::Id(identifier(required_str(params, "effect_id")?, "Effect id")?),
         };
-        let reason = optional_str(params, "reason")
-            .unwrap_or("cancelled")
-            .to_string();
+        let reason = optional_str(params, "reason").map(str::to_owned);
         // Which row the caller may reach: the operator any closeable
         // row; an agent only its own `waiting` ones — a `reconcile` row
         // is exactly the ambiguity only the operator resolves.
@@ -600,27 +600,24 @@ impl Shared {
                 .unwrap_or_else(|| row.clone());
             return Ok(json!({"state": "acknowledged", "record": row.to_record()}));
         }
-        // Caller-authored free text lands durably — screen it against
-        // the row's enrolled credential and bound it like every other
-        // stored string (N2). A custody miss just skips the screen.
-        let mut reason = reason;
-        if let Ok(bytes) = platform::load_credential(
-            &self.store,
-            &self.platform_custody,
-            &row.platform,
-            &row.account,
-        ) {
-            platform::refuse_leak("close reason", &reason, &bytes)?;
-        }
-        if reason.len() > REASON_CAP {
-            cap_str(&mut reason, REASON_CAP);
-        }
+        // Classification, screen and durable write share C; release before notifications.
+        let custody_guard = self.custody_operation()?;
+        let reason = self
+            .screen_reason_or_refuse(&row.platform, &row.account, reason, "close reason")?
+            .unwrap_or_else(|| {
+                if row.state == "reconcile" {
+                    "operator_reconciled_outcome_unknown".to_string()
+                } else {
+                    "cancelled".to_string()
+                }
+            });
         let Some(row) = self.store.effect_close(key, &reason)? else {
             return Err(Error::rejected(format!(
                 "effect {} is no longer closeable (already decided or terminal)",
                 row.effect_id
             )));
         };
+        drop(custody_guard);
         self.emit_request_closed(&row.agent, &row.request, &reason);
         self.wake();
         Ok(json!({"state": "closed", "record": row.to_record()}))
@@ -673,26 +670,12 @@ impl Shared {
                  press accept is operator-only in v1 (ADR 0006 §5.4 step 4, C6)"
             )));
         }
-        // The presser's free-text reason lands on the durable row —
-        // screen it against the row's enrolled credential and bound it
-        // like every other stored string (N2). A custody miss just
-        // skips the screen.
-        let reason = reason
-            .map(|mut r| {
-                if let Ok(bytes) = platform::load_credential(
-                    &self.store,
-                    &self.platform_custody,
-                    &row.platform,
-                    &row.account,
-                ) {
-                    platform::refuse_leak("decision reason", &r, &bytes)?;
-                }
-                if r.len() > REASON_CAP {
-                    cap_str(&mut r, REASON_CAP);
-                }
-                Ok::<String, Error>(r)
-            })
-            .transpose()?;
+        let custody_guard = self.custody_operation()?;
+        if accept {
+            self.refuse_encrypted_target(&row.platform, &row.account)?;
+        }
+        let reason =
+            self.screen_reason_or_refuse(&row.platform, &row.account, reason, "decision reason")?;
         // `by` is {member, role, rule}: who pressed, the role they
         // hold, the rule that authorised the press — {member, role}
         // comes from the proven caller and the agent row, never a
@@ -730,6 +713,7 @@ impl Shared {
                  decided, declined or closed",
             ));
         };
+        drop(custody_guard);
         if !accept {
             self.deliver_effect_outcome(&row, "declined");
             self.emit_request_closed(&row.agent, &row.request, "declined");
@@ -752,6 +736,52 @@ impl Shared {
         }
     }
 
+    pub(super) fn refuse_encrypted_target(&self, provider: &str, account: &str) -> Result<()> {
+        if self
+            .store
+            .platform_credential(provider, account)?
+            .is_some_and(|r| {
+                r.custody
+                    .starts_with(platform::encrypted_sqlite::TAG_PREFIX)
+            })
+        {
+            return Err(Error::invalid(
+                "unsupported_custody_use",
+                "encrypted credentials are unsupported on this path",
+            ));
+        }
+        Ok(())
+    }
+
+    // Adapted from cad1128-confidentiality-swe's independently drafted R3 helper.
+    // Caller holds C through its subsequent guarded state write.
+    fn screen_reason_or_refuse(
+        &self,
+        provider: &str,
+        account: &str,
+        reason: Option<String>,
+        what: &'static str,
+    ) -> Result<Option<String>> {
+        let Some(mut reason) = reason else {
+            return Ok(None);
+        };
+        self.refuse_encrypted_target(provider, account)
+            .map_err(|_| {
+                Error::invalid(
+                    "reason_unscreenable",
+                    "omit reason for a fixed-cause outcome",
+                )
+            })?;
+        let bytes =
+            platform::load_credential(&self.store, &self.platform_custody, provider, account)
+                .map_err(|_| {
+                    Error::invalid("reason_unscreenable", "credential unavailable; omit reason")
+                })?;
+        platform::refuse_leak(what, &reason, &bytes)?;
+        cap_str(&mut reason, REASON_CAP);
+        Ok(Some(reason))
+    }
+
     /// Execute the accepted send — §5.4 steps 3–6. The durable
     /// `decided` row exists already; this runs: source re-verify →
     /// grant re-check → custody load → `executing` → the platform call
@@ -762,6 +792,7 @@ impl Shared {
     /// stays that error and does not borrow another workspace. A
     /// platform error lands `failed`, never `closed`.
     fn execute_effect(&self, row: &EffectRow) -> Result<EffectRow> {
+        self.refuse_encrypted_target(&row.platform, &row.account)?;
         if self.store.app_effect_is_child(&row.effect_id)? {
             return Err(Error::rejected(
                 "app artifact effects require an exact app execution claim",
@@ -830,7 +861,7 @@ impl Shared {
             }
             Err(err) => return Err(err),
         };
-        self.store.effect_executing(&row.effect_id)?;
+        let row = self.store.effect_executing(&row.effect_id, row)?;
         let outcome = adapter.execute(
             &bytes,
             &row.tool,
@@ -879,7 +910,7 @@ impl Shared {
     /// lands `failed` with `verified:"unknown"`: the run could not even
     /// be attempted, which is a Needs-you-grade ambiguity.
     fn fail_effect(&self, row: &EffectRow, error: &str) -> Result<EffectRow> {
-        self.store.effect_executing(&row.effect_id)?;
+        let row = self.store.effect_executing(&row.effect_id, row)?;
         let outcome = json!({"error": error, "verified": "unknown"});
         let row = self
             .store
@@ -1091,3 +1122,20 @@ pub(crate) type PlatformMap = HashMap<String, Arc<dyn PlatformAdapter>>;
 /// The test-only crash seam between the durable `decided` write and
 /// execution (`ServeOptions::effect_execute_gate`).
 pub(crate) type EffectExecuteGate = Arc<dyn Fn(&EffectRow) -> bool + Send + Sync>;
+
+#[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "effect_rpc/platform_call_floor_tests.rs"]
+mod platform_call_floor_tests;
+
+#[cfg(all(test, unix, feature = "test-seam"))]
+#[path = "effect_rpc/claims_revoke.rs"]
+mod claims_revoke;
+
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod boundary_floor_tests;
+
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod cad1128_execute_claim_tests;
+
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod cad1128_reason_claim_tests;

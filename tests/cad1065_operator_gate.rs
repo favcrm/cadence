@@ -335,10 +335,10 @@ impl Fixture {
         };
         issue::Pm::init(&fixture.pm()).unwrap();
         assert!(
-            matches!(
-                platform::custody::Custody::open(&fixture.state()).unwrap(),
-                platform::custody::Custody::File(_)
-            ),
+            platform::custody::Custody::open(&fixture.state())
+                .unwrap()
+                .tag()
+                == platform::custody::FILE_TAG,
             "run this owned gate in its isolated File-custody environment"
         );
         let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
@@ -1407,10 +1407,9 @@ fn cad1065_libsecret_cleanup_pending_child() {
     let state = root.path().join("state");
     let pm = root.path().join("pm");
     issue::Pm::init(&pm).unwrap();
-    assert!(matches!(
-        platform::custody::Custody::open(&state).unwrap(),
-        platform::custody::Custody::Libsecret(_)
-    ));
+    assert!(
+        platform::custody::Custody::open(&state).unwrap().tag() == platform::custody::LIBSECRET_TAG
+    );
 
     let provider_env = cadence_agent::adapter::ProviderEnv::refusing_providers();
     provider_env.set("CADENCE_PM_DIR", pm.to_str().unwrap());

@@ -342,10 +342,7 @@ impl Shared {
             capabilities,
             requests,
         ) = workspace::with_runtime_snapshot(&pm, id, |row, files| {
-            let _custody = self
-                .platform_custody_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _custody = self.custody_operation()?;
             let _release = self
                 .app_release_lock
                 .lock()
@@ -552,10 +549,7 @@ impl Shared {
             ));
         }
         workspace::with_runtime_snapshot(&pm, id, |row, files| {
-            let _custody = self
-                .platform_custody_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _custody = self.custody_operation()?;
             let _release = self
                 .app_release_lock
                 .lock()
@@ -570,6 +564,8 @@ impl Shared {
             if let (Some(slot), Some(proof)) =
                 (workflow.publication_slot.as_deref(), binding.as_ref())
             {
+                // Custody may have changed while prices were fetched without locks.
+                self.refuse_encrypted_binding(&proof.config)?;
                 self.app_binding_receipt_current(id, context_id, slot, proof, row, files)?;
             }
             for (slot, proof) in &capabilities {
@@ -963,10 +959,7 @@ impl Shared {
         let install = required_str(run, "install_id")?;
         let pm = self.pm_at(&self.pm_dir()?)?;
         workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
-            let _custody = self
-                .platform_custody_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _custody = self.custody_operation()?;
             let _release = self
                 .app_release_lock
                 .lock()
@@ -1023,10 +1016,7 @@ impl Shared {
         self.probe_app_run_prices(&run)?;
         let pm = self.pm_at(&self.pm_dir()?)?;
         workspace::with_runtime_snapshot(&pm, run["install_id"].as_str().unwrap(), |row, files| {
-            let _custody = self
-                .platform_custody_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _custody = self.custody_operation()?;
             let _release = self
                 .app_release_lock
                 .lock()
@@ -1048,6 +1038,7 @@ impl Shared {
             let binding: crate::store::app_bindings::BindingProof =
                 serde_json::from_value(binding.clone())
                     .map_err(|_| Error::rejected("run binding receipt is invalid"))?;
+            self.refuse_encrypted_binding(&binding.config)?;
             self.app_binding_receipt_current(
                 required_str(run, "install_id")?,
                 run["context_id"].as_str(),
@@ -1063,6 +1054,7 @@ impl Shared {
                     serde_json::from_value(value.clone()).map_err(|_| {
                         Error::rejected("run capability binding receipt is invalid")
                     })?;
+                self.refuse_encrypted_binding(&proof.config)?;
                 self.app_binding_receipt_current(
                     required_str(run, "install_id")?,
                     run["context_id"].as_str(),
@@ -1129,10 +1121,7 @@ impl Shared {
                 &pm,
                 required_str(&run, "install_id")?,
                 |bundle, files| {
-                    let _custody = self
-                        .platform_custody_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let _custody = self.custody_operation()?;
                     let _release = self
                         .app_release_lock
                         .lock()
@@ -1369,10 +1358,7 @@ impl Shared {
                 );
                 let mut prepared = None;
                 snap(&mut |bundle, files, producer| {
-                    let _custody = self
-                        .platform_custody_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let _custody = self.custody_operation()?;
                     let _release = self
                         .app_release_lock
                         .lock()
@@ -1570,10 +1556,7 @@ impl Shared {
                     }
                 };
                 let recorded = snap(&mut |bundle, files, producer| {
-                    let _custody = self
-                        .platform_custody_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let _custody = self.custody_operation()?;
                     let _release = self
                         .app_release_lock
                         .lock()
@@ -1664,10 +1647,7 @@ impl Shared {
             }
             if finish {
                 snap(&mut |bundle, files, producer| {
-                    let _custody = self
-                        .platform_custody_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let _custody = self.custody_operation()?;
                     let _release = self
                         .app_release_lock
                         .lock()
@@ -1714,10 +1694,7 @@ impl Shared {
             self.fresh_run_human(&run["approval"]["human"])?;
         }
         workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
-            let _custody = self
-                .platform_custody_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _custody = self.custody_operation()?;
             let _release = self
                 .app_release_lock
                 .lock()
@@ -1775,10 +1752,7 @@ impl Shared {
         self.probe_app_run_prices(&self.store.app_run_show(&run_id)?)?;
         let pm = self.pm_at(&self.pm_dir()?)?;
         workspace::with_runtime_snapshot(&pm, &install, |row, files| {
-            let _custody = self
-                .platform_custody_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _custody = self.custody_operation()?;
             let _release = self
                 .app_release_lock
                 .lock()
@@ -1836,10 +1810,7 @@ impl Shared {
                 self.probe_app_run_prices(&checked)?;
                 let pm = self.pm_at(&self.pm_dir()?)?;
                 workspace::with_runtime_snapshot(&pm, &install, |row, files| {
-                    let _custody = self
-                        .platform_custody_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let _custody = self.custody_operation()?;
                     let _release = self
                         .app_release_lock
                         .lock()
@@ -1884,10 +1855,7 @@ impl Shared {
         self.probe_app_run_prices(&self.store.app_run_show(&run_id)?)?;
         let pm = self.pm_at(&self.pm_dir()?)?;
         workspace::with_runtime_snapshot(&pm, &install, |row, files| {
-            let _custody = self
-                .platform_custody_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _custody = self.custody_operation()?;
             let _release = self
                 .app_release_lock
                 .lock()

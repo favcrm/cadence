@@ -390,6 +390,9 @@ impl Shared {
         else {
             return Ok(None);
         };
+        // Runtime use is unsupported even when a historical metadata binding
+        // exists. Refuse before readiness re-derivation or compatible migration.
+        self.refuse_encrypted_binding(&proof.config)?;
         let connection = proof.config["connection_id"]
             .as_str()
             .ok_or_else(|| Error::rejected("binding connection receipt is missing"))?;

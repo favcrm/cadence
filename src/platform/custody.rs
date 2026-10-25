@@ -1,30 +1,27 @@
-//! ADR 0006 §5.3: where credential bytes live. The agent-visible
-//! artifacts are handles and fingerprints, never bytes — custody is
-//! the only component that ever holds them.
+//! Connection credential persistence and private encrypted admission.
+//! Trusted provider operations hold plaintext transiently; encrypted
+//! storage does not establish agent isolation.
 //!
 //! Backends: the OS keychain where the host has one the daemon can use
 //! without leaking the bytes (libsecret's `secret-tool` reads the
 //! secret on stdin — macOS `security` cannot take one off argv, so it
 //! is not a backend), else the daemon-owned `0600` file store.
 //!
-//! Honest scope of isolation: custody keeps the bytes out of other
-//! uids and out of the confined master's read set — and nothing more.
-//! The P4 residual stands: a same-uid process that ignores the API
-//! reads a custody file or the login keyring, and today only the
-//! master runs under Landlock — every managed pty agent is same-uid
-//! and unconfined. Until a backend/mode protects custody from them,
-//! `platform enroll` refuses (`custody_unprotected`) unless the
-//! operator passes `accept_same_uid_risk`; that acceptance lands on
-//! the `platform_connected` audit event.
+//! Legacy file/keychain custody does not protect against same-UID access.
+//! Encryption likewise cannot protect an owner-readable key or process
+//! memory from that actor. Enrollment therefore retains explicit
+//! `accept_same_uid_risk` while custody isolation is unestablished.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
+use crate::platform::encrypted_sqlite::EncryptedVault;
 
 /// The file store: `<state dir>/custody/<sha256(platform\naccount)>.
 /// cred`. Hashed names keep an account handle out of the listing and
@@ -33,13 +30,15 @@ pub const FILE_TAG: &str = "file";
 /// libsecret (GNOME keyring / KeePassXC / …) via `secret-tool`.
 pub const LIBSECRET_TAG: &str = "keychain:libsecret";
 
-/// The custody backend this daemon uses — picked once at
-/// [`Custody::open`]; every record names the tag it was written under
-/// so a load always reaches the backend that holds it.
-pub enum Custody {
-    /// The `0600` file store at `Custody::File(dir)`.
+/// Credential custody with a host-selected legacy backend and an optional
+/// private encrypted manager. Durable record tags select the read path.
+pub struct Custody {
+    legacy: LegacyBackend,
+    vault: Option<Arc<EncryptedVault>>,
+}
+
+enum LegacyBackend {
     File(PathBuf),
-    /// `secret-tool` at the resolved path.
     Libsecret(PathBuf),
 }
 
@@ -53,30 +52,62 @@ impl Custody {
     /// Pick the backend this host supports: the keychain when one is
     /// usable, else the file store (§5.3's default).
     pub fn open(state_dir: &Path) -> Result<Custody> {
-        if let Some(tool) = libsecret_tool() {
-            return Ok(Custody::Libsecret(tool));
-        }
-        Ok(Custody::File(custody_dir(state_dir)))
+        let legacy = if let Some(tool) = libsecret_tool() {
+            LegacyBackend::Libsecret(tool)
+        } else {
+            LegacyBackend::File(custody_dir(state_dir))
+        };
+        Ok(Self {
+            legacy,
+            vault: None,
+        })
     }
 
-    /// The tag written into the record's `custody` column.
+    #[cfg(test)]
+    pub(crate) fn file(dir: PathBuf) -> Self {
+        Self {
+            legacy: LegacyBackend::File(dir),
+            vault: None,
+        }
+    }
+
+    pub(crate) fn with_encrypted(mut self, vault: Arc<EncryptedVault>) -> Self {
+        self.vault = Some(vault);
+        self
+    }
+
+    /// The tag for legacy writes. Encrypted writes use the immutable
+    /// per-row locator returned by the private enrollment path instead.
     pub fn tag(&self) -> &'static str {
-        match self {
-            Custody::File(_) => FILE_TAG,
-            Custody::Libsecret(_) => LIBSECRET_TAG,
+        match &self.legacy {
+            LegacyBackend::File(_) => FILE_TAG,
+            LegacyBackend::Libsecret(_) => LIBSECRET_TAG,
         }
     }
 
-    /// Store `bytes` under `key`. Atomic for the file backend (temp +
-    /// rename), so a rotate's overwrite never truncates the old
-    /// credential for a concurrent reader.
+    pub(crate) fn encrypted(&self) -> Option<&Arc<EncryptedVault>> {
+        self.vault.as_ref()
+    }
+    /// Store legacy bytes atomically. Configured encrypted custody admits
+    /// new writes only through its private enrollment path.
     pub fn put(&self, key: &Key, bytes: &[u8]) -> Result<&'static str> {
-        match self {
-            Custody::File(dir) => {
+        if self.vault.is_some() {
+            return Err(Error::invalid(
+                "unsupported_custody_use",
+                "encrypted custody records are written by the enrollment path only",
+            ));
+        }
+        self.put_legacy(key, bytes)
+    }
+
+    /// Existing-legacy mutation only; new configured enrollments never call this.
+    pub(crate) fn put_legacy(&self, key: &Key, bytes: &[u8]) -> Result<&'static str> {
+        match &self.legacy {
+            LegacyBackend::File(dir) => {
                 file_put(dir, key, bytes)?;
                 Ok(FILE_TAG)
             }
-            Custody::Libsecret(tool) => {
+            LegacyBackend::Libsecret(tool) => {
                 libsecret_store(tool, key, bytes)?;
                 Ok(LIBSECRET_TAG)
             }
@@ -86,17 +117,28 @@ impl Custody {
     /// The bytes `tag` custody holds for `key`. `tag` comes from the
     /// record — a record enrolled on a keychain this host no longer
     /// has fails here, never silently reads the file store.
+    ///
+    /// An `encrypted-sqlite-v1:<locator>` tag names a vault row, not
+    /// a `(platform, account)` slot: this default path refuses it
+    /// unconditionally. Only audited daemon call sites with private scoped
+    /// admission may decrypt.
     pub fn load(&self, tag: &str, key: &Key) -> Result<Vec<u8>> {
-        match (tag, self) {
-            (FILE_TAG, Custody::File(dir)) => file_load(dir, key),
+        match (tag, &self.legacy) {
+            (FILE_TAG, LegacyBackend::File(dir)) => file_load(dir, key),
             (FILE_TAG, _) => Err(Error::internal(
                 "custody record names the file store but this daemon picked the keychain",
             )),
-            (LIBSECRET_TAG, Custody::Libsecret(tool)) => libsecret_lookup(tool, key),
+            (LIBSECRET_TAG, LegacyBackend::Libsecret(tool)) => libsecret_lookup(tool, key),
             (LIBSECRET_TAG, _) => Err(Error::rejected(format!(
                 "credential for '{}/{}' lives in a keychain this host no longer offers",
                 key.platform, key.account
             ))),
+            (tag, _) if tag.starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX) => {
+                Err(Error::invalid(
+                    "unsupported_custody_use",
+                    "credential is encrypted custody — this use is not authorized",
+                ))
+            }
             (other, _) => Err(Error::internal(format!("unknown custody tag '{other}'"))),
         }
     }
@@ -110,12 +152,18 @@ impl Custody {
         fenced: &std::sync::atomic::AtomicBool,
         pending: &mut Option<std::process::Child>,
     ) -> Result<Vec<u8>> {
-        match (tag, self) {
-            (FILE_TAG, Custody::File(dir)) => file_load_bounded(dir, key, cap, deadline),
+        match (tag, &self.legacy) {
+            (tag, _) if tag.starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX) => {
+                Err(Error::invalid(
+                    "unsupported_custody_use",
+                    "credential is encrypted custody — this use is not authorized",
+                ))
+            }
+            (FILE_TAG, LegacyBackend::File(dir)) => file_load_bounded(dir, key, cap, deadline),
             (FILE_TAG, _) => Err(Error::internal(
                 "custody record names the file store but this daemon picked the keychain",
             )),
-            (LIBSECRET_TAG, Custody::Libsecret(tool)) => {
+            (LIBSECRET_TAG, LegacyBackend::Libsecret(tool)) => {
                 libsecret_lookup_bounded(tool, key, cap, deadline, fenced, pending)
             }
             (LIBSECRET_TAG, _) => Err(Error::rejected(format!(
@@ -126,19 +174,47 @@ impl Custody {
         }
     }
 
+    /// The one authorized encrypted read: the caller presents the
+    /// scoped [`Witness`](crate::platform::CustodyWitness) minted by
+    /// the management/SMTP admission path, plus the expected core
+    /// identity bound into AAD. Both stored and expected identity must
+    /// match — a substituted locator never yields another record's
+    /// bytes.
+    pub(crate) fn load_encrypted(
+        &self,
+        witness: &crate::platform::CustodyWitness<'_>,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        self.vault
+            .as_ref()
+            .ok_or_else(|| {
+                Error::invalid(
+                    "unsupported_custody_use",
+                    "this daemon is not configured for encrypted custody",
+                )
+            })?
+            .read_exact(&witness.record().custody, witness.expected())
+    }
+
     /// Drop `key`'s bytes from the `tag` backend. Idempotent — a
     /// retry after a crash between the custody delete and the record
-    /// delete finds nothing and proceeds.
+    /// delete finds nothing and proceeds. Encrypted rows are immutable
+    /// in v1: a revoked record's ciphertext stays (contract §recovery —
+    /// no compensation deletion), so `remove` on an encrypted
+    /// reference is an acknowledged no-op.
     pub fn remove(&self, tag: &str, key: &Key) -> Result<()> {
-        match (tag, self) {
-            (FILE_TAG, Custody::File(dir)) => file_remove(dir, key),
+        match (tag, &self.legacy) {
+            (FILE_TAG, LegacyBackend::File(dir)) => file_remove(dir, key),
             (FILE_TAG, _) => Ok(()),
-            (LIBSECRET_TAG, Custody::Libsecret(tool)) => libsecret_clear(tool, key),
+            (LIBSECRET_TAG, LegacyBackend::Libsecret(tool)) => libsecret_clear(tool, key),
             (LIBSECRET_TAG, _) => Err(Error::rejected(format!(
                 "credential for '{}/{}' lives in a keychain this host no longer offers — \
                  the record stays until its bytes can be removed",
                 key.platform, key.account
             ))),
+            (tag, _) if tag.starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX) => {
+                let _ = key;
+                Ok(())
+            }
             (other, _) => Err(Error::internal(format!("unknown custody tag '{other}'"))),
         }
     }
