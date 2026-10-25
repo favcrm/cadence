@@ -325,7 +325,9 @@ function ServiceSection({
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-2">
         <h2 className="slabel">{group.label}</h2>
         <span className="text-micro text-ink-500">
-          {group.connections.length === 0 ? t("nothing connected") : `${group.connections.length} connected`}
+          {group.connections.length === 0
+            ? t("nothing connected")
+            : t("{count} connected").replace("{count}", String(group.connections.length))}
         </span>
         {group.builtin && (
           <span className="chip bg-ink-800 text-ink-300">{t("built-in")}</span>
@@ -351,7 +353,11 @@ function ServiceSection({
       </div>
       {group.connections.length === 0 ? (
         <p className="text-label text-ink-500 break-words">
-          {group.builtin ? t("No built-in accounts.") : support.shapes.length === 0 ? support.reason : `No ${group.label} account connected yet.`}
+          {group.builtin
+            ? t("No built-in accounts.")
+            : support.shapes.length === 0
+              ? support.reason
+              : t("No {label} account connected yet.").replace("{label}", () => String(group.label ?? ""))}
         </p>
       ) : (
         <ul className="space-y-1.5">
