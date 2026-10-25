@@ -20,6 +20,8 @@ equal(hostedOrigin("100.101.102.103"), false, "tailnet");
 equal(hostedOrigin("box.local"), false, "mdns name");
 equal(hostedOrigin("ip-172-31-1-32.tail9fcf30.ts.net"), false, "tailnet MagicDNS");
 equal(hostedOrigin("host.tailscale.net"), false, "tailscale DNS");
+equal(hostedOrigin("ip-172-31-1-32.tail9fcf30.ts.net."), false, "trailing root label");
+equal(hostedOrigin("board.example.test."), true, "trailing root label on a public host");
 // No readable location: hosted is the safer copy (retry + sign-in, no CLI).
 equal(hostedOrigin(undefined), true, "no location");
 equal(hostedOrigin(""), true, "empty host");

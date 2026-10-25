@@ -12,7 +12,8 @@ const LOCAL_HOST =
 
 export function hostedOrigin(hostname: string | null | undefined): boolean {
   if (typeof hostname !== "string") return true;
-  const host = hostname.trim();
+  // FQDNs may carry the root label (`box.ts.net.`); it does not change the host.
+  const host = hostname.trim().replace(/\.+$/, "");
   // No readable location (locked-down webview): a hosted answer is the safe
   // default — it offers a retry and a real sign-in rather than a CLI command.
   if (host.length === 0) return true;
