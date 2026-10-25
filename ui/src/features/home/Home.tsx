@@ -1171,7 +1171,7 @@ function MasterHome({
       </aside>
 
       <section className="min-w-0 rail:order-1 flex flex-col min-h-0 gap-4" aria-label={t("master thread")}>
-        <SinceCard onOpenIssue={onOpenIssue} />
+        <SinceCard onOpenIssue={onOpenIssue} hosted={hosted} />
 
         {/* CAD-600: the conversation panel — the master's header, the
             thread scrolling inside it, and the composer docked to its
