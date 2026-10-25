@@ -1,4 +1,5 @@
 import { ApiError } from "../../lib/api";
+import { errorMessage } from "../../lib/apiError";
 import { sessionHeaders } from "../../lib/sessionKey";
 import { privateFetch, withPrivateOperation } from "../../lib/privateSession";
 
@@ -269,7 +270,7 @@ async function request<T>(path: string, signal?: AbortSignal, body?: Record<stri
     }, op);
     const value = await response.json().catch(() => null);
     op.assertCurrent();
-    if (!response.ok) throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status);
+    if (!response.ok) throw new ApiError(errorMessage(value, `${response.status} ${response.statusText}`), response.status);
     if (value === null) throw new ApiError("The server returned an invalid publish receipt", 502);
     return value as T;
   }, signal);

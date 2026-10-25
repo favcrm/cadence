@@ -16,7 +16,7 @@ import {
   type SetupReport,
   type Tone,
 } from "./checks";
-import { recheckSetup, setupResource, SETUP_ON_HOST } from "./setupApi";
+import { recheckSetup, setupResource, SETUP_HOSTED, SETUP_ON_HOST } from "./setupApi";
 import { useTranslate } from "../../lib/locale";
 import "./setup.css";
 
@@ -369,6 +369,19 @@ function OnHost() {
   );
 }
 
+function Hosted() {
+  const t = useTranslate();
+  return (
+    <main className="setup-page">
+      <h1>{t("Setup")}</h1>
+      <div className="card setup-host" role="status">
+        <h2>{t("Setup is handled for you")}</h2>
+        <p>{t("This workspace is set up for you, so there is nothing to run here.")}</p>
+      </div>
+    </main>
+  );
+}
+
 /** Metadata and the existing HTTP host-only proof remain authoritative. */
 export default function Setup({
   settingsHref,
@@ -449,6 +462,7 @@ function SetupWorkspace({ settingsHref }: { settingsHref: string }) {
     }
   };
   if (state.error === SETUP_ON_HOST) return <OnHost />;
+  if (state.error === SETUP_HOSTED) return <Hosted />;
   const sectionStates = STEPS.map((section) => sectionReady(section.id));
   const attentionCount = sectionStates.filter(
     (status) => status === "attention",

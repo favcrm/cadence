@@ -396,6 +396,7 @@ Object.assign(zhTW, {
   "Retry access check": "重試存取權檢查",
   "Access could not be confirmed. Retry the access check before opening an installed app.": "無法確認存取權。請先重試存取權檢查，再開啟已安裝的應用程式。",
   "Checking access…": "正在檢查存取權…",
+  "Setup is handled for you": "設定已為你處理好", "This workspace is set up for you, so there is nothing to run here.": "這個工作區已為你設定好，這裡沒有需要執行的項目。",
   "App unavailable": "應用程式無法使用",
   "Sign in as the operator to resolve an installed app.": "請以操作員身分登入，以開啟已安裝的應用程式。",
   "All apps": "所有應用程式",

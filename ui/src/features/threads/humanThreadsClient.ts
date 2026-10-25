@@ -1,4 +1,5 @@
 import { ApiError } from "../../lib/api";
+import { errorMessage } from "../../lib/apiError";
 import { sessionHeaders } from "../../lib/sessionKey";
 import { privateFetch, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 
@@ -78,9 +79,8 @@ async function call<T>(method: "GET" | "POST" | "DELETE", path: string, body?: o
     const parsed = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
     op.assertCurrent();
     if (!resp.ok) {
-      const error = parsed?.error;
       throw new ApiError(
-        typeof error === "string" && error !== "" ? error : `${resp.status} ${resp.statusText}`.trim(),
+        errorMessage(parsed, `${resp.status} ${resp.statusText}`.trim()),
         resp.status,
         parsed ?? undefined,
       );

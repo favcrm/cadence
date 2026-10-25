@@ -1,3 +1,4 @@
+import { errorMessage } from "../../lib/apiError";
 import { cache } from "../../lib/resources";
 import { privateFetch, withPrivateOperation } from "../../lib/privateSession";
 import { sessionHeaders } from "../../lib/sessionKey";
@@ -5,6 +6,8 @@ import type { SetupReport } from "./checks";
 
 /** The error a refused `/api/setup` (read-only board, tailnet viewer) reads as. */
 export const SETUP_ON_HOST = "setup runs on the host";
+/** A hosted board answers `501 not_implemented`: setup is the platform's job there. */
+export const SETUP_HOSTED = "setup is handled for this workspace";
 
 async function fetchSetup(fresh: boolean): Promise<SetupReport> {
   return withPrivateOperation(async (op) => {
@@ -19,7 +22,9 @@ async function fetchSetup(fresh: boolean): Promise<SetupReport> {
     if (!resp.ok) {
       const body = await resp.json().catch(() => null);
       op.assertCurrent();
-      throw new Error(body?.error ?? `${resp.status} ${resp.statusText}`);
+      const code = body?.error?.code;
+      if (resp.status === 501 && code === "not_implemented") throw new Error(SETUP_HOSTED);
+      throw new Error(errorMessage(body, `${resp.status} ${resp.statusText}`));
     }
     const report = await resp.json() as SetupReport;
     op.assertCurrent();
@@ -39,7 +44,8 @@ export const setupResource = cache.resource<SetupReport>(
     freshMs: 60_000,
     // Once refused, no later availability error may reveal the prior host report.
     discardOnError: (error) =>
-      error instanceof Error && error.message === SETUP_ON_HOST,
+      error instanceof Error &&
+      (error.message === SETUP_ON_HOST || error.message === SETUP_HOSTED),
   },
 );
 
