@@ -264,6 +264,10 @@ pub struct Receipt {
     pub generation: Option<String>,
     pub appended_bytes: usize,
     pub body_bytes: usize,
+    /// Known local adapter-added prompt material reserved in the combined cap
+    /// (for example the Pi guard prefix). A reservation, never source bytes.
+    #[serde(default)]
+    pub adapter_reserved_bytes: usize,
     pub limit: usize,
     pub mode: String,
     #[serde(default)]
@@ -300,6 +304,18 @@ pub fn selection_role(team_role: Option<&str>) -> (&'static str, Option<String>)
     };
     let recorded = (lower.as_str() != role).then(|| raw.to_string());
     (role, recorded)
+}
+
+/// The known local prompt material an adapter adds after the daemon plans the
+/// payload. Pi prepends its fixed guard line; reserve it unconditionally for
+/// that provider because guard readiness can change between planning and the
+/// turn. This is a local byte bound, never a provider-window estimate.
+pub fn adapter_reserved_bytes(provider: &str) -> usize {
+    if provider == "pi" {
+        crate::adapter::pi::TASK_INPUT_PREFIX.len()
+    } else {
+        0
+    }
 }
 
 /// Build the manifest from an already-pinned project context. `None` means
@@ -472,15 +488,17 @@ pub fn plan(
     previous: Option<&Receipt>,
     resident: bool,
     body: &str,
+    reserved_bytes: usize,
     reader: SourceReader<'_>,
 ) -> std::result::Result<Plan, Refusal> {
     let body_bytes = body.len();
-    if body_bytes > MAX_COMBINED_BYTES {
-        // The turn's own body already exceeds the local cap; appending nothing
-        // cannot make it deliverable.
+    let with_reserved = body_bytes.saturating_add(reserved_bytes);
+    if with_reserved > MAX_COMBINED_BYTES {
+        // The turn's own body plus adapter-added material already exceeds the
+        // local cap; appending nothing cannot make it deliverable.
         return Err(Refusal::MandatoryOverflow {
             limit: MAX_COMBINED_BYTES,
-            needed: body_bytes,
+            needed: with_reserved,
         });
     }
     let required_resident = |previous: &Receipt| {
@@ -615,7 +633,7 @@ pub fn plan(
     // a throwaway copy of the accumulated payload for every optional source.
     // The actor joins body and context with two newlines; that join counts.
     let overhead = envelope(manifest, supersedes, mode, "", "0000000000000000").len();
-    let needed = body_bytes + 2 + overhead + required.len();
+    let needed = body_bytes + 2 + reserved_bytes + overhead + required.len();
     if needed > MAX_COMBINED_BYTES {
         return Err(Refusal::MandatoryOverflow {
             limit: MAX_COMBINED_BYTES,
@@ -635,7 +653,9 @@ pub fn plan(
             }
         };
         let block = source_block(document, supersedes, &text);
-        if body_bytes + 2 + overhead + context.len() + block.len() > MAX_COMBINED_BYTES {
+        if body_bytes + 2 + reserved_bytes + overhead + context.len() + block.len()
+            > MAX_COMBINED_BYTES
+        {
             withheld.push(json!({
                 "id": document.id, "path": document.path, "state": "overflow",
                 "reason": "optional source omitted to keep the combined payload under its cap",
@@ -649,7 +669,7 @@ pub fn plan(
 
     let nonce = nonce(&context);
     let text = envelope(manifest, supersedes, mode, &context, &nonce);
-    let needed = body_bytes + 2 + text.len();
+    let needed = body_bytes + 2 + reserved_bytes + text.len();
     if needed > MAX_COMBINED_BYTES {
         return Err(Refusal::MandatoryOverflow {
             limit: MAX_COMBINED_BYTES,
@@ -960,10 +980,10 @@ mod tests {
         };
         let mut read =
             |document: &Source| Ok::<_, (String, String)>(format!("body {}", document.id));
-        let retained = plan(&manifest, Some(&receipt), true, "", &mut read).unwrap();
+        let retained = plan(&manifest, Some(&receipt), true, "", 0, &mut read).unwrap();
         assert_eq!(retained.mode, Mode::Retained);
         assert!(retained.text.is_empty());
-        let restored = plan(&manifest, Some(&receipt), false, "", &mut read).unwrap();
+        let restored = plan(&manifest, Some(&receipt), false, "", 0, &mut read).unwrap();
         assert_eq!(restored.mode, Mode::Full);
         assert!(restored.text.contains("Acceptance (complete, verbatim)"));
     }
@@ -987,7 +1007,7 @@ mod tests {
         };
         let mut read =
             |document: &Source| Ok::<_, (String, String)>(format!("body {}", document.id));
-        let retained = plan(&manifest, Some(&receipt), true, "", &mut read).unwrap();
+        let retained = plan(&manifest, Some(&receipt), true, "", 0, &mut read).unwrap();
         assert_eq!(retained.mode, Mode::Retained);
         assert_eq!(retained.included.len(), 1);
         assert_eq!(retained.included[0]["id"], "policy");
@@ -1013,7 +1033,7 @@ mod tests {
         after.digest = "b".repeat(64);
         let mut read =
             |document: &Source| Ok::<_, (String, String)>(format!("body {}", document.id));
-        let delta = plan(&after, Some(&receipt), true, "", &mut read).unwrap();
+        let delta = plan(&after, Some(&receipt), true, "", 0, &mut read).unwrap();
         assert_eq!(delta.mode, Mode::Delta);
         assert!(delta.text.contains("Supersedes"));
         assert!(delta.text.contains("Acceptance (complete, verbatim)"));
@@ -1026,7 +1046,7 @@ mod tests {
         manifest.task.acceptance = vec!["x".repeat(MAX_COMBINED_BYTES)];
         let mut read =
             |document: &Source| Ok::<_, (String, String)>(format!("body {}", document.id));
-        let refusal = plan(&manifest, None, false, "", &mut read).unwrap_err();
+        let refusal = plan(&manifest, None, false, "", 0, &mut read).unwrap_err();
         match refusal {
             Refusal::MandatoryOverflow { limit, needed } => {
                 assert_eq!(limit, MAX_COMBINED_BYTES);

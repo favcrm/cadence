@@ -1013,7 +1013,12 @@ resident by an earlier receipt, plus the actual prior gap
 state/reason for anything still undelivered; if a required source is
 not confirmed resident the turn degrades to a delta and appends it.
 The body itself must fit the combined cap, and the actor's two-byte
-join is counted in every budget. Only an opted-in project's changed
+join is counted in every budget. Known local adapter-added prompt
+material is reserved conservatively in the same cap — currently the
+44-byte guarded Pi task prefix, reserved even while that guard is
+currently off. This is a local byte reservation, not provider-window
+accounting; the receipt records it as `adapter_reserved_bytes`, never as
+appended source. Only an opted-in project's changed
 kickoff body supersedes a reported duplicate. A
 missing
 required source, an unusable manifest, a combined payload over 48 000

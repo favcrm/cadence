@@ -889,6 +889,9 @@ pub(super) struct ContextDelivery {
     assigned_role: Option<String>,
     conversation: String,
     body_bytes: usize,
+    /// Known local prompt material the adapter adds after planning (Pi guard
+    /// prefix). Counted in the continuity budget too.
+    pub(super) reserved_bytes: usize,
     limit: usize,
 }
 
@@ -917,6 +920,7 @@ impl ContextDelivery {
             generation: agent.generation,
             appended_bytes: self.plan.bytes,
             body_bytes: self.body_bytes,
+            adapter_reserved_bytes: self.reserved_bytes,
             limit: self.limit,
             mode: self.plan.mode.as_str().to_string(),
             sources: self.plan.included.clone(),
@@ -2134,9 +2138,16 @@ impl Shared {
                 &document.digest,
             )
         };
-        let plan =
-            crate::context_pack::plan(&manifest, previous.as_ref(), resident, body, &mut reader)
-                .map_err(|refusal| self.context_refusal(&agent.alias, message, refusal))?;
+        let reserved_bytes = crate::context_pack::adapter_reserved_bytes(&agent.provider);
+        let plan = crate::context_pack::plan(
+            &manifest,
+            previous.as_ref(),
+            resident,
+            body,
+            reserved_bytes,
+            &mut reader,
+        )
+        .map_err(|refusal| self.context_refusal(&agent.alias, message, refusal))?;
         Ok(Some(ContextDelivery {
             plan,
             pin: pin_message,
@@ -2148,6 +2159,7 @@ impl Shared {
             assigned_role: manifest.assigned_role.clone(),
             conversation,
             body_bytes: body.len(),
+            reserved_bytes,
             limit: crate::context_pack::MAX_COMBINED_BYTES,
         }))
     }

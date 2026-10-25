@@ -182,6 +182,7 @@ impl Shared {
                 &front,
                 &items,
                 target.team_role.as_deref(),
+                &target.provider,
                 &target.endpoint_kind,
                 text,
             )? {

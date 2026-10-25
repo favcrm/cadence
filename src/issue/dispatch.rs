@@ -592,6 +592,7 @@ pub(crate) fn context_guard(
     front: &Front,
     items: &[AcceptanceItem],
     team_role: Option<&str>,
+    provider: &str,
     endpoint_kind: &str,
     body: &str,
 ) -> Result<Option<crate::context_pack::Manifest>> {
@@ -627,8 +628,15 @@ pub(crate) fn context_guard(
             &document.digest,
         )
     };
-    crate::context_pack::plan(&manifest, None, false, body, &mut reader)
-        .map_err(|refusal| refusal.error())?;
+    crate::context_pack::plan(
+        &manifest,
+        None,
+        false,
+        body,
+        crate::context_pack::adapter_reserved_bytes(provider),
+        &mut reader,
+    )
+    .map_err(|refusal| refusal.error())?;
     Ok(Some(manifest))
 }
 
@@ -764,6 +772,7 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
             &front,
             &items,
             agent["team_role"].as_str(),
+            &provider,
             &endpoint_kind,
             body,
         )?

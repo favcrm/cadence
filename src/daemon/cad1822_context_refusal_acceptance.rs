@@ -1569,15 +1569,16 @@ fn cad1822_context_join_is_inside_the_combined_byte_cap() {
             &source.digest,
         )
     };
-    let baseline = crate::context_pack::plan(&manifest, None, false, "", &mut reader).unwrap();
+    let baseline = crate::context_pack::plan(&manifest, None, false, "", 0, &mut reader).unwrap();
     let exact_body = 48_000 - baseline.text.len() - 2;
     let body = "x".repeat(exact_body + 1);
-    let exact = crate::context_pack::plan(&manifest, None, false, &body[..exact_body], &mut reader)
-        .unwrap();
+    let exact =
+        crate::context_pack::plan(&manifest, None, false, &body[..exact_body], 0, &mut reader)
+            .unwrap();
     assert_eq!(exact_body + 2 + exact.text.len(), 48_000);
     assert!(
         matches!(
-            crate::context_pack::plan(&manifest, None, false, &body, &mut reader),
+            crate::context_pack::plan(&manifest, None, false, &body, 0, &mut reader),
             Err(crate::context_pack::Refusal::MandatoryOverflow { .. })
         ),
         "one byte beyond the actual body + join + context cap must refuse, not reach the adapter"
@@ -1635,7 +1636,7 @@ fn cad1822_omitted_optional_source_is_not_resident_when_promoted() {
     initial_body.push_str(r#"Acceptance: "The supplied required policy is delivered whole.""#);
     initial_body.extend(std::iter::repeat_n('x', 40_000 - initial_body.len()));
     let full =
-        crate::context_pack::plan(&original, None, false, &initial_body, &mut reader).unwrap();
+        crate::context_pack::plan(&original, None, false, &initial_body, 0, &mut reader).unwrap();
     assert!(full
         .withheld
         .iter()
@@ -1646,6 +1647,7 @@ fn cad1822_omitted_optional_source_is_not_resident_when_promoted() {
         Some(&previous),
         true,
         "Continue the unchanged task.",
+        0,
         &mut reader,
     )
     .unwrap();
@@ -1693,6 +1695,7 @@ fn cad1822_omitted_optional_source_is_not_resident_when_promoted() {
         Some(&previous),
         true,
         "Apply the current task.",
+        0,
         &mut reader,
     )
     .unwrap();
@@ -1750,4 +1753,89 @@ fn cad1822_legacy_summary_change_keeps_the_reported_duplicate() {
         "changing summary alone must not execute another task in a non-opted-in project: {repeated}");
     assert_eq!(repeated["duplicate_kind"], "reported");
     assert_eq!(repeated["message"], first["message"]);
+}
+
+#[test]
+fn cad1822_pi_guard_is_inside_the_full_combined_cap() {
+    let fixture = Fixture::new();
+    let sent = fixture.kickoff_rpc(CONTROL, RESTORED_WORKER).unwrap();
+    let manifest: crate::context_pack::Manifest = serde_json::from_value(
+        fixture.context_pin(RESTORED_WORKER, sent["message"].as_str().unwrap())["manifest"].clone(),
+    )
+    .unwrap();
+    let mut reader = |source: &crate::context_pack::Source| {
+        crate::issue::context::read_pinned_blob(
+            &fixture.repo,
+            &source.revision,
+            &source.path,
+            &source.digest,
+        )
+    };
+    let guard = crate::adapter::pi::TASK_INPUT_PREFIX;
+    let baseline =
+        crate::context_pack::plan(&manifest, None, false, "", guard.len(), &mut reader).unwrap();
+    let body_bytes = 48_000 - guard.len() - baseline.text.len() - 2;
+    let mut body = "界".repeat(body_bytes / 3);
+    body.extend(std::iter::repeat_n('x', body_bytes % 3));
+    let exact =
+        crate::context_pack::plan(&manifest, None, false, &body, guard.len(), &mut reader).unwrap();
+    assert_eq!(guard.len() + body.len() + 2 + exact.text.len(), 48_000);
+    body.push('x');
+    assert!(
+        matches!(
+            crate::context_pack::plan(&manifest, None, false, &body, guard.len(), &mut reader),
+            Err(crate::context_pack::Refusal::MandatoryOverflow { .. })
+        ),
+        "one byte above the complete local Pi text, including its real guard and Unicode, must refuse"
+    );
+}
+
+#[test]
+fn cad1822_pi_guard_is_inside_the_retained_cap() {
+    let fixture = Fixture::new();
+    let sent = fixture.kickoff_rpc(CONTROL, RESTORED_WORKER).unwrap();
+    let manifest: crate::context_pack::Manifest = serde_json::from_value(
+        fixture.context_pin(RESTORED_WORKER, sent["message"].as_str().unwrap())["manifest"].clone(),
+    )
+    .unwrap();
+    let mut reader = |source: &crate::context_pack::Source| {
+        crate::issue::context::read_pinned_blob(
+            &fixture.repo,
+            &source.revision,
+            &source.path,
+            &source.digest,
+        )
+    };
+    let guard = crate::adapter::pi::TASK_INPUT_PREFIX;
+    let full =
+        crate::context_pack::plan(&manifest, None, false, "", guard.len(), &mut reader).unwrap();
+    let previous = receipt_from_plan(&manifest, full);
+    let body_bytes = 48_000 - guard.len();
+    let mut body = "界".repeat(body_bytes / 3);
+    body.extend(std::iter::repeat_n('x', body_bytes % 3));
+    let exact = crate::context_pack::plan(
+        &manifest,
+        Some(&previous),
+        true,
+        &body,
+        guard.len(),
+        &mut reader,
+    )
+    .unwrap();
+    assert_eq!(guard.len() + body.len() + exact.text.len(), 48_000);
+    body.push('x');
+    assert!(
+        matches!(
+            crate::context_pack::plan(
+                &manifest,
+                Some(&previous),
+                true,
+                &body,
+                guard.len(),
+                &mut reader,
+            ),
+            Err(crate::context_pack::Refusal::MandatoryOverflow { .. })
+        ),
+        "retained context must not hide the known Pi guard overhead from the hard cap"
+    );
 }

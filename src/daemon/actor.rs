@@ -634,7 +634,11 @@ impl Shared {
                         // otherwise omit it whole with a recorded reason and
                         // keep the mandatory task contract and sources.
                         if let Some(pack) = pack {
-                            let combined = text.len() + pack.text.len() + 2;
+                            let reserved = pending_context
+                                .as_ref()
+                                .map(|delivery| delivery.reserved_bytes)
+                                .unwrap_or(0);
+                            let combined = text.len() + pack.text.len() + 2 + reserved;
                             if pending_context.is_some()
                                 && combined > crate::context_pack::MAX_COMBINED_BYTES
                             {
@@ -725,7 +729,11 @@ impl Shared {
                                 };
                             let prompt = match pack {
                                 Some(pack) => {
-                                    let combined = prompt.len() + pack.text.len() + 2;
+                                    let reserved = pending_context
+                                        .as_ref()
+                                        .map(|delivery| delivery.reserved_bytes)
+                                        .unwrap_or(0);
+                                    let combined = prompt.len() + pack.text.len() + 2 + reserved;
                                     if pending_context.is_some()
                                         && combined > crate::context_pack::MAX_COMBINED_BYTES
                                     {
