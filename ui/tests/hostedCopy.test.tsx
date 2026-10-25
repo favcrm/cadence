@@ -50,9 +50,11 @@ const { createRoot } = require("react-dom/client") as typeof ReactDomClient;
 const { LocaleProvider } = require("../src/lib/locale") as typeof LocaleModule;
 const SinceCard = namedExport(require("../src/features/home/SinceCard"), "default") as typeof SinceCardType;
 
+const KEY = "cadence-home-last-seen";
+const seedAway = () => globalThis.localStorage.setItem(KEY, String(Math.floor(Date.now() / 1000) - 7200));
 // A return visit long enough for the card's premise to hold, so the guard —
 // not the away window — is what suppresses it.
-globalThis.localStorage.setItem("cadence-last-seen", String(Math.floor(Date.now() / 1000) - 7200));
+seedAway();
 const calls: string[] = [];
 globalThis.fetch = (async (url: string) => {
   calls.push(String(url));
@@ -70,8 +72,22 @@ await new Promise((resolve) => setTimeout(resolve, 50));
 await React.act(async () => {});
 assert(host.textContent === "", "a hosted board renders no since-you-left card");
 assert(calls.length === 0, "a hosted board never requests the daemon summary");
-
 await React.act(async () => { root.unmount(); });
+
+// The same away state without `hosted` must fetch and render: otherwise the
+// hosted assertions above would pass on a card that never had a premise.
+seedAway();
+const local = document.createElement("div");
+document.body.appendChild(local);
+const localRoot = createRoot(local);
+await React.act(async () => {
+  localRoot.render(React.createElement(LocaleProvider, null,
+    React.createElement(SinceCard, { onOpenIssue: () => {} })));
+});
+await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 60)); });
+assert(calls.length > 0, "a local return visit requests the daemon summary");
+assert(local.textContent !== "", "a local return visit renders the card");
+await React.act(async () => { localRoot.unmount(); });
 console.log("hosted copy checks passed");
 }
 void main().catch((e: unknown) => { console.error(e); process.exit(1); });
