@@ -167,6 +167,7 @@ pub struct RunningMessage {
 /// A provider allowance record as the store keeps it. The envelope is fixed;
 /// `data` is the provider's own report (for Codex, its rate-limit buckets).
 #[derive(Clone, Debug, Serialize, JsonSchema)]
+#[schemars(transform = require_quota_keys)]
 pub struct AgentQuota {
     pub provider: String,
     pub assignee: String,
@@ -384,10 +385,30 @@ pub struct SessionScope {
 /// `user` and `account_id` are always sent, `null` when absent, so the schema
 /// requires the keys and keeps them nullable (`schemars(required)` would drop
 /// the null). `scope` is skipped when `None`, so it stays optional.
-fn require_session_keys(schema: &mut schemars::Schema) {
-    if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
-        required.extend([Value::from("user"), Value::from("account_id")]);
+fn require_nullable_keys(schema: &mut schemars::Schema, keys: &[&str]) {
+    for key in keys {
+        assert!(
+            schema
+                .get("properties")
+                .is_some_and(|p| p.get(*key).is_some()),
+            "schema has no property `{key}` to require"
+        );
     }
+    let required = schema
+        .ensure_object()
+        .entry("required")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .expect("`required` is an array");
+    required.extend(keys.iter().map(|key| Value::from(*key)));
+}
+
+fn require_session_keys(schema: &mut schemars::Schema) {
+    require_nullable_keys(schema, &["user", "account_id"]);
+}
+
+fn require_quota_keys(schema: &mut schemars::Schema) {
+    require_nullable_keys(schema, &["account_id"]);
 }
 
 /// A live board session as the daemon reports it; never the token.

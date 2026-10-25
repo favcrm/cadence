@@ -27,7 +27,7 @@ export interface ActivityEntry {
 /** A provider allowance record as the store keeps it. The envelope is fixed;
  * `data` is the provider's own report (for Codex, its rate-limit buckets). */
 export interface AgentQuota {
-  account_id?: string | null;
+  account_id: string | null;
   assignee: string;
   data: unknown;
   observed_at: string;
