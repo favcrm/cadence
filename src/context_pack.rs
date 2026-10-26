@@ -211,6 +211,30 @@ impl TaskContract {
             execution: None,
         }
     }
+
+    /// Completed plain-dispatch comparison only. Tracker bookkeeping changes
+    /// the raw source revision, not necessarily the actionable contract.
+    /// This never replaces provenance, manifest identity or residency proofs.
+    pub(crate) fn semantic_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"cadence-task-content-v1");
+        let field = |hasher: &mut Sha256, value: &str| {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        };
+        for value in [&self.task, &self.issue, &self.title, &self.request] {
+            field(&mut hasher, value);
+        }
+        hasher.update((self.acceptance.len() as u64).to_le_bytes());
+        for criterion in &self.acceptance {
+            field(&mut hasher, criterion);
+        }
+        hasher.update([u8::from(self.execution.is_some())]);
+        if let Some(execution) = &self.execution {
+            field(&mut hasher, execution);
+        }
+        format!("{:x}", hasher.finalize())
+    }
 }
 
 /// The exact pinned bytes for one source, or `(state, reason)` when it cannot

@@ -113,6 +113,12 @@ client-supplied project or revision. Job specs are separately restricted to
 the canonical issue directory, its real task worktree or a tracked regular
 file in that declared repository. Descriptor-relative bounded reads reject
 escapes; a spec's working-byte digest is not Git verification.
+For newly created opted-in canonical issue-as-default-spec jobs, the native
+job's spec hash covers the complete body (criteria included), while the pin
+retains exact raw issue provenance. Native bookkeeping may change frontmatter
+without revising the spec; a material body change still refuses, never refreshes
+the accepted hash. Other spec files retain raw-byte job hashes. Task-specific
+acceptance cannot erase distinct criteria belonging to the effective spec.
 An opted-in manifest always requires a prompt-capable endpoint, even when no
 document body is selected: the canonical task contract is still mandatory.
 
@@ -152,8 +158,13 @@ Known local adapter-added prompt material is reserved in the same cap — the
 44-byte guarded Pi-adapter task prefix for every registry-defined Pi-family
 provider, even while the guard is off (readiness can change). This is a local byte
 reservation, not provider-window accounting; the receipt carries
-`adapter_reserved_bytes`, never as appended source. Only an opted-in plain
-issue's changed kickoff body supersedes a reported plain duplicate.
+`adapter_reserved_bytes`, never as appended source. An opted-in plain issue's
+changed actionable contract or kickoff body supersedes a reported duplicate.
+The completed-only comparison uses a domain-separated, length-prefixed task
+digest excluding incidental raw tracker revision. An exact alias/message pin
+lookup through the existing daemon read surface returns only this digest, not
+source bodies; malformed/incomplete old pins do not compare equal. This digest
+never replaces immutable provenance or conversation/session residency proofs.
 Pre-turn delivery
 (`src/daemon.rs`, `src/daemon/actor.rs`) appends the full payload when the
 provider session is new, lost or compacted, and appends nothing when the same

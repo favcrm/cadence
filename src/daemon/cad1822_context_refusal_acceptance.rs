@@ -4073,3 +4073,736 @@ fn cad1846_synthetic_eligible_lesson_reaches_all_three_native_entrypoints_once()
         );
     }
 }
+
+fn cad1846_replace_canonical_body(fixture: &Fixture, issue: &str, body: String) {
+    let pm = Pm::at(&fixture.pm).unwrap();
+    let result = write::patch_issue(
+        &pm,
+        issue,
+        &write::IssuePatch {
+            status: None,
+            priority: None,
+            owner: None,
+            component: None,
+            title: None,
+            body: Some(body),
+            tags: None,
+        },
+        None,
+        "cad1846-independent-acceptance",
+        Some(&fixture.state),
+    )
+    .expect("replace only canonical prose through the native tracker writer");
+    assert_eq!(result["committed"], true, "{result}");
+}
+
+fn cad1846_completed_context_input(fixture: &Fixture, worker: &str, message: &str) -> String {
+    let supply = context_event(fixture, worker, "context_supplied", message);
+    assert_eq!(supply["message"], message);
+    let finished = context_event(fixture, worker, "turn_finished", message);
+    fixture.wait_state(worker, "idle");
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let row = store
+        .message(message)
+        .unwrap()
+        .expect("accepted native message");
+    assert_eq!(row.state, "completed", "{}", row.to_json());
+    finished["result"]["text"]
+        .as_str()
+        .expect("the refusing-provider fixture's native fake reports the delivered input")
+        .to_string()
+}
+
+#[test]
+fn cad1846_reported_plain_redispatch_delivers_narrative_only_revision() {
+    use crate::issue::dispatch::{DispatchArgs, DispatchOrigin};
+
+    const WORKER: &str = "ctxp-narrative-revision";
+    const OLD_REQUEST: &str = "CAD1846_REQUEST_OLD Read tracked.txt and write narrative-old.csv without normalizing identifiers.";
+    const NEW_REQUEST: &str = "CAD1846_REQUEST_NEW Read tracked.txt and write narrative-new.csv while preserving source row order.";
+    const CRITERION: &str =
+        "CAD1846_REQUEST_ACCEPTANCE Every source identifier appears exactly once.";
+
+    let fixture = Fixture::new();
+    cad1846_replace_canonical_body(
+        &fixture,
+        CONTROL,
+        format!("## Request\n\n{OLD_REQUEST}\n\n## Acceptance\n\n- [ ] {CRITERION}\n"),
+    );
+    fixture.op(
+        "agent_register",
+        json!({
+            "alias": WORKER, "provider": "fake", "endpoint_kind": "fake",
+            "role": "worker", "team_role": "dev", "cwd": fixture.repo,
+            "params": json!({"fake_generation": true, "upstream": GROUP}).to_string(),
+        }),
+    );
+    fixture.wait_state(WORKER, "idle");
+    let pm = Pm::at(&fixture.pm).unwrap();
+    let args = DispatchArgs {
+        to: WORKER.to_string(),
+        note: None,
+        name: None,
+        base: Some("main".to_string()),
+        repo: Some(fixture.repo.clone()),
+        reply_to: Some(GROUP.to_string()),
+        summary: None,
+        job_spec: None,
+        no_lessons: true,
+        force: false,
+        take_over: None,
+    };
+    let dispatch = || {
+        scoped(Asserted::Operator, || {
+            crate::issue::dispatch::run(
+                &pm,
+                CONTROL,
+                &args,
+                "operator",
+                &fixture.state,
+                Some(GROUP),
+                DispatchOrigin::Explicit,
+            )
+        })
+        .expect("the explicit plain dispatch remains usable")
+    };
+    let first = dispatch();
+    assert_eq!(first["dispatched"], true, "{first}");
+    let first_id = first["message"].as_str().unwrap().to_string();
+    let first_input = cad1846_completed_context_input(&fixture, WORKER, &first_id);
+    assert_eq!(first_input.matches(OLD_REQUEST).count(), 1);
+    assert_eq!(first_input.matches(CRITERION).count(), 1);
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let first_row = store.message(&first_id).unwrap().unwrap().to_json();
+    let first_pin = fixture.context_pin(WORKER, &first_id);
+    let before = fs::read_to_string(fixture.issue_file(CONTROL)).unwrap();
+    let (before_front, before_body) = crate::issue::parse::parse_issue(&before).unwrap();
+    let acceptance_before = crate::issue::parse::acceptance_items(&before_body);
+
+    // Only the canonical narrative changes: title, criteria, assignee and
+    // lane stay fixed, and the previous native kickoff has completed.
+    cad1846_replace_canonical_body(
+        &fixture,
+        CONTROL,
+        before_body.replacen(OLD_REQUEST, NEW_REQUEST, 1),
+    );
+    let after = fs::read_to_string(fixture.issue_file(CONTROL)).unwrap();
+    let (after_front, after_body) = crate::issue::parse::parse_issue(&after).unwrap();
+    assert_eq!(after_front.title, before_front.title);
+    assert_eq!(
+        crate::issue::parse::acceptance_items(&after_body),
+        acceptance_before
+    );
+    assert!(after_body.contains(NEW_REQUEST));
+    assert!(!after_body.contains(OLD_REQUEST));
+
+    let revised = dispatch();
+    assert_eq!(
+        revised["dispatched"], true,
+        "explicit narrative-only redispatch must deliver the new contract, not return the old reported kickoff: {revised}"
+    );
+    assert_ne!(revised["duplicate"], true, "{revised}");
+    let revised_id = revised["message"].as_str().unwrap().to_string();
+    assert_ne!(revised_id, first_id);
+    assert_eq!(revised["worktree"], first["worktree"]);
+    let revised_input = cad1846_completed_context_input(&fixture, WORKER, &revised_id);
+    assert_eq!(revised_input.matches(NEW_REQUEST).count(), 1);
+    assert_eq!(revised_input.matches(CRITERION).count(), 1);
+    assert!(!revised_input.contains(OLD_REQUEST));
+    let revised_pin = fixture.context_pin(WORKER, &revised_id);
+    let manifest: crate::context_pack::Manifest =
+        serde_json::from_value(revised_pin["manifest"].clone()).unwrap();
+    assert_eq!(manifest.task.task, CONTROL);
+    assert_eq!(manifest.task.issue, CONTROL);
+    assert_eq!(manifest.task.request.matches(NEW_REQUEST).count(), 1);
+    assert!(!manifest.task.request.contains(OLD_REQUEST));
+    assert_eq!(manifest.task.acceptance, vec![CRITERION.to_string()]);
+    assert_ne!(revised_pin["task_revision"], first_pin["task_revision"]);
+    assert_eq!(
+        store.message(&first_id).unwrap().unwrap().to_json(),
+        first_row
+    );
+    assert_eq!(fixture.context_pin(WORKER, &first_id), first_pin);
+    assert_eq!(fixture.message_ids(WORKER, Some("dispatch")).len(), 2);
+}
+
+#[test]
+fn cad1846_canonical_issue_spec_preserves_criteria_distinct_from_task_acceptance() {
+    const WORKER: &str = "ctxp-canonical-spec";
+    const TASK: &str = "cad1846-canonical-spec-task";
+    const MESSAGE: &str = "cad1846-canonical-spec-message";
+    const REQUEST: &str = "CAD1846_CANONICAL_SPEC Read tracked.txt and produce criteria-result.txt without changing input bytes.";
+    const SPEC_CRITERION: &str =
+        "CAD1846_SPEC_CRITERION Retain every original identifier, including leading zeroes.";
+    const TASK_CRITERION: &str =
+        "CAD1846_TASK_CRITERION Report the committed criteria-result.txt artifact.";
+
+    let (fixture, started) = cad1846_job_guard_fixture(true);
+    cad1846_replace_canonical_body(
+        &fixture,
+        CONTROL,
+        format!("## Request\n\n{REQUEST}\n\n## Acceptance\n\n- [ ] {SPEC_CRITERION}\n"),
+    );
+    fixture.op(
+        "agent_register",
+        json!({
+            "alias": WORKER, "provider": "fake", "endpoint_kind": "fake",
+            "role": "worker", "team_role": "dev", "cwd": fixture.repo,
+            "params": json!({"fake_generation": true, "upstream": GROUP}).to_string(),
+        }),
+    );
+    fixture.wait_state(WORKER, "idle");
+    let issue_file = fixture.issue_file(CONTROL).canonicalize().unwrap();
+    let source = fs::read_to_string(&issue_file).unwrap();
+    let (yaml, _) = crate::issue::parse::split_front(&source).unwrap();
+    let forbidden_frontmatter: Vec<String> = yaml
+        .lines()
+        .filter(|line| {
+            line.starts_with("status:") || line.starts_with("owner:") || line.starts_with("refs:")
+        })
+        .map(str::to_string)
+        .collect();
+    assert!(!forbidden_frontmatter.is_empty());
+    fixture.op(
+        "task_new",
+        json!({
+            "job": started["job"], "task": TASK,
+            "title": "Preserve canonical spec criteria",
+            "assignee": WORKER, "spec": issue_file,
+            "acceptance": TASK_CRITERION,
+            "worktree": started["worktree"], "branch": started["branch"],
+            "base_sha": started["base"]["sha"],
+        }),
+    );
+    let sent = fixture.op(
+        "task_dispatch",
+        json!({"task": TASK, "by": GROUP, "message": MESSAGE}),
+    );
+    assert_eq!(sent["message"], MESSAGE);
+    assert_eq!(sent["duplicate"], false);
+    let input = cad1846_completed_context_input(&fixture, WORKER, MESSAGE);
+    assert_eq!(input.matches(REQUEST).count(), 1);
+    assert_eq!(
+        input.matches(SPEC_CRITERION).count(), 1,
+        "the effective canonical issue spec's own criterion must survive exactly once even when task acceptance differs: {input}"
+    );
+    assert_eq!(input.matches(TASK_CRITERION).count(), 1);
+    for forbidden in forbidden_frontmatter {
+        assert!(
+            !input.contains(&forbidden),
+            "raw issue frontmatter became instructions: {forbidden}"
+        );
+    }
+    let pin = fixture.context_pin(WORKER, MESSAGE);
+    let manifest: crate::context_pack::Manifest =
+        serde_json::from_value(pin["manifest"].clone()).unwrap();
+    assert_eq!(manifest.task.task, TASK);
+    assert_eq!(manifest.task.issue, CONTROL);
+    // Preserve the native task's own acceptance authority; do not repair the
+    // missing spec requirement by replacing it with the parent checklist.
+    assert_eq!(manifest.task.acceptance, vec![TASK_CRITERION.to_string()]);
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let task = store.task(TASK).unwrap();
+    assert_eq!(task.acceptance.as_deref(), Some(TASK_CRITERION));
+    assert_eq!(task.dispatch_message.as_deref(), Some(MESSAGE));
+    assert_eq!(task.revision, 1);
+}
+
+#[test]
+fn cad1846_changed_default_job_spec_refuses_native_admission_with_opt_out_control() {
+    use sha2::{Digest, Sha256};
+
+    const MESSAGE: &str = "cad1846-default-spec-drift";
+    let (fixture, started) = cad1846_job_guard_fixture(true);
+    let worker = CAD1846_JOB_GUARD_WORKER;
+    let task_id = started["task"].as_str().unwrap();
+    let job_id = started["job"].as_str().unwrap();
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let job_before = store.job(job_id).unwrap().to_json();
+    let job = store.job(job_id).unwrap();
+    let task_before = store.task(task_id).unwrap().to_json();
+    assert_eq!(task_before["state"], "draft");
+    assert_eq!(task_before["revision"], 0);
+    assert!(task_before["spec_path"].is_null());
+    assert!(task_before["dispatch_message"].is_null());
+    let spec = Path::new(&job.spec_path);
+    let original = fs::read(spec).unwrap();
+    assert_eq!(
+        job.spec_sha256.as_deref(),
+        Some(format!("{:x}", Sha256::digest(&original)).as_str())
+    );
+    let changed =
+        "CAD1846_CHANGED_DEFAULT_SPEC Read tracked.txt and produce changed-default-result.txt.\n";
+    fs::write(spec, changed).unwrap();
+    assert_ne!(
+        job.spec_sha256.as_deref(),
+        Some(format!("{:x}", Sha256::digest(changed.as_bytes())).as_str())
+    );
+    let messages_before = fixture.message_ids(worker, None);
+    let cursor = store
+        .events_tail(worker, 1)
+        .unwrap()
+        .last()
+        .map(|event| event.seq)
+        .unwrap_or(0);
+
+    // Unchanged native rows, changed file bytes: this must traverse the
+    // real RPC/source guard, not only DispatchPlan::verify_current.
+    let result = fixture.try_op(
+        "task_dispatch",
+        json!({"task": task_id, "by": GROUP, "message": MESSAGE}),
+    );
+    let error = result
+        .expect_err("a changed pinned default spec must refuse before admission")
+        .to_string();
+    assert!(error.contains("context refused: spec-changed"), "{error}");
+    assert_eq!(store.task(task_id).unwrap().to_json(), task_before);
+    assert_eq!(store.job(job_id).unwrap().to_json(), job_before);
+    assert_eq!(fixture.message_ids(worker, None), messages_before);
+    assert!(store.messages_for_task(task_id).unwrap().is_empty());
+    assert!(store.message(MESSAGE).unwrap().is_none());
+    assert!(store.context_pin(worker, MESSAGE).unwrap().is_none());
+    assert!(store.context_disabled(worker, MESSAGE).unwrap().is_none());
+    let events = store.events(worker, cursor, 1000).unwrap();
+    assert!(events.len() < 1000);
+    assert!(events
+        .iter()
+        .all(|event| !matches!(event.kind.as_str(), "context_pin" | "context_disabled")));
+    let job_events = store.job_events(job_id, 0, 1000).unwrap();
+    assert!(job_events.len() < 1000);
+    assert!(job_events
+        .iter()
+        .all(|event| event.kind != "task_dispatched" || event.payload["task"] != task_id));
+
+    // Committed explicit opt-out is the positive control on this same task,
+    // endpoint and still-changed spec; do not restore the old file or digest.
+    let manifest_path = fixture.repo.join(MANIFEST);
+    let enabled = fs::read_to_string(&manifest_path).unwrap();
+    assert!(enabled.contains("agent_delivery: true"));
+    fs::write(
+        &manifest_path,
+        enabled.replacen("agent_delivery: true", "agent_delivery: false", 1),
+    )
+    .unwrap();
+    commit_all(
+        &fixture.repo,
+        "CAD-1846 pinned-spec drift explicit opt-out control",
+    );
+    assert_eq!(fs::read_to_string(spec).unwrap(), changed);
+    let accepted = fixture
+        .try_op(
+            "task_dispatch",
+            json!({"task": task_id, "by": GROUP, "message": MESSAGE}),
+        )
+        .expect("explicit opt-out preserves the legacy default-spec admission behavior");
+    assert_eq!(accepted["message"], MESSAGE);
+    assert_eq!(accepted["duplicate"], false);
+    let row = store.message(MESSAGE).unwrap().unwrap();
+    assert_eq!(row.source, "job_dispatch");
+    assert_eq!(row.state, "queued");
+    assert_eq!(row.task_id.as_deref(), Some(task_id));
+    let task_after = store.task(task_id).unwrap();
+    assert_eq!(task_after.state, "dispatched");
+    assert_eq!(task_after.revision, 1);
+    assert_eq!(task_after.dispatch_message.as_deref(), Some(MESSAGE));
+    assert_eq!(store.messages_for_task(task_id).unwrap().len(), 1);
+    assert!(store.context_pin(worker, MESSAGE).unwrap().is_none());
+    assert_eq!(store.job(job_id).unwrap().to_json(), job_before);
+}
+
+#[test]
+fn cad1846_fresh_issue_as_default_job_spec_survives_native_tracker_setup() {
+    use crate::issue::dispatch::{DispatchArgs, DispatchOrigin};
+
+    const WORKER: &str = "ctxp-fresh-issue-spec";
+    const REQUEST: &str = "CAD1846_FRESH_ISSUE_SPEC Read tracked.txt and write fresh-issue-result.csv while preserving leading zeroes.";
+    const CRITERION: &str =
+        "CAD1846_FRESH_ISSUE_CRITERION Preserve every source identifier exactly once.";
+    let fixture = Fixture::new();
+    cad1846_replace_canonical_body(
+        &fixture,
+        CONTROL,
+        format!("## Request\n\n{REQUEST}\n\n## Acceptance\n\n- [ ] {CRITERION}\n"),
+    );
+    let issue_file = fixture.issue_file(CONTROL).canonicalize().unwrap();
+    let source_before = fs::read_to_string(&issue_file).unwrap();
+    let (front_before, _) = crate::issue::parse::parse_issue(&source_before).unwrap();
+    assert!(front_before
+        .refs
+        .iter()
+        .all(|reference| reference.kind != "worktree"));
+    fixture.op(
+        "agent_register",
+        json!({
+            "alias": WORKER, "provider": "fake", "endpoint_kind": "fake",
+            "role": "worker", "team_role": "dev", "cwd": fixture.repo,
+            "params": json!({"fake_generation": true, "upstream": GROUP}).to_string(),
+        }),
+    );
+    fixture.wait_state(WORKER, "idle");
+    let pm = Pm::at(&fixture.pm).unwrap();
+    let args = DispatchArgs {
+        to: WORKER.to_string(),
+        note: None,
+        name: None,
+        base: Some("main".to_string()),
+        repo: Some(fixture.repo.clone()),
+        reply_to: Some(GROUP.to_string()),
+        summary: None,
+        job_spec: Some(issue_file.clone()),
+        no_lessons: true,
+        force: false,
+        take_over: None,
+    };
+    let result = scoped(Asserted::Operator, || {
+        crate::issue::dispatch::run(
+            &pm,
+            CONTROL,
+            &args,
+            "operator",
+            &fixture.state,
+            Some(GROUP),
+            DispatchOrigin::Explicit,
+        )
+    })
+    .expect("fresh canonical issue-as-spec dispatch must survive its own native claim/ref updates");
+    assert_eq!(result["dispatched"], true, "{result}");
+    let message = result["message"].as_str().unwrap();
+    let input = cad1846_completed_context_input(&fixture, WORKER, message);
+    let source_after = fs::read_to_string(&issue_file).unwrap();
+    assert_ne!(
+        source_after, source_before,
+        "the control must exercise real native tracker setup"
+    );
+    let (front_after, _) = crate::issue::parse::parse_issue(&source_after).unwrap();
+    assert!(front_after
+        .refs
+        .iter()
+        .any(|reference| reference.kind == "worktree"));
+    assert_eq!(input.matches(REQUEST).count(), 1, "{input}");
+    assert_eq!(input.matches(CRITERION).count(), 1, "{input}");
+    let (yaml, _) = crate::issue::parse::split_front(&source_after).unwrap();
+    let forbidden: Vec<&str> = yaml
+        .lines()
+        .filter(|line| {
+            line.starts_with("status:") || line.starts_with("owner:") || line.starts_with("refs:")
+        })
+        .collect();
+    assert!(!forbidden.is_empty());
+    for line in forbidden {
+        assert!(
+            !input.contains(line),
+            "raw tracker frontmatter became task instructions: {line}"
+        );
+    }
+    let pin = fixture.context_pin(WORKER, message);
+    let manifest: crate::context_pack::Manifest =
+        serde_json::from_value(pin["manifest"].clone()).unwrap();
+    assert_eq!(manifest.task.task, result["task"].as_str().unwrap());
+    assert_eq!(manifest.task.issue, CONTROL);
+    assert_eq!(manifest.task.request.matches(REQUEST).count(), 1);
+    assert_eq!(manifest.task.acceptance, vec![CRITERION.to_string()]);
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let task = store.task(result["task"].as_str().unwrap()).unwrap();
+    let job = store.job(result["job"].as_str().unwrap()).unwrap();
+    assert_eq!(Path::new(&job.spec_path), issue_file.as_path());
+    assert_eq!(task.dispatch_message.as_deref(), Some(message));
+    assert_eq!(task.revision, 1);
+    assert_eq!(store.jobs(None, true).unwrap().len(), 1);
+    let kickoffs = store.messages_for_task(&task.id).unwrap();
+    let kickoffs: Vec<_> = kickoffs
+        .iter()
+        .filter(|row| row.source == "job_dispatch")
+        .collect();
+    assert_eq!(kickoffs.len(), 1);
+    assert_eq!(kickoffs[0].alias, WORKER);
+    assert_eq!(kickoffs[0].id, message);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cad1846_accepted_issue_job_retry_does_not_open_oversized_or_unavailable_spec() {
+    use crate::issue::dispatch::{DispatchArgs, DispatchOrigin};
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    const WORKER: &str = "ctxp-retry-no-spec-read";
+    let fixture = Fixture::new();
+    let spec = fixture.repo.join("docs/cad1846-retry-no-read.md");
+    fs::write(
+        &spec,
+        "Read tracked.txt and produce retry-result.txt without changing input bytes.\n",
+    )
+    .unwrap();
+    commit_all(&fixture.repo, "CAD-1846 accepted retry source control");
+    fixture.op(
+        "agent_register",
+        json!({
+            "alias": WORKER, "provider": "fake", "endpoint_kind": "fake",
+            "role": "worker", "team_role": "dev", "cwd": fixture.repo,
+            "params": json!({"fake_generation": true, "upstream": GROUP}).to_string(),
+        }),
+    );
+    fixture.wait_state(WORKER, "idle");
+    let pm = Pm::at(&fixture.pm).unwrap();
+    let args = DispatchArgs {
+        to: WORKER.to_string(),
+        note: None,
+        name: None,
+        base: Some("main".to_string()),
+        repo: Some(fixture.repo.clone()),
+        reply_to: Some(GROUP.to_string()),
+        summary: None,
+        job_spec: Some(spec.clone()),
+        no_lessons: true,
+        force: false,
+        take_over: None,
+    };
+    let dispatch = || {
+        scoped(Asserted::Operator, || {
+            crate::issue::dispatch::run(
+                &pm,
+                CONTROL,
+                &args,
+                "operator",
+                &fixture.state,
+                Some(GROUP),
+                DispatchOrigin::Explicit,
+            )
+        })
+    };
+    let first = dispatch().expect("valid native issue-linked job control");
+    assert_eq!(first["dispatched"], true, "{first}");
+    let message = first["message"].as_str().unwrap().to_string();
+    cad1846_completed_context_input(&fixture, WORKER, &message);
+    let task_id = first["task"].as_str().unwrap();
+    let job_id = first["job"].as_str().unwrap();
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let task_before = store.task(task_id).unwrap().to_json();
+    let job_before = store.job(job_id).unwrap().to_json();
+    let pin_before = fixture.context_pin(WORKER, &message);
+    let messages_before: Vec<Value> = store
+        .messages_for_task(task_id)
+        .unwrap()
+        .iter()
+        .map(|row| row.to_json())
+        .collect();
+    let worker_messages_before = fixture.message_ids(WORKER, None);
+    assert_eq!(store.message(&message).unwrap().unwrap().state, "completed");
+
+    // Deliberately exceed the source reader's bound after acceptance, but
+    // stay tiny enough that the bad baseline cannot exhaust host memory.
+    let oversized = "x".repeat(crate::context_pack::MAX_COMBINED_BYTES + 1);
+    fs::write(&spec, &oversized).unwrap();
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    assert!(
+        fd >= 0,
+        "inotify_init1: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut watch = unsafe { fs::File::from_raw_fd(fd) };
+    let source_name = CString::new(spec.as_os_str().as_bytes()).unwrap();
+    let wd =
+        unsafe { libc::inotify_add_watch(watch.as_raw_fd(), source_name.as_ptr(), libc::IN_OPEN) };
+    assert!(
+        wd >= 0,
+        "inotify_add_watch: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut events = [0u8; 4096];
+    // Positive control for the observation itself, then drain that event.
+    drop(fs::File::open(&spec).unwrap());
+    assert!(
+        watch
+            .read(&mut events)
+            .expect("observe the controlled source open")
+            > 0
+    );
+
+    let retry = dispatch().expect("an accepted retry must not recapture the oversized spec");
+    assert_eq!(retry["duplicate"], true, "{retry}");
+    assert_eq!(retry["dispatched"], false, "{retry}");
+    assert_eq!(retry["message"], message);
+    let observed = watch.read(&mut events);
+    assert!(
+        matches!(&observed, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "accepted CLI retry opened its working spec instead of answering from stored binding: {observed:?}"
+    );
+    drop(watch);
+
+    // Missing working bytes must also retain the exact accepted binding.
+    fs::rename(&spec, spec.with_extension("unavailable")).unwrap();
+    let unavailable = dispatch().expect("an accepted retry must not require the spec to exist");
+    assert_eq!(unavailable["duplicate"], true, "{unavailable}");
+    assert_eq!(unavailable["dispatched"], false, "{unavailable}");
+    assert_eq!(unavailable["message"], message);
+    assert_eq!(store.task(task_id).unwrap().to_json(), task_before);
+    assert_eq!(store.job(job_id).unwrap().to_json(), job_before);
+    assert_eq!(fixture.context_pin(WORKER, &message), pin_before);
+    assert_eq!(fixture.message_ids(WORKER, None), worker_messages_before);
+    let messages_after: Vec<Value> = store
+        .messages_for_task(task_id)
+        .unwrap()
+        .iter()
+        .map(|row| row.to_json())
+        .collect();
+    assert_eq!(messages_after, messages_before);
+    assert_eq!(store.jobs(None, true).unwrap().len(), 1);
+}
+
+#[test]
+fn cad1846_changed_canonical_default_spec_body_refuses_native_admission() {
+    use crate::issue::start::{JobArgs, StartArgs};
+
+    const WORKER: &str = "ctxp-canonical-body-drift";
+    const MESSAGE: &str = "cad1846-canonical-body-drift-message";
+    const ORIGINAL: &str = "CAD1846_CANONICAL_BODY_ORIGINAL Read tracked.txt and write original-body-result.csv without normalizing identifiers.";
+    const CHANGED: &str = "CAD1846_CANONICAL_BODY_CHANGED Read tracked.txt and write changed-body-result.csv while preserving source row order.";
+    const CRITERION: &str =
+        "CAD1846_CANONICAL_BODY_ACCEPTANCE Preserve every source identifier exactly once.";
+    let fixture = Fixture::new();
+    cad1846_replace_canonical_body(
+        &fixture,
+        CONTROL,
+        format!("## Request\n\n{ORIGINAL}\n\n## Acceptance\n\n- [ ] {CRITERION}\n"),
+    );
+    fixture.op(
+        "agent_register",
+        json!({
+            "alias": WORKER, "provider": "fake", "endpoint_kind": "fake",
+            "role": "worker", "team_role": "dev", "cwd": fixture.repo,
+            "params": json!({"fake_generation": true, "upstream": GROUP}).to_string(),
+        }),
+    );
+    fixture.wait_state(WORKER, "idle");
+    let pm = Pm::at(&fixture.pm).unwrap();
+    let issue_file = fixture.issue_file(CONTROL).canonicalize().unwrap();
+    let started = scoped(Asserted::Operator, || {
+        crate::issue::start::run(
+            &pm,
+            CONTROL,
+            &StartArgs {
+                repo: Some(fixture.repo.clone()),
+                name: None,
+                base: Some("main".to_string()),
+                owner: Some(WORKER.to_string()),
+                job: Some(JobArgs {
+                    id: None,
+                    pm: GROUP.to_string(),
+                    spec: issue_file.clone(),
+                    assignee: Some(WORKER.to_string()),
+                    force: false,
+                }),
+                by: Some(GROUP.to_string()),
+                take_over: None,
+            },
+            "cad1846-independent-acceptance",
+            &fixture.state,
+        )
+    })
+    .expect("establish a real fresh issue-linked job using its canonical issue as default spec");
+    assert!(Path::new(started["worktree"].as_str().unwrap()).is_dir());
+    let task_id = started["task"].as_str().unwrap();
+    let job_id = started["job"].as_str().unwrap();
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
+    let task_before = store.task(task_id).unwrap().to_json();
+    let job_before = store.job(job_id).unwrap().to_json();
+    assert_eq!(task_before["state"], "draft");
+    assert_eq!(task_before["revision"], 0);
+    assert!(task_before["spec_path"].is_null());
+    assert!(task_before["dispatch_message"].is_null());
+    assert_eq!(
+        Path::new(job_before["spec_path"].as_str().unwrap()),
+        issue_file.as_path()
+    );
+    assert!(store.messages_for_task(task_id).unwrap().is_empty());
+
+    // Keep the exact native job/task/lane and checklist. Only canonical
+    // actionable prose changes after job_new has accepted the spec binding.
+    let selected = fs::read_to_string(&issue_file).unwrap();
+    let (_, selected_body) = crate::issue::parse::parse_issue(&selected).unwrap();
+    assert_eq!(selected_body.matches(ORIGINAL).count(), 1);
+    let selected_items = crate::issue::parse::acceptance_items(&selected_body);
+    cad1846_replace_canonical_body(
+        &fixture,
+        CONTROL,
+        selected_body.replacen(ORIGINAL, CHANGED, 1),
+    );
+    let changed_source = fs::read_to_string(&issue_file).unwrap();
+    let (_, changed_body) = crate::issue::parse::parse_issue(&changed_source).unwrap();
+    assert!(changed_body.contains(CHANGED));
+    assert!(!changed_body.contains(ORIGINAL));
+    assert_eq!(
+        crate::issue::parse::acceptance_items(&changed_body),
+        selected_items
+    );
+    let messages_before = fixture.message_ids(WORKER, None);
+    let cursor = store
+        .events_tail(WORKER, 1)
+        .unwrap()
+        .last()
+        .map(|event| event.seq)
+        .unwrap_or(0);
+    let result = fixture.try_op(
+        "task_dispatch",
+        json!({"task": task_id, "by": GROUP, "message": MESSAGE}),
+    );
+    let error = result
+        .expect_err("material canonical-body drift must refuse native admission")
+        .to_string();
+    assert!(error.contains("context refused: spec-changed"), "{error}");
+    assert_eq!(store.task(task_id).unwrap().to_json(), task_before);
+    assert_eq!(store.job(job_id).unwrap().to_json(), job_before);
+    assert_eq!(fixture.message_ids(WORKER, None), messages_before);
+    assert!(store.messages_for_task(task_id).unwrap().is_empty());
+    assert!(store.message(MESSAGE).unwrap().is_none());
+    assert!(store.context_pin(WORKER, MESSAGE).unwrap().is_none());
+    assert!(store.context_disabled(WORKER, MESSAGE).unwrap().is_none());
+    let events = store.events(WORKER, cursor, 1000).unwrap();
+    assert!(events.len() < 1000);
+    assert!(events
+        .iter()
+        .all(|event| !matches!(event.kind.as_str(), "context_pin" | "context_disabled")));
+    let job_events = store.job_events(job_id, 0, 1000).unwrap();
+    assert!(job_events.len() < 1000);
+    assert!(job_events
+        .iter()
+        .all(|event| { event.kind != "task_dispatched" || event.payload["task"] != task_id }));
+
+    // Explicit opt-out preserves legacy dispatch on the SAME changed file,
+    // without restoring its old content or refreshing the accepted job hash.
+    let manifest_file = fixture.repo.join(MANIFEST);
+    let enabled = fs::read_to_string(&manifest_file).unwrap();
+    assert!(enabled.contains("agent_delivery: true"));
+    fs::write(
+        &manifest_file,
+        enabled.replacen("agent_delivery: true", "agent_delivery: false", 1),
+    )
+    .unwrap();
+    commit_all(
+        &fixture.repo,
+        "CAD-1846 canonical body drift explicit opt-out control",
+    );
+    assert_eq!(fs::read_to_string(&issue_file).unwrap(), changed_source);
+    let accepted = fixture
+        .try_op(
+            "task_dispatch",
+            json!({"task": task_id, "by": GROUP, "message": MESSAGE}),
+        )
+        .expect("explicit opt-out keeps the legacy canonical-spec behavior");
+    assert_eq!(accepted["message"], MESSAGE);
+    assert_eq!(accepted["duplicate"], false);
+    context_event(&fixture, WORKER, "turn_finished", MESSAGE);
+    fixture.wait_state(WORKER, "idle");
+    let row = store.message(MESSAGE).unwrap().unwrap();
+    assert_eq!(row.state, "completed");
+    assert_eq!(row.source, "job_dispatch");
+    assert_eq!(row.task_id.as_deref(), Some(task_id));
+    let task_after = store.task(task_id).unwrap();
+    assert_eq!(task_after.revision, 1);
+    assert_eq!(task_after.dispatch_message.as_deref(), Some(MESSAGE));
+    assert_eq!(store.job(job_id).unwrap().to_json(), job_before);
+    assert!(store.context_pin(WORKER, MESSAGE).unwrap().is_none());
+}

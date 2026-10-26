@@ -1026,8 +1026,10 @@ material is reserved conservatively in the same cap — currently the
 44-byte guarded Pi-adapter task prefix for every registry-defined Pi-family
 provider, even while its guard is off. This is a local byte reservation, not provider-window
 accounting; the receipt records it as `adapter_reserved_bytes`, never as
-appended source. Only an opted-in plain issue's changed kickoff body
-supersedes a reported plain duplicate.
+appended source. An opted-in plain issue's changed actionable contract or
+kickoff body supersedes a reported plain duplicate. The completed-contract
+comparison excludes tracker bookkeeping, not narrative/title/criteria;
+live retries still return before recapture.
 A missing
 required source, an unusable manifest, a combined payload over 48 000
 bytes, a pinned project context on an endpoint that cannot receive
@@ -1054,6 +1056,17 @@ spec paths supply their current bounded UTF-8 working bytes with an exact
 content digest, **not** a claim that those bytes were verified at a Git SHA.
 Opt-out does not read the spec through this context pipeline. Old incomplete
 pins are not silently upgraded to complete contracts; dispatch a new revision.
+For a new opted-in job whose default spec is exactly its canonical `issue.md`,
+the daemon pins `spec_sha256` over the complete Markdown body, including every
+criterion, rather than tracker frontmatter. Claim/lane/message-ref bookkeeping
+therefore cannot invalidate the job's own spec. Material body changes still
+refuse; the accepted job digest is never refreshed. The context manifest
+separately retains the exact raw captured issue/source revision. Other spec
+files retain their raw-byte job hash. A task-specific checklist does not replace
+requirements in the effective canonical spec: only criteria already represented
+verbatim are deduplicated. Older canonical jobs with raw-source hashes are not
+silently converted; recreate/reconcile their binding when that hash no longer
+matches the effective spec.
 
 Eligible lessons reuse the existing accepted-memory matching/rendering policy;
 no approval or verification rule is relaxed. One optional `native:lessons`

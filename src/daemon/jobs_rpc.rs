@@ -29,6 +29,19 @@ impl Shared {
         }
         let spec = required_str(params, "spec")?;
         let spec_sha256 = required_str(params, "spec_sha256")?;
+        // The canonical issue's effective spec is its complete body, not
+        // tracker metadata changed by claim/lane/message-ref bookkeeping.
+        // This new pin is server-derived; accepted jobs are never refreshed.
+        let canonical_digest = match (optional_str(params, "issue"), self.pm()) {
+            (Some(issue), Ok(pm)) => crate::issue::dispatch::canonical_issue_spec_digest(
+                &pm,
+                issue,
+                std::path::Path::new(spec),
+                true,
+            )?,
+            _ => None,
+        };
+        let spec_sha256 = canonical_digest.as_deref().unwrap_or(spec_sha256);
         let id = optional_str(params, "job")
             .map(str::to_string)
             .unwrap_or_else(|| format!("job-{}", &Uuid::new_v4().simple().to_string()[..8]));
@@ -122,10 +135,23 @@ impl Shared {
         if let Some(sha) = &job.spec_sha256 {
             match sha256_file(std::path::Path::new(&job.spec_path)) {
                 Some(now) if now != *sha => {
-                    jj["attention"] = json!(
-                        "spec changed since `job new` — \
-                        re-create the job if the drift is real work"
-                    );
+                    let canonical_digest = match (job.issue_id.as_deref(), self.pm()) {
+                        (Some(issue), Ok(pm)) => {
+                            crate::issue::dispatch::canonical_issue_spec_digest(
+                                &pm,
+                                issue,
+                                std::path::Path::new(&job.spec_path),
+                                false,
+                            )?
+                        }
+                        _ => None,
+                    };
+                    if canonical_digest.as_deref() != Some(sha.as_str()) {
+                        jj["attention"] = json!(
+                            "spec changed since `job new` — \
+                            re-create the job if the drift is real work"
+                        );
+                    }
                 }
                 None => {
                     jj["attention"] = json!(format!("spec {} is unreadable", job.spec_path));

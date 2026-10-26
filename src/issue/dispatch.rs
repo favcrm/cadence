@@ -578,6 +578,8 @@ struct Preflight {
     /// reported duplicate; non-opted projects keep the legacy duplicate
     /// behavior.
     context_active: bool,
+    /// Stable actionable plain contract, excluding tracker bookkeeping.
+    context_contract_digest: Option<String>,
     /// CAD-1846: the lesson facts the pinned context carries for the plain
     /// kickoff. Present exactly when this dispatch's own plain context was
     /// prepared, so the legacy lesson sidecar is skipped instead of injected
@@ -1240,6 +1242,39 @@ fn read_job_spec(
     Ok((text, file, label))
 }
 
+/// Canonical issue specs contain mutable tracker metadata that is not part
+/// of their effective spec. Pin every body byte, including all criteria;
+/// retain the separate raw source digest in the delivery manifest.
+pub(crate) fn canonical_issue_spec_digest(
+    pm: &Pm,
+    issue: &str,
+    spec: &Path,
+    only_opted_in: bool,
+) -> Result<Option<String>> {
+    let Ok((project, dir)) = write::issue_dir(pm, issue) else {
+        // Jobs may name issues not held by this tracker.
+        return Ok(None);
+    };
+    let Ok(canonical) = dir.join("issue.md").canonicalize() else {
+        return Ok(None);
+    };
+    if spec.canonicalize().ok().as_ref() != Some(&canonical)
+        || (only_opted_in && super::context::pin(&project, None).state == "unconfigured")
+    {
+        return Ok(None);
+    }
+    let reader = super::app_catalog::fs::Root::open(&dir)?;
+    let source = reader
+        .read(
+            Path::new("issue.md"),
+            crate::context_pack::MAX_COMBINED_BYTES as u64,
+        )?
+        .ok_or_else(|| Error::rejected("canonical issue spec is unavailable"))?;
+    Ok(Some(content_digest(
+        parse::split_front(&source)?.1.as_bytes(),
+    )))
+}
+
 /// CAD-1846: the same mandatory pipeline for an issue-linked job task.
 /// The caller proves the job's issue binding and real lane from its own
 /// captured rows; this captures the complete effective spec once, the
@@ -1257,7 +1292,7 @@ pub(crate) fn job_context(
         project,
         dir,
         front,
-        items: _,
+        items: parent_items,
         source,
         request: parent_request,
     } = gated;
@@ -1293,15 +1328,29 @@ pub(crate) fn job_context(
             .spec_path
             .as_deref()
             .unwrap_or(job_row.spec_path.as_str());
-        let (spec, spec_file, spec_scope) =
+        let (captured_spec, spec_file, spec_scope) =
             read_job_spec(&project, &dir, task, job_row, spec_path)?;
+        let issue_file = std::fs::canonicalize(dir.join("issue.md")).ok();
+        let canonical_issue_spec = issue_file.as_deref() == Some(spec_file.as_path());
+        // Use the selected issue snapshot for both provenance and its request,
+        // not a second source revision observed during the scope/read proof.
+        let spec = if canonical_issue_spec {
+            source.as_str()
+        } else {
+            captured_spec.as_str()
+        };
         let spec_digest = content_digest(spec.as_bytes());
         // The job's recorded digest still gates its own spec. The working
         // bytes may be dirty; this digest is the captured data revision, not
         // a claim that the file matches HEAD.
         if task.spec_path.is_none() {
             if let Some(expected) = job_row.spec_sha256.as_deref() {
-                if spec_digest != expected {
+                let canonical_digest = if canonical_issue_spec {
+                    Some(content_digest(parse::split_front(spec)?.1.as_bytes()))
+                } else {
+                    None
+                };
+                if canonical_digest.as_deref().unwrap_or(&spec_digest) != expected {
                     return Err(Error::rejected(format!(
                         "context refused: spec-changed: the task spec {} no longer \
                          matches the revision the job was opened with — reopen the task or \
@@ -1311,13 +1360,10 @@ pub(crate) fn job_context(
                 }
             }
         }
-        // A spec that IS the parent issue file is not re-embedded: its
-        // frontmatter and criteria would duplicate the contract, and the
-        // canonical parent prose plus the task criteria already are the
-        // complete logical issue-spec.
-        let issue_file = std::fs::canonicalize(dir.join("issue.md")).ok();
-        let spec_is_issue = spec.as_bytes() == source.as_bytes()
-            || issue_file.as_deref() == Some(spec_file.as_path());
+        // Do not re-embed tracker frontmatter or criteria already represented
+        // by the native task. A task-specific checklist may differ from the
+        // canonical spec's checklist, whose other requirements remain mandatory.
+        let spec_is_issue = canonical_issue_spec || spec.as_bytes() == source.as_bytes();
         let acceptance = task_acceptance(task);
         let title = task
             .title
@@ -1351,9 +1397,24 @@ pub(crate) fn job_context(
         ));
         if spec_is_issue {
             request.push_str(&parent_request);
+            let mut additional = parent_items
+                .iter()
+                .filter(|item| !acceptance.iter().any(|task| task.text == item.text))
+                .peekable();
+            if additional.peek().is_some() {
+                if !request.ends_with('\n') {
+                    request.push('\n');
+                }
+                request.push_str("\n## Additional effective spec criteria\n\n");
+                for item in additional {
+                    request.push_str(if item.checked { "- [x] " } else { "- [ ] " });
+                    request.push_str(&item.text);
+                    request.push('\n');
+                }
+            }
         } else {
             request.push_str("## Task spec\n\n");
-            request.push_str(&spec);
+            request.push_str(spec);
             if !request.ends_with('\n') {
                 request.push('\n');
             }
@@ -1597,11 +1658,7 @@ struct OpenJob {
 }
 
 fn open_job(state_dir: &Path, front: &Front) -> Result<Option<OpenJob>> {
-    let list = client::rpc(
-        state_dir,
-        "job_list",
-        json!({"states": ["open"], "tasks_detail": true}),
-    )?;
+    let list = client::rpc(state_dir, "job_list", json!({"states": ["open"]}))?;
     let jobs: Vec<Value> = list["jobs"]
         .as_array()
         .map(|rows| {
@@ -1632,20 +1689,16 @@ fn open_job(state_dir: &Path, front: &Front) -> Result<Option<OpenJob>> {
     };
     let id = job["id"].as_str().unwrap_or_default().to_string();
     let task_id = format!("{id}-t1");
-    let show = client::rpc(state_dir, "job_show", json!({"job": id}))?;
-    let job = show["job"].clone();
-    let task = job["tasks"].as_array().and_then(|tasks| {
-        tasks
-            .iter()
-            .find(|task| task["id"].as_str() == Some(task_id.as_str()))
-            .cloned()
-    });
-    let Some(task) = task else {
+    // `job_show` computes file drift and opens the spec. A retry must read
+    // only stored identity, even if its source is now huge or unavailable.
+    let show = client::rpc(state_dir, "task_show", json!({"task": task_id}))?;
+    let task = show["task"].clone();
+    if task["id"].as_str() != Some(task_id.as_str()) || task["job"].as_str() != Some(id.as_str()) {
         return Err(Error::rejected(format!(
             "open job {id} does not carry its canonical task {task_id} — refusing to \
              infer a native binding from it"
         )));
-    };
+    }
     Ok(Some(OpenJob { job, task }))
 }
 
@@ -2092,6 +2145,7 @@ fn preflight(
             if let Some(task) = task {
                 out["task"] = task["id"].clone();
                 out["task_revision"] = task["revision"].clone();
+                out["base"]["sha"] = task["base_sha"].clone();
             }
             if items.is_empty() {
                 out["acceptance"]["warning"] = json!(self::acceptance_warning(&front.id, false));
@@ -2108,6 +2162,7 @@ fn preflight(
     // queued message behind. The guard pins first, so its factory — the only
     // place a contract, spec or body is captured — never runs on opt-out.
     let mut context_active = false;
+    let mut context_contract_digest = None;
     let mut context_lessons: Option<ContextFacts> = None;
     let body = if args.job_spec.is_none() {
         let summary = args.summary.as_deref().unwrap_or(&front.title);
@@ -2147,6 +2202,7 @@ fn preflight(
         match prepared {
             Some(prepared) => {
                 context_active = true;
+                context_contract_digest = Some(prepared.manifest.task.semantic_digest());
                 context_lessons = Some(ContextFacts::from_manifest(&prepared.manifest));
                 Some(prepared.body.into_owned())
             }
@@ -2230,6 +2286,7 @@ fn preflight(
         cwd_override,
         body,
         context_active,
+        context_contract_digest,
         context_lessons,
         reuse_job,
     }))
@@ -2524,6 +2581,7 @@ fn duplicate(
     items: &[AcceptanceItem],
     next_body: Option<&str>,
     context_active: bool,
+    next_contract_digest: Option<&str>,
     out: &mut Value,
 ) -> Result<bool> {
     let mode = if args.job_spec.is_some() {
@@ -2593,8 +2651,8 @@ fn duplicate(
         return Ok(true);
     }
     if let Some(msg) = reported {
-        // An opted-in task's changed kickoff body is an explicit revision, not
-        // a duplicate. History is preserved: the old message and its ref stay,
+        // An opted-in task's changed actionable contract/body is a revision,
+        // not a duplicate. History is preserved: the old message and its ref stay,
         // and the new kickoff is added beside them. A live duplicate above
         // still suppresses, so an in-flight task is never silently retargeted,
         // and a non-opted project keeps the legacy reported-duplicate outcome
@@ -2606,7 +2664,22 @@ fn duplicate(
                         .strip_prefix(next)
                         .is_some_and(|suffix| suffix.starts_with(" Lessons:"))
             });
-            if context_active && !same {
+            let same_contract = match next_contract_digest {
+                Some(next) => {
+                    let previous = client::rpc(
+                        state_dir,
+                        "agent_show",
+                        json!({
+                            "alias": args.to,
+                            "limit": 0,
+                            "context_message": msg["id"],
+                        }),
+                    )?;
+                    previous["context_contract_digest"].as_str() == Some(next)
+                }
+                None => true,
+            };
+            if context_active && (!same || !same_contract) {
                 out["revised"] = json!(true);
                 out["previous_message"] = msg["id"].clone();
                 let _ = write::add_comment(
@@ -2705,6 +2778,7 @@ pub fn run(
         cwd_override,
         body,
         context_active,
+        context_contract_digest,
         context_lessons,
         reuse_job,
     } = preflight;
@@ -2796,6 +2870,7 @@ pub fn run(
         &items,
         body.as_deref(),
         context_active,
+        context_contract_digest.as_deref(),
         &mut out,
     )? {
         return Ok(out);

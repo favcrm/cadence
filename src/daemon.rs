@@ -3405,6 +3405,25 @@ impl Shared {
                     // `agent unfence` is the only exit.
                     "unknown": self.store.unknown_messages(&alias)?.len(),
                 });
+                // Exact stored task semantics for a reported-dispatch retry.
+                // Same read authority as this alias's existing event history;
+                // return no source body and never recapture a source file.
+                if let Some(mid) = optional_str(params, "context_message") {
+                    let pin = self.store.context_pin(&alias, mid)?;
+                    let contract = pin.and_then(|mut pin| {
+                        let manifest: crate::context_pack::Manifest =
+                            serde_json::from_value(pin.get_mut("manifest")?.take()).ok()?;
+                        (manifest.schema == crate::context_pack::SCHEMA
+                            && pin["message"].as_str() == Some(mid)
+                            && pin["task"].as_str() == Some(manifest.task.task.as_str())
+                            && pin["project"].as_str() == Some(manifest.project.as_str())
+                            && pin["task_revision"].as_str()
+                                == Some(manifest.task.revision.as_str())
+                            && manifest.task.task == manifest.task.issue)
+                            .then(|| manifest.task.semantic_digest())
+                    });
+                    out["context_contract_digest"] = json!(contract);
+                }
                 // CAD-1752: the agent page's figures, only when asked.
                 if params.get("include_stats").and_then(Value::as_bool) == Some(true) {
                     out["stats"] = self.store.agent_stats(&alias)?;
