@@ -7,6 +7,7 @@
 export { HostedSession } from "./hosted-session.ts";
 export type {
   AskResult,
+  AssistantIdentityContext,
   GenerationIdentity,
   HostedSessionOptions,
   HostedState,
@@ -14,6 +15,7 @@ export type {
   PendingOperation,
   RuntimeTool,
   RuntimeTools,
+  ThreadContext,
   ThreadEntry,
   ToolContent,
   ToolContext,
@@ -21,4 +23,4 @@ export type {
   ToolResult,
 } from "./contract.ts";
 export { BOARD_MESSAGE_KIND, OPERATIONAL_SKILL_VERSION } from "./contract.ts";
-export { masterState } from "./master.ts";
+export { masterState, type MasterMetadata } from "./master.ts";

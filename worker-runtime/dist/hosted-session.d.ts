@@ -50,6 +50,25 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
     /** What the runtime has not settled yet, so the board can show queued/running/parked. */
     pendingOperations(): Promise<PendingOperation[]>;
     /**
+     * Resolve and render the host's committed identity before admitting new
+     * work. A refusal propagates unchanged, so an operation never starts when its
+     * canonical identity is unavailable; a host without the feature is unchanged.
+     */
+    private requireIdentity;
+    /**
+     * The committed identity text this conversation's operations see. It is
+     * resolved for admission and again for an operation's first request; only the
+     * immutable operation snapshot stores it, so a change committed mid-operation
+     * applies to the next one.
+     */
+    private identityContextText;
+    /**
+     * The one connection's public projection, checked before it is framed. A
+     * malformed projection fails the connection exactly like an unavailable one,
+     * so a partial header is never served.
+     */
+    private validatedThreadContext;
+    /**
      * The operation-scoped identity of the model request running right now. It
      * comes from the engine's own running generation checkpoint (task id +
      * transcript cutoff), so provider retries and a crash recovery reuse the

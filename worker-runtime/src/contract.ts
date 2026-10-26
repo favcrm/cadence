@@ -101,6 +101,61 @@ export interface RuntimeTools {
 }
 
 /**
+ * The committed assistant identity a host has for one conversation.
+ *
+ * This is domain data only: the host resolves and validates its own canonical
+ * store and supplies the result. The runtime decides how the committed identity
+ * reaches the model and never accepts a prompt string, a model message, an
+ * engine hook or an SDK type through this seam.
+ *
+ * - `personal` is actor-private: it belongs to the actor who owns the
+ *   conversation. `user_name` and `preferences` are private context and must
+ *   not be copied into any public projection.
+ * - `workspace` is the shared operator-managed coordinator identity. It has no
+ *   personal address or preferences.
+ */
+export type AssistantIdentityContext =
+  | {
+      readonly scope: "personal";
+      readonly profile: {
+        readonly identity: {
+          readonly name: string | null;
+          readonly tone: string | null;
+          readonly look: string;
+          readonly revision: number;
+        };
+        readonly bootstrap_state:
+          "pending" | "complete" | "skipped" | "deferred";
+        readonly user_name: string | null;
+        readonly preferences: string | null;
+      };
+      /** The host's avatar catalogue, in its own established order. */
+      readonly avatarLooks: readonly string[];
+    }
+  | {
+      readonly scope: "workspace";
+      readonly identity: {
+        readonly name: string | null;
+        readonly tone: string | null;
+        readonly look: string;
+        readonly revision: string;
+      };
+    };
+
+/**
+ * The current public projection of one board thread.
+ *
+ * `metadata` is application-owned business identity (for example a public
+ * workspace/actor identity projection). The runtime composes it under its own
+ * header fields, so a business field can never replace the model, provider,
+ * session, turn or queue state. Private per-actor context does not belong here.
+ */
+export interface ThreadContext {
+  readonly conversationId: string;
+  readonly metadata: Readonly<Record<string, unknown>>;
+}
+
+/**
  * What the host application supplies to one hosted conversation.
  *
  * `requestModel` is the only model path: the runtime never calls a provider,
@@ -135,6 +190,23 @@ export interface HostedSessionOptions {
    * Consulted for the declared intent and again for each execution.
    */
   toolRefusal(name: string): string | undefined;
+  /**
+   * The committed identity of this conversation's actor or workspace.
+   *
+   * Optional for a host without an identity feature. When supplied, the
+   * runtime formats it privately, snapshots it once per operation and enforces
+   * it on every actual model generation; there is no generic fallback. A
+   * refusal must throw (for example a malformed or unavailable committed row),
+   * so admission fails closed before new work.
+   */
+  identity?(): Promise<AssistantIdentityContext>;
+  /**
+   * The current public projection of this thread, read for each new stream
+   * connection so a reconnect observes the current committed identity. A
+   * refusal throws; the runtime then fails the connection instead of serving a
+   * stale or partial header.
+   */
+  threadContext?(): Promise<ThreadContext>;
 }
 
 /** How one asked turn ended. */

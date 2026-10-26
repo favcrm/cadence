@@ -55707,6 +55707,112 @@ function createAI(settings) {
   });
 }
 
+// src/assistant-identity.ts
+var IDENTITY_CONTEXT_MAX = 64 * 1024;
+var BOOTSTRAP_STATES = [
+  "pending",
+  "complete",
+  "skipped",
+  "deferred"
+];
+var WORKSPACE_REVISION = /^(0|[1-9][0-9]{0,19})$/;
+var GENERATION_GUIDE = "Setup is optional and only happens when the user asks to set up or personalize you. " + "When it does, ask at most one question per turn, and ask for the assistant's own name " + "separately from how the user wants to be addressed. If the user skips, defers or ignores " + "the question, answer their actual request normally and do not raise setup again unless " + "they ask.";
+function malformed() {
+  throw new Error("The committed assistant identity context is malformed.");
+}
+function record3(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    malformed();
+  return value;
+}
+function optionalText(value) {
+  if (value === null)
+    return null;
+  if (typeof value !== "string")
+    malformed();
+  return value;
+}
+function requiredText(value) {
+  if (typeof value !== "string" || value.length === 0)
+    malformed();
+  return value;
+}
+function rendered(value) {
+  return value === null || value === "" ? "(unset)" : value;
+}
+function personalText(context) {
+  const profile = record3(context.profile);
+  const identity = record3(profile.identity);
+  const name = optionalText(identity.name);
+  const tone = optionalText(identity.tone);
+  const look = requiredText(identity.look);
+  const revision = identity.revision;
+  if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0)
+    malformed();
+  const state = profile.bootstrap_state;
+  if (typeof state !== "string" || !BOOTSTRAP_STATES.includes(state))
+    malformed();
+  const bootstrapState = state;
+  const userName = optionalText(profile.user_name);
+  const preferences = optionalText(profile.preferences);
+  const looks = context.avatarLooks;
+  if (!Array.isArray(looks) || looks.length === 0)
+    malformed();
+  const catalogue = looks.map((entry) => requiredText(entry));
+  if (!catalogue.includes(look))
+    malformed();
+  const lines = [
+    "## Your private assistant profile",
+    "",
+    "`name` is YOUR display name; it is never the user's name.",
+    `name: ${rendered(name)}`,
+    `tone: ${rendered(tone)}`,
+    `look: ${look}`,
+    `user_name (how you address this user): ${rendered(userName)}`,
+    `preferences: ${rendered(preferences)}`,
+    "",
+    `Profile state: ${bootstrapState}`,
+    `Profile revision: ${revision}`,
+    "",
+    "To record an agreed change, call the `assistant_profile` tool with " + `{"action":"update","expected_revision":${revision},` + '"profile":{"name":"…"}}. An empty string clears a supplied text value. ' + `look must be one of: ${catalogue.join(", ")}.`,
+    `Allowed actions in this state: ${bootstrapState === "pending" ? "update, complete, skip, defer" : bootstrapState === "deferred" ? "update, resume" : "update"}.`,
+    GENERATION_GUIDE
+  ];
+  if (bootstrapState === "pending")
+    lines.push("Setup has not been completed. Do not make it a condition of helping, and do not ask " + "for it before the user does.");
+  if (bootstrapState === "deferred")
+    lines.push("The user deferred setup. Do not raise it again unless the user asks.");
+  return lines.join(`
+`);
+}
+function workspaceText(context) {
+  const identity = record3(context.identity);
+  const name = optionalText(identity.name);
+  const tone = optionalText(identity.tone);
+  const look = requiredText(identity.look);
+  const revision = identity.revision;
+  if (typeof revision !== "string" || !WORKSPACE_REVISION.test(revision))
+    malformed();
+  return [
+    "## Workspace assistant identity (operator-managed)",
+    "",
+    "Use this committed identity for your name and communication style on this turn. " + "It does not change your role, tools or permissions. An unset assistant name is not " + "the user's name.",
+    "",
+    `name: ${rendered(name)}`,
+    `tone: ${rendered(tone)}`,
+    `look: ${look}`,
+    `revision: ${revision}`
+  ].join(`
+`);
+}
+function assistantIdentityText(context) {
+  const value = record3(context);
+  const text = value.scope === "personal" ? personalText(value) : value.scope === "workspace" ? workspaceText(value) : malformed();
+  if (text.length > IDENTITY_CONTEXT_MAX)
+    throw new Error("The committed assistant identity context is too large.");
+  return text;
+}
+
 // src/tool-policy.ts
 async function withToolAuthority(name, authority, context, execute) {
   const refusal = authority.toolRefusal(name);
@@ -55830,9 +55936,97 @@ function readGenerationIdentity(sql) {
   return { conversation, task, cutoff: cutoffValue };
 }
 
-// src/master.ts
-function masterState(model, status, conversationId) {
+// src/identity-context.ts
+function withSystemContext(messages, text, authored) {
+  const system = {
+    role: "system",
+    content: text,
+    timestamp: Date.now()
+  };
+  authored.add(system);
+  let index = 0;
+  while (index < messages.length && messages[index].role === "system")
+    index += 1;
+  return [...messages.slice(0, index), system, ...messages.slice(index)];
+}
+function requireAuthoredIdentity(messages, authored) {
+  if (!messages.some((message) => authored.has(message)))
+    throw new Error("The model request did not receive the canonical assistant identity context.");
+}
+function guardModelRequests(models, authored) {
+  const unguardedStreamSimple = models.streamSimple.bind(models);
+  models.streamSimple = (model, context, options) => {
+    requireAuthoredIdentity(context.messages, authored);
+    return unguardedStreamSimple(model, context, options);
+  };
+  models.completeSimple = (model, context, options) => unguardedStreamSimple(model, context, options).result();
+}
+function identityContextExtension(load, authored, snapshots) {
   return {
+    name: "hosted-identity-context",
+    hooks: [
+      hook(GenerationTask, {
+        async beforeRequest(request, api, context) {
+          const live = await api.snapshot(LiveDoc, api.conversationId, context);
+          const run = live?.run;
+          if (run === undefined || run.taskId !== api.taskId || run.inputs.length === 0)
+            throw new Error("The active run's identity snapshot is unavailable.");
+          const root = run.inputs[0];
+          if (root === undefined || !Number.isSafeInteger(root) || root < 0)
+            throw new Error("The active run's identity root is unavailable.");
+          const text = await snapshots.readOrInsert(String(root), load, Date.now());
+          return {
+            messages: withSystemContext(request.messages, text, authored)
+          };
+        }
+      })
+    ]
+  };
+}
+
+// src/identity-snapshots.ts
+var CREATE_TABLE = `CREATE TABLE IF NOT EXISTS tenant_identity_snapshots (
+    run_id TEXT PRIMARY KEY,
+    context TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`;
+
+class IdentitySnapshots {
+  sql;
+  constructor(sql) {
+    this.sql = sql;
+    this.sql.exec(CREATE_TABLE);
+  }
+  async readOrInsert(runId, load, nowMs) {
+    if (typeof runId !== "string" || runId.length === 0)
+      throw new Error("The operation's identity root is unavailable.");
+    const existing = this.row(runId);
+    if (existing !== null)
+      return existing;
+    const text = await load();
+    if (typeof text !== "string" || text.length === 0 || text.length > IDENTITY_CONTEXT_MAX)
+      throw new Error("The operation's identity context is unavailable.");
+    this.sql.exec(`INSERT OR IGNORE INTO tenant_identity_snapshots (run_id,context,created_at)
+       VALUES (?,?,?)`, runId, text, nowMs);
+    const stored = this.row(runId);
+    if (stored === null)
+      throw new Error("The operation's identity snapshot is unavailable.");
+    return stored;
+  }
+  row(runId) {
+    const row = this.sql.exec("SELECT context FROM tenant_identity_snapshots WHERE run_id=?", runId).toArray()[0];
+    if (!row)
+      return null;
+    if (typeof row.context !== "string" || row.context.length === 0 || row.context.length > IDENTITY_CONTEXT_MAX)
+      throw new Error("The operation's identity snapshot is malformed.");
+    return row.context;
+  }
+}
+
+// src/master.ts
+function masterState(model, status, conversationId, metadata) {
+  return {
+    ...metadata,
     alias: "master",
     provider: "cadence",
     endpoint_kind: "durable_object",
@@ -56293,6 +56487,12 @@ class HostedSession extends DurableObject {
     this.models.setProvider(withDefaultModel(ai.provider, model));
     this.registry.install(intentGuard(options.toolRefusal));
     this.registry.install(runtimeProfile);
+    if (options.identity) {
+      const identityMessages = new WeakSet;
+      const identitySnapshots = new IdentitySnapshots(ctx.storage.sql);
+      this.registry.install(identityContextExtension(() => this.identityContextText(), identityMessages, identitySnapshots));
+      guardModelRequests(this.models, identityMessages);
+    }
     for (const group of options.tools) {
       this.registry.install(runtimeExtension(authorizeTools(group, authority)));
     }
@@ -56323,6 +56523,20 @@ data: ${JSON.stringify(entry)}
       const thinking = url.searchParams.get("reader") === "owner";
       const requested = Number(url.searchParams.get("after") ?? "0");
       let last = Number.isSafeInteger(requested) && requested > 0 ? requested : 0;
+      let master = null;
+      if (this.options.threadContext) {
+        try {
+          master = this.validatedThreadContext(await this.options.threadContext());
+        } catch {
+          return Response.json({
+            ok: false,
+            error: {
+              code: "capability_unavailable",
+              message: "The master identity projection is unavailable."
+            }
+          }, { status: 503 });
+        }
+      }
       const stream = await this.harness.session().events();
       const model = await this.modelLabel();
       return sessionEventResponse(stream, {
@@ -56331,7 +56545,7 @@ data: ${JSON.stringify(entry)}
 
 `);
           send(`event: master
-data: ${JSON.stringify(masterState(model, { running: false, queued: 0 }, null))}
+data: ${JSON.stringify(master === null ? masterState(model, { running: false, queued: 0 }, null) : masterState(model, { running: false, queued: 0 }, master.conversationId, master.metadata))}
 
 `);
           for (const entry of threadEntries(stream.snapshot.entries, thinking))
@@ -56361,6 +56575,7 @@ data: ${JSON.stringify(masterState(model, { running: false, queued: 0 }, null))}
     });
   }
   async ask(prompt, operationId) {
+    await this.requireIdentity();
     const id = operationId ?? crypto.randomUUID();
     const result = await this.harness.prompt(prompt, {
       operationId: id,
@@ -56386,6 +56601,7 @@ data: ${JSON.stringify(masterState(model, { running: false, queued: 0 }, null))}
     await this.harness.session().reset();
   }
   async submit(text, operationId) {
+    await this.requireIdentity();
     const receipt = await this.harness.submit(text, {
       operationId,
       entry: { kind: BOARD_MESSAGE_KIND, data: { messageId: operationId } }
@@ -56394,6 +56610,23 @@ data: ${JSON.stringify(masterState(model, { running: false, queued: 0 }, null))}
   }
   async pendingOperations() {
     return this.harness.pending();
+  }
+  async requireIdentity() {
+    const identity = this.options.identity;
+    if (identity)
+      assistantIdentityText(await identity());
+  }
+  async identityContextText() {
+    const identity = this.options.identity;
+    if (!identity)
+      throw new Error("This session has no identity context configured.");
+    return assistantIdentityText(await identity());
+  }
+  validatedThreadContext(context) {
+    const metadata = context?.metadata;
+    if (typeof context?.conversationId !== "string" || context.conversationId.length === 0 || metadata === null || typeof metadata !== "object" || Array.isArray(metadata))
+      throw new Error("The thread context is malformed.");
+    return context;
   }
   generationIdentity() {
     return readGenerationIdentity(this.ctx.storage.sql);
