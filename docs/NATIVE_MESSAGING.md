@@ -50,6 +50,155 @@ actor queue cannot claim it. A duplicate durable envelope returns its original
 disposition, without another provider call. Reusing an id with changed content
 is a conflict. This is broker idempotency, not a claim of provider idempotency.
 
+## Local connect recipe (Codex, Pi, Cursor, omp)
+
+CAD-1814's first wave is Codex, Pi, native Cursor (`agent`) and omp. Claude
+is deferred while its usage is unavailable; cloud/hosted runtimes and custom
+skills/MCP/memory are later work. On 2026-10-25, codex-cli 0.163.0, Pi
+1.4.0, native Cursor 2026.10.22-27dcf5f and omp 18.12.6 produced real replies
+in disposable state. Cursor -> omp and omp -> Codex peer requests produced
+model replies with recorded identities and one automatic return hop.
+The owned local runtime-to-daemon route below is separate from
+`agent connect`, which binds a local actor to a hosted workspace. Runtime
+versions are evidence, not certification of native steering.
+
+1. Instance and state, on a non-production board port:
+   `cadence dev up --name <n> --build <cadence>` then
+   `eval "$(cadence dev env <n>)"`. Pin the destination explicitly on every
+   later command (`--state-dir <root>/state`) and confirm
+   `cadence dev status <n>` reports that same `root` before reading or
+   mutating; `settings agents show` reports the settings revision separately
+   (step 3). This keeps a previously sourced
+   `CADENCE_STATE_DIR`/`CADENCE_PROFILE` from retargeting the instance. No
+   manual or exported credential copies are needed for the exercised
+   Codex/Pi route: Codex reads its normal configuration, while a managed Pi
+   worker gets the adapter's private auth.json copy under the state dir
+   (`PI_CODING_AGENT_DIR`; never env/argv, never `~/.pi` inheritance).
+2. Provider readiness is separate from Cadence:
+   `codex login status`, `pi auth check --provider <provider>`. For native
+   Cursor, check `agent models` as well as `agent status`: cached login
+   previously succeeded while catalog access and real inference refused.
+   Complete `agent login` when required, then prove an actual model reply.
+   OMP uses its native `agent.db`, not Pi's auth.json. Do not copy an entire
+   operator database or export credentials to the command line. Authenticate
+   a fresh private store BEFORE that worker's first Cadence launch:
+   `PI_CODING_AGENT_DIR=<sd>/agents/<omp>/pi omp login openai-codex`.
+   For SSH with a browser on another machine, the exercised native
+   `omp login openai-codex-device` method needs no localhost callback and
+   stores credentials under the same `openai-codex` provider. Keep the same
+   `PI_CODING_AGENT_DIR` on that command; approve in the browser, never paste
+   tokens into messages or logs.
+   Missing native auth or quota is a blocker, not a delivery failure to
+   substitute another account/provider around.
+3. Launch (no profile, skill, messaging MCP or memory service required):
+   `cadence codex --alias <codex> --role pm --cwd <repo> --detach`,
+   `cadence cursor --alias <cursor> --role pm --cwd <repo> --model <native-model> --detach`,
+   and `cadence join <group> pi --alias <pi>
+   --model <provider/model> --no-bootstrap --detach`. OMP uses
+   `cadence join <group> omp --alias <omp> --model <provider/model>
+   --no-bootstrap --detach`. There is no standalone `cadence pi` verb.
+   Pi/OMP workers require an operator-authorized worker model in
+   `Settings > Agents`; no silent provider fallback is used. Cursor uses
+   the native `agent` harness, not Cursor through Pi: the unsafe Pi
+   transport remains refused. A startup refusal lands in `attention`.
+   Seed only the intended row against the pinned destination as the operator;
+   re-read the revision before each mutation:
+
+   ```sh
+   cadence --state-dir <sd> settings agents show    # take .revision
+   cadence --state-dir <sd> settings agents provider put pi \
+     --kind pi-extension --expected-revision <rev1>
+   cadence --state-dir <sd> settings agents show    # new .revision
+   cadence --state-dir <sd> settings agents model put <provider/model> \
+     --provider pi --scope worker --expected-revision <rev2>
+   ```
+
+   `--expected-revision` is required on both mutations; a stale token is
+   refused with a conflict, so take the fresh one instead of retrying the
+   same call.
+4. Send and correlate: `cadence send <alias> --message <id> --text '…'
+   --wait`. The terminal receipt carries the provider's own `state`,
+   `result.text` and `result.turn_id`; `agent show` reports the session id and
+   `model_effective`/`model_reported`. `cadence message send` without
+   `--wait` answers once the envelope is durable (`queued`).
+5. Reply routing: `--reply-to <peer>` routes the finished turn's result to
+   that peer as a `worker_result` message with the recorded sender and
+   recipient uids. The routed copy has no `reply_to`, so it cannot loop; one
+   send produces the reply hop without a second manual delivery.
+
+   Peers read their own mailbox, not another actor's private mail. An
+   enrolled Cursor or omp actor can originate peer sends with its native
+   Cadence CLI. Codex's confined shell cannot open the daemon's Unix socket;
+   its adapter installs a curated local MCP bridge automatically, but the
+   observed bridge exposes no peer-send tool. Incoming peer requests and
+   automatic replies work; arbitrary Codex-originated peer sends are not
+   proved here. Do not widen confinement to work around this limitation.
+6. Operator surface: the Agent page's Message action opens
+   `/threads?dm=<alias>`, and the board's
+   `POST /api/threads/<alias>/messages` (`thread_send`) starts the canonical
+   home thread inside the enqueue transaction. `/api/threads/<alias>` and
+   `/api/work-conversations` then return the same id with the operator
+   message and the agent's `turn_result`.
+
+   A Home thread is per agent alias. Plain `cadence send`, dispatch and task
+   traffic do not create one; before it exists, read that work through
+   `agent show`/`inbox` (and agent↔agent pairs, below). Once the alias has a
+   Home thread, its timeline is alias-scoped: a CLI, dispatch, task or peer
+   turn that finishes for that alias is noted there too, so the thread can
+   show turns that were not started from the board. Full
+   conversation-scoped separation — only that conversation's traffic on a
+   conversation surface — is CAD-1812's later design and is not implemented
+   here. Agent↔agent traffic is a separate pair conversation: ordinary peer
+   messages are listed without a filter, while routed `worker_result` and
+   notice copies are system traffic and appear only with
+   `include_system=true`.
+7. Restart, dedup and unknown: `cadence dev reload` resumes registered agents
+   on their stored session ids and keeps message ids. Retrying the same
+   `--message` id with the same body answers `{"duplicate":true,…}` and starts
+   no second turn; different content for a used id is refused. A provider
+   connection lost mid-turn records the message `unknown` and fences the
+   agent in `attention` with the inspection note; the uncertain turn is never
+   replayed. `cadence agent unfence <alias>` is the explicit operator
+   reconcile (and resumes unless `--no-resume`). Turnless nudge uncertainty is
+   the non-fencing case and never fences the agent.
+
+Native steering on these versions: managed Claude refuses strict nudges;
+Codex refuses until its exact version is validated (0.160.0/0.161.0 above);
+Pi's generated guard opens turn admission only on Pi 1.0.0, so 1.4.0 serves
+ordinary turns and refuses strict nudges (`agent show` distinguishes
+`capabilities.native_turn_steering` from `native_turn_steering_enabled`).
+Ordinary queued delivery and observation are unaffected.
+
+OMP startup uses its own CLI flags and core-tool names, not Pi's
+`--offline`/`--no-themes`/`--no-prompt-templates` or `find`/`ls`. Fresh
+workers use `--session-dir` only when no native identity has been recorded.
+Once owned, a worker must resume its exact in-worker `session.current` file;
+a missing, dangling, outside-worker or mismatched-identity pointer refuses
+instead of adopting `session.jsonl` or silently creating another session.
+OMP's leading title slot is skipped when reading its actual session header.
+The saved working directory must match the requested launch directory:
+native OMP relocation is unsupported, so a home-to-lane move refuses rather
+than using Pi's fork switches or executing in the old home directory.
+
+The current-session pointer is recorded only once its file exists inside
+that worker's directory; a nonexistent initial path is not proof of
+resumability. A first session that never materialized cannot be resumed
+after shutdown. Preserve its history and refusal; do not delete pointers
+or replay uncertain input to obtain a fresh launch.
+
+OMP's ordinary prompt acknowledgment is not completion. Its matching
+`prompt_result` reports completed/aborted/error; when `sessionSettled` is
+false, the adapter waits for `session_settled` before dispatching the next
+durable task. A synchronous response with `data.agentInvoked=false` instead
+completes that local command immediately; no model turn or `prompt_result`
+will follow. This is command completion, not proof of model inference.
+An asynchronous native auth rejection becomes a failed receipt, not a
+permanently running task. Strict nudges remain disabled without verified
+runtime guard admission. Authenticated omp replies, materialized native
+session/header identity, serialized busy sends, peer routing and saved-history
+recall after actor and coordinator restarts were exercised on 18.12.6.
+This does not certify future native versions or cloud/hosted execution.
+
 ## Disposition is not task completion
 
 A native receipt can have message state `completed` with:

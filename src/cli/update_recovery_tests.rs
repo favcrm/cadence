@@ -377,7 +377,21 @@ fn cad628_real_host_preserves_legacy_board_arguments_without_ui_json() {
 fn cad1251_restart_passes_the_board_budget_and_start_board_retries() {
     let fixture = OldCli::new();
     fixture.claim("operator:cad628");
-    let board = board_stand_in(&fixture.state, &[]);
+    let ready = fixture.dir.path().join("board-ready");
+    let mut board = board_stand_in(&fixture.state, &[ready.as_os_str()]);
+    // Recovery models an already-serving board, not an in-flight exec.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            board.0.try_wait().unwrap().is_none(),
+            "board fixture exited before readiness"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "board fixture did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     std::fs::write(fixture.state.join("ui.pid"), board.0.id().to_string()).unwrap();
     // `ui start` records the budget variable; the first one fails, as a
     // timed-out proof does, the second succeeds.
