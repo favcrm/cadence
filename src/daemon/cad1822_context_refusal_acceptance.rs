@@ -3647,8 +3647,17 @@ fn cad1846_plain_kickoff_cannot_suppress_explicit_issue_job_dispatch() {
     assert_eq!(store.jobs(None, true).unwrap().len(), 1);
     assert_eq!(store.tasks_for_job(&job.id).unwrap().len(), 1);
     let task_messages = store.messages_for_task(task_id).unwrap();
-    assert_eq!(task_messages.len(), 1);
-    assert_eq!(task_messages[0].id, job_message);
+    let task_kickoffs = task_messages
+        .iter()
+        .filter(|message| message.source == "job_dispatch")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        task_kickoffs.len(),
+        1,
+        "the native task must have exactly one job_dispatch kickoff across all recipients"
+    );
+    assert_eq!(task_kickoffs[0].alias, WORKER);
+    assert_eq!(task_kickoffs[0].id, job_message);
 
     let job_pin = fixture.context_pin(WORKER, &job_message);
     assert_eq!(job_pin["task"], task_id);
@@ -3687,6 +3696,12 @@ fn cad1846_plain_kickoff_cannot_suppress_explicit_issue_job_dispatch() {
     let messages_before = fixture.message_ids(WORKER, None);
     let task_before = store.task(task_id).unwrap().to_json();
     let job_before = store.job(&job.id).unwrap().to_json();
+    let task_messages_before = store
+        .messages_for_task(task_id)
+        .unwrap()
+        .iter()
+        .map(|message| message.to_json())
+        .collect::<Vec<_>>();
     let retry = dispatch_job();
     assert_eq!(retry["dispatched"], json!(false), "{retry}");
     assert_eq!(retry["duplicate"], json!(true), "{retry}");
@@ -3698,7 +3713,17 @@ fn cad1846_plain_kickoff_cannot_suppress_explicit_issue_job_dispatch() {
     assert_eq!(fixture.message_ids(WORKER, None), messages_before);
     assert_eq!(store.jobs(None, true).unwrap().len(), 1);
     assert_eq!(store.tasks_for_job(&job.id).unwrap().len(), 1);
-    assert_eq!(store.messages_for_task(task_id).unwrap().len(), 1);
+    let task_messages_after = store
+        .messages_for_task(task_id)
+        .unwrap()
+        .iter()
+        .map(|message| message.to_json())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        task_messages_after,
+        task_messages_before,
+        "reported retry must not add, remove or modify any task-attached message, including PM notifications"
+    );
     assert_eq!(store.task(task_id).unwrap().to_json(), task_before);
     assert_eq!(store.job(&job.id).unwrap().to_json(), job_before);
     assert_eq!(fixture.context_pin(WORKER, &job_message), job_pin);
