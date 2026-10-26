@@ -704,6 +704,8 @@ pub fn send_authorized(
         // Filled by the admission transaction from the grant it is admitted
         // under; a draft never names its own lineage.
         grant_admitted_at: 0.0,
+        // Filled by the submission claim; a draft has never been claimed.
+        claimed_at: 0.0,
     };
     // A canonical message id is global. A collision with a different
     // target/source must refuse BEFORE any operation claim exists, and a
@@ -891,14 +893,17 @@ fn submit_queued(
     // returns, the row is `running` with no remote id and the readback
     // driver reconciles it; a never-woken `queued` row stays excluded.
     if !store.cloud_agent_operation_claim(&operation.cloud_agent_id, &operation.operation_id)? {
-        return store
-            .cloud_agent_operation(&operation.cloud_agent_id, &operation.operation_id)?
-            .ok_or_else(|| {
-                Error::gate_coded(
-                    "cloud_agent_operation_unknown",
-                    "cloud agent operation is unavailable",
-                )
-            });
+        // Another caller already claimed this operation — either it is in
+        // flight or it has settled since this caller read the row. The store
+        // row is the reconciliation target, never an answer: it may hold a
+        // settled reply, and this branch runs under submission authority
+        // alone. Refuse with a content-free conflict; a caller with read
+        // authority reads the operation back through the platform.
+        return Err(Error::conflict_coded(
+            "cloud_agent_operation_claimed",
+            "this operation id was already claimed and submitted by another caller; \
+             nothing was sent — read it back to see its state",
+        ));
     }
     let outcome = match transport.submit(target, &request) {
         Ok(outcome) => outcome,
@@ -1168,8 +1173,12 @@ fn read_operation_with(
     // A queue-only operation was never sent (no wake yet): reading it would
     // invent a remote "unknown" the contract never had and poison the later
     // explicit wake. Report the durable local queue state, zero transport.
+    // A CLAIMED row that the contract accepted as queued is not queue-only:
+    // it crossed the transport boundary, so only the platform can say what
+    // became of it.
     if operation.status == crate::store::cloud_agent::STATUS_QUEUED
         && operation.remote_operation_id.is_none()
+        && operation.claimed_at <= 0.0
     {
         return Ok(operation);
     }
@@ -1178,18 +1187,32 @@ fn read_operation_with(
     let outcome = match transport.read(target, &operation.conversation_id, operation_id, source) {
         Ok(outcome) => outcome,
         Err(Error::OutcomeUnknown(_)) => {
-            return store.cloud_agent_operation_set(
-                &operation.cloud_agent_id,
-                &operation.operation_id,
-                crate::store::cloud_agent::STATUS_UNKNOWN,
-                operation.remote_operation_id.as_deref(),
-                None,
-                None,
-                Some((
-                    "cloud_agent_uncertain",
-                    "readback was interrupted; the remote outcome is still unknown",
-                )),
-            );
+            // An unreachable readback proves nothing about the platform's
+            // state, so it may never be answered from the local receipt:
+            // that row can be settled and carry the reply text. A
+            // non-terminal row records the uncertainty for the reconciler;
+            // a settled receipt is left exactly as it is — the durable
+            // terminal receipt is kept for reconciliation, never deleted
+            // here and never served as this read's answer.
+            if !settled_before {
+                let _ = store.cloud_agent_operation_set(
+                    &operation.cloud_agent_id,
+                    &operation.operation_id,
+                    crate::store::cloud_agent::STATUS_UNKNOWN,
+                    operation.remote_operation_id.as_deref(),
+                    None,
+                    None,
+                    Some((
+                        "cloud_agent_uncertain",
+                        "readback was interrupted; the remote outcome is still unknown",
+                    )),
+                );
+            }
+            return Err(Error::unknown_coded(
+                "cloud_agent_uncertain",
+                "readback was unreachable; the remote outcome is still unknown — nothing \
+                 was served from the local receipt",
+            ));
         }
         Err(error) => return Err(error),
     };
@@ -1197,15 +1220,31 @@ fn read_operation_with(
         outcome.status,
         RemoteStatus::Completed | RemoteStatus::Failed
     );
+    if settled_before && !terminal {
+        // A late correlated readback may not reopen a settled receipt, and
+        // it must equally not be answered WITH that receipt: the platform's
+        // own answer to this read is nonterminal, so that is the state the
+        // caller gets, with no cached reply text in it.
+        let mut pending = operation.clone();
+        pending.status = outcome.status.as_str().to_string();
+        pending.remote_operation_id = outcome
+            .remote_operation_id
+            .or(pending.remote_operation_id.take());
+        pending.reply_text = None;
+        pending.reply_message_id = None;
+        pending.error_code = outcome.error.as_ref().map(|(code, _)| code.clone());
+        pending.error_message = outcome.error.as_ref().map(|(_, message)| message.clone());
+        return Ok(pending);
+    }
     let answer_status = outcome.status;
     let reply = outcome.reply.clone();
     let remote_operation_id = outcome.remote_operation_id.clone();
     let error = outcome.error.clone();
     let answer = apply_remote(store, agent, &operation, outcome)?;
-    if !settled_before || !terminal {
-        // A non-settled row is answered by the readback itself; a settled row
-        // receiving a stale intermediate answer keeps its terminal receipt
-        // (monotonic: the reply is never withdrawn by a late read).
+    if !settled_before {
+        // A non-settled row is answered by the readback itself. A settled row
+        // that settles here from a concurrent read keeps its terminal
+        // receipt (monotonic: the reply is never withdrawn by a late read).
         return Ok(answer);
     }
     if answer_status.as_str() != operation.status {

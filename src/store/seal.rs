@@ -1692,6 +1692,18 @@ impl Store {
                 if cloud_tables != 4 {
                     return Err(Error::rejected("owner witness database schema is unsupported"));
                 }
+                // The v57 operation receipt carries both admission witnesses:
+                // the consent lineage it was admitted under and the durable
+                // submission claim. A v57 database without them is not the
+                // schema this witness accepts.
+                let cloud_columns: i64 = wtx.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('cloud_agent_operations') WHERE name IN ('grant_admitted_at','claimed_at')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if cloud_columns != 2 {
+                    return Err(Error::rejected("owner witness database schema is unsupported"));
+                }
             }
             wtx.execute(
                 "INSERT INTO owner_witness(challenge,attempt,artifact_identity,epoch,db_schema,committed_at)

@@ -3259,8 +3259,10 @@ impl Shared {
                 let agent = self.store.agent(&alias)?;
                 // CAD-1853 review: this projection serialises the alias'
                 // messages (cloud requests and their reply text), so it takes
-                // the same source/owner decision as the dedicated cloud read.
-                self.admit_cloud_projection(&alias, peer_pid, "agent show")?;
+                // the same source/owner decision as the dedicated cloud read:
+                // current READ authority for the caller's own source, and
+                // only that source's messages.
+                let projection = self.admit_cloud_projection(&alias, peer_pid, "agent show")?;
                 let include_profile_instructions = match params.get("include_profile_instructions")
                 {
                     None | Some(Value::Null) => false,
@@ -3338,6 +3340,7 @@ impl Shared {
                 } else {
                     self.store.messages(&alias)?
                 };
+                let messages = projection.messages(&self.store, messages)?;
                 let mut agent_json = agent.to_json();
                 if profile_snapshot || catalogue_snapshot {
                     agent_json["instructions"] = json!(agent.instructions);

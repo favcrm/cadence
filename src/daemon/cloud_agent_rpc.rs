@@ -47,6 +47,101 @@ fn cloud_agent_id(params: &Value) -> Result<&str> {
     Ok(id)
 }
 
+/// The caller's own admitted view of one cloud alias.
+///
+/// An ordinary local alias carries no scopes and projects unchanged. A cloud
+/// alias carries the caller's own source per connection, and every projected
+/// row must resolve to an operation that source was admitted for.
+pub(super) struct CloudProjection {
+    scopes: Vec<(String, Source)>,
+}
+
+impl CloudProjection {
+    /// No cloud authority on this alias: nothing to filter.
+    fn ordinary() -> Self {
+        Self { scopes: Vec::new() }
+    }
+
+    /// Whether the operation a projected row belongs to was admitted for the
+    /// caller's own source. The operation row is the attribution witness: the
+    /// cloud request/reply carries no caller-supplied owner, and the canonical
+    /// message id IS the operation id. A row whose operation does not resolve
+    /// on this connection is never projected.
+    fn owns(&self, store: &crate::store::Store, message_id: &str) -> Result<bool> {
+        for (cloud_agent_id, source) in &self.scopes {
+            if let Some(operation) = store.cloud_agent_operation(cloud_agent_id, message_id)? {
+                return Ok(source.matches(&operation));
+            }
+        }
+        Ok(false)
+    }
+
+    pub(super) fn entries(
+        &self,
+        store: &crate::store::Store,
+        entries: Vec<crate::store::ThreadEntry>,
+    ) -> Result<Vec<crate::store::ThreadEntry>> {
+        if self.scopes.is_empty() {
+            return Ok(entries);
+        }
+        let mut kept = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let owned = match entry.message_id.as_deref() {
+                Some(id) => self.owns(store, id)?,
+                // A cloud thread carries no unattributable entry: an entry
+                // with no canonical message cannot be shown to be the
+                // caller's own.
+                None => false,
+            };
+            if owned {
+                kept.push(entry);
+            }
+        }
+        Ok(kept)
+    }
+
+    pub(super) fn messages(
+        &self,
+        store: &crate::store::Store,
+        messages: Vec<crate::store::Message>,
+    ) -> Result<Vec<crate::store::Message>> {
+        if self.scopes.is_empty() {
+            return Ok(messages);
+        }
+        let mut kept = Vec::with_capacity(messages.len());
+        for message in messages {
+            if self.owns(store, &message.id)? {
+                kept.push(message);
+            }
+        }
+        Ok(kept)
+    }
+
+    pub(super) fn events(
+        &self,
+        store: &crate::store::Store,
+        events: Vec<crate::store::Event>,
+    ) -> Result<Vec<crate::store::Event>> {
+        if self.scopes.is_empty() {
+            return Ok(events);
+        }
+        let mut kept = Vec::with_capacity(events.len());
+        for event in events {
+            let owned = match event.payload.get("message").and_then(Value::as_str) {
+                Some(id) => self.owns(store, id)?,
+                // Alias-level metadata (the connection itself) carries no
+                // request or result text; the read authority above already
+                // admitted the caller to this connection.
+                None => true,
+            };
+            if owned {
+                kept.push(event);
+            }
+        }
+        Ok(kept)
+    }
+}
+
 impl Shared {
     fn cloud_agent_target(agent: &crate::store::CloudAgent) -> RemoteTarget {
         Self::cloud_agent_target_for(agent, None)
@@ -229,27 +324,53 @@ impl Shared {
     /// content. `thread_read`, `agent_show` and `agent_events` all project a
     /// cloud target's request/result text, so each applies this same check
     /// instead of a bespoke one: the daemon-derived caller must hold the
-    /// authority the dedicated cloud reads require — the operator, or an
-    /// enrolled peer whose source grant is current on this connection, on the
-    /// split agent UID boundary. A plain local alias is untouched, so a
-    /// peer's own UID-bound reports keep working.
+    /// authority the dedicated cloud reads require — CURRENT read authority
+    /// on its own source (the operator, or an enrolled peer whose source
+    /// grant and credential are current on this connection, on the split
+    /// agent UID boundary). A plain local alias is untouched, so a peer's own
+    /// UID-bound reports keep working.
+    ///
+    /// The returned admission also binds every projected row: a cloud row is
+    /// shown only to the source/owner its operation was admitted for. The
+    /// operator is the owner of its own user source, never a blanket reader
+    /// of a peer's entries, and an enrolled peer never reads another
+    /// source's alias-wide history. When cloud content exists but no
+    /// authority metadata resolves at all — a restored workspace whose four
+    /// cloud tables were omitted — the projection fails closed.
     pub(super) fn admit_cloud_projection(
         &self,
         alias: &str,
         peer_pid: u32,
         verb: &str,
-    ) -> Result<()> {
-        if !self
-            .store
-            .agent_opt(alias)?
-            .is_some_and(|agent| agent.provider == crate::cloud_agent::PROVIDER)
-        {
-            return Ok(());
+    ) -> Result<CloudProjection> {
+        let cloud_agents = self.store.cloud_agents_for_alias(alias)?;
+        if cloud_agents.is_empty() {
+            let cloud_target = self
+                .store
+                .agent_opt(alias)?
+                .is_some_and(|agent| agent.provider == crate::cloud_agent::PROVIDER);
+            if cloud_target || self.store.alias_has_cloud_content(alias)? {
+                return Err(Error::gate_coded(
+                    "cloud_agent_authority_missing",
+                    format!(
+                        "{verb} refused: this alias holds cloud-agent content but no cloud \
+                         connection authority resolves; reconnect it explicitly"
+                    ),
+                ));
+            }
+            return Ok(CloudProjection::ordinary());
         }
-        for agent in self.store.cloud_agents_for_alias(alias)? {
-            self.cloud_agent_caller_source(&agent, peer_pid, verb)?;
+        let mut scopes = Vec::with_capacity(cloud_agents.len());
+        for agent in cloud_agents {
+            let (_, source) = self.cloud_agent_caller_source(&agent, peer_pid, verb)?;
+            // Current READ authority — connection state, the active grant and
+            // the scope on the verified credential/enrollment — not bare
+            // membership: a write-only operator must not read stored replies
+            // through a generic projection.
+            self.cloud_agent_authority(&agent, &source, SCOPE_READ)?;
+            scopes.push((agent.id, source));
         }
-        Ok(())
+        Ok(CloudProjection { scopes })
     }
 
     pub(super) fn rpc_cloud_agent(

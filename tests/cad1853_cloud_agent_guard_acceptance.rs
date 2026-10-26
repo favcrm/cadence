@@ -37,7 +37,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -71,10 +71,15 @@ struct Script {
     provenance: Option<Value>,
     submit_status: u16,
     submit_state: String,
+    submit_text: Option<String>,
     submit_accepted: bool,
     read_state: String,
     read_text: String,
     read_status: u16,
+    /// Drop a readback connection without an answer, as an unreachable
+    /// platform does: the published transport maps that to an unknown
+    /// outcome rather than to a refusal.
+    read_drop: bool,
     submit_delay_ms: u64,
     slow_read_operation: Option<String>,
     slow_read_ms: u64,
@@ -91,10 +96,12 @@ impl Script {
             provenance: None,
             submit_status: 0,
             submit_state: "queued".into(),
+            submit_text: None,
             submit_accepted: true,
             read_state: "completed".into(),
             read_text: "genuine stub reply".into(),
             read_status: 0,
+            read_drop: false,
             submit_delay_ms: 0,
             slow_read_operation: None,
             slow_read_ms: 0,
@@ -347,7 +354,7 @@ fn serve(mut stream: TcpStream, script: Arc<Mutex<Script>>) {
                             "status": script.submit_state,
                             "accepted": script.submit_accepted,
                             "invoker_id": "inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-                            "text": null,
+                            "text": script.submit_text,
                             "reason": null,
                         },
                     }),
@@ -355,6 +362,15 @@ fn serve(mut stream: TcpStream, script: Arc<Mutex<Script>>) {
             }
         }
         "readback" => {
+            let drop = {
+                let script = script.lock().unwrap_or_else(|e| e.into_inner());
+                script.read_drop
+            };
+            if drop {
+                // An unreachable platform: the socket closes with no answer.
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return;
+            }
             let script = script.lock().unwrap_or_else(|e| e.into_inner());
             if script.read_status != 0 {
                 (
@@ -504,6 +520,44 @@ fn write_login_owner(spec: LoginSpec<'_>) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
+/// Serve one state dir with the same isolated, seam-armed options every
+/// fixture daemon uses, and wait until it answers. The returned flag is the
+/// one the daemon obeys, so a caller can stop it without a `Fx`.
+fn spawn_daemon_at(
+    state: &Path,
+    pm: &Path,
+) -> (Arc<AtomicBool>, JoinHandle<cadence_agent::Result<()>>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let env = ProviderEnv::refusing_providers();
+    env.set("CADENCE_PM_DIR", pm.to_str().unwrap());
+    let opts = daemon::ServeOptions {
+        provider_env: env,
+        stop: Some(Arc::clone(&stop)),
+        test_seam: true,
+        slots: Some(Default::default()),
+        lease: Some(Default::default()),
+        auto_stop: Some(daemon::AutoStopSetting::off()),
+        agent_gc: Some(Default::default()),
+        report_router: Some(0),
+        checkup: Some(0),
+        ..Default::default()
+    };
+    let owned = state.to_path_buf();
+    let handle = thread::spawn(move || daemon::serve_with(&owned, opts));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while client::rpc_timeout(state, "health", json!({}), Duration::from_secs(1)).is_err()
+        || Seam::token_at(state).is_none()
+    {
+        assert!(
+            !handle.is_finished() && Instant::now() < deadline,
+            "daemon never started at {}",
+            state.display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    (stop, handle)
+}
+
 struct Fx {
     _env: EnvRestore,
     root: tempfile::TempDir,
@@ -577,42 +631,22 @@ impl Fx {
     }
 
     fn spawn_daemon(&mut self) {
-        let stop = Arc::new(AtomicBool::new(false));
-        self.stop = Arc::clone(&stop);
-        let state = self.state.clone();
-        let pm = self.pm.clone();
-        let env = ProviderEnv::refusing_providers();
-        env.set("CADENCE_PM_DIR", pm.to_str().unwrap());
-        let opts = daemon::ServeOptions {
-            provider_env: env,
-            stop: Some(stop),
-            test_seam: true,
-            slots: Some(Default::default()),
-            lease: Some(Default::default()),
-            auto_stop: Some(daemon::AutoStopSetting::off()),
-            agent_gc: Some(Default::default()),
-            report_router: Some(0),
-            checkup: Some(0),
-            ..Default::default()
-        };
-        self.daemon = Some(thread::spawn(move || daemon::serve_with(&state, opts)));
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while client::rpc_timeout(&self.state, "health", json!({}), Duration::from_secs(1)).is_err()
-            || Seam::token_at(&self.state).is_none()
-        {
-            assert!(
-                !self.daemon.as_ref().unwrap().is_finished() && Instant::now() < deadline,
-                "fixture daemon never started"
-            );
-            thread::sleep(Duration::from_millis(50));
-        }
+        let (stop, handle) = spawn_daemon_at(&self.state, &self.pm);
+        self.stop = stop;
+        self.daemon = Some(handle);
     }
 
-    fn restart(&mut self) {
+    /// Stop the daemon without starting another one, so a case can act on the
+    /// durable store exactly as a later restart will see it.
+    fn stop_daemon(&mut self) {
         self.stop.store(true, SeqCst);
         if let Some(handle) = self.daemon.take() {
             let _ = handle.join();
         }
+    }
+
+    fn restart(&mut self) {
+        self.stop_daemon();
         self.spawn_daemon();
     }
 
@@ -1835,31 +1869,41 @@ fn admitted_peer_source_settles_canonical_result_and_uid_bound_report() {
     );
 
     // Same native uid+stamp, different parent issuer/subject: the settled
-    // history is not disclosed and no transport is invoked.
-    struct NoTransport;
-    impl CloudTransport for NoTransport {
+    // history is not disclosed and no transport is invoked. The transport
+    // answers and counts, so the refusal can only be the source/owner check.
+    struct WouldAnswer(Arc<AtomicUsize>);
+    impl CloudTransport for WouldAnswer {
         fn connect(
             &self,
             _: &cadence_agent::remote_cli::RemoteTarget,
             _: &str,
         ) -> cadence_agent::Result<RemoteAgent> {
-            Err(cadence_agent::Error::rejected("no transport"))
+            Err(cadence_agent::Error::rejected("connect unused"))
         }
         fn submit(
             &self,
             _: &cadence_agent::remote_cli::RemoteTarget,
             _: &SubmitRequest<'_>,
         ) -> cadence_agent::Result<RemoteOperation> {
-            Err(cadence_agent::Error::rejected("no transport"))
+            Err(cadence_agent::Error::rejected("submit unused"))
         }
         fn read(
             &self,
             _: &cadence_agent::remote_cli::RemoteTarget,
             _: &str,
-            _: &str,
+            operation: &str,
             _: &Source,
         ) -> cadence_agent::Result<RemoteOperation> {
-            Err(cadence_agent::Error::rejected("no transport"))
+            self.0.fetch_add(1, SeqCst);
+            Ok(RemoteOperation {
+                status: RemoteStatus::Completed,
+                remote_operation_id: Some(operation.to_string()),
+                remote_session_id: None,
+                provider_session_id: None,
+                reply: Some("genuine stub reply".into()),
+                error: None,
+                invoker_id: Some("inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+            })
         }
         fn cancel(
             &self,
@@ -1868,16 +1912,17 @@ fn admitted_peer_source_settles_canonical_result_and_uid_bound_report() {
             _: &str,
             _: &Source,
         ) -> cadence_agent::Result<()> {
-            Err(cadence_agent::Error::rejected("no transport"))
+            Err(cadence_agent::Error::rejected("cancel unused"))
         }
     }
     let foreign = Source::registered(
         &peer,
         Owner::new("https://other-issuer.example.test", "other-parent"),
     );
+    let foreign_reads = Arc::new(AtomicUsize::new(0));
     let error = cloud_agent::read_operation(
         &store,
-        &NoTransport,
+        &WouldAnswer(Arc::clone(&foreign_reads)),
         &cloud,
         &target,
         OPERATION,
@@ -1885,9 +1930,15 @@ fn admitted_peer_source_settles_canonical_result_and_uid_bound_report() {
         || Ok(()),
     )
     .unwrap_err();
-    assert!(
-        !error.to_string().is_empty(),
-        "foreign owner read settled history"
+    assert_eq!(
+        code(&error),
+        Some("cloud_agent_source_mismatch"),
+        "a foreign owner was stopped by something other than the source check: {error}"
+    );
+    assert_eq!(
+        foreign_reads.load(SeqCst),
+        0,
+        "a foreign owner reached the transport"
     );
     // Same human subject, different issuer is the additional old-bug catch.
     let foreign_issuer = Source::operator(Owner::new(
@@ -1896,7 +1947,7 @@ fn admitted_peer_source_settles_canonical_result_and_uid_bound_report() {
     ));
     let error = cloud_agent::read_operation(
         &store,
-        &NoTransport,
+        &WouldAnswer(Arc::clone(&foreign_reads)),
         &cloud,
         &target,
         OPERATION,
@@ -1904,9 +1955,15 @@ fn admitted_peer_source_settles_canonical_result_and_uid_bound_report() {
         || Ok(()),
     )
     .unwrap_err();
-    assert!(
-        !error.to_string().is_empty(),
-        "different issuer read settled history"
+    assert_eq!(
+        code(&error),
+        Some("cloud_agent_source_mismatch"),
+        "a different issuer was stopped by something other than the source check: {error}"
+    );
+    assert_eq!(
+        foreign_reads.load(SeqCst),
+        0,
+        "a different issuer reached the transport"
     );
 }
 
@@ -2590,37 +2647,45 @@ fn intermediate_unknown_does_not_consume_the_final_report_id() {
 #[test]
 fn a_foreign_owner_cannot_read_the_settled_history() {
     use cadence_agent::cloud_agent::{
-        self, CloudTransport, RemoteAgent, RemoteOperation, Source, SubmitRequest,
+        self, CloudTransport, RemoteAgent, RemoteOperation, RemoteStatus, Source, SubmitRequest,
     };
     use cadence_agent::remote_cli::RemoteTarget;
     use cadence_agent::store::Owner;
 
-    struct NoTransport;
-    impl CloudTransport for NoTransport {
+    /// A transport that WOULD answer with a genuine settled reply and counts
+    /// every call. A foreign-owner refusal must come from the admission
+    /// decision itself, so a deleted source check cannot hide behind a
+    /// transport that also refuses: this one refuses nothing, and the only
+    /// way the read is stopped is the source/owner comparison.
+    struct WouldAnswer(Arc<AtomicUsize>);
+    impl CloudTransport for WouldAnswer {
         fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
-            Err(cadence_agent::Error::rejected(
-                "no transport in this bad case",
-            ))
+            Err(cadence_agent::Error::rejected("connect unused"))
         }
         fn submit(
             &self,
             _: &RemoteTarget,
             _: &SubmitRequest<'_>,
         ) -> cadence_agent::Result<RemoteOperation> {
-            Err(cadence_agent::Error::rejected(
-                "no transport in this bad case",
-            ))
+            Err(cadence_agent::Error::rejected("submit unused"))
         }
         fn read(
             &self,
             _: &RemoteTarget,
             _: &str,
-            _: &str,
+            operation: &str,
             _: &Source,
         ) -> cadence_agent::Result<RemoteOperation> {
-            Err(cadence_agent::Error::rejected(
-                "no transport in this bad case",
-            ))
+            self.0.fetch_add(1, SeqCst);
+            Ok(RemoteOperation {
+                status: RemoteStatus::Completed,
+                remote_operation_id: Some(operation.to_string()),
+                remote_session_id: None,
+                provider_session_id: None,
+                reply: Some("genuine stub reply".into()),
+                error: None,
+                invoker_id: Some("inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+            })
         }
         fn cancel(
             &self,
@@ -2629,9 +2694,7 @@ fn a_foreign_owner_cannot_read_the_settled_history() {
             _: &str,
             _: &Source,
         ) -> cadence_agent::Result<()> {
-            Err(cadence_agent::Error::rejected(
-                "no transport in this bad case",
-            ))
+            Err(cadence_agent::Error::rejected("cancel unused"))
         }
     }
 
@@ -2667,10 +2730,13 @@ fn a_foreign_owner_cannot_read_the_settled_history() {
         "https://other-issuer.example.test",
         "other-subject",
     ));
+    // Nothing but the source/owner comparison may stop this: the transport
+    // answers and is counted, and the platform is never reached.
+    let foreign_reads = Arc::new(AtomicUsize::new(0));
     let readbacks_before_foreign = fx.stub.calls("readback");
     let foreign_error = cloud_agent::read_operation(
         &store,
-        &NoTransport,
+        &WouldAnswer(Arc::clone(&foreign_reads)),
         &agent,
         &target,
         OPERATION,
@@ -2678,14 +2744,24 @@ fn a_foreign_owner_cannot_read_the_settled_history() {
         || Ok(()),
     )
     .unwrap_err();
-    assert!(
-        !foreign_error.to_string().is_empty(),
-        "a foreign owner read the settled history"
+    assert_eq!(
+        code(&foreign_error),
+        Some("cloud_agent_source_mismatch"),
+        "a foreign owner was stopped by something other than the source check: {foreign_error}"
+    );
+    assert_eq!(
+        foreign_reads.load(SeqCst),
+        0,
+        "a foreign owner reached the transport"
     );
     assert_eq!(
         fx.stub.calls("readback"),
         readbacks_before_foreign,
         "a foreign owner reached the upstream readback"
+    );
+    assert!(
+        !foreign_error.to_string().contains("genuine stub reply"),
+        "the foreign refusal carried the cached reply: {foreign_error}"
     );
 
     // An admitted settled read is only served after the platform's own
@@ -3654,4 +3730,1493 @@ fn the_board_http_peer_refuses_a_peer_forged_or_unproven_caller() {
     assert_eq!(status, 200, "{accepted}");
     assert_eq!(accepted["operation"]["operation_id"], json!(OPERATION));
     assert_eq!(fx.stub.calls("submit"), 1);
+}
+
+// ---------- round three: the claim, projection, readback and portable guards ----------
+
+/// A submission claim is exclusive and permanent. Two identical wakes race;
+/// the winner claims and settles, READ authority is then gone, and the loser
+/// is still told only that the operation was claimed — never handed the
+/// settled reply, never granted a readback and never allowed a second turn.
+#[test]
+fn a_lost_submit_claim_returns_the_conflict_without_content_or_a_second_submit() {
+    use cadence_agent::cloud_agent::{
+        self, Authority, CloudTransport, RemoteAgent, RemoteOperation, RemoteStatus, Sender,
+        Source, SubmitRequest, SCOPE_READ, SCOPE_WRITE,
+    };
+    use cadence_agent::remote_cli::RemoteTarget;
+    use cadence_agent::store::Owner;
+
+    const WINNER: &str = "the reply the winner settled";
+
+    /// Answers anything it is asked and counts it, so "the loser never sent"
+    /// is a counted effect rather than an inference from an error.
+    struct Counted {
+        submits: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
+        reply: &'static str,
+    }
+    impl CloudTransport for Counted {
+        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+            Err(cadence_agent::Error::rejected("connect unused"))
+        }
+        fn submit(
+            &self,
+            _: &RemoteTarget,
+            request: &SubmitRequest<'_>,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            self.submits.fetch_add(1, SeqCst);
+            Ok(RemoteOperation {
+                status: RemoteStatus::Completed,
+                remote_operation_id: Some(request.operation_id.to_string()),
+                remote_session_id: None,
+                provider_session_id: None,
+                reply: Some(self.reply.to_string()),
+                error: None,
+                invoker_id: Some("inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+            })
+        }
+        fn read(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            operation: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            self.reads.fetch_add(1, SeqCst);
+            Ok(RemoteOperation {
+                status: RemoteStatus::Completed,
+                remote_operation_id: Some(operation.to_string()),
+                remote_session_id: None,
+                provider_session_id: None,
+                reply: Some(self.reply.to_string()),
+                error: None,
+                invoker_id: Some("inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+            })
+        }
+        fn cancel(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<()> {
+            Err(cadence_agent::Error::rejected("cancel unused"))
+        }
+    }
+
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    // Queue without waking: the row is `queued` and has never been claimed.
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": false,
+        }),
+    )
+    .unwrap();
+    assert_eq!(fx.stub.calls("submit"), 0);
+    let queued = fx
+        .store()
+        .cloud_agent_operation(&id, OPERATION)
+        .unwrap()
+        .expect("queued operation");
+    assert_eq!(queued.status, "queued");
+    assert_eq!(queued.claimed_at, 0.0);
+
+    // READ scope is removed from the saved login; WRITE authority — the
+    // submission gate — remains, exactly as a real partial revocation leaves
+    // it.
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    write_login(ORG, ORG_ID, &fx.stub.url, &["cloud_agent.write"], expires);
+
+    let store = fx.store();
+    let cloud = store.cloud_agent(&id).unwrap().expect("cloud agent");
+    let target = RemoteTarget {
+        org: cloud.org_slug.clone(),
+        endpoint: cloud.endpoint.clone(),
+        org_id: cloud.organization_id.clone(),
+        identity: None,
+    };
+    let source = Sender::Operator
+        .source_for(&store, &target)
+        .expect("the saved login still proves the operator's owner");
+    assert_eq!(
+        source.owner,
+        Owner::new("https://issuer.example.test", "stub-subject")
+    );
+
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let submit_authority_calls = Arc::new(AtomicUsize::new(0));
+    let read_authority_calls = Arc::new(AtomicUsize::new(0));
+    let loser_submits = Arc::new(AtomicUsize::new(0));
+    let loser_reads = Arc::new(AtomicUsize::new(0));
+    let loser = {
+        let state = fx.state.clone();
+        let thread_id = home.clone();
+        let (cloud, target, source) = (cloud.clone(), target.clone(), source.clone());
+        let (submit_calls, read_calls) = (
+            Arc::clone(&submit_authority_calls),
+            Arc::clone(&read_authority_calls),
+        );
+        let submits = Arc::clone(&loser_submits);
+        let reads = Arc::clone(&loser_reads);
+        thread::spawn(move || {
+            let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+            // The daemon's own two gates against the fixture's real
+            // credential: submission authority passes, read authority fails.
+            let submit = || {
+                submit_calls.fetch_add(1, SeqCst);
+                let proven = cadence_agent::remote_cli::cloud_agent_credential_owned(
+                    &target,
+                    SCOPE_WRITE,
+                    Some(&source.owner),
+                );
+                parked_tx.send(()).expect("the winning caller never ran");
+                // The winner claims and settles while this caller is parked
+                // exactly here: past authorization, before the claim.
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                proven
+            };
+            let read = || {
+                read_calls.fetch_add(1, SeqCst);
+                cadence_agent::remote_cli::cloud_agent_credential_owned(
+                    &target,
+                    SCOPE_READ,
+                    Some(&source.owner),
+                )
+            };
+            cloud_agent::send_authorized(
+                &store,
+                &Counted {
+                    submits,
+                    reads,
+                    reply: "the loser never sends",
+                },
+                &cloud,
+                &target,
+                cloud_agent::SendRequest {
+                    thread_id: &thread_id,
+                    sender: &Sender::Operator,
+                    source: &source,
+                    operation_id: OPERATION,
+                    text: TEXT,
+                    wake: true,
+                    expected_recipient_uid: None,
+                },
+                &Authority {
+                    submit: &submit,
+                    read: &read,
+                },
+            )
+        })
+    };
+    parked_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the losing caller never reached its submission authority");
+    // The winner is the daemon's own send route under the same write-only
+    // login: it claims the queued row and settles it in one accepted turn.
+    fx.stub.set(|script| {
+        script.submit_state = "completed".into();
+        script.submit_text = Some(WINNER.to_string());
+    });
+    let won = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_send",
+            json!({
+                "cloud_agent_id": id, "thread_id": home,
+                "text": TEXT, "operation_id": OPERATION, "wake": true,
+            }),
+        )
+        .expect("the winner must claim and submit the queued request");
+    assert_eq!(won["operation"]["status"], json!("completed"));
+    assert_eq!(won["operation"]["reply"]["text"], json!(WINNER));
+    assert_eq!(fx.stub.calls("submit"), 1, "the winner did not submit once");
+    assert_eq!(
+        fx.stub.calls("readback"),
+        0,
+        "the winner needed no readback"
+    );
+    let settled = fx
+        .store()
+        .cloud_agent_operation(&id, OPERATION)
+        .unwrap()
+        .expect("settled operation");
+    assert_eq!(settled.status, "completed");
+    assert!(
+        settled.claimed_at > 0.0,
+        "the winning claim was not recorded"
+    );
+    assert_eq!(settled.reply_text.as_deref(), Some(WINNER));
+
+    let _ = release_tx.send(());
+    let error = loser
+        .join()
+        .expect("the losing caller panicked")
+        .expect_err("the loser must not be handed the settled operation");
+    assert_eq!(
+        code(&error),
+        Some("cloud_agent_operation_claimed"),
+        "{error}"
+    );
+    assert_eq!(error.kind(), "conflict", "{error}");
+    assert!(
+        !error.to_string().contains(WINNER),
+        "the losing claim returned the settled reply: {error}"
+    );
+    assert_eq!(
+        submit_authority_calls.load(SeqCst),
+        1,
+        "the losing branch never proved submission authority"
+    );
+    assert_eq!(
+        read_authority_calls.load(SeqCst),
+        0,
+        "the losing branch consulted read authority"
+    );
+    assert_eq!(
+        loser_submits.load(SeqCst),
+        0,
+        "the loser crossed the submission boundary"
+    );
+    assert_eq!(
+        loser_reads.load(SeqCst),
+        0,
+        "the loser performed a readback"
+    );
+    assert_eq!(
+        fx.stub.calls("submit"),
+        1,
+        "a second model turn was submitted"
+    );
+    assert_eq!(
+        fx.stub.calls("readback"),
+        0,
+        "the losing claim performed a readback"
+    );
+    let texts: Vec<String> = fx
+        .store()
+        .thread_entries(ALIAS, 0, 100)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.text)
+        .collect();
+    assert_eq!(
+        texts.iter().filter(|text| *text == WINNER).count(),
+        1,
+        "{texts:?}"
+    );
+    assert_eq!(
+        texts.iter().filter(|text| *text == TEXT).count(),
+        1,
+        "{texts:?}"
+    );
+}
+
+/// The claim is durable eligibility, not just `status='queued'`: an accepted
+/// queued answer that names no remote operation id leaves the row `queued`,
+/// and a delayed identical wake still may not submit it. Restart recovery
+/// remains readback-only for that row.
+#[test]
+fn an_accepted_queued_claim_cannot_re_fire_and_restart_reconciles_by_readback() {
+    use cadence_agent::cloud_agent::{
+        self, Authority, CloudTransport, RemoteAgent, RemoteOperation, RemoteStatus, Sender,
+        Source, SubmitRequest,
+    };
+    use cadence_agent::remote_cli::RemoteTarget;
+
+    /// The contract's accepted-queued answer: the turn was accepted, but no
+    /// remote operation id came back. Every call is counted.
+    struct AcceptedQueued(Arc<AtomicUsize>);
+    impl CloudTransport for AcceptedQueued {
+        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+            Err(cadence_agent::Error::rejected("connect unused"))
+        }
+        fn submit(
+            &self,
+            _: &RemoteTarget,
+            _: &SubmitRequest<'_>,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            self.0.fetch_add(1, SeqCst);
+            Ok(RemoteOperation {
+                status: RemoteStatus::Queued,
+                remote_operation_id: None,
+                remote_session_id: None,
+                provider_session_id: None,
+                reply: None,
+                error: None,
+                invoker_id: Some("inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+            })
+        }
+        fn read(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Err(cadence_agent::Error::rejected(
+                "this fake never reads back; the daemon owns recovery",
+            ))
+        }
+        fn cancel(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<()> {
+            Err(cadence_agent::Error::rejected("cancel unused"))
+        }
+    }
+
+    let mut fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    // The daemon is stopped so nothing but this case can touch the row
+    // before the deliberate delayed wake.
+    fx.stop_daemon();
+    let store = fx.store();
+    let cloud = store.cloud_agent(&id).unwrap().expect("cloud agent");
+    let target = RemoteTarget {
+        org: cloud.org_slug.clone(),
+        endpoint: cloud.endpoint.clone(),
+        org_id: cloud.organization_id.clone(),
+        identity: None,
+    };
+    let source = Sender::Operator
+        .source_for(&store, &target)
+        .expect("operator source");
+    let submits = Arc::new(AtomicUsize::new(0));
+    cloud_agent::send(
+        &store,
+        &AcceptedQueued(Arc::clone(&submits)),
+        &cloud,
+        &target,
+        &home,
+        &Sender::Operator,
+        &source,
+        OPERATION,
+        TEXT,
+        true,
+        None,
+        || Ok(()),
+    )
+    .expect("an accepted-queued answer is a success");
+    assert_eq!(submits.load(SeqCst), 1, "the first wake did not submit");
+    let claimed = store
+        .cloud_agent_operation(&id, OPERATION)
+        .unwrap()
+        .expect("operation");
+    assert_eq!(
+        claimed.status, "queued",
+        "an accepted-queued answer must stay nonterminal"
+    );
+    assert_eq!(claimed.remote_operation_id, None);
+    assert!(
+        claimed.claimed_at > 0.0,
+        "the accepted-queued submit recorded no claim"
+    );
+    assert!(claimed.reply_text.is_none());
+
+    // A delayed identical wake: eligibility is durable, so no second submit.
+    let second = Arc::new(AtomicUsize::new(0));
+    let allow = || -> cadence_agent::Result<()> { Ok(()) };
+    let error = cloud_agent::send_authorized(
+        &store,
+        &AcceptedQueued(Arc::clone(&second)),
+        &cloud,
+        &target,
+        cloud_agent::SendRequest {
+            thread_id: &home,
+            sender: &Sender::Operator,
+            source: &source,
+            operation_id: OPERATION,
+            text: TEXT,
+            wake: true,
+            expected_recipient_uid: None,
+        },
+        &Authority {
+            submit: &allow,
+            read: &allow,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        code(&error),
+        Some("cloud_agent_operation_claimed"),
+        "{error}"
+    );
+    assert_eq!(
+        second.load(SeqCst),
+        0,
+        "an already-claimed turn was submitted again"
+    );
+    let after = store
+        .cloud_agent_operation(&id, OPERATION)
+        .unwrap()
+        .expect("operation");
+    assert_eq!(after.status, claimed.status);
+    assert_eq!(after.claimed_at, claimed.claimed_at);
+    assert!(after.reply_text.is_none());
+    assert_eq!(
+        fx.stub.calls("submit"),
+        0,
+        "a fake claim reached the real model boundary"
+    );
+
+    // Restart recovery must reconcile the claimed-queued row by READBACK and
+    // never by submitting it again.
+    fx.restart();
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let current = fx
+            .store()
+            .cloud_agent_operation(&id, OPERATION)
+            .unwrap()
+            .expect("operation");
+        if current.status == "completed" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "restart never reconciled the claimed queued row: {current:?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let settled = fx
+        .store()
+        .cloud_agent_operation(&id, OPERATION)
+        .unwrap()
+        .expect("operation");
+    assert_eq!(settled.reply_text.as_deref(), Some("genuine stub reply"));
+    assert_eq!(
+        fx.stub.calls("readback"),
+        1,
+        "restart recovery did not read the row back"
+    );
+    assert_eq!(
+        fx.stub.calls("submit"),
+        0,
+        "restart recovery resubmitted the claimed turn"
+    );
+    let replies = fx
+        .store()
+        .thread_entries(ALIAS, 0, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.text == "genuine stub reply")
+        .count();
+    assert_eq!(replies, 1, "restart recovery recorded {replies} results");
+}
+
+/// Every generic projection of a cloud alias demands CURRENT read authority,
+/// not bare connection membership: a write-only operator gets no stored reply
+/// from `thread_read`, `agent_show` or `agent_events`.
+#[test]
+fn a_write_only_operator_cannot_read_cloud_content_through_generic_projections() {
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_read",
+        json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+    )
+    .unwrap();
+    assert_eq!(fx.stub.calls("readback"), 1);
+
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    write_login(ORG, ORG_ID, &fx.stub.url, &["cloud_agent.write"], expires);
+    for (method, params) in [
+        ("thread_read", json!({"alias": ALIAS})),
+        ("agent_show", json!({"alias": ALIAS})),
+        ("agent_events", json!({"alias": ALIAS, "after": 0})),
+    ] {
+        let error = fx
+            .call(Asserted::Operator, method, params.clone())
+            .unwrap_err();
+        assert_eq!(
+            code(&error),
+            Some("cloud_agent_scope_revoked"),
+            "{method}: {error}"
+        );
+        assert!(
+            !error.to_string().contains("genuine stub reply"),
+            "{method} disclosed the reply: {error}"
+        );
+    }
+
+    // Positive control: the same three projections serve the durable reply
+    // again once the saved login carries read authority.
+    write_login(
+        ORG,
+        ORG_ID,
+        &fx.stub.url,
+        &["cloud_agent.read", "cloud_agent.write"],
+        expires,
+    );
+    for (method, params) in [
+        ("thread_read", json!({"alias": ALIAS})),
+        ("agent_show", json!({"alias": ALIAS})),
+        ("agent_events", json!({"alias": ALIAS, "after": 0})),
+    ] {
+        let value = fx
+            .call(Asserted::Operator, method, params)
+            .unwrap_or_else(|e| panic!("{method} refused the owner's restored read: {e}"));
+        assert!(
+            value.to_string().contains("genuine stub reply"),
+            "{method} did not serve the reply: {value}"
+        );
+    }
+}
+
+/// The projection binds each row to the source its operation was admitted
+/// for: another source's request and reply never appear in the operator's
+/// view of the same cloud alias.
+#[test]
+fn a_cloud_projection_shows_only_the_callers_own_source_rows() {
+    use cadence_agent::cloud_agent::{
+        self, CloudTransport, RemoteAgent, RemoteOperation, RemoteStatus, Sender, Source,
+        SubmitRequest,
+    };
+    use cadence_agent::remote_cli::RemoteTarget;
+    use cadence_agent::store::cloud_agent::{CloudSource, Owner};
+
+    struct PeerReply;
+    impl CloudTransport for PeerReply {
+        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+            Err(cadence_agent::Error::rejected("connect unused"))
+        }
+        fn submit(
+            &self,
+            _: &RemoteTarget,
+            request: &SubmitRequest<'_>,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Ok(RemoteOperation {
+                status: RemoteStatus::Completed,
+                remote_operation_id: Some(request.operation_id.to_string()),
+                remote_session_id: None,
+                provider_session_id: None,
+                reply: Some("peer-only reply".into()),
+                error: None,
+                invoker_id: Some("inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+            })
+        }
+        fn read(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Err(cadence_agent::Error::rejected("read unused"))
+        }
+        fn cancel(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<()> {
+            Err(cadence_agent::Error::rejected("cancel unused"))
+        }
+    }
+
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    // The caller's OWN settled turn.
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_read",
+        json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+    )
+    .unwrap();
+
+    // A second source admitted on the same connection, with its own settled
+    // turn on the same canonical work conversation.
+    fx.call(
+        Asserted::Operator,
+        "agent_register",
+        json!({"alias": "peer", "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
+    )
+    .unwrap();
+    let store = fx.store();
+    let cloud = store.cloud_agent(&id).unwrap().expect("cloud agent");
+    let peer = store.agent("peer").unwrap();
+    let stamp = cadence_agent::cloud_agent::registration_epoch(peer.created);
+    let owner = Owner::new("https://issuer.example.test", "stub-subject");
+    store
+        .cloud_agent_source_grant(&CloudSource {
+            cloud_agent_id: id.clone(),
+            kind: "local_peer".into(),
+            uid: peer.uid.clone(),
+            registration_epoch: stamp,
+            owner: owner.clone(),
+            label: "peer".into(),
+            scope: "cloud_agent.write".into(),
+            granted_by: "operator".into(),
+            granted_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+            invoker_id: None,
+            state: "active".into(),
+        })
+        .unwrap();
+    let target = RemoteTarget {
+        org: cloud.org_slug.clone(),
+        endpoint: cloud.endpoint.clone(),
+        org_id: cloud.organization_id.clone(),
+        identity: None,
+    };
+    // The enrolled peer record is what `source_for` reads; with it present,
+    // the only thing left to stop the peer is the split-UID boundary.
+    cadence_agent::remote_cli::cloud_agent_save_peer(
+        &target,
+        &owner,
+        &peer.uid,
+        stamp,
+        &json!({
+            "agent_id": "hca_native_guard_peer",
+            "credential_id": "hcp_native_guard_peer",
+            "token": format!("hct_{}", "p".repeat(43)),
+            "expires_at": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 600,
+            "role": "cloud_agent",
+            "sender": {"uid": peer.uid, "registration_epoch": stamp},
+        }),
+    )
+    .unwrap();
+    let source = Source::registered(&peer, owner);
+    cloud_agent::send(
+        &store,
+        &PeerReply,
+        &cloud,
+        &target,
+        &home,
+        &Sender::Agent("peer".into()),
+        &source,
+        "peer-operation-0001",
+        "peer request body",
+        true,
+        None,
+        || Ok(()),
+    )
+    .expect("the admitted peer source settles its own turn");
+    let peer_operation = store
+        .cloud_agent_operation(&id, "peer-operation-0001")
+        .unwrap()
+        .expect("peer operation");
+    assert_eq!(peer_operation.status, "completed");
+
+    for (method, params) in [
+        ("thread_read", json!({"alias": ALIAS})),
+        ("agent_show", json!({"alias": ALIAS})),
+        ("agent_events", json!({"alias": ALIAS, "after": 0})),
+    ] {
+        let value = fx
+            .call(Asserted::Operator, method, params)
+            .unwrap_or_else(|e| panic!("{method} refused the owner: {e}"));
+        let text = value.to_string();
+        assert!(
+            text.contains("genuine stub reply"),
+            "{method} lost the caller's own result: {value}"
+        );
+        assert!(
+            !text.contains("peer-only reply"),
+            "{method} projected another source's reply: {value}"
+        );
+        assert!(
+            !text.contains("peer request body"),
+            "{method} projected another source's request: {value}"
+        );
+    }
+
+    // This fixture runs same-UID, where a peer's cloud projection is refused
+    // before the row filter by the split-UID boundary itself. The enrolled
+    // peer therefore reads nothing (and certainly not the operator's reply).
+    let error = fx
+        .call(
+            Asserted::Agent("peer".into()),
+            "thread_read",
+            json!({"alias": ALIAS}),
+        )
+        .unwrap_err();
+    assert_eq!(
+        code(&error),
+        Some("cloud_agent_peer_isolation_required"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("genuine stub reply"));
+}
+
+/// The cloud projection guard must not over-refuse: a non-cloud alias and an
+/// ordinary UID-bound peer report keep projecting for the operator and for
+/// the posting agent.
+#[test]
+fn a_non_cloud_alias_and_a_uid_bound_peer_report_still_project() {
+    let fx = Fx::start();
+    fx.connect();
+    fx.call(
+        Asserted::Operator,
+        "agent_register",
+        json!({"alias": "worker", "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "agent_register",
+        json!({"alias": "peer", "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
+    )
+    .unwrap();
+    // An ordinary UID-bound peer report into a NON-cloud alias, over the
+    // agents' own send route (`cadence send`, not `thread_send`).
+    fx.call(
+        Asserted::Agent("peer".into()),
+        "agent_send",
+        json!({
+            "alias": "worker", "text": "uid-bound peer report",
+            "message": "m-peer-report-0001",
+        }),
+    )
+    .unwrap();
+    let store = fx.store();
+    let peer = store.agent("peer").unwrap();
+    let report = store
+        .message("m-peer-report-0001")
+        .unwrap()
+        .expect("peer report row");
+    assert_eq!(
+        report.sender_uid.as_deref(),
+        Some(peer.uid.as_str()),
+        "the peer report lost its UID attribution"
+    );
+
+    // `agent_show` projects the alias' messages: the peer's report is there
+    // for the operator AND for the posting peer, with its UID attribution.
+    for who in [Asserted::Operator, Asserted::Agent("peer".into())] {
+        let shown = fx
+            .call(who, "agent_show", json!({"alias": "worker"}))
+            .unwrap_or_else(|e| panic!("agent_show refused ordinary local work: {e}"));
+        assert!(
+            shown.to_string().contains("uid-bound peer report"),
+            "agent_show lost the peer report: {shown}"
+        );
+    }
+    // `thread_read` projects thread entries, and this untargeted send wrote
+    // none; what matters is that the cloud projection guard does not refuse a
+    // non-cloud alias for either caller.
+    for who in [Asserted::Operator, Asserted::Agent("peer".into())] {
+        let thread = fx
+            .call(who, "thread_read", json!({"alias": "worker"}))
+            .expect("thread_read must keep working on a non-cloud alias");
+        assert!(
+            thread["entries"].is_array(),
+            "thread_read broke on a non-cloud alias: {thread}"
+        );
+    }
+}
+
+/// Cloud content whose four authority tables do not resolve fails closed:
+/// the projection refuses rather than treating the alias as an ordinary
+/// local agent.
+#[test]
+fn cloud_content_without_resolvable_authority_fails_closed() {
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_read",
+        json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+    )
+    .unwrap();
+
+    // Remove exactly what a restored coordination package never carries: the
+    // connection, grant, session and receipt authority. The request and
+    // result rows stay, which is the state that must fail closed.
+    {
+        let conn = rusqlite::Connection::open(fx.state.join("cadence.sqlite3")).unwrap();
+        conn.busy_timeout(Duration::from_secs(10)).unwrap();
+        for sql in [
+            "DELETE FROM cloud_agent_operations WHERE cloud_agent_id=?1",
+            "DELETE FROM cloud_agent_sessions WHERE cloud_agent_id=?1",
+            "DELETE FROM cloud_agent_sources WHERE cloud_agent_id=?1",
+            "DELETE FROM cloud_agents WHERE id=?1",
+        ] {
+            conn.execute(sql, [id.as_str()]).unwrap();
+        }
+    }
+    let store = fx.store();
+    assert!(
+        store.cloud_agents_for_alias(ALIAS).unwrap().is_empty(),
+        "the fixture still resolves cloud authority"
+    );
+    assert!(
+        store.alias_has_cloud_content(ALIAS).unwrap(),
+        "the fixture lost the cloud content it asserts about"
+    );
+
+    for (method, params) in [
+        ("thread_read", json!({"alias": ALIAS})),
+        ("agent_show", json!({"alias": ALIAS})),
+        ("agent_events", json!({"alias": ALIAS, "after": 0})),
+    ] {
+        let error = fx.call(Asserted::Operator, method, params).unwrap_err();
+        assert_eq!(
+            code(&error),
+            Some("cloud_agent_authority_missing"),
+            "{method}: {error}"
+        );
+        assert!(
+            !error.to_string().contains("genuine stub reply"),
+            "{method} disclosed the reply: {error}"
+        );
+    }
+}
+
+/// An unreachable readback proves nothing, so a settled operation may not be
+/// answered from its local receipt; a correlated nonterminal readback returns
+/// only its own state. Both hide the cached reply and both really read.
+#[test]
+fn an_unreachable_readback_is_uncertain_and_a_pending_answer_never_serves_the_receipt() {
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_read",
+        json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+    )
+    .unwrap();
+    assert_eq!(fx.stub.calls("readback"), 1);
+
+    // 1. The settled receipt, with an unreachable platform.
+    fx.stub.set(|script| script.read_drop = true);
+    let before = fx.stub.calls("readback");
+    let error = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_read",
+            json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+        )
+        .unwrap_err();
+    assert_eq!(code(&error), Some("cloud_agent_uncertain"), "{error}");
+    assert_eq!(error.kind(), "unknown", "{error}");
+    assert!(
+        !error.to_string().contains("genuine stub reply"),
+        "the unreachable readback served the cached reply: {error}"
+    );
+    assert_eq!(
+        fx.stub.calls("readback"),
+        before + 1,
+        "the uncertainty was asserted without attempting the readback"
+    );
+    // The durable terminal receipt survives for reconciliation.
+    let kept = fx
+        .store()
+        .cloud_agent_operation(&id, OPERATION)
+        .unwrap()
+        .expect("settled receipt");
+    assert_eq!(kept.status, "completed");
+    assert_eq!(kept.reply_text.as_deref(), Some("genuine stub reply"));
+
+    // The settled send replay is the same guard, not a second path.
+    let replay = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_send",
+            json!({
+                "cloud_agent_id": id, "thread_id": home,
+                "text": TEXT, "operation_id": OPERATION, "wake": true,
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(code(&replay), Some("cloud_agent_uncertain"), "{replay}");
+    assert!(
+        !replay.to_string().contains("genuine stub reply"),
+        "the settled replay served the cached reply: {replay}"
+    );
+    assert_eq!(
+        fx.stub.calls("submit"),
+        1,
+        "the unsettled replay submitted a second turn"
+    );
+
+    // 2. A correlated, nonterminal readback answer for a settled row.
+    fx.stub.set(|script| {
+        script.read_drop = false;
+        script.read_state = "running".into();
+    });
+    let before = fx.stub.calls("readback");
+    let pending = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_read",
+            json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+        )
+        .expect("a nonterminal readback is a normal answer");
+    assert_eq!(pending["operation"]["status"], json!("running"));
+    assert_eq!(pending["operation"]["terminal"], json!(false));
+    assert!(
+        pending["operation"]["reply"].is_null(),
+        "the pending answer carried a reply: {pending}"
+    );
+    assert!(
+        !pending.to_string().contains("genuine stub reply"),
+        "the pending answer served the cached reply: {pending}"
+    );
+    assert_eq!(
+        fx.stub.calls("readback"),
+        before + 1,
+        "the pending answer was served without a readback"
+    );
+    let kept = fx
+        .store()
+        .cloud_agent_operation(&id, OPERATION)
+        .unwrap()
+        .expect("settled receipt");
+    assert_eq!(
+        kept.status, "completed",
+        "the pending answer reopened the receipt"
+    );
+    assert_eq!(kept.reply_text.as_deref(), Some("genuine stub reply"));
+
+    // Positive control: the platform's own terminal answer is served again.
+    fx.stub.set(|script| script.read_state = "completed".into());
+    let admitted = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_read",
+            json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+        )
+        .unwrap();
+    assert_eq!(admitted["operation"]["status"], json!("completed"));
+    assert_eq!(
+        admitted["operation"]["reply"]["text"],
+        json!("genuine stub reply")
+    );
+}
+
+/// A portable round trip drops the cloud request/result text together with
+/// its authority rows, and the restored alias fails closed for an ordinary
+/// local caller instead of reading as an ordinary local conversation.
+#[test]
+fn a_portable_round_trip_drops_the_cloud_reply_and_the_restored_alias_fails_closed() {
+    use cadence_agent::backup::portable::{
+        export_portable, restore_activate_disabled, PortableExportOptions, PortableManifest, Scope,
+    };
+    use cadence_agent::backup::portable_activate::required_inventory;
+
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_read",
+        json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+    )
+    .unwrap();
+
+    // A clean tracker (pm.yaml at its root) is what the package pins.
+    let tracker = fx.root.path().join("tracker");
+    std::fs::create_dir_all(&tracker).unwrap();
+    std::fs::copy(fx.pm.join("pm.yaml"), tracker.join("pm.yaml")).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "pm.yaml"],
+        vec!["commit", "-q", "-m", "CAD-1853 portable guard fixture"],
+    ] {
+        let mut command = std::process::Command::new("git");
+        command
+            .arg("-C")
+            .arg(&tracker)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "maintenance.auto=false",
+            ])
+            .args(&args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "cad1853-acceptance")
+            .env("GIT_AUTHOR_EMAIL", "acceptance@example.invalid")
+            .env("GIT_COMMITTER_NAME", "cad1853-acceptance")
+            .env("GIT_COMMITTER_EMAIL", "acceptance@example.invalid");
+        let output = cadence_agent::reaper::output(&mut command).unwrap();
+        assert!(
+            output.status.success(),
+            "fixture git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let package = fx.root.path().join("package");
+    export_portable(
+        &fx.state,
+        &package,
+        &PortableExportOptions {
+            scope: Scope::Coordination,
+            tracker,
+            redact_history_secrets: false,
+        },
+    )
+    .expect("a workspace holding a completed cloud turn must still export");
+    let manifest: PortableManifest =
+        serde_json::from_slice(&std::fs::read(package.join("manifest.json")).unwrap()).unwrap();
+    for table in [
+        "cloud_agents",
+        "cloud_agent_sources",
+        "cloud_agent_sessions",
+        "cloud_agent_operations",
+    ] {
+        assert!(
+            manifest.omitted_tables.iter().any(|row| row == table),
+            "the package did not declare {table} omitted"
+        );
+    }
+    let plan = required_inventory(&package).expect("the package's non-terminal rows");
+    let restored = fx.root.path().join("restored");
+    restore_activate_disabled(&package, &restored, &plan)
+        .expect("the package restores with execution disabled");
+
+    // Neither the package nor the restored copy carries the cloud reply or
+    // request text, and no cloud authority row travels.
+    for copy in [&package, &restored] {
+        let conn = rusqlite::Connection::open_with_flags(
+            copy.join("cadence.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM messages WHERE body LIKE '%genuine stub reply%'"),
+            0,
+            "{}: the cloud reply text survived",
+            copy.display()
+        );
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM messages WHERE body LIKE '%{TEXT}%'"
+            )),
+            0,
+            "{}: the cloud request text survived",
+            copy.display()
+        );
+        for table in [
+            "cloud_agents",
+            "cloud_agent_sources",
+            "cloud_agent_sessions",
+            "cloud_agent_operations",
+        ] {
+            assert_eq!(
+                count(&format!("SELECT COUNT(*) FROM {table}")),
+                0,
+                "{}: {table} authority survived",
+                copy.display()
+            );
+        }
+        // The alias row stays inert so an explicit reconnect can reuse it.
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM agents WHERE alias='{ALIAS}' \
+                 AND provider='agenticos-cloud' AND endpoint IS NULL"
+            )),
+            1,
+            "{}: the inert alias row is missing",
+            copy.display()
+        );
+    }
+
+    // The restored store answers an ordinary local caller: with no cloud
+    // authority to resolve, the projection of the alias fails closed.
+    let (stop, handle) = spawn_daemon_at(&restored, &fx.pm);
+    let restored_show = scoped(Asserted::Operator, || {
+        client::rpc(&restored, "agent_show", json!({"alias": ALIAS}))
+    })
+    .unwrap_err();
+    assert_eq!(
+        code(&restored_show),
+        Some("cloud_agent_authority_missing"),
+        "agent_show on restored data: {restored_show}"
+    );
+    assert!(
+        !restored_show.to_string().contains("genuine stub reply"),
+        "agent_show disclosed the reply: {restored_show}"
+    );
+    // The other two projections are execution-capable verbs, so the restored
+    // root's execution-disabled fence refuses them even earlier. Either
+    // refusal must stay content-free.
+    for (method, params) in [
+        ("thread_read", json!({"alias": ALIAS})),
+        ("agent_events", json!({"alias": ALIAS, "after": 0})),
+    ] {
+        let error = scoped(Asserted::Operator, || {
+            client::rpc(&restored, method, params)
+        })
+        .unwrap_err();
+        assert!(
+            !error.to_string().contains("genuine stub reply"),
+            "{method} disclosed the reply: {error}"
+        );
+        assert!(
+            error.to_string().contains("execution-disabled")
+                || code(&error) == Some("cloud_agent_authority_missing"),
+            "{method} was refused by neither the fence nor the projection: {error}"
+        );
+    }
+    // A caller that proves nothing is refused as well: with no cloud
+    // authority to resolve, the projection's own refusal comes first and a
+    // caller-rule refusal would be equally content-free.
+    let unproven = scoped(Asserted::Unproven, || {
+        client::rpc(&restored, "agent_show", json!({"alias": ALIAS}))
+    })
+    .unwrap_err();
+    assert!(
+        unproven.to_string().contains("derives no agent identity")
+            || code(&unproven) == Some("cloud_agent_authority_missing"),
+        "{unproven}"
+    );
+    assert!(
+        !unproven.to_string().contains("genuine stub reply"),
+        "an unproven caller was shown the reply: {unproven}"
+    );
+    stop.store(true, SeqCst);
+    let _ = handle.join();
+
+    // Positive control: the same projection serves the live connection's
+    // settled turn, so the restored refusal is the missing authority.
+    let live = fx
+        .call(Asserted::Operator, "agent_show", json!({"alias": ALIAS}))
+        .expect("the live workspace still projects its own cloud turn");
+    assert!(
+        live.to_string().contains("genuine stub reply"),
+        "the live projection lost the reply: {live}"
+    );
+}
+
+/// A settled send replay discloses a reply, so a write-only credential may
+/// not serve one: the replay refuses on the missing read scope, without a
+/// second submit and without a new readback.
+#[test]
+fn a_write_only_credential_cannot_replay_a_settled_send() {
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_read",
+        json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+    )
+    .unwrap();
+    assert_eq!(fx.stub.calls("submit"), 1);
+    assert_eq!(fx.stub.calls("readback"), 1);
+
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    write_login(ORG, ORG_ID, &fx.stub.url, &["cloud_agent.write"], expires);
+    let error = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_send",
+            json!({
+                "cloud_agent_id": id, "thread_id": home,
+                "text": TEXT, "operation_id": OPERATION, "wake": true,
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(code(&error), Some("cloud_agent_scope_revoked"), "{error}");
+    assert!(
+        !error.to_string().contains("genuine stub reply"),
+        "the write-only replay served the reply: {error}"
+    );
+    assert_eq!(fx.stub.calls("submit"), 1, "the replay submitted again");
+    assert_eq!(
+        fx.stub.calls("readback"),
+        1,
+        "the replay read back despite the missing read scope"
+    );
+    let kept = fx
+        .store()
+        .cloud_agent_operation(&id, OPERATION)
+        .unwrap()
+        .expect("settled receipt");
+    assert_eq!(kept.status, "completed");
+    assert_eq!(kept.reply_text.as_deref(), Some("genuine stub reply"));
+
+    // Positive control: with read authority restored the same replay serves
+    // the platform's own readback answer.
+    write_login(
+        ORG,
+        ORG_ID,
+        &fx.stub.url,
+        &["cloud_agent.read", "cloud_agent.write"],
+        expires,
+    );
+    let replayed = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_send",
+            json!({
+                "cloud_agent_id": id, "thread_id": home,
+                "text": TEXT, "operation_id": OPERATION, "wake": true,
+            }),
+        )
+        .expect("read authority serves the settled replay");
+    assert_eq!(replayed["operation"]["status"], json!("completed"));
+    assert_eq!(
+        replayed["operation"]["reply"]["text"],
+        json!("genuine stub reply")
+    );
+    assert_eq!(fx.stub.calls("submit"), 1);
+    assert_eq!(fx.stub.calls("readback"), 2);
+}
+
+/// The normal `send` route onto a cloud alias is that same remote turn, not a
+/// local queue: steering, turn correlation, a captured recipient and
+/// dispatch-only lane fields are refused whole before any transport call or
+/// canonical row.
+#[test]
+fn the_normal_send_envelope_refuses_cloud_unsupported_fields_before_transport() {
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let recipient = fx.store().agent(ALIAS).unwrap().uid;
+    assert_eq!(connect["agent"]["recipient_uid"], json!(recipient));
+    for (index, (field, value)) in [
+        ("nudge", json!(true)),
+        ("turn_id", json!("t-forged")),
+        ("expected_recipient_uid", json!(recipient)),
+        ("issue", json!("CAD-1853")),
+        ("worktree", json!("/tmp/not-a-lane")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let message = format!("m-envelope-{index}");
+        let mut params = json!({"alias": ALIAS, "text": TEXT, "message": message});
+        params[field] = value;
+        let error = fx
+            .call(Asserted::Operator, "agent_send", params)
+            .unwrap_err();
+        assert_eq!(error.kind(), "rejected", "{field}: {error}");
+        let text = error.to_string();
+        assert!(
+            text.contains(field)
+                || text.contains("not a cloud-agent send field")
+                || text.contains("not steering"),
+            "{field} was not refused as an unsupported cloud-send field: {error}"
+        );
+        assert_eq!(
+            fx.stub.calls("submit"),
+            0,
+            "{field} reached the model boundary"
+        );
+        assert!(
+            fx.store().message(&message).unwrap().is_none(),
+            "{field} wrote a canonical message"
+        );
+    }
+
+    // Positive control: the cloud-legal envelope (text + message) submits once.
+    let accepted = fx
+        .call(
+            Asserted::Operator,
+            "agent_send",
+            json!({"alias": ALIAS, "text": TEXT, "message": "m-envelope-accepted"}),
+        )
+        .expect("the cloud-legal envelope must send");
+    assert_eq!(accepted["operation"]["status"], json!("queued"));
+    assert_eq!(fx.stub.calls("submit"), 1);
+}
+
+/// A reconnect refreshes consent, never identity: a refused reconnect leaves
+/// the retained invoker pin and provider session byte-for-byte as they were.
+#[test]
+fn a_refused_reconnect_leaves_the_pin_and_the_session_unchanged() {
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_read",
+        json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+    )
+    .unwrap();
+
+    let store = fx.store();
+    let before_sources = store.cloud_agent_sources(&id).unwrap();
+    let before_sessions = store.cloud_agent_sessions(&id).unwrap();
+    assert_eq!(before_sources.len(), 1);
+    assert_eq!(before_sessions.len(), 1);
+    let pinned = before_sources[0]
+        .invoker_id
+        .clone()
+        .expect("the connection pinned its stable owner");
+
+    // The contract answers with a different stable owner.
+    fx.stub.set(|script| {
+        script.provenance = Some(json!({
+            "kind": "user",
+            "invoker_id": "inv_yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+            "peer": null,
+        }));
+    });
+    let calls_before = fx.stub.calls("agent");
+    let error = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_connect",
+            json!({
+                "org": ORG,
+                "org_id": ORG_ID,
+                "endpoint": fx.stub.url,
+                "alias": ALIAS,
+                "accept_assistant_consent": true,
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(code(&error), Some("cloud_agent_invoker_changed"), "{error}");
+    assert_eq!(
+        fx.stub.calls("agent"),
+        calls_before + 1,
+        "the refused reconnect never reached the contract"
+    );
+
+    let after_sources = fx.store().cloud_agent_sources(&id).unwrap();
+    let after_sessions = fx.store().cloud_agent_sessions(&id).unwrap();
+    assert_eq!(
+        after_sources[0].invoker_id.as_deref(),
+        Some(pinned.as_str()),
+        "the refused reconnect replaced the invoker pin"
+    );
+    assert_eq!(
+        after_sources, before_sources,
+        "the refused reconnect rewrote the granted source"
+    );
+    assert_eq!(
+        after_sessions.len(),
+        before_sessions.len(),
+        "the refused reconnect created or dropped a provider session"
+    );
+    for (after, before) in after_sessions.iter().zip(&before_sessions) {
+        assert_eq!(
+            after.to_json(),
+            before.to_json(),
+            "the refused reconnect rewrote the provider session"
+        );
+    }
+    let agent = fx.store().cloud_agent(&id).unwrap().expect("cloud agent");
+    assert_eq!(agent.state, "connected");
+    let read = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_read",
+            json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+        )
+        .expect("the retained connection still reads its settled turn");
+    assert_eq!(
+        read["operation"]["reply"]["text"],
+        json!("genuine stub reply")
+    );
+
+    // Positive control: the pinned owner answer reconnects cleanly.
+    fx.stub.set(|script| script.provenance = None);
+    let again = fx.connect();
+    assert_eq!(again["agent"]["state"], json!("connected"));
+    assert_eq!(again["agent"]["id"], json!(id));
 }

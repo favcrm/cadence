@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS cloud_agent_operations(
     created REAL NOT NULL,
     updated REAL NOT NULL,
     grant_admitted_at REAL NOT NULL DEFAULT 0,
+    claimed_at REAL NOT NULL DEFAULT 0,
     PRIMARY KEY(cloud_agent_id, operation_id));
 CREATE INDEX IF NOT EXISTS cloud_agent_operations_thread
     ON cloud_agent_operations(cloud_agent_id, thread_id, created);
@@ -336,6 +337,15 @@ pub struct CloudOperation {
     /// for the same stable owner is a different lineage and may not revive
     /// this request — a new operation id is the supported path.
     pub grant_admitted_at: f64,
+    /// When this operation's submission was last claimed across the
+    /// transport boundary, or `0` while it has never been claimed. The claim
+    /// is the durable submission eligibility witness: an operation that has
+    /// ever been claimed can never be claimed again, even if the contract's
+    /// own answer leaves the row `queued` (an accepted-queued response
+    /// without a remote operation id). A row that never reached the
+    /// transport is still `queued` with `claimed_at = 0` and may be retried
+    /// by an explicit wake.
+    pub claimed_at: f64,
 }
 
 impl CloudOperation {
@@ -378,6 +388,7 @@ impl CloudOperation {
             "remote_session_id": self.remote_session_id,
             "status": self.status,
             "terminal": self.settled(),
+            "claimed": self.claimed_at > 0.0,
             "remote_operation_id": self.remote_operation_id,
             "message_id": self.message_id,
             "reply": self.reply_text.as_ref().map(|text| json!({
@@ -496,6 +507,7 @@ fn operation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CloudOperation> {
         created: row.get(21)?,
         updated: row.get(22)?,
         grant_admitted_at: row.get(23)?,
+        claimed_at: row.get(24)?,
     })
 }
 
@@ -503,7 +515,8 @@ const OPERATION_COLUMNS: &str = "operation_id, cloud_agent_id, source_kind, \
 source_uid, registration_epoch, owner_issuer, owner_subject, recipient_uid, \
 sender_label, thread_id, conversation_id, remote_session_id, request_digest, \
 request_text, status, remote_operation_id, message_id, reply_text, \
-reply_message_id, error_code, error_message, created, updated, grant_admitted_at";
+reply_message_id, error_code, error_message, created, updated, grant_admitted_at, \
+claimed_at";
 
 fn digest(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
@@ -1275,8 +1288,11 @@ impl Store {
     }
 
     /// Non-terminal operations whose submit may have reached the contract.
-    /// A queue-only row with no remote id is not in this worklist: only an
-    /// explicit wake may submit it.
+    /// A queue-only row that never crossed the transport boundary
+    /// (`claimed_at = 0`, no remote id) is not in this worklist: only an
+    /// explicit wake may submit it. A CLAIMED row that the contract accepted
+    /// as queued IS here even without a remote id, because its outcome is
+    /// real and only the platform can settle it.
     pub fn cloud_agent_pending_operations(
         &self,
         cloud_agent_id: &str,
@@ -1287,7 +1303,8 @@ impl Store {
                     "SELECT {OPERATION_COLUMNS} FROM cloud_agent_operations \
                      WHERE cloud_agent_id=?1 AND (\
                        status IN ('running','parked','unknown') \
-                       OR (status='queued' AND remote_operation_id IS NOT NULL)) \
+                       OR (status='queued' AND (remote_operation_id IS NOT NULL \
+                         OR claimed_at > 0))) \
                      ORDER BY created, operation_id"
                 ),
                 [cloud_agent_id],
@@ -1352,17 +1369,31 @@ impl Store {
     /// Claim one queued operation for submission: a compare-and-set from
     /// `queued` to `running` that exactly one caller can win. Two identical
     /// concurrent sends (or a new-row/enqueue race) therefore submit once;
-    /// the loser reads the original intent and never calls the transport.
+    /// the loser never calls the transport and is told the operation is
+    /// already claimed instead of being handed the cached row.
+    ///
+    /// Eligibility is durable, not just the current status: `claimed_at = 0`
+    /// is part of the predicate, so an operation that ever crossed (or tried
+    /// to cross) the submission boundary can never be claimed again, even
+    /// when the contract's accepted-queued answer — which carries no remote
+    /// operation id — leaves the row `queued`. A row that never reached the
+    /// transport keeps `claimed_at = 0` and stays retryable by an explicit
+    /// wake, which is exactly the pre-transport refusal semantics. Restart
+    /// recovery is unaffected: the claim itself sets `running`, and the
+    /// readback worklist selects `running`/`parked`/`unknown` plus a
+    /// `queued` row that already carries a remote id or a claim.
     pub fn cloud_agent_operation_claim(
         &self,
         cloud_agent_id: &str,
         operation_id: &str,
     ) -> Result<bool> {
         self.write_tx(|conn| {
+            let at = now();
             let changed = conn.execute(
-                "UPDATE cloud_agent_operations SET status=?3, updated=?4 \
-                 WHERE cloud_agent_id=?1 AND operation_id=?2 AND status='queued'",
-                params![cloud_agent_id, operation_id, STATUS_RUNNING, now()],
+                "UPDATE cloud_agent_operations SET status=?3, claimed_at=?5, updated=?4 \
+                 WHERE cloud_agent_id=?1 AND operation_id=?2 AND status='queued' \
+                 AND claimed_at=0",
+                params![cloud_agent_id, operation_id, STATUS_RUNNING, at, at],
             )?;
             Ok(changed == 1)
         })
@@ -1496,12 +1527,30 @@ impl Store {
         })
     }
 
+    /// Whether this alias still carries cloud-agent private content: a
+    /// request or result row the cloud transport wrote. A restored workspace
+    /// can hold such rows with no connection authority at all (the four
+    /// cloud tables are outside the coordination profile), so a projection
+    /// must fail closed instead of treating the alias as an ordinary local
+    /// agent.
+    pub fn alias_has_cloud_content(&self, alias: &str) -> Result<bool> {
+        self.read_tx(|conn| {
+            let present: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE alias=?1 AND source='cloud_agent')",
+                [alias],
+                |row| row.get(0),
+            )?;
+            Ok(present != 0)
+        })
+    }
+
     pub fn cloud_agents_with_pending_operations(&self) -> Result<Vec<String>> {
         self.read_tx(|conn| {
             Ok(conn.query_vec(
                 "SELECT DISTINCT cloud_agent_id FROM cloud_agent_operations \
                  WHERE status IN ('running','parked','unknown') \
-                    OR (status='queued' AND remote_operation_id IS NOT NULL) \
+                    OR (status='queued' AND (remote_operation_id IS NOT NULL \
+                      OR claimed_at > 0)) \
                  ORDER BY cloud_agent_id",
                 [],
                 |row| row.get::<_, String>(0),

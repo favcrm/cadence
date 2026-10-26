@@ -549,8 +549,9 @@ impl Shared {
         };
         // CAD-1853 review: the alias' event stream carries cloud request and
         // result detail, so it applies the same source/owner decision as the
-        // dedicated cloud read before projecting anything.
-        self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
+        // dedicated cloud read before projecting anything — current READ
+        // authority, and only the caller's own source's rows.
+        let projection = self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
         // CAD-1380: daemon `assist_intent` rows are member-private routing. Only
         // the operator reads them from the shared stream; every other caller gets
         // the same page with those rows removed, cursors unchanged.
@@ -559,15 +560,16 @@ impl Shared {
                 self.connection_caller(peer_pid)?,
                 caller_rule::Who::Operator
             );
-        let visible = |events: Vec<crate::store::Event>| -> Vec<crate::store::Event> {
-            if hide_intents {
+        let visible = |events: Vec<crate::store::Event>| -> Result<Vec<crate::store::Event>> {
+            let events = projection.events(&self.store, events)?;
+            Ok(if hide_intents {
                 events
                     .into_iter()
                     .filter(|e| e.kind != "assist_intent")
                     .collect()
             } else {
                 events
-            }
+            })
         };
         let after = optional_i64(params, "after").unwrap_or(0);
         if after < 0 {
@@ -587,7 +589,7 @@ impl Shared {
             }
             let cursor = events.last().map(|e| e.seq).unwrap_or(0);
             return Ok(json!({
-                "events": visible(events).iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
+                "events": visible(events)?.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
                 "cursor": cursor,
                 "has_older": has_older,
             }));
@@ -598,7 +600,7 @@ impl Shared {
             if !events.is_empty() || self.closing.load(Ordering::SeqCst) {
                 let cursor = events.last().map(|e| e.seq).unwrap_or(after);
                 return Ok(json!({
-                    "events": visible(events).iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
+                    "events": visible(events)?.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
                     "cursor": cursor,
                 }));
             }

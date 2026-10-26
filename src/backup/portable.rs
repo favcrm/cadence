@@ -539,6 +539,7 @@ const CATALOG: &[(&str, &[&str])] = &[
             "created",
             "updated",
             "grant_admitted_at",
+            "claimed_at",
         ],
     ),
     (
@@ -1802,6 +1803,41 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
         )?;
         tx.execute("DELETE FROM topics WHERE type='human_room'", [])?;
     }
+    // CAD-1853 review: the four cloud-agent tables are outside the
+    // coordination profile, so their connection, grant, session and receipt
+    // authority never travels — but the cloud request and result TEXT reuses
+    // the coordination tables (`messages`, `thread_entries`, `threads`,
+    // `events`). Exporting that text against an alias whose authority rows
+    // are omitted would hand whoever restores the package a cloud
+    // conversation that reads as an ordinary local one. Cloud content is
+    // private to the source/owner that was admitted on the live workspace,
+    // so it is omitted together with the authority that admitted it. The
+    // inert alias row itself stays (its `endpoint`/`params` are nulled
+    // below) so an explicit `cloud-agent connect` can reuse it; until then
+    // every cloud projection of that alias fails closed.
+    let cloud = crate::cloud_agent::PROVIDER;
+    let cloud_alias = "SELECT alias FROM agents WHERE provider=?1";
+    tx.execute(
+        &format!(
+            "DELETE FROM thread_entries WHERE \
+               message_id IN (SELECT id FROM messages WHERE alias IN ({cloud_alias}) \
+                 OR source='cloud_agent') \
+               OR thread_id IN (SELECT id FROM threads WHERE alias IN ({cloud_alias}))"
+        ),
+        [cloud],
+    )?;
+    tx.execute(
+        &format!("DELETE FROM messages WHERE alias IN ({cloud_alias}) OR source='cloud_agent'"),
+        [cloud],
+    )?;
+    tx.execute(
+        &format!("DELETE FROM threads WHERE alias IN ({cloud_alias})"),
+        [cloud],
+    )?;
+    tx.execute(
+        &format!("DELETE FROM events WHERE alias IN ({cloud_alias})"),
+        [cloud],
+    )?;
     for table in omitted_names() {
         let present: i64 = tx.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?",
@@ -2450,6 +2486,7 @@ fn exclusions() -> Vec<String> {
         "imported actors disabled: agents.enabled=0; monitors dispatch flags=0",
         "provenance purged: connection_metadata (source UUID recorded in the manifest only), model_defaults, settings_authority",
         "business app data outside the coordination profile: app_*, crm_*, social_publish_intents, cloud_dispatch_outbox, chat_files, artifacts (rows deleted from the private copy; declared omitted, not a full workspace)",
+        "cloud-agent private content: cloud_agents, cloud_agent_sources, cloud_agent_sessions and cloud_agent_operations, plus the cloud alias' messages, thread entries, threads and events (rows deleted from the private copy). The alias row itself is kept inert with no authority; cloud projections of it fail closed until it is reconnected explicitly",
         "local checkouts, process identity, sockets and runtime files: not included",
     ]
     .iter()

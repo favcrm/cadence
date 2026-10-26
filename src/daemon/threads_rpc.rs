@@ -109,9 +109,10 @@ impl Shared {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         // CAD-1853 review: a cloud target's request/reply text reaches this
         // projection, so it demands the same source/owner authority as the
-        // dedicated cloud read — a peer with no grant on the connection is
-        // refused rather than shown another source's reply.
-        self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
+        // dedicated cloud read — current READ authority for the caller's own
+        // source, and only that source's rows — so a peer with no grant is
+        // refused and an enrolled peer never sees another source's reply.
+        let projection = self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
         // CAD-1098: `conversation` selects one thread of this alias by
         // id (validated; unknown answers an error and creates nothing).
         // Without it the read is the home thread, unchanged.
@@ -161,6 +162,7 @@ impl Shared {
                     .thread_entries_before_of(&thread.id, before, limit)?,
                 None => self.store.thread_entries_before(&alias, before, limit)?,
             };
+            let entries = projection.entries(&self.store, entries)?;
             let cursor = entries.last().map(|e| e.seq).unwrap_or(0);
             // CAD-1700: the complete watermark of the authorized thread,
             // never just this (bounded) page or the cursor's window.
@@ -193,6 +195,7 @@ impl Shared {
                 || Instant::now() >= deadline
                 || self.closing.load(Ordering::SeqCst)
             {
+                let entries = projection.entries(&self.store, entries)?;
                 let cursor = entries.last().map(|e| e.seq).unwrap_or(after);
                 // CAD-1700: the same complete watermark whatever the
                 // cursor — a cold tail or a long catch-up page carries it.
