@@ -438,13 +438,11 @@ impl Store {
                 }
             }
             .to_string();
-            // Local profile files only; a failure here leaves state untouched.
-            apply_files()?;
             // REQ-011: an explicit avatar pick is the owning assistant's
             // ordinary `params.look`, written in this same fenced transaction
             // so the projection, the pin and the committed revision move
             // together. No second look store exists.
-            if let Some(look) = look {
+            let stored_params = if let Some(look) = look {
                 let stored: Option<String> = tx
                     .query_row(
                         "SELECT params FROM agents WHERE alias=?",
@@ -465,6 +463,13 @@ impl Store {
                 if stored.len() > 4_000 {
                     return Err(refused("the avatar look does not fit the params cap"));
                 }
+                Some(stored)
+            } else {
+                None
+            };
+            // An invalid avatar merge must refuse before any profile file changes.
+            apply_files()?;
+            if let Some(stored) = stored_params {
                 tx.execute(
                     "UPDATE agents SET params=?, updated=? WHERE alias=?",
                     params![stored, now, expect.alias],

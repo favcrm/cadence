@@ -24,7 +24,7 @@ impl Shared {
                     .map(str::to_string)
             });
         let look = crate::agent_roles::effective_look(crate::master::ALIAS, pinned.as_deref());
-        let identity = crate::master::read_identity(&pm_dir, look)?;
+        let identity = crate::master::read_verified_identity(&self.state_dir, &pm_dir, look)?;
         Ok(MasterIdentity {
             name: identity.name,
             tone: identity.tone,

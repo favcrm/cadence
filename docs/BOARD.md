@@ -2252,6 +2252,9 @@ state and conversation. Name/tone remain in the managed IDENTITY.md/SOUL.md
 sections; user address/preferences stay in private USER.md. Subsequent valid turns read
 the committed profile. A personal avatar selection is an ordinary chat request,
 not a browser-side profile write, and remains pending until state confirms it.
+The profile patch is bounded by UTF-8 value bytes: 4096 per field and 16384
+across supplied values (including a supplied look), not JSON encoding or the
+merged stored profile. Avatar params are validated before profile-file effects.
 
 The avatar renderer and eleven looks are the existing `AgentAvatar` catalogue.
 A new personal assistant pins its immutable alias-derived look once in
@@ -2263,6 +2266,10 @@ headers keep that scope visible at narrow widths too. The About panel offers
 proven operators a bounded name/personality/avatar editor through
 `POST /api/master/identity` (`master_identity_set` natively). IDENTITY.md and
 SOUL.md use the protected writer and digest record, never agent self-edit.
+Identity reads check the protected source digests before per-turn use. A
+coordinator identity save refuses existing drift in any protected source before
+writing; it records only the fields changed and verifies the post-save briefing
+sources rather than blessing unrelated edits.
 `Shared::prompt_with_profile` includes committed name/personality in the initial
 prompt and any permitted fresh-session retry, including Pi `/new` and pre-tool
 history recovery. The UI reports next-turn application, not a change to an
@@ -2282,6 +2289,8 @@ reads `/api/master/state?conversation=<id>` and refuses mismatched projections.
 Only an absent projection retains Native's coordinator contract. A present
 malformed projection or failed/stale canonical read is unavailable, with no
 borrowed profile, ownership claim or edit control.
+Hosted app turn indicators and Stop/Cancel reconciliation use the selected
+conversation's state too; an idle Home snapshot cannot hide its running turn.
 
 Worker personal profiles are canonical actor-private Workspace-DO rows, not
 Native Markdown files. The actor-bound `assistant_profile` tool uses the same

@@ -850,10 +850,11 @@ impl Shared {
                 tone.as_deref(),
                 "operator",
             )?;
-            master::record_identity(&self.state_dir, &pm.dir)?;
+            master::record_identity(&self.state_dir, &pm.dir, name.is_some(), tone.is_some())?;
             // Keep the launch briefing and stored instructions current too;
             // per-turn identity context is the live provider's refresh path.
             let files = master::read_files(&pm.dir, ALIAS, false)?;
+            master::verify(&self.state_dir, ALIAS, &files)?;
             let briefing = master::compose(&files);
             let file = client::briefing_path(&self.state_dir, &Value::Null, ALIAS);
             if let Some(dir) = file.parent() {

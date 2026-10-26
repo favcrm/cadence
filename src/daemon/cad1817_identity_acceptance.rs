@@ -34,7 +34,15 @@
 //   * `POST /api/master/identity` is no weaker: agent, unproven, stolen
 //     session, forged actor field, stale revision and unknown look all
 //     refuse without state/file effects, while the operator's session +
-//     proof succeeds.
+//     proof succeeds;
+//   * a profile ACK whose merged owning params would cross the 4000-byte cap
+//     refuses BEFORE any profile-file effect (the store used to run
+//     `apply_files` first, mutating IDENTITY.md for a refused ACK);
+//   * per-turn `master_profile_context` refuses a managed IDENTITY.md/SOUL.md
+//     edited around the protected writer, and a legitimate name-only
+//     coordinator save refuses external AGENT.md / untouched SOUL.md drift
+//     without re-recording its digest or importing it into the briefing,
+//     standing instructions or identity projection.
 
 // The canonical AgentAvatar looks (ui/src/features/agents/AgentAvatar.tsx).
 const CAD1817_AVATAR_LOOKS: [&str; 11] = [
@@ -1939,5 +1947,681 @@ fn cad1817_master_identity_http_is_no_weaker_than_native() {
         cad1817_owning_look(&shared, crate::master::ALIAS).as_deref(),
         Some("tester"),
         "a refused stale avatar overwrite changed the owning pin"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CAD-1817 phase-one regressions (reviewer-authored, independently of the
+// source writer). Each case is bounded and deterministic and asserts the
+// refusal plus the unchanged canonical artifacts.
+// ---------------------------------------------------------------------------
+
+/// The authoritative read-only protected-file guard (`master::tampered_file`,
+/// the read half of `master::verify`), over the master's current files.
+fn cad1817_master_tampered(shared: &Shared, pm: &crate::issue::Pm) -> Option<String> {
+    let files = crate::master::read_files(&pm.dir, crate::master::ALIAS, false).unwrap();
+    crate::master::tampered_file(&shared.state_dir, crate::master::ALIAS, &files)
+}
+
+/// A drift refusal must come from the protected-digest guard, not from a
+/// malformed managed section or another read failure, and must never echo
+/// the externally edited value.
+fn cad1817_assert_drift_refusal(text: &str, label: &str) {
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        lower.contains("changed outside")
+            || lower.contains("master edit")
+            || lower.contains("tamper"),
+        "{label}: the refusal did not come from the protected digest guard: {text}"
+    );
+    assert!(
+        !lower.contains("external hijack")
+            && !lower.contains("external tone")
+            && !lower.contains("hijacked tone"),
+        "{label}: the refusal echoed the drift: {text}"
+    );
+}
+
+// A profile ACK that would push the owning assistant's stored params past the
+// 4000-byte cap refuses BEFORE any profile-file effect. `assistant_bootstrap_apply`
+// used to run `apply_files` before validating the merged params, so a refused
+// ACK still rewrote IDENTITY.md while the DB transaction rolled back.
+#[test]
+fn cad1817_profile_ack_params_cap_refuses_before_files() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let sub = "sub-cad1817-params-cap";
+    let (alias, message, token, root) = cad1817_running_turn(&fx, sub);
+    let revision = fx
+        .shared
+        .store
+        .assistant_binding(ORG, sub)
+        .unwrap()
+        .unwrap()
+        .bootstrap_revision;
+
+    // Bring the stored params to exactly 4000 bytes through the production
+    // writer: pin the existing canonical look `robot` and add an opaque
+    // operator param as padding. Replacing `robot` with `bookkeeper` grows the
+    // stored JSON by five bytes, so an ACK carrying that look cannot fit.
+    let mut padded = fx
+        .shared
+        .store
+        .agent(&alias)
+        .unwrap()
+        .params
+        .unwrap_or_else(|| json!({}));
+    padded["look"] = json!("robot");
+    padded["cad1817_cap_pad"] = json!("");
+    let overhead = padded.to_string().len();
+    assert!(
+        overhead < 4_000,
+        "the fixture params overhead already reaches the cap: {overhead}"
+    );
+    let pad = "p".repeat(4_000 - overhead);
+    fx.shared
+        .store
+        .set_params(&alias, &json!({"look": "robot", "cad1817_cap_pad": pad}))
+        .unwrap_or_else(|e| panic!("pinning the near-cap params was refused: {e}"));
+    let stored = fx.shared.store.agent(&alias).unwrap().params.unwrap();
+    assert_eq!(stored["look"], json!("robot"));
+    assert_eq!(
+        stored.to_string().len(),
+        4_000,
+        "the fixture params must sit exactly at the cap: {}",
+        stored.to_string().len()
+    );
+    let params_before = stored.to_string();
+    let pad_before = stored["cad1817_cap_pad"].clone();
+    let params_snapshot = |fx: &Fx| {
+        fx.shared
+            .store
+            .agent(&alias)
+            .unwrap()
+            .params
+            .unwrap()
+            .to_string()
+    };
+    let before = cad1817_profile_snapshot(&fx, sub, &root);
+    assert_eq!(
+        before["identity"]["look"],
+        json!("robot"),
+        "the fixture's committed look must be the existing robot: {before}"
+    );
+
+    let refused = cad1817_ack(
+        &fx,
+        &alias,
+        &message,
+        &token,
+        json!({"action": "update", "expected_revision": revision,
+               "profile": {"name": "Cap Refused", "look": "bookkeeper"}}),
+    );
+    let error = refused
+        .expect_err("an ACK whose merged params exceed the 4000-byte cap was accepted")
+        .to_string();
+    assert!(
+        error.to_ascii_lowercase().contains("cap"),
+        "the over-cap ACK refused for another reason: {error}"
+    );
+    assert_eq!(
+        cad1817_profile_snapshot(&fx, sub, &root),
+        before,
+        "a refused over-cap ACK changed canonical profile files, the binding \
+         revision or the identity projection"
+    );
+    assert_eq!(
+        params_snapshot(&fx),
+        params_before,
+        "a refused over-cap ACK changed the owning assistant's params"
+    );
+    let unchanged = fx.shared.store.agent(&alias).unwrap().params.unwrap();
+    assert_eq!(unchanged["look"], json!("robot"));
+    assert_eq!(unchanged["cad1817_cap_pad"], pad_before);
+
+    // Control: the same ACK with a same-width canonical look (`guard`, five
+    // chars like `robot`) leaves the merged params at the cap and is admitted,
+    // proving the refusal above was the cap and not this ACK path.
+    cad1817_ack(
+        &fx,
+        &alias,
+        &message,
+        &token,
+        json!({"action": "update", "expected_revision": revision,
+               "profile": {"name": "Cap Admitted", "look": "guard"}}),
+    )
+    .unwrap_or_else(|e| panic!("a same-width look at the params cap was refused: {e}"));
+    let admitted = cad1817_identity(&fx, sub);
+    assert_eq!(admitted["name"], json!("Cap Admitted"));
+    assert_eq!(admitted["look"], json!("guard"));
+    let after = fx.shared.store.agent(&alias).unwrap().params.unwrap();
+    assert_eq!(after.to_string().len(), 4_000);
+    assert_eq!(after["cad1817_cap_pad"], pad_before);
+    assert_eq!(after["report_timeout_secs"], json!(3600));
+}
+
+// After the protected master files are installed and recorded, an external
+// edit of a managed IDENTITY.md/SOUL.md section is refused before the per-turn
+// profile context uses it. No provider/actor is started: the per-turn
+// projection itself is the guard-visible interface.
+#[test]
+fn cad1817_master_profile_context_refuses_external_identity_drift() {
+    let fx = Fx::new();
+    let pm = cad1817_prepare_master(&fx.shared, &fx.dir.path().join("master-context-cwd"));
+    let state_before = fx.op("master_state", json!({}));
+    assert_eq!(state_before["identity"]["look"], json!("robot"));
+    let revision = state_before["identity"]["revision"]
+        .as_str()
+        .expect("master identity revision must be a string")
+        .to_string();
+    // Create the managed name/tone sections and record their digests through
+    // the real operator write path before tampering.
+    fx.op(
+        "master_identity_set",
+        json!({"expected_revision": revision, "name": "Context Guide", "tone": "steady"}),
+    );
+    let context = fx
+        .shared
+        .master_profile_context()
+        .unwrap_or_else(|e| panic!("the baseline profile context was refused: {e}"));
+    assert!(
+        context.contains("Context Guide") && context.contains("steady"),
+        "the baseline profile context lacks the committed identity: {context}"
+    );
+
+    let root = pm.dir.join("agents").join(crate::master::ALIAS);
+    let identity_path = root.join("IDENTITY.md");
+    let soul_path = root.join("SOUL.md");
+    let files_before = cad1817_master_files(&pm.dir);
+    let record_path = fx.shared.state_dir.join("agent-files.json");
+    let record_before = std::fs::read_to_string(&record_path).unwrap();
+    let identity_before = std::fs::read_to_string(&identity_path).unwrap();
+    let soul_before = std::fs::read_to_string(&soul_path).unwrap();
+
+    // 1) A managed IDENTITY.md edited around the writer.
+    let tampered_identity = crate::managed_section::set(
+        &identity_before,
+        "name",
+        &crate::managed_section::line("name", "External Hijack"),
+    )
+    .unwrap();
+    std::fs::write(&identity_path, &tampered_identity).unwrap();
+    assert!(
+        cad1817_master_tampered(&fx.shared, &pm).is_some(),
+        "the fixture created no drift for the authoritative digest guard"
+    );
+    let refused = fx
+        .shared
+        .master_profile_context()
+        .expect_err("a tampered IDENTITY.md was used for the per-turn profile context");
+    cad1817_assert_drift_refusal(&refused.to_string(), "IDENTITY.md");
+    assert_eq!(
+        std::fs::read_to_string(&identity_path).unwrap(),
+        tampered_identity,
+        "the refused profile-context read rewrote IDENTITY.md"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&record_path).unwrap(),
+        record_before,
+        "the refused profile-context read re-recorded a digest over the drift"
+    );
+    std::fs::write(&identity_path, &identity_before).unwrap();
+    assert!(
+        fx.shared
+            .master_profile_context()
+            .unwrap()
+            .contains("Context Guide"),
+        "restoring IDENTITY.md did not restore the committed context"
+    );
+
+    // 2) A managed SOUL.md edited around the writer.
+    let tampered_soul = crate::managed_section::set(
+        &soul_before,
+        "tone",
+        &crate::managed_section::line("tone", "External Tone"),
+    )
+    .unwrap();
+    std::fs::write(&soul_path, &tampered_soul).unwrap();
+    assert!(
+        cad1817_master_tampered(&fx.shared, &pm).is_some(),
+        "the fixture created no SOUL.md drift for the authoritative digest guard"
+    );
+    let refused = fx
+        .shared
+        .master_profile_context()
+        .expect_err("a tampered SOUL.md was used for the per-turn profile context");
+    cad1817_assert_drift_refusal(&refused.to_string(), "SOUL.md");
+    assert_eq!(
+        std::fs::read_to_string(&soul_path).unwrap(),
+        tampered_soul,
+        "the refused profile-context read rewrote SOUL.md"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&record_path).unwrap(),
+        record_before,
+        "the refused SOUL.md read re-recorded a digest over the drift"
+    );
+    std::fs::write(&soul_path, &soul_before).unwrap();
+    assert_eq!(
+        cad1817_master_files(&pm.dir),
+        files_before,
+        "the refused profile-context reads left a protected-file effect"
+    );
+    assert!(cad1817_master_tampered(&fx.shared, &pm).is_none());
+    let restored = fx.shared.master_profile_context().unwrap();
+    assert!(
+        restored.contains("Context Guide") && restored.contains("steady"),
+        "restoring SOUL.md did not restore the committed context: {restored}"
+    );
+}
+
+// A legitimate name-only coordinator save refuses external AGENT.md and
+// untouched-SOUL.md drift before any side effect: it must not rewrite
+// IDENTITY.md, re-record the drifted digest, or import the drift into the
+// launch briefing / standing instructions.
+#[test]
+fn cad1817_master_identity_save_refuses_external_file_drift() {
+    let fx = Fx::new();
+    let pm = cad1817_prepare_master(&fx.shared, &fx.dir.path().join("master-drift-cwd"));
+    let initial = fx.op("master_state", json!({}));
+    let look = initial["identity"]["look"]
+        .as_str()
+        .expect("master identity look must be a string")
+        .to_string();
+    assert_eq!(look, "robot");
+    let rev0 = initial["identity"]["revision"]
+        .as_str()
+        .expect("master identity revision must be a string")
+        .to_string();
+    fx.op(
+        "master_identity_set",
+        json!({"expected_revision": rev0, "name": "Baseline Guide"}),
+    );
+    let baseline_state = fx.op("master_state", json!({}));
+    assert_eq!(baseline_state["identity"]["name"], json!("Baseline Guide"));
+    let baseline_revision = baseline_state["identity"]["revision"]
+        .as_str()
+        .expect("master identity revision must be a string")
+        .to_string();
+    let files_baseline = cad1817_master_files(&pm.dir);
+    let record_path = fx.shared.state_dir.join("agent-files.json");
+    let record_baseline = std::fs::read_to_string(&record_path).unwrap();
+    let briefing_path =
+        crate::client::briefing_path(&fx.shared.state_dir, &Value::Null, crate::master::ALIAS);
+    let briefing_baseline = std::fs::read(&briefing_path)
+        .unwrap_or_else(|e| panic!("the baseline identity save wrote no briefing: {e}"));
+    let instructions_baseline = fx
+        .shared
+        .store
+        .agent(crate::master::ALIAS)
+        .unwrap()
+        .instructions;
+    assert!(
+        instructions_baseline
+            .as_deref()
+            .is_some_and(|text| text.contains("Baseline Guide")),
+        "the baseline identity save did not update the standing instructions"
+    );
+    let root = pm.dir.join("agents").join(crate::master::ALIAS);
+
+    // A) AGENT.md changed around the writer. It is not part of the identity
+    // revision, so the supplied revision is legitimately current and only the
+    // protected-digest guard can refuse this save. The tamper is a same-length
+    // replacement, so the file stays inside its existing cap.
+    let agent_path = root.join("AGENT.md");
+    let agent_before = std::fs::read_to_string(&agent_path).unwrap();
+    let tampered_agent = agent_before.replacen("# Master", "# Hijack", 1);
+    assert_ne!(
+        tampered_agent, agent_before,
+        "the AGENT.md tamper fixture matched no anchor"
+    );
+    assert_eq!(
+        tampered_agent.chars().count(),
+        agent_before.chars().count(),
+        "the AGENT.md tamper fixture changed the file length"
+    );
+    std::fs::write(&agent_path, &tampered_agent).unwrap();
+    assert!(
+        cad1817_master_tampered(&fx.shared, &pm).is_some(),
+        "the fixture created no AGENT.md drift for the authoritative digest guard"
+    );
+    let refused = fx.op_err(
+        "master_identity_set",
+        json!({"expected_revision": baseline_revision, "name": "AGENT Tamper Save"}),
+    );
+    let error = refused
+        .expect_err("a name-only coordinator save imported an externally changed AGENT.md")
+        .to_string();
+    cad1817_assert_drift_refusal(&error, "AGENT.md");
+    let files = cad1817_master_files(&pm.dir);
+    assert_eq!(
+        files["IDENTITY.md"], files_baseline["IDENTITY.md"],
+        "the refused coordinator save rewrote IDENTITY.md"
+    );
+    assert_eq!(
+        files["SOUL.md"], files_baseline["SOUL.md"],
+        "the refused coordinator save rewrote SOUL.md"
+    );
+    assert_eq!(
+        files["AGENT.md"].as_deref(),
+        Some(tampered_agent.as_bytes()),
+        "the refused coordinator save rewrote the externally changed AGENT.md"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&record_path).unwrap(),
+        record_baseline,
+        "the refused coordinator save re-recorded digests over the drift"
+    );
+    assert_eq!(
+        std::fs::read(&briefing_path).unwrap(),
+        briefing_baseline,
+        "the refused coordinator save rebuilt the briefing from the drift"
+    );
+    assert_eq!(
+        fx.shared
+            .store
+            .agent(crate::master::ALIAS)
+            .unwrap()
+            .instructions,
+        instructions_baseline,
+        "the refused coordinator save imported the AGENT.md drift into the \
+         standing instructions"
+    );
+    std::fs::write(&agent_path, &agent_before).unwrap();
+    assert!(cad1817_master_tampered(&fx.shared, &pm).is_none());
+
+    // B) SOUL.md changed around the writer while this save leaves the tone
+    // untouched. The supplied revision is the CURRENT revision of the drifted
+    // raw files (recomputed with the production revision helper), so the save
+    // is otherwise legitimate and only the digest guard can refuse it.
+    let soul_path = root.join("SOUL.md");
+    let soul_before = std::fs::read_to_string(&soul_path).unwrap();
+    let tampered_soul = crate::managed_section::set(
+        &soul_before,
+        "tone",
+        &crate::managed_section::line("tone", "Hijacked tone"),
+    )
+    .unwrap();
+    std::fs::write(&soul_path, &tampered_soul).unwrap();
+    assert!(
+        cad1817_master_tampered(&fx.shared, &pm).is_some(),
+        "the fixture created no SOUL.md drift for the authoritative digest guard"
+    );
+    let identity_now = std::fs::read_to_string(root.join("IDENTITY.md")).unwrap();
+    let current_revision = crate::master::identity_revision(&identity_now, &tampered_soul, &look);
+    let refused = fx.op_err(
+        "master_identity_set",
+        json!({"expected_revision": current_revision, "name": "SOUL Tamper Save"}),
+    );
+    let error = refused
+        .expect_err("a name-only coordinator save imported an untouched SOUL.md's external drift")
+        .to_string();
+    cad1817_assert_drift_refusal(&error, "SOUL.md");
+    let files = cad1817_master_files(&pm.dir);
+    assert_eq!(
+        files["IDENTITY.md"], files_baseline["IDENTITY.md"],
+        "the refused coordinator save rewrote IDENTITY.md"
+    );
+    assert_eq!(
+        files["AGENT.md"], files_baseline["AGENT.md"],
+        "the refused coordinator save rewrote AGENT.md"
+    );
+    assert_eq!(
+        files["SOUL.md"].as_deref(),
+        Some(tampered_soul.as_bytes()),
+        "the refused coordinator save rewrote the externally changed SOUL.md"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&record_path).unwrap(),
+        record_baseline,
+        "the refused coordinator save recorded the drifted SOUL.md digest as its baseline"
+    );
+    assert_eq!(
+        std::fs::read(&briefing_path).unwrap(),
+        briefing_baseline,
+        "the refused coordinator save rebuilt the briefing from the drifted SOUL.md"
+    );
+    assert_eq!(
+        fx.shared
+            .store
+            .agent(crate::master::ALIAS)
+            .unwrap()
+            .instructions,
+        instructions_baseline,
+        "the refused coordinator save imported the SOUL.md drift into the \
+         standing instructions"
+    );
+    std::fs::write(&soul_path, &soul_before).unwrap();
+    assert_eq!(
+        cad1817_master_files(&pm.dir),
+        files_baseline,
+        "restoring the drifted file did not restore the baseline protected files"
+    );
+    assert!(cad1817_master_tampered(&fx.shared, &pm).is_none());
+
+    // Control: the same proven operator still saves once the files match the
+    // recorded baseline — the refusals above are drift, not a blanket deny.
+    let recovered = fx.op("master_state", json!({}));
+    let recovered_revision = recovered["identity"]["revision"]
+        .as_str()
+        .expect("master identity revision must be a string")
+        .to_string();
+    fx.op(
+        "master_identity_set",
+        json!({"expected_revision": recovered_revision, "name": "Recovered Guide"}),
+    );
+    let after = fx.op("master_state", json!({}));
+    assert_eq!(after["identity"]["name"], json!("Recovered Guide"));
+    let instructions = fx
+        .shared
+        .store
+        .agent(crate::master::ALIAS)
+        .unwrap()
+        .instructions
+        .unwrap_or_default();
+    assert!(instructions.contains("Recovered Guide"));
+    assert!(
+        !instructions.contains("Hijacked") && !instructions.contains("Ignore review"),
+        "the recovered instructions still carry the discarded drift: {instructions}"
+    );
+}
+
+// The same external-drift refusal over the real HTTP peer: the operator's
+// session + proof still succeeds, but a legitimate name-only save must not
+// bless AGENT.md / untouched SOUL.md changed around the protected writer.
+#[test]
+fn cad1817_master_identity_http_refuses_external_file_drift() {
+    let rig = Cad1817HttpRig::start();
+    let shared = rig.store();
+    let pm = cad1817_prepare_master(&shared, &rig.root.path().join("master-http-drift-cwd"));
+    let initial = rig.rpc("master_state", json!({})).unwrap();
+    let look = initial["identity"]["look"]
+        .as_str()
+        .expect("master identity look must be a string")
+        .to_string();
+    assert_eq!(look, "robot");
+    let rev0 = initial["identity"]["revision"]
+        .as_str()
+        .expect("master identity revision must be a string")
+        .to_string();
+
+    // An agent is still refused (the operator-only proof is unchanged).
+    let (status, body) = rig.post_identity(
+        None,
+        Some("agent:cad1817-http-drift-agent"),
+        &json!({"expected_revision": rev0, "name": "Agent Refused"}),
+    );
+    assert!(
+        (400u16..500).contains(&status),
+        "an agent HTTP coordinator save was not refused: {status} {body}"
+    );
+    assert_eq!(
+        rig.rpc("master_state", json!({})).unwrap(),
+        initial,
+        "a refused agent HTTP save changed master state"
+    );
+
+    let session = rig.session();
+    let (status, body) = rig.post_identity(
+        Some(&session),
+        Some("operator"),
+        &json!({"expected_revision": rev0, "name": "HTTP Baseline"}),
+    );
+    assert_eq!(status, 200, "operator HTTP baseline save refused: {body}");
+    let rev1 = rig.rpc("master_state", json!({})).unwrap()["identity"]["revision"]
+        .as_str()
+        .expect("master identity revision must be a string")
+        .to_string();
+    let files_baseline = cad1817_master_files(&pm.dir);
+    let record_path = rig.state.join("agent-files.json");
+    let record_baseline = std::fs::read_to_string(&record_path).unwrap();
+    let briefing_path =
+        crate::client::briefing_path(&rig.state, &Value::Null, crate::master::ALIAS);
+    let briefing_baseline = std::fs::read(&briefing_path)
+        .unwrap_or_else(|e| panic!("the baseline HTTP save wrote no briefing: {e}"));
+    let instructions_baseline = shared
+        .store
+        .agent(crate::master::ALIAS)
+        .unwrap()
+        .instructions;
+    let root = pm.dir.join("agents").join(crate::master::ALIAS);
+
+    // External AGENT.md edit, legitimate current revision. Same-length
+    // replacement keeps the file inside its existing cap.
+    let agent_path = root.join("AGENT.md");
+    let agent_before = std::fs::read_to_string(&agent_path).unwrap();
+    let tampered_agent = agent_before.replacen("# Master", "# Hijack", 1);
+    assert_ne!(
+        tampered_agent, agent_before,
+        "the HTTP AGENT.md tamper fixture matched no anchor"
+    );
+    assert_eq!(
+        tampered_agent.chars().count(),
+        agent_before.chars().count(),
+        "the HTTP AGENT.md tamper fixture changed the file length"
+    );
+    std::fs::write(&agent_path, &tampered_agent).unwrap();
+    assert!(
+        cad1817_master_tampered(&shared, &pm).is_some(),
+        "the fixture created no HTTP AGENT.md drift"
+    );
+    let (status, body) = rig.post_identity(
+        Some(&session),
+        Some("operator"),
+        &json!({"expected_revision": rev1, "name": "HTTP After Tamper"}),
+    );
+    assert!(
+        (400u16..500).contains(&status),
+        "a legitimate HTTP save blessed externally changed AGENT.md: {status} {body}"
+    );
+    let files = cad1817_master_files(&pm.dir);
+    assert_eq!(
+        files["IDENTITY.md"], files_baseline["IDENTITY.md"],
+        "the refused HTTP save rewrote IDENTITY.md"
+    );
+    assert_eq!(
+        files["AGENT.md"].as_deref(),
+        Some(tampered_agent.as_bytes()),
+        "the refused HTTP save rewrote the externally changed AGENT.md"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&record_path).unwrap(),
+        record_baseline,
+        "the refused HTTP save re-recorded digests over the drift"
+    );
+    assert_eq!(
+        std::fs::read(&briefing_path).unwrap(),
+        briefing_baseline,
+        "the refused HTTP save rebuilt the briefing from the drift"
+    );
+    assert_eq!(
+        shared
+            .store
+            .agent(crate::master::ALIAS)
+            .unwrap()
+            .instructions,
+        instructions_baseline,
+        "the refused HTTP save imported the AGENT.md drift into the standing instructions"
+    );
+    std::fs::write(&agent_path, &agent_before).unwrap();
+    assert!(cad1817_master_tampered(&shared, &pm).is_none());
+
+    // External SOUL.md edit while this save leaves the tone untouched; the
+    // supplied revision is the current revision over the drifted raw files.
+    let soul_path = root.join("SOUL.md");
+    let soul_before = std::fs::read_to_string(&soul_path).unwrap();
+    let tampered_soul = crate::managed_section::set(
+        &soul_before,
+        "tone",
+        &crate::managed_section::line("tone", "HTTP Hijacked tone"),
+    )
+    .unwrap();
+    std::fs::write(&soul_path, &tampered_soul).unwrap();
+    assert!(
+        cad1817_master_tampered(&shared, &pm).is_some(),
+        "the fixture created no HTTP SOUL.md drift"
+    );
+    let identity_now = std::fs::read_to_string(root.join("IDENTITY.md")).unwrap();
+    let current_revision = crate::master::identity_revision(&identity_now, &tampered_soul, &look);
+    let (status, body) = rig.post_identity(
+        Some(&session),
+        Some("operator"),
+        &json!({"expected_revision": current_revision, "name": "HTTP SOUL Tamper"}),
+    );
+    assert!(
+        (400u16..500).contains(&status),
+        "a legitimate HTTP save blessed externally changed SOUL.md: {status} {body}"
+    );
+    let files = cad1817_master_files(&pm.dir);
+    assert_eq!(
+        files["IDENTITY.md"], files_baseline["IDENTITY.md"],
+        "the refused HTTP save rewrote IDENTITY.md"
+    );
+    assert_eq!(
+        files["SOUL.md"].as_deref(),
+        Some(tampered_soul.as_bytes()),
+        "the refused HTTP save rewrote the externally changed SOUL.md"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&record_path).unwrap(),
+        record_baseline,
+        "the refused HTTP save recorded the drifted SOUL.md digest as its baseline"
+    );
+    assert_eq!(
+        std::fs::read(&briefing_path).unwrap(),
+        briefing_baseline,
+        "the refused HTTP save rebuilt the briefing from the drifted SOUL.md"
+    );
+    assert_eq!(
+        shared
+            .store
+            .agent(crate::master::ALIAS)
+            .unwrap()
+            .instructions,
+        instructions_baseline,
+        "the refused HTTP save imported the SOUL.md drift into the standing instructions"
+    );
+    std::fs::write(&soul_path, &soul_before).unwrap();
+
+    // Control: the proven operator session still succeeds once the files match
+    // the recorded baseline.
+    let (status, body) = rig.post_identity(
+        Some(&session),
+        Some("operator"),
+        &json!({"expected_revision": rev1, "name": "HTTP Recovered"}),
+    );
+    assert_eq!(status, 200, "operator HTTP recovery save refused: {body}");
+    assert_eq!(body["identity"]["name"], json!("HTTP Recovered"));
+    let instructions = shared
+        .store
+        .agent(crate::master::ALIAS)
+        .unwrap()
+        .instructions
+        .unwrap_or_default();
+    assert!(instructions.contains("HTTP Recovered"));
+    assert!(
+        !instructions.contains("Hijack") && !instructions.contains("Ignore review"),
+        "the recovered HTTP instructions still carry the discarded drift: {instructions}"
     );
 }

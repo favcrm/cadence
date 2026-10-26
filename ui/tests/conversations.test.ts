@@ -86,7 +86,9 @@ let identityUnavailable = false;
 const masterSnapshot = (conversation: string): MasterState => ({
   alias: "master",
   identity: { name: null, tone: null, look: "robot", revision: "fixture" },
-  provider: "p", endpoint_kind: "k", live: true, turn, queue,
+  provider: "p", endpoint_kind: "k", live: true,
+  turn: hostedIdentity && conversation === "home-thread" ? null : turn,
+  queue: hostedIdentity && conversation === "home-thread" ? [] : queue,
   ...(hostedIdentity ? { actor_identity: {
     scope: "personal", conversation_id: conversation,
     identity: { name: "Poppy", tone: "Warm", look: "designer", revision: 1 },
@@ -144,6 +146,7 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     : json(masterSnapshot(url.searchParams.get("conversation") ?? "home-thread"));
   if (url.pathname === "/api/master/command") {
     commandPosts.push(JSON.parse(String(init!.body)));
+    if (hostedIdentity) { turn = null; queue = []; }
     return json({ command: "x", ok: true, result: {} });
   }
   if (url.pathname === "/api/crm-send/list") return json({ sends: [] });
@@ -626,6 +629,25 @@ await mount("install-crm");
 await pick("General");
 assert(host.querySelector("[data-assistant-name]")?.textContent === "Poppy", "the selected hosted conversation names its own assistant");
 assert(host.querySelector("[data-identity-state]")?.getAttribute("data-identity-state") === "ready", "the fresh private profile is current");
+// Home is idle while this hosted app has its own running/queued operation.
+// Both display and command reconciliation must read the selected scope.
+turn = { state: "working", message: "m-gen", conversation: "c-gen", summary: "customers.search" };
+await React.act(async () => { await resources.masterConversation("c-gen").refresh(); });
+await settle();
+assert(bar()?.dataset.state === "working" && barButton("Stop"), "a hosted app shows its own working turn while Home is idle");
+await React.act(async () => { barButton("Stop")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+await settle();
+equal(commandPosts.at(-1), { command: "stop", message: "m-gen" }, "hosted Stop controls the selected app message");
+assert(!barButton("Stop"), "Stop refreshes the selected hosted conversation after the operation ends");
+turn = { state: "working", message: "m-other", conversation: "c-camp" };
+queue = [{ message: "m-gen", conversation: "c-gen" }];
+await React.act(async () => { await resources.masterConversation("c-gen").refresh(); });
+await settle();
+assert(bar()?.dataset.state === "queued" && barButton("Cancel") && !barButton("Stop"), "a hosted app shows its own queued turn without borrowing idle Home");
+await React.act(async () => { barButton("Cancel")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+await settle();
+equal(commandPosts.at(-1), { command: "cancel", message: "m-gen" }, "hosted Cancel controls the selected queued app message");
+assert(!barButton("Cancel"), "Cancel refreshes the selected hosted conversation after queue removal");
 identityUnavailable = true;
 await React.act(async () => { await resources.masterConversation("c-gen").refresh(); });
 await settle();

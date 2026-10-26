@@ -494,7 +494,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const store = active.store ?? idleThread;
   const convId = active.state === "ready" ? (active.selected?.id ?? null) : null;
   const thread = useResource(store);
-  const masterState = useQuery(resources.masterState);
+  const homeMasterState = useQuery(resources.masterState);
+  const hosted = homeMasterState.data !== null && Object.hasOwn(homeMasterState.data, "actor_identity");
+  // Hosted turn state belongs to the selected session, just like identity.
+  // Native retains the install-wide coordinator queue.
+  const masterSource = hosted && convId !== null ? resources.masterConversation(convId) : resources.masterState;
+  const masterState = useQuery(masterSource);
   const homeThread = useResource(resources.masterThread);
   // One draft per conversation: the composer remounts per store, so
   // switching conversations keeps each one's typed text (the stores and
@@ -1109,7 +1114,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           composerKeyRef.current === origin.key && visitRef.current === origin.visit && frameRef.current === origin.frame;
         if (current) setSendError(e instanceof ApiError ? e.message : String(e));
       })
-      .finally(() => void resources.masterState.refresh());
+      .finally(() => void masterSource.refresh());
   };
   const turnActions = {
     onStop: canControlTurns ? (message: string) => turnCommand("stop", message) : undefined,
@@ -1133,8 +1138,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // (the `master` stream frame keeps it live while it is queued).
   const unanswered = hasUnansweredOperator(thread.data?.entries ?? []);
   useEffect(() => {
-    if (unanswered) void resources.masterState.refresh();
-  }, [unanswered, convId]);
+    if (unanswered) void masterSource.refresh();
+  }, [unanswered, masterSource]);
 
   // "+ New", `/new` and `/clear` are one call: a fresh conversation.
   const startNew = () => {
@@ -1188,7 +1193,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           await api.threadSend(MASTER, body, message, refs, app, id ?? undefined, attachments, op, mediaRefs);
           op.assertCurrent();
           dest.write((s) => settlePending(s, message, { ok: true }));
-          void resources.masterState.refresh();
+          void (hosted && id !== null ? resources.masterConversation(id) : resources.masterState).refresh();
         } catch (e: unknown) {
           if (op.signal.aborted || op.generation !== privateSessionGeneration()) {
             releaseAbandoned();
@@ -1216,7 +1221,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         dest.write((s) => settlePending(s, message, { ok: false, error }));
       });
     },
-    [],
+    [hosted],
   );
 
   /** Adopt one immutable submitted envelope into its destination store:
@@ -1889,7 +1894,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                   );
                   op.assertCurrent();
                   void store.refresh();
-                  void resources.masterState.refresh();
+                  void masterSource.refresh();
                 });
                 return null;
               } catch (e: unknown) {

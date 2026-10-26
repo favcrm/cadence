@@ -1626,10 +1626,34 @@ pub fn identity_revision(identity_text: &str, soul_text: &str, look: &str) -> St
 pub fn read_identity(pm_dir: &Path, look: &str) -> Result<Identity> {
     let identity = read_one(pm_dir, ALIAS, "IDENTITY.md")?.unwrap_or_default();
     let soul = read_one(pm_dir, ALIAS, "SOUL.md")?.unwrap_or_default();
+    identity_from_sources(&identity, &soul, look)
+}
+
+/// Read only verified source bytes for UI and per-turn context. Unlike the
+/// launch check, this never trusts-once or updates the protected baseline.
+pub fn read_verified_identity(state_dir: &Path, pm_dir: &Path, look: &str) -> Result<Identity> {
+    let identity = read_one(pm_dir, ALIAS, "IDENTITY.md")?.unwrap_or_default();
+    let soul = read_one(pm_dir, ALIAS, "SOUL.md")?.unwrap_or_default();
+    let agent = read_one(pm_dir, ALIAS, "AGENT.md")?.unwrap_or_default();
+    if let Some(reason) = tampered_sources(
+        state_dir,
+        ALIAS,
+        [
+            ("IDENTITY.md", identity.as_str()),
+            ("SOUL.md", soul.as_str()),
+            ("AGENT.md", agent.as_str()),
+        ],
+    ) {
+        return Err(Error::invalid("agent_files_changed", reason));
+    }
+    identity_from_sources(&identity, &soul, look)
+}
+
+fn identity_from_sources(identity: &str, soul: &str, look: &str) -> Result<Identity> {
     Ok(Identity {
-        name: crate::managed_section::value(&identity, "name")?,
-        tone: crate::managed_section::value(&soul, "tone")?,
-        revision: identity_revision(&identity, &soul, look),
+        name: crate::managed_section::value(identity, "name")?,
+        tone: crate::managed_section::value(soul, "tone")?,
+        revision: identity_revision(identity, soul, look),
     })
 }
 
@@ -1723,10 +1747,18 @@ pub fn write_identity(
     read_identity(&pm.dir, look)
 }
 
-/// Record the protected-writer digests for the identity sources, so the next
-/// `master start` verifies exactly what this writer left.
-pub fn record_identity(state_dir: &Path, pm_dir: &Path) -> Result<()> {
-    for name in ["IDENTITY.md", "SOUL.md"] {
+/// Record only the identity sources explicitly changed by the protected writer;
+/// an unrelated source must retain its baseline for the post-write check.
+pub fn record_identity(
+    state_dir: &Path,
+    pm_dir: &Path,
+    name_changed: bool,
+    tone_changed: bool,
+) -> Result<()> {
+    for (name, changed) in [("IDENTITY.md", name_changed), ("SOUL.md", tone_changed)] {
+        if !changed {
+            continue;
+        }
         if let Some(text) = read_one(pm_dir, ALIAS, name)? {
             record(state_dir, ALIAS, name, &digest(&text))?;
         }
@@ -1805,6 +1837,20 @@ pub fn verify(state_dir: &Path, slug: &str, files: &[(String, String)]) -> Resul
 /// refusal `verify` raises — without the trust-once recording `verify`
 /// performs. `master status` reports drift; it never records.
 pub fn tampered_file(state_dir: &Path, slug: &str, files: &[(String, String)]) -> Option<String> {
+    tampered_sources(
+        state_dir,
+        slug,
+        files
+            .iter()
+            .map(|(name, text)| (name.as_str(), text.as_str())),
+    )
+}
+
+fn tampered_sources<'a>(
+    state_dir: &Path,
+    slug: &str,
+    files: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<String> {
     let all = load_records(state_dir);
     for (name, text) in files {
         match all[slug][name]["digest"].as_str() {
