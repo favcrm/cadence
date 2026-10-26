@@ -753,7 +753,7 @@ pre {
 }
 .answer .issue-reader > :last-child,
 .chat-bubble.issue-reader > :last-child {
-  margin-bottom: 0;
+  margin-block-end: 0;
 }
 .answer-fail {
   margin: .25rem 0 .5rem;
@@ -1243,9 +1243,15 @@ pre {
   font-weight: 600;
   line-height: 1.4;
 }
+.answer .issue-reader > :is(h1, h2, h3, h4, h5, h6):last-child,
+.answer .issue-reader > p:has(> strong:only-child):last-child,
+.chat-bubble.issue-reader > :is(h1, h2, h3, h4, h5, h6):last-child,
+.chat-bubble.issue-reader > p:has(> strong:only-child):last-child {
+  margin-block-end: 0;
+}
 .answer .issue-reader > :first-child,
 .chat-bubble.issue-reader > :first-child {
-  margin-top: 0;
+  margin-block-start: 0;
 }
 .issue-reader ul,
 .issue-reader ol {
