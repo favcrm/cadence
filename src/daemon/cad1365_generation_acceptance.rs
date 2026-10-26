@@ -9,8 +9,8 @@
 //! connection) on a Designer-like installed host-execution `create-image`
 //! workflow → frozen `media.generate v1` binding resolved through the real
 //! `connection_list_locked`/`app_binding_config` path → the real media
-//! price read frozen into the snapshot at create and re-compared fresh
-//! at dispatch → approve-by-digest → host dispatch → the REAL
+//! price read frozen into the snapshot at create and re-quoted fresh at
+//! dispatch (CAD-1141: the fresh quote is the ceiling) → approve-by-digest → host dispatch → the REAL
 //! `AgenticosExternalAdapter` talking the real submit/poll/artifact
 //! protocol to a loopback provider fixture → verified original
 //! descriptor/bytes before the custody derivative →
@@ -25,7 +25,7 @@
 //! `owner_pm`, which a host run's snapshot contract refuses
 //! ("a host-execution run has no owner PM"). The declared host path is
 //! the three-verb operator click chain — same snapshot digest approval
-//! and the same frozen-vs-fresh quote comparison at dispatch — so this
+//! and the same fresh re-quote at dispatch — so this
 //! acceptance rides it and never weakens the team or owner rules.
 //!
 //! Fixture honesty: the provider is a loopback HTTP server answering the
@@ -170,7 +170,7 @@ struct DoorRecord {
 
 /// Loopback AgenticOS media door: the EXISTING provider schema — price
 /// read, submit, job poll, artifact bytes — joined before the tempdir
-/// drops. `charge` lets the bad case move the price without touching the
+/// drops. `charge` lets a case move the price without touching the
 /// door shape.
 fn media_door(
     charge: Arc<std::sync::atomic::AtomicU64>,
@@ -560,24 +560,70 @@ fn cad1365_generation_declared_host_run_retains_receipt_catalog_and_creator() {
     );
 }
 
-/// A quote the caller froze differently from the current provider price
-/// refuses BEFORE the image submit: no job is posted and no receipt,
-/// catalog asset or origin row exists. The quote GET itself is
-/// legitimate; only the paid submit is gated by the frozen comparison.
+/// CAD-1141 (operator decision 2026-10-26, "Proceed within bound"): a
+/// provider price that moves after the run froze its quote no longer
+/// refuses. The fresh re-quote at dispatch proceeds, the image submit
+/// carries the NEW quote as its `max_charge_minor` ceiling, and the
+/// frozen, digest-covered snapshot still records the approved quote.
 #[test]
-fn cad1365_generation_quote_mismatch_refuses_before_submit_and_leaves_nothing() {
+fn cad1365_generation_quote_drift_proceeds_with_the_fresh_quote_as_the_ceiling() {
     let fx = Fx::new();
     let created = fx
         .create("run-1365-stale")
         .expect("run creation must freeze the real quote");
-    // The provider price moves after the run froze its quote: the
-    // fresh re-quote at dispatch must refuse BEFORE any submit.
-    fx.charge.store(CHARGE + 1, Ordering::SeqCst);
+    assert_eq!(
+        created["snapshot"]["quotes"]["image"]["total_price_micros"],
+        CHARGE
+    );
+    let drifted = CHARGE * 2;
+    fx.charge.store(drifted, Ordering::SeqCst);
+    let run = fx
+        .approve_dispatch(&created)
+        .expect("a drifted price must not refuse the run");
+    assert_eq!(run["state"], "succeeded", "{run}");
+    let seen = fx.seen.lock().unwrap();
+    let submits: Vec<&DoorRecord> = seen
+        .iter()
+        .filter(|r| r.method == "POST" && r.url == "/v1/runtime/media/image")
+        .collect();
+    assert_eq!(submits.len(), 1, "exactly one image submit: {seen:?}");
+    assert_eq!(
+        submits[0].body["max_charge_minor"], drifted,
+        "the ceiling sent must be the fresh quote: {}",
+        submits[0].body
+    );
+    drop(seen);
+    let receipts = fx
+        .operator("app_run_capability_results", json!({"run_id": run["id"]}))
+        .expect("capability receipts");
+    let rows = receipts["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "one retained capability receipt: {receipts}");
+    assert_eq!(rows[0]["result"]["quoted_micros"], drifted, "{receipts}");
+    assert_eq!(
+        run["snapshot"]["quotes"]["image"]["total_price_micros"], CHARGE,
+        "the frozen snapshot is never rewritten"
+    );
+    assert_eq!(run["snapshot_digest"], created["snapshot_digest"]);
+}
+
+/// A fresh quote beyond the supported price bound (1e9 micros) still
+/// refuses BEFORE the image submit: no job is posted and no receipt,
+/// catalog asset or origin row exists. The quote GET itself is
+/// legitimate; only the paid submit is gated.
+#[test]
+fn cad1365_generation_quote_beyond_bound_refuses_before_submit_and_leaves_nothing() {
+    let fx = Fx::new();
+    let created = fx
+        .create("run-1365-bound")
+        .expect("run creation must freeze the real quote");
+    fx.charge.store(1_000_000_001, Ordering::SeqCst);
     let refused = fx
         .approve_dispatch(&created)
-        .expect_err("a stale frozen quote must be refused");
+        .expect_err("a quote beyond the supported bound must be refused");
     assert!(
-        refused.to_string().contains("price changed"),
+        refused
+            .to_string()
+            .contains("bound capability price discovery refused"),
         "wrong guard: {refused}"
     );
     let seen = fx.seen.lock().unwrap();
@@ -588,6 +634,17 @@ fn cad1365_generation_quote_mismatch_refuses_before_submit_and_leaves_nothing() 
         "no image submit may leave before the quote refusal: {seen:?}"
     );
     drop(seen);
+    let receipts = fx
+        .operator(
+            "app_run_capability_results",
+            json!({"run_id": created["id"]}),
+        )
+        .expect("capability receipts");
+    assert_eq!(
+        receipts["results"].as_array().map_or(0, Vec::len),
+        0,
+        "no receipt on a refused run: {receipts}"
+    );
     let (page, _next) = fx.shared.store.app_media_catalog(20, None).unwrap();
     assert!(page.is_empty(), "no catalog asset on a refused run");
     let origins: i64 = fx

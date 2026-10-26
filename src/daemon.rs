@@ -57,6 +57,8 @@ mod approvals_rpc;
 mod area_rpc;
 mod business_templates_rpc;
 #[cfg(all(test, feature = "test-seam"))]
+mod cad1141_drift_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
 mod cad1184_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1184_revision_acceptance;
