@@ -10,10 +10,20 @@ import type {
   HostedSessionOptions,
   HostedState,
   PendingOperation,
+  ThreadContext,
   ThreadEntry,
 } from "./contract.ts";
+import { assistantIdentityText } from "./assistant-identity.ts";
 import { authorizeExtension, intentGuard, runtimeExtension } from "./engine.ts";
 import { readGenerationIdentity, type TaskSql } from "./identity.ts";
+import {
+  guardModelRequests,
+  identityContextExtension,
+} from "./identity-context.ts";
+import {
+  IdentitySnapshots,
+  type IdentitySnapshotSql,
+} from "./identity-snapshots.ts";
 import { masterState } from "./master.ts";
 import { defaultModel, meteredBinding, withDefaultModel } from "./model.ts";
 import {
@@ -84,6 +94,24 @@ export class HostedSession<
     this.models.setProvider(withDefaultModel(ai.provider, model));
     this.registry.install(intentGuard(options.toolRefusal));
     this.registry.install(runtimeProfile);
+    if (options.identity) {
+      const identityMessages = new WeakSet<object>();
+      const identitySnapshots = new IdentitySnapshots(
+        ctx.storage.sql as unknown as IdentitySnapshotSql,
+      );
+      // The host has a committed identity: this session privately formats it,
+      // snapshots it once per operation and refuses a generation that did not
+      // receive the very object it authored. A generic host installs neither,
+      // and never silently receives a fallback.
+      this.registry.install(
+        identityContextExtension(
+          () => this.identityContextText(),
+          identityMessages,
+          identitySnapshots,
+        ),
+      );
+      guardModelRequests(this.models, identityMessages);
+    }
     for (const group of options.tools) {
       this.registry.install(runtimeExtension(authorizeTools(group, authority)));
     }
@@ -130,10 +158,43 @@ export class HostedSession<
       const requested = Number(url.searchParams.get("after") ?? "0");
       let last =
         Number.isSafeInteger(requested) && requested > 0 ? requested : 0;
+      // Read the projection now, at this connection's snapshot. A reconnect
+      // reads the host's store again, so a connection never pins an older
+      // revision/avatar/name over a newer committed edit; an unavailable or
+      // malformed projection fails the connection rather than serving a
+      // partial header.
+      let masterFrame: string;
+      try {
+        const master = this.options.threadContext
+          ? this.validatedThreadContext(await this.options.threadContext())
+          : null;
+        const model = await this.modelLabel();
+        // Serialize the actual composed payload once, before opening a watch
+        // or returning SSE 200. Metadata may contain non-JSON values, while
+        // reserved fields it cannot override must retain runtime precedence.
+        masterFrame = `event: master\ndata: ${JSON.stringify(
+          masterState(
+            model,
+            { running: false, queued: 0 },
+            master?.conversationId ?? null,
+            master?.metadata,
+          ),
+        )}\n\n`;
+      } catch {
+        return Response.json(
+          {
+            ok: false,
+            error: {
+              code: "capability_unavailable",
+              message: "The master identity projection is unavailable.",
+            },
+          },
+          { status: 503 },
+        );
+      }
       // Capture the watch before reading its snapshot so commits between the
       // initial read and subscription are buffered, not silently missed.
       const stream = await this.harness.session().events();
-      const model = await this.modelLabel();
       function emit(entry: ThreadEntry, send: (frame: string) => void): void {
         if (entry.seq <= last) return;
         send(
@@ -148,12 +209,9 @@ export class HostedSession<
           // nothing else, so a stream that never sends one reads
           // "reconnecting" forever — the stale banner then never clears.
           // This object is the master: it answered, and it holds no live
-          // native turn, so the honest snapshot is idle.
-          send(
-            `event: master\ndata: ${JSON.stringify(
-              masterState(model, { running: false, queued: 0 }, null),
-            )}\n\n`,
-          );
+          // native turn, so the honest snapshot is idle. A host projection
+          // composes under those runtime fields and cannot replace them.
+          send(masterFrame);
           for (const entry of threadEntries(stream.snapshot.entries, thinking))
             emit(entry, send);
         },
@@ -181,6 +239,7 @@ export class HostedSession<
 
   /** Ask the session and wait for the answer. */
   async ask(prompt: string, operationId?: string): Promise<AskResult> {
+    await this.requireIdentity();
     const id = operationId ?? crypto.randomUUID();
     const result = await this.harness.prompt(prompt, {
       operationId: id,
@@ -224,6 +283,7 @@ export class HostedSession<
 
   /** Submit without waiting: the board's send is queued, not a blocking turn. */
   async submit(text: string, operationId: string): Promise<boolean> {
+    await this.requireIdentity();
     const receipt = await this.harness.submit(text, {
       operationId,
       entry: { kind: BOARD_MESSAGE_KIND, data: { messageId: operationId } },
@@ -234,6 +294,47 @@ export class HostedSession<
   /** What the runtime has not settled yet, so the board can show queued/running/parked. */
   async pendingOperations(): Promise<PendingOperation[]> {
     return this.harness.pending();
+  }
+
+  /**
+   * Resolve and render the host's committed identity before admitting new
+   * work. A refusal propagates unchanged, so an operation never starts when its
+   * canonical identity is unavailable; a host without the feature is unchanged.
+   */
+  private async requireIdentity(): Promise<void> {
+    const identity = this.options.identity;
+    if (identity) assistantIdentityText(await identity());
+  }
+
+  /**
+   * The committed identity text this conversation's operations see. It is
+   * resolved for admission and again for an operation's first request; only the
+   * immutable operation snapshot stores it, so a change committed mid-operation
+   * applies to the next one.
+   */
+  private async identityContextText(): Promise<string> {
+    const identity = this.options.identity;
+    if (!identity)
+      throw new Error("This session has no identity context configured.");
+    return assistantIdentityText(await identity());
+  }
+
+  /**
+   * The one connection's public projection, checked before it is framed. A
+   * malformed projection fails the connection exactly like an unavailable one,
+   * so a partial header is never served.
+   */
+  private validatedThreadContext(context: ThreadContext): ThreadContext {
+    const metadata: unknown = context?.metadata;
+    if (
+      typeof context?.conversationId !== "string" ||
+      context.conversationId.length === 0 ||
+      metadata === null ||
+      typeof metadata !== "object" ||
+      Array.isArray(metadata)
+    )
+      throw new Error("The thread context is malformed.");
+    return context;
   }
 
   /**

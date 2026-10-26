@@ -75,6 +75,39 @@ checked before and after the authority check. Tool handlers receive only the
 neutral invocation identity, clock and cancellation context, not the engine's
 model registry or nested-execution API.
 
+**Hosted identity.** A host that has a committed assistant identity may supply
+two optional domain-data callbacks on `HostedSessionOptions`: `identity()`
+returns the current personal profile or workspace identity, and
+`threadContext()` returns the thread's public projection. Both carry data only.
+Prompt text, model messages, engine hooks and SDK types are not accepted
+through them, and a generic host that supplies neither keeps its current
+behavior.
+
+When `identity()` is configured, the runtime renders the established personal
+setup or workspace instructions privately, resolves the identity for each
+operation, and stores it once per operation root in the session object's
+existing `tenant_identity_snapshots` table (insert-once; a stored snapshot is
+never rewritten). Admission resolves the identity before accepting new work,
+and every actual generation must carry the exact message object the runtime
+authored for that operation: a text marker, a look-alike object or the current
+store cannot substitute for it. A profile change therefore applies to the next
+operation, never to an operation already running, and a malformed or
+unavailable identity refuses the operation instead of falling back to a generic
+prompt. The summarizer's `completeSimple` path keeps its original
+normalization, authentication and transport.
+
+Each `/thread-stream` connection reads `threadContext()` once. Its metadata
+composes into the `master` frame under the runtime's own fields, so business
+identity such as `identity` and `actor_identity` can be added but never
+replaces the model, provider, session, turn or queue state. An unavailable or
+malformed projection fails the connection with a `503` capability refusal
+instead of serving a stale or partial header. `masterState` applies the same
+precedence to the HTTP header read.
+The composed master frame is serialized once before opening the watch or
+returning SSE `200`. Serialization failures (such as cycles or bigint values)
+and callable root `toJSON` hooks refuse with `503`. Ordinary data fields remain
+allowed; values shadowed by reserved runtime fields do not invalidate the frame.
+
 `HostedSession.recordCount()` reports active stored runtime records, not the
 number of expanded UI transcript parts. A host can combine it with `state()`
 for release inspection without reading engine snapshots or starting a turn.
