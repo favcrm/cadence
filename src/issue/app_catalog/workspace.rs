@@ -371,53 +371,10 @@ fn mkdir_parents(root: &Root, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The lexical grammar a journaled bundle member's rel-path must satisfy
-/// — the flat `app.md`/`workflows/<tag>.md`/`rubrics|templates/<leaf>`
-/// plus CAD-1006's `screens/<tag>/<leaf>` (the one depth-3 member: a
-/// tag-named package dir holding `screens.json` or a
-/// `<stem>.<js|css|svg|json>` leaf). `Path::components` already drops
-/// `.`/`..`/slashes, so a member that survives the components grammar is
-/// normal by construction.
+/// The shared lexical grammar is checked before path normalization can fold
+/// distinct journaled member names onto the same filesystem entry.
 fn member_path_ok(name: &str) -> bool {
-    let path = Path::new(name);
-    let parts: Vec<_> = path.components().collect();
-    let normal = |i: usize| -> Option<&str> {
-        match parts.get(i) {
-            Some(std::path::Component::Normal(n)) => n.to_str(),
-            _ => None,
-        }
-    };
-    if crate::issue::app::root_member(name) {
-        return true;
-    }
-    match (parts.len(), normal(0)) {
-        (2, Some(top)) if matches!(top, "workflows" | "rubrics" | "templates" | "views") => {
-            normal(1).is_some_and(|leaf| {
-                !leaf.starts_with('.')
-                    && match top {
-                        // workflows are tag-named Markdown.
-                        "workflows" => {
-                            leaf.ends_with(".md") && model::valid_tag(leaf.trim_end_matches(".md"))
-                        }
-                        // views/ holds exactly the app-views/v1 descriptor.
-                        "views" => leaf == crate::issue::app_view::FILE,
-                        _ => true,
-                    }
-            })
-        }
-        // CAD-1129: assets/<leaf>.svg — the catalog's flat SVG assets.
-        (2, Some("assets")) => normal(1).is_some_and(|leaf| {
-            !leaf.starts_with('.') && leaf.len() <= 128 && leaf.ends_with(".svg")
-        }),
-        // screens/<tag>/<leaf> — tag-validated dir + package leaf grammar.
-        (3, Some("screens")) => {
-            normal(1).is_some_and(model::valid_tag)
-                && normal(2).is_some_and(|leaf| {
-                    !leaf.starts_with('.') && crate::issue::app_screen_pkg::leaf_ok(leaf)
-                })
-        }
-        _ => false,
-    }
+    crate::issue::app::bundle_path_ok(name)
 }
 
 fn validate_source_transport(source: &str) -> Result<()> {
@@ -578,10 +535,11 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
             Some(libc::S_IFDIR)
                 if matches!(
                     name.as_str(),
-                    "workflows" | "rubrics" | "templates" | "views" | "assets"
+                    "workflows" | "rubrics" | "templates" | "views" | "assets" | "storage"
                 ) =>
             {
                 for leaf in root.list(&path, &mut budget)? {
+                    let relative = format!("{name}/{leaf}");
                     if leaf.starts_with('.')
                         || (name == "workflows"
                             && (!leaf.ends_with(".md")
@@ -590,12 +548,13 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
                         // pins the descriptor contract version.
                         || (name == "views" && leaf != app_view::FILE)
                         || (name == "assets" && (!leaf.ends_with(".svg") || leaf.len() > 128))
+                        || (name == "storage" && !app::bundle_path_ok(&relative))
                     {
                         return Err(Error::rejected(
                             "workflows must be named Markdown files, views/ holds exactly app-views-v1.json, assets flat *.svg, and all bundle entries must be visible flat text files",
                         ));
                     }
-                    add(format!("{name}/{leaf}"), path.join(leaf))?;
+                    add(relative, path.join(leaf))?;
                 }
             }
             Some(libc::S_IFREG) if crate::issue::app::root_member(&name) => add(name, path)?,
