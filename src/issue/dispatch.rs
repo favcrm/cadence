@@ -1789,7 +1789,7 @@ fn accepted_row_ok(row: &Value, d: &EarlyDispatch<'_>, task_id: &str) -> bool {
         && row["issue"].as_str() == Some(d.front.id.as_str())
         && row["worktree"]
             .as_str()
-            .is_some_and(|worktree| same_path(Path::new(worktree), d.lane))
+            .is_some_and(|worktree| same_lane(worktree, d.lane))
         && row["task_id"].as_str() == Some(task_id)
         && row_mode(row) == Some(DispatchMode::Job)
 }
