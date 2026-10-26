@@ -129,6 +129,10 @@ rotation inherits verified settings under the same custody section and exact
 caller revision used for publication. Use `connection rotate-smtp`, not the
 legacy `platform rotate` grammar, for an encrypted sender.
 
+Rotation leaves an existing SMTP binding stale. SMTP show reports that stale
+state with the current sender metadata; sending still refuses until the operator
+explicitly rebinds.
+
 Generic effects, app capability/artifact execution, mounted screen services and
 campaign sends refuse encrypted targets even when unlocked or granted. Encrypted
 initialization, unlock, enrollment and credential use with hosted `smtp.internal`
@@ -136,10 +140,12 @@ also refuse before key access or relay work. Existing legacy records keep their
 durable backend tags and legacy behavior; this is not a migration or erasure of
 plaintext stores and historical backups.
 
-Ordinary backup/export excludes the vault and external key, and refuses custody
-source/output overlaps. Those artifacts are not key recovery; losing the key
-loses access to its ciphertext. No anti-rollback or physical power-loss guarantee
-is implied.
+On Linux, ordinary backup/export excludes the vault and external key and refuses
+custody source/output overlaps. macOS retains ordinary backup/export only for
+unconfigured legacy state; configured encrypted-state artifacts refuse on
+non-Linux before output inspection or creation. These artifacts are not key
+recovery: losing the key loses access to its ciphertext. No anti-rollback or
+physical power-loss guarantee is implied.
 
 These owner commands are not chat-driven setup or CLI browser enrollment.
 Trusted credential-entry components, isolated agent access and hosted encrypted
@@ -167,6 +173,9 @@ All these routes require the same proven operator boundary as native RPC:
 Encrypted rotate/revoke requires the exact expected connection ID and revision.
 CLI and HTTP preflight may resolve that pair once through Connection show for
 the invocation; a supplied expectation is never replaced or automatically retried.
+Legacy callers may omit expectations, but supplied fields are never silently
+dropped: the ID must be a string and the revision an integer in
+`1..=9223372036854775807`. Null, wrong types and out-of-range revisions refuse.
 Custody bodies accept acknowledgement only, never key bytes or configuration
 paths. The closed request schemas live in
 [`src/ui/connections.rs`](../../src/ui/connections.rs).

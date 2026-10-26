@@ -588,6 +588,16 @@ fn refuse_custody_output(
     // Shared path-only admission before output creation, inspection/pruning
     // or cleanup. Never construct custody or open its key/vault database.
     let configured = crate::platform::encrypted_config::load(state_dir, None)?;
+    // Artifacts over an encrypted state stay unsupported away from Linux:
+    // refuse before inspecting the output, allocating a namespace,
+    // inventorying or cleaning anything. `load` above still refuses present
+    // but malformed/future/casefolded references itself.
+    #[cfg(not(target_os = "linux"))]
+    if configured.is_some() {
+        return Err(Error::rejected(
+            "encrypted custody artifacts are unsupported on this platform; nothing was written",
+        ));
+    }
     if let Some(config) = &configured {
         config.refuse_output(output)?;
     }
@@ -615,7 +625,7 @@ pub fn backup(state_dir: &Path, dir: &Path, keep: usize, reason: &str) -> Result
         )));
     }
     let mut output = ArtifactDir::open(dir, false)?;
-    let dir = output.view();
+    let dir = output.view()?;
     let now = epoch_now();
     let stem = format!(
         "cadence-{reason}-{}-{}",
@@ -1157,7 +1167,7 @@ pub fn export(state_dir: &Path, out: &Path) -> Result<Value> {
 }
 
 fn export_into(live: &Path, output: &mut ArtifactDir, allow: &Allowlist) -> Result<Value> {
-    let out = output.view();
+    let out = output.view()?;
     let temp_name = format!(".{BUNDLE_DB}.partial");
     let partial = output.file_path(temp_name.as_ref())?;
     artifact_snapshot(live, output, temp_name.as_ref())?;

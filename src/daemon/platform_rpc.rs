@@ -488,8 +488,13 @@ impl Shared {
         self.revoke_inner(params, None)
     }
 
-    pub(super) fn revoke_inner(&self, params: &Value, expected_id: Option<&str>) -> Result<Value> {
-        let caller_id = params
+    /// The caller's optional CAS expectation, parsed once under one
+    /// convention (CAD-1128): an absent field stays `None` — legacy
+    /// callers legitimately omit it — while a present field must have
+    /// the exact type and range. A malformed expectation refuses; it
+    /// is never treated as absent and silently dropped.
+    pub(super) fn expected_cas(params: &Value) -> Result<(Option<&str>, Option<u64>)> {
+        let expected_id = params
             .get("expected_connection_id")
             .map(|value| {
                 value.as_str().ok_or_else(|| {
@@ -511,6 +516,11 @@ impl Shared {
                     })
             })
             .transpose()?;
+        Ok((expected_id, expected_revision))
+    }
+
+    pub(super) fn revoke_inner(&self, params: &Value, expected_id: Option<&str>) -> Result<Value> {
+        let (caller_id, expected_revision) = Self::expected_cas(params)?;
         if expected_id
             .zip(caller_id)
             .is_some_and(|(expected, caller)| expected != caller)

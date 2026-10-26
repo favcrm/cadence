@@ -1,5 +1,7 @@
-//! Artifact namespace ownership. Paths for SQLite are views of retained
-//! directory descriptors, never an independent post-admission pathname walk.
+//! Artifact namespace ownership. Mutations address retained directory
+//! descriptors, never an independent post-admission pathname walk. SQLite
+//! needs a pathname: Linux hands over the retained descriptor itself, other
+//! supported Unix re-proves the admitted canonical path on every use.
 //! Publication is exclusive linkat, cleanup is inode/owner checked unlinkat.
 use crate::error::{Error, Result};
 use crate::platform::ControlledDirectories;
@@ -37,15 +39,21 @@ struct Identity {
 pub(super) struct ArtifactDir {
     pin: ControlledDirectories,
     path: PathBuf,
+    // Identity of the admitted directory. Linux uses it for the one-time
+    // /proc admission proof; the other supported Unix re-proves the pathname
+    // view against it on every use.
+    dir_dev: u64,
+    dir_ino: u64,
     owned: BTreeMap<OsString, Identity>,
     committed: bool,
     created: bool,
 }
 impl ArtifactDir {
     pub(super) fn open(path: &Path, fresh: bool) -> Result<Self> {
-        // Stock Unix SQLite needs a path; only qualify the descriptor view on
-        // hosts providing it. No unsupported-platform pathname fallback.
-        if !cfg!(target_os = "linux") {
+        // Stock Unix SQLite needs a pathname. Linux can address the retained
+        // descriptor; the other supported Unix host re-proves its admitted
+        // canonical path before every use. Unknown hosts keep refusing.
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
             return Err(refused());
         }
         let path = crate::platform::encrypted_config::resolve_output(path)?;
@@ -58,23 +66,61 @@ impl ArtifactDir {
         let result = Self {
             pin,
             path,
+            dir_dev: meta.dev(),
+            dir_ino: meta.ino(),
             owned: BTreeMap::new(),
             committed: false,
             created,
         };
-        // Verify /proc support before reserving any file.
-        let proc = std::fs::metadata(result.view())?;
-        if proc.dev() != meta.dev() || proc.ino() != meta.ino() {
-            return Err(refused());
-        }
+        // Prove the pathname view names the pinned directory before any file
+        // is reserved. Linux checks only here; its per-use views stay
+        // stat-free because /proc names the retained descriptor itself.
+        result.admit_view()?;
         result.check()?;
         Ok(result)
     }
     pub(super) fn check(&self) -> Result<()> {
         self.pin.check().map_err(|_| refused())
     }
-    pub(super) fn view(&self) -> PathBuf {
+    /// The pathname stock SQLite receives. Linux names the retained
+    /// descriptor, so no per-use stat is needed. Other supported Unix uses
+    /// the admitted canonical path and re-proves it still names the pinned
+    /// directory on every call, so a replaced, renamed-away or deleted
+    /// output refuses instead of silently redirecting a later open.
+    pub(super) fn view(&self) -> Result<PathBuf> {
+        #[cfg(not(target_os = "linux"))]
+        self.recheck_view()?;
+        Ok(self.view_path())
+    }
+    /// One-time proof that the pathname view names the pinned directory,
+    /// run before any file is reserved.
+    #[cfg(target_os = "linux")]
+    fn admit_view(&self) -> Result<()> {
+        let proc = std::fs::metadata(self.view_path())?;
+        if proc.dev() != self.dir_dev || proc.ino() != self.dir_ino {
+            return Err(refused());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn admit_view(&self) -> Result<()> {
+        self.recheck_view()
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn recheck_view(&self) -> Result<()> {
+        let meta = std::fs::metadata(&self.path)?;
+        if !meta.is_dir() || meta.dev() != self.dir_dev || meta.ino() != self.dir_ino {
+            return Err(refused());
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn view_path(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.pin.last().as_raw_fd()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn view_path(&self) -> PathBuf {
+        self.path.clone()
     }
     pub(super) fn public_path(&self, name: &OsStr) -> PathBuf {
         self.path.join(name)
@@ -82,7 +128,7 @@ impl ArtifactDir {
     pub(super) fn file_path(&self, name: &OsStr) -> Result<PathBuf> {
         leaf(name)?;
         self.check()?;
-        Ok(self.view().join(name))
+        Ok(self.view()?.join(name))
     }
     pub(super) fn create(&mut self, name: &OsStr) -> Result<File> {
         self.check()?;

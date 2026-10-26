@@ -129,3 +129,147 @@ fn ordinary_legacy_export_remains_available_on_supported_unix() {
         "ordinary export must not initialize or require encrypted custody"
     );
 }
+
+/// A configured encrypted state is intentionally unsupported for macOS
+/// artifacts. This is a real filesystem/public-API bad case, independent of
+/// the ordinary legacy-positive oracles above. No vault initialization or key
+/// read is necessary for the path-only configuration admission being tested.
+#[cfg(target_os = "macos")]
+#[test]
+fn configured_encrypted_macos_artifacts_refuse_before_output_effects() {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let root = root();
+    let state = state(root.path());
+    let owned = state.parent().expect("private fixture parent");
+    let planted = owned.join("planted-artifacts");
+    // A genuinely valid existing artifact is the retention/cleanup sentinel.
+    // This must succeed BEFORE encryption is configured, not be a canned file.
+    let existing = must(
+        cadence_agent::backup::backup(&state, &planted, 2, "manual"),
+        "macOS legacy artifact sentinel setup failed",
+    );
+    let existing_manifest = existing["manifest"]
+        .as_str()
+        .expect("existing artifact sentinel omitted its manifest");
+    must(
+        cadence_agent::backup::verify(Path::new(existing_manifest)),
+        "actual existing artifact sentinel failed verification",
+    );
+    let sentinel = planted.join("foreign-output.bin");
+    must(
+        std::fs::write(&sentinel, b"OMP-MAC-FOREIGN-OUTPUT-PRESERVE"),
+        "planted output sentinel setup failed",
+    );
+
+    let key_dir = owned.join("owner-key");
+    must(
+        std::fs::DirBuilder::new().mode(0o700).create(&key_dir),
+        "private synthetic key directory setup failed",
+    );
+    let key_path = key_dir.join("fixture-key");
+    let mut synthetic_key = [0u8; 32];
+    must(
+        getrandom::fill(&mut synthetic_key),
+        "synthetic fixture key entropy failed",
+    );
+    let mut key = must(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&key_path),
+        "private synthetic key reservation failed",
+    );
+    must(
+        key.write_all(&synthetic_key),
+        "synthetic key provisioning failed",
+    );
+    must(key.sync_all(), "synthetic key durability setup failed");
+    drop(key);
+    let config_path = state.join("custody-encrypted.json");
+    let config_bytes = must(
+        serde_json::to_vec(&serde_json::json!({
+            "key_file": key_path,
+            "vault_dir": state.join("vault"),
+        })),
+        "path-only configuration serialization failed",
+    );
+    let mut config = must(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&config_path),
+        "private configuration reservation failed",
+    );
+    must(
+        config.write_all(&config_bytes),
+        "path-only configuration setup failed",
+    );
+    must(
+        config.sync_all(),
+        "path-only configuration durability setup failed",
+    );
+    drop(config);
+    for path in [&key_path, &config_path] {
+        let meta = must(
+            std::fs::symlink_metadata(path),
+            "private fixture file metadata failed",
+        );
+        assert!(
+            meta.is_file()
+                && meta.mode() & 0o7777 == 0o600
+                && meta.nlink() == 1
+                && meta.uid() == unsafe { libc::geteuid() },
+            "configured fixture must have real owner-only single-link regular files"
+        );
+    }
+    assert!(
+        must(
+            std::fs::metadata(&key_path),
+            "synthetic key metadata failed"
+        )
+        .len()
+            == 32,
+        "configured fixture key must have exactly 32 bytes"
+    );
+
+    let fresh = owned.join("absent-parent").join("fresh-artifact");
+    // Resolving this path would fail at a non-directory ancestor. The platform
+    // refusal must win before output-path inspection, not merely before writes.
+    let invalid_parent = sentinel.join("uninspectable-child");
+    let before = super::snapshot(owned);
+    for output in [&fresh, &planted, &invalid_parent] {
+        let operations = [
+            cadence_agent::backup::backup(&state, output, 1, "manual"),
+            cadence_agent::backup::export(&state, output),
+        ];
+        for outcome in operations {
+            let error = match outcome {
+                Err(error) => error,
+                Ok(_) => panic!("configured macOS encrypted artifact generation was admitted"),
+            };
+            // Distinguish the actual new platform guard from malformed config,
+            // an existing-output refusal, or an output pathname/setup failure.
+            assert!(
+                error.kind() == "rejected"
+                    && error
+                        .to_string()
+                        .contains("encrypted custody artifacts are unsupported on this platform"),
+                "configured operation did not refuse at the early platform boundary"
+            );
+            assert!(super::snapshot(owned) == before,
+                "platform refusal allocated/inspected destructively/pruned/cleaned source or output bytes");
+        }
+    }
+    assert!(
+        !owned.join("absent-parent").exists(),
+        "platform refusal allocated an output ancestor"
+    );
+    assert!(
+        !state.join("vault").exists(),
+        "artifact refusal initialized encrypted storage"
+    );
+}

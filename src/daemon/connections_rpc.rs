@@ -444,13 +444,17 @@ impl Shared {
                     .store
                     .connection_credential(id)?
                     .ok_or_else(|| Error::rejected("connection is unavailable or stale"))?;
+                // CAD-1128: both verbs parse the optional CAS pair once,
+                // strictly. An absent pair stays legacy-optional; a
+                // present field must be exact, and a malformed one
+                // refuses here — before provider verification, custody,
+                // projection or any write.
+                let (expected_id, expected_rev) = Self::expected_cas(params)?;
                 if method == "connection_revoke" {
                     // CAD-1128: an encrypted revoke requires the exact
                     // incarnation+revision CAS. Legacy callers may omit
                     // the pair; supplied expectations are never rewritten
                     // into a different identity or execution authority.
-                    let expected_id = optional_str(params, "expected_connection_id");
-                    let expected_rev = params.get("expected_revision").and_then(Value::as_u64);
                     if record
                         .custody
                         .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX)
@@ -490,8 +494,6 @@ impl Shared {
                     let encrypted = record
                         .custody
                         .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX);
-                    let expected_id = optional_str(params, "expected_connection_id");
-                    let expected_rev = params.get("expected_revision").and_then(Value::as_u64);
                     let operation = encrypted.then(|| self.custody_operation()).transpose()?;
                     let record = if operation.is_some() {
                         let current = self.store.connection_credential(id)?.ok_or_else(|| {
@@ -579,8 +581,8 @@ impl Shared {
                         &operation,
                         &mapped,
                         true,
-                        optional_str(params, "expected_connection_id").or(Some(id)),
-                        params.get("expected_revision").and_then(Value::as_u64),
+                        expected_id.or(Some(id)),
+                        expected_rev,
                         Some(
                             &descriptor
                                 .capabilities

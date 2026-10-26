@@ -472,8 +472,20 @@ impl Shared {
                     }
                     return self.crm_smtp_scope_encrypted(install, context, true, |witness| {
                         let revision = self.crm_sender_revision(connection)?;
-                        let (_, projection) =
+                        let (transport, projection) =
                             self.crm_smtp_authority_witnessed(connection, revision, Some(witness))?;
+                        // The exact row/event/response material —
+                        // including the caller-computable link digest
+                        // that raw-input screening would miss — is
+                        // screened against the secret just decoded,
+                        // before the core write or its event.
+                        let screen: &dyn Fn(&Value) -> Result<()> = &|material: &Value| {
+                            crate::platform::refuse_leak(
+                                "SMTP binding",
+                                &material.to_string(),
+                                transport.secret(),
+                            )
+                        };
                         self.store.crm_smtp_bind(
                             install,
                             context,
@@ -481,6 +493,7 @@ impl Shared {
                             revision,
                             &projection,
                             request,
+                            Some(screen),
                         )
                     });
                 }
@@ -502,6 +515,7 @@ impl Shared {
                         revision,
                         &projection,
                         request,
+                        None,
                     )
                 })
             }
@@ -517,8 +531,15 @@ impl Shared {
                     }
                     return self.crm_smtp_scope_encrypted(install, context, true, |witness| {
                         let revision = self.crm_sender_revision(connection)?;
-                        let (_, projection) =
+                        let (transport, projection) =
                             self.crm_smtp_authority_witnessed(connection, revision, Some(witness))?;
+                        let screen: &dyn Fn(&Value) -> Result<()> = &|material: &Value| {
+                            crate::platform::refuse_leak(
+                                "SMTP rebinding",
+                                &material.to_string(),
+                                transport.secret(),
+                            )
+                        };
                         self.store.crm_smtp_rebind(
                             install,
                             context,
@@ -526,6 +547,7 @@ impl Shared {
                             revision,
                             &projection,
                             expected,
+                            Some(screen),
                         )
                     });
                 }
@@ -544,6 +566,7 @@ impl Shared {
                         revision,
                         &projection,
                         expected,
+                        None,
                     )
                 })
             }
@@ -658,24 +681,51 @@ impl Shared {
             // custody projects, so the board can rebind in place
             // instead of dead-ending. Sending stays refused: the
             // authority check above still gates every send.
-            let (transport_kind, projection, state) = match self.crm_smtp_authority_witnessed(
-                &link.connection_id,
-                link.auth_revision,
-                witness,
-            ) {
-                Ok((transport, projection)) => (transport.kind(), projection, link.state.clone()),
+            let (transport_kind, projection, state, transport) = match self
+                .crm_smtp_authority_witnessed(&link.connection_id, link.auth_revision, witness)
+            {
+                Ok((transport, projection)) => (
+                    transport.kind(),
+                    projection,
+                    link.state.clone(),
+                    Some(transport),
+                ),
                 Err(refusal) => {
-                    let stale = self
+                    let current = self
                         .store
                         .connection_credential(&link.connection_id)?
                         .filter(|record| {
                             record.exchange == crate::platform::smtp::ENROLLMENT_SHAPE
                                 && i64::try_from(record.credential_revision)
                                     .is_ok_and(|rev| rev != link.auth_revision)
-                        })
-                        .and_then(|record| self.smtp_projection_typed(&record).ok());
+                        });
+                    // Encrypted stale: resolve the rotated revision
+                    // through the same typed authority a send would
+                    // use, so the admitted projection (and the secret
+                    // it was decoded from) is the held one — never the
+                    // default legacy loader. Legacy keeps its typed
+                    // projection fallback.
+                    let stale = current.and_then(|record| match witness {
+                        Some(operation) => i64::try_from(record.credential_revision)
+                            .ok()
+                            .and_then(|revision| {
+                                self.crm_smtp_authority_witnessed(
+                                    &link.connection_id,
+                                    revision,
+                                    Some(operation),
+                                )
+                                .ok()
+                            })
+                            .map(|(transport, projection)| (Some(transport), projection)),
+                        None => self
+                            .smtp_projection_typed(&record)
+                            .ok()
+                            .map(|projection| (None::<SenderTransport>, projection)),
+                    });
                     match stale {
-                        Some(projection) => ("smtp", projection, "stale".to_string()),
+                        Some((transport, projection)) => {
+                            ("smtp", projection, "stale".to_string(), transport)
+                        }
                         None => return Err(refusal),
                     }
                 }
@@ -685,7 +735,7 @@ impl Shared {
                 .into_iter()
                 .find(|row| row["id"] == link.connection_id)
                 .unwrap_or(Value::Null);
-            Ok(json!({
+            let binding = json!({
                 "binding": {
                     "install_id": install,
                     "context_id": context,
@@ -699,7 +749,19 @@ impl Shared {
                     "transport_kind": transport_kind,
                     "connection": row,
                 },
-            }))
+            });
+            // Encrypted show publishes caller identifiers, the link
+            // digest and the admitted projection: screen the whole
+            // response against the secret just decoded, before it
+            // leaves the daemon. Legacy show keeps its existing shape.
+            if let (Some(_), Some(transport)) = (witness, transport.as_ref()) {
+                crate::platform::refuse_leak(
+                    "SMTP binding show",
+                    &binding.to_string(),
+                    transport.secret(),
+                )?;
+            }
+            Ok(binding)
         }
     }
 
@@ -766,6 +828,16 @@ impl Shared {
                 .ok_or_else(|| Error::internal("SMTP render lost its digest"))?;
             let (html_bytes, text_bytes) = (html.len(), text.len());
             let unsubscribe_authority = "test send (no unsubscribe token)";
+            // CAD-1128: one derivation, reused by the pre-provider
+            // screen and the final receipt — never recomputed there.
+            let payload_digest = crate::store::app_runs::material_digest(&json!({
+                "domain": "cadence-crm-smtp-test-send-v1",
+                "payload_digest": rendered["payload_digest"],
+                "to_email": to,
+                "connection_id": link.connection_id,
+                "auth_revision": link.auth_revision,
+                "link_digest": link.digest,
+            }));
             let public_smtp_message = |mut message: String, fixed: &'static str| {
                 if witness.is_some() {
                     zeroize::Zeroize::zeroize(&mut message);
@@ -773,6 +845,35 @@ impl Shared {
                 }
                 message
             };
+            // CAD-1128: the common receipt is prepared once. Only the
+            // provider outcome fields are unknown here; they are filled
+            // after submission and screened again then. Every field
+            // already known here is screened before provider traffic.
+            let mut receipt = json!({
+                "test_send": true,
+                "kind": "test",
+                "install_id": install,
+                "context_id": context,
+                "campaign_id": campaign,
+                "connection_id": link.connection_id,
+                "auth_revision": link.auth_revision,
+                "link_revision": link.link_revision,
+                "link_digest": link.digest,
+                "content_revision": rendered["content_revision"],
+                "content_digest": rendered["content_digest"],
+                "binding_digest": rendered["binding_digest"],
+                "payload_digest": payload_digest,
+                "transport": {"host": projection.host, "port": projection.port, "tls_mode": projection.tls_mode},
+                "sender": {"name": projection.sender_name, "address": projection.sender},
+                "multipart": {"html_bytes": html_bytes, "text_bytes": text_bytes},
+                "accepted": Value::Null,
+                "pending_approval": Value::Null,
+                "transport_kind": transport.kind(),
+                "smtp_code": Value::Null,
+                "smtp_message": Value::Null,
+                "delivery_claim": "smtp-acceptance-only",
+                "unsubscribe_authority": unsubscribe_authority,
+            });
             let outcome = match &transport {
                 SenderTransport::Smtp(envelope) => {
                     let message = crate::platform::smtp::SmtpMessage {
@@ -786,17 +887,44 @@ impl Shared {
                             .to_string(),
                         idempotency_key: None,
                     };
-                    crate::platform::refuse_leak(
-                        "SMTP input",
-                        &json!({
-                            "to": message.to, "subject": message.subject, "html": message.html,
-                            "text": message.text, "unsubscribe_url": message.unsubscribe_url,
-                            "content_digest": content_digest, "projection": projection.to_json(),
-                            "link": {"connection_id": link.connection_id, "digest": link.digest},
-                        })
-                        .to_string(),
-                        envelope.secret(),
-                    )?;
+                    if witness.is_some() {
+                        // The prepared receipt already holds every known
+                        // receipt field; borrow it plus the raw message
+                        // and the fixed encrypted outcome text. Only the
+                        // provider outcome remains unknown and is
+                        // screened after submission.
+                        let screened = (
+                            &receipt,
+                            &message.to,
+                            &message.subject,
+                            &message.html,
+                            &message.text,
+                            &message.unsubscribe_url,
+                            &projection.username,
+                            "SMTP message accepted",
+                            "SMTP send outcome is unknown; delivery may have occurred",
+                            "SMTP test send was not accepted",
+                        );
+                        crate::platform::refuse_leak(
+                            "SMTP input",
+                            &serde_json::to_string(&screened).map_err(|_| {
+                                Error::internal("SMTP input screen could not serialize")
+                            })?,
+                            envelope.secret(),
+                        )?;
+                    } else {
+                        crate::platform::refuse_leak(
+                            "SMTP input",
+                            &json!({
+                                "to": message.to, "subject": message.subject, "html": message.html,
+                                "text": message.text, "unsubscribe_url": message.unsubscribe_url,
+                                "content_digest": content_digest, "projection": projection.to_json(),
+                                "link": {"connection_id": link.connection_id, "digest": link.digest},
+                            })
+                            .to_string(),
+                            envelope.secret(),
+                        )?;
+                    }
                     match self.smtp_deliver(envelope, &message, content_digest)? {
                         crate::platform::smtp::SmtpOutcome::Accepted { code, message } => {
                             crate::platform::smtp::SmtpOutcome::Accepted {
@@ -867,38 +995,12 @@ impl Shared {
                 }
                 _ => unreachable!("other outcomes returned above"),
             };
-            let receipt = json!({
-                "test_send": true,
-                "kind": "test",
-                "install_id": install,
-                "context_id": context,
-                "campaign_id": campaign,
-                "connection_id": link.connection_id,
-                "auth_revision": link.auth_revision,
-                "link_revision": link.link_revision,
-                "link_digest": link.digest,
-                "content_revision": rendered["content_revision"],
-                "content_digest": rendered["content_digest"],
-                "binding_digest": rendered["binding_digest"],
-                "payload_digest": crate::store::app_runs::material_digest(&json!({
-                    "domain": "cadence-crm-smtp-test-send-v1",
-                    "payload_digest": rendered["payload_digest"],
-                    "to_email": to,
-                    "connection_id": link.connection_id,
-                    "auth_revision": link.auth_revision,
-                    "link_digest": link.digest,
-                })),
-                "transport": {"host": projection.host, "port": projection.port, "tls_mode": projection.tls_mode},
-                "sender": {"name": projection.sender_name, "address": projection.sender},
-                "multipart": {"html_bytes": html_bytes, "text_bytes": text_bytes},
-                "accepted": accepted,
-                "pending_approval": pending,
-                "transport_kind": transport.kind(),
-                "smtp_code": code,
-                "smtp_message": outcome_message,
-                "delivery_claim": "smtp-acceptance-only",
-                "unsubscribe_authority": unsubscribe_authority,
-            });
+            // Only the provider outcome was unknown before submission;
+            // fill it into the same prepared receipt.
+            receipt["accepted"] = json!(accepted);
+            receipt["pending_approval"] = json!(pending);
+            receipt["smtp_code"] = json!(code);
+            receipt["smtp_message"] = Value::String(outcome_message);
             // The receipt must not carry the secret even when
             // the server echoed credential-shaped bytes — the
             // send path screens first; this is the second bar.

@@ -45,6 +45,8 @@ pub struct SmtpLink {
     pub state: String,
     pub digest: String,
     pub request_id: String,
+    pub created: f64,
+    pub updated: f64,
 }
 
 fn link_digest(
@@ -83,6 +85,46 @@ fn link_json(install: &str, context: &str, row: &SmtpLink, projection: &SmtpProj
     })
 }
 
+/// Screen the exact prepared link write and hand back the existing
+/// public response shape. The material is the serialized response plus
+/// the row-only fields the response omits (persisted request ID and
+/// timestamps) — including the derived digest no caller input
+/// screening can see. It is built once, screened, then stripped of
+/// only those row-private keys and returned as the same value.
+fn screened_binding(
+    install: &str,
+    context: &str,
+    prepared: &SmtpLink,
+    projection: &SmtpProjection,
+    screen: Option<&dyn Fn(&Value) -> Result<()>>,
+) -> Result<Value> {
+    // Build the normal public response by moving the one binding Value
+    // into its envelope — no serialize round-trip, no second copy.
+    let mut envelope = serde_json::Map::new();
+    envelope.insert(
+        "binding".to_string(),
+        link_json(install, context, prepared, projection),
+    );
+    let mut material = Value::Object(envelope);
+    if let Some(screen) = screen {
+        // Attach only the row-private fields the response omits, with
+        // their exact persisted values; screen; then drop them again
+        // so the caller gets the unchanged public shape.
+        if let Value::Object(fields) = &mut material {
+            fields.insert("request_id".to_string(), json!(prepared.request_id));
+            fields.insert("created".to_string(), json!(prepared.created));
+            fields.insert("updated".to_string(), json!(prepared.updated));
+        }
+        screen(&material)?;
+        if let Value::Object(fields) = &mut material {
+            fields.remove("request_id");
+            fields.remove("created");
+            fields.remove("updated");
+        }
+    }
+    Ok(material)
+}
+
 impl Store {
     fn crm_smtp_row(
         &self,
@@ -91,7 +133,7 @@ impl Store {
         context: &str,
     ) -> Result<Option<SmtpLink>> {
         conn.query_row(
-            "SELECT connection_id,auth_revision,link_revision,state,digest,request_id FROM crm_smtp_links WHERE install_id=? AND context_id=?",
+            "SELECT connection_id,auth_revision,link_revision,state,digest,request_id,created,updated FROM crm_smtp_links WHERE install_id=? AND context_id=?",
             params![install, context],
             |row| {
                 Ok(SmtpLink {
@@ -101,6 +143,8 @@ impl Store {
                     state: row.get(3)?,
                     digest: row.get(4)?,
                     request_id: row.get(5)?,
+                    created: row.get(6)?,
+                    updated: row.get(7)?,
                 })
             },
         )
@@ -120,6 +164,14 @@ impl Store {
     /// under a fresh request ID. Replaying the bind's own request ID
     /// against identical material returns the row; against different
     /// material it refuses — a request ID never retargets.
+    ///
+    /// `screen` sees the exact row/event/response material this call
+    /// would persist — including the derived digest, the persisted
+    /// request ID and the row timestamps no caller input screening can
+    /// see — once, under the write transaction and before any SQL,
+    /// event or replay response. Encrypted custody passes the
+    /// secret-aware screen; legacy callers pass `None`.
+    #[allow(clippy::too_many_arguments)]
     pub fn crm_smtp_bind(
         &self,
         install: &str,
@@ -128,6 +180,7 @@ impl Store {
         auth_revision: i64,
         projection: &SmtpProjection,
         request_id: &str,
+        screen: Option<&dyn Fn(&Value) -> Result<()>>,
     ) -> Result<Value> {
         crate::proto::identifier(install, "installation ID")?;
         crate::proto::identifier(context, "context ID")?;
@@ -136,113 +189,78 @@ impl Store {
             return Err(Error::rejected("SMTP sender binding is invalid"));
         }
         self.write_tx(|conn| {
-
-                    let tx = &mut *conn;
-                    let digest = link_digest(install, context, connection_id, auth_revision, projection);
-                    match self.crm_smtp_row(&tx, install, context)? {
-                        None => {
-                            tx.execute(
-                                "INSERT INTO crm_smtp_links(install_id,context_id,connection_id,auth_revision,link_revision,state,digest,request_id,created,updated) VALUES(?,?,?,?,?, 'live',?,?,?,?)",
-                                params![install, context, connection_id, auth_revision, 1, digest, request_id, now(), now()],
-                            )
-                            .map_err(|e| Error::internal(e.to_string()))?;
-                            Self::event(
-                                &tx,
-                                "crm_smtp",
-                                "crm_smtp_bound",
-                                json!({"install_id": install, "context_id": context, "connection_id": connection_id, "auth_revision": auth_revision, "link_revision": 1, "digest": digest}),
-                            )?;
-                        }
-                        Some(row) if row.state == "live" => {
-                            if row.request_id == request_id
-                                && row.connection_id == connection_id
-                                && row.auth_revision == auth_revision
-                                && row.digest == digest
-                            {
-                                return Ok(json!({"binding": link_json(install, context, &row, projection)}));
-                            }
-                            if row.request_id == request_id {
-                                return Err(Error::rejected(
-                                    "SMTP binding request ID is already used for different material",
-                                ));
-                            }
-                            return Err(Error::rejected(
-                                "this installation and context already has a live SMTP sender; rebind or revoke it first",
-                            ));
-                        }
-                        Some(row) => {
-                            // Revoked rows re-bind only under a fresh request ID,
-                            // as a new live incarnation — the old request never
-                            // resurrects.
-                            if row.request_id == request_id {
-                                return Err(Error::rejected(
-                                    "SMTP binding request ID is already used; bind with a fresh request ID",
-                                ));
-                            }
-                            let revision = row.link_revision + 1;
-                            let changed = tx
-                                .execute(
-                                    "UPDATE crm_smtp_links SET connection_id=?,auth_revision=?,link_revision=?,state='live',digest=?,request_id=?,updated=? WHERE install_id=? AND context_id=? AND link_revision=? AND state='revoked'",
-                                    params![connection_id, auth_revision, revision, digest, request_id, now(), install, context, row.link_revision],
-                                )
-                                .map_err(|e| Error::internal(e.to_string()))?;
-                            if changed != 1 {
-                                return Err(Error::rejected("SMTP sender binding changed under claim"));
-                            }
-                            Self::event(
-                                &tx,
-                                "crm_smtp",
-                                "crm_smtp_bound",
-                                json!({"install_id": install, "context_id": context, "connection_id": connection_id, "auth_revision": auth_revision, "link_revision": revision, "digest": digest}),
-                            )?;
-                        }
+            let tx = &mut *conn;
+            let digest = link_digest(install, context, connection_id, auth_revision, projection);
+            match self.crm_smtp_row(&tx, install, context)? {
+                None => {
+                    let timestamp = now();
+                    let prepared = SmtpLink {
+                        connection_id: connection_id.to_string(),
+                        auth_revision,
+                        link_revision: 1,
+                        state: "live".to_string(),
+                        digest,
+                        request_id: request_id.to_string(),
+                        created: timestamp,
+                        updated: timestamp,
+                    };
+                    let response =
+                        screened_binding(install, context, &prepared, projection, screen)?;
+                    tx.execute(
+                        "INSERT INTO crm_smtp_links(install_id,context_id,connection_id,auth_revision,link_revision,state,digest,request_id,created,updated) VALUES(?,?,?,?,?, 'live',?,?,?,?)",
+                        params![install, context, prepared.connection_id, prepared.auth_revision, prepared.link_revision, prepared.digest, prepared.request_id, prepared.created, prepared.updated],
+                    )
+                    .map_err(|e| Error::internal(e.to_string()))?;
+                    Self::event(
+                        &tx,
+                        "crm_smtp",
+                        "crm_smtp_bound",
+                        json!({"install_id": install, "context_id": context, "connection_id": connection_id, "auth_revision": auth_revision, "link_revision": prepared.link_revision, "digest": &prepared.digest}),
+                    )?;
+                    Ok(response)
+                }
+                Some(row) if row.state == "live" => {
+                    if row.request_id == request_id
+                        && row.connection_id == connection_id
+                        && row.auth_revision == auth_revision
+                        && row.digest == digest
+                    {
+                        return screened_binding(install, context, &row, projection, screen);
                     }
-                    let row = self
-                        .crm_smtp_row(&tx, install, context)?
-                        .ok_or_else(|| Error::internal("SMTP sender binding vanished after bind"))?;
-                    Ok(json!({"binding": link_json(install, context, &row, projection)}))
-        })
-    }
-
-    /// Rebind under CAS: the expected link revision must be the live
-    /// one. Post-rotate rebinds (same connection, fresh authorization
-    /// revision) and sender switches (different connection) share
-    /// this path — either way the digest changes and prior authority
-    /// ends. A revoked link refuses: bind again instead.
-    pub fn crm_smtp_rebind(
-        &self,
-        install: &str,
-        context: &str,
-        connection_id: &str,
-        auth_revision: i64,
-        projection: &SmtpProjection,
-        expected_revision: i64,
-    ) -> Result<Value> {
-        crate::proto::identifier(install, "installation ID")?;
-        crate::proto::identifier(context, "context ID")?;
-        if expected_revision <= 0 || connection_id.is_empty() || auth_revision <= 0 {
-            return Err(Error::rejected("SMTP sender rebinding is invalid"));
-        }
-        self.write_tx(|conn| {
-
-                    let tx = &mut *conn;
-                    let row = self.crm_smtp_row(&tx, install, context)?.ok_or_else(|| {
-                        Error::rejected("no SMTP sender is bound to this installation and context")
-                    })?;
-                    if row.state != "live" {
+                    if row.request_id == request_id {
                         return Err(Error::rejected(
-                            "SMTP sender binding is revoked; bind it again instead",
+                            "SMTP binding request ID is already used for different material",
                         ));
                     }
-                    if row.link_revision != expected_revision {
-                        return Err(Error::rejected("SMTP sender binding revision is stale"));
+                    return Err(Error::rejected(
+                        "this installation and context already has a live SMTP sender; rebind or revoke it first",
+                    ));
+                }
+                Some(row) => {
+                    // Revoked rows re-bind only under a fresh request ID,
+                    // as a new live incarnation — the old request never
+                    // resurrects.
+                    if row.request_id == request_id {
+                        return Err(Error::rejected(
+                            "SMTP binding request ID is already used; bind with a fresh request ID",
+                        ));
                     }
-                    let digest = link_digest(install, context, connection_id, auth_revision, projection);
-                    let revision = row.link_revision + 1;
+                    let prepared = SmtpLink {
+                        connection_id: connection_id.to_string(),
+                        auth_revision,
+                        link_revision: row.link_revision + 1,
+                        state: "live".to_string(),
+                        digest,
+                        request_id: request_id.to_string(),
+                        created: row.created,
+                        updated: now(),
+                    };
+                    let response =
+                        screened_binding(install, context, &prepared, projection, screen)?;
                     let changed = tx
                         .execute(
-                            "UPDATE crm_smtp_links SET connection_id=?,auth_revision=?,link_revision=?,digest=?,updated=? WHERE install_id=? AND context_id=? AND link_revision=? AND state='live'",
-                            params![connection_id, auth_revision, revision, digest, now(), install, context, expected_revision],
+                            "UPDATE crm_smtp_links SET connection_id=?,auth_revision=?,link_revision=?,state='live',digest=?,request_id=?,updated=? WHERE install_id=? AND context_id=? AND link_revision=? AND state='revoked'",
+                            params![prepared.connection_id, prepared.auth_revision, prepared.link_revision, prepared.digest, prepared.request_id, prepared.updated, install, context, row.link_revision],
                         )
                         .map_err(|e| Error::internal(e.to_string()))?;
                     if changed != 1 {
@@ -251,13 +269,83 @@ impl Store {
                     Self::event(
                         &tx,
                         "crm_smtp",
-                        "crm_smtp_rebound",
-                        json!({"install_id": install, "context_id": context, "connection_id": connection_id, "auth_revision": auth_revision, "link_revision": revision, "digest": digest}),
+                        "crm_smtp_bound",
+                        json!({"install_id": install, "context_id": context, "connection_id": connection_id, "auth_revision": auth_revision, "link_revision": prepared.link_revision, "digest": &prepared.digest}),
                     )?;
-                    let row = self
-                        .crm_smtp_row(&tx, install, context)?
-                        .ok_or_else(|| Error::internal("SMTP sender binding vanished after rebind"))?;
-                    Ok(json!({"binding": link_json(install, context, &row, projection)}))
+                    Ok(response)
+                }
+            }
+        })
+    }
+
+    /// Rebind under CAS: the expected link revision must be the live
+    /// one. Post-rotate rebinds (same connection, fresh authorization
+    /// revision) and sender switches (different connection) share
+    /// this path — either way the digest changes and prior authority
+    /// ends. A revoked link refuses: bind again instead.
+    ///
+    /// `screen` sees the exact row/event/response material this rebind
+    /// would persist (derived digest, retained request ID and
+    /// timestamps included), once, before the CAS update or event.
+    /// Encrypted custody passes the secret-aware screen; legacy
+    /// callers pass `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn crm_smtp_rebind(
+        &self,
+        install: &str,
+        context: &str,
+        connection_id: &str,
+        auth_revision: i64,
+        projection: &SmtpProjection,
+        expected_revision: i64,
+        screen: Option<&dyn Fn(&Value) -> Result<()>>,
+    ) -> Result<Value> {
+        crate::proto::identifier(install, "installation ID")?;
+        crate::proto::identifier(context, "context ID")?;
+        if expected_revision <= 0 || connection_id.is_empty() || auth_revision <= 0 {
+            return Err(Error::rejected("SMTP sender rebinding is invalid"));
+        }
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let row = self.crm_smtp_row(&tx, install, context)?.ok_or_else(|| {
+                Error::rejected("no SMTP sender is bound to this installation and context")
+            })?;
+            if row.state != "live" {
+                return Err(Error::rejected(
+                    "SMTP sender binding is revoked; bind it again instead",
+                ));
+            }
+            if row.link_revision != expected_revision {
+                return Err(Error::rejected("SMTP sender binding revision is stale"));
+            }
+            let digest = link_digest(install, context, connection_id, auth_revision, projection);
+            let prepared = SmtpLink {
+                connection_id: connection_id.to_string(),
+                auth_revision,
+                link_revision: row.link_revision + 1,
+                state: "live".to_string(),
+                digest,
+                created: row.created,
+                updated: now(),
+                request_id: row.request_id,
+            };
+            let response = screened_binding(install, context, &prepared, projection, screen)?;
+            let changed = tx
+                .execute(
+                    "UPDATE crm_smtp_links SET connection_id=?,auth_revision=?,link_revision=?,digest=?,updated=? WHERE install_id=? AND context_id=? AND link_revision=? AND state='live'",
+                    params![prepared.connection_id, prepared.auth_revision, prepared.link_revision, prepared.digest, prepared.updated, install, context, expected_revision],
+                )
+                .map_err(|e| Error::internal(e.to_string()))?;
+            if changed != 1 {
+                return Err(Error::rejected("SMTP sender binding changed under claim"));
+            }
+            Self::event(
+                &tx,
+                "crm_smtp",
+                "crm_smtp_rebound",
+                json!({"install_id": install, "context_id": context, "connection_id": connection_id, "auth_revision": auth_revision, "link_revision": prepared.link_revision, "digest": &prepared.digest}),
+            )?;
+            Ok(response)
         })
     }
 
