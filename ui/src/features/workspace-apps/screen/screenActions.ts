@@ -355,14 +355,20 @@ async function planSavePublishSettings(ctx: ActionContext, args: Record<string, 
 /** `publish.draft.confirm`: the human confirmed the frozen draft's publish in the app.
  *  The human's own authenticated action is the approval, so this sends the board's frozen effect
  *  directly — no operator card and no second approval round. */
-async function planConfirmPublish(ctx: ActionContext, args: Record<string, unknown>): Promise<SlotPlan | ActionRefusal> {
+async function planConfirmPublish(ctx: ActionContext, args: Record<string, unknown>, actionToken?: string): Promise<SlotPlan | ActionRefusal> {
+  if (typeof actionToken !== "string" || !/^[a-f0-9]{64}$/.test(actionToken)) return { code: "denied", text: "That draft action is unavailable." };
   if (!exact(args, ["alias", "effect_id"]) || typeof args.alias !== "string" || typeof args.effect_id !== "string" || !TOOL_ALIAS.test(args.alias))
     return { code: "bad_args", text: "That request is not valid." };
   return { label: "Publish now", run: async (): Promise<ActionResult> => {
     try {
-      const sent = await workspaceApps.socialDraftAction("confirm", { alias: args.alias as string, effect_id: args.effect_id as string });
+      const sent = await workspaceApps.socialDraftAction("confirm", { action_token: actionToken, alias: args.alias as string, effect_id: args.effect_id as string });
       await ctx.onChanged();
-      return { ok: true, data: sent };
+      // The board answers 200 with the effect it settled; only a posted effect is success.
+      const effect = (sent as { effect?: { state?: unknown } }).effect;
+      const state = typeof effect?.state === "string" ? effect.state : "";
+      if (state === "posted") return { ok: true, data: sent };
+      if (state === "failed") return { ok: false, refusal: { code: "refused", text: "Instagram didn't take that post." } };
+      return { ok: false, refusal: { code: "unconfirmed", text: "That isn't confirmed yet. Check before trying again." } };
     } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
   } };
 }
@@ -408,7 +414,8 @@ const MAX_DRAFT_SCHEDULE_SECONDS = 366 * 24 * 60 * 60;
 
 /** Schedule controls name a board draft effect and execute on the human's own action: the app's
  *  time picker already chose the time, so no second confirmation card is shown. */
-async function planDraftEffectChange(ctx: ActionContext, verb: SlotVerb, args: Record<string, unknown>): Promise<SlotPlan | ActionRefusal> {
+async function planDraftEffectChange(ctx: ActionContext, verb: SlotVerb, args: Record<string, unknown>, actionToken?: string): Promise<SlotPlan | ActionRefusal> {
+  if (typeof actionToken !== "string" || !/^[a-f0-9]{64}$/.test(actionToken)) return { code: "denied", text: "That draft action is unavailable." };
   const hasDue = verb !== "publish.draft.cancel";
   const expectedKeys = hasDue ? ["alias", "due_epoch", "effect_id"] : ["alias", "effect_id"];
   if (!exact(args, expectedKeys) || typeof args.alias !== "string" || !TOOL_ALIAS.test(args.alias) ||
@@ -423,7 +430,7 @@ async function planDraftEffectChange(ctx: ActionContext, verb: SlotVerb, args: R
   const label = verb === "publish.draft.schedule" ? "Schedule post" : verb === "publish.draft.reschedule" ? "Reschedule post" : "Cancel scheduled post";
   return { label, run: async (): Promise<ActionResult> => {
     try {
-      const changed = await workspaceApps.socialDraftAction(operation, { alias: args.alias as string, effect_id: args.effect_id as string, ...(dueEpoch !== undefined ? { due_epoch: dueEpoch } : {}) });
+      const changed = await workspaceApps.socialDraftAction(operation, { action_token: actionToken, alias: args.alias as string, effect_id: args.effect_id as string, ...(dueEpoch !== undefined ? { due_epoch: dueEpoch } : {}) });
       await ctx.onChanged();
       return { ok: true, data: changed };
     } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
@@ -628,10 +635,10 @@ export function makePlanner(get: () => ActionContext): Planner {
     const table: Record<(typeof SLOT_VERBS)[number], () => Promise<SlotPlan | ActionRefusal>> = {
       "run.start": () => planRunStart(get(), args),
       "publish.destination.use": () => planUseDestination(get(), args),
-      "publish.draft.confirm": () => planConfirmPublish(get(), args),
-      "publish.draft.schedule": () => planDraftEffectChange(get(), verb, args),
-      "publish.draft.reschedule": () => planDraftEffectChange(get(), verb, args),
-      "publish.draft.cancel": () => planDraftEffectChange(get(), verb, args),
+      "publish.draft.confirm": () => planConfirmPublish(get(), args, ui?.actionToken),
+      "publish.draft.schedule": () => planDraftEffectChange(get(), verb, args, ui?.actionToken),
+      "publish.draft.reschedule": () => planDraftEffectChange(get(), verb, args, ui?.actionToken),
+      "publish.draft.cancel": () => planDraftEffectChange(get(), verb, args, ui?.actionToken),
       "publish.settings.save": () => planSavePublishSettings(get(), args),
       "media.original.download": () => planOriginalDownload(get, args, ui),
       "social.image.pick": () => planImagePick(args, ui),
