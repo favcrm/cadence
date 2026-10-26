@@ -295,12 +295,19 @@ impl ProcView {
             )
         };
         if count < 0 {
+            let error = io::Error::last_os_error();
+            // CAD-1845: newer kernels (7.0.0-1014) answer the same read with
+            // EACCES instead of an empty target. Only a link owned by another
+            // uid gets the CAD-1196 meaning; any other failure refuses.
+            let foreign = file
+                .metadata()
+                .is_ok_and(|metadata| metadata.uid() != unsafe { libc::geteuid() });
+            if error.raw_os_error() == Some(libc::EACCES) && foreign {
+                return Ok(None);
+            }
             return Err(proc_view_error(
                 &self.canonical,
-                format!(
-                    "cannot read {relative} through held link: {}",
-                    io::Error::last_os_error()
-                ),
+                format!("cannot read {relative} through held link: {error}"),
             ));
         }
         let count = count as usize;
@@ -465,7 +472,7 @@ impl ProcView {
             Some(_) => {}
             None => {
                 // CAD-1196: PID 2 is root's, so an unprivileged caller reads
-                // its ns link as empty. The same fact is proven without it:
+                // its ns link as empty (or EACCES, CAD-1845). The same fact is proven without it:
                 // PID 2 was just verified as kthreadd (PF_KTHREAD, parent 0),
                 // which exists only in the initial PID namespace, so this
                 // proc is the initial namespace's view; and the caller's own
