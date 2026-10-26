@@ -535,6 +535,7 @@ mod board;
 mod caller;
 mod cloud_hold;
 mod continuity;
+mod job_inspection;
 mod lifecycle;
 mod misc;
 mod redaction;

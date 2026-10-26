@@ -119,6 +119,11 @@ retains exact raw issue provenance. Native bookkeeping may change frontmatter
 without revising the spec; a material body change still refuses, never refreshes
 the accepted hash. Other spec files retain raw-byte job hashes. Task-specific
 acceptance cannot erase distinct criteria belonging to the effective spec.
+
+Read-only job inspection retains the stored job/task view and an `attention`
+diagnostic when optional canonical-spec drift inspection cannot read its source;
+it never refreshes the accepted hash or relaxes mandatory dispatch admission.
+
 An opted-in manifest always requires a prompt-capable endpoint, even when no
 document body is selected: the canonical task contract is still mandatory.
 
@@ -318,11 +323,14 @@ provider operation or completion of CAD-225's full acceptance.
 
 ## Memory implementation boundaries
 
-`src/issue/dispatch.rs` matches accepted project memories, writes a bounded
-lessons file and records included and withheld IDs. `src/briefing.rs` adds accepted
-project-wide rules to generated briefings. `--job` kickoffs are
-daemon-templated and carry no lessons (CAD-194); do not assume every entry point
-shares this retrieval behavior.
+For projects not opted into agent delivery, `src/issue/dispatch.rs` matches
+accepted project memories, writes a bounded lessons file and records included
+and withheld IDs. Legacy `--job` kickoffs remain daemon-templated without a
+lessons sidecar. In opted-in projects, plain issue, explicit issue `--job` and
+native issue-linked task dispatch instead share the bounded optional inline
+`native:lessons` source described under task context delivery above.
+`src/briefing.rs` adds accepted project-wide rules to generated briefings;
+do not assume every entry point shares the opted-in task delivery behavior.
 
 A memory record carries the daemon-authenticated proposer proof, one receipt
 per independent reviewer (identity, digest, evidence) and PM finalization
