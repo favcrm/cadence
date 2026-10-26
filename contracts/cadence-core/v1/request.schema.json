@@ -62,6 +62,57 @@
         "op",
         "input"
       ]
+    },
+    {
+      "description": "Validate a Works draft's kind, title, tags and closed content payload.",
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/DraftInput"
+        },
+        "op": {
+          "type": "string",
+          "const": "works.draft.validate"
+        }
+      },
+      "required": [
+        "op",
+        "input"
+      ]
+    },
+    {
+      "description": "Whether a Works review may be recorded for a revision.",
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/ReviewInput"
+        },
+        "op": {
+          "type": "string",
+          "const": "works.review.check"
+        }
+      },
+      "required": [
+        "op",
+        "input"
+      ]
+    },
+    {
+      "description": "Whether a Works revision is approved material a host may export.",
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/ExportInput"
+        },
+        "op": {
+          "type": "string",
+          "const": "works.export.check"
+        }
+      },
+      "required": [
+        "op",
+        "input"
+      ]
     }
   ],
   "required": [
@@ -83,6 +134,57 @@
       "required": [
         "id",
         "status"
+      ]
+    },
+    "DraftInput": {
+      "description": "Input of `works.draft.validate`: the fields a Works create parses. They\nstay untyped so a wrong type reaches the same refusal a native caller gets\ninstead of failing envelope decoding.",
+      "type": "object",
+      "properties": {
+        "content": true,
+        "kind": true,
+        "tags": {
+          "description": "Optional; an absent or null value means no tags."
+        },
+        "title": true
+      },
+      "additionalProperties": false
+    },
+    "ExportInput": {
+      "description": "Input of `works.export.check`: the stored state plus the requested format.",
+      "type": "object",
+      "properties": {
+        "current": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "format": {
+          "description": "The host's export format, required, non-blank and bounded.",
+          "type": "string"
+        },
+        "review_status": {
+          "type": "string"
+        },
+        "reviewed": {
+          "description": "The revision the last approval covered; `0` before any approval.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "trashed": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "current",
+        "revision",
+        "review_status",
+        "reviewed",
+        "trashed",
+        "format"
       ]
     },
     "ManifestPreflightInput": {
@@ -120,6 +222,61 @@
         "id",
         "status",
         "blockers"
+      ]
+    },
+    "ReviewInput": {
+      "description": "The stored state a Works operation must judge; the host proves it.",
+      "type": "object",
+      "properties": {
+        "author": {
+          "description": "The stored author of the revision.",
+          "type": "string"
+        },
+        "current": {
+          "description": "The item's current revision.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "decision": {
+          "description": "`approve` or `changes`.",
+          "type": "string"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pending": {
+          "description": "The revision a pending review was requested for.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "review_status": {
+          "description": "`none` | `pending` | `approved` | `changes_requested`.",
+          "type": "string"
+        },
+        "reviewer": {
+          "description": "The verified human presenting the decision.",
+          "type": "string"
+        },
+        "revision": {
+          "description": "The revision under review.",
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "current",
+        "revision",
+        "review_status",
+        "author",
+        "reviewer",
+        "decision"
       ]
     },
     "ValidateInput": {

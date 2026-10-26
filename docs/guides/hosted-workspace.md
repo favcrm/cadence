@@ -28,6 +28,7 @@ below; none of them covers every capacity, rotation or abrupt-loss case.
 | Wiki/ticket domain operations and app install/approval/run/business records | Existing native domain owners. The hosted HTTP relay can still wake the company runtime for these operations. The directory/outbox do not replace those owners. |
 | Published immutable package bytes | Hosted package storage; an exact listing/version/digest is provenance, not authority. |
 | Pure app `needs.requires` compatibility rules | Canonical Rust `crates/cadence-core`, called natively and compiled to WASM for the hosted adapter. Transport, authentication, storage and app execution are not moved into this kernel. |
+| Pure Works draft grammar and review/export gates | Canonical Rust `crates/cadence-core`, called by the native store and compiled to WASM for a hosted adapter. It judges domain input only: caller identity, stored current state, revision CAS, idempotency and export authority stay host-side. |
 
 Directory registration/read, event/presence transport and storing an FYI operate
 on hosted metadata without invoking a model or waking the company container.
@@ -38,7 +39,8 @@ runtime; waking or unavailable is not a reason to fall back to local state.
 
 Shared hosted work stays in its selected workspace; it is not a mirror of the
 teammate's standalone local tracker. Sharing currently extracts only the pure
-requirements kernel, not the whole daemon or CRM backend into WASM. Each adapter
+requirements and Works rules kernel, not the whole daemon or CRM backend into
+WASM. Each adapter
 must supply its actual host version and supported contracts; a shared rule result
 does not confer platform capabilities or native execution authority.
 

@@ -12,7 +12,7 @@
 use super::*;
 use crate::daemon::app_screen_services_rpc::ScreenServiceProof;
 use crate::store::app_records::RecordStore;
-use crate::store::app_works::WorksDraft;
+use cadence_core::works::Draft;
 use serde_json::Value;
 
 fn required_i64(params: &Value, key: &str) -> Result<i64> {
@@ -163,7 +163,7 @@ impl Shared {
             let records = RecordStore::open(&self.state_dir, &install)?;
             match method {
                 "app_works_create" => {
-                    let draft = WorksDraft::parse(params)?;
+                    let draft = Draft::parse(params)?;
                     let key = required_str(params, "idempotency_key")?;
                     records.app_works_create(&context, &draft, &actor, key, None)
                 }

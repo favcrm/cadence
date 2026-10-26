@@ -1,0 +1,29 @@
+{
+  "input": {
+    "v": 1,
+    "op": "works.review.check",
+    "input": {
+      "current": 1,
+      "revision": 1,
+      "review_status": "pending",
+      "pending": 1,
+      "author": "human:acme:alice",
+      "reviewer": "human:acme:alice",
+      "decision": "approve"
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "works.review.check",
+    "value": {
+      "allowed": false,
+      "refusals": [
+        {
+          "kind": "rejected",
+          "code": "forbidden",
+          "message": "a review requires two verified distinct humans"
+        }
+      ]
+    }
+  }
+}

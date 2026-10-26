@@ -1,0 +1,25 @@
+{
+  "input": {
+    "v": 1,
+    "op": "works.draft.validate",
+    "input": {
+      "kind": "other",
+      "title": "Retention",
+      "content": { "blocks": [{ "type": "h2", "text": "Retention" }] }
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "works.draft.validate",
+    "value": {
+      "valid": false,
+      "refusals": [
+        {
+          "kind": "rejected",
+          "code": "invalid",
+          "message": "works kind must be doc, deck or sheet"
+        }
+      ]
+    }
+  }
+}

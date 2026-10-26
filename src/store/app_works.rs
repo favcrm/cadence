@@ -8,274 +8,66 @@
 //! verified human derived from the connection, never request text.
 //!
 //! Content grammar is deliberately small: `doc` blocks, `deck` slides,
-//! and `sheet` columns/rows. Unknown kinds, fields, block types and
-//! malformed/oversize content refuse before any write.
+//! and `sheet` columns/rows. It lives in `cadence_core::works` — the same
+//! functions a hosted adapter evaluates — so this module stores only what
+//! that grammar admits and never keeps a second copy.
 
 use super::app_records::RecordStore;
-use super::app_runs::material_digest;
+use super::app_runs::{artifact_digest, material_digest};
 use super::*;
+use cadence_core::works::{self, Decision, Draft, State, Violation};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
-pub const TITLE_BYTES: usize = 240;
-pub const CONTENT_BYTES: usize = 64 * 1024;
-pub const TAGS_MAX: usize = 20;
+/// A query never lists more than this many items.
 pub const LIST_MAX: usize = 500;
-const KINDS: &[&str] = &["doc", "deck", "sheet"];
 
-#[derive(Clone)]
-pub struct WorksDraft {
-    pub kind: String,
-    pub title: String,
-    pub content: Value,
-    pub tags: Vec<String>,
-}
-
-impl WorksDraft {
-    pub fn parse(params: &Value) -> Result<Self> {
-        let kind = required_str(params, "kind")?.to_string();
-        let title = required_str(params, "title")?.trim().to_string();
-        let content = params
-            .get("content")
-            .cloned()
-            .ok_or_else(|| Error::invalid("invalid", "works content is required"))?;
-        let tags = match params.get("tags") {
-            None | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(items)) => {
-                if items.len() > TAGS_MAX {
-                    return Err(Error::invalid("invalid", "works tags exceed their bound"));
-                }
-                let mut tags = Vec::with_capacity(items.len());
-                for item in items {
-                    let tag = item
-                        .as_str()
-                        .ok_or_else(|| Error::invalid("invalid", "works tags must be strings"))?
-                        .trim()
-                        .to_string();
-                    if tag.is_empty() || tag.len() > 60 {
-                        return Err(Error::invalid(
-                            "invalid",
-                            "works tags must be non-empty and bounded",
-                        ));
-                    }
-                    if !tags.contains(&tag) {
-                        tags.push(tag);
-                    }
-                }
-                tags
-            }
-            Some(_) => return Err(Error::invalid("invalid", "works tags must be an array")),
-        };
-        if title.is_empty() || title.len() > TITLE_BYTES {
-            return Err(Error::invalid(
-                "invalid",
-                "works title is required and bounded",
-            ));
+/// Carry a shared Works refusal onto the native wire unchanged: the same
+/// kind, code and message the store has always produced.
+impl From<Violation> for Error {
+    fn from(violation: Violation) -> Self {
+        match violation.kind {
+            "conflict" => Error::conflict_coded(violation.code, violation.message),
+            "internal" => Error::internal(violation.message),
+            _ => Error::invalid(violation.code, violation.message),
         }
-        validate_content(&kind, &content)?;
-        Ok(Self {
-            kind,
-            title,
-            content,
-            tags,
-        })
-    }
-
-    fn payload_digest(&self) -> String {
-        material_digest(&json!({
-            "kind": self.kind,
-            "title": self.title,
-            "content": self.content,
-            "tags": self.tags,
-        }))
-    }
-
-    fn content_digest(&self) -> String {
-        material_digest(&json!({
-            "kind": self.kind,
-            "title": self.title,
-            "content": self.content,
-        }))
     }
 }
 
-fn required_str<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
-    params
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| Error::invalid("invalid", format!("{key} is required")))
+/// The stored review/export columns of one item, as the shared gates read
+/// them.
+type Item = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    Option<i64>,
+    bool,
+    f64,
+);
+
+fn item_state(item: &Item) -> State<'_> {
+    State {
+        current: item.4,
+        reviewed: item.5,
+        review_status: &item.6,
+        pending: item.7,
+        trashed: item.8,
+    }
 }
 
-fn validate_content(kind: &str, content: &Value) -> Result<()> {
-    if !KINDS.contains(&kind) {
-        return Err(Error::invalid(
-            "invalid",
-            "works kind must be doc, deck or sheet",
-        ));
-    }
-    let object = content
-        .as_object()
-        .ok_or_else(|| Error::invalid("invalid", "works content must be an object"))?;
-    let encoded = serde_json::to_vec(content).map_err(|e| Error::internal(e.to_string()))?;
-    if encoded.len() > CONTENT_BYTES {
-        return Err(Error::invalid("invalid", "works content exceeds its bound"));
-    }
-    let allowed: &[&str] = match kind {
-        "doc" => &["blocks"],
-        "deck" => &["slides"],
-        "sheet" => &["columns", "rows"],
-        _ => unreachable!(),
-    };
-    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
-        return Err(Error::invalid(
-            "invalid",
-            "works content has unsupported fields",
-        ));
-    }
-    match kind {
-        "doc" => {
-            let blocks = content_array(object, "blocks")?;
-            for block in blocks {
-                let block = block
-                    .as_object()
-                    .ok_or_else(|| Error::invalid("invalid", "works doc blocks must be objects"))?;
-                if block
-                    .keys()
-                    .any(|key| !matches!(key.as_str(), "type" | "text" | "label"))
-                {
-                    return Err(Error::invalid(
-                        "invalid",
-                        "works doc block has unsupported fields",
-                    ));
-                }
-                let kind = block
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| Error::invalid("invalid", "works doc block type is required"))?;
-                if !matches!(kind, "h2" | "p" | "callout") {
-                    return Err(Error::invalid(
-                        "invalid",
-                        "works doc block type is unsupported",
-                    ));
-                }
-                let text = block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| Error::invalid("invalid", "works doc block text is required"))?;
-                if text.trim().is_empty() {
-                    return Err(Error::invalid(
-                        "invalid",
-                        "works doc block text is required",
-                    ));
-                }
-                if kind == "callout" {
-                    if let Some(label) = block.get("label") {
-                        if label.as_str().map(str::trim).is_none_or(str::is_empty) {
-                            return Err(Error::invalid(
-                                "invalid",
-                                "works callout label must be a string",
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        "deck" => {
-            let slides = content_array(object, "slides")?;
-            for slide in slides {
-                let slide = slide.as_object().ok_or_else(|| {
-                    Error::invalid("invalid", "works deck slides must be objects")
-                })?;
-                if slide
-                    .keys()
-                    .any(|key| !matches!(key.as_str(), "title" | "body" | "notes"))
-                {
-                    return Err(Error::invalid(
-                        "invalid",
-                        "works deck slide has unsupported fields",
-                    ));
-                }
-                for field in ["title", "body"] {
-                    if slide
-                        .get(field)
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .is_none_or(str::is_empty)
-                    {
-                        return Err(Error::invalid(
-                            "invalid",
-                            format!("works deck slide {field} is required"),
-                        ));
-                    }
-                }
-                if let Some(notes) = slide.get("notes") {
-                    if notes.as_str().map(str::trim).is_none_or(str::is_empty) {
-                        return Err(Error::invalid(
-                            "invalid",
-                            "works deck notes must be a string",
-                        ));
-                    }
-                }
-            }
-        }
-        "sheet" => {
-            let columns = content_array(object, "columns")?;
-            if columns.is_empty() {
-                return Err(Error::invalid(
-                    "invalid",
-                    "works sheet columns are required",
-                ));
-            }
-            for column in columns {
-                if column.as_str().map(str::trim).is_none_or(str::is_empty) {
-                    return Err(Error::invalid(
-                        "invalid",
-                        "works sheet columns must be strings",
-                    ));
-                }
-            }
-            let rows = object
-                .get("rows")
-                .and_then(Value::as_array)
-                .ok_or_else(|| Error::invalid("invalid", "works sheet rows are required"))?;
-            for row in rows {
-                let cells = row
-                    .as_array()
-                    .ok_or_else(|| Error::invalid("invalid", "works sheet rows must be arrays"))?;
-                if cells.len() != columns.len() {
-                    return Err(Error::invalid(
-                        "invalid",
-                        "works sheet row must match its columns",
-                    ));
-                }
-                for cell in cells {
-                    if !cell.is_string() && !cell.is_number() {
-                        return Err(Error::invalid(
-                            "invalid",
-                            "works sheet cells must be strings or numbers",
-                        ));
-                    }
-                }
-            }
-        }
-        _ => unreachable!(),
-    }
-    Ok(())
+/// `sha256:` plus the hex digest of the shared content material.
+fn content_digest(kind: &str, title: &str, content: &Value) -> String {
+    artifact_digest(works::content_material(kind, title, content).as_bytes())
 }
 
-fn content_array<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a Vec<Value>> {
-    let values = object
-        .get(key)
-        .and_then(Value::as_array)
-        .ok_or_else(|| Error::invalid("invalid", format!("works {key} are required")))?;
-    if values.is_empty() {
-        return Err(Error::invalid(
-            "invalid",
-            format!("works {key} are required"),
-        ));
-    }
-    Ok(values)
+/// `sha256:` plus the hex digest of the shared content-plus-tags material,
+/// which pins an idempotent create to its exact payload.
+fn payload_digest(draft: &Draft) -> String {
+    artifact_digest(draft.payload_material().as_bytes())
 }
 
 fn slug(title: &str) -> String {
@@ -303,32 +95,6 @@ fn slug(title: &str) -> String {
         "content".to_string()
     } else {
         out
-    }
-}
-
-fn review_state(status: &str, reviewed: i64, revision: i64) -> &'static str {
-    if status == "changes_requested" {
-        "edited"
-    } else if reviewed == 0 {
-        "draft"
-    } else if reviewed == revision {
-        "reviewed"
-    } else {
-        "edited"
-    }
-}
-
-fn export_state(status: &str, reviewed: i64, revision: i64, trashed: bool) -> bool {
-    !trashed && status == "approved" && reviewed == revision
-}
-
-fn export_reason(status: &str, reviewed: i64, revision: i64) -> &'static str {
-    if status == "changes_requested" {
-        "Export is blocked until the requested changes are reviewed."
-    } else if reviewed == revision && status == "approved" {
-        "This revision is reviewed and ready for host export."
-    } else {
-        "Export is blocked until the current revision is reviewed."
     }
 }
 
@@ -412,26 +178,7 @@ impl RecordStore {
         Ok(())
     }
 
-    #[allow(clippy::type_complexity)]
-    fn works_item(
-        &self,
-        conn: &Connection,
-        context: &str,
-        id: &str,
-    ) -> Result<
-        Option<(
-            String,
-            String,
-            String,
-            String,
-            i64,
-            i64,
-            String,
-            Option<i64>,
-            bool,
-            f64,
-        )>,
-    > {
+    fn works_item(&self, conn: &Connection, context: &str, id: &str) -> Result<Option<Item>> {
         conn.query_row(
             "SELECT kind,title,tags,owner,revision,reviewed_revision,review_status,pending_revision,trashed,updated FROM app_works_items WHERE context_id=? AND id=?",
             params![context, id],
@@ -472,8 +219,15 @@ impl RecordStore {
             serde_json::from_str(&content_json).map_err(|e| Error::internal(e.to_string()))?;
         let tags: Vec<String> =
             serde_json::from_str(&tags).map_err(|e| Error::internal(e.to_string()))?;
-        let state = review_state(&status, reviewed, revision);
-        let ready = export_state(&status, reviewed, revision, trashed);
+        let state = State {
+            current: revision,
+            reviewed,
+            review_status: &status,
+            pending,
+            trashed,
+        };
+        let review_state = works::review_state(&state);
+        let ready = works::export_state(&state);
         let updated_at = chrono::DateTime::<chrono::Utc>::from_timestamp(updated as i64, 0)
             .map(|value| value.to_rfc3339())
             .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
@@ -509,11 +263,11 @@ impl RecordStore {
             "title": title,
             "revision": revision,
             "reviewedRevision": reviewed,
-            "reviewState": state,
+            "reviewState": review_state,
             "reviewStatus": status,
             "reviewRequestedRevision": pending,
             "exportState": if ready { "ready" } else { "blocked" },
-            "exportReason": export_reason(&status, reviewed, revision),
+            "exportReason": works::export_reason(&state),
             "updated": "just now",
             "updatedAt": updated_at,
             "owner": owner,
@@ -544,13 +298,13 @@ impl RecordStore {
     pub fn app_works_create(
         &self,
         context: &str,
-        draft: &WorksDraft,
+        draft: &Draft,
         actor: &str,
         key: &str,
         on_behalf_of: Option<&str>,
     ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
-        let payload = draft.payload_digest();
+        let payload = payload_digest(draft);
         let mut result = None;
         self.write_tx(|tx| {
             if let Some(existing) =
@@ -585,7 +339,7 @@ impl RecordStore {
                 .map_err(|e| Error::internal(e.to_string()))?;
             let content = serde_json::to_string(&draft.content)
                 .map_err(|e| Error::internal(e.to_string()))?;
-            let digest = draft.content_digest();
+            let digest = content_digest(&draft.kind, &draft.title, &draft.content);
             tx.execute(
                 "INSERT INTO app_works_items(context_id,id,kind,title,tags,owner,revision,reviewed_revision,review_status,pending_revision,trashed,updated) VALUES(?,?,?,?,?,?,1,0,'none',NULL,0,?)",
                 params![context, id, draft.kind, draft.title, tags, actor, now()],
@@ -760,8 +514,7 @@ impl RecordStore {
                         let value = object
                             .get("title")
                             .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty() && value.len() <= TITLE_BYTES)
+                            .and_then(works::bounded_title)
                             .ok_or_else(|| Error::invalid("invalid", "set_title requires a bounded title"))?;
                         title = value.to_string();
                     }
@@ -779,14 +532,14 @@ impl RecordStore {
                             .get("content")
                             .cloned()
                             .ok_or_else(|| Error::invalid("invalid", "set_content requires content"))?;
-                        validate_content(&kind, &content)?;
+                        works::validate_content(&kind, &content)?;
                     }
                     _ => return Err(Error::invalid("invalid", "works operation is unsupported")),
                 }
             }
-            validate_content(&kind, &content)?;
+            works::validate_content(&kind, &content)?;
             let next = if_revision + 1;
-            let digest = material_digest(&json!({"kind": kind, "title": title, "content": content}));
+            let digest = content_digest(&kind, &title, &content);
             let content_json =
                 serde_json::to_string(&content).map_err(|e| Error::internal(e.to_string()))?;
             let changed = tx
@@ -974,39 +727,12 @@ impl RecordStore {
     ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(id, "content ID")?;
-        if !matches!(decision, "approve" | "changes") {
-            return Err(Error::invalid(
-                "invalid",
-                "works decision must be approve or changes",
-            ));
-        }
-        if let Some(note) = note {
-            if note.len() > 2_000 {
-                return Err(Error::invalid(
-                    "invalid",
-                    "works review note exceeds its bound",
-                ));
-            }
-        }
+        let decision = works::review_decision(decision, note)?;
         self.write_tx(|tx| {
             let item = self
                 .works_item(tx, context, id)?
                 .ok_or_else(|| Error::invalid("not_found", "works content was not found"))?;
-            if item.8 {
-                return Err(Error::invalid("not_found", "works content was not found"));
-            }
-            if item.4 != revision {
-                return Err(Error::conflict_coded(
-                    "conflict",
-                    "works content revision is stale",
-                ));
-            }
-            if item.6 != "pending" || item.7 != Some(revision) {
-                return Err(Error::conflict_coded(
-                    "conflict",
-                    "works review is not pending for this revision",
-                ));
-            }
+            works::review(&item_state(&item), revision)?;
             let author: String = tx
                 .query_row(
                     "SELECT author FROM app_works_revisions WHERE context_id=? AND id=? AND revision=?",
@@ -1014,31 +740,32 @@ impl RecordStore {
                     |row| row.get(0),
                 )
                 .map_err(|e| Error::internal(e.to_string()))?;
-            if author == actor || author == "operator" || actor == "operator" {
-                return Err(Error::invalid(
-                    "forbidden",
-                    "a review requires two verified distinct humans",
-                ));
-            }
-            if decision == "approve" {
-                tx.execute(
-                    "UPDATE app_works_items SET review_status='approved',reviewed_revision=?,pending_revision=NULL,updated=? WHERE context_id=? AND id=?",
-                    params![revision, now(), context, id],
-                )
-                .map_err(|e| Error::internal(e.to_string()))?;
-            } else {
-                tx.execute(
-                    "UPDATE app_works_items SET review_status='changes_requested',pending_revision=NULL,updated=? WHERE context_id=? AND id=?",
-                    params![now(), context, id],
-                )
-                .map_err(|e| Error::internal(e.to_string()))?;
+            works::reviewer(&author, actor)?;
+            match decision {
+                Decision::Approve => {
+                    tx.execute(
+                        "UPDATE app_works_items SET review_status='approved',reviewed_revision=?,pending_revision=NULL,updated=? WHERE context_id=? AND id=?",
+                        params![revision, now(), context, id],
+                    )
+                    .map_err(|e| Error::internal(e.to_string()))?;
+                }
+                Decision::Changes => {
+                    tx.execute(
+                        "UPDATE app_works_items SET review_status='changes_requested',pending_revision=NULL,updated=? WHERE context_id=? AND id=?",
+                        params![now(), context, id],
+                    )
+                    .map_err(|e| Error::internal(e.to_string()))?;
+                }
             }
             self.works_audit(
                 tx,
                 context,
                 actor,
                 on_behalf_of,
-                if decision == "approve" { "review_approve" } else { "review_changes" },
+                match decision {
+                    Decision::Approve => "review_approve",
+                    Decision::Changes => "review_changes",
+                },
                 id,
                 revision,
             )?;
@@ -1057,31 +784,12 @@ impl RecordStore {
     ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(id, "content ID")?;
-        if format.trim().is_empty() || format.len() > 40 {
-            return Err(Error::invalid(
-                "invalid",
-                "works export format is required and bounded",
-            ));
-        }
+        works::check_format(format)?;
         self.write_tx(|tx| {
             let item = self
                 .works_item(tx, context, id)?
                 .ok_or_else(|| Error::invalid("not_found", "works content was not found"))?;
-            if item.8 {
-                return Err(Error::invalid("not_found", "works content was not found"));
-            }
-            if item.4 != revision {
-                return Err(Error::invalid(
-                    "needs_review",
-                    "only the current revision can be exported",
-                ));
-            }
-            if item.6 != "approved" || item.5 != revision {
-                return Err(Error::invalid(
-                    "needs_review",
-                    "works export requires an approved current revision",
-                ));
-            }
+            works::export(&item_state(&item), revision)?;
             let digest: String = tx
                 .query_row(
                     "SELECT content_digest FROM app_works_revisions WHERE context_id=? AND id=? AND revision=?",

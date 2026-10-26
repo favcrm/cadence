@@ -1,0 +1,29 @@
+{
+  "input": {
+    "v": 1,
+    "op": "works.review.check",
+    "input": {
+      "current": 2,
+      "revision": 1,
+      "review_status": "pending",
+      "pending": 1,
+      "author": "human:acme:alice",
+      "reviewer": "human:acme:bob",
+      "decision": "changes"
+    }
+  },
+  "expected": {
+    "ok": true,
+    "op": "works.review.check",
+    "value": {
+      "allowed": false,
+      "refusals": [
+        {
+          "kind": "conflict",
+          "code": "conflict",
+          "message": "works content revision is stale"
+        }
+      ]
+    }
+  }
+}
