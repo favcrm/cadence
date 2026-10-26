@@ -734,6 +734,16 @@ function MasterHome({
       && readConversationIdentity(master.data, homeProjection.conversation_id).read.state === "ready"
       ? homeProjection.conversation_id
       : undefined);
+  useEffect(() => {
+    if (homeConversation === undefined || thread.data === null
+      || thread.data.conversation !== undefined
+      || resources.masterState.get().data !== master.data) return;
+    // Stream admission and turn controls use the same canonical binding.
+    // Never replace a transcript's ID or seed a superseded session's store.
+    resources.masterThread.mutate((current) => current.conversation === undefined
+      ? { ...current, conversation: homeConversation }
+      : current);
+  }, [homeConversation, thread.data, master.data]);
   const attachDestination: AttachDestination | undefined = loaded && !missing
     ? homeConversation ? { conversation: homeConversation } : {}
     : undefined;
@@ -840,7 +850,14 @@ function MasterHome({
   // resumes after its last seq — never a replay of the history. On a
   // reconnect `streamInto` resumes with `?after=<last id>` and the
   // reducer dedupes by seq: no gaps, no repeats.
-  useThreadStream(resources.masterThread, `/api/threads/${MASTER}/stream`, loaded && !missing, setLink);
+  useThreadStream(
+    resources.masterThread,
+    `/api/threads/${MASTER}/stream`,
+    loaded && !missing && (master.data === null
+      || !Object.hasOwn(master.data, "actor_identity")
+      || thread.data?.conversation !== undefined),
+    setLink,
+  );
 
   // The seq watermark for the enter animation: items at or below the
   // mount tail are history — they render still; only what lands after

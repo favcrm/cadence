@@ -2295,8 +2295,11 @@ borrowed profile, ownership claim or edit control.
 Before the first hosted Home message, the thread may still be null. Home binds
 the valid personal projection from its default master-state response, whose
 server-issued conversation ID already exists; the first streamed entries do
-not need a reload to acquire the name or scope. App/Recruit panes still require
-their selected conversation ID and never borrow that default Home projection.
+not need a reload to acquire the name or scope. That validated binding is also
+adopted by the empty thread before its hosted stream opens, so initial turn
+snapshots and Stop/Cancel use the same ID without relaxing stream admission.
+App/Recruit panes still require their selected conversation ID and never borrow
+that default Home projection.
 Hosted app turn indicators and Stop/Cancel reconciliation use the selected
 conversation's state too; an idle Home snapshot cannot hide its running turn.
 
