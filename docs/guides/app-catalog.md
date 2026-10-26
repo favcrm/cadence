@@ -103,6 +103,28 @@ against this build's contract registry, and the secret guard) and reports the
 same `sha256:` bundle digest. A git/URL source is refused: fetching is a
 transport the daemon vets, not bytes in hand.
 
+The version-2 bundle member grammar also recognizes the root
+`app-storage.json` and flat `storage/<tag>.json` migration members. The tag uses
+the same lowercase ASCII/digit/hyphen grammar as other app tags (1–32 bytes,
+no leading hyphen); links, nested storage directories and alternate extensions
+are refused. Storage members require exactly
+`needs.requires.contracts: {app-storage: [1]}`, and that requirement needs its
+root declaration. The generated document is
+`contracts/bundle-grammar/v2/grammar.json`; version 1 remains a historical
+artifact, not a second current admission path.
+
+This is package grammar support, **not a native storage runtime**. The native
+host does not advertise `app-storage`, execute these migrations or claim schema
+validation. `cadence app check` inventories the new members and returns the
+explicit incompatible-host receipt for a storage-bearing package. A hosted
+implementation must separately validate the declaration and checksums, enforce
+its tenant-local storage contract and bind activation to the same immutable
+bundle. An unknown requirement is never treated as supported.
+Explicit approval of edited installed bytes rechecks the same requirement and
+storage-member pairing before recording execution authority. Unsupported bytes
+remain inspectable; an operator approval cannot supply a missing runtime.
+
+
 The JSON report carries `ok`, a stable `refusal.code` (`app_check_transport`,
 `app_check_source`, `app_check_inventory`, `app_check_content`), `digest`,
 per-file `bytes`/`cap`, the 2 MiB aggregate position, and the `host` block and

@@ -555,3 +555,93 @@ fn accept_board_http_is_at_least_as_strict_as_the_rpc() {
     );
     assert!(status >= 400, "a stale swap was relayed: {reply}");
 }
+
+/// CAD-1848 independent acceptance, author: NativeCombinedReview.
+/// An installed edit remains inspectable, but native approval must refuse
+/// app-storage/v1 before granting execution authority for its new digest.
+/// The implementer must not edit or weaken this acceptance check.
+#[test]
+fn cad1848_installed_storage_edit_cannot_receive_native_execution_approval() {
+    let fx = Fx::new();
+    fx.start_team();
+    let baseline = fx
+        .operator("app_workspace_show", json!({"install_id": fx.install}))
+        .unwrap();
+    let baseline_digest = baseline["digest"].as_str().unwrap();
+    assert_eq!(baseline["compatibility"]["compatible"], true, "{baseline}");
+    let approved = fx
+        .operator(
+            "app_local_install_approve",
+            json!({"install_id": fx.install, "digest": baseline_digest}),
+        )
+        .expect("control: the ordinary installed package can be approved");
+    assert_eq!(approved["approved"], true, "{approved}");
+
+    // Edit the real installed bundle, not a journal or an approval row.
+    let bundle = fx
+        .state()
+        .join("pm/.apps/installations")
+        .join(&fx.install)
+        .join("bundle");
+    let manifest_path = bundle.join("app.md");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    assert!(manifest.contains("needs:\n"), "fixture has a needs mapping");
+    let manifest = manifest.replacen(
+        "needs:\n",
+        "needs:\n  requires: {contracts: {app-storage: [1]}}\n",
+        1,
+    );
+    std::fs::write(&manifest_path, manifest).unwrap();
+    std::fs::create_dir(bundle.join("storage")).unwrap();
+    // Native admits these as bounded inert UTF-8; storage schema validation
+    // belongs to the hosted runtime, not this grammar/compatibility check.
+    std::fs::write(bundle.join("app-storage.json"), "{}\n").unwrap();
+    std::fs::write(bundle.join("storage/001-init.json"), "{}\n").unwrap();
+
+    let edited = fx
+        .operator("app_workspace_show", json!({"install_id": fx.install}))
+        .expect("unsupported installed bytes must remain inspectable");
+    let digest = edited["digest"].as_str().unwrap();
+    assert_ne!(
+        digest, baseline_digest,
+        "the edit changes the bundle digest"
+    );
+    assert_eq!(edited["compatibility"]["compatible"], false, "{edited}");
+    assert_eq!(
+        edited["compatibility"]["contracts"]["app-storage"],
+        json!([1]),
+        "{edited}"
+    );
+    for member in ["app-storage.json", "storage/001-init.json"] {
+        assert!(
+            edited["files"].as_array().unwrap().contains(&json!(member)),
+            "the admitted member {member} must remain inventoried: {edited}"
+        );
+    }
+    let before = fx
+        .shared
+        .store
+        .app_capability_status(&fx.install, digest)
+        .unwrap();
+    assert_eq!(before["state"], "unapproved", "{before}");
+    let error = refusal(fx.operator(
+        "app_local_install_approve",
+        json!({"install_id": fx.install, "digest": digest}),
+    ));
+    assert!(error.contains("app-storage"), "{error}");
+    assert!(error.contains("supports none"), "{error}");
+    let after = fx
+        .shared
+        .store
+        .app_capability_status(&fx.install, digest)
+        .unwrap();
+    assert_eq!(after, before, "refused approval must not write authority");
+
+    let error = refusal(fx.create("cad1848-unsupported-storage"));
+    assert!(
+        error.contains("app-storage")
+            || error.contains("installation capability approval is absent or stale"),
+        "run creation must refuse unsupported or unapproved bytes: {error}"
+    );
+    assert_eq!(runs_of(&fx), 0, "unsupported storage created a native run");
+}

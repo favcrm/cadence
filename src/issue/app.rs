@@ -87,6 +87,7 @@ const TOP_DIRS: &[&str] = &[
     "screens",
     "views",
     "assets",
+    "storage",
 ];
 
 /// Largest single file in a bundle — workflows render to plans, so the
@@ -119,6 +120,7 @@ pub(crate) const ROOT_MEMBERS: &[&str] = &[
     crate::issue::app_chat::FILE,
     crate::issue::app_assistant::FILE,
     crate::issue::app_action::FILE,
+    "app-storage.json",
 ];
 
 pub(crate) fn root_member(name: &str) -> bool {
@@ -149,6 +151,8 @@ fn workflow_leaf_ok(seg: &str) -> bool {
 pub(crate) enum DirRule {
     /// `<tag>.md`, the installer's own tag rule.
     WorkflowMdTag,
+    /// One tag-shaped stem and exactly one declared suffix.
+    TaggedLeaf { suffix: &'static str },
     /// Exactly this leaf name.
     Exact(&'static str),
     /// Any visible, ASCII, flat leaf.
@@ -176,11 +180,12 @@ pub(crate) const DIR_RULES: &[(&str, DirRule)] = &[
         },
     ),
     ("screens", DirRule::ScreensPackage),
+    ("storage", DirRule::TaggedLeaf { suffix: ".json" }),
 ];
 
 /// Version of the published grammar document. Bump only for a shape change.
 #[cfg(test)]
-pub(crate) const GRAMMAR_VERSION: u32 = 1;
+pub(crate) const GRAMMAR_VERSION: u32 = 2;
 
 /// The lexical pieces the published document must state normatively. They are
 /// constants so the predicate and the document cannot disagree.
@@ -228,6 +233,12 @@ pub(crate) fn bundle_path_ok(path: &str) -> bool {
         [name] => root_member(name),
         [directory, leaf] => match dir_rule(directory) {
             Some(DirRule::WorkflowMdTag) => workflow_leaf_ok(leaf),
+            Some(DirRule::TaggedLeaf { suffix }) => {
+                plain_leaf_ok(leaf)
+                    && leaf
+                        .strip_suffix(suffix)
+                        .is_some_and(crate::issue::model::valid_tag)
+            }
             Some(DirRule::Exact(name)) => *leaf == name,
             Some(DirRule::VisibleLeaf) => plain_leaf_ok(leaf),
             Some(DirRule::SvgLeaf { max_leaf_bytes }) => {
@@ -245,8 +256,9 @@ pub(crate) fn bundle_path_ok(path: &str) -> bool {
 }
 
 /// The published grammar document, generated from [`ROOT_MEMBERS`],
-/// [`DIR_RULES`] and the caps. `contracts/bundle-grammar/v1/grammar.json` must
-/// equal this byte for byte; the test below refuses drift.
+/// [`DIR_RULES`] and the caps. `contracts/bundle-grammar/v2/grammar.json` must
+/// equal this byte for byte; the test below refuses drift. The v1 document
+/// stays as the historical artifact a v1 reader already carries.
 #[cfg(test)]
 pub(crate) fn bundle_grammar_json() -> String {
     let directories: Vec<serde_json::Value> = DIR_RULES
@@ -254,6 +266,9 @@ pub(crate) fn bundle_grammar_json() -> String {
         .map(|(directory, rule)| match rule {
             DirRule::WorkflowMdTag => {
                 serde_json::json!({ "dir": directory, "rule": "workflow_md_tag" })
+            }
+            DirRule::TaggedLeaf { suffix } => {
+                serde_json::json!({ "dir": directory, "rule": "tagged_leaf", "suffix": suffix })
             }
             DirRule::Exact(name) => {
                 serde_json::json!({ "dir": directory, "rule": "exact", "name": name })
@@ -370,13 +385,16 @@ mod bundle_grammar_tests {
         assert!(!bundle_path_ok(&format!("assets/{}.svg", "a".repeat(125))));
     }
 
+    /// The live artifact. Parity is checked against v2 only: the v1 document
+    /// is historical and stays untouched, so a v1 reader keeps the shape it
+    /// was published with.
     fn grammar_path() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("contracts/bundle-grammar/v1/grammar.json")
+            .join("contracts/bundle-grammar/v2/grammar.json")
     }
 
     /// The published document is generated, never hand-written: this test is
-    /// the only thing keeping `contracts/bundle-grammar/v1/grammar.json` equal
+    /// the only thing keeping `contracts/bundle-grammar/v2/grammar.json` equal
     /// to the predicate consumers are expected to apply.
     #[test]
     fn published_artifact_matches_the_predicate() {
@@ -431,6 +449,219 @@ mod bundle_grammar_tests {
         // The asset rule is bounded by the published leaf cap.
         assert!(bundle_path_ok(&format!("assets/{}.svg", "a".repeat(124))));
         assert!(!bundle_path_ok(&format!("assets/{}.svg", "a".repeat(125))));
+    }
+
+    /// CAD-1848: `storage/` holds one flat `<validTag>.json` migration per
+    /// file, and `app-storage.json` is its root declaration. The tag rule is
+    /// the manifest tag rule (`model::valid_tag`): 1..=32 lowercase ASCII
+    /// letters, digits or hyphens, never leading with a hyphen.
+    #[test]
+    fn admits_app_storage_root_and_flat_migration_members() {
+        assert!(root_member("app-storage.json"));
+        for path in [
+            "app-storage.json",
+            "storage/a.json",
+            "storage/001-init.json",
+            "storage/a-b0.json",
+        ] {
+            assert!(bundle_path_ok(path), "{path}");
+        }
+        // The bound is the published 32 bytes, and a trailing hyphen is
+        // still a tag.
+        assert!(bundle_path_ok(&format!("storage/{}.json", "a".repeat(32))));
+        assert!(bundle_path_ok("storage/a-.json"));
+    }
+
+    /// Everything the flat shape does not admit refuses: traversal, empty
+    /// segments, nesting, a second suffix, an unsupported or uppercase
+    /// extension, and any stem the tag rule rejects.
+    #[test]
+    fn refuses_storage_members_outside_the_flat_tag_json_shape() {
+        for path in [
+            "",
+            "storage",
+            "storage/",
+            "storage//a.json",
+            "storage/../a.json",
+            "storage/a/../b.json",
+            "storage/nested/a.json",
+            // Exactly one `.json` suffix.
+            "storage/a",
+            "storage/a.txt",
+            "storage/a.JSON",
+            "storage/a.json.json",
+            // One tag-shaped stem.
+            "storage/.json",
+            "storage/.a.json",
+            "storage/-a.json",
+            "storage/a_b.json",
+            "storage/a.b.json",
+            "storage/a b.json",
+            "storage/aß.json",
+            // The segment rules hold inside `storage/` too.
+            "storage\\a.json",
+            "storage/a.json\0b",
+        ] {
+            assert!(!bundle_path_ok(path), "{path}");
+        }
+        // One byte past the published tag cap refuses.
+        assert!(!bundle_path_ok(&format!("storage/{}.json", "a".repeat(33))));
+    }
+
+    /// The workflow half of the guard bundle: the CAD-1254 acceptance
+    /// fixture's plan template, which the real `app::validate` gate already
+    /// accepts (an unregistered `agent:` is a note at install, never an
+    /// error).
+    const STORAGE_GUARD_WORKFLOW: &str = "---\ntitle: \"Post: {{topic}}\"\ngoal: \"Publish {{topic}}\"\n\
+inputs:\n  topic: { ask: \"About what?\" }\n---\n\n\
+Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance\n- [ ] brief written\n";
+
+    /// Lay a genuinely valid workflow app out at `root`. With `majors`, the
+    /// manifest also declares
+    /// `needs.requires.contracts: {app-storage: [<majors>]}`.
+    fn write_workflow_app(root: &Path, majors: Option<&str>) {
+        std::fs::create_dir_all(root.join("workflows")).unwrap();
+        let requires = match majors {
+            Some(majors) => format!("  requires: {{contracts: {{app-storage: [{majors}]}}}}\n"),
+            None => String::new(),
+        };
+        std::fs::write(
+            root.join(MANIFEST),
+            format!(
+                "---\napp: storage-guard\ntitle: Storage guard\nversion: '1'\n\
+                 needs:\n  connections: []\n{requires}---\n\nGuide.\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("workflows/do.md"), STORAGE_GUARD_WORKFLOW).unwrap();
+    }
+
+    fn write_member(root: &Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("member parent")).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// Real source validation over `root`, with the refusal text or `()`.
+    fn validate_source(root: &Path) -> std::result::Result<(), String> {
+        match validate(root, &HashSet::new(), &[]) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// The fixture the storage guards start from is a valid package on its
+    /// own: a refusal below is storage's, never a broken baseline.
+    #[test]
+    fn the_storage_guard_baseline_is_a_valid_app() {
+        let root = tempfile::tempdir().unwrap();
+        write_workflow_app(root.path(), None);
+        assert_eq!(validate_source(root.path()), Ok(()));
+    }
+
+    /// Storage members are admitted only for a package that declares the
+    /// exact host contract it needs: `needs.requires.contracts.app-storage:
+    /// [1]`. Absent, a different major, or an extra major all refuse.
+    #[test]
+    fn storage_members_refuse_without_the_exact_app_storage_declaration() {
+        let member_only: &[&str] = &["storage/a.json"];
+        let root_only: &[&str] = &["app-storage.json"];
+        let root_and_member: &[&str] = &["app-storage.json", "storage/a.json"];
+        for (label, majors, files) in [
+            ("member only", None, member_only),
+            ("root only", None, root_only),
+            ("root and member", None, root_and_member),
+            ("major 2", Some("2"), root_and_member),
+            ("majors 1 and 2", Some("1, 2"), root_and_member),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            write_workflow_app(root.path(), majors);
+            for &rel in files {
+                write_member(root.path(), rel, "{}");
+            }
+            let error = validate_source(root.path())
+                .expect_err(&format!("{label}: storage must refuse without [1]"));
+            assert!(
+                error.contains(
+                    "app storage members require needs.requires.contracts.app-storage: [1]"
+                ),
+                "{label}: {error}"
+            );
+        }
+    }
+
+    /// A declaration without its root member refuses — the pairing runs
+    /// both ways, so `requires` alone cannot promise storage.
+    #[test]
+    fn storage_declaration_without_its_root_member_refuses() {
+        let no_members: &[&str] = &[];
+        let member_only: &[&str] = &["storage/a.json"];
+        for files in [no_members, member_only] {
+            let root = tempfile::tempdir().unwrap();
+            write_workflow_app(root.path(), Some("1"));
+            for &rel in files {
+                write_member(root.path(), rel, "{}");
+            }
+            let error = validate_source(root.path())
+                .expect_err("a declared app-storage still needs app-storage.json");
+            assert!(
+                error.contains("app-storage requires app-storage.json"),
+                "{error}"
+            );
+        }
+    }
+
+    /// Recognizing inert members is not a native storage capability: the
+    /// exact pairing is admitted by the bundle checks, and the package still
+    /// refuses for the runtime this host does not have — never a fabricated
+    /// native success.
+    #[test]
+    fn declared_storage_fails_for_the_missing_native_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        write_workflow_app(root.path(), Some("1"));
+        write_member(root.path(), "app-storage.json", "{}");
+        write_member(root.path(), "storage/001-init.json", "{}");
+        let error = validate_source(root.path()).expect_err("no native app-storage runtime");
+        assert!(error.contains("app is not installable"), "{error}");
+        assert!(
+            error.contains("app requires host contract 'app-storage' major 1"),
+            "{error}"
+        );
+        assert!(
+            error.contains("this host supports none (unknown contract)"),
+            "{error}"
+        );
+        // The refusal is the missing runtime, not the bundle pairing.
+        assert!(
+            !error.contains("app storage members require"),
+            "the exact [1] declaration pairs with the members: {error}"
+        );
+        assert!(!error.contains("requires app-storage.json"), "{error}");
+    }
+
+    /// Source validation refuses a storage member that is a link or sits in
+    /// a nested directory before any bytes are read.
+    #[test]
+    fn storage_source_refuses_links_and_nested_directories() {
+        let linked = tempfile::tempdir().unwrap();
+        write_workflow_app(linked.path(), Some("1"));
+        write_member(linked.path(), "app-storage.json", "{}");
+        write_member(linked.path(), "storage/a.json", "{}");
+        std::os::unix::fs::symlink(
+            linked.path().join("storage/a.json"),
+            linked.path().join("storage/b.json"),
+        )
+        .unwrap();
+        let error = validate_source(linked.path()).expect_err("a link is not app content");
+        assert!(error.contains("storage/b.json"), "{error}");
+        assert!(error.contains("symlink"), "{error}");
+
+        let nested = tempfile::tempdir().unwrap();
+        write_workflow_app(nested.path(), Some("1"));
+        write_member(nested.path(), "app-storage.json", "{}");
+        write_member(nested.path(), "storage/nested/a.json", "{}");
+        let error = validate_source(nested.path()).expect_err("storage/ is flat");
+        assert!(error.contains("storage/nested"), "{error}");
     }
 }
 
@@ -1114,7 +1345,14 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
                     "views/ holds exactly app-views-v1.json",
                 ));
             }
-            files.push((format!("{top}/{name}"), entry.path()));
+            let relative = format!("{top}/{name}");
+            if top == "storage" && !bundle_path_ok(&relative) {
+                return Err(entry_err(
+                    &relative,
+                    "storage migrations are flat <tag>.json files",
+                ));
+            }
+            files.push((relative, entry.path()));
         }
         // screens/<tag>/<leaf> — the one nested level v1 allows: each
         // `<tag>` is a tag-named subdir holding the declaration and flat
@@ -1323,6 +1561,30 @@ pub(crate) fn validate_texts(
     validate_contents(files, warnings, Vec::new(), agents, agent_sources)
 }
 
+/// Storage members and their requirement are one package contract, including
+/// when already-installed bytes are explicitly approved again.
+pub(crate) fn validate_storage_members<'a>(
+    manifest: &Manifest,
+    paths: impl Iterator<Item = &'a str>,
+) -> Result<()> {
+    let declared = manifest.requires.contracts.get("app-storage");
+    let mut root = false;
+    let mut members = false;
+    for path in paths {
+        root |= path == "app-storage.json";
+        members |= path.starts_with("storage/");
+    }
+    if (root || members) && declared.is_none_or(|majors| majors.as_slice() != [1]) {
+        return Err(Error::rejected(
+            "app storage members require needs.requires.contracts.app-storage: [1]",
+        ));
+    }
+    if declared.is_some() && !root {
+        return Err(Error::rejected("app-storage requires app-storage.json"));
+    }
+    Ok(())
+}
+
 fn validate_contents(
     files: Vec<(String, String)>,
     secret_warnings: Vec<crate::secret::Finding>,
@@ -1364,6 +1626,11 @@ fn validate_contents(
             guide: String::new(),
         },
     };
+    if let Err(error) =
+        validate_storage_members(&manifest, files.iter().map(|(path, _)| path.as_str()))
+    {
+        errors.push(error.to_string());
+    }
     // CAD-1129 §3: every asset `listing` references must be in this
     // bundle's own inventory — `assets/` flat *.svg, nothing outside.
     if let Some(listing) = &manifest.listing {

@@ -109,7 +109,14 @@ const TIMEOUT_KILL_CODE: i32 = 137;
 /// CAD-1006's `screens/` (one `<tag>/` subdir per package of flat
 /// `<stem>.<js|css|svg|json>` leaves + `screens.json`) and CAD-1129's
 /// `assets/` (flat `*.svg`). Kept identical by inspection parity.
-const TOP_DIRS: &[&str] = &["workflows", "rubrics", "templates", "screens", "assets"];
+const TOP_DIRS: &[&str] = &[
+    "workflows",
+    "rubrics",
+    "templates",
+    "screens",
+    "assets",
+    "storage",
+];
 
 /// Most files a bundle may carry — pinned at `app.rs`'s private
 /// `MAX_FILES`.
@@ -836,6 +843,11 @@ fn snapshot_dir(dir: &File) -> Result<BTreeMap<String, String>> {
                     {
                         return Err(Error::rejected(format!(
                             "bundle entry '{rel}': assets are flat <stem>.svg files"
+                        )));
+                    }
+                    if top_text == "storage" && !app::bundle_path_ok(&rel) {
+                        return Err(Error::rejected(format!(
+                            "bundle entry '{rel}': storage migrations are flat <tag>.json files"
                         )));
                     }
                     add(&sub, &leaf, rel)?;
