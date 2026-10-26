@@ -75,6 +75,12 @@ export interface ThreadState {
    *  window. Absent on a daemon that predates it; entries never advance
    *  it, and a page never lowers it. */
   replySeq?: number;
+  /** CAD-1853: the highest `seq` the daemon has SCANNED for this thread.
+   *  A projection filters another source's cloud entries out of a page, so
+   *  the scanned cursor can be ahead of every held entry; resuming the
+   *  catch-up from it is what keeps a fully filtered page from being read
+   *  again forever. Absent on a daemon that predates the page cursor. */
+  cursor?: number;
   entries: ThreadEntry[];
   pending: PendingMessage[];
 }
@@ -109,6 +115,13 @@ export function asEntry(value: unknown): ThreadEntry | null {
 export function lastSeq(state: ThreadState | null): number | null {
   const entries = state?.entries ?? [];
   return entries.length ? entries[entries.length - 1].seq : null;
+}
+
+/** The forward resume cursor: every stored row at or below it has been
+ *  scanned, including rows a projection filtered out. */
+export function resumeSeq(state: ThreadState | null): number | null {
+  const seq = Math.max(state?.cursor ?? 0, lastSeq(state) ?? 0);
+  return seq > 0 ? seq : null;
 }
 
 /** A visible agent reply — the same rule as the daemon's complete
@@ -575,6 +588,9 @@ export interface ThreadPageLike {
    *  (0 when none), independent of the page cursor. Absent on a daemon
    *  that predates it. */
   reply_seq?: number;
+  /** CAD-1853: the last `seq` this page scanned, past every row the
+   *  projection filtered out. Absent on a daemon that predates it. */
+  cursor?: number;
 }
 
 /** How the store reads pages: forward after a seq, the newest page, or
@@ -611,14 +627,28 @@ export async function loadThread(
 ): Promise<ThreadState> {
   const held = current ?? EMPTY_THREAD;
   try {
-    let after = lastSeq(held);
-    if (after !== null) {
+    const resume = resumeSeq(held);
+    if (resume !== null) {
+      let after: number = resume;
       let state = held;
       for (let i = 0; i < CATCH_UP_PAGES; i++) {
         const page = await read.after(after, limit);
+        const visible = (page.entries ?? []).length;
         state = mergePage(state, page);
-        if ((page.entries ?? []).length < limit) return state;
-        after = lastSeq(state) ?? after;
+        // CAD-1853: resume past every row the daemon scanned, not just the
+        // ones it kept. A page of another source's cloud entries is filtered
+        // out of the projection, shows nothing, and still carries the cursor
+        // beyond them; ignoring it would read the same hidden page forever.
+        const next: number =
+          typeof page.cursor === "number" &&
+          Number.isSafeInteger(page.cursor) &&
+          page.cursor > after
+            ? page.cursor
+            : (lastSeq(state) ?? after);
+        if (next > after) state = { ...state, cursor: next };
+        if (visible > 0 && visible < limit) return state;
+        if (next <= after) return state;
+        after = next;
       }
       // Too far behind to replay: reopen on the newest page.
     }
@@ -627,8 +657,15 @@ export async function loadThread(
       { ...EMPTY_THREAD, pending: held.pending, replySeq: held.replySeq },
       page,
     );
+    const scanned = Math.max(
+      typeof page.cursor === "number" && Number.isSafeInteger(page.cursor)
+        ? page.cursor
+        : 0,
+      resumeSeq(fresh) ?? 0,
+    );
     return {
       ...fresh,
+      ...(scanned > 0 ? { cursor: scanned } : {}),
       moreBefore: typeof page.more_before === "boolean" ? page.more_before : null,
     };
   } catch (e) {

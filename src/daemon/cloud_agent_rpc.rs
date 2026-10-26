@@ -330,6 +330,12 @@ impl Shared {
     /// agent UID boundary). A plain local alias is untouched, so a peer's own
     /// UID-bound reports keep working.
     ///
+    /// That authority is checked twice, and only the second check can refuse
+    /// a revocation that landed after this workspace saved its login: the
+    /// local credential/enrollment scope first, then the platform's own
+    /// current answer via [`Self::cloud_read_authority`]. A projection never
+    /// serves stored reply text on the strength of the local copy alone.
+    ///
     /// The returned admission also binds every projected row: a cloud row is
     /// shown only to the source/owner its operation was admitted for. The
     /// operator is the owner of its own user source, never a blanket reader
@@ -368,9 +374,71 @@ impl Shared {
             // membership: a write-only operator must not read stored replies
             // through a generic projection.
             self.cloud_agent_authority(&agent, &source, SCOPE_READ)?;
+            // The local copy proves what the workspace STORED, not what the
+            // platform still allows: a read scope revoked upstream leaves the
+            // saved login valid and unexpired. The platform's own answer is
+            // required before any stored cloud text is projected.
+            self.cloud_read_authority(&agent, &source)?;
             scopes.push((agent.id, source));
         }
         Ok(CloudProjection { scopes })
+    }
+
+    /// The platform's own answer to "may this source read its cloud turn
+    /// now?" — one readback of the caller's own newest submitted turn.
+    ///
+    /// The saved login/enrollment proves only the scope this workspace
+    /// stored; the contract is the sole authority on whether it is still
+    /// live. A refusal refuses the projection, an unreachable or uncertain
+    /// answer propagates as uncertainty, and neither serves stored content.
+    /// The readback's answer is discarded: projections are rendered from the
+    /// store, so this call exists to prove permission, never to become a
+    /// second read path or a cache. Nothing is probed when the caller owns no
+    /// turn that crossed the submission boundary — such an alias holds only
+    /// the caller's own unsent request, and there is no receipt to vouch for.
+    fn cloud_read_authority(
+        &self,
+        agent: &crate::store::CloudAgent,
+        source: &Source,
+    ) -> Result<()> {
+        let Some(operation) = self
+            .store
+            .cloud_agent_operations(&agent.id, None)?
+            .into_iter()
+            .filter(|operation| source.matches(operation))
+            .filter(|operation| {
+                operation.remote_operation_id.is_some() || operation.claimed_at > 0.0
+            })
+            .max_by(|a, b| {
+                a.updated
+                    .total_cmp(&b.updated)
+                    .then_with(|| a.operation_id.cmp(&b.operation_id))
+            })
+        else {
+            return Ok(());
+        };
+        let target = Self::cloud_agent_target_for(agent, Some(source));
+        HostedCloudTransport
+            .read(
+                &target,
+                &operation.conversation_id,
+                &operation.operation_id,
+                source,
+            )
+            // A projection that cannot prove current read authority must not
+            // answer from the local receipt, and the caller must be able to
+            // tell that apart from a refusal: the dedicated read already
+            // reports an unreachable readback as `cloud_agent_uncertain`, so
+            // the generic projections report the same code.
+            .map(|_| ())
+            .map_err(|error| match error {
+                Error::OutcomeUnknown(_) => Error::unknown_coded(
+                    "cloud_agent_uncertain",
+                    "the platform could not be asked whether this caller may still read \
+                     this cloud agent; nothing was projected from the local receipt",
+                ),
+                error => error,
+            })
     }
 
     pub(super) fn rpc_cloud_agent(

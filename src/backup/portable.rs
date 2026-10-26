@@ -1815,19 +1815,38 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
     // inert alias row itself stays (its `endpoint`/`params` are nulled
     // below) so an explicit `cloud-agent connect` can reuse it; until then
     // every cloud projection of that alias fails closed.
+    //
+    // A settled turn also routes its reply as a `worker_result` (or a
+    // `worker_notice`) on the ordinary alias of whoever invoked it, and that
+    // copy is what `agent_show`/`thread_read` of that alias would serve after
+    // a restore. Those rows are not on the cloud alias, so they are collected
+    // by their ORIGIN — `messages.origin` names the cloud message, whose id
+    // is the operation id — recursively, together with the canonical rows
+    // they derive from. Their thread entries, receipts (`messages.result`
+    // and `error`) and events travel with the same closure; the derived row's
+    // own body is never filtered by alias or source.
     let cloud = crate::cloud_agent::PROVIDER;
     let cloud_alias = "SELECT alias FROM agents WHERE provider=?1";
+    let cloud_messages = format!(
+        "WITH RECURSIVE cloud_message(id) AS ( \
+           SELECT id FROM messages \
+            WHERE alias IN ({cloud_alias}) OR source='cloud_agent' \
+           UNION \
+           SELECT m.id FROM messages m JOIN cloud_message c ON m.origin=c.id \
+         )"
+    );
     tx.execute(
         &format!(
-            "DELETE FROM thread_entries WHERE \
-               message_id IN (SELECT id FROM messages WHERE alias IN ({cloud_alias}) \
-                 OR source='cloud_agent') \
+            "{cloud_messages} DELETE FROM thread_entries WHERE \
+               message_id IN (SELECT id FROM cloud_message) \
                OR thread_id IN (SELECT id FROM threads WHERE alias IN ({cloud_alias}))"
         ),
         [cloud],
     )?;
     tx.execute(
-        &format!("DELETE FROM messages WHERE alias IN ({cloud_alias}) OR source='cloud_agent'"),
+        &format!(
+            "{cloud_messages} DELETE FROM messages WHERE id IN (SELECT id FROM cloud_message)"
+        ),
         [cloud],
     )?;
     tx.execute(
@@ -2486,7 +2505,7 @@ fn exclusions() -> Vec<String> {
         "imported actors disabled: agents.enabled=0; monitors dispatch flags=0",
         "provenance purged: connection_metadata (source UUID recorded in the manifest only), model_defaults, settings_authority",
         "business app data outside the coordination profile: app_*, crm_*, social_publish_intents, cloud_dispatch_outbox, chat_files, artifacts (rows deleted from the private copy; declared omitted, not a full workspace)",
-        "cloud-agent private content: cloud_agents, cloud_agent_sources, cloud_agent_sessions and cloud_agent_operations, plus the cloud alias' messages, thread entries, threads and events (rows deleted from the private copy). The alias row itself is kept inert with no authority; cloud projections of it fail closed until it is reconnected explicitly",
+        "cloud-agent private content: cloud_agents, cloud_agent_sources, cloud_agent_sessions and cloud_agent_operations, plus the cloud alias' messages, thread entries, threads and events and every request/result copy DERIVED from a cloud message by origin (a routed worker_result/worker_notice on an ordinary alias, with its thread entries and receipt) (rows deleted from the private copy). The alias row itself is kept inert with no authority; cloud projections of it fail closed until it is reconnected explicitly",
         "local checkouts, process identity, sockets and runtime files: not included",
     ]
     .iter()

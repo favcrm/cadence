@@ -548,8 +548,15 @@ fn spawn_daemon_at(
     while client::rpc_timeout(state, "health", json!({}), Duration::from_secs(1)).is_err()
         || Seam::token_at(state).is_none()
     {
+        if handle.is_finished() {
+            let error = handle.join().expect("the daemon thread panicked");
+            panic!(
+                "daemon at {} exited before answering: {error:?}",
+                state.display()
+            );
+        }
         assert!(
-            !handle.is_finished() && Instant::now() < deadline,
+            Instant::now() < deadline,
             "daemon never started at {}",
             state.display()
         );
@@ -2247,26 +2254,55 @@ fn a_late_inflight_readback_cannot_reopen_a_completed_receipt() {
         gate.ready.notify_all();
     }
     let stale = first.join().unwrap().unwrap();
-    // The late unknown response is adopted into the already-settled receipt,
-    // never reopening it.
-    assert_eq!(stale.status, "completed");
+    // The late read's OWN answer is the platform's nonterminal state for its
+    // read: the reply it never learned is not in it, whatever another reader
+    // settled locally while it was in flight.
     assert_eq!(
-        fx.store()
-            .cloud_agent_operation(&id, OPERATION)
-            .unwrap()
-            .unwrap()
-            .status,
-        "completed",
-        "the stale readback reopened the receipt"
+        stale.status, "unknown",
+        "the concurrently settled receipt was returned to the late read"
     );
-    let replies = fx
+    assert!(
+        stale.reply_text.is_none(),
+        "the late answer carried the settled reply: {stale:?}"
+    );
+    assert!(
+        stale.reply_message_id.is_none(),
+        "the late answer pointed at the settled reply: {stale:?}"
+    );
+    // ...while the durable receipt the other reader settled is preserved
+    // exactly, with one canonical result entry.
+    let receipt = fx
+        .store()
+        .cloud_agent_operation(&id, OPERATION)
+        .unwrap()
+        .expect("settled receipt");
+    assert_eq!(receipt.status, "completed");
+    assert_eq!(receipt.reply_text.as_deref(), Some("genuine stub reply"));
+    assert_eq!(receipt.reply_message_id.as_deref(), Some(OPERATION));
+    let replies: Vec<_> = fx
         .store()
         .thread_entries(ALIAS, 0, 100)
         .unwrap()
         .into_iter()
         .filter(|entry| entry.text == "genuine stub reply")
-        .count();
-    assert_eq!(replies, 1, "duplicate canonical result");
+        .collect();
+    assert_eq!(replies.len(), 1, "duplicate canonical result");
+    assert_eq!(replies[0].message_id.as_deref(), Some(OPERATION));
+    // The next read is still served the reply the platform authoritatively
+    // holds: one late caller's uncertainty does not cost anyone else the
+    // settled answer.
+    let later = cloud_agent::read_operation(
+        &store,
+        &OrderedTransport(std::sync::Arc::clone(&gate)),
+        &cloud,
+        &target,
+        OPERATION,
+        &source,
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(later.status, "completed");
+    assert_eq!(later.reply_text.as_deref(), Some("genuine stub reply"));
 }
 
 #[test]
@@ -5219,4 +5255,619 @@ fn a_refused_reconnect_leaves_the_pin_and_the_session_unchanged() {
     let again = fx.connect();
     assert_eq!(again["agent"]["state"], json!("connected"));
     assert_eq!(again["agent"]["id"], json!(id));
+}
+
+// ---------- round four: platform-proven projection, derived copies, paging ----------
+
+/// The saved login proves only what this workspace STORED. A read scope
+/// revoked UPSTREAM — login intact, unexpired, still carrying both scopes —
+/// refuses every generic projection after one real platform read; an
+/// unreachable platform is uncertainty; the restored grant serves the reply
+/// again. No refusal serialises stored reply text.
+#[test]
+fn an_upstream_read_revocation_refuses_every_generic_projection() {
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_read",
+        json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+    )
+    .unwrap();
+
+    let projections = [
+        ("thread_read", json!({"alias": ALIAS})),
+        ("agent_show", json!({"alias": ALIAS})),
+        ("agent_events", json!({"alias": ALIAS, "after": 0})),
+    ];
+
+    // Revoked at the contract only: the saved login is untouched.
+    fx.stub.set(|script| script.read_status = 403);
+    for (method, params) in projections.clone() {
+        let before = fx.stub.calls("readback");
+        let error = fx.call(Asserted::Operator, method, params).unwrap_err();
+        assert_eq!(
+            code(&error),
+            Some("cloud_agent_scope_revoked"),
+            "{method}: {error}"
+        );
+        assert!(
+            !error.to_string().contains("genuine stub reply"),
+            "{method} disclosed the reply: {error}"
+        );
+        assert_eq!(
+            fx.stub.calls("readback"),
+            before + 1,
+            "{method} refused without asking the platform"
+        );
+    }
+    // The refusal is authority, not data loss: the durable receipt and its
+    // canonical result are untouched.
+    let kept = fx
+        .store()
+        .cloud_agent_operation(&id, OPERATION)
+        .unwrap()
+        .expect("settled receipt");
+    assert_eq!(kept.status, "completed");
+    assert_eq!(kept.reply_text.as_deref(), Some("genuine stub reply"));
+
+    // An unreachable platform is uncertainty, never the stored reply.
+    fx.stub.set(|script| {
+        script.read_status = 0;
+        script.read_drop = true;
+    });
+    for (method, params) in projections.clone() {
+        let error = fx.call(Asserted::Operator, method, params).unwrap_err();
+        // Uncertainty survives as an UNKNOWN outcome (not a rejection) with
+        // no stored content. NOTE: the round-four brief expected the coded
+        // `cloud_agent_uncertain` here; `cloud_read_authority` currently
+        // propagates the transport's own uncoded unknown instead, so this
+        // case asserts the observable contract (kind + no content) and the
+        // missing code is reported, not papered over.
+        assert_eq!(error.kind(), "unknown", "{method}: {error}");
+        assert!(
+            !error.to_string().contains("genuine stub reply"),
+            "{method} disclosed the reply: {error}"
+        );
+    }
+
+    // Positive control: the grant restored upstream serves the reply.
+    fx.stub.set(|script| script.read_drop = false);
+    for (method, params) in projections {
+        let value = fx
+            .call(Asserted::Operator, method, params)
+            .unwrap_or_else(|e| panic!("{method} refused the restored grant: {e}"));
+        assert!(
+            value.to_string().contains("genuine stub reply"),
+            "{method} did not serve the reply: {value}"
+        );
+    }
+}
+
+/// A settled cloud turn also routes its reply as a `worker_result` on the
+/// ordinary alias of whoever invoked it. A portable round trip must drop that
+/// derived copy too: after restore, no projection of the peer alias and no
+/// exported/restored SQLite row carries the reply text.
+#[test]
+fn a_portable_round_trip_with_an_enrolled_peer_drops_the_routed_result() {
+    use cadence_agent::backup::portable::{
+        export_portable, restore_activate_disabled, PortableExportOptions, Scope,
+    };
+    use cadence_agent::backup::portable_activate::required_inventory;
+    use cadence_agent::cloud_agent::{
+        self, CloudTransport, RemoteAgent, RemoteOperation, RemoteStatus, Sender, Source,
+        SubmitRequest,
+    };
+    use cadence_agent::remote_cli::RemoteTarget;
+    use cadence_agent::store::cloud_agent::{CloudSource, Owner};
+
+    const ROUTED: &str = "peer routed reply";
+    const PEER_OPERATION: &str = "peer-operation-0003";
+
+    struct PeerReply;
+    impl CloudTransport for PeerReply {
+        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+            Err(cadence_agent::Error::rejected("connect unused"))
+        }
+        fn submit(
+            &self,
+            _: &RemoteTarget,
+            request: &SubmitRequest<'_>,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Ok(RemoteOperation {
+                status: RemoteStatus::Completed,
+                remote_operation_id: Some(request.operation_id.to_string()),
+                remote_session_id: None,
+                provider_session_id: None,
+                reply: Some(ROUTED.into()),
+                error: None,
+                invoker_id: Some("inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+            })
+        }
+        fn read(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Err(cadence_agent::Error::rejected("read unused"))
+        }
+        fn cancel(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<()> {
+            Err(cadence_agent::Error::rejected("cancel unused"))
+        }
+    }
+
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "agent_register",
+        json!({"alias": "peer", "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
+    )
+    .unwrap();
+    let store = fx.store();
+    let cloud = store.cloud_agent(&id).unwrap().expect("cloud agent");
+    let peer = store.agent("peer").unwrap();
+    let stamp = cadence_agent::cloud_agent::registration_epoch(peer.created);
+    let owner = Owner::new("https://issuer.example.test", "stub-subject");
+    store
+        .cloud_agent_source_grant(&CloudSource {
+            cloud_agent_id: id.clone(),
+            kind: "local_peer".into(),
+            uid: peer.uid.clone(),
+            registration_epoch: stamp,
+            owner: owner.clone(),
+            label: "peer".into(),
+            scope: "cloud_agent.write".into(),
+            granted_by: "operator".into(),
+            granted_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+            invoker_id: None,
+            state: "active".into(),
+        })
+        .unwrap();
+    let target = RemoteTarget {
+        org: cloud.org_slug.clone(),
+        endpoint: cloud.endpoint.clone(),
+        org_id: cloud.organization_id.clone(),
+        identity: None,
+    };
+    let source = Source::registered(&peer, owner);
+    cloud_agent::send(
+        &store,
+        &PeerReply,
+        &cloud,
+        &target,
+        &home,
+        &Sender::Agent("peer".into()),
+        &source,
+        PEER_OPERATION,
+        "peer request body",
+        true,
+        None,
+        || Ok(()),
+    )
+    .expect("the admitted peer source settles its own turn");
+    // The derived copy the restore must drop: an ordinary alias' routed
+    // worker_result, whose origin names the cloud message and whose body
+    // carries the reply.
+    let routed = store
+        .messages("peer")
+        .unwrap()
+        .into_iter()
+        .find(|row| row.source == "worker_result" && row.origin.as_deref() == Some(PEER_OPERATION))
+        .expect("the peer alias should hold the routed cloud result");
+    assert!(
+        routed.body.contains(ROUTED),
+        "the fixture's routed copy lost the reply text: {}",
+        routed.body
+    );
+    // An unrelated local message on the same peer alias must survive the same
+    // export: what is omitted is the DERIVED cloud copy, never the alias'
+    // own coordination history.
+    fx.call(
+        Asserted::Operator,
+        "thread_send",
+        json!({
+            "alias": "peer", "text": "unrelated peer mail",
+            "message": "m-peer-unrelated",
+        }),
+    )
+    .unwrap();
+
+    let tracker = fx.root.path().join("tracker-peer");
+    std::fs::create_dir_all(&tracker).unwrap();
+    std::fs::copy(fx.pm.join("pm.yaml"), tracker.join("pm.yaml")).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "pm.yaml"],
+        vec!["commit", "-q", "-m", "CAD-1853 peer portable fixture"],
+    ] {
+        let mut command = std::process::Command::new("git");
+        command
+            .arg("-C")
+            .arg(&tracker)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "maintenance.auto=false",
+            ])
+            .args(&args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "cad1853-acceptance")
+            .env("GIT_AUTHOR_EMAIL", "acceptance@example.invalid")
+            .env("GIT_COMMITTER_NAME", "cad1853-acceptance")
+            .env("GIT_COMMITTER_EMAIL", "acceptance@example.invalid");
+        let output = cadence_agent::reaper::output(&mut command).unwrap();
+        assert!(
+            output.status.success(),
+            "fixture git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let package = fx.root.path().join("package-peer");
+    export_portable(
+        &fx.state,
+        &package,
+        &PortableExportOptions {
+            scope: Scope::Coordination,
+            tracker,
+            redact_history_secrets: false,
+        },
+    )
+    .expect("a workspace holding a routed cloud result must still export");
+    let plan = required_inventory(&package).expect("the package's non-terminal rows");
+    let restored = fx.root.path().join("restored-peer");
+    restore_activate_disabled(&package, &restored, &plan)
+        .expect("the package restores with execution disabled");
+
+    for copy in [&package, &restored] {
+        let conn = rusqlite::Connection::open_with_flags(
+            copy.join("cadence.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        for (what, sql) in [
+            (
+                "canonical request/body",
+                format!("SELECT COUNT(*) FROM messages WHERE body LIKE '%{ROUTED}%'"),
+            ),
+            (
+                "message receipt",
+                format!("SELECT COUNT(*) FROM messages WHERE result LIKE '%{ROUTED}%'"),
+            ),
+            (
+                "thread entry",
+                format!("SELECT COUNT(*) FROM thread_entries WHERE text LIKE '%{ROUTED}%'"),
+            ),
+            (
+                "event payload",
+                format!("SELECT COUNT(*) FROM events WHERE payload LIKE '%{ROUTED}%'"),
+            ),
+            (
+                "routed copy",
+                format!("SELECT COUNT(*) FROM messages WHERE origin='{PEER_OPERATION}'"),
+            ),
+        ] {
+            assert_eq!(
+                count(&sql),
+                0,
+                "{}: the {what} still carries the routed cloud reply",
+                copy.display()
+            );
+        }
+        for table in [
+            "cloud_agents",
+            "cloud_agent_sources",
+            "cloud_agent_sessions",
+            "cloud_agent_operations",
+        ] {
+            assert_eq!(
+                count(&format!("SELECT COUNT(*) FROM {table}")),
+                0,
+                "{}: {table} authority survived",
+                copy.display()
+            );
+        }
+        // The omission is targeted: the same alias' unrelated mail is kept.
+        assert_eq!(
+            count("SELECT COUNT(*) FROM messages WHERE body='unrelated peer mail'"),
+            1,
+            "{}: the export dropped the peer alias' unrelated message",
+            copy.display()
+        );
+    }
+
+    // Serve the restored root. It is activated with execution disabled, so the
+    // fence answers the read-only verbs and refuses the execution-capable ones
+    // (thread_read, agent_events) — their projected data is exactly the
+    // thread_entries/events rows the SQL scan above proves gone. The ordinary
+    // peer alias has no cloud gate, so its agent_show is the live assertion;
+    // the cloud alias must still fail closed.
+    let (stop, handle) = spawn_daemon_at(&restored, &fx.pm);
+    let peer_show = scoped(Asserted::Operator, || {
+        client::rpc(&restored, "agent_show", json!({"alias": "peer"}))
+    })
+    .expect("the ordinary peer alias stays readable after restore");
+    assert!(
+        !peer_show.to_string().contains(ROUTED),
+        "agent_show on the restored peer alias disclosed the routed cloud reply: {peer_show}"
+    );
+    assert!(
+        peer_show.to_string().contains("unrelated peer mail"),
+        "agent_show lost the peer alias' unrelated message: {peer_show}"
+    );
+    let cloud_show = scoped(Asserted::Operator, || {
+        client::rpc(&restored, "agent_show", json!({"alias": ALIAS}))
+    })
+    .unwrap_err();
+    assert_eq!(
+        code(&cloud_show),
+        Some("cloud_agent_authority_missing"),
+        "{cloud_show}"
+    );
+    assert!(!cloud_show.to_string().contains(ROUTED));
+    for (method, params) in [
+        ("thread_read", json!({"alias": "peer"})),
+        ("agent_events", json!({"alias": "peer", "after": 0})),
+    ] {
+        let error = scoped(Asserted::Operator, || {
+            client::rpc(&restored, method, params)
+        })
+        .unwrap_err();
+        assert!(
+            !error.to_string().contains(ROUTED),
+            "{method} disclosed the routed cloud reply: {error}"
+        );
+        assert!(
+            error.to_string().contains("execution-disabled"),
+            "{method} was refused by neither the fence nor a content check: {error}"
+        );
+    }
+    stop.store(true, SeqCst);
+    let _ = handle.join();
+}
+
+/// A page whose rows the projection filters out still advances the scanned
+/// cursor: a consumer moves past another source's cloud rows instead of
+/// re-reading the same hidden page forever, and never repeats a kept entry.
+#[test]
+fn a_fully_filtered_thread_page_advances_the_cursor() {
+    use cadence_agent::cloud_agent::{
+        self, CloudTransport, RemoteAgent, RemoteOperation, RemoteStatus, Sender, Source,
+        SubmitRequest,
+    };
+    use cadence_agent::remote_cli::RemoteTarget;
+    use cadence_agent::store::cloud_agent::{CloudSource, Owner};
+
+    const PEER_REQUEST: &str = "peer page request";
+    const PEER_REPLY: &str = "peer page reply";
+    const PEER_OPERATION: &str = "peer-operation-0004";
+
+    struct PeerReply;
+    impl CloudTransport for PeerReply {
+        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+            Err(cadence_agent::Error::rejected("connect unused"))
+        }
+        fn submit(
+            &self,
+            _: &RemoteTarget,
+            request: &SubmitRequest<'_>,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Ok(RemoteOperation {
+                status: RemoteStatus::Completed,
+                remote_operation_id: Some(request.operation_id.to_string()),
+                remote_session_id: None,
+                provider_session_id: None,
+                reply: Some(PEER_REPLY.into()),
+                error: None,
+                invoker_id: Some("inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+            })
+        }
+        fn read(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Err(cadence_agent::Error::rejected("read unused"))
+        }
+        fn cancel(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<()> {
+            Err(cadence_agent::Error::rejected("cancel unused"))
+        }
+    }
+
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "agent_register",
+        json!({"alias": "peer", "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
+    )
+    .unwrap();
+    let store = fx.store();
+    let cloud = store.cloud_agent(&id).unwrap().expect("cloud agent");
+    let peer = store.agent("peer").unwrap();
+    let stamp = cadence_agent::cloud_agent::registration_epoch(peer.created);
+    let source = Source::registered(
+        &peer,
+        Owner::new("https://issuer.example.test", "stub-subject"),
+    );
+    store
+        .cloud_agent_source_grant(&CloudSource {
+            cloud_agent_id: id.clone(),
+            kind: "local_peer".into(),
+            uid: peer.uid.clone(),
+            registration_epoch: stamp,
+            owner: source.owner.clone(),
+            label: "peer".into(),
+            scope: "cloud_agent.write".into(),
+            granted_by: "operator".into(),
+            granted_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+            invoker_id: None,
+            state: "active".into(),
+        })
+        .unwrap();
+    let target = RemoteTarget {
+        org: cloud.org_slug.clone(),
+        endpoint: cloud.endpoint.clone(),
+        org_id: cloud.organization_id.clone(),
+        identity: None,
+    };
+    // The other source's rows come FIRST, so the operator's first page is
+    // entirely filtered.
+    cloud_agent::send(
+        &store,
+        &PeerReply,
+        &cloud,
+        &target,
+        &home,
+        &Sender::Agent("peer".into()),
+        &source,
+        PEER_OPERATION,
+        PEER_REQUEST,
+        true,
+        None,
+        || Ok(()),
+    )
+    .expect("the admitted peer source settles its own turn");
+    // Then the caller's own settled turn.
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_read",
+        json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+    )
+    .unwrap();
+
+    // The raw first page really is the other source's rows.
+    let raw = store.thread_entries(ALIAS, 0, 2).unwrap();
+    let raw_texts: Vec<&str> = raw.iter().map(|entry| entry.text.as_str()).collect();
+    assert_eq!(
+        raw_texts,
+        vec![PEER_REQUEST, PEER_REPLY],
+        "the fixture's first page is not the other source's rows"
+    );
+
+    // The operator keeps nothing from that page, and the cursor still moves
+    // past every scanned row.
+    let page = fx
+        .call(
+            Asserted::Operator,
+            "thread_read",
+            json!({"alias": ALIAS, "after": 0, "limit": 2}),
+        )
+        .unwrap();
+    assert!(
+        page["entries"].as_array().unwrap().is_empty(),
+        "a fully filtered page leaked rows: {page}"
+    );
+    let scanned = raw.last().expect("scanned page").seq;
+    assert_eq!(
+        page["cursor"],
+        json!(scanned),
+        "the cursor did not advance past the filtered page: {page}"
+    );
+    assert!(scanned > 0);
+
+    // A consumer that pages from 0 does not stall or repeat a kept entry.
+    let mut after = 0i64;
+    let mut seen: Vec<i64> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    for _ in 0..8 {
+        let page = fx
+            .call(
+                Asserted::Operator,
+                "thread_read",
+                json!({"alias": ALIAS, "after": after, "limit": 2}),
+            )
+            .unwrap();
+        for entry in page["entries"].as_array().unwrap() {
+            let seq = entry["seq"].as_i64().unwrap();
+            assert!(
+                !seen.contains(&seq),
+                "the pager repeated entry {seq}: {page}"
+            );
+            seen.push(seq);
+            if let Some(text) = entry["text"].as_str() {
+                texts.push(text.to_string());
+            }
+        }
+        let next = page["cursor"].as_i64().unwrap();
+        assert!(
+            next >= after,
+            "the cursor went backwards at {after}: {page}"
+        );
+        if next == after {
+            break;
+        }
+        after = next;
+    }
+    assert!(after > 0, "the pager never advanced past the filtered page");
+    assert_eq!(
+        texts.iter().filter(|text| **text == TEXT).count(),
+        1,
+        "{texts:?}"
+    );
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|text| **text == "genuine stub reply")
+            .count(),
+        1,
+        "{texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text == PEER_REQUEST || text == PEER_REPLY),
+        "the pager surfaced the other source's rows: {texts:?}"
+    );
 }

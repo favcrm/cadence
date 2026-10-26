@@ -1124,7 +1124,10 @@ fn apply_remote(
 /// it: the `cloud_agent_operations` row is the reconciliation target, never
 /// the answer. A revocation that landed upstream therefore refuses a
 /// settled read, and an unreachable readback is reported as uncertainty
-/// rather than served from the cache.
+/// rather than served from the cache. A NONTERMINAL readback is answered
+/// with the platform's own state for that read, even when another caller
+/// settled the same operation while it was in flight: this read never
+/// learned a reply, so it never returns one.
 pub fn read_operation(
     store: &Store,
     transport: &dyn CloudTransport,
@@ -1220,20 +1223,32 @@ fn read_operation_with(
         outcome.status,
         RemoteStatus::Completed | RemoteStatus::Failed
     );
-    if settled_before && !terminal {
-        // A late correlated readback may not reopen a settled receipt, and
-        // it must equally not be answered WITH that receipt: the platform's
-        // own answer to this read is nonterminal, so that is the state the
-        // caller gets, with no cached reply text in it.
+    if !terminal {
+        // The platform's own answer to THIS read is nonterminal, so that is
+        // the state the caller gets, with no reply text in it — whatever the
+        // local row says by now. Another read (or the driver) may have
+        // settled this operation while this readback was in flight; its
+        // durable terminal receipt is kept for reconciliation and canonical
+        // history, but it is never this read's answer, because this read
+        // never learned that reply, and returning it would disclose content
+        // the caller's own authoritative answer did not contain.
         let mut pending = operation.clone();
         pending.status = outcome.status.as_str().to_string();
         pending.remote_operation_id = outcome
             .remote_operation_id
-            .or(pending.remote_operation_id.take());
+            .clone()
+            .or_else(|| operation.remote_operation_id.clone());
         pending.reply_text = None;
         pending.reply_message_id = None;
         pending.error_code = outcome.error.as_ref().map(|(code, _)| code.clone());
         pending.error_message = outcome.error.as_ref().map(|(_, message)| message.clone());
+        if !settled_before {
+            // Record the observed nonterminal state for the reconciler. The
+            // settle is a terminal-preserving compare-and-set, so a receipt
+            // that settled concurrently stays settled (and stays the
+            // reconciliation target) while this read keeps its own answer.
+            apply_remote(store, agent, &operation, outcome)?;
+        }
         return Ok(pending);
     }
     let answer_status = outcome.status;

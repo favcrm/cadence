@@ -156,14 +156,19 @@ impl Shared {
                 Some(thread) => Some(thread.clone()),
                 None => self.store.thread(&alias)?,
             };
-            let (entries, more) = match &conversation {
+            let (raw, more) = match &conversation {
                 Some(thread) => self
                     .store
                     .thread_entries_before_of(&thread.id, before, limit)?,
                 None => self.store.thread_entries_before(&alias, before, limit)?,
             };
-            let entries = projection.entries(&self.store, entries)?;
-            let cursor = entries.last().map(|e| e.seq).unwrap_or(0);
+            // The cursor is the last row this page SCANNED, never the last
+            // row the projection kept. A projection filters another source's
+            // cloud entries out; taking the kept page's last seq would pin
+            // the caller's cursor short of rows it must move past, and the
+            // filtered content is exactly what must not be exposed.
+            let cursor = raw.last().map(|e| e.seq).unwrap_or(0);
+            let entries = projection.entries(&self.store, raw)?;
             // CAD-1700: the complete watermark of the authorized thread,
             // never just this (bounded) page or the cursor's window.
             let reply_seq = match &thread {
@@ -187,16 +192,21 @@ impl Shared {
                 Some(thread) => Some(thread.clone()),
                 None => self.store.thread(&alias)?,
             };
-            let entries = match &conversation {
+            let raw = match &conversation {
                 Some(thread) => self.store.thread_entries_of(&thread.id, after, limit)?,
                 None => self.store.thread_entries(&alias, after, limit)?,
             };
+            // The cursor is the last row this page SCANNED, never the last
+            // row the projection kept. Filtering another source's cloud
+            // entries out must not leave the caller's `after` on a seq it has
+            // already passed, or a consumer would re-read the same hidden
+            // page forever; the filtered content itself is never exposed.
+            let scanned = raw.last().map(|e| e.seq).unwrap_or(after);
+            let entries = projection.entries(&self.store, raw)?;
             if !entries.is_empty()
                 || Instant::now() >= deadline
                 || self.closing.load(Ordering::SeqCst)
             {
-                let entries = projection.entries(&self.store, entries)?;
-                let cursor = entries.last().map(|e| e.seq).unwrap_or(after);
                 // CAD-1700: the same complete watermark whatever the
                 // cursor — a cold tail or a long catch-up page carries it.
                 let reply_seq = match &thread {
@@ -207,7 +217,7 @@ impl Shared {
                     alias: alias.clone(),
                     thread: thread.as_ref().map(store::Thread::info),
                     entries: self.entries_json(&alias, &entries)?,
-                    cursor,
+                    cursor: scanned,
                     more_before: None,
                     reply_seq,
                 })
