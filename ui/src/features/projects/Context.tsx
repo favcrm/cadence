@@ -12,6 +12,8 @@ interface ContextProps {
   actor: string;
   onToast: WikiProps["onToast"];
   navHref: (route: Route) => string;
+  /** A hosted tenant does not serve the wiki; the project context is wiki-backed. */
+  hosted?: boolean;
 }
 
 export default function Context({
@@ -20,10 +22,18 @@ export default function Context({
   actor,
   onToast,
   navHref,
+  hosted = false,
 }: ContextProps) {
   const t = useTranslate();
   const href = useHref();
   const scope = useMemo(() => ({ root: projectWikiRoot(project), label: "Context" }), [project]);
+  if (hosted) {
+    return (
+      <main className="context-workspace" aria-label={`${project} context`}>
+        <div className="p-5 text-secondary text-ink-400">{t("The wiki isn’t available on this board.")}</div>
+      </main>
+    );
+  }
   const route = contextRoute(project, href);
   const wikiHref = (next: Route) => next.screen === "wiki" ? contextHref(project, next, href) : navHref(next);
   return (

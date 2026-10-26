@@ -1188,7 +1188,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 }),
                 on: route.screen === "projects" && route.section === "workflows",
               },
-              {
+              ...(meta?.hosted === true ? [] : [{
                 label: "Context",
                 href: hrefFor({
                   screen: "projects",
@@ -1196,7 +1196,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                   section: "context",
                 }),
                 on: route.screen === "projects" && route.section === "context",
-              },
+              }]),
             ]}
           />
         )}
@@ -1277,6 +1277,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         )}
         {route.screen === "projects" && route.section === "context" && (
           <Context
+            hosted={meta?.hosted === true}
             readOnly={readOnly}
             actor={actor}
             onToast={say}
