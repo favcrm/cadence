@@ -813,7 +813,7 @@ fn cad1822_compaction_restores_the_bound_task_on_plain_worker_followups() {
     // compaction rather than making the same task impossible to resume.
     let policy = format!(
         "The required policy body is present.\n{}\nEnd of mandatory policy appendix.\n",
-        "Reference policy clause.\n".repeat(1699)
+        "Reference policy clause.\n".repeat(1680)
     );
     set_sources(
         &fixture.repo,
@@ -858,6 +858,12 @@ fn cad1822_compaction_restores_the_bound_task_on_plain_worker_followups() {
             .to_string()
     };
     let first = supplied(dispatched["message"].as_str().unwrap());
+    let mandatory_bytes = first["body_bytes"].as_u64().unwrap()
+        + first["appended_bytes"].as_u64().unwrap()
+        + first["adapter_reserved_bytes"].as_u64().unwrap()
+        + 2;
+    assert!(mandatory_bytes > 44_000);
+    assert!(mandatory_bytes <= 48_000);
     fixture.wait_state(CONTROL_WORKER, "idle");
     let active = fixture.op("agent_show", json!({"alias": CONTROL_WORKER}));
     assert_eq!(
@@ -885,6 +891,18 @@ fn cad1822_compaction_restores_the_bound_task_on_plain_worker_followups() {
     assert_eq!(restored["task"], CONTROL);
     assert_eq!(restored["pin"], first["pin"]);
     let events = store.events_tail(CONTROL_WORKER, 100).unwrap();
+    assert_eq!(restored["mode"], "full");
+    assert!(restored["appended_bytes"].as_u64().unwrap() > 0);
+    assert!(
+        events.iter().any(|event| {
+            event.kind == "context_gap"
+                && event.payload["message"] == resumed
+                && event.payload["state"] == "continuity-omitted"
+                && event.payload["limit"] == 48_000
+                && event.payload["combined_bytes"].as_u64().unwrap() > 48_000
+        }),
+        "the real optional continuity pack must overflow and be omitted whole"
+    );
     let result = events
         .iter()
         .find(|event| event.kind == "turn_finished" && event.payload["message"] == resumed)
