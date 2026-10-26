@@ -28,7 +28,7 @@ import {
   AssistantActorProvider,
   AssistantFace,
   useAssistantActor,
-  useWorkspaceActor,
+  useConversationActor,
 } from "../assistant/AssistantIdentity";
 import { displayName, scopeDescriptor } from "../assistant/identity";
 import type { AttachDestination } from "../app-shell/chat/attach";
@@ -392,9 +392,10 @@ function NotStarted({ status, hosted }: { status: MasterStatus; hosted: boolean 
 
 function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabled: boolean }) {
   const t = useTranslate();
+  const actor = useAssistantActor();
   return (
     <div className="card px-4 py-4" data-empty="thread">
-      <h2 className="text-cardtitle font-semibold text-ink-100">{t("Ask the master for work")}</h2>
+      <h2 className="text-cardtitle font-semibold text-ink-100">{`${t("Ask")} ${displayName(actor.read, actor.scope, t)}`}</h2>
       <p className="text-secondary text-ink-400 mt-1">{t("No conversation yet. Try one of these:")}</p>
       <div className="mt-3 grid gap-2">
         {EXAMPLES.map((ex) => (
@@ -603,9 +604,10 @@ export default function Home({
    *  keys the owner's private chat on it; a member's default view is
    *  already private. */
   viewerSub?: string | null;
-  /** The verified session's `role === "member"`. Members always land on
-   *  their own private assistant; owners/operators keep Master unless
-   *  they explicitly ask for their own assistant. */
+  /** The verified session's `role === "member"`. Members use the private
+   *  assistant layout; owners/operators keep the master-transport layout
+   *  unless they select the private layout. The backend still determines
+   *  the actual conversation actor. */
   viewerIsMember?: boolean;
   /** The verified session's id — scopes the member-chat store so a
    *  re-login as another member never reads the previous chat. */
@@ -660,8 +662,8 @@ export default function Home({
   );
 }
 
-/** The Master workspace — unchanged, mounted only when the outer Home
- *  did NOT route to the member's private assistant. */
+/** The shared master-transport pane: Native coordinator or verified hosted
+ *  actor. The outer Home chooses the layout without changing recipients. */
 function MasterHome({
   readOnly,
   hosted = null,
@@ -689,7 +691,6 @@ function MasterHome({
   const thread = useQuery(resources.masterThread);
   const agents = useResource(resources.agents);
   const master = useQuery(resources.masterState);
-  const actor = useWorkspaceActor(master, operator === true && !readOnly);
   const [seed, setSeed] = useState<{ text: string; n: number; refs?: ThreadRef[] }>({
     text: "",
     n: 0,
@@ -893,6 +894,18 @@ function MasterHome({
     setActivity(false);
     setGlideTick((n) => n + 1);
   }, []);
+  const sendPersonalRequest = useCallback(async (text: string) => {
+    if (readOnly || block || homeConversation === undefined) throw new Error("Sending is unavailable.");
+    engage();
+    const receipt = await sendToMaster(text, newMessageId(), undefined, undefined, homeConversation);
+    if (!receipt.ok) throw new Error(receipt.error);
+  }, [readOnly, block, homeConversation, engage]);
+  const actor = useConversationActor(
+    master,
+    operator === true && !readOnly,
+    homeConversation ?? null,
+    readOnly || !!block || homeConversation === undefined ? null : sendPersonalRequest,
+  );
   const onRetrySend = useCallback(
     (
       message: string,
@@ -1206,13 +1219,13 @@ function MasterHome({
         <div className="relative flex-1 min-h-0 flex flex-col" data-chat-panel>
           <div
             className="master-heading assistant-heading pb-2.5 border-b border-ink-700/70"
-            data-assistant-identity="workspace"
+            data-assistant-identity={actor.scope ?? undefined}
             data-identity-state={actor.read.state}
           >
             <AssistantFace size={30} active={status.kind === "running"} />
             <div className="assistant-heading-text">
               <div className="assistant-heading-name">
-                <h1 className="text-section font-semibold text-ink-100" data-assistant-name>{displayName(actor.read, "workspace", t)}</h1>
+                <h1 className="text-section font-semibold text-ink-100" data-assistant-name>{displayName(actor.read, actor.scope, t)}</h1>
                 <span
                   className={`chip ${
                     status.kind === "running"
@@ -1229,7 +1242,7 @@ function MasterHome({
                   <span className="text-micro text-ink-500">{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
                 )}
               </div>
-              <p className="assistant-scope">{scopeDescriptor("workspace", t)}</p>
+              <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
             </div>
             <div className="assistant-heading-actions">
               <AssistantAboutButton />

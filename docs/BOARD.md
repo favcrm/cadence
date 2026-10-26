@@ -2245,11 +2245,11 @@ An unavailable profile is not reported as an unnamed or successfully saved one.
 
 Member-assistant setup is optional and request-first. The assistant may ask
 "What would you like to call me?" and "How would you like me to communicate?",
-one question per turn; skip/later do not block work. The existing fenced ACK
-accepts `name` (the assistant), `tone`, `user_name` (how to address the user),
-`preferences` and `look`. Later edits preserve the existing bootstrap state and
-conversation. Name/tone remain in the managed IDENTITY.md/SOUL.md sections;
-user address/preferences stay in private USER.md. Subsequent valid turns read
+one question per turn; skip/later do not block work. On Native, the existing
+fenced ACK accepts `name` (the assistant), `tone`, `user_name` (how to address the
+user), `preferences` and `look`. Later edits preserve the existing bootstrap
+state and conversation. Name/tone remain in the managed IDENTITY.md/SOUL.md
+sections; user address/preferences stay in private USER.md. Subsequent valid turns read
 the committed profile. A personal avatar selection is an ordinary chat request,
 not a browser-side profile write, and remains pending until state confirms it.
 
@@ -2258,9 +2258,9 @@ A new personal assistant pins its immutable alias-derived look once in
 `params.look`; renaming, setup deferral, reload and login never reroll it.
 Existing pins win, and an unpinned Master keeps the robot.
 
-Master-backed Home/app conversations are still workspace-owned. Their headers
-keep that scope visible at narrow widths too. The About panel offers proven
-operators a bounded name/personality/avatar editor through
+Native Master-backed Home/app conversations are still workspace-owned. Their
+headers keep that scope visible at narrow widths too. The About panel offers
+proven operators a bounded name/personality/avatar editor through
 `POST /api/master/identity` (`master_identity_set` natively). IDENTITY.md and
 SOUL.md use the protected writer and digest record, never agent self-edit.
 `Shared::prompt_with_profile` includes committed name/personality in the initial
@@ -2272,6 +2272,26 @@ The About panel preserves Escape dismissal and returns focus after a save.
 A rename does not change the `master` routing alias, ownership, permissions or
 retained history. Personal-assistant Home/app routing
 and scoped assistant-to-Master queries remain the separate CAD-1818 phase.
+
+The tenant Worker port (AOS-378) uses the same shared UI without changing its
+existing recipients: subject-owned Home/app conversations are personal, while
+the reserved owner-only Recruit conversation uses the workspace coordinator.
+The server adds `actor_identity: {scope, conversation_id, identity}` to the
+selected conversation's master state and initial streamed snapshot; the UI
+reads `/api/master/state?conversation=<id>` and refuses mismatched projections.
+Only an absent projection retains Native's coordinator contract. A present
+malformed projection or failed/stale canonical read is unavailable, with no
+borrowed profile, ownership claim or edit control.
+
+Worker personal profiles are canonical actor-private Workspace-DO rows, not
+Native Markdown files. The actor-bound `assistant_profile` tool uses the same
+fields and bootstrap states, while protected workspace edits remain owner-only
+HTTP actions. Initial personal avatars are pinned from the immutable
+tenant-scoped subject; a rename never rerolls them. User address/preferences
+never enter UI identity projections or workspace context. Recruit's About panel
+is the workspace editor; editing it does not rename the user's assistant.
+Both source repositories and the matching UI release must pass their normal
+promotion/release gates before this behavior is available in a hosted tenant.
 
 ### App routing QA handovers
 

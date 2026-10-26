@@ -683,6 +683,8 @@ export interface MasterState {
    *  protected IDENTITY/SOUL projection, never a member's private profile.
    *  Generated as `MasterIdentity` from the daemon's Rust type. */
   identity: MasterIdentity;
+  /** Hosted-only actor projection, bound to its selected conversation. */
+  actor_identity?: Api.MasterState["actor_identity"];
 }
 
 /** `POST /api/master/command` — one allowlisted session verb's answer. */

@@ -24,6 +24,17 @@ export interface ActivityEntry {
   title?: string | null;
 }
 
+/** The actor actually serving a conversation, independent of its transport alias. */
+export type ActorIdentity = {
+  conversation_id: string;
+  identity: PersonalAssistantIdentity;
+  scope: "personal";
+} | {
+  conversation_id: string;
+  identity: MasterIdentity;
+  scope: "workspace";
+};
+
 /** A provider allowance record as the store keeps it. The envelope is fixed;
  * `data` is the provider's own report (for Codex, its rate-limit buckets). */
 export interface AgentQuota {
@@ -406,6 +417,9 @@ export interface MasterSession {
 /** `master_state` (daemon RPC; `GET /api/master/state` relays it): what the
  * master header shows. A member's copy drops the turn's `summary`. */
 export interface MasterState {
+  /** Hosted conversations may be personal even when the transport alias is `master`.
+   * An absent projection retains the native workspace-coordinator contract. */
+  actor_identity?: ActorIdentity | null;
   alias: string;
   /** The session verbs the live provider accepts. */
   commands: string[];
@@ -510,6 +524,14 @@ export interface PatchReq {
   /** Replaces the tag list; `[]` clears it. */
   tags?: string[] | null;
   title?: string | null;
+}
+
+/** A member's committed identity. Private address/preferences are never a UI projection. */
+export interface PersonalAssistantIdentity {
+  look: AvatarLook;
+  name?: string | null;
+  revision: number;
+  tone?: string | null;
 }
 
 /** Work-item counts by status bucket. */

@@ -1,16 +1,15 @@
 /** CAD-1817: the assistant's effective identity is a projection of one
- *  committed profile — the member's private IDENTITY/SOUL files or the
- *  workspace coordinator's protected IDENTITY/SOUL files. The UI never
+ *  committed profile — native IDENTITY/SOUL files or hosted actor-private
+ *  storage. The UI never
  *  derives a name from a display coincidence, never translates a custom
  *  name, and never treats an unreadable projection as "unnamed".
  *
  *  Two actors exist and stay separate: the private assistant (personal
  *  scope, owns its own profile) and the workspace coordinator (workspace
- *  scope, shares the workspace's identity). A Master-backed pane is
- *  labelled from the coordinator only; the owner's private profile is
- *  never borrowed for it. */
+ *  scope, shares the workspace's identity). Native Master panes retain the
+ *  coordinator; hosted panes use their conversation-bound actor projection.
+ *  An alias or a display-name coincidence never chooses the profile. */
 
-import type { MasterState } from "../../lib/types";
 import { AVATAR_LOOKS, agentLook, type AvatarLook } from "../agents/AgentAvatar";
 import { MASTER } from "../home/master";
 
@@ -59,15 +58,20 @@ export class IdentityShapeError extends Error {}
  *  caller can show the actor as unavailable instead of silently renaming
  *  it to the fallback. */
 export function decodeIdentity(raw: unknown, scope: AssistantScope): IdentityRecord {
-  if (raw === null || typeof raw !== "object") throw new IdentityShapeError("identity is not an object");
-  const row = raw as Record<string, unknown>;
-  const name = nullableText(row.name);
+  if (raw === null || typeof raw !== "object"
+    || !("name" in raw) || !("tone" in raw) || !("look" in raw) || !("revision" in raw)) {
+    throw new IdentityShapeError("identity fields are missing");
+  }
+  const name = nullableText(raw.name);
   if (name === undefined) throw new IdentityShapeError("name is not text");
-  const tone = nullableText(row.tone);
+  const tone = nullableText(raw.tone);
   if (tone === undefined) throw new IdentityShapeError("tone is not text");
-  const look = row.look;
+  const look = raw.look;
   if (!isAvatarLook(look)) throw new IdentityShapeError("look is not in the catalog");
-  const revision = row.revision;
+  const revision = raw.revision;
+  if (typeof revision !== "number" && typeof revision !== "string") {
+    throw new IdentityShapeError("revision is not a number or string");
+  }
   if (scope === "personal") {
     if (typeof revision !== "number" || !Number.isInteger(revision) || revision < 0) {
       throw new IdentityShapeError("profile revision is not an integer");
@@ -75,15 +79,15 @@ export function decodeIdentity(raw: unknown, scope: AssistantScope): IdentityRec
   } else if (typeof revision !== "string" || revision.trim() === "") {
     throw new IdentityShapeError("coordinator revision is not an opaque string");
   }
-  return { name, tone, look, revision: revision as number | string };
+  return { name, tone, look, revision };
 }
 
 /** The signed-in member's own identity, read from their private state.
  *  A missing or malformed `identity` is unavailable — never "unset" and
  *  never another actor's name. */
 export function readPersonalIdentity(state: unknown): IdentityRead {
-  if (state === null || typeof state !== "object") return { state: "unavailable" };
-  const assistant = (state as { assistant?: unknown }).assistant;
+  if (state === null || typeof state !== "object" || !("assistant" in state)) return { state: "unavailable" };
+  const assistant = state.assistant;
   if (assistant === null || typeof assistant !== "object") return { state: "unavailable" };
   if (!("identity" in assistant)) return { state: "unavailable" };
   try {
@@ -94,8 +98,8 @@ export function readPersonalIdentity(state: unknown): IdentityRead {
 }
 
 /** The workspace identity, read from the coordinator's own state. */
-export function readWorkspaceIdentity(master: MasterState | null | undefined): IdentityRead {
-  if (master === null || master === undefined) return { state: "unavailable" };
+export function readWorkspaceIdentity(master: unknown): IdentityRead {
+  if (master === null || typeof master !== "object" || !("identity" in master)) return { state: "unavailable" };
   try {
     return { state: "ready", identity: decodeIdentity(master.identity, "workspace") };
   } catch {
@@ -103,9 +107,39 @@ export function readWorkspaceIdentity(master: MasterState | null | undefined): I
   }
 }
 
+export interface ConversationIdentityRead {
+  scope: AssistantScope | null;
+  read: IdentityRead;
+}
+
+/** A selected hosted conversation must not borrow Home's identity. Only an
+ *  absent projection retains the native coordinator contract; malformed or
+ *  foreign projections are explicitly unavailable. */
+export function readConversationIdentity(
+  master: unknown,
+  conversation: string | null,
+): ConversationIdentityRead {
+  const unavailable: ConversationIdentityRead = { scope: null, read: { state: "unavailable" } };
+  if (master === null || typeof master !== "object") return unavailable;
+  if (!("actor_identity" in master)) {
+    return { scope: "workspace", read: readWorkspaceIdentity(master) };
+  }
+  const projection = master.actor_identity;
+  if (projection === null || typeof projection !== "object"
+    || !("conversation_id" in projection) || !("scope" in projection) || !("identity" in projection)) return unavailable;
+  if (conversation === null || conversation === "" || projection.conversation_id !== conversation) return unavailable;
+  const scope = projection.scope;
+  if (scope !== "personal" && scope !== "workspace") return unavailable;
+  try {
+    return { scope, read: { state: "ready", identity: decodeIdentity(projection.identity, scope) } };
+  } catch {
+    return { scope, read: { state: "unavailable" } };
+  }
+}
+
 /** The visible name: the committed name verbatim (never translated), or
  *  the localized generic role label only while the name is unset. */
-export function displayName(read: IdentityRead, scope: AssistantScope, t: (text: string) => string): string {
+export function displayName(read: IdentityRead, scope: AssistantScope | null, t: (text: string) => string): string {
   if (read.state === "ready" && read.identity.name !== null) return read.identity.name;
   return scope === "workspace" ? t("Workspace assistant") : t("Assistant");
 }
@@ -119,19 +153,21 @@ export function identityLook(read: IdentityRead, alias: string): AvatarLook {
 }
 
 /** The explicit ownership descriptor shown beside the actor's name. */
-export function scopeDescriptor(scope: AssistantScope, t: (text: string) => string): string {
+export function scopeDescriptor(scope: AssistantScope | null, t: (text: string) => string): string {
+  if (scope === null) return "";
   return scope === "workspace"
-    ? t("Workspace assistant · shared with this workspace")
+    ? t("Workspace coordinator · workspace-owned")
     : t("Personal assistant · private to you");
 }
 
 /** Composer placeholder naming the actual actor. */
-export function messagePlaceholder(read: IdentityRead, scope: AssistantScope, t: (text: string) => string): string {
+export function messagePlaceholder(read: IdentityRead, scope: AssistantScope | null, t: (text: string) => string): string {
   if (read.state === "ready" && read.identity.name !== null) return `${t("Message")} ${read.identity.name}…`;
+  if (scope === null) return `${t("Message")} ${t("Assistant")}…`;
   return scope === "workspace" ? t("Message the workspace assistant…") : t("Message your assistant…");
 }
 
 /** Composer accessible label naming the actual actor. */
-export function messageLabel(read: IdentityRead, scope: AssistantScope, t: (text: string) => string): string {
+export function messageLabel(read: IdentityRead, scope: AssistantScope | null, t: (text: string) => string): string {
   return `${t("Message")} ${displayName(read, scope, t)}`;
 }

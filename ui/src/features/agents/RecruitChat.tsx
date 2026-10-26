@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { api } from "../../lib/api";
-import { cache } from "../../lib/resources";
+import { cache, resources } from "../../lib/resources";
 import { useTranslate } from "../../lib/locale";
-import { useResource } from "../../lib/useResource";
+import { useQuery, useResource } from "../../lib/useResource";
 import Button from "../../ui/Button";
-import AgentAvatar from "./AgentAvatar";
+import { AssistantAboutButton, AssistantActorProvider, AssistantFace, useConversationActor } from "../assistant/AssistantIdentity";
+import { displayName, scopeDescriptor } from "../assistant/identity";
 import HireProposalCard from "./HireProposalCard";
 import { addPending, loadThread, newMessageId, settlePending, threadItems, type ThreadItem, type ThreadState } from "../home/thread";
 import { useThreadStream } from "../app-shell/chat/conversationThread";
@@ -37,6 +38,10 @@ export default function RecruitChat({
   const t = useTranslate();
   const [conversation, setConversation] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const master = useQuery(resources.masterState);
+  // Reuse the proven operator-only recruitment gate; the write endpoint
+  // independently revalidates current owner authority and profile revision.
+  const actor = useConversationActor(master, hireBlock === null, conversation, null);
   useEffect(() => {
     if (hireBlock) return;
     let live = true;
@@ -50,15 +55,19 @@ export default function RecruitChat({
   }, [hireBlock]);
 
   return (
+    <AssistantActorProvider actor={actor}>
     <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
       <button type="button" className="rc-back" onClick={onBack}>
         ← {t("Agents")}
       </button>
       <div className="rc-head">
+        <AssistantFace size={32} />
         <div>
-          <h1>{t("Ask Master to recruit")}</h1>
-          <p>{t("Say what you need. Master picks a role; you still press Hire.")}</p>
+          <h1>{t("Recruit")}</h1>
+          <p data-assistant-name>{displayName(actor.read, actor.scope, t)}</p>
+          <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
         </div>
+        <AssistantAboutButton />
       </div>
       <HireGate reason={hireBlock} />
       {error && (
@@ -68,6 +77,7 @@ export default function RecruitChat({
       )}
       {conversation && !hireBlock && <Chat key={conversation} conversation={conversation} />}
     </main>
+    </AssistantActorProvider>
   );
 }
 
@@ -189,7 +199,7 @@ function Me({ text, children }: { text: string; children?: ReactNode }) {
 function Master({ children }: { children: ReactNode }) {
   return (
     <div className="msg">
-      <AgentAvatar slug="robot" size={32} still />
+      <AssistantFace size={32} />
       <div className="bub">{children}</div>
     </div>
   );

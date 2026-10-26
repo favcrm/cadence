@@ -1,8 +1,8 @@
-/** CAD-1817: the shared assistant-identity UI. One actor is bound to the
- *  pane it labels — the private assistant on the member surface, the
- *  workspace coordinator on Master/app panes — and every heading, sender
- *  row, composer label and About panel reads that actor, never a global
- *  translation or another user's profile.
+/** CAD-1817 / AOS-378: identity chrome for the pane's admitted actor.
+ *  Native Master panes retain the workspace coordinator; hosted panes use
+ *  their conversation-bound personal/workspace projection. Every heading,
+ *  sender, composer and About panel reads that actor, never a global
+ *  translation, Home's cached profile or another user's identity.
  *
  *  Editing stays inside existing authority: a personal avatar change is
  *  an ordinary explicit chat request (the model records `profile.look`
@@ -29,6 +29,7 @@ import { useTranslate } from "../../lib/locale";
 import { sessionKey } from "../../lib/sessionKey";
 import { privateSessionGeneration } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
+import { useQuery } from "../../lib/useResource";
 import type { MasterState } from "../../lib/types";
 import type { ResourceState } from "../../lib/cache";
 import Button from "../../ui/Button";
@@ -41,12 +42,13 @@ import {
   identityLook,
   messageLabel,
   messagePlaceholder,
-  readWorkspaceIdentity,
+  readConversationIdentity,
   scopeDescriptor,
   WORKSPACE_ALIAS,
   type AssistantScope,
   type AvatarLook,
   type IdentityRead,
+  type ConversationIdentityRead,
   type IdentityRecord,
 } from "./identity";
 import "./assistant-identity.css";
@@ -73,8 +75,8 @@ export type WorkspaceSaveResult =
   | { ok: false; error: string };
 
 export interface AssistantActorValue {
-  scope: AssistantScope;
-  /** The stable agent alias that anchors the unpinned avatar look. */
+  scope: AssistantScope | null;
+  /** Avatar fallback key only; it never chooses the actor's profile or scope. */
   alias: string;
   read: IdentityRead;
   personal: PersonalLookRequest | null;
@@ -87,7 +89,7 @@ export interface AssistantActorValue {
 /** Outside a provider (e.g. a human thread's bubbles) the historical
  *  generic role label stands; nothing claims a personal name there. */
 const FALLBACK_ACTOR: AssistantActorValue = {
-  scope: "personal",
+  scope: null,
   alias: "",
   read: { state: "unavailable" },
   personal: null,
@@ -104,37 +106,64 @@ export function useAssistantActor(): AssistantActorValue {
   return useContext(AssistantActorContext);
 }
 
-/** The workspace coordinator's identity projection plus the operator's
- *  guarded edit. The save's own response identity is shown until a state
- *  read reflects a different revision (this save or another operator's),
- *  so a save never flickers back to the pre-save name while the refresh
- *  is in flight, and a newer committed revision still wins. */
-export function useWorkspaceActor(master: ResourceState<MasterState>, canEdit: boolean): AssistantActorValue {
+/** The selected actor's committed identity. Native keeps its coordinator;
+ *  hosted panes read their own conversation projection, never Home's cache.
+ *  Personal avatar requests use the pane's existing send path. Only a proven
+ *  owner viewing the workspace actor gets the guarded workspace editor. */
+export function useConversationActor(
+  master: ResourceState<MasterState>,
+  canEdit: boolean,
+  conversation: string | null,
+  sendPersonalRequest: ((text: string) => Promise<void>) | null,
+): AssistantActorValue {
+  const hosted = master.data !== null && Object.hasOwn(master.data, "actor_identity");
+  const source = hosted && conversation !== null ? resources.masterConversation(conversation) : resources.masterState;
+  const current = useQuery(source);
+  const view: ConversationIdentityRead = current.status === "failed" || current.status === "stale"
+    ? { scope: null, read: { state: "unavailable" } }
+    : current.data !== null
+      ? readConversationIdentity(current.data, conversation)
+      : { scope: null, read: { state: "loading" } };
+  const live = view.read;
   const [saved, setSaved] = useState<{ identity: IdentityRecord; before: string; scope: string } | null>(null);
-  // A save may only be shown within the private session that made it: a
-  // user/workspace switch invalidates the overlay immediately, even if the
-  // resource still carries the previous principal's payload.
-  const scopeKey = `${sessionKey() ?? ""}:${privateSessionGeneration()}`;
+  const [pending, setPending] = useState<{ look: AvatarLook; scope: string } | null>(null);
+  const scopeKey = `${sessionKey() ?? ""}:${privateSessionGeneration()}:${conversation ?? ""}:${view.scope ?? ""}`;
   const scoped = saved !== null && saved.scope === scopeKey ? saved : null;
-  const live: IdentityRead =
-    master.data !== null
-      ? readWorkspaceIdentity(master.data)
-      : master.status === "failed"
-        ? { state: "unavailable" }
-        : { state: "loading" };
+  const liveCommitted = scoped !== null && live.state === "ready" && String(live.identity.revision) !== scoped.before;
+  const read: IdentityRead = scoped !== null && live.state === "ready" && !liveCommitted
+    ? { state: "ready", identity: scoped.identity }
+    : live;
 
-  const liveCommitted =
-    scoped !== null && live.state === "ready" && String(live.identity.revision) !== scoped.before;
   useEffect(() => {
     if (liveCommitted) setSaved(null);
   }, [liveCommitted]);
+  useEffect(() => {
+    if (pending?.scope === scopeKey && read.state === "ready" && read.identity.look === pending.look) setPending(null);
+  }, [pending, scopeKey, read]);
+  useEffect(() => {
+    if (!hosted || conversation === null) return;
+    const timer = window.setInterval(() => { void source.refresh(); }, 6000);
+    return () => window.clearInterval(timer);
+  }, [hosted, conversation, source]);
 
-  const read: IdentityRead =
-    scoped !== null && !liveCommitted ? { state: "ready", identity: scoped.identity } : live;
+  const requestLook = useCallback(async (look: AvatarLook) => {
+    if (view.scope !== "personal" || read.state !== "ready" || sendPersonalRequest === null) {
+      return { ok: false, error: "The saved assistant identity could not be read." };
+    }
+    if (read.identity.look === look) return { ok: true };
+    try {
+      await sendPersonalRequest(`Use the ${look} avatar for yourself.`);
+      setPending({ look, scope: scopeKey });
+      void source.refresh();
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }, [view.scope, read, sendPersonalRequest, scopeKey, source]);
 
   const save = useCallback(
     async (change: WorkspaceIdentityChange): Promise<WorkspaceSaveResult> => {
-      if (read.state !== "ready") {
+      if (view.scope !== "workspace" || !canEdit || read.state !== "ready") {
         return { ok: false, error: "The saved workspace identity could not be read." };
       }
       const before = change.expected_revision;
@@ -145,11 +174,10 @@ export function useWorkspaceActor(master: ResourceState<MasterState>, canEdit: b
           ...(change.tone !== undefined ? { tone: change.tone ?? "" } : {}),
           ...(change.look !== undefined ? { look: change.look } : {}),
         });
-        void resources.masterState.refresh();
+        void source.refresh();
+        if (source !== resources.masterState) void resources.masterState.refresh();
         try {
-          if (result.applies !== "next_turn") {
-            throw new Error("The saved workspace identity response was not recognized.");
-          }
+          if (result.applies !== "next_turn") throw new Error("The saved workspace identity response was not recognized.");
           const identity = decodeIdentity(result.identity, "workspace");
           setSaved({ identity, before, scope: scopeKey });
           return { ok: true, identity };
@@ -157,22 +185,23 @@ export function useWorkspaceActor(master: ResourceState<MasterState>, canEdit: b
           return { ok: false, error: String(error) };
         }
       } catch (error) {
-        // HTTP status alone cannot prove no effect across the file/store
-        // writes. Preserve the draft and reconcile from committed state.
-        void resources.masterState.refresh();
-        return {
-          ok: false,
-          error: error instanceof ApiError ? error.message : String(error),
-        };
+        // A failed response cannot prove rollback. Reconcile, never auto-replay.
+        void source.refresh();
+        return { ok: false, error: error instanceof ApiError ? error.message : String(error) };
       }
     },
-    [read, scopeKey],
+    [view.scope, canEdit, read, source, scopeKey],
   );
 
-  return useMemo<AssistantActorValue>(
-    () => ({ scope: "workspace", alias: WORKSPACE_ALIAS, read, personal: null, workspace: { canEdit, save } }),
-    [read, canEdit, save],
-  );
+  return useMemo<AssistantActorValue>(() => ({
+    scope: view.scope,
+    alias: view.scope === "workspace" ? WORKSPACE_ALIAS : view.scope === "personal" && read.state === "ready" ? (current.data?.alias ?? "assistant") : "",
+    read,
+    personal: view.scope === "personal" && sendPersonalRequest !== null && read.state === "ready"
+      ? { requestLook, pendingLook: pending?.scope === scopeKey ? pending.look : null }
+      : null,
+    workspace: view.scope === "workspace" ? { canEdit, save } : null,
+  }), [view.scope, current.data?.alias, read, sendPersonalRequest, requestLook, pending, scopeKey, canEdit, save]);
 }
 
 /** The actor's real avatar (the canonical AgentAvatar artwork). While the
@@ -233,7 +262,7 @@ export function AssistantAboutButton({ className = "" }: { className?: string })
   const t = useTranslate();
   const actor = useAssistantActor();
   const [open, setOpen] = useState(false);
-  const label = actor.scope === "workspace" ? t("About the workspace assistant") : t("About your assistant");
+  const label = actor.scope === null ? t("About the assistant") : actor.scope === "workspace" ? t("About the workspace assistant") : t("About your assistant");
   return (
     <>
       <button
@@ -268,7 +297,7 @@ function AssistantAboutDialog({ actor, onClose }: { actor: AssistantActorValue; 
   const openerRef = useRef<HTMLElement | null>(null);
   const read = actor.read;
   const identity = read.state === "ready" ? read.identity : null;
-  const title = actor.scope === "workspace" ? t("About the workspace assistant") : t("About your assistant");
+  const title = actor.scope === null ? t("About the assistant") : actor.scope === "workspace" ? t("About the workspace assistant") : t("About your assistant");
 
   useEffect(() => {
     openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -365,15 +394,15 @@ function AssistantAboutDialog({ actor, onClose }: { actor: AssistantActorValue; 
           </div>
           <div>
             <dt>{t("Belongs to")}</dt>
-            <dd>{actor.scope === "workspace" ? t("This workspace") : t("You")}</dd>
+            <dd>{actor.scope === null ? t("Unavailable") : actor.scope === "workspace" ? t("This workspace") : t("You")}</dd>
           </div>
         </dl>
 
         {actor.scope === "personal" ? (
           <PersonalIdentityDetails actor={actor} identity={identity} />
-        ) : (
+        ) : actor.scope === "workspace" ? (
           <WorkspaceIdentityDetails actor={actor} identity={identity} />
-        )}
+        ) : null}
       </aside>
     </div>,
     document.body,

@@ -587,12 +587,39 @@ pub struct MasterIdentity {
     pub revision: String,
 }
 
+/// A member's committed identity. Private address/preferences are never a UI projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct PersonalAssistantIdentity {
+    pub name: Option<String>,
+    pub tone: Option<String>,
+    pub look: AvatarLook,
+    pub revision: u64,
+}
+
+/// The actor actually serving a conversation, independent of its transport alias.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(tag = "scope", rename_all = "lowercase")]
+pub enum ActorIdentity {
+    Personal {
+        conversation_id: String,
+        identity: PersonalAssistantIdentity,
+    },
+    Workspace {
+        conversation_id: String,
+        identity: MasterIdentity,
+    },
+}
+
 /// `master_state` (daemon RPC; `GET /api/master/state` relays it): what the
 /// master header shows. A member's copy drops the turn's `summary`.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct MasterState {
     pub alias: String,
     pub identity: MasterIdentity,
+    /// Hosted conversations may be personal even when the transport alias is `master`.
+    /// An absent projection retains the native workspace-coordinator contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_identity: Option<ActorIdentity>,
     pub provider: String,
     pub endpoint_kind: String,
     pub live: bool,

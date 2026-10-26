@@ -37,7 +37,22 @@ export function useThreadStream(
     const sub = streamInto(store, (data, event) => {
       if (event.type === "master") {
         const snapshot = JSON.parse(event.data) as MasterState;
-        resources.masterState.write(() => snapshot);
+        if (Object.hasOwn(snapshot, "actor_identity")) {
+          const conversation = snapshot.actor_identity?.conversation_id;
+          if (typeof conversation !== "string" || conversation === "" || conversation !== data?.conversation) {
+            onLink("reconnecting");
+            return data ?? EMPTY_THREAD;
+          }
+          // A connection snapshot can arrive after a newer identity GET.
+          // Reconcile through the canonical reader instead of rolling back
+          // its opaque revision with an older streamed profile.
+          void resources.masterConversation(conversation).refresh();
+          if (resources.masterThread.get().data?.conversation === conversation) {
+            resources.masterState.write(() => snapshot);
+          }
+        } else {
+          resources.masterState.write(() => snapshot);
+        }
         onSnapshot?.();
         onLink("live");
         return data ?? EMPTY_THREAD;

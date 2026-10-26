@@ -223,6 +223,7 @@ impl Shared {
         Ok(serde_json::to_value(MasterState {
             alias: alias.to_string(),
             identity: self.master_identity()?,
+            actor_identity: None,
             provider: agent.provider.clone(),
             endpoint_kind: agent.endpoint_kind.clone(),
             live,

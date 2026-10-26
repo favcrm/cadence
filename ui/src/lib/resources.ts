@@ -198,6 +198,10 @@ export const resources = {
    * it when `agents` moves and after a `masterCommand`.
    */
   masterState: cache.resource<MasterState>("master", () => api.masterState()),
+  /** Hosted identity/status for one server-selected conversation, never Home's cached actor. */
+  masterConversation: cache.family<string, MasterState>("masterConversation", (id) => api.masterState(id), {
+    discardOnError: unavailablePrivateRecord,
+  }),
   /** `GET /api/issues/<id>` — one drawer's detail (and a plan card's epic). */
   issue: cache.family<string, IssueDetail>("issue", (id) => api.issue(id), (id) => ({
     discardOnError: unavailablePrivateRecord,

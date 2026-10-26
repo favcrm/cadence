@@ -1120,7 +1120,8 @@ export const api = {
     get<Record<string, unknown>>(`/api/master/summary?since=${Math.floor(since)}`),
   /** `GET /api/master/state` — session chips + in-flight turn (CAD-551);
    *  501 on a daemon that predates it. */
-  masterState: () => get<MasterState>("/api/master/state"),
+  masterState: (conversation?: string) =>
+    get<MasterState>(conversation === undefined ? "/api/master/state" : `/api/master/state?conversation=${encodeURIComponent(conversation)}`),
   /** `POST /api/master/identity` (CAD-1817) — the proven operator edits
    *  the workspace coordinator's name/personality/avatar. The response is
    *  the committed identity plus when it applies; the UI never assumes a

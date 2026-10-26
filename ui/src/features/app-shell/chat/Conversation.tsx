@@ -94,7 +94,7 @@ import {
   AssistantAboutButton,
   AssistantActorProvider,
   AssistantFace,
-  useWorkspaceActor,
+  useConversationActor,
 } from "../../assistant/AssistantIdentity";
 import { displayName, messageLabel, messagePlaceholder, scopeDescriptor } from "../../assistant/identity";
 import { carriesSecret, hideIds, matchDirective, type Directive } from "./directive";
@@ -495,16 +495,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const convId = active.state === "ready" ? (active.selected?.id ?? null) : null;
   const thread = useResource(store);
   const masterState = useQuery(resources.masterState);
-  // CAD-1817: this pane's actor is the workspace coordinator. The owner's
-  // private profile never labels a Master-backed app conversation.
-  const workspaceActor = useWorkspaceActor(masterState, viewer.operator === true && !viewer.readOnly);
-  const composerLabels = useMemo(
-    () => ({
-      placeholder: messagePlaceholder(workspaceActor.read, "workspace", t),
-      ariaLabel: messageLabel(workspaceActor.read, "workspace", t),
-    }),
-    [workspaceActor.read, t],
-  );
   const homeThread = useResource(resources.masterThread);
   // One draft per conversation: the composer remounts per store, so
   // switching conversations keeps each one's typed text (the stores and
@@ -1416,6 +1406,20 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     return Promise.resolve();
   };
 
+  const actor = useConversationActor(
+    masterState,
+    viewer.operator === true && !viewer.readOnly,
+    convId,
+    canSend && convId !== null ? (text) => send(text, []) : null,
+  );
+  const composerLabels = useMemo(
+    () => ({
+      placeholder: messagePlaceholder(actor.read, actor.scope, t),
+      ariaLabel: messageLabel(actor.read, actor.scope, t),
+    }),
+    [actor.read, actor.scope, t],
+  );
+
   /** Retry one failed submitted envelope: the same message id, body,
    *  refs, file ids and captured destination — never the current draft
    *  or route. */
@@ -1552,7 +1556,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           : null;
 
   return (
-    <AssistantActorProvider actor={workspaceActor}>
+    <AssistantActorProvider actor={actor}>
     <div className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
       <button
         type="button"
@@ -1568,14 +1572,14 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       <div className="app-chat-head">
         <div
           className="app-chat-title min-w-0"
-          data-assistant-identity="workspace"
-          data-identity-state={workspaceActor.read.state}
+          data-assistant-identity={actor.scope ?? undefined}
+          data-identity-state={actor.read.state}
         >
           <AssistantFace size={20} />
           <div className="assistant-heading-text">
             <div className="flex min-w-0 items-baseline gap-2">
-              <strong className="truncate" title={`${displayName(workspaceActor.read, "workspace", t)} — ${scopeDescriptor("workspace", t)}`} data-assistant-name>
-                {displayName(workspaceActor.read, "workspace", t)}
+              <strong className="truncate" title={`${displayName(actor.read, actor.scope, t)} — ${scopeDescriptor(actor.scope, t)}`} data-assistant-name>
+                {displayName(actor.read, actor.scope, t)}
               </strong>
               {(convLabel !== null || streamDown) && (
                 <span
@@ -1587,7 +1591,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                 </span>
               )}
             </div>
-            <span className="assistant-scope truncate">{scopeDescriptor("workspace", t)}</span>
+            <span className="assistant-scope truncate">{scopeDescriptor(actor.scope, t)}</span>
           </div>
         </div>
         <div className="app-chat-head-tools" role="toolbar" aria-label={t("Assistant tools")}>

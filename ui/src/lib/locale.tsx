@@ -1524,9 +1524,12 @@ Object.assign(zhTW, {
 Object.assign(zhTW, {
   "Workspace assistant": "工作區助理",
   "Personal assistant · private to you": "你的私人助理 · 僅你可見",
-  "Workspace assistant · shared with this workspace": "工作區助理 · 與此工作區共用身分",
+  "Workspace coordinator · workspace-owned": "工作區協調助理 · 屬於工作區",
   "About your assistant": "關於你的助理",
   "About the workspace assistant": "關於工作區助理",
+  "About the assistant": "關於助理",
+  "Ask": "詢問",
+  "Recruit": "招募",
   "Close assistant details": "關閉助理資料",
   "Display name": "顯示名稱",
   "Personality": "個性與溝通風格",
