@@ -64,7 +64,16 @@ export interface ResourceOptions<T> {
 
 function message(e: unknown): string {
   if (e && typeof e === "object" && "message" in e) {
-    return String((e as { message: unknown }).message);
+    const detail = e.message;
+    if (typeof detail === "string" && detail !== "") return detail;
+    // A server refusal can carry its reason one level down, as
+    // `{ error: { code, message } }`. Reach it rather than stringifying
+    // the object — "[object Object]" says nothing about what refused.
+    if (detail !== null && typeof detail === "object" && "message" in detail) {
+      const nested = detail.message;
+      if (typeof nested === "string" && nested !== "") return nested;
+    }
+    return "request failed";
   }
   return String(e);
 }

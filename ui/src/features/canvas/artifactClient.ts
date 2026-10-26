@@ -1,4 +1,4 @@
-import { ApiError } from "../../lib/apiError";
+import { ApiError, errorMessage } from "../../lib/apiError";
 import { sessionHeaders } from "../../lib/sessionKey";
 import { privateFetch, usingPrivateOperation } from "../../lib/privateSession";
 
@@ -17,7 +17,7 @@ export function artifactBytes(
     const resp = await privateFetch(url, { headers: sessionHeaders(), signal }, op);
     if (!resp.ok) {
       const body = await resp.json().catch(() => null);
-      throw new ApiError(typeof body?.error === "string" ? body.error : `${resp.status} ${resp.statusText}`, resp.status);
+      throw new ApiError(errorMessage(body, `${resp.status} ${resp.statusText}`), resp.status);
     }
     const bytes = await resp.arrayBuffer();
     op.assertCurrent();

@@ -1,4 +1,5 @@
 import { ApiError } from "../../lib/api";
+import { errorMessage } from "../../lib/apiError";
 import { hostErrorText } from "./shared/hostErrors";
 import { sessionHeaders } from "../../lib/sessionKey";
 import { privateFetch, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
@@ -76,13 +77,7 @@ async function post<T>(path: string, body: Record<string, unknown>, operation?: 
     const value = await resp.json().catch(() => null);
     op.assertCurrent();
     if (!resp.ok) {
-      const serverError = (value as { error?: unknown } | null)?.error;
-      throw new ApiError(
-        typeof serverError === "string" && serverError !== ""
-          ? serverError
-          : `${resp.status} ${resp.statusText}`.trim(),
-        resp.status,
-      );
+      throw new ApiError(errorMessage(value, `${resp.status} ${resp.statusText}`.trim()), resp.status);
     }
     if (value === null) throw new ApiError("The server returned an invalid send receipt", 502);
     return value as T;
@@ -99,13 +94,7 @@ async function get<T>(path: string, operation?: PrivateOperation): Promise<T> {
     const value = await resp.json().catch(() => null);
     op.assertCurrent();
     if (!resp.ok) {
-      const serverError = (value as { error?: unknown } | null)?.error;
-      throw new ApiError(
-        typeof serverError === "string" && serverError !== ""
-          ? serverError
-          : `${resp.status} ${resp.statusText}`.trim(),
-        resp.status,
-      );
+      throw new ApiError(errorMessage(value, `${resp.status} ${resp.statusText}`.trim()), resp.status);
     }
     if (value === null) throw new ApiError("The server returned an invalid send receipt", 502);
     return value as T;

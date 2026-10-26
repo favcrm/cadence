@@ -1,3 +1,4 @@
+import { errorMessage } from "../../lib/apiError";
 import { sessionHeaders } from "../../lib/sessionKey";
 import { privateFetch, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 
@@ -151,7 +152,7 @@ async function write<T>(url: string, body: unknown, operation?: PrivateOperation
 async function answer<T>(resp: Response): Promise<T> {
   const body = await resp.json().catch(() => null);
   if (!resp.ok) {
-    const message = typeof body?.error === "string" ? body.error : `${resp.status} ${resp.statusText}`;
+    const message = errorMessage(body, `${resp.status} ${resp.statusText}`);
     throw new TemplateError(message, resp.status);
   }
   return body as T;

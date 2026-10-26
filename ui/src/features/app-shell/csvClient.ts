@@ -1,4 +1,5 @@
 import { ApiError } from "../../lib/api";
+import { errorMessage } from "../../lib/apiError";
 import { sessionHeaders } from "../../lib/sessionKey";
 import { privateFetch, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import { assertCleanBody, assertScope, listPath, type HostScope } from "./hostActions";
@@ -215,7 +216,7 @@ async function post<T>(path: string, body: Record<string, unknown>, operation?: 
     const value = await response.json().catch(() => null);
     op.assertCurrent();
     if (!response.ok) {
-      throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status);
+      throw new ApiError(errorMessage(value, `${response.status} ${response.statusText}`), response.status);
     }
     if (value === null) throw new ApiError("The server returned an invalid CSV receipt", 502);
     return value as T;
