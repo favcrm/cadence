@@ -1,6 +1,6 @@
 [package]
 name = "cadence-agent"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 # CAD-1727: `tests/*.rs` are modules of the one `suite` target below, not
 # one linked executable each. 109 executables cost 15.74 GiB per lane and
