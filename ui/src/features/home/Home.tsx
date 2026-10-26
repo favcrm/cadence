@@ -39,7 +39,7 @@ import { turnBarState } from "../app-shell/chat/turnBarState";
 import { useConversationDestination } from "../app-shell/chat/conversationNavigation";
 import MemberChat from "./MemberChat";
 import { memberScope } from "./memberThread";
-import { StreamBanner, time } from "./ThreadView";
+import { StreamBanner, ThreadTurn, time } from "./ThreadView";
 import {
   initialFollow,
   motionBehavior,
@@ -507,11 +507,6 @@ const ThreadList = memo(function ThreadList({
         activity={(item) => {
           if (!working || activityItem === null || item.key !== activityItem.key) return null;
           const live = <AssistantActivity since={working.since} />;
-          // The anchored row shows this turn's own newest entry time. A
-          // fallback row rides the tail item, which may belong to an
-          // EARLIER turn (a stale or failed reply), so it is stamped with
-          // the running turn's start — never with that foreign time
-          // (CAD-1533 review, finding 1).
           const at =
             anchorItem !== null
               ? anchorEntry
@@ -523,17 +518,17 @@ const ThreadList = memo(function ThreadList({
           // The answer bubble carries the indicator on its own name row;
           // a standalone row covers in-flight steps/commentary that have
           // none of their own, and the running turn when the row it would
-          // anchor to is another turn's reply (CAD-1533). A row that IS
-          // this turn's own — the operator's just-sent message, or the
-          // reply itself — keeps the indicator below it.
+          // anchor to is another turn's reply (CAD-1533). A turn with no
+          // stored entry yet has nothing to anchor to, so it shows the
+          // inline typing bubble after the operator's own message instead.
           if (item.type === "answer" && anchorItem !== null) return { kind: "header", node: live };
           const below = item.type === "operator" || item.type === "pending" || item.type === "answer";
+          const needsTypingTurn =
+            anchorItem === null || item.type === "operator" || item.type === "pending";
           return {
             kind: "row",
-            node: <AssistantNameRow at={at} live={live} />,
+            node: needsTypingTurn ? <ThreadTurn items={[]} running /> : <AssistantNameRow at={at} live={live} />,
             position: below ? "after" : "before",
-            // A fallback row rides an EARLIER item; the run it lands in
-            // keeps the flat rendering so the row is not folded away.
             ...(anchorItem === null ? { fallback: true as const } : {}),
           };
         }}
@@ -791,10 +786,16 @@ function MasterHome({
   // row has no stored entry yet, so its row is the anchor while it
   // waits). Once the terminal `turn_result` lands the daemon flips
   // `turn.state` off working and the indicator clears with the reply.
+  // The inline typing bubble starts the moment the send begins: `submitting`
+  // is the composer's own POST in flight (no stored entry to anchor on yet),
+  // `working` the daemon's verified turn. A queued wait keeps the dock's
+  // honest "behind a turn" line instead of claiming to type.
   const workingActivity =
     turn.kind === "working"
       ? { message: turn.message, since: typeof turn.since === "number" ? turn.since : null }
-      : null;
+      : turn.kind === "submitting"
+        ? { message: "", since: null }
+        : null;
   // The ResizeObserver re-subscribes when the name-row indicator appears
   // or clears (its content lives inside the observed list): a running
   // turn with any row to ride, whether it anchors to its own entry or

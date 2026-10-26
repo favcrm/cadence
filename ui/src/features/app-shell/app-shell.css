@@ -382,7 +382,7 @@
 
 .app-chat-list {
   display: grid;
-  gap: 0.5rem;
+  gap: 0.875rem;
   flex: 1;
   min-height: 0;
   max-height: none;
@@ -391,6 +391,11 @@
   list-style: none;
   margin: 0;
   padding: 0;
+}
+.app-chat-list .chat-bubble:not([data-chat-message="user"] .chat-bubble),
+.app-chat-list .answer,
+.app-chat-list .typing {
+  background: var(--color-ink-875);
 }
 
 .app-chat-form {

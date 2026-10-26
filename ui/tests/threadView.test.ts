@@ -283,6 +283,9 @@ for (const density of ["full", "compact"] as const) {
   // The answer: Markdown through Md, not the raw text.
   ok(count(complete, 'data-kind="answer"') === 1, "turn: one answer surface");
   ok(complete.includes("<strong>One</strong>"), "turn: answer Markdown bold");
+  ok(!complete.includes("answer-kicker"), "turn: no redundant Answer kicker bar");
+  ok(complete.includes("turn-copy") && complete.includes(">Copy<"), "turn: Copy action remains available in the head");
+  ok(count(complete, "answer-copy") === 0, "turn: the answer surface carries no copy chrome over its text");
   ok(complete.includes("<table>") && complete.includes(">PILOT-1<"), "turn: answer Markdown table");
   ok(!complete.includes("| id | title |"), "turn: no literal Markdown pipes");
   // Artifacts come after the answer, still the existing card.
@@ -302,6 +305,9 @@ for (const density of ["full", "compact"] as const) {
   ok(!running.includes('data-kind="answer"'), "streaming: no answer body");
   ok(!running.toLowerCase().includes("skeleton"), "streaming: no skeleton");
   ok(!running.includes("data-assistant-activity") && !running.includes("Working"), "streaming: no status chip");
+  const initialTyping = renderTurn([], true);
+  ok(initialTyping.includes('data-turn-state="running"') && count(initialTyping, 'data-kind="typing"') === 1, "streaming: initial 0-step turn shows typing bubble immediately");
+  ok(!initialTyping.includes('data-kind="no-answer"') && !initialTyping.includes('data-kind="turn-trace"'), "streaming: initial 0-step turn has no trace or no-answer line");
 
   // A transcript from before `turn_result`: the last worker note reads as the
   // reply, with the quiet earlier-transcript marker.

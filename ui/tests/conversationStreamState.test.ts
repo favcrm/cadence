@@ -57,6 +57,20 @@ function Harness() {
   }));
 }
 function assert(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason); }
+// A finished turn unmounts the bar: `done` is not a state the operator needs
+// a lingering row for, and a 3 s banner sat over the composer's own space.
+{
+  const { renderToStaticMarkup } = require<typeof import("react-dom/server")>("react-dom/server");
+  const bar = (state: Parameters<typeof TurnBar>[0]["state"], reconnecting = false) =>
+    renderToStaticMarkup(React.createElement(TurnBar, {
+      state, since: null, reconnecting,
+      actions: { onStop: () => undefined, onCancel: () => undefined, onReview: () => undefined },
+    }));
+  assert(bar({ kind: "done", seconds: 6 }) === "", "a finished turn unmounts the bar instead of lingering");
+  assert(bar({ kind: "idle" }) === "", "an idle conversation has no bar");
+  assert(bar({ kind: "working", step: "planning", since: 1000, stopMessage: "m-1" }).includes('data-state="working"'), "a working turn still paints its bar");
+  assert(bar({ kind: "working", step: "planning", since: 1000, stopMessage: "m-1" }, true).includes('data-stale="true"'), "a reconnect marks the bar stale");
+}
 async function main() {
   const unthreaded = snapshot("m-unthreaded");
   unthreaded.turn!.conversation = null;
