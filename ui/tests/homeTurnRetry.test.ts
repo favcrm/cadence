@@ -95,6 +95,38 @@ async function main() {
   });
   await settle();
   assert(!Array.from(host.querySelectorAll("[data-turn-bar] button")).some((button) => button.textContent === "Retry"), "read-only Home cannot retry a stored failure");
+
+  // CAD-1859: a send that has not reached the daemon yet still shows the
+  // inline typing bubble. `submitting` carries no message id, so the bubble
+  // rides the operator's own row rather than a stored entry of this turn.
+  await render(false);
+  await React.act(async () => {
+    resources.masterState.write(() => ({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
+    resources.masterThread.write((state) => ({
+      ...state!,
+      pending: [{ message: "ui-submitting", text: "While the POST is in flight", state: "sending", at: 2 }],
+    }));
+  });
+  await settle();
+  const typingRows = Array.from(host.querySelectorAll('[data-kind="typing"]')) as HTMLElement[];
+  assert(typingRows.length === 1, `a submitting turn shows exactly one inline typing bubble (got ${typingRows.length})`);
+  const typingTurn = typingRows[0].closest('li, [data-kit="turn"]') as HTMLElement | null;
+  assert(typingTurn !== null && typingTurn.textContent?.includes("Assistant"), "the typing bubble paints as an assistant turn, not a status bar");
+  assert(
+    host.querySelector('[data-turn-bar][data-state="sending"]') !== null,
+    "the dock bar reports the send as sending, not as a working banner",
+  );
+  assert(host.querySelector('[data-turn-bar] [aria-label="Stop this turn"]') === null, "nothing is stoppable before the daemon runs the turn");
+  const listItems = Array.from(host.querySelectorAll("ol[role='log'] > li")) as HTMLElement[];
+  const typingIndex = listItems.findIndex((row) => row.contains(typingRows[0]));
+  const operatorIndex = listItems.findIndex((row) => row.querySelector('[data-chat-message="user"]'));
+  assert(typingIndex === listItems.length - 1 && operatorIndex >= 0 && typingIndex > operatorIndex, "the typing bubble trails the operator's message");
+  await React.act(async () => {
+    resources.masterThread.write((state) => ({ ...state!, pending: [] }));
+  });
+  await settle();
+  assert(host.querySelectorAll('[data-kind="typing"]').length === 0, "the typing bubble clears once the send settles out of submitting");
+
   await React.act(async () => { root.unmount(); });
   await win.happyDOM.close();
   console.log("Home turn Retry checks passed");

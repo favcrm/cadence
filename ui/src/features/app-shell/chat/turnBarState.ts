@@ -10,8 +10,7 @@ export type TurnBarState =
   | { kind: "writing"; since: number | null; stopMessage: string | null }
   | { kind: "approval" }
   | { kind: "failed"; reason: string; message: string | null }
-  | { kind: "stopped" }
-  | { kind: "done"; seconds: number | null };
+  | { kind: "stopped" };
 
 export interface TurnBarInput {
   master: MasterState | null | undefined;
@@ -94,14 +93,16 @@ export function turnBarState(input: TurnBarInput, conversationId: string | null)
   if (pendingMessages.length > 0) return { kind: "sending" };
 
   // A finished turn shows only when its result arrived while this surface
-  // was open: a reload does not replay the last historic outcome.
+  // was open: a reload does not replay the last historic outcome. A
+  // successful finish carries no state of its own — the reply is the
+  // completion signal — so it reads as idle; failures and interruptions
+  // still need saying.
   const last = entries.at(-1);
   const arrived = last?.created ? Date.parse(last.created) : NaN;
   if (last && last.kind === "turn_result" && !(arrived < (input.liveSince ?? 0))) {
     const reason = turnFailureReason(last);
     if (reason !== null) return { kind: "failed", reason, message: last.message ?? null };
     if (last.payload?.status === "interrupted" || last.payload?.status === "stopped") return { kind: "stopped" };
-    return { kind: "done", seconds: turnDuration(entries, last) };
   }
   return { kind: "idle" };
 }
@@ -134,11 +135,3 @@ export function aheadLabel(
   return name?.(conversation) ?? "another conversation";
 }
 
-/** Seconds from the turn's operator message to its `turn_result`, or null. */
-function turnDuration(entries: ThreadEntry[], result: ThreadEntry): number | null {
-  const start = entries.find((e) => e.message === result.message && e.role === "operator");
-  const a = start?.created ? Date.parse(start.created) : NaN;
-  const b = result.created ? Date.parse(result.created) : NaN;
-  if (Number.isNaN(a) || Number.isNaN(b)) return null;
-  return Math.max(0, Math.round((b - a) / 1000));
-}

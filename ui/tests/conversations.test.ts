@@ -309,6 +309,26 @@ await pick("Spring launch");
   await settle();
   equal(bar()?.dataset.state, "working", "the owned running turn shows Working after a master frame");
   assert(bar()!.textContent!.includes("customers.search"), "Working names the live step");
+  // CAD-1859: the app pane paints the same inline typing bubble as Home, at
+  // the tail of its own list, and takes it away when the turn stops working.
+  const typingRows = Array.from(host.querySelectorAll(".app-chat-list [data-chat-typing]")) as HTMLElement[];
+  assert(typingRows.length === 1, `a working turn appends exactly one typing row (got ${typingRows.length})`);
+  assert(typingRows[0].querySelector('[data-kind="typing"]') !== null, "the appended row is the assistant typing bubble");
+  const paneRows = Array.from(host.querySelectorAll(".app-chat-list > li")) as HTMLElement[];
+  assert(paneRows.length > 0 && paneRows[paneRows.length - 1] === typingRows[0], "the typing row is the last row in the pane");
+  // The store state the daemon's own operator entry produces: the optimistic
+  // row retires, so nothing is left sending or working for this pane.
+  turn = null;
+  await React.act(async () => {
+    const held = conversationThread("c-camp").get().data;
+    if (held) conversationThread("c-camp").write(() => ({ ...held, pending: [] }));
+    await resources.masterState.refresh();
+  });
+  await settle();
+  assert(host.querySelectorAll(".app-chat-list [data-chat-typing]").length === 0, "a settled turn leaves no typing row behind");
+  turn = { state: "working", message: sentMessage, conversation: "c-camp", summary: "customers.search" };
+  await React.act(async () => { await resources.masterState.invalidate(); });
+  await settle();
   operations = [{
     id: "op-tags", action_id: "customer.tags.update", status: "pending_permission", revision: 1,
     summary: "Tag the selected customer", resource_refs: [],
