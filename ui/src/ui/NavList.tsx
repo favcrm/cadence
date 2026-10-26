@@ -5,7 +5,7 @@ import type { AppNav } from "../features/app-shell/appNav";
 import { updateSidebarPrefs, useSidebarPrefs } from "../features/app-shell/sidebarPrefs";
 import { prefetchWorkspaceApp } from "../features/workspace-apps/workspaceApps";
 import { navMatches } from "../features/issues/model";
-import { NAV, type Route, type Screen } from "../lib/router";
+import { navItems, type Route, type Screen } from "../lib/router";
 import type { IssueCard, Project } from "../lib/types";
 import Link from "./Link";
 import { IconAgents, IconApps, IconCaret, IconHome, IconMyWork, IconOutbox, IconPin, IconProjects, IconSettings, IconWiki, IconThreads } from "./icons";
@@ -56,12 +56,15 @@ interface NavListProps {
   onNavigate?: () => void;
   /** Pending To do items for the Home row's badge (CAD-1216); hidden at 0 or unknown. */
   homeCount?: number;
+  /** A hosted tenant does not serve the wiki; do not advertise it there. */
+  hosted?: boolean;
 }
 
 /** The one nav row list: the desktop sidebar and the phone menu both
  *  render it, so there is a single row style. */
-export function NavList({ screen, navHref, appMenu = null, label = "Primary", onNavigate, homeCount = 0 }: NavListProps) {
+export function NavList({ screen, navHref, appMenu = null, label = "Primary", onNavigate, homeCount = 0, hosted = false }: NavListProps) {
   const { t } = useLocale();
+  const items = navItems(hosted);
   const prefs = useSidebarPrefs();
   const foldId = useId();
   // CAD-1700: a quiet dot where an assistant reply waits unseen.
@@ -70,7 +73,7 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
   const currentApp = apps.find((a) => a.current) ?? null;
   return (
     <nav className="grid gap-[2px]" aria-label={t(label)}>
-      {NAV.map((item) => {
+      {items.map((item) => {
         const here = navMatches(screen, item.screen);
         if (item.screen !== "apps" || apps.length === 0) {
           return (

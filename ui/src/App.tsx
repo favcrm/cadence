@@ -52,6 +52,7 @@ import { NavList, ProjectsSection } from "./ui/NavList";
 import Wiki from "./features/wiki/Wiki";
 import Link from "./ui/Link";
 import ProjectFilter from "./ui/ProjectFilter";
+import PageState from "./ui/PageState";
 import SectionTabs from "./ui/SectionTabs";
 import StatusChips from "./ui/StatusChips";
 import AccountMenu from "./ui/AccountMenu";
@@ -968,6 +969,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       }`}
     >
       <Sidebar
+        hosted={meta?.hosted === true}
         screen={screen === "workspaceApp" || screen === "workspaceAppKey" ? "apps" : screen}
         navHref={hrefFor}
         appMenu={appMenu}
@@ -1062,6 +1064,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
         {menuOpen && (
           <div id="mobile-navigation" className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
             <NavList
+              hosted={meta?.hosted === true}
               screen={screen === "workspaceApp" || screen === "workspaceAppKey" ? "apps" : screen}
               navHref={hrefFor}
               appMenu={appMenu}
@@ -1343,13 +1346,22 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           />
         )}
         {route.screen === "wiki" && (
-          <Wiki
-            route={route}
-            navHref={hrefFor}
-            readOnly={readOnly || meta === null}
-            actor={actor}
-            onToast={say}
-          />
+          meta?.hosted === true ? (
+            <PageState
+              title={t("The wiki isn’t available on this board.")}
+              actions={<Link href={hrefFor({ screen: "home" })}>{t("Back to Home")}</Link>}
+            >
+              {t("This board carries the tracker, apps and the assistant.")}
+            </PageState>
+          ) : (
+            <Wiki
+              route={route}
+              navHref={hrefFor}
+              readOnly={readOnly || meta === null}
+              actor={actor}
+              onToast={say}
+            />
+          )
         )}
         {route.screen === "threads" && (
           <ThreadsPage

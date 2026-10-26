@@ -95,6 +95,15 @@ export const NAV: { screen: Screen; label: string; route: Route }[] = [
 ];
 
 /**
+ * The nav a board carries. A hosted tenant does not serve the wiki (the shared
+ * UI's requests answer 501), so it is not advertised there; a local board keeps
+ * it. The route still explains itself if reached by a deep link.
+ */
+export function navItems(hosted: boolean): typeof NAV {
+  return hosted ? NAV.filter((item) => item.screen !== "wiki") : NAV;
+}
+
+/**
  * Where a project lives on a screen. The in-page chip row and the memory
  * picker read this. The sidebar and the phone menu do not: their highlight
  * is `route.screen === "projects"` (`navProject` in App.tsx).
