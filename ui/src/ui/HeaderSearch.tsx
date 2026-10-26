@@ -338,7 +338,9 @@ export default function HeaderSearch({
 
             {!trimmed ? (
               <p className="header-search-guide text-label text-ink-400">
-                {t("Type an issue ID, title word, owner or tag. Knowledge comes from the Wiki. Issue search covers card fields only, not descriptions or comments.")}
+                {hosted
+                  ? t("Type an issue ID, title word, owner or tag. Issue search covers card fields only, not descriptions or comments.")
+                  : t("Type an issue ID, title word, owner or tag. Knowledge comes from the Wiki. Issue search covers card fields only, not descriptions or comments.")}
               </p>
             ) : (
               <div id="header-search-results" className="header-search-results">
