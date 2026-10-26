@@ -142,15 +142,24 @@ impl Shared {
                                 issue,
                                 std::path::Path::new(&job.spec_path),
                                 false,
-                            )?
+                            )
                         }
-                        _ => None,
+                        _ => Ok(None),
                     };
-                    if canonical_digest.as_deref() != Some(sha.as_str()) {
-                        jj["attention"] = json!(
-                            "spec changed since `job new` — \
-                            re-create the job if the drift is real work"
-                        );
+                    match canonical_digest {
+                        Ok(Some(now)) if now == *sha => {}
+                        Ok(_) => {
+                            jj["attention"] = json!(
+                                "spec changed since `job new` — \
+                                re-create the job if the drift is real work"
+                            );
+                        }
+                        Err(error) => {
+                            jj["attention"] = json!(format!(
+                                "spec {} is unavailable for drift inspection: {error}",
+                                job.spec_path
+                            ));
+                        }
                     }
                 }
                 None => {
