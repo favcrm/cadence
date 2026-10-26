@@ -15,6 +15,13 @@ pub mod agenticos_web;
 pub mod connections;
 pub mod custody;
 pub mod deployments;
+pub(crate) mod encrypted_config;
+mod encrypted_fs;
+pub(crate) use encrypted_fs::Directories as ControlledDirectories;
+/// CAD-1128: the encrypted-SQLite custody vault. `pub(crate)` — the
+/// manager and its key material are daemon-internal; no public
+/// platform/custody re-export exposes them.
+pub(crate) mod encrypted_sqlite;
 pub mod hosted_email;
 pub mod hosted_whatsapp;
 pub mod local;
@@ -146,7 +153,9 @@ pub struct AppCapabilityAsset {
 use crate::error::{Error, Result};
 use crate::store::{Grant, Store};
 
-pub use custody::{Custody, Key};
+pub(crate) use custody::{Custody, Key};
+
+pub(crate) use crate::daemon::custody_rpc::CustodyWitness;
 
 pub struct OpDeadline {
     end: std::time::Instant,
@@ -676,7 +685,9 @@ pub(crate) fn credential_enrollment_missing(err: &Error) -> bool {
     )
 }
 
-pub fn load_credential(
+/// Refuses encrypted custody records. Supported consumers require a fresh
+/// `CustodyWitness` and `load_credential_witnessed`.
+pub(crate) fn load_credential(
     store: &Store,
     custody: &Custody,
     platform: &str,
@@ -705,6 +716,29 @@ pub fn load_credential(
     Ok(bytes)
 }
 
+/// The witnessed encrypted read — the ONLY way an encrypted record's
+/// bytes leave custody. `expected` carries the live core identity the
+/// caller resolved (connection_id/provider/account/revision/exchange
+/// plus the workspace and the configured key id); `read_exact`
+/// authenticates the stored row against exactly that before any
+/// plaintext returns. The core fingerprint is still checked after
+/// decrypt, so a torn vault/core pair refuses.
+pub(crate) fn load_credential_witnessed(
+    store: &Store,
+    custody: &Custody,
+    witness: &CustodyWitness<'_>,
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    witness.validate(store)?;
+    let bytes = custody.load_encrypted(witness)?;
+    if crate::secret::fingerprint(&bytes) != witness.record().fingerprint {
+        return Err(Error::invalid(
+            "integrity_failure",
+            "custody fingerprint mismatch",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Belt-and-braces: a serialized result, event payload or error text
 /// must never contain `secret` or a fragment of eight or more characters.
 /// Callers check before the value leaves
@@ -712,17 +746,87 @@ pub fn load_credential(
 /// names only where the leak would have surfaced.
 pub fn refuse_leak(what: &str, text: &str, secret: &[u8]) -> Result<()> {
     let secret = String::from_utf8_lossy(secret);
-    let characters: Vec<_> = secret.chars().collect();
-    let carries_secret = !secret.is_empty() && text.contains(secret.as_ref());
-    let carries_fragment = characters
-        .windows(8)
-        .any(|fragment| text.contains(&fragment.iter().collect::<String>()));
-    if carries_secret || carries_fragment {
+    if carries_credential(&secret, text) {
         return Err(Error::internal(format!(
             "{what} would carry the enrolled credential — withheld"
         )));
     }
     Ok(())
+}
+
+/// `true` when `text` carries the whole secret or any eight-character
+/// window of it. Windows are borrowed slices of `secret`, so a long
+/// credential costs no per-fragment allocation; both byte ends come
+/// from `char_indices`, so multi-byte characters stay intact.
+fn carries_credential(secret: &str, text: &str) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    if text.contains(secret) {
+        return true;
+    }
+    secret
+        .char_indices()
+        .zip(secret.char_indices().skip(7))
+        .any(|((start, _), (end, last))| text.contains(&secret[start..end + last.len_utf8()]))
+}
+
+/// Structural companion to [`refuse_leak`] for decoded JSON. Serializing
+/// first would escape the punctuation a raw credential can contain, so
+/// this walks object keys, string values and scalar text directly with
+/// the same whole-secret + eight-character semantics and no exemptions.
+pub(crate) fn refuse_json_leak(what: &str, value: &Value, secret: &[u8]) -> Result<()> {
+    let secret = String::from_utf8_lossy(secret);
+    if secret.is_empty() {
+        return Ok(());
+    }
+    let mut scratch = String::new();
+    if json_carries(&secret, value, &mut scratch)? {
+        return Err(Error::internal(format!(
+            "{what} would carry the enrolled credential — withheld"
+        )));
+    }
+    Ok(())
+}
+
+/// Recursive decoded-value walk behind [`refuse_json_leak`]. One scratch
+/// String is reused for numeric scalar text; a formatting failure is a
+/// fixed non-revealing internal error, never an ignored result.
+fn json_carries(secret: &str, value: &Value, scratch: &mut String) -> Result<bool> {
+    match value {
+        Value::String(text) => Ok(carries_credential(secret, text)),
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if carries_credential(secret, key) {
+                    return Ok(true);
+                }
+                if json_carries(secret, value, scratch)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Value::Array(items) => {
+            for value in items {
+                if json_carries(secret, value, scratch)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Value::Number(number) => {
+            use std::fmt::Write as _;
+            scratch.clear();
+            write!(scratch, "{number}")
+                .map_err(|_| Error::internal("JSON metadata screen could not format a scalar"))?;
+            Ok(carries_credential(secret, scratch))
+        }
+        Value::Bool(boolean) => Ok(carries_credential(
+            secret,
+            if *boolean { "true" } else { "false" },
+        )),
+        Value::Null => Ok(carries_credential(secret, "null")),
+    }
 }
 
 #[cfg(test)]

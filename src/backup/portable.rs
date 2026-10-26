@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::{inspect, quote_ident, require_ok, scan_db, scrub, snapshot, sync_dir};
+use super::{
+    artifact_snapshot, inspect, quote_ident, require_ok, scan_db, scrub, sync_dir, ArtifactDir,
+};
 use crate::error::{Error, Result};
 use crate::rollout::db_file;
 use crate::secret::Allowlist;
@@ -1039,6 +1041,10 @@ pub fn export_portable(
     out: &Path,
     opts: &PortableExportOptions,
 ) -> Result<Value> {
+    let custody_paths = super::refuse_custody_output(state_dir, out)?;
+    if let Some(config) = &custody_paths {
+        config.refuse_output(&opts.tracker)?;
+    }
     let Scope::Coordination = opts.scope;
     let live = db_file(state_dir);
     if !live.is_file() {
@@ -1097,6 +1103,10 @@ pub fn export_portable_snapshot_selected(
 ) -> Result<Value> {
     if !apps.is_empty() {
         return export_portable_selected(state_dir, out, opts, apps);
+    }
+    let custody_paths = super::refuse_custody_output(state_dir, out)?;
+    if let Some(config) = &custody_paths {
+        config.refuse_output(&opts.tracker)?;
     }
     refuse_existing(out)?;
     refuse_output_in_tracker(out, &opts.tracker)?;
@@ -1485,18 +1495,25 @@ fn build_package(
     allow: &Allowlist,
     redact_history_secrets: bool,
 ) -> Result<PortableManifest> {
-    let db = staging.join(PKG_DB);
+    let mut output = ArtifactDir::open(staging, false)?;
+    let temp_name = format!(".{PKG_DB}.partial");
+    let partial = output.file_path(temp_name.as_ref())?;
     // Private online snapshot; the live store is only read.
-    snapshot(live, &db)?;
-    let source_uuid = read_source_uuid(&db)?;
-    check_catalog(&db)?;
-    let omitted_rows = project(&db)?;
+    artifact_snapshot(live, &mut output, temp_name.as_ref())?;
+    let source_uuid = read_source_uuid(&partial)?;
+    check_catalog(&partial)?;
+    output.sqlite_sidecars(temp_name.as_ref())?;
+    let omitted_rows = project(&partial)?;
     // Existing redaction on the private copy, then a read-only secret scan
     // and integrity check of the projected copy.
-    let scrub = scrub(&db, redact_history_secrets)?;
-    scan_db(&db, allow)?;
-    let (integrity, schema) = inspect(&db)?;
-    require_ok(&db, &integrity)?;
+    output.sqlite_sidecars(temp_name.as_ref())?;
+    let scrub = scrub(&partial, redact_history_secrets)?;
+    scan_db(&partial, allow)?;
+    let (integrity, schema) = inspect(&partial)?;
+    require_ok(&partial, &integrity)?;
+    output.clean_sidecars(temp_name.as_ref())?;
+    output.publish(temp_name.as_ref(), PKG_DB.as_ref())?;
+    let db = output.file_path(PKG_DB.as_ref())?;
     let tracker_dir = staging.join(PKG_TRACKER);
     copy_tracker(tracker, &tracker_dir, head)?;
     let pm_root = pm_root_of(&tracker_dir)?;
@@ -1530,6 +1547,7 @@ fn build_package(
     };
     let text = serde_json::to_string_pretty(&manifest)?;
     write_private(&staging.join(PKG_MANIFEST), text.as_bytes())?;
+    output.commit()?;
     Ok(manifest)
 }
 

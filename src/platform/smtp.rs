@@ -239,8 +239,25 @@ pub fn custody_bytes(enrollment: &SmtpEnrollment) -> Result<Vec<u8>> {
 /// schema-1 document refuses — a foreign or hand-edited custody blob
 /// never becomes send authority.
 pub fn custody_decode(bytes: &[u8]) -> Result<(SmtpEnvelope, SmtpProjection)> {
-    let doc: Value =
-        serde_json::from_slice(bytes).map_err(|_| Error::rejected("SMTP custody is corrupt"))?;
+    // Own the parsed secret under a zeroizing drop guard on every return path.
+    struct SecretDocument(Value);
+    impl std::ops::Deref for SecretDocument {
+        type Target = Value;
+        fn deref(&self) -> &Value {
+            &self.0
+        }
+    }
+    impl Drop for SecretDocument {
+        fn drop(&mut self) {
+            use zeroize::Zeroize;
+            if let Some(Value::String(secret)) = self.0.get_mut("secret") {
+                secret.zeroize();
+            }
+        }
+    }
+    let doc = SecretDocument(
+        serde_json::from_slice(bytes).map_err(|_| Error::rejected("SMTP custody is corrupt"))?,
+    );
     let fields = doc
         .as_object()
         .ok_or_else(|| Error::rejected("SMTP custody is corrupt"))?;
@@ -283,7 +300,7 @@ pub fn custody_decode(bytes: &[u8]) -> Result<(SmtpEnvelope, SmtpProjection)> {
             port,
             tls_mode: tls_mode.to_string(),
             username: username.to_string(),
-            secret: secret.as_bytes().to_vec(),
+            secret: zeroize::Zeroizing::new(secret.as_bytes().to_vec()),
             sender: sender.to_string(),
             sender_name: sender_name.to_string(),
         },
@@ -305,7 +322,7 @@ pub struct SmtpEnvelope {
     pub port: u16,
     pub tls_mode: String,
     pub username: String,
-    secret: Vec<u8>,
+    secret: zeroize::Zeroizing<Vec<u8>>,
     pub sender: String,
     pub sender_name: String,
 }
@@ -2078,7 +2095,7 @@ mod tests {
             port: 587,
             tls_mode: "starttls".into(),
             username: "u".into(),
-            secret: b"never-in-the-message".to_vec(),
+            secret: zeroize::Zeroizing::new(b"never-in-the-message".to_vec()),
             sender: "News@Example.COM".into(),
             sender_name: String::new(),
         };

@@ -16,6 +16,7 @@
 
 use serde_json::{json, Value};
 
+use super::custody_rpc::CustodyOperation;
 use super::{optional_str, required_str, AgentCaller, Shared};
 use crate::error::{Error, Result};
 use crate::platform::{self, custody, Enrollment};
@@ -132,6 +133,33 @@ impl Shared {
         allowed_scopes: Option<&[String]>,
         metadata_projection: Option<&CredentialMetadataProjection<'_>>,
     ) -> Result<Value> {
+        let operation = self.custody_operation()?;
+        self.enroll_inner_expected(
+            &operation,
+            params,
+            rotate,
+            expected_id,
+            None,
+            allowed_scopes,
+            metadata_projection,
+        )
+    }
+
+    /// `enroll_inner` with the caller's expected revision bound into
+    /// the CAS (CAD-1128): for encrypted rotation/revoke the caller's
+    /// `expected_revision`/`expected_connection_id` MUST reach the
+    /// core transaction, never a silently reloaded later value.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn enroll_inner_expected(
+        &self,
+        operation: &CustodyOperation<'_>,
+        params: &Value,
+        rotate: bool,
+        expected_id: Option<&str>,
+        expected_revision: Option<u64>,
+        allowed_scopes: Option<&[String]>,
+        metadata_projection: Option<&CredentialMetadataProjection<'_>>,
+    ) -> Result<Value> {
         let platform = if allowed_scopes.is_some() {
             platform::connections::provider_identifier(
                 required_str(params, "platform")?,
@@ -169,27 +197,53 @@ impl Shared {
             .get("accept_same_uid_risk")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        // Serialize the custody write against the record write it
-        // pairs with: concurrent enrolls of one account, or a revoke
-        // racing a put, must never leave a record whose fingerprint
-        // disagrees with the bytes under it. Held across check →
-        // exchange → put → record; a consent adapter's network wait
-        // stretches it, which is correct — the record must not turn
-        // over mid-exchange.
-        let _custody_guard = self
-            .platform_custody_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // The caller retains custody across live identity, exchange and publication.
         // Existence is checked inside the lock before custody is
         // touched — an early `put` would leave bytes disagreeing with
         // the record's fingerprint. The store re-checks inside its
         // transaction, so these pre-checks only order the refusal
         // ahead of the write.
         let existing = self.store.platform_credential(&platform, &account)?;
+        let encrypted_existing = existing.as_ref().is_some_and(|record| {
+            record
+                .custody
+                .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX)
+        });
+        if rotate && encrypted_existing {
+            if allowed_scopes.is_none()
+                || optional_str(params, "shape") != Some(platform::smtp::ENROLLMENT_SHAPE)
+                || existing.as_ref().map(|record| record.exchange.as_str())
+                    != Some(platform::smtp::ENROLLMENT_SHAPE)
+            {
+                return Err(Error::invalid(
+                    "unsupported_custody_use",
+                    "encrypted rotation requires typed SMTP connection management",
+                ));
+            }
+            if expected_id
+                != existing
+                    .as_ref()
+                    .map(|record| record.connection_id.as_str())
+                || expected_revision != existing.as_ref().map(|record| record.credential_revision)
+            {
+                return Err(Error::invalid(
+                    "stale_revision",
+                    "encrypted rotation requires the exact current connection and revision",
+                ));
+            }
+        }
         if expected_id
             .is_some_and(|id| existing.as_ref().map(|r| r.connection_id.as_str()) != Some(id))
         {
             return Err(Error::rejected("connection incarnation is stale"));
+        }
+        if expected_revision
+            .is_some_and(|rev| existing.as_ref().map(|r| r.credential_revision) != Some(rev))
+        {
+            return Err(Error::invalid(
+                "stale_revision",
+                "connection revision is stale — reload and re-approve",
+            ));
         }
         let declared = match params.get("scopes") {
             Some(_) => scope_list(params, "scopes")?,
@@ -249,6 +303,36 @@ impl Shared {
         } else {
             None
         };
+        // CAD-1128 custody selection. `encrypted` is true only when
+        // the vault is configured AND this write belongs to it: a new
+        // SMTP-shape enrollment through the connection path, or a
+        // rotation of a record already vault-backed. Mixed records
+        // resolve their own durable backend tag — a legacy record
+        // stays legacy, never silently migrates. Under a configured
+        // daemon, a NEW credential-bearing non-SMTP enrollment refuses
+        // before any exchange or write; credential-less builtins and
+        // legacy rotations are untouched.
+        let encrypted = match self.platform_custody.encrypted() {
+            Some(_) if rotate => encrypted_existing,
+            Some(_) => {
+                optional_str(params, "shape") == Some(platform::smtp::ENROLLMENT_SHAPE)
+                    && allowed_scopes.is_some()
+            }
+            None => false,
+        };
+        if self.platform_custody.encrypted().is_some() && !rotate && !encrypted {
+            // A fresh enrollment under the configured vault. Builtin
+            // credential-less accounts never reach enroll_inner, so a
+            // non-SMTP write here is a credential-bearing enrollment
+            // the configured backend refuses — before any exchange.
+            return Err(Error::invalid(
+                "unsupported_custody_use",
+                "this daemon's custody is encrypted — only SMTP-shape enrollments are supported",
+            ));
+        }
+        if encrypted {
+            self.refuse_hosted_encrypted()?;
+        }
         let enrollment: Enrollment = match optional_str(params, "shape").unwrap_or("token") {
             "token" => platform::enroll_token(params, &declared)?,
             "consent" => platform::enroll_consent(&platform, &account, &declared, params)?,
@@ -265,13 +349,21 @@ impl Shared {
                 )))
             }
         };
+        if encrypted {
+            let (envelope, projection) = platform::smtp::custody_decode(&enrollment.bytes)?;
+            platform::refuse_leak(
+                "SMTP enrollment projection",
+                &projection.to_json().to_string(),
+                envelope.secret(),
+            )?;
+        }
         platform::refuse_leak(
             "platform enrollment metadata",
             &json!({"platform":platform,"account":account,"scopes":enrollment.scopes}).to_string(),
             enrollment.screen_bytes(),
         )?;
         let fingerprint = crate::secret::fingerprint(&enrollment.bytes);
-        let record = CredentialRecord {
+        let mut record = CredentialRecord {
             connection_id: existing
                 .as_ref()
                 .map(|r| r.connection_id.clone())
@@ -308,36 +400,66 @@ impl Shared {
                 enrollment.screen_bytes(),
             )?;
         }
-        let key = custody::Key {
-            platform: &record.platform,
-            account: &record.account,
-        };
-        // A rotate captures the old bytes first: if the record write
-        // fails, custody is put back exactly as it was — never left
-        // holding bytes the record disowns. A load failure refuses the
-        // rotate before anything is overwritten.
-        let prior = match &existing {
-            Some(record) => Some(self.platform_custody.load(&record.custody, &key)?),
-            None => None,
-        };
-        self.platform_custody.put(&key, &enrollment.bytes)?;
-        if let Err(err) = self.store.platform_enroll(&record, rotate, risk) {
-            // The record refused — custody must hold exactly what the
-            // record (still) describes: the old bytes for a rotate,
-            // nothing for a fresh enroll.
+        if encrypted {
+            // CAD-1128 vault-first: commit the immutable ciphertext row
+            // under the exact proposed core identity/revision BEFORE
+            // core publishes the reference. A refused core write leaves
+            // a non-authoritative orphan — never overwritten, never a
+            // credential. `key_id` binds this daemon's configured key.
+            let vault = self
+                .platform_custody
+                .encrypted()
+                .ok_or_else(|| Error::internal("encrypted custody vanished"))?;
+            let key_id = vault
+                .key_id()
+                .ok_or_else(|| Error::invalid("locked", "custody is locked"))?;
+            let expected = crate::platform::encrypted_sqlite::ExpectedIdentity {
+                workspace_id: self.store.connection_workspace_id()?,
+                connection_id: record.connection_id.clone(),
+                provider: record.platform.clone(),
+                account: record.account.clone(),
+                credential_revision: record.credential_revision,
+                exchange: record.exchange.clone(),
+                key_id,
+            };
+            record.custody = vault.write_row(&expected, &enrollment.bytes)?;
+            if let Err(err) = self.store.platform_enroll(&record, rotate, risk) {
+                // Contract I4: no ciphertext compensation — the orphan
+                // stays, non-authoritative until a fresh attempt.
+                return Err(self.encrypted_core_error(err));
+            }
+        } else {
             let key = custody::Key {
                 platform: &record.platform,
                 account: &record.account,
             };
-            match &prior {
-                Some(old) => {
-                    let _ = self.platform_custody.put(&key, old);
+            // A rotate captures the old bytes first: if the record write
+            // fails, custody is put back exactly as it was — never left
+            // holding bytes the record disowns. A load failure refuses the
+            // rotate before anything is overwritten.
+            let prior = match &existing {
+                Some(record) => Some(self.platform_custody.load(&record.custody, &key)?),
+                None => None,
+            };
+            self.platform_custody.put_legacy(&key, &enrollment.bytes)?;
+            if let Err(err) = self.store.platform_enroll(&record, rotate, risk) {
+                // The record refused — custody must hold exactly what the
+                // record (still) describes: the old bytes for a rotate,
+                // nothing for a fresh enroll.
+                let key = custody::Key {
+                    platform: &record.platform,
+                    account: &record.account,
+                };
+                match &prior {
+                    Some(old) => {
+                        let _ = self.platform_custody.put_legacy(&key, old);
+                    }
+                    None => {
+                        let _ = self.platform_custody.remove(&record.custody, &key);
+                    }
                 }
-                None => {
-                    let _ = self.platform_custody.remove(&record.custody, &key);
-                }
+                return Err(err);
             }
-            return Err(err);
         }
         // The result and its event carry handles only — prove it: a
         // byte leak here is a withheld response, never a quiet one.
@@ -347,7 +469,12 @@ impl Shared {
             &result.to_string(),
             enrollment.screen_bytes(),
         )?;
-        Ok(json!({"state": "enrolled", "account": result}))
+        let connection = if allowed_scopes.is_some() {
+            Some(self.connection_record_admitted(&record, operation)?)
+        } else {
+            None
+        };
+        Ok(json!({"state": "enrolled", "account": result, "connection": connection}))
     }
 
     /// `platform_revoke {platform, account, reason?}` — the operator
@@ -361,7 +488,60 @@ impl Shared {
         self.revoke_inner(params, None)
     }
 
+    /// The caller's optional CAS expectation, parsed once under one
+    /// convention (CAD-1128): an absent field stays `None` — legacy
+    /// callers legitimately omit it — while a present field must have
+    /// the exact type and range. A malformed expectation refuses; it
+    /// is never treated as absent and silently dropped.
+    pub(super) fn expected_cas(params: &Value) -> Result<(Option<&str>, Option<u64>)> {
+        let expected_id = params
+            .get("expected_connection_id")
+            .map(|value| {
+                value.as_str().ok_or_else(|| {
+                    Error::invalid("stale_revision", "expected_connection_id must be a string")
+                })
+            })
+            .transpose()?;
+        let expected_revision = params
+            .get("expected_revision")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .filter(|revision| (1..=i64::MAX as u64).contains(revision))
+                    .ok_or_else(|| {
+                        Error::invalid(
+                            "stale_revision",
+                            "expected_revision must be a valid revision",
+                        )
+                    })
+            })
+            .transpose()?;
+        Ok((expected_id, expected_revision))
+    }
+
     pub(super) fn revoke_inner(&self, params: &Value, expected_id: Option<&str>) -> Result<Value> {
+        let (caller_id, expected_revision) = Self::expected_cas(params)?;
+        if expected_id
+            .zip(caller_id)
+            .is_some_and(|(expected, caller)| expected != caller)
+        {
+            return Err(Error::rejected("connection incarnation is stale"));
+        }
+        self.revoke_inner_expected(params, caller_id.or(expected_id), expected_revision)
+    }
+
+    /// `revoke_inner` carrying the caller's expected revision CAS
+    /// (CAD-1128): an encrypted revoke binds both exact incarnation
+    /// and revision, refuses caller-authored reason text outright
+    /// (`reason_unscreenable`), and closes only waiting/decided
+    /// generic rows inside the same guarded core transaction —
+    /// executing/reconcile rows stay uncertain, never drained early.
+    pub(super) fn revoke_inner_expected(
+        &self,
+        params: &Value,
+        expected_id: Option<&str>,
+        expected_revision: Option<u64>,
+    ) -> Result<Value> {
         let platform = if expected_id.is_some() {
             platform::connections::provider_identifier(
                 required_str(params, "platform")?,
@@ -383,12 +563,8 @@ impl Shared {
             enroll_account_identifier(&platform, required_str(params, "account")?)?
         };
         let reason = optional_str(params, "reason");
-        // Same lock the enroll path serializes on: a revoke racing a
-        // rotate must not interleave remove with put.
-        let _custody_guard = self
-            .platform_custody_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // Same operation section as enrollment and supported send.
+        let _custody_guard = self.custody_operation()?;
         let record = self
             .store
             .platform_credential(&platform, &account)?
@@ -400,6 +576,29 @@ impl Shared {
         if expected_id.is_some_and(|id| record.connection_id != id) {
             return Err(Error::rejected("connection incarnation is stale"));
         }
+        if expected_revision.is_some_and(|rev| record.credential_revision != rev) {
+            return Err(Error::invalid(
+                "stale_revision",
+                "connection revision is stale — reload and re-approve",
+            ));
+        }
+        let encrypted = record
+            .custody
+            .starts_with(crate::platform::encrypted_sqlite::TAG_PREFIX);
+        if encrypted && (expected_id.is_none() || expected_revision.is_none()) {
+            return Err(Error::invalid(
+                "stale_revision",
+                "an encrypted revoke requires exact expected_connection_id and expected_revision",
+            ));
+        }
+        // CAD-1128 R3: an encrypted record's caller-supplied reason is
+        // unscreenable — refuse it outright rather than echo/persist it.
+        if encrypted && reason.is_some() {
+            return Err(Error::invalid(
+                "reason_unscreenable",
+                "an encrypted record carries no caller-authored revoke reason",
+            ));
+        }
         let key = custody::Key {
             platform: &platform,
             account: &account,
@@ -407,30 +606,62 @@ impl Shared {
         // `reason` is operator text that lands on audit events and the
         // agent-visible `request_closed` — screen it against the bytes
         // it must never carry before the drain publishes it. A custody
-        // that no longer reads has nothing left to leak.
-        let bytes = self.platform_custody.load(&record.custody, &key).ok();
+        // that no longer reads has nothing left to leak. Encrypted
+        // records are never caller-reasoned (above) and carry no
+        // decrypted bytes here, so no screen runs for them.
+        let bytes = if encrypted {
+            None
+        } else {
+            self.platform_custody.load(&record.custody, &key).ok()
+        };
+        if reason.is_some() && !encrypted && bytes.is_none() {
+            return Err(Error::invalid(
+                "reason_unscreenable",
+                "credential unavailable; omit reason",
+            ));
+        }
         if let (Some(reason), Some(bytes)) = (reason, bytes.as_deref()) {
             platform::refuse_leak("platform revoke reason", reason, bytes)?;
         }
         // Bytes first: a revoke that cannot drop custody refuses
         // before the record goes — the record without custody still
-        // fails closed at load.
+        // fails closed at load. The encrypted arm is an acknowledged
+        // no-op: ciphertext is retained, never compensated.
         self.platform_custody.remove(&record.custody, &key)?;
-        let closed = self.close_credential_effects(
-            &platform,
-            &account,
-            reason.unwrap_or("credential revoked"),
-        );
-        let revoked = self
-            .store
-            .platform_revoke(&platform, &account, OPERATOR, reason, &closed);
-        let Some((record, grants)) = (match revoked {
+        // Contract: the encrypted revoke retires authority AND closes
+        // provably-unexecuted waiting/decided rows in ONE guarded core
+        // transaction (`platform_revoke_encrypted`) — `close_credential_effects`
+        // is deliberately not used, it drains reconcile rows and memory
+        // before the commit lands. A legacy revoke keeps its existing
+        // helper + `platform_revoke` order.
+        let revoked = if encrypted {
+            self.store.platform_revoke_encrypted(
+                &platform,
+                &account,
+                OPERATOR,
+                expected_id.unwrap_or(&record.connection_id),
+                expected_revision.unwrap_or(record.credential_revision),
+            )
+        } else {
+            let closed = self.close_credential_effects(
+                &platform,
+                &account,
+                reason.unwrap_or("credential revoked"),
+            );
+            self.store
+                .platform_revoke(&platform, &account, OPERATOR, reason, &closed)
+                .map(|opt| opt.map(|(r, g)| (r, g, closed)))
+        };
+        let Some((record, grants, closed)) = (match revoked {
             Err(err) => {
+                if encrypted {
+                    return Err(self.encrypted_core_error(err));
+                }
                 // The record stayed — custody must describe it again:
                 // put the bytes back (best effort; the record fails
                 // closed at load if the restore cannot land either).
                 if let Some(bytes) = bytes {
-                    let _ = self.platform_custody.put(&key, &bytes);
+                    let _ = self.platform_custody.put_legacy(&key, &bytes);
                 }
                 return Err(err);
             }
@@ -440,6 +671,12 @@ impl Shared {
                 "no credential is enrolled for {platform}/{account}"
             )));
         };
+        // Only a confirmed encrypted core commit authorizes the pending drain.
+        // Never hold C or a DB borrow while touching pending/notifications.
+        drop(_custody_guard);
+        if encrypted {
+            self.finish_encrypted_revoke(&closed);
+        }
         self.wake();
         Ok(json!({
             "state": "revoked",
@@ -449,6 +686,57 @@ impl Shared {
             "grants_revoked": grants.len(),
             "effects_closed": closed,
         }))
+    }
+
+    fn finish_encrypted_revoke(&self, closed: &[String]) {
+        for id in closed {
+            // Closed IDs came from the guarded transaction's exactly-one-row
+            // updates. Re-read only immutable routing; never close a reconcile,
+            // executing or newly queued row merely because its account matches.
+            let Ok(Some(row)) = self.store.effect_by_id(id) else {
+                continue;
+            };
+            if row.state != "closed" || row.close_reason.as_deref() != Some("credential_revoked") {
+                continue;
+            }
+            let removed = {
+                let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                if pending.get(&row.request).is_some_and(|request| {
+                    request.alias == row.agent && request.params["kind"] == "effect"
+                }) {
+                    pending.remove(&row.request).is_some()
+                } else {
+                    false
+                }
+            };
+            if removed {
+                self.relax_waiting(&row.agent);
+            }
+            let _ = self.store.event_public(
+                &row.agent,
+                "request_closed",
+                json!({"request": row.request, "kind": "effect", "reason": "credential_revoked"}),
+            );
+        }
+    }
+
+    fn encrypted_core_error(&self, error: Error) -> Error {
+        if error.code() == Some("outcome_unknown") || error.kind() == "internal" {
+            if let Some(vault) = self.platform_custody.encrypted() {
+                vault.fence();
+            }
+            return Error::invalid(
+                "outcome_unknown",
+                "encrypted authority publication requires reconciliation",
+            );
+        }
+        match error.code() {
+            Some("busy") => Error::busy_coded("busy", "core authority writer busy; no publication"),
+            Some("stale_revision") => {
+                Error::invalid("stale_revision", "connection revision is stale")
+            }
+            _ => Error::invalid("storage_unavailable", "core authority write refused"),
+        }
     }
 
     /// `platform_grant {agent, platform, account, scopes}` — the

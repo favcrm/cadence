@@ -59,9 +59,11 @@ chooses to accept that existing risk. Rotation accepts optional repeated
 different provider or account.
 
 Rotation preserves connection identity and advances its credential revision.
-Revocation removes its existing grants/defaults and closes its pending effects
-through the existing custody lifecycle. Re-enrolling the same provider/account
-creates a new connection incarnation. An old ID cannot modify the replacement.
+For encrypted Connections, revocation atomically removes grants/defaults and
+closes only unexecuted effects; executing or reconcile-needed effects retain
+their uncertain history. Legacy custody retains its existing revoke behavior.
+Re-enrolling the same provider/account creates a new connection incarnation.
+An old ID cannot modify the replacement.
 No management command derives a new grant or approves an app/run.
 
 The reviewed `agenticos_external` provider accepts a company-scoped AgenticOS
@@ -81,6 +83,78 @@ The separate hosted `agenticos` account retains Cadence's Send approval gate
 without independently supplied deployment metadata. A matching trusted
 embedding assertion is not live remote verification.
 
+## Encrypted persistence in an isolated self-hosted instance
+
+Encryption at rest is **not agent isolation**. Custody status deliberately
+reports `isolation: "none"` and `protected: false`: an unconfined same-UID
+process can still read owner-accessible key files, ciphertext or process memory.
+Do not treat an unlocked vault or risk acknowledgement as protection from agents.
+
+Before starting the isolated instance, its owner selects the external key through
+`ISOLATED_STATE/custody-encrypted.json`, an owner-only `0600` path-only record:
+
+```json
+{"key_file":"/absolute/owner-private/connections.key"}
+```
+
+The dedicated key must be uniformly random, exactly 32 bytes, in a `0600`
+single-link regular file under an owner-controlled `0700` directory outside the
+state, tracker, app and artifact trees. Symlink or untrusted writable traversal
+refuses. No key-generation, key-export, key-rotation or key-recovery command is provided.
+Absent configuration retains legacy selection; missing encrypted configuration
+or material never silently downgrades existing encrypted references.
+Legacy metadata and artifact inspection allows owner-controlled, non-private
+directories; it does not impose encrypted-key permissions on an unconfigured
+instance. A present vault or any `encrypted-sqlite` reference still refuses
+missing configuration. Opaque legacy references are not reinterpreted or made
+usable; portable coordination exports discard their credential authority.
+
+```sh
+cadence --state-dir ISOLATED_STATE connection custody initialize --accept-same-uid-risk
+cadence --state-dir ISOLATED_STATE connection custody unlock --accept-same-uid-risk
+cadence --state-dir ISOLATED_STATE connection custody status
+cadence --state-dir ISOLATED_STATE connection custody lock
+```
+
+Initialization provisions a fresh vault but leaves it locked. Review the current
+Connections and grants before explicit unlock: reference authentication is not
+proof that restored authority is the freshest snapshot. Restart always locks
+custody. A contended encrypted operation returns busy without scheduling a later
+lock, rotation or revoke.
+An uncertain guarded core commit fences encrypted use. Inspect current
+Connections, then explicitly lock/unlock to reconcile. A provider's unknown
+delivery result is not permission to resend.
+
+Under this selection, new credential-bearing enrollment supports only the typed
+SMTP shape. Direct authenticated owner Connections management and native operator
+SMTP bind/rebind/show/test-send are the supported consumers. Password-only SMTP
+rotation inherits verified settings under the same custody section and exact
+caller revision used for publication. Use `connection rotate-smtp`, not the
+legacy `platform rotate` grammar, for an encrypted sender.
+
+Rotation leaves an existing SMTP binding stale. SMTP show reports that stale
+state with the current sender metadata; sending still refuses until the operator
+explicitly rebinds.
+
+Generic effects, app capability/artifact execution, mounted screen services and
+campaign sends refuse encrypted targets even when unlocked or granted. Encrypted
+initialization, unlock, enrollment and credential use with hosted `smtp.internal`
+also refuse before key access or relay work. Existing legacy records keep their
+durable backend tags and legacy behavior; this is not a migration or erasure of
+plaintext stores and historical backups.
+
+On Linux, ordinary backup/export excludes the vault and external key and refuses
+custody source/output overlaps. macOS retains ordinary backup/export only for
+unconfigured legacy state; configured encrypted-state artifacts refuse on
+non-Linux before output inspection or creation. These artifacts are not key
+recovery: losing the key loses access to its ciphertext. No anti-rollback or
+physical power-loss guarantee is implied.
+
+These owner commands are not chat-driven setup or CLI browser enrollment.
+Trusted credential-entry components, isolated agent access and hosted encrypted
+execution are separate requirements; never paste credentials into agent chat.
+
+
 ## HTTP contract
 
 All these routes require the same proven operator boundary as native RPC:
@@ -90,10 +164,24 @@ All these routes require the same proven operator boundary as native RPC:
 | GET | `/api/connection-providers` | No query |
 | GET | `/api/connections` | No query |
 | GET | `/api/connections/:id` | No query |
-| POST | `/api/connections` | `provider`, `account`, `shape: "token"`, `token`, `scopes`; optional `accept_same_uid_risk` |
-| POST | `/api/connections/:id/rotate` | `token`; optional `scopes`, `accept_same_uid_risk` |
-| POST | `/api/connections/:id/revoke` | `{}` |
+| POST | `/api/connections` | `provider`, `account`, `shape`, `scopes`; `token` for token shape or SMTP `host`, `port`, `tls_mode`, `username`, `secret`, `sender` (optional `sender_name`); optional `accept_same_uid_risk` |
+| POST | `/api/connections/:id/rotate` | `token` or fresh SMTP `secret` with optional inherited transport/sender fields; optional `scopes`, `accept_same_uid_risk`, `expected_connection_id`, `expected_revision` |
+| POST | `/api/connections/:id/revoke` | Optional `expected_connection_id`, `expected_revision` |
 | POST | `/api/connections/:id/status` | `{}`; local configuration check only |
+| GET | `/api/connection-custody/status` | No body or `{}` |
+| POST | `/api/connection-custody/initialize` | `accept_same_uid_risk: true` |
+| POST | `/api/connection-custody/unlock` | `accept_same_uid_risk: true` |
+| POST | `/api/connection-custody/lock` | No body or `{}` |
+
+Encrypted rotate/revoke requires the exact expected connection ID and revision.
+CLI and HTTP preflight may resolve that pair once through Connection show for
+the invocation; a supplied expectation is never replaced or automatically retried.
+Legacy callers may omit expectations, but supplied fields are never silently
+dropped: the ID must be a string and the revision an integer in
+`1..=9223372036854775807`. Null, wrong types and out-of-range revisions refuse.
+Custody bodies accept acknowledgement only, never key bytes or configuration
+paths. The closed request schemas live in
+[`src/ui/connections.rs`](../../src/ui/connections.rs).
 
 Unknown or duplicate fields, unsupported queries and wrong types refuse.
 Credential-bearing requests are limited to 16 KiB; JSON responses to 64 KiB.

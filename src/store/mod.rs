@@ -138,6 +138,8 @@ pub use seal::OpenMode;
 // needs, and there is no `commit`/`rollback`/`Connection` escape.
 pub use seal::WriteTxn;
 pub(crate) use seal::{preflight_writer_guard, require_legacy_writer_tx, StoreConn};
+#[cfg(all(test, target_os = "linux", feature = "test-seam"))]
+pub(crate) mod cad1128_commit_refusal;
 #[cfg(test)]
 mod tests;
 

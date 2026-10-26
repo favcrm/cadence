@@ -32,7 +32,7 @@
 //! EXISTING AgenticOS media schema (price read, submit, job read,
 //! artifact bytes) — never a new API, fake SDK or in-process stub. The
 //! daemon's own adapter issues every request; the test never touches its
-//! internals. Custody is `Custody::File` inside the fixture tempdir with
+//! internals. Custody is the file backend (`Custody::file`) inside the fixture tempdir with
 //! a synthetic token; no real credential, keychain, paid provider or
 //! network beyond loopback is involved. The operator session is minted
 //! through the REAL `operator_link_mint`/`operator_session_open` RPCs on
@@ -299,7 +299,7 @@ impl Fx {
         // crate-private `Shared` — the exact pattern the existing
         // `app_capabilities_rpc::tests` fixture uses.
         Arc::get_mut(&mut shared).unwrap().platform_custody =
-            Custody::File(dir.path().join("fixture-custody"));
+            Custody::file(dir.path().join("fixture-custody"));
         // A fixture-generated synthetic token under the exact reviewed
         // account shape — never a real credential.
         let token = b"synthetic-cad1365-gen-token";

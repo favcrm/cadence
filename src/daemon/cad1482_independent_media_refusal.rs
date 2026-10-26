@@ -298,7 +298,7 @@ impl Fx {
         );
         let mut shared = Shared::new(&state, &opts).unwrap();
         Arc::get_mut(&mut shared).unwrap().platform_custody =
-            Custody::File(dir.path().join("fixture-custody"));
+            Custody::file(dir.path().join("fixture-custody"));
         let token = b"synthetic-cad1482-inspect-token";
         let key = Key {
             platform: agenticos_external::PLATFORM,

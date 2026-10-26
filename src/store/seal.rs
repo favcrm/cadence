@@ -917,8 +917,14 @@ impl Store {
             } else {
                 TransactionBehavior::Immediate
             };
-            Transaction::new_unchecked(&guard, behavior)
-                .map_err(|e| Error::internal(e.to_string()))?
+            Transaction::new_unchecked(&guard, behavior).map_err(|e| {
+                // BEGIN has admitted no callback/DML: known nonpublication.
+                if matches!(e, rusqlite::Error::SqliteFailure(ref code, _) if code.code == rusqlite::ErrorCode::DatabaseBusy || code.code == rusqlite::ErrorCode::DatabaseLocked) {
+                    Error::busy_coded("busy", "guarded core writer is busy")
+                } else {
+                    Error::invalid("storage_unavailable", "guarded core writer could not begin")
+                }
+            })?
         };
         // BEGIN may have waited on another connection after the first check.
         // Refuse a lease lost during that wait before any callback begins.
@@ -957,7 +963,10 @@ impl Store {
                     )));
                 }
                 let _ctrl = ControlPhase::enter(state);
-                tx.commit().map_err(|e| Error::internal(e.to_string()))?;
+                // Never infer nonpublication from autocommit after COMMIT error.
+                tx.commit().map_err(|_| {
+                    Error::invalid("outcome_unknown", "guarded core commit outcome unknown")
+                })?;
                 Ok(v)
             }
             Ok(Err(e)) => {
@@ -1066,11 +1075,16 @@ impl Store {
             tx.rollback().err()
         };
         if let Some(e) = rb_err {
-            return Err(Error::internal(format!("sealed-tx ROLLBACK failed: {e}")));
+            let _ = e;
+            return Err(Error::invalid(
+                "outcome_unknown",
+                "guarded core rollback outcome unknown",
+            ));
         }
         if !conn.is_autocommit() {
-            return Err(Error::internal(
-                "sealed-tx rollback did not return the connection to autocommit".to_string(),
+            return Err(Error::invalid(
+                "outcome_unknown",
+                "guarded core rollback unverified",
             ));
         }
         Ok(())

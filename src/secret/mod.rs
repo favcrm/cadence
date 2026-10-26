@@ -617,6 +617,19 @@ pub fn fingerprint(secret: &[u8]) -> String {
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// CAD-1128: the vault row's key-confirmation id — SHA-256(key)[..16].
+/// Stored so a wrong key file is refused before any ciphertext decrypt.
+pub fn fingerprint_key_id(key: &[u8]) -> [u8; 16] {
+    let digest = Sha256::digest(key);
+    digest[..16].try_into().expect("SHA-256 is 32 bytes")
+}
+
+/// CAD-1128: SHA-256 over raw bytes as a `[u8; 32]` — the tamper-evident
+/// row-content digest the vault's public metadata carries.
+pub fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
 /// The full line(s) covering `start..end`.
 fn line_span(text: &[u8], start: usize, end: usize) -> &[u8] {
     let from = text[..start]

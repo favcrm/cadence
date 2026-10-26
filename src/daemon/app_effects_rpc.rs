@@ -1122,10 +1122,7 @@ impl Shared {
                     required_str(authority, "install_id")?,
                     required_str(authority, "bundle_digest")?,
                     |bundle, files| {
-                        let _custody = self
-                            .platform_custody_lock
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
+                        let _custody = self.custody_operation()?;
                         let _release = self
                             .app_release_lock
                             .lock()
@@ -1175,10 +1172,7 @@ impl Shared {
             install,
             required_str(&run["snapshot"], "bundle_digest")?,
             |bundle, files| {
-                let _custody = self
-                    .platform_custody_lock
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let _custody = self.custody_operation()?;
                 let _release = self
                     .app_release_lock
                     .lock()
@@ -1192,6 +1186,9 @@ impl Shared {
                 )?;
                 let proof: BindingProof = serde_json::from_value(material["binding"].clone())
                     .map_err(|_| Error::rejected("frozen publication binding is invalid"))?;
+                // Before prepare/preview, cached stage receipts or any
+                // input-derived persistence; a binding is not a decrypt permit.
+                self.refuse_encrypted_binding(&proof.config)?;
                 self.app_binding_receipt_current(
                     install,
                     run["context_id"].as_str(),
@@ -1326,6 +1323,9 @@ impl Shared {
         let install = required_str(authority, "install_id")?;
         let proof: BindingProof = serde_json::from_value(authority["binding"].clone())
             .map_err(|_| Error::rejected("app effect binding receipt is invalid"))?;
+        // Also covers accepting a historical waiting row, before deciding
+        // it. Decline/reconciliation do not call this execution validation.
+        self.refuse_encrypted_binding(&proof.config)?;
         let slot = required_str(authority, "slot")?;
         self.app_binding_receipt_current(
             install,
@@ -1386,10 +1386,7 @@ impl Shared {
             install,
             bundle_digest,
             |bundle, files| {
-                let _custody = self
-                    .platform_custody_lock
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let _custody = self.custody_operation()?;
                 let _release = self
                     .app_release_lock
                     .lock()
@@ -1757,3 +1754,6 @@ mod cad1778_screen_tests {
         assert!(screened.contains("details withheld"), "{screened}");
     }
 }
+
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod cad1128_boundaries_tests;

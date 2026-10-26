@@ -219,11 +219,26 @@ mod cad1700_acceptance;
 mod cad1777_drawer_acceptance;
 mod connection_test;
 mod connections_rpc;
+/// CAD-1128: the `connection_custody_*` operator verbs.
+pub(crate) mod custody_rpc;
+
+// CAD-1128 r2: the frozen acceptance check and its genuine fixture.
+// Both compile only under `test-seam`; production carries neither.
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod cached_return_tests;
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod cad1128_canary_fx;
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod campaign_canary_tests;
 #[cfg(all(test, feature = "test-seam"))]
 mod conversations_acceptance;
 mod conversations_rpc;
 mod crm_send_rpc;
 mod crm_smtp_rpc;
+#[cfg(all(test, unix, feature = "test-seam"))]
+pub(crate) mod custody_acceptance_fixture;
+#[cfg(all(test, unix, feature = "test-seam"))]
+mod custody_security_r2;
 mod delivery_requirements_rpc;
 mod delivery_rpc;
 mod dispatch_rpc;
@@ -753,6 +768,12 @@ pub struct Shared {
     /// and verify through the `smtp.internal` pass-through instead of
     /// opening a socket the offline container does not have.
     smtp_internal: Option<crate::platform::smtp_internal::SmtpInternal>,
+    /// CAD-1128: `Some` on a daemon configured for dedicated
+    /// encrypted-SQLite custody of new SMTP-shape Connections. Owner-
+    /// selected at serve time (never RPC/PM); the vault starts locked
+    /// on every start and stays that way until an explicit operator
+    /// `connection_custody_unlock` proves the key and header.
+
     /// CAD-786: the base the unsubscribe links mint — the board's
     /// public origin; `None` refuses `crm_send_prepare`.
     unsubscribe_origin: Option<String>,
@@ -1018,6 +1039,25 @@ impl Shared {
             state_dir,
             &opts.provider_env,
         )?;
+        if let Some(config) = &opts.encrypted_custody {
+            if config.key_file.starts_with(state_dir)
+                || config.key_file.starts_with(&wiki_pm_dir)
+                || config.vault_dir != state_dir.join("vault")
+                || config.key_file.components().any(|c| match c {
+                    std::path::Component::ParentDir | std::path::Component::CurDir => true,
+                    std::path::Component::Normal(name) => matches!(
+                        name.to_str(),
+                        Some("backups" | "exports" | "app-records" | "workspace-apps")
+                    ),
+                    _ => false,
+                })
+            {
+                return Err(Error::invalid(
+                    "key_unavailable",
+                    "unsafe encrypted custody placement",
+                ));
+            }
+        }
         let wiki_pm_lease = lease.as_ref().map(|l| l.pm_lease());
         // CAD-1416: the document door is selected by the image-owned tuple
         // alone, never by the lifecycle lease. Trusted in-memory metadata wins
@@ -1132,7 +1172,14 @@ impl Shared {
             membership_mode: membership,
             #[cfg(test)]
             membership_lookup_for_test: None,
-            platform_custody: crate::platform::Custody::open(state_dir)?,
+            platform_custody: match &opts.encrypted_custody {
+                Some(config) => {
+                    crate::platform::Custody::open(state_dir)?.with_encrypted(std::sync::Arc::new(
+                        crate::platform::encrypted_sqlite::EncryptedVault::new(config.clone())?,
+                    ))
+                }
+                None => crate::platform::Custody::open(state_dir)?,
+            },
             platform_custody_lock: Box::leak(Box::new(Mutex::new(()))),
             crm_send_workers: Mutex::new(std::collections::HashSet::new()),
             image_job_workers: Mutex::new(std::collections::HashSet::new()),
@@ -1200,6 +1247,10 @@ impl Shared {
                 wiki_pm_lease,
             ),
         });
+        #[cfg(test)]
+        if let Some(observer) = &opts.custody_acceptance_shared {
+            *observer.lock().unwrap() = Some(shared.clone());
+        }
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
         shared.emit_slot_events(boot_events);
@@ -3553,6 +3604,12 @@ impl Shared {
             "connection_rotate" => self.rpc_connection(method, params, peer_pid),
             "connection_revoke" => self.rpc_connection(method, params, peer_pid),
             "connection_test" => self.rpc_connection(method, params, peer_pid),
+            "connection_custody_initialize" => {
+                self.rpc_connection_custody(method, params, peer_pid)
+            }
+            "connection_custody_unlock" => self.rpc_connection_custody(method, params, peer_pid),
+            "connection_custody_lock" => self.rpc_connection_custody(method, params, peer_pid),
+            "connection_custody_status" => self.rpc_connection_custody(method, params, peer_pid),
             "crm_smtp_bind" => self.rpc_crm_smtp(method, params, peer_pid),
             "crm_smtp_rebind" => self.rpc_crm_smtp(method, params, peer_pid),
             "crm_smtp_revoke" => self.rpc_crm_smtp(method, params, peer_pid),
@@ -4736,6 +4793,8 @@ pub type FlushGate = Arc<dyn Fn() + Send + Sync>;
 /// Per-instance daemon configuration.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
+    #[cfg(test)]
+    pub(crate) custody_acceptance_shared: Option<Arc<Mutex<Option<Arc<Shared>>>>>,
     /// In-process fixture override; `serve()` leaves this unset and
     /// resolves the private state record. Never sourced from an RPC.
     pub agent_uid: Option<u32>,
@@ -4976,6 +5035,11 @@ pub struct ServeOptions {
     /// `http://smtp.internal`) with the lifecycle lease off; `None` keeps
     /// direct SMTP. Never sourced from RPC or PM.
     pub smtp_internal: Option<crate::platform::smtp_internal::SmtpInternal>,
+    /// CAD-1128: owner-selected dedicated encrypted-SQLite custody for
+    /// new SMTP-shape Connections — the key file lives outside the
+    /// state dir and every ordinary artifact root. `None` keeps the
+    /// legacy backend selection. Never sourced from RPC or PM.
+    pub encrypted_custody: Option<crate::platform::encrypted_sqlite::EncryptedCustodyConfig>,
     /// CAD-786: the public origin unsubscribe links mint
     /// (`{origin}/unsubscribe/<token>`). `https://` anywhere or
     /// loopback `http://` for rigs; `None` refuses
@@ -5031,6 +5095,23 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     std::fs::create_dir_all(state_dir)?;
     if opts.agent_uid.is_none() {
         opts.agent_uid = crate::agent_uid::config::configured_uid(state_dir)?;
+    }
+    // One fixed path-only record also governs standalone artifact exclusion.
+    // An in-process option cannot silently disagree with that admitted record.
+    let configured =
+        crate::platform::encrypted_config::load(state_dir, Some(&pm_dir_of(&opts.provider_env)?))?;
+    match (&opts.encrypted_custody, configured.as_ref()) {
+        (Some(selected), Some(record))
+            if selected.key_file == record.paths.key_file
+                && selected.vault_dir == record.paths.vault_dir => {}
+        (Some(_), _) => {
+            return Err(Error::invalid(
+                "storage_unavailable",
+                "custody path configuration mismatch",
+            ))
+        }
+        (None, Some(record)) => opts.encrypted_custody = Some(record.paths.clone()),
+        (None, None) => {}
     }
     let euid = unsafe { libc::geteuid() };
     if opts.agent_uid.is_some_and(|uid| uid == 0 || uid == euid) {

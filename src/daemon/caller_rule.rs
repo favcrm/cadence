@@ -1291,6 +1291,22 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "connection_test",
         Rule::Handler("rpc_connection: operator_connection (CAD-1065)"),
     ),
+    (
+        "connection_custody_initialize",
+        Rule::Handler("rpc_custody: operator_connection (CAD-1128)"),
+    ),
+    (
+        "connection_custody_unlock",
+        Rule::Handler("rpc_custody: operator_connection (CAD-1128)"),
+    ),
+    (
+        "connection_custody_lock",
+        Rule::Handler("rpc_custody: operator_connection (CAD-1128)"),
+    ),
+    (
+        "connection_custody_status",
+        Rule::Handler("rpc_custody: operator_connection (CAD-1128)"),
+    ),
     ("crm_smtp_bind", Rule::Handler("rpc_crm_smtp")),
     ("crm_smtp_rebind", Rule::Handler("rpc_crm_smtp")),
     ("crm_smtp_revoke", Rule::Handler("rpc_crm_smtp")),
