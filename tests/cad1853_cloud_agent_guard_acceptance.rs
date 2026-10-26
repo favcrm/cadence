@@ -80,6 +80,11 @@ struct Script {
     /// platform does: the published transport maps that to an unknown
     /// outcome rather than to a refusal.
     read_drop: bool,
+    /// Refuse the readback of THIS operation with 403 (an upstream read
+    /// revocation scoped to one receipt), while other operations answer
+    /// normally. Lets a case order "the admitted receipt was answered" before
+    /// "the newly observed one is refused" without any sleep deciding it.
+    refuse_read_operation: Option<String>,
     submit_delay_ms: u64,
     slow_read_operation: Option<String>,
     slow_read_ms: u64,
@@ -102,6 +107,7 @@ impl Script {
             read_text: "genuine stub reply".into(),
             read_status: 0,
             read_drop: false,
+            refuse_read_operation: None,
             submit_delay_ms: 0,
             slow_read_operation: None,
             slow_read_ms: 0,
@@ -168,6 +174,25 @@ impl Stub {
             .seen
             .iter()
             .map(|seen| seen.authorization.clone())
+            .collect()
+    }
+
+    /// The operation id of every readback the platform was actually asked
+    /// about, in order. This is the observable proof of which receipt a read
+    /// proved authority against, and that a re-admission happened at all.
+    fn readback_operations(&self) -> Vec<String> {
+        self.script
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .seen
+            .iter()
+            .filter(|seen| seen.action == "readback")
+            .map(|seen| {
+                seen.body["arguments"]["operation_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
             .collect()
     }
 }
@@ -372,7 +397,12 @@ fn serve(mut stream: TcpStream, script: Arc<Mutex<Script>>) {
                 return;
             }
             let script = script.lock().unwrap_or_else(|e| e.into_inner());
-            if script.read_status != 0 {
+            if script.refuse_read_operation.as_deref() == Some(operation.as_str()) {
+                (
+                    403,
+                    json!({"ok": false, "error": {"code": "forbidden", "message": "read authority revoked upstream for this operation"}}),
+                )
+            } else if script.read_status != 0 {
                 (
                     script.read_status,
                     json!({"ok": false, "error": {"code": "forbidden", "message": "read authority revoked upstream"}}),
@@ -817,6 +847,61 @@ impl Fx {
             serde_json::from_str(&text).unwrap_or(json!({"raw": text})),
             cookie,
         )
+    }
+
+    /// Read the board's SSE thread stream until `done` accepts what has
+    /// arrived or the budget runs out, then drop the connection. The stream
+    /// writes `: ping` for a page it kept nothing from, so a consumer's
+    /// progress past fully filtered rows is observable without any entry
+    /// arriving.
+    fn read_stream(
+        &self,
+        who: &str,
+        route: &str,
+        done: impl Fn(&str) -> bool,
+        budget: Duration,
+    ) -> String {
+        let host = format!("cadence-{}.localhost:{}", self.board_port, self.board_port);
+        let mut stream = TcpStream::connect(("127.0.0.1", self.board_port)).unwrap();
+        let request = format!(
+            "GET {route} HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\n\
+             X-Cadence-Board: 1\r\nAccept: text/event-stream\r\n\
+             {AS_HEADER}: {who}\r\n{TOKEN_HEADER}: {token}\r\nCookie: {cookie}\r\n\
+             X-Cadence-Session: {session}\r\nConnection: close\r\n\r\n",
+            token = self.seam_token(),
+            cookie = self.cookie,
+            session = self.session_key,
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let deadline = Instant::now() + budget;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            stream
+                .set_read_timeout(Some(left.min(Duration::from_millis(250))))
+                .unwrap();
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if done(&String::from_utf8_lossy(&buf)) {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => break,
+            }
+        }
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        String::from_utf8_lossy(&buf).to_string()
     }
 }
 
@@ -5484,18 +5569,20 @@ fn a_routed_cloud_result_is_not_projected_to_an_unrelated_agent() {
         .message(&routed.id)
         .unwrap()
         .expect("routed delivery row");
-    store
-        .finish(
-            &delivered,
-            "completed",
-            &json!({
-                "status": "completed",
-                "text": format!("peer turn observed: {}", delivered.body),
-                "via": "cad1853_guard_delivery",
-            }),
-            None,
-        )
-        .expect("the routed delivery must reach a terminal state");
+    if !matches!(delivered.state.as_str(), "completed" | "failed") {
+        store
+            .finish(
+                &delivered,
+                "completed",
+                &json!({
+                    "status": "completed",
+                    "text": format!("peer turn observed: {}", delivered.body),
+                    "via": "cad1853_guard_delivery",
+                }),
+                None,
+            )
+            .expect("the routed delivery must reach a terminal state");
+    }
     let peer_entry = store
         .thread_entries("peer", 0, 100)
         .unwrap()
@@ -5582,18 +5669,106 @@ fn a_routed_cloud_result_is_not_projected_to_an_unrelated_agent() {
     }
 }
 
-/// An admission is fixed when a read begins: a long-poll that observes a turn
-/// it was not admitted for re-proves authority before projecting it, so a
-/// revocation landing during the wait withholds the reply — while the same
-/// interleaving under a live grant serves the new request.
+/// The projection's default is denial. An id it never admitted is withheld,
+/// never rendered as ordinary content: an entry whose message row no longer
+/// exists cannot be classified, so it is dropped rather than shown. The
+/// previous default (`Row::Full` for an unknown id) painted it as plain mail.
+/// The page must still advance past it, or a reader would stall on a row it
+/// is not allowed to see.
+#[test]
+fn an_id_outside_the_admission_snapshot_is_withheld_and_the_page_advances() {
+    const MISSING: &str = "m-cad1853-vanished-row";
+    const MISSING_TEXT: &str = "orphaned entry text that must never project";
+
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    let store = fx.store();
+    let orphan = store
+        .thread_append(
+            ALIAS,
+            cadence_agent::store::NewEntry {
+                role: "agent",
+                kind: "message",
+                text: MISSING_TEXT,
+                payload: None,
+                message_id: Some(MISSING),
+            },
+        )
+        .unwrap()
+        .expect("the orphaned entry is appended to the thread");
+    assert!(
+        store.message(MISSING).unwrap().is_none(),
+        "the fixture must not create the message row the entry names"
+    );
+
+    let read = fx
+        .call(
+            Asserted::Operator,
+            "thread_read",
+            json!({"alias": ALIAS, "after": 0, "limit": 200}),
+        )
+        .unwrap();
+    let rendered = read.to_string();
+    assert!(
+        !rendered.contains(MISSING_TEXT),
+        "an unadmitted id was rendered as ordinary content: {rendered}"
+    );
+    assert!(
+        !rendered.contains(MISSING),
+        "an unadmitted id reached the projection: {rendered}"
+    );
+    assert!(
+        rendered.contains(TEXT),
+        "the admitted turn stopped projecting: {rendered}"
+    );
+    // The cursor follows what the projection scanned, so the withheld row is
+    // behind it rather than in front of every later read.
+    let cursor = read["cursor"]
+        .as_i64()
+        .or_else(|| read["scanned"].as_i64())
+        .or_else(|| read["page"]["cursor"].as_i64())
+        .unwrap_or_else(|| panic!("the page must report where it stopped: {read}"));
+    assert!(
+        cursor >= orphan,
+        "the page did not advance past the withheld row ({cursor} < {orphan})"
+    );
+    let after = fx
+        .call(
+            Asserted::Operator,
+            "thread_read",
+            json!({"alias": ALIAS, "after": cursor, "limit": 200}),
+        )
+        .unwrap();
+    assert!(
+        !after.to_string().contains(MISSING_TEXT),
+        "a later page re-served the withheld row: {after}"
+    );
+}
+
+/// An admission is fixed when a read begins, and that ordering is explicit
+/// here: the wait's own platform proof is recorded BEFORE read authority
+/// changes, so the snapshot it froze — and the answer it got — predate the
+/// change. A long-poll that then observes a turn it was not admitted for
+/// re-proves authority before projecting it, so the revocation withholds it;
+/// the same ordered interleaving under a live grant serves the new turn.
 #[test]
 fn a_waiting_thread_read_re_proves_authority_before_projecting_a_new_turn() {
     let fx = Fx::start();
     let connect = fx.connect();
     let id = cloud_agent_id(&connect);
     let home = thread_of(&connect);
-    // One settled turn gives the caller an admitted receipt the platform can
-    // be asked about during the wait.
+    // One settled turn gives the admission a receipt to prove.
     fx.call(
         Asserted::Operator,
         "cloud_agent_send",
@@ -5617,7 +5792,12 @@ fn a_waiting_thread_read_re_proves_authority_before_projecting_a_new_turn() {
         .expect("the settled turn wrote entries")
         .seq;
 
-    // 1. The wait is admitted while read authority is live...
+    // The platform refuses exactly the turn that lands during the wait; the
+    // already-admitted receipt still answers normally.
+    fx.stub.set(|script| {
+        script.refuse_read_operation = Some("operation-00000031".into());
+    });
+    let before = fx.stub.readback_operations();
     let waiting = {
         let state = fx.state.clone();
         thread::spawn(move || {
@@ -5630,11 +5810,25 @@ fn a_waiting_thread_read_re_proves_authority_before_projecting_a_new_turn() {
             })
         })
     };
-    thread::sleep(Duration::from_millis(150));
-    // ...then the platform revokes read upstream and a new turn lands. The
-    // stub answers the submit as completed, so the trigger settles under
-    // WRITE authority alone — the wait must still re-prove its READ authority
-    // before projecting it.
+    // ORDERING, not a sleep: the wait's admission asks the platform about its
+    // own receipt before anything changes, which is what proves the snapshot
+    // and the proof both happened first.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fx.stub.readback_operations().len() <= before.len() {
+        assert!(
+            Instant::now() < deadline,
+            "the wait's admission never proved its receipt: {:?}",
+            fx.stub.readback_operations()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        fx.stub.readback_operations().last().map(String::as_str),
+        Some(OPERATION),
+        "the admission proved something other than its own receipt"
+    );
+    // Now authority changes and the observed turn lands. Its submit settles
+    // under WRITE authority alone, so only the READ re-proof can withhold it.
     fx.stub.set(|script| {
         script.read_status = 403;
         script.submit_state = "completed".into();
@@ -5657,16 +5851,25 @@ fn a_waiting_thread_read_re_proves_authority_before_projecting_a_new_turn() {
         .unwrap()
         .expect_err("the revoked wait must refuse, not serve from its old admission");
     assert_eq!(code(&error), Some("cloud_agent_scope_revoked"), "{error}");
+    // The wait asked the platform about the turn it observed. Without that
+    // re-proof it would project the new rows under the admission taken before
+    // them, so this counter is the case's discriminator.
+    let probes = fx.stub.readback_operations();
+    assert_eq!(
+        probes[probes.len() - 2..],
+        [OPERATION.to_string(), "operation-00000031".to_string()],
+        "the wait did not re-prove authority for the turn it observed: {probes:?}"
+    );
     assert!(
         !error.to_string().contains("revoked wait request")
             && !error.to_string().contains("revoked wait reply"),
         "the refused wait projected the newly settled turn: {error}"
     );
 
-    // 2. Positive control: the same wait under a live grant serves the turn it
-    // was not admitted for.
+    // Positive control: the same ordered interleaving under a live grant.
     fx.stub.set(|script| {
         script.read_status = 0;
+        script.refuse_read_operation = None;
         script.submit_text = Some("second reply".into());
     });
     let last = fx
@@ -5676,6 +5879,7 @@ fn a_waiting_thread_read_re_proves_authority_before_projecting_a_new_turn() {
         .last()
         .expect("the settled trigger wrote entries")
         .seq;
+    let before = fx.stub.readback_operations();
     let waiting = {
         let state = fx.state.clone();
         thread::spawn(move || {
@@ -5688,7 +5892,14 @@ fn a_waiting_thread_read_re_proves_authority_before_projecting_a_new_turn() {
             })
         })
     };
-    thread::sleep(Duration::from_millis(150));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fx.stub.readback_operations().len() <= before.len() {
+        assert!(
+            Instant::now() < deadline,
+            "the second wait's admission never proved its receipt"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     fx.call(
         Asserted::Operator,
         "cloud_agent_send",
@@ -5706,6 +5917,11 @@ fn a_waiting_thread_read_re_proves_authority_before_projecting_a_new_turn() {
     assert!(
         page.to_string().contains("second request"),
         "the re-proved wait withheld the new request: {page}"
+    );
+    assert_eq!(
+        fx.stub.readback_operations().last().map(String::as_str),
+        Some("operation-00000032"),
+        "the wait served a turn it never re-proved authority for"
     );
 }
 
@@ -6214,19 +6430,22 @@ fn a_portable_round_trip_with_an_enrolled_peer_drops_the_routed_result() {
     // what the daemon calls on a finished turn, and its result echoes the
     // routed prompt, so the peer alias gets the `turn_finished` event and the
     // result entry that quote the cloud reply. That is exactly the state the
-    // event closure has to drop.
+    // event closure has to drop. If the fixture's own actor already finished
+    // it, that completion is the state under test.
     let delivered = store
         .message(&routed.id)
         .unwrap()
         .expect("routed delivery row");
-    let turn = json!({
-        "status": "completed",
-        "text": format!("peer turn observed: {}", delivered.body),
-        "via": "cad1853_guard_delivery",
-    });
-    store
-        .finish(&delivered, "completed", &turn, None)
-        .expect("the routed delivery must reach a terminal state");
+    if !matches!(delivered.state.as_str(), "completed" | "failed") {
+        let turn = json!({
+            "status": "completed",
+            "text": format!("peer turn observed: {}", delivered.body),
+            "via": "cad1853_guard_delivery",
+        });
+        store
+            .finish(&delivered, "completed", &turn, None)
+            .expect("the routed delivery must reach a terminal state");
+    }
     let settled = store
         .message(&routed.id)
         .unwrap()
@@ -6638,5 +6857,592 @@ fn a_fully_filtered_thread_page_advances_the_cursor() {
             .iter()
             .any(|text| text == PEER_REQUEST || text == PEER_REPLY),
         "the pager surfaced the other source's rows: {texts:?}"
+    );
+}
+
+// ---------- round six: default deny, snapshot ordering, stream cursor ----------
+
+/// A read admits nothing by default. A long-poll admitted with NO operation
+/// takes no snapshot entry and asks the platform nothing; the turn that lands
+/// afterwards is not served by that read — it is served only under a fresh
+/// proof, which here refuses it, and a fresh read follows current authority.
+#[test]
+fn an_operation_created_after_the_snapshot_is_served_only_under_a_fresh_proof() {
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    assert!(
+        fx.stub.readback_operations().is_empty(),
+        "a fresh connection has no receipt to prove: {:?}",
+        fx.stub.readback_operations()
+    );
+
+    // The wait is admitted with no operation at all.
+    let waiting = {
+        let state = fx.state.clone();
+        thread::spawn(move || {
+            scoped(Asserted::Operator, || {
+                client::rpc(
+                    &state,
+                    "thread_read",
+                    json!({"alias": ALIAS, "after": 0, "wait": 20}),
+                )
+            })
+        })
+    };
+    thread::sleep(Duration::from_millis(250));
+    assert!(
+        fx.stub.readback_operations().is_empty(),
+        "an admission with no operation must ask the platform nothing: {:?}",
+        fx.stub.readback_operations()
+    );
+
+    // The platform refuses the turn that lands now; its submit still settles
+    // under WRITE authority.
+    fx.stub.set(|script| {
+        script.refuse_read_operation = Some("operation-00000051".into());
+        script.submit_state = "completed".into();
+        script.submit_text = Some("post-snapshot reply".into());
+    });
+    let landed = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_send",
+            json!({
+                "cloud_agent_id": id, "thread_id": home,
+                "text": "post-snapshot request",
+                "operation_id": "operation-00000051", "wake": true,
+            }),
+        )
+        .expect("submitting a turn needs write authority, not read");
+    assert_eq!(landed["operation"]["status"], json!("completed"));
+    let error = waiting.join().unwrap().expect_err(
+        "the read must not serve an operation created after its snapshot without a fresh proof",
+    );
+    assert_eq!(code(&error), Some("cloud_agent_scope_revoked"), "{error}");
+    assert!(
+        !error.to_string().contains("post-snapshot request")
+            && !error.to_string().contains("post-snapshot reply"),
+        "the read served the operation its snapshot never named: {error}"
+    );
+    // The fresh proof is what asked the platform about it.
+    assert_eq!(
+        fx.stub.readback_operations(),
+        vec!["operation-00000051".to_string()],
+        "the observed turn was never re-proved"
+    );
+
+    // A NEW read of the same turn follows current authority: refused while
+    // the platform refuses that receipt...
+    let refused = fx
+        .call(Asserted::Operator, "thread_read", json!({"alias": ALIAS}))
+        .unwrap_err();
+    assert_eq!(
+        code(&refused),
+        Some("cloud_agent_scope_revoked"),
+        "{refused}"
+    );
+    assert!(!refused.to_string().contains("post-snapshot reply"));
+    // ...and served once the platform answers again.
+    fx.stub.set(|script| script.refuse_read_operation = None);
+    let served = fx
+        .call(Asserted::Operator, "thread_read", json!({"alias": ALIAS}))
+        .expect("a fresh read under a live grant serves the turn");
+    assert!(
+        served.to_string().contains("post-snapshot request"),
+        "{served}"
+    );
+}
+
+/// A cloud result that resolves AFTER a read was admitted is in neither half
+/// of that admission's snapshot, so it is never rendered as ordinary mail: the
+/// reader re-resolves and the row appears only under its real delivery
+/// binding — visible to the delivery's recipient, withheld from an unrelated
+/// agent.
+#[test]
+fn a_routed_cloud_result_resolving_after_admission_keeps_its_binding() {
+    use cadence_agent::cloud_agent::{
+        self, CloudTransport, RemoteAgent, RemoteOperation, RemoteStatus, Sender, Source,
+        SubmitRequest,
+    };
+    use cadence_agent::remote_cli::RemoteTarget;
+    use cadence_agent::store::cloud_agent::{CloudSource, Owner};
+
+    const EARLY: &str = "early routed reply";
+    const LATE: &str = "late routed reply";
+    const EARLY_OPERATION: &str = "peer-operation-0007";
+    const LATE_OPERATION: &str = "peer-operation-0008";
+
+    struct Reply(&'static str);
+    impl CloudTransport for Reply {
+        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+            Err(cadence_agent::Error::rejected("connect unused"))
+        }
+        fn submit(
+            &self,
+            _: &RemoteTarget,
+            request: &SubmitRequest<'_>,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Ok(RemoteOperation {
+                status: RemoteStatus::Completed,
+                remote_operation_id: Some(request.operation_id.to_string()),
+                remote_session_id: None,
+                provider_session_id: None,
+                reply: Some(self.0.into()),
+                error: None,
+                invoker_id: Some("inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+            })
+        }
+        fn read(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Err(cadence_agent::Error::rejected("read unused"))
+        }
+        fn cancel(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<()> {
+            Err(cadence_agent::Error::rejected("cancel unused"))
+        }
+    }
+
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    for alias in ["peer", "outsider"] {
+        fx.call(
+            Asserted::Operator,
+            "agent_register",
+            json!({"alias": alias, "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
+        )
+        .unwrap();
+    }
+    fx.call(
+        Asserted::Operator,
+        "thread_send",
+        json!({
+            "alias": "peer", "text": "ordinary peer mail",
+            "message": "m-peer-ordinary",
+        }),
+    )
+    .unwrap();
+    let store = fx.store();
+    let cloud = store.cloud_agent(&id).unwrap().expect("cloud agent");
+    let peer = store.agent("peer").unwrap();
+    let stamp = cadence_agent::cloud_agent::registration_epoch(peer.created);
+    let owner = Owner::new("https://issuer.example.test", "stub-subject");
+    store
+        .cloud_agent_source_grant(&CloudSource {
+            cloud_agent_id: id.clone(),
+            kind: "local_peer".into(),
+            uid: peer.uid.clone(),
+            registration_epoch: stamp,
+            owner: owner.clone(),
+            label: "peer".into(),
+            scope: "cloud_agent.write".into(),
+            granted_by: "operator".into(),
+            granted_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+            invoker_id: None,
+            state: "active".into(),
+        })
+        .unwrap();
+    let target = RemoteTarget {
+        org: cloud.org_slug.clone(),
+        endpoint: cloud.endpoint.clone(),
+        org_id: cloud.organization_id.clone(),
+        identity: None,
+    };
+    let source = Source::registered(&peer, owner.clone());
+    // One routed result already exists, so the alias' admission enumerates a
+    // derived row and its ordinary mail: the default-deny path is live.
+    cloud_agent::send(
+        &store,
+        &Reply(EARLY),
+        &cloud,
+        &target,
+        &home,
+        &Sender::Agent("peer".into()),
+        &source,
+        EARLY_OPERATION,
+        "early peer request",
+        true,
+        None,
+        || Ok(()),
+    )
+    .expect("the admitted peer source settles its own turn");
+    // The alias' own turn and the first routed result are delivered by the
+    // fixture's fake actor; freeze the admission point only after both are
+    // terminal and their entries exist, so nothing but the intended late
+    // result can land during the wait.
+    let routed_early = store
+        .messages("peer")
+        .unwrap()
+        .into_iter()
+        .find(|row| row.source == "worker_result" && row.origin.as_deref() == Some(EARLY_OPERATION))
+        .expect("the first routed cloud result");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let terminal = |id: &str| {
+            store
+                .message(id)
+                .unwrap()
+                .is_some_and(|row| matches!(row.state.as_str(), "completed" | "failed"))
+        };
+        let entries = store.thread_entries("peer", 0, 100).unwrap();
+        let settled = |id: &str| {
+            entries
+                .iter()
+                .any(|entry| entry.message_id.as_deref() == Some(id))
+        };
+        if terminal("m-peer-ordinary")
+            && terminal(&routed_early.id)
+            && settled("m-peer-ordinary")
+            && settled(&routed_early.id)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fixture never finished the peer's ordinary turn and first routed result"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        store
+            .thread_entries("peer", 0, 100)
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry.message_id.as_deref() == Some(routed_early.id.as_str())
+                    && entry.text.contains(EARLY)
+            }),
+        "the first routed result never wrote its reply text"
+    );
+    let last = store
+        .thread_entries("peer", 0, 100)
+        .unwrap()
+        .last()
+        .expect("the peer alias has its ordinary mail entry")
+        .seq;
+
+    // Two reads are admitted before the new result resolves: the delivery's
+    // recipient, and an unrelated agent on the same socket.
+    let recipient = {
+        let state = fx.state.clone();
+        thread::spawn(move || {
+            scoped(Asserted::Agent("peer".into()), || {
+                client::rpc(
+                    &state,
+                    "thread_read",
+                    json!({"alias": "peer", "after": last, "wait": 20}),
+                )
+            })
+        })
+    };
+    let unrelated = {
+        let state = fx.state.clone();
+        thread::spawn(move || {
+            scoped(Asserted::Agent("outsider".into()), || {
+                client::rpc(
+                    &state,
+                    "thread_read",
+                    json!({"alias": "peer", "after": last, "wait": 5}),
+                )
+            })
+        })
+    };
+    thread::sleep(Duration::from_millis(400));
+    // The new cloud result resolves AFTER both admissions: a new operation,
+    // then its delivered completion — a derived row in neither snapshot.
+    cloud_agent::send(
+        &store,
+        &Reply(LATE),
+        &cloud,
+        &target,
+        &home,
+        &Sender::Agent("peer".into()),
+        &source,
+        LATE_OPERATION,
+        "late peer request",
+        true,
+        None,
+        || Ok(()),
+    )
+    .expect("the second peer turn settles");
+    let routed_late = store
+        .messages("peer")
+        .unwrap()
+        .into_iter()
+        .find(|row| row.source == "worker_result" && row.origin.as_deref() == Some(LATE_OPERATION))
+        .expect("the new routed cloud result");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let terminal = store
+            .message(&routed_late.id)
+            .unwrap()
+            .is_some_and(|row| matches!(row.state.as_str(), "completed" | "failed"));
+        let settled = store
+            .thread_entries("peer", 0, 100)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.message_id.as_deref() == Some(routed_late.id.as_str()));
+        if terminal && settled {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fixture never finished the newly routed result"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        store
+            .thread_entries("peer", 0, 100)
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry.message_id.as_deref() == Some(routed_late.id.as_str())
+                    && entry.text.contains(LATE)
+            }),
+        "the newly routed result never wrote its reply text"
+    );
+
+    // The recipient's admitted read re-resolves and renders it under the
+    // delivery binding...
+    let recipient_page = recipient
+        .join()
+        .unwrap()
+        .expect("the recipient's wait must not refuse");
+    assert!(
+        recipient_page.to_string().contains(LATE),
+        "the recipient's wait did not render the newly resolved result under its binding: {recipient_page}"
+    );
+    // ...and the unrelated agent's admitted read withholds it: not rendered
+    // as ordinary mail, and not an error that would mask the decision.
+    let unrelated_page = unrelated
+        .join()
+        .unwrap()
+        .expect("the unrelated agent's wait is a refusal only for cloud content, not a read error");
+    assert!(
+        !unrelated_page.to_string().contains(LATE),
+        "the unrelated agent read the newly resolved cloud reply: {unrelated_page}"
+    );
+    assert!(
+        !unrelated_page.to_string().contains(&routed_late.id),
+        "the unrelated agent read the delivery's entry: {unrelated_page}"
+    );
+    assert!(
+        unrelated_page["entries"]
+            .as_array()
+            .expect("thread entries")
+            .is_empty(),
+        "the newly resolved row was rendered as unrestricted ordinary mail: {unrelated_page}"
+    );
+    // And the same unrelated agent still reads the alias' ordinary mail.
+    let ordinary = fx
+        .call(
+            Asserted::Agent("outsider".into()),
+            "agent_show",
+            json!({"alias": "peer"}),
+        )
+        .expect("the alias' ordinary mail still projects");
+    assert!(
+        ordinary.to_string().contains("ordinary peer mail"),
+        "the unrelated agent lost the alias' ordinary mail: {ordinary}"
+    );
+    assert!(!ordinary.to_string().contains(LATE));
+}
+
+/// The board's server-side thread stream advances its cursor by what the
+/// daemon page SCANNED. With a whole page (the stream's own limit) of another
+/// source's rows ahead of the caller's turn, the stream must move past them and
+/// deliver every visible entry exactly once instead of re-reading the hidden
+/// page forever.
+#[test]
+fn the_board_thread_stream_advances_past_a_fully_filtered_page() {
+    use cadence_agent::cloud_agent::{
+        self, CloudTransport, RemoteAgent, RemoteOperation, RemoteStatus, Sender, Source,
+        SubmitRequest,
+    };
+    use cadence_agent::remote_cli::RemoteTarget;
+    use cadence_agent::store::cloud_agent::{CloudSource, Owner};
+
+    const PEER_REPLY: &str = "peer stream reply";
+
+    struct PeerReply;
+    impl CloudTransport for PeerReply {
+        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+            Err(cadence_agent::Error::rejected("connect unused"))
+        }
+        fn submit(
+            &self,
+            _: &RemoteTarget,
+            request: &SubmitRequest<'_>,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Ok(RemoteOperation {
+                status: RemoteStatus::Completed,
+                remote_operation_id: Some(request.operation_id.to_string()),
+                remote_session_id: None,
+                provider_session_id: None,
+                reply: Some(PEER_REPLY.into()),
+                error: None,
+                invoker_id: Some("inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+            })
+        }
+        fn read(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Err(cadence_agent::Error::rejected("read unused"))
+        }
+        fn cancel(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<()> {
+            Err(cadence_agent::Error::rejected("cancel unused"))
+        }
+    }
+
+    let mut fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "agent_register",
+        json!({"alias": "peer", "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
+    )
+    .unwrap();
+    let store = fx.store();
+    let cloud = store.cloud_agent(&id).unwrap().expect("cloud agent");
+    let peer = store.agent("peer").unwrap();
+    let stamp = cadence_agent::cloud_agent::registration_epoch(peer.created);
+    let source = Source::registered(
+        &peer,
+        Owner::new("https://issuer.example.test", "stub-subject"),
+    );
+    store
+        .cloud_agent_source_grant(&CloudSource {
+            cloud_agent_id: id.clone(),
+            kind: "local_peer".into(),
+            uid: peer.uid.clone(),
+            registration_epoch: stamp,
+            owner: source.owner.clone(),
+            label: "peer".into(),
+            scope: "cloud_agent.write".into(),
+            granted_by: "operator".into(),
+            granted_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+            invoker_id: None,
+            state: "active".into(),
+        })
+        .unwrap();
+    let target = RemoteTarget {
+        org: cloud.org_slug.clone(),
+        endpoint: cloud.endpoint.clone(),
+        org_id: cloud.organization_id.clone(),
+        identity: None,
+    };
+    // A full stream page (limit 100) of the other source's rows comes first,
+    // so the stream's first scan keeps nothing at all.
+    for index in 0..50 {
+        cloud_agent::send(
+            &store,
+            &PeerReply,
+            &cloud,
+            &target,
+            &home,
+            &Sender::Agent("peer".into()),
+            &source,
+            &format!("peer-stream-{index:04}"),
+            &format!("peer stream request {index}"),
+            true,
+            None,
+            || Ok(()),
+        )
+        .expect("the admitted peer source settles its own turn");
+    }
+    let hidden = store.thread_entries(ALIAS, 0, 100).unwrap();
+    assert_eq!(
+        hidden.len(),
+        100,
+        "the first stream page is not exactly the other source's rows"
+    );
+    assert!(
+        hidden.iter().all(|entry| entry
+            .message_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("peer-stream-"))),
+        "the first stream page is not the other source's rows: {hidden:?}"
+    );
+
+    // The caller's own settled turn sits beyond that page.
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_read",
+        json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+    )
+    .unwrap();
+    let visible: Vec<i64> = store
+        .thread_entries(ALIAS, 0, 200)
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.message_id.as_deref() == Some(OPERATION))
+        .map(|entry| entry.seq)
+        .collect();
+    assert_eq!(
+        visible.len(),
+        2,
+        "the caller's turn is not beyond the hidden page: {visible:?}"
+    );
+
+    fx.start_board();
+    let stream = fx.read_stream(
+        "operator",
+        &format!("/api/threads/{ALIAS}/stream?after=0"),
+        |text| text.matches("event: entry").count() >= 2,
+        Duration::from_secs(12),
+    );
+    let ids: Vec<i64> = stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("id: "))
+        .filter_map(|value| value.trim().parse::<i64>().ok())
+        .collect();
+    assert_eq!(
+        ids, visible,
+        "the stream did not deliver exactly the visible entries once: {stream}"
+    );
+    assert!(
+        !stream.contains("peer stream request"),
+        "the stream surfaced the other source's rows: {stream}"
     );
 }

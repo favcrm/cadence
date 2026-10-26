@@ -3262,7 +3262,7 @@ impl Shared {
                 // the same source/owner decision as the dedicated cloud read:
                 // current READ authority for the caller's own source, and
                 // only that source's messages.
-                let projection = self.admit_cloud_projection(&alias, peer_pid, "agent show")?;
+                let mut projection = self.admit_cloud_projection(&alias, peer_pid, "agent show")?;
                 let include_profile_instructions = match params.get("include_profile_instructions")
                 {
                     None | Some(Value::Null) => false,
@@ -3340,6 +3340,19 @@ impl Shared {
                 } else {
                     self.store.messages(&alias)?
                 };
+                // This read observes rows, then projects them: anything the
+                // admission snapshot does not cover — a routed cloud result
+                // that resolved since, or mail that arrived meanwhile — is
+                // outside what authority was proven for, so re-resolve the
+                // page once before deciding. Only rows the fresh admission
+                // names are projected; the rest is withheld, never rendered
+                // as ordinary.
+                if projection.needs_readmission(
+                    &self.store,
+                    messages.iter().map(|message| message.id.as_str()),
+                )? {
+                    projection = self.admit_cloud_projection(&alias, peer_pid, "agent show")?;
+                }
                 let messages = projection.messages(&self.store, messages)?;
                 let mut agent_json = agent.to_json();
                 if profile_snapshot || catalogue_snapshot {

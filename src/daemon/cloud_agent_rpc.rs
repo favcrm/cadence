@@ -93,6 +93,16 @@ struct CloudScope {
 
 /// The caller's own admitted view of one alias.
 ///
+/// THE RULE, enforced by construction in [`CloudProjection::row`]: a
+/// projection renders a row only if that row was affirmatively admitted in a
+/// snapshot taken when the read began — BEFORE any authority proof — and the
+/// projection re-resolves that snapshot whenever an observation names
+/// anything outside it ([`CloudProjection::needs_readmission`]). Nothing is
+/// admitted by default: an unknown message id, a row that appeared during a
+/// wait, and a derived row that resolved after admission are all withheld
+/// until a fresh admission names them, so a read can never widen the set of
+/// rows it renders beyond what authority was proven for.
+///
 /// A cloud alias carries the caller's own source per connection, and every
 /// projected row must resolve to an operation that source was admitted for,
 /// in the state the admission covered. An ordinary local alias projects
@@ -105,6 +115,12 @@ pub(super) struct CloudProjection {
     /// Cloud-derived rows on an ordinary alias by message id, with the
     /// delivered UID binding.
     derived: std::collections::HashMap<String, crate::store::cloud_agent::CloudDerivedRow>,
+    /// The ordinary mail of an ordinary alias, enumerated in the same
+    /// snapshot. This is what makes that alias' own rows admitted explicitly
+    /// rather than by absence from [`Self::derived`]. Empty when this
+    /// projection is unscoped (the alias carries no cloud content at all) or
+    /// scoped (a cloud alias' rows route through [`Self::scopes`]).
+    ordinary: std::collections::BTreeSet<String>,
     /// The caller's verified agent UID, when the connection derives one.
     viewer: Option<String>,
     /// The connection is provably the operator.
@@ -117,6 +133,7 @@ impl CloudProjection {
         Self {
             scopes: Vec::new(),
             derived: std::collections::HashMap::new(),
+            ordinary: std::collections::BTreeSet::new(),
             viewer: None,
             operator: false,
         }
@@ -127,15 +144,19 @@ impl CloudProjection {
         Self {
             scopes,
             derived: std::collections::HashMap::new(),
+            ordinary: std::collections::BTreeSet::new(),
             viewer: None,
             operator: false,
         }
     }
 
     /// An ordinary alias holding cloud-derived rows: those rows are bound to
-    /// the UIDs their delivery carried.
+    /// the UIDs their delivery carried, and the alias' own mail is admitted
+    /// by enumeration — the snapshot names exactly the rows that were
+    /// ordinary when the read began.
     fn derived_rows(
         rows: Vec<crate::store::cloud_agent::CloudDerivedRow>,
+        ordinary: Vec<String>,
         viewer: Option<String>,
         operator: bool,
     ) -> Self {
@@ -145,6 +166,7 @@ impl CloudProjection {
                 .into_iter()
                 .map(|row| (row.message_id.clone(), row))
                 .collect(),
+            ordinary: ordinary.into_iter().collect(),
             viewer,
             operator,
         }
@@ -186,6 +208,11 @@ impl CloudProjection {
         row.sender_uid.as_deref() == Some(viewer) || row.recipient_uid.as_deref() == Some(viewer)
     }
 
+    /// What this snapshot admits for one message id. Default DENY: a row the
+    /// snapshot did not name is withheld, never assumed ordinary — an id
+    /// absent from the derived map may be a routed cloud result that resolved
+    /// after admission, and rendering it would hand another source's reply to
+    /// whoever asks.
     fn row(&self, store: &crate::store::Store, message_id: &str) -> Result<Row> {
         if !self.scopes.is_empty() {
             return Ok(match self.admission(store, message_id)? {
@@ -194,25 +221,50 @@ impl CloudProjection {
                 None => Row::Never,
             });
         }
-        match self.derived.get(message_id) {
-            None => Ok(Row::Full),
-            Some(row) => Ok(if self.bound(row) {
+        if let Some(row) = self.derived.get(message_id) {
+            return Ok(if self.bound(row) {
                 Row::Full
             } else {
                 Row::Never
-            }),
+            });
         }
+        // An ordinary alias: only the mail this snapshot enumerated.
+        Ok(if self.ordinary.contains(message_id) {
+            Row::Full
+        } else {
+            Row::Never
+        })
     }
 
-    /// Whether these rows carry content this admission does not cover because
-    /// one of the caller's own operations settled after it was taken. A
-    /// waiting read re-proves authority before it may project such rows.
+    /// Whether this observation names anything the admission snapshot does
+    /// not cover, so the read must re-resolve the whole page's admission
+    /// before projecting it.
+    ///
+    /// Two things land here. On a cloud alias, a row of the caller's own
+    /// source that settled after the snapshot was taken. On an ordinary
+    /// alias, an id the snapshot enumerates neither as ordinary mail nor as a
+    /// bound derived row — which is exactly what a routed cloud result
+    /// resolving after admission (or mail arriving during a wait) looks like.
+    /// Either way the caller has not been admitted for it, so a read that
+    /// projects it under the old snapshot would widen its own view beyond
+    /// what authority was proven for.
     pub(super) fn needs_readmission<'a>(
         &self,
         store: &crate::store::Store,
         ids: impl IntoIterator<Item = &'a str>,
     ) -> Result<bool> {
+        // No cloud content resolves on this alias: the alias' own mail
+        // projects whole and there is nothing to re-prove.
+        if self.scopes.is_empty() && self.derived.is_empty() {
+            return Ok(false);
+        }
         for id in ids {
+            if self.scopes.is_empty() {
+                if !self.ordinary.contains(id) && !self.derived.contains_key(id) {
+                    return Ok(true);
+                }
+                continue;
+            }
             for scope in &self.scopes {
                 let Some(operation) = store.cloud_agent_operation(&scope.cloud_agent_id, id)?
                 else {
@@ -523,11 +575,14 @@ impl Shared {
     /// The returned admission also binds every projected row to the state it
     /// had when the read began: a cloud row is shown only to the source/owner
     /// its operation was admitted for, and only as far as that snapshot
-    /// reaches. The operator is the owner of its own user source, never a
-    /// blanket reader of a peer's entries, and an enrolled peer never reads
-    /// another source's alias-wide history. When cloud content exists but no
-    /// authority metadata resolves at all — a restored workspace whose four
-    /// cloud tables were omitted — the projection fails closed.
+    /// reaches. The snapshot is taken BEFORE either authority proof, so the
+    /// platform's answer can never widen it: an operation that settled while
+    /// the proof ran is not admitted after the fact. The operator is the
+    /// owner of its own user source, never a blanket reader of a peer's
+    /// entries, and an enrolled peer never reads another source's alias-wide
+    /// history. When cloud content exists but no authority metadata resolves
+    /// at all — a restored workspace whose four cloud tables were omitted —
+    /// the projection fails closed.
     pub(super) fn admit_cloud_projection(
         &self,
         alias: &str,
@@ -554,23 +609,13 @@ impl Shared {
         let mut scopes = Vec::with_capacity(cloud_agents.len());
         for agent in cloud_agents {
             let (_, source) = self.cloud_agent_caller_source(&agent, peer_pid, verb)?;
-            // Current READ authority — connection state, the active grant and
-            // the scope on the verified credential/enrollment — not bare
-            // membership: a write-only operator must not read stored replies
-            // through a generic projection.
-            self.cloud_agent_authority(&agent, &source, SCOPE_READ)?;
-            // The local copy proves what the workspace STORED, not what the
-            // platform still allows: a read scope revoked upstream leaves the
-            // saved login valid and unexpired. The platform's own answer is
-            // required before any stored cloud text is projected — and its
-            // state decides whether the stored receipt may be shown at all.
-            let answer = self.cloud_read_authority(&agent, &source)?;
-            // Every operation this caller's own source owns is admitted in
-            // the state it had WHEN this read began: a row may only be
-            // projected as far as that snapshot reaches, so a settlement
-            // that lands while a read waits is never served under an
-            // admission that did not cover it. The waiting readers re-prove
-            // authority before projecting such content (see
+            // FIRST the snapshot, before any authority proof: every operation
+            // this caller's own source owned, in the state it had when this
+            // read began. Freezing the set here is what makes a proof unable
+            // to move a row into the admitted set after the fact — a
+            // settlement that lands below is never served under an admission
+            // that did not cover it, and the waiting readers re-resolve
+            // instead of projecting it (see
             // [`CloudProjection::needs_readmission`]).
             let mut admitted = std::collections::BTreeMap::new();
             for operation in self.store.cloud_agent_operations(&agent.id, None)? {
@@ -584,12 +629,32 @@ impl Shared {
                 };
                 admitted.insert(operation.operation_id, admission);
             }
+            // THEN the authority proofs. Current READ authority — connection
+            // state, the active grant and the scope on the verified
+            // credential/enrollment — not bare membership: a write-only
+            // operator must not read stored replies through a generic
+            // projection.
+            self.cloud_agent_authority(&agent, &source, SCOPE_READ)?;
+            // The local copy proves what the workspace STORED, not what the
+            // platform still allows: a read scope revoked upstream leaves the
+            // saved login valid and unexpired. The platform's own answer is
+            // required before any stored cloud text is projected — and its
+            // state decides whether the stored receipt may be shown at all.
+            let answer = self.cloud_read_authority(&agent, &source)?;
+            // Decided from the snapshot AND the answer together: the snapshot
+            // names the operations, the answer may only change the state of
+            // one it names. It never ADMITS an operation the snapshot did not
+            // name — that operation did not exist when the read began, so its
+            // content was never admitted for this read.
             if let Some((operation_id, state)) = answer {
                 match state {
                     // Only the platform's own terminal-completed answer
-                    // covers the stored receipt.
+                    // covers the stored receipt — and only for an operation
+                    // this read already admitted.
                     PlatformState::Completed => {
-                        admitted.insert(operation_id, Admission::Settled);
+                        if let Some(admission) = admitted.get_mut(&operation_id) {
+                            *admission = Admission::Settled;
+                        }
                     }
                     // Nonterminal or failed: the platform does not report
                     // this operation settled, so no stored reply text for it
@@ -618,12 +683,19 @@ impl Shared {
     /// operator reads them, and any other connection on the same socket UID
     /// (an unrelated, unenrolled agent) does not. The alias' ordinary local
     /// mail is untouched: a UID-bound report that did not derive from cloud
-    /// content has no such provenance and projects exactly as before.
+    /// content has no such provenance and is admitted here by enumeration.
+    ///
+    /// Both halves are the same snapshot, taken now: the derived rows WITH
+    /// their binding, and the ids that were ordinary. Together they enumerate
+    /// the whole alias, so [`CloudProjection::row`] has no default to fall
+    /// back on — a row that resolved after this point is in neither half and
+    /// is withheld until a read re-resolves.
     fn admit_derived_cloud_rows(&self, alias: &str, peer_pid: u32) -> Result<CloudProjection> {
         let rows = self.store.cloud_derived_messages(alias)?;
         if rows.is_empty() {
             return Ok(CloudProjection::ordinary());
         }
+        let ordinary = self.store.ordinary_message_ids(alias)?;
         let (viewer, operator) = match self.connection_caller(peer_pid) {
             Ok(caller_rule::Who::Operator) => (None, true),
             Ok(caller_rule::Who::Agent(caller)) => {
@@ -633,7 +705,9 @@ impl Shared {
             // rows; its ordinary mail still projects as before.
             Ok(caller_rule::Who::Unproven(_)) | Err(_) => (None, false),
         };
-        Ok(CloudProjection::derived_rows(rows, viewer, operator))
+        Ok(CloudProjection::derived_rows(
+            rows, ordinary, viewer, operator,
+        ))
     }
 
     /// The platform's own answer for "may this source read its cloud turn

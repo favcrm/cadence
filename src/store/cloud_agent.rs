@@ -1586,6 +1586,34 @@ impl Store {
         })
     }
 
+    /// The alias' message ids whose immutable provenance does NOT reach a
+    /// cloud request/result — the ordinary local mail of an ordinary alias.
+    ///
+    /// This is the complement of [`Self::cloud_derived_messages`] over the
+    /// same alias, so a projection can admit an ordinary alias' own mail
+    /// EXPLICITLY (an enumerated snapshot) instead of assuming that any row
+    /// the derived map does not name is ordinary. It is not: a routed cloud
+    /// result that resolves after the snapshot is absent from both, and
+    /// assuming it ordinary would hand another source's reply to whoever
+    /// asks. Only rows enumerated here render.
+    pub fn ordinary_message_ids(&self, alias: &str) -> Result<Vec<String>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_vec(
+                "WITH RECURSIVE cloud(id) AS ( \
+                   SELECT id FROM messages \
+                    WHERE source='cloud_agent' \
+                       OR alias IN (SELECT alias FROM agents WHERE provider=?2) \
+                   UNION \
+                   SELECT m.id FROM messages m JOIN cloud c ON m.origin=c.id \
+                 ) \
+                 SELECT id FROM messages \
+                  WHERE alias=?1 AND id NOT IN (SELECT id FROM cloud)",
+                params![alias, crate::cloud_agent::PROVIDER],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+    }
+
     pub fn cloud_agents_with_pending_operations(&self) -> Result<Vec<String>> {
         self.read_tx(|conn| {
             Ok(conn.query_vec(

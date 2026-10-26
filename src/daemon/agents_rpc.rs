@@ -589,6 +589,18 @@ impl Shared {
             if has_older {
                 events.remove(0);
             }
+            // Observed before it is projected: an event naming a row the
+            // admission snapshot does not cover — a routed cloud result that
+            // resolved since, or a turn that settled meanwhile — re-resolves
+            // this page's admission once, exactly as the waiting path does.
+            if projection.needs_readmission(
+                &self.store,
+                events
+                    .iter()
+                    .filter_map(|event| event.payload.get("message").and_then(Value::as_str)),
+            )? {
+                projection = self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
+            }
             let cursor = events.last().map(|e| e.seq).unwrap_or(0);
             return Ok(json!({
                 "events": visible(&projection, events)?.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
@@ -601,10 +613,12 @@ impl Shared {
             let events = self.store.events(&alias, after, 100)?;
             if !events.is_empty() || self.closing.load(Ordering::SeqCst) {
                 // A waiting read can observe an event about a turn that
-                // settled after this admission was taken. Re-prove the
-                // caller's current authority before projecting it, exactly as
-                // `thread_read` does: the old admission never covered it. This
-                // page is returned either way, so one re-proof is the bound.
+                // settled after this admission was taken — or, on an ordinary
+                // alias, an event naming a routed cloud result that resolved
+                // since. Re-resolve the page's whole admission before
+                // projecting it, exactly as `thread_read` does: the old
+                // admission never covered those rows. This page is returned
+                // either way, so one re-resolution is the bound.
                 if projection.needs_readmission(
                     &self.store,
                     events

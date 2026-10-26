@@ -27,6 +27,7 @@ import { StageLabel, ThreadComposerFrame, Turn } from "./ThreadChatParts";
 import {
   changeSubscriber,
   createTopic,
+  earlierBoundary,
   listWorkConversations,
   postToTopic,
   readTopic,
@@ -730,13 +731,15 @@ function Timeline({
         entries: threadEntries(p.entries),
         cursor: p.cursor ?? at.after ?? 0,
         more_before: p.more_before === true,
+        // The backward continuation the daemon SCANNED past its projection.
+        scanned_before: p.scanned_before ?? null,
         // Raw row count: a malformed row dropped by threadEntries is still a row the daemon sent.
         full: p.entries.length >= PAGE,
       };
     }
     if (isGroup) {
       const p = await readTopic(row.id, { ...at, limit: PAGE });
-      return { posts: p.posts, cursor: p.cursor, more_before: p.more_before, full: p.posts.length >= PAGE };
+      return { posts: p.posts, cursor: p.cursor, more_before: p.more_before, scanned_before: null, full: p.posts.length >= PAGE };
     }
     const p = await readWorkConversation(row.id, { ...at, limit: PAGE }, scope);
     // The daemon filters system rows after computing `cursor`, so the raw
@@ -745,6 +748,7 @@ function Timeline({
       messages: p.messages,
       cursor: p.cursor,
       more_before: p.more_before,
+      scanned_before: null,
       full: p.cursor > (at.after ?? 0),
     };
   };
@@ -785,8 +789,12 @@ function Timeline({
         .then((p) => {
           if (!current()) return;
           absorb(p);
-          setBefore(oldestOf(p));
-          setMore(p.more_before);
+          // The newest page opens the backward window: the boundary it
+          // SCANNED, so a fully filtered tail still lets "Load earlier"
+          // reach the history below it.
+          const backward = earlierBoundary(p, oldestOf(p));
+          setBefore(backward.before);
+          setMore(backward.more);
           setError(null);
         })
         .catch(fail);
@@ -806,9 +814,12 @@ function Timeline({
     step(oldest - 1).catch(fail);
   }, [identity, liveStamp, threadsTick, tick]);
 
-  // (5) Earlier history: page backwards from the oldest loaded seq; a short
-  // page means the start is reached. Nothing is dropped silently. A result
-  // from an old epoch is discarded.
+  // (5) Earlier history: page backwards from the boundary the previous page
+  // SCANNED — never from its oldest KEPT row, because a fully filtered page
+  // keeps nothing and that cursor would re-fetch the same page forever. The
+  // daemon's `more_before` is the exhaustion answer; the boundary must also
+  // actually move, or the control would be offered with nothing to read. A
+  // result from an old epoch is discarded.
   const loadEarlier = async () => {
     if (before === null) return;
     const n = epoch.current.n;
@@ -816,8 +827,10 @@ function Timeline({
       const p = await pull({ before });
       if (epoch.current.n !== n) return;
       absorb(p);
-      setBefore(oldestOf(p) ?? before);
-      setMore(p.more_before);
+      const backward = earlierBoundary(p, oldestOf(p));
+      const next = Math.min(before, backward.before ?? before);
+      setBefore(next);
+      setMore(backward.more && next < before);
     } catch (e) {
       if (epoch.current.n === n) setError(e instanceof ApiError ? e.message : String(e));
     }
@@ -906,12 +919,18 @@ type Pulled = {
   posts?: TopicPost[];
   messages?: ThreadMessage[];
   cursor: number;
+  /** Raw rows remain below the backward boundary. */
   more_before: boolean;
+  /** The LOWEST seq this page scanned: the backward continuation, present
+   *  even when the page kept nothing (the daemon's `scanned_before`). */
+  scanned_before: number | null;
   /** A forward read may have rows past `cursor`. */
   full: boolean;
 };
 
-/** The oldest row of a page (pages are ascending): the next `before` cursor. */
+/** The oldest row of a page (pages are ascending). A FALLBACK only: the
+ *  `before` continuation is `scanned_before` (see `earlierBoundary`), which
+ *  a page that kept no rows still carries. */
 function oldestOf(p: Pulled): number | null {
   return p.entries?.[0]?.seq ?? p.posts?.[0]?.seq ?? p.messages?.[0]?.seq ?? null;
 }

@@ -324,21 +324,24 @@ pub(super) fn stream(
         }
         match page {
             Ok(mut page) => {
-                // The cursor follows the whole page, hidden entries included,
-                // so a page that is all operator-only never stalls the poll.
-                let seqs: Vec<i64> = page["entries"]
-                    .as_array()
-                    .map(|rows| rows.iter().filter_map(|e| e["seq"].as_i64()).collect())
-                    .unwrap_or_default();
+                // The cursor follows what the daemon page SCANNED, never what
+                // this board kept. The page's own `cursor` is the last row the
+                // projection walked — hidden rows and another source's cloud
+                // rows included — so advancing by it is what lets a fully
+                // filtered page move on. Deriving the cursor from the kept
+                // entry seqs (the old shape) stalls that page: no entry comes
+                // back, the cursor never moves, and the poll re-reads the same
+                // hidden rows forever instead of reaching the history below
+                // them.
+                if let Some(scanned) = page["cursor"].as_i64() {
+                    cursor = cursor.max(scanned);
+                }
                 if !operator {
                     super::member_view::member_view(&mut page);
                 }
                 let entries = page["entries"].as_array().cloned().unwrap_or_default();
                 if entries.is_empty() && !frame(&mut w, b": ping\n\n") {
                     return;
-                }
-                if let Some(top) = seqs.iter().max() {
-                    cursor = cursor.max(*top);
                 }
                 for entry in entries {
                     let Some(seq) = entry["seq"].as_i64() else {

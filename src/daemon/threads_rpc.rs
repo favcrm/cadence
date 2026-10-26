@@ -162,6 +162,18 @@ impl Shared {
                     .thread_entries_before_of(&thread.id, before, limit)?,
                 None => self.store.thread_entries_before(&alias, before, limit)?,
             };
+            // The page is observed before it is projected, so anything the
+            // admission snapshot does not cover is re-resolved here — before
+            // the boundary and the rows are decided, never after. A backward
+            // page can carry a routed cloud result or a cloud operation that
+            // resolved after this read was admitted, and authority was never
+            // proven for it.
+            if projection.needs_readmission(
+                &self.store,
+                raw.iter().filter_map(|entry| entry.message_id.as_deref()),
+            )? {
+                projection = self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
+            }
             // The cursor is the last row this page SCANNED, never the last
             // row the projection kept. A projection filters another source's
             // cloud entries out; taking the kept page's last seq would pin
@@ -210,12 +222,13 @@ impl Shared {
             };
             // A read that WAITED can observe content that settled after its
             // admission was taken — its own queued turn woken by another
-            // connection, for instance. That settlement was never admitted,
-            // so re-prove the caller's current authority before projecting
-            // it: the new admission either covers it under the platform's own
-            // answer or refuses/withholds it. Projecting it under the old
-            // admission would serve a reply the platform's readback never
-            // covered.
+            // connection, for instance — and, on an ordinary alias, a routed
+            // cloud result that resolved after admission. Neither was
+            // admitted, so re-resolve this page's whole admission once before
+            // projecting it: the new snapshot either covers each row (under
+            // the platform's own answer, for cloud content) or refuses /
+            // withholds it. Projecting under the old admission would serve a
+            // row authority was never proven for.
             if !readmitted
                 && projection.needs_readmission(
                     &self.store,
