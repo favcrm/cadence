@@ -95,6 +95,11 @@ Issuance requires the service/gateway feature gates and a live workspace-owner
 cookie session; an Authorization bearer is refused. The server derives the board
 audience from the live workspace slug and checks owner membership again at the
 write. A supplied foreign board origin is not a valid alternate target.
+Cookie-authenticated issuance, rotation and revocation POSTs also require an
+`Origin` admitted by the deployment's `trustedOrigins` configuration; a missing
+or untrusted Origin returns 403 even with a valid owner cookie. Requests marked
+`Sec-Fetch-Site: cross-site` are refused. These headers do not replace owner
+authentication or authorize an agent to perform the handoff.
 
 Issue returns the access token once. Use only the approved owner-controlled
 handoff that feeds that token to Native stdin without printing or exposing it to
