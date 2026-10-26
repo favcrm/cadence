@@ -289,14 +289,17 @@ From an operator connection, grant the saved workspace explicit cloud scopes,
 then connect it to a local alias:
 
 ```sh
-cadence login --org acme --cloud-agent
+cadence login acme --cloud-agent
 cadence cloud-agent connect --workspace acme --alias cloud --accept-assistant-consent
 cadence send cloud --text "Explain this task" --wait 60
 ```
 
-`--workspace` selects the saved cloud login; it does **not** change the local
-coordinator. Global `--org` selects a coordinator and must not be used as the
-cloud connection's target flag. A local `--state-dir` pin remains supported.
+The workspace hint for `login` is positional (`cadence login <slug>`): global
+`--org` is the legacy bound-login workspace id and conflicts with
+`--cloud-agent`. `--workspace` selects the saved cloud login for `connect`; it
+does **not** change the local coordinator, and global `--org` must not be used
+as the cloud connection's target flag. A local `--state-dir` pin remains
+supported.
 Connect performs identity/capability discovery, not a model invocation.
 Existing `cli.*`, wiki or settings permission does not imply cloud consent.
 

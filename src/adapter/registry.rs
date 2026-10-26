@@ -2053,23 +2053,41 @@ mod tests {
             "threads",
             "fake_provider_tests",
             "devin_cloud",
+            // CAD-1853: the actorless cloud conversational endpoint's own
+            // capability, unioned once from its spec.
+            "cloud_agent_conversation",
         ] {
             assert!(caps.contains(&name), "missing {name}");
         }
-        assert_eq!(caps.len(), 21);
+        assert_eq!(caps.len(), 22);
     }
 
     #[test]
     fn model_matrix_keeps_devin_and_drops_test_doubles() {
         let rows = model_provider_matrix();
         let ids: Vec<&str> = rows.iter().map(|row| row.id).collect();
+        // `agenticos-cloud` is a real registered provider row (CAD-1853) with
+        // no launch model of its own, exactly like `sandbox`: it stays visible
+        // ineligible so the settings page explains why it has no default.
         assert_eq!(
             ids,
-            vec!["codex", "claude", "pi", "omp", "devin", "cursor", "sandbox"]
+            vec![
+                "codex",
+                "claude",
+                "pi",
+                "omp",
+                "devin",
+                "cursor",
+                "sandbox",
+                "agenticos-cloud"
+            ]
         );
         assert!(rows
             .iter()
             .any(|row| { row.id == "sandbox" && !row.eligible && row.limitation.is_some() }));
+        assert!(rows.iter().any(|row| {
+            row.id == "agenticos-cloud" && !row.eligible && row.limitation.is_some()
+        }));
         assert!(rows.iter().any(|row| row.id == "claude" && row.eligible));
         assert!(rows.iter().any(|row| row.id == "pi" && row.eligible));
         assert!(rows

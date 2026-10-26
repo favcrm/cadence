@@ -395,6 +395,50 @@ pub fn connect(
         ));
     }
 
+    // A reconnect refreshes CONSENT, never identity: the retained invoker pin
+    // and provider session are validated BEFORE any row is written. A refused
+    // reconnect therefore leaves the granted authority exactly as it was
+    // instead of adopting a replacement pin that later replies cannot match.
+    let id = local_id(&target.org_id, &remote.remote_agent_id);
+    let source = Source::operator(owner.clone());
+    if let Some(existing) =
+        store.cloud_agent_source(&id, source.kind, &source.uid, source.epoch, &source.owner)?
+    {
+        if existing
+            .invoker_id
+            .as_deref()
+            .is_some_and(|pinned| pinned != remote.invoker_id)
+        {
+            return Err(Error::gate_coded(
+                "cloud_agent_invoker_changed",
+                "the contract reported a different stable owner (invoker_id) than this \
+                 source is pinned to; its consent, provider session and cached replies are \
+                 retained unchanged",
+            ));
+        }
+    }
+    if let Some(thread) = store.thread(alias)? {
+        if let Some(session) = store.cloud_agent_session(
+            &id,
+            source.kind,
+            &source.uid,
+            source.epoch,
+            &source.owner,
+            &thread.id,
+        )? {
+            if session.conversation_id != conversation_id
+                || session.remote_session_id != remote.remote_session_id
+            {
+                return Err(Error::gate_coded(
+                    "cloud_agent_session_mismatch",
+                    "the contract derived a different provider session for this source and \
+                     work conversation; the original binding is retained — open an explicit \
+                     new connection/context instead of replacing it",
+                ));
+            }
+        }
+    }
+
     let now = crate::store::now_public();
     if store.agent_opt(alias)?.is_none() {
         let cwd = cwd.to_string_lossy().into_owned();
@@ -419,7 +463,7 @@ pub fn connect(
     // connection's turns or replies.
     let recipient_uid = store.agent(alias)?.uid;
     let agent = CloudAgent {
-        id: local_id(&target.org_id, &remote.remote_agent_id),
+        id,
         alias: alias.to_string(),
         organization_id: target.org_id.clone(),
         org_slug: target.org.clone(),
@@ -437,7 +481,6 @@ pub fn connect(
         updated: now,
     };
     let agent = store.cloud_agent_connect(&agent)?;
-    let source = Source::operator(owner.clone());
     store.cloud_agent_source_grant(&CloudSource {
         cloud_agent_id: agent.id.clone(),
         kind: source.kind.to_string(),
@@ -489,6 +532,25 @@ fn local_id(organization_id: &str, remote_agent_id: &str) -> String {
     format!("cld-{}", &digest[..24])
 }
 
+/// One submit-or-replay request. Its two authorities are deliberately
+/// distinct: a write-only credential may submit a paid turn, while a
+/// settled replay DISCLOSES a reply and therefore needs read authority.
+pub struct SendRequest<'a> {
+    pub thread_id: &'a str,
+    pub sender: &'a Sender,
+    pub source: &'a Source,
+    pub operation_id: &'a str,
+    pub text: &'a str,
+    pub wake: bool,
+    pub expected_recipient_uid: Option<&'a str>,
+}
+
+/// Who may spend a turn, and who may read one back.
+pub struct Authority<'a> {
+    pub submit: &'a dyn Fn() -> Result<()>,
+    pub read: &'a dyn Fn() -> Result<()>,
+}
+
 /// Send (or explicitly wake) one request as the derived source.
 ///
 /// `wake=false` durably queues the request without transport. A later call
@@ -497,6 +559,10 @@ fn local_id(organization_id: &str, remote_agent_id: &str) -> String {
 /// outcome is unknown is resolved only by readback. `authorize` runs
 /// immediately before the transport, so a revoked source/credential refuses
 /// a queued or recovered turn before model spend.
+///
+/// This entry point proves ONE credential in both directions. A caller that
+/// must separate them — the daemon submits under `cloud_agent.write` but
+/// discloses under `cloud_agent.read` — uses [`send_authorized`].
 #[allow(clippy::too_many_arguments)]
 pub fn send(
     store: &Store,
@@ -512,6 +578,47 @@ pub fn send(
     expected_recipient_uid: Option<&str>,
     authorize: impl Fn() -> Result<()>,
 ) -> Result<CloudOperation> {
+    send_authorized(
+        store,
+        transport,
+        agent,
+        target,
+        SendRequest {
+            thread_id,
+            sender,
+            source,
+            operation_id,
+            text,
+            wake,
+            expected_recipient_uid,
+        },
+        &Authority {
+            submit: &authorize,
+            read: &authorize,
+        },
+    )
+}
+
+/// [`send`] with separate submission and read authority: `authority.submit`
+/// guards every paid turn, `authority.read` guards serving an already
+/// settled reply through the platform's readback.
+pub fn send_authorized(
+    store: &Store,
+    transport: &dyn CloudTransport,
+    agent: &CloudAgent,
+    target: &RemoteTarget,
+    request: SendRequest<'_>,
+    authority: &Authority<'_>,
+) -> Result<CloudOperation> {
+    let SendRequest {
+        thread_id,
+        sender,
+        source,
+        operation_id,
+        text,
+        wake,
+        expected_recipient_uid,
+    } = request;
     validate_operation_id(operation_id)?;
     validate_request_text(text)?;
     let target = &target_for_source(target, source);
@@ -594,6 +701,9 @@ pub fn send(
         error_message: None,
         created: now,
         updated: now,
+        // Filled by the admission transaction from the grant it is admitted
+        // under; a draft never names its own lineage.
+        grant_admitted_at: 0.0,
     };
     // A canonical message id is global. A collision with a different
     // target/source must refuse BEFORE any operation claim exists, and a
@@ -644,17 +754,24 @@ pub fn send(
                 if operation.remote_operation_id.is_none() && operation.reply_text.is_none() =>
             {
                 if !wake {
-                    // Queue-only replay: no transport, and no cached reply.
-                    authorize()?;
+                    // Queue-only replay: no transport, and no cached reply,
+                    // so it discloses nothing and keeps submission authority.
+                    (authority.submit)()?;
                     return Ok(operation);
                 }
                 canonical_enqueue(store, agent, &operation, sender, expected_recipient_uid)?;
                 submit_queued(
-                    store, transport, agent, target, &operation, source, &authorize,
+                    store,
+                    transport,
+                    agent,
+                    target,
+                    &operation,
+                    source,
+                    authority.submit,
                 )
             }
-            // A settled row is still a cached read: re-prove the current
-            // authority and source before returning it.
+            // A settled row is a reply, not an answer: serving it re-checks
+            // READ authority and the platform's own readback.
             _ => read_operation_with(
                 store,
                 transport,
@@ -662,7 +779,7 @@ pub fn send(
                 target,
                 &operation.operation_id,
                 source,
-                &authorize,
+                authority.read,
             ),
         }
     } else {
@@ -678,7 +795,13 @@ pub fn send(
             return Ok(operation);
         }
         submit_queued(
-            store, transport, agent, target, &operation, source, &authorize,
+            store,
+            transport,
+            agent,
+            target,
+            &operation,
+            source,
+            authority.submit,
         )
     }
 }
@@ -690,7 +813,7 @@ fn submit_queued(
     target: &RemoteTarget,
     operation: &CloudOperation,
     source: &Source,
-    authorize: &impl Fn() -> Result<()>,
+    authorize: &dyn Fn() -> Result<()>,
 ) -> Result<CloudOperation> {
     if let Some(other) = store.cloud_agent_unsettled(
         &agent.id,
@@ -710,6 +833,49 @@ fn submit_queued(
         ));
     }
     authorize()?;
+    // The wake must present the SAME consent lineage this request was
+    // admitted under. A revoked grant that a later reconnect regranted for
+    // the same stable owner is a different lineage: the dispatch that
+    // disconnected revoked this admission, so this queued request may not
+    // ride the new consent. A genuinely new operation id is the supported
+    // path; ordinary credential renewal never rewrites the grant, so its own
+    // queued work still proceeds.
+    let current = store
+        .cloud_agent_source(
+            &agent.id,
+            &operation.source_kind,
+            &operation.source_uid,
+            operation.registration_epoch,
+            &operation.owner,
+        )?
+        .ok_or_else(|| {
+            Error::gate_coded(
+                "cloud_agent_consent_required",
+                "this invoker source has no explicit cloud-agent consent on this target",
+            )
+        })?;
+    if current.granted_at != operation.grant_admitted_at {
+        // The admission lineage was revoked and this consent is a NEW grant.
+        // The request can never be sent under it, so it is settled as the
+        // pre-transport failure it is — never sent, never left looking like a
+        // pending turn that blocks this conversation's next request — and the
+        // wake is refused. A genuinely new operation id is the supported path.
+        let _ = canonical_finish(
+            store,
+            agent,
+            operation,
+            crate::store::cloud_agent::STATUS_FAILED,
+            None,
+            Some("cloud_agent_source_stale"),
+            None,
+        );
+        return Err(Error::gate_coded(
+            "cloud_agent_source_stale",
+            "this queued request was admitted under a consent grant that was revoked and \
+             regranted since; it is not revived by the new grant — queue it again under a new \
+             operation id",
+        ));
+    }
     let request = SubmitRequest {
         remote_agent_id: &agent.remote_agent_id,
         conversation_id: &operation.conversation_id,
@@ -717,19 +883,23 @@ fn submit_queued(
         text: &operation.request_text,
         source,
     };
-    // Durable submit intent BEFORE the request leaves: if the process dies
-    // after the contract accepted but before this call returns, the row is
-    // `running` with no remote id and the readback driver reconciles it. A
-    // never-woken `queued` row stays excluded (no implicit submit).
-    store.cloud_agent_operation_set(
-        &operation.cloud_agent_id,
-        &operation.operation_id,
-        crate::store::cloud_agent::STATUS_RUNNING,
-        None,
-        None,
-        None,
-        None,
-    )?;
+    // Durable submit intent BEFORE the request leaves, as a compare-and-set:
+    // exactly one caller may take the queued row to `running`, so two
+    // identical concurrent sends cannot both cross the submission boundary.
+    // The loser reads the original intent and never calls the transport. If
+    // the process dies after the contract accepted but before this call
+    // returns, the row is `running` with no remote id and the readback
+    // driver reconciles it; a never-woken `queued` row stays excluded.
+    if !store.cloud_agent_operation_claim(&operation.cloud_agent_id, &operation.operation_id)? {
+        return store
+            .cloud_agent_operation(&operation.cloud_agent_id, &operation.operation_id)?
+            .ok_or_else(|| {
+                Error::gate_coded(
+                    "cloud_agent_operation_unknown",
+                    "cloud agent operation is unavailable",
+                )
+            });
+    }
     let outcome = match transport.submit(target, &request) {
         Ok(outcome) => outcome,
         Err(error) => return Err(record_transport_failure(store, agent, operation, error)),
@@ -942,10 +1112,14 @@ fn apply_remote(
     )
 }
 
-/// Read one operation back. This never invokes the model. The live
-/// credential/scope is re-checked BEFORE any local row is returned or
-/// disclosed, so a revoked source no longer reads the result through this
-/// surface; an auth/connection refusal leaves the durable outcome unknown.
+/// Read one operation back. This never invokes the model.
+///
+/// The live credential/scope is re-checked BEFORE any transport call, and a
+/// settled reply is served only AFTER the platform's own readback authorizes
+/// it: the `cloud_agent_operations` row is the reconciliation target, never
+/// the answer. A revocation that landed upstream therefore refuses a
+/// settled read, and an unreachable readback is reported as uncertainty
+/// rather than served from the cache.
 pub fn read_operation(
     store: &Store,
     transport: &dyn CloudTransport,
@@ -973,7 +1147,7 @@ fn read_operation_with(
     target: &RemoteTarget,
     operation_id: &str,
     source: &Source,
-    authorize: &impl Fn() -> Result<()>,
+    authorize: &dyn Fn() -> Result<()>,
 ) -> Result<CloudOperation> {
     let operation = store
         .cloud_agent_operation(&agent.id, operation_id)?
@@ -991,9 +1165,6 @@ fn read_operation_with(
         ));
     }
     authorize()?;
-    if operation.settled() {
-        return Ok(operation);
-    }
     // A queue-only operation was never sent (no wake yet): reading it would
     // invent a remote "unknown" the contract never had and poison the later
     // explicit wake. Report the durable local queue state, zero transport.
@@ -1002,6 +1173,7 @@ fn read_operation_with(
     {
         return Ok(operation);
     }
+    let settled_before = operation.settled();
     let target = &target_for_source(target, source);
     let outcome = match transport.read(target, &operation.conversation_id, operation_id, source) {
         Ok(outcome) => outcome,
@@ -1021,7 +1193,45 @@ fn read_operation_with(
         }
         Err(error) => return Err(error),
     };
-    apply_remote(store, agent, &operation, outcome)
+    let terminal = matches!(
+        outcome.status,
+        RemoteStatus::Completed | RemoteStatus::Failed
+    );
+    let answer_status = outcome.status;
+    let reply = outcome.reply.clone();
+    let remote_operation_id = outcome.remote_operation_id.clone();
+    let error = outcome.error.clone();
+    let answer = apply_remote(store, agent, &operation, outcome)?;
+    if !settled_before || !terminal {
+        // A non-settled row is answered by the readback itself; a settled row
+        // receiving a stale intermediate answer keeps its terminal receipt
+        // (monotonic: the reply is never withdrawn by a late read).
+        return Ok(answer);
+    }
+    if answer_status.as_str() != operation.status {
+        // The platform's terminal answer contradicts the settled receipt.
+        // Neither copy may be presented as authorized, so this is an explicit
+        // refusal to reconcile by hand — never the cached reply.
+        return Err(Error::unknown_coded(
+            "cloud_agent_receipt_conflict",
+            "the platform's terminal readback disagrees with this operation's settled \
+             receipt; the receipt and the canonical history are retained — reconcile this \
+             operation explicitly, do not trust either copy",
+        ));
+    }
+    // Same outcome, so the readback's own answer is what the caller gets: it
+    // is recorded on the receipt (the reconciliation target) and served in
+    // place of a possibly stale cached copy. The receipt's status and the
+    // canonical Thread history are not rewritten.
+    store.cloud_agent_operation_reconcile(
+        &operation.cloud_agent_id,
+        &operation.operation_id,
+        remote_operation_id.as_deref(),
+        reply.as_deref(),
+        error
+            .as_ref()
+            .map(|(code, message)| (code.as_str(), message.as_str())),
+    )
 }
 
 /// Explicit cancellation is unsupported: the contract answers

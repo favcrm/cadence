@@ -101,8 +101,17 @@ impl Shared {
     /// `thread_read` — a page of an agent's thread after `after`,
     /// optionally long-polling up to `wait` seconds (≤ 30) for the next
     /// entry, the way `agent_events` does. Read-only.
-    pub(super) fn rpc_thread_read(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_thread_read(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // CAD-1853 review: a cloud target's request/reply text reaches this
+        // projection, so it demands the same source/owner authority as the
+        // dedicated cloud read — a peer with no grant on the connection is
+        // refused rather than shown another source's reply.
+        self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
         // CAD-1098: `conversation` selects one thread of this alias by
         // id (validated; unknown answers an error and creates nothing).
         // Without it the read is the home thread, unchanged.

@@ -74,6 +74,7 @@ struct Script {
     submit_accepted: bool,
     read_state: String,
     read_text: String,
+    read_status: u16,
     submit_delay_ms: u64,
     slow_read_operation: Option<String>,
     slow_read_ms: u64,
@@ -93,6 +94,7 @@ impl Script {
             submit_accepted: true,
             read_state: "completed".into(),
             read_text: "genuine stub reply".into(),
+            read_status: 0,
             submit_delay_ms: 0,
             slow_read_operation: None,
             slow_read_ms: 0,
@@ -354,21 +356,28 @@ fn serve(mut stream: TcpStream, script: Arc<Mutex<Script>>) {
         }
         "readback" => {
             let script = script.lock().unwrap_or_else(|e| e.into_inner());
-            let completed = script.read_state == "completed";
-            (
-                200,
-                json!({
-                    "ok": true,
-                    "operation": {
-                        "operation_id": operation,
-                        "conversation_id": conversation,
-                        "status": script.read_state,
-                        "text": completed.then(|| script.read_text.clone()),
-                        "reason": (script.read_state == "failed").then(|| "unanswered".to_string()),
-                        "terminal": completed || script.read_state == "failed",
-                    },
-                }),
-            )
+            if script.read_status != 0 {
+                (
+                    script.read_status,
+                    json!({"ok": false, "error": {"code": "forbidden", "message": "read authority revoked upstream"}}),
+                )
+            } else {
+                let completed = script.read_state == "completed";
+                (
+                    200,
+                    json!({
+                        "ok": true,
+                        "operation": {
+                            "operation_id": operation,
+                            "conversation_id": conversation,
+                            "status": script.read_state,
+                            "text": completed.then(|| script.read_text.clone()),
+                            "reason": (script.read_state == "failed").then(|| "unanswered".to_string()),
+                            "terminal": completed || script.read_state == "failed",
+                        },
+                    }),
+                )
+            }
         }
         "cancel" => {
             let script = script.lock().unwrap_or_else(|e| e.into_inner());
@@ -2654,11 +2663,11 @@ fn a_foreign_owner_cannot_read_the_settled_history() {
         org_id: agent.organization_id.clone(),
         identity: None,
     };
-    let owner = Owner::new("https://issuer.example.test", "stub-subject");
     let foreign = Source::operator(Owner::new(
         "https://other-issuer.example.test",
         "other-subject",
     ));
+    let readbacks_before_foreign = fx.stub.calls("readback");
     let foreign_error = cloud_agent::read_operation(
         &store,
         &NoTransport,
@@ -2673,21 +2682,320 @@ fn a_foreign_owner_cannot_read_the_settled_history() {
         !foreign_error.to_string().is_empty(),
         "a foreign owner read the settled history"
     );
+    assert_eq!(
+        fx.stub.calls("readback"),
+        readbacks_before_foreign,
+        "a foreign owner reached the upstream readback"
+    );
 
-    // Admitted positive control: the original owner still reads it, with no
-    // transport call because the operation is already settled.
-    let admitted = cloud_agent::read_operation(
-        &store,
-        &NoTransport,
-        &agent,
-        &target,
-        OPERATION,
-        &Source::operator(owner),
-        || Ok(()),
+    // An admitted settled read is only served after the platform's own
+    // readback authorizes it; the reply is the one that readback returned.
+    fx.stub
+        .set(|script| script.read_text = "fresh readback reply".into());
+    let readbacks_before_admitted = fx.stub.calls("readback");
+    let admitted = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_read",
+            json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+        )
+        .expect("the original owner must read its settled history");
+    assert_eq!(
+        fx.stub.calls("readback"),
+        readbacks_before_admitted + 1,
+        "the settled read was served without an upstream readback"
+    );
+    assert_eq!(
+        admitted["operation"]["reply"]["text"],
+        json!("fresh readback reply")
+    );
+}
+
+#[test]
+fn revoked_upstream_read_refuses_a_locally_settled_reply() {
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
     )
-    .expect("the original owner must read its settled history");
-    assert_eq!(admitted.reply_text.as_deref(), Some("genuine stub reply"));
-    assert_eq!(fx.stub.calls("readback"), 1);
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_read",
+        json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+    )
+    .unwrap();
+
+    // Revoke READ at the contract/upstream only; the local saved credential
+    // and the settled local row are untouched.
+    fx.stub.set(|script| script.read_status = 403);
+    let before = fx.stub.calls("readback");
+    let error = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_read",
+            json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+        )
+        .unwrap_err();
+    assert_eq!(code(&error), Some("cloud_agent_scope_revoked"), "{error}");
+    assert_eq!(
+        fx.stub.calls("readback"),
+        before + 1,
+        "the revoked read was served from the local cache"
+    );
+    assert!(
+        !error.to_string().contains("genuine stub reply"),
+        "the revoked read returned the reply: {error}"
+    );
+
+    // Positive control: the same fixture with read authority restored still
+    // yields the settled reply.
+    fx.stub.set(|script| script.read_status = 0);
+    let admitted = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_read",
+            json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+        )
+        .unwrap();
+    assert_eq!(admitted["operation"]["status"], json!("completed"));
+    assert_eq!(
+        admitted["operation"]["reply"]["text"],
+        json!("genuine stub reply")
+    );
+}
+
+#[test]
+fn an_expired_enrolled_peer_record_is_refused_locally_before_transport() {
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "agent_register",
+        json!({"alias": "peer", "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
+    )
+    .unwrap();
+    let store = fx.store();
+    let peer = store.agent("peer").unwrap();
+    let cloud = store.cloud_agent(&id).unwrap().expect("cloud agent");
+    let target = cadence_agent::remote_cli::RemoteTarget {
+        org: cloud.org_slug.clone(),
+        endpoint: cloud.endpoint.clone(),
+        org_id: cloud.organization_id.clone(),
+        identity: None,
+    };
+    let owner = cadence_agent::store::Owner::new("https://issuer.example.test", "stub-subject");
+    let stamp = cadence_agent::cloud_agent::registration_epoch(peer.created);
+    let expired = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 60;
+    cadence_agent::remote_cli::cloud_agent_save_peer(
+        &target,
+        &owner,
+        &peer.uid,
+        stamp,
+        &json!({
+            "agent_id": "hca_native_guard_peer",
+            "credential_id": "hcp_native_guard_peer",
+            "token": format!("hct_{}", "p".repeat(43)),
+            "expires_at": expired,
+            "role": "cloud_agent",
+            "sender": {"uid": peer.uid, "registration_epoch": stamp},
+        }),
+    )
+    .unwrap();
+    let before = fx.stub.calls("readback");
+    let error = fx
+        .call(
+            Asserted::Agent("peer".into()),
+            "cloud_agent_read",
+            json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().to_lowercase().contains("expire"),
+        "an expired peer record was not refused by expiry: {error}"
+    );
+    assert_eq!(
+        fx.stub.calls("readback"),
+        before,
+        "an expired peer reached the upstream readback"
+    );
+    let _ = home;
+}
+
+#[test]
+fn generic_readers_do_not_expose_a_cloud_reply_to_an_unenrolled_peer() {
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_read",
+        json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "agent_register",
+        json!({"alias": "peer", "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
+    )
+    .unwrap();
+
+    // The peer has no cloud enrollment. Refusal or redaction is accepted, but
+    // the reply must never cross these generic projections.
+    for (method, params) in [
+        ("thread_read", json!({"alias": ALIAS})),
+        ("agent_show", json!({"alias": ALIAS})),
+        ("agent_events", json!({"alias": ALIAS, "after": 0})),
+    ] {
+        if let Ok(value) = fx.call(Asserted::Agent("peer".into()), method, params) {
+            assert!(
+                !value.to_string().contains("genuine stub reply"),
+                "{method} exposed the cloud reply to an unenrolled peer: {value}"
+            );
+        }
+    }
+
+    // The operator still sees the reply; the UID-bound peer report positive
+    // remains the dedicated admitted-peer component case.
+    let operator = fx
+        .call(Asserted::Operator, "thread_read", json!({"alias": ALIAS}))
+        .unwrap();
+    assert!(operator.to_string().contains("genuine stub reply"));
+}
+
+#[test]
+fn regrant_does_not_revive_queued_work_and_renewal_continues() {
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": false,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_disconnect",
+        json!({"cloud_agent_id": id}),
+    )
+    .unwrap();
+    fx.connect();
+    let error = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_send",
+            json!({
+                "cloud_agent_id": id, "thread_id": home,
+                "text": TEXT, "operation_id": OPERATION, "wake": true,
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        !error.to_string().is_empty(),
+        "a regrant revived queued work"
+    );
+    assert_eq!(fx.stub.calls("submit"), 0, "a regrant submitted old work");
+    let queued = fx
+        .store()
+        .cloud_agent_operation(&id, OPERATION)
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        queued.status, "completed",
+        "old queued work completed after regrant"
+    );
+
+    // Positive control: a fresh operation after the regrant submits once.
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": "fresh after regrant", "operation_id": "regrant-fresh-0001", "wake": true,
+        }),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let operation = fx
+            .store()
+            .cloud_agent_operation(&id, "regrant-fresh-0001")
+            .unwrap()
+            .unwrap();
+        if operation.status == "completed" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fresh after regrant did not submit: {operation:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(fx.stub.calls("submit"), 1);
+
+    // Ordinary credential renewal (same subject/issuer, no revocation) keeps
+    // its own later queued work admissible.
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": "renewal queued", "operation_id": "renewal-queued-0001", "wake": false,
+        }),
+    )
+    .unwrap();
+    write_login_owner(LoginSpec {
+        org: ORG,
+        org_id: ORG_ID,
+        endpoint: &fx.stub.url,
+        capabilities: &["cloud_agent.read", "cloud_agent.write"],
+        expires: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600,
+        subject: "stub-subject",
+        issuer: "https://issuer.example.test",
+        token_char: "r",
+    });
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": "renewal queued", "operation_id": "renewal-queued-0001", "wake": true,
+        }),
+    )
+    .expect("ordinary credential renewal must let its own queued work proceed");
+    assert_eq!(fx.stub.calls("submit"), 2);
 }
 
 #[test]

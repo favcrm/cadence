@@ -547,6 +547,10 @@ impl Shared {
         } else {
             self.resolve_alias(raw)?
         };
+        // CAD-1853 review: the alias' event stream carries cloud request and
+        // result detail, so it applies the same source/owner decision as the
+        // dedicated cloud read before projecting anything.
+        self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
         // CAD-1380: daemon `assist_intent` rows are member-private routing. Only
         // the operator reads them from the shared stream; every other caller gets
         // the same page with those rows removed, cursors unchanged.

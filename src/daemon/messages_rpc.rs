@@ -49,6 +49,53 @@ pub(super) fn admit_message_list(who: &caller_rule::Who, target: &str) -> Result
     }
 }
 
+/// Whether a normal send actually supplied `value`: absent, null, false and
+/// empty containers are the shapes the CLI fills for unset flags, so they
+/// carry no instruction and are not treated as a field.
+fn send_field_supplied(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(false) => false,
+        Value::String(text) => !text.is_empty(),
+        Value::Array(rows) => !rows.is_empty(),
+        Value::Object(fields) => !fields.is_empty(),
+        _ => true,
+    }
+}
+
+/// The only normal-send fields a cloud target accepts. A cloud agent is one
+/// remote conversational turn: it has no live pane to steer, no local queue
+/// to prioritize or supersede, no task/job lane and no dispatch to attach. A
+/// supplied field outside this set is refused whole — never silently dropped,
+/// and never reinterpreted as a new paid turn. The local path's own refusals
+/// for these fields (`send --nudge`, forged `turn_id`, `expected_recipient_uid`,
+/// `issue`/`worktree`, `--task`, `reply_to`) run inside `send_with_…`, which a
+/// cloud alias never reaches, so this is that same envelope for the cloud
+/// route — checked BEFORE any transport call.
+fn admit_cloud_send(params: &Value) -> Result<()> {
+    const CLOUD_SEND_FIELDS: &[&str] = &["alias", "text", "message"];
+    let object = params
+        .as_object()
+        .ok_or_else(|| Error::rejected("cloud agent send parameters must be an object"))?;
+    let Some((key, value)) = object.iter().find(|(key, value)| {
+        send_field_supplied(value) && !CLOUD_SEND_FIELDS.contains(&key.as_str())
+    }) else {
+        return Ok(());
+    };
+    if key == "nudge" || (key == "source" && value.as_str() == Some(store::NUDGE_SOURCE)) {
+        return Err(Error::rejected(
+            "cloud agent send refused: --nudge is not steering for a cloud agent — it has no \
+             live pane to steer, and this is not turned into a new paid turn; send a normal \
+             message instead",
+        ));
+    }
+    Err(Error::rejected(format!(
+        "cloud agent send refused: '{key}' is not a cloud-agent send field — a cloud agent \
+         has no live pane, local queue, lane or dispatch, so only text and message apply; \
+         nothing was sent"
+    )))
+}
+
 impl Shared {
     /// One retained library image: `{asset_id, revision, sha256}` proved
     /// against the catalog and the stored original digest. No bytes move.
@@ -121,6 +168,10 @@ impl Shared {
             .agent_opt(&alias)?
             .is_some_and(|agent| agent.provider == crate::cloud_agent::PROVIDER)
         {
+            // The envelope is validated HERE, before any transport call: the
+            // local path's steering/dispatch refusals must not be bypassed by
+            // routing a cloud alias early.
+            admit_cloud_send(params)?;
             return self.cloud_send_from(&alias, params, peer_pid, None, None, "cloud agent send");
         }
         self.send_with(

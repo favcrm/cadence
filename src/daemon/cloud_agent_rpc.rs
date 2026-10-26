@@ -225,6 +225,33 @@ impl Shared {
         Ok((sender, source))
     }
 
+    /// ONE source/owner decision for every generic projection of cloud
+    /// content. `thread_read`, `agent_show` and `agent_events` all project a
+    /// cloud target's request/result text, so each applies this same check
+    /// instead of a bespoke one: the daemon-derived caller must hold the
+    /// authority the dedicated cloud reads require — the operator, or an
+    /// enrolled peer whose source grant is current on this connection, on the
+    /// split agent UID boundary. A plain local alias is untouched, so a
+    /// peer's own UID-bound reports keep working.
+    pub(super) fn admit_cloud_projection(
+        &self,
+        alias: &str,
+        peer_pid: u32,
+        verb: &str,
+    ) -> Result<()> {
+        if !self
+            .store
+            .agent_opt(alias)?
+            .is_some_and(|agent| agent.provider == crate::cloud_agent::PROVIDER)
+        {
+            return Ok(());
+        }
+        for agent in self.store.cloud_agents_for_alias(alias)? {
+            self.cloud_agent_caller_source(&agent, peer_pid, verb)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn rpc_cloud_agent(
         self: &Arc<Self>,
         method: &str,
@@ -413,7 +440,11 @@ impl Shared {
                 let (sender, source) =
                     self.cloud_agent_caller_source(&agent, peer_pid, "cloud agent send")?;
                 let target = Self::cloud_agent_target_for(&agent, Some(&source));
-                let authorize = || self.cloud_agent_authority(&agent, &source, SCOPE_WRITE);
+                // Submission spends a paid turn (write); serving an already
+                // settled replay discloses its reply (read). They are
+                // different authorities and are proven separately.
+                let write_authority = || self.cloud_agent_authority(&agent, &source, SCOPE_WRITE);
+                let read_authority = || self.cloud_agent_authority(&agent, &source, SCOPE_READ);
                 let wake = match params.get("wake") {
                     None => false,
                     Some(Value::Bool(value)) => *value,
@@ -424,19 +455,24 @@ impl Shared {
                         ))
                     }
                 };
-                let operation = cloud_agent::send(
+                let operation = cloud_agent::send_authorized(
                     &self.store,
                     &transport,
                     &agent,
                     &target,
-                    required_str(params, "thread_id")?,
-                    &sender,
-                    &source,
-                    required_str(params, "operation_id")?,
-                    required_str(params, "text")?,
-                    wake,
-                    None,
-                    authorize,
+                    cloud_agent::SendRequest {
+                        thread_id: required_str(params, "thread_id")?,
+                        sender: &sender,
+                        source: &source,
+                        operation_id: required_str(params, "operation_id")?,
+                        text: required_str(params, "text")?,
+                        wake,
+                        expected_recipient_uid: None,
+                    },
+                    &cloud_agent::Authority {
+                        submit: &write_authority,
+                        read: &read_authority,
+                    },
                 )?;
                 self.wake();
                 Ok(json!({"agent": agent.to_json(), "operation": operation.to_json()}))
@@ -536,20 +572,29 @@ impl Shared {
             None => format!("cl-{}", uuid::Uuid::new_v4().simple()),
         };
         let target = Self::cloud_agent_target_for(&agent, Some(&source));
-        let authorize = || self.cloud_agent_authority(&agent, &source, SCOPE_WRITE);
-        let operation = cloud_agent::send(
+        // The normal `cadence send` route also replays an operation id, so it
+        // needs the same split: write to submit, read to disclose a settled
+        // reply. A write-only credential gets no reply here either.
+        let write_authority = || self.cloud_agent_authority(&agent, &source, SCOPE_WRITE);
+        let read_authority = || self.cloud_agent_authority(&agent, &source, SCOPE_READ);
+        let operation = cloud_agent::send_authorized(
             &self.store,
             &HostedCloudTransport,
             &agent,
             &target,
-            &thread,
-            &sender,
-            &source,
-            &operation_id,
-            text,
-            true,
-            expected_uid,
-            authorize,
+            cloud_agent::SendRequest {
+                thread_id: &thread,
+                sender: &sender,
+                source: &source,
+                operation_id: &operation_id,
+                text,
+                wake: true,
+                expected_recipient_uid: expected_uid,
+            },
+            &cloud_agent::Authority {
+                submit: &write_authority,
+                read: &read_authority,
+            },
         )?;
         self.wake();
         Ok(json!({

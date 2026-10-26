@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS cloud_agent_operations(
     error_message TEXT,
     created REAL NOT NULL,
     updated REAL NOT NULL,
+    grant_admitted_at REAL NOT NULL DEFAULT 0,
     PRIMARY KEY(cloud_agent_id, operation_id));
 CREATE INDEX IF NOT EXISTS cloud_agent_operations_thread
     ON cloud_agent_operations(cloud_agent_id, thread_id, created);
@@ -329,6 +330,12 @@ pub struct CloudOperation {
     pub error_message: Option<String>,
     pub created: f64,
     pub updated: f64,
+    /// The `cloud_agent_sources.granted_at` lineage this operation was
+    /// ADMITTED under, copied at admission. A wake must present that same
+    /// grant still current: a consent that was revoked and later regranted
+    /// for the same stable owner is a different lineage and may not revive
+    /// this request — a new operation id is the supported path.
+    pub grant_admitted_at: f64,
 }
 
 impl CloudOperation {
@@ -488,6 +495,7 @@ fn operation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CloudOperation> {
         error_message: row.get(20)?,
         created: row.get(21)?,
         updated: row.get(22)?,
+        grant_admitted_at: row.get(23)?,
     })
 }
 
@@ -495,7 +503,7 @@ const OPERATION_COLUMNS: &str = "operation_id, cloud_agent_id, source_kind, \
 source_uid, registration_epoch, owner_issuer, owner_subject, recipient_uid, \
 sender_label, thread_id, conversation_id, remote_session_id, request_digest, \
 request_text, status, remote_operation_id, message_id, reply_text, \
-reply_message_id, error_code, error_message, created, updated";
+reply_message_id, error_code, error_message, created, updated, grant_admitted_at";
 
 fn digest(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
@@ -683,6 +691,37 @@ impl Store {
     /// own grant is created at connect; a peer's requires its own enrollment.
     pub fn cloud_agent_source_grant(&self, source: &CloudSource) -> Result<()> {
         self.write_tx(|conn| {
+            // A grant refresh is consent, never identity: the first verified
+            // `invoker_id` is this source's immutable pin. A supplied
+            // different value is refused BEFORE any row is written, so a
+            // refused reconnect leaves the retained pin exactly as it was
+            // instead of adopting a new owner's context or half-refreshing.
+            if let Some(supplied) = source.invoker_id.as_deref() {
+                let existing: Option<Option<String>> = conn.query_opt(
+                    "SELECT invoker_id FROM cloud_agent_sources \
+                     WHERE cloud_agent_id=?1 AND source_kind=?2 AND source_uid=?3 \
+                     AND registration_epoch=?4 AND owner_issuer=?5 AND owner_subject=?6",
+                    params![
+                        source.cloud_agent_id,
+                        source.kind,
+                        source.uid,
+                        source.registration_epoch,
+                        source.owner.issuer,
+                        source.owner.subject,
+                    ],
+                    |row| row.get(0),
+                )?;
+                if let Some(Some(pinned)) = existing {
+                    if pinned != supplied {
+                        return Err(Error::gate_coded(
+                            "cloud_agent_invoker_changed",
+                            "the contract reported a different stable owner (invoker_id) than \
+                             this source is pinned to; its consent and provider session are \
+                             retained unchanged",
+                        ));
+                    }
+                }
+            }
             // A peer re-enrollment under a different human REPLACES its
             // grant: the same native uid+epoch is not allowed two active
             // owners, or a cached session/reply could be inherited. The old
@@ -1090,12 +1129,34 @@ impl Store {
                     ),
                 ));
             }
+            // The admission lineage: the consent grant this request is
+            // admitted under, identified by its immutable `granted_at`. A
+            // later wake must present the SAME current grant; a revoked and
+            // regranted consent is a different lineage. No grant row (a
+            // direct caller that never proved consent) records 0, which no
+            // real grant timestamp can equal, so a wake is refused.
+            let admitted_at: f64 = conn
+                .query_opt(
+                    "SELECT granted_at FROM cloud_agent_sources \
+                     WHERE cloud_agent_id=?1 AND source_kind=?2 AND source_uid=?3 \
+                     AND registration_epoch=?4 AND owner_issuer=?5 AND owner_subject=?6",
+                    params![
+                        operation.cloud_agent_id,
+                        operation.source_kind,
+                        operation.source_uid,
+                        operation.registration_epoch,
+                        operation.owner.issuer,
+                        operation.owner.subject,
+                    ],
+                    |row| row.get(0),
+                )?
+                .unwrap_or(0.0);
             conn.execute(
                 "INSERT INTO cloud_agent_operations(operation_id, cloud_agent_id, source_kind, \
                  source_uid, registration_epoch, owner_issuer, owner_subject, recipient_uid, \
                  sender_label, thread_id, conversation_id, remote_session_id, request_digest, \
-                 request_text, status, created, updated) \
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                 request_text, status, created, updated, grant_admitted_at) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                 params![
                     operation.operation_id,
                     operation.cloud_agent_id,
@@ -1114,11 +1175,13 @@ impl Store {
                     STATUS_QUEUED,
                     operation.created,
                     operation.updated,
+                    admitted_at,
                 ],
             )?;
             Ok((
                 CloudOperation {
                     status: STATUS_QUEUED.to_string(),
+                    grant_admitted_at: admitted_at,
                     ..operation.clone()
                 },
                 true,
@@ -1264,6 +1327,74 @@ impl Store {
                     remote_operation_id,
                     reply_text,
                     reply_message_id,
+                    error.map(|e| e.0),
+                    error.map(|e| e.1),
+                    now(),
+                ],
+            )?;
+            conn.query_opt(
+                &format!(
+                    "SELECT {OPERATION_COLUMNS} FROM cloud_agent_operations \
+                     WHERE cloud_agent_id=?1 AND operation_id=?2"
+                ),
+                params![cloud_agent_id, operation_id],
+                operation_row,
+            )?
+            .ok_or_else(|| {
+                Error::gate_coded(
+                    "cloud_agent_operation_unknown",
+                    "cloud agent operation is unavailable",
+                )
+            })
+        })
+    }
+
+    /// Claim one queued operation for submission: a compare-and-set from
+    /// `queued` to `running` that exactly one caller can win. Two identical
+    /// concurrent sends (or a new-row/enqueue race) therefore submit once;
+    /// the loser reads the original intent and never calls the transport.
+    pub fn cloud_agent_operation_claim(
+        &self,
+        cloud_agent_id: &str,
+        operation_id: &str,
+    ) -> Result<bool> {
+        self.write_tx(|conn| {
+            let changed = conn.execute(
+                "UPDATE cloud_agent_operations SET status=?3, updated=?4 \
+                 WHERE cloud_agent_id=?1 AND operation_id=?2 AND status='queued'",
+                params![cloud_agent_id, operation_id, STATUS_RUNNING, now()],
+            )?;
+            Ok(changed == 1)
+        })
+    }
+
+    /// Reconcile ONE settled operation's cached answer with the platform's
+    /// own terminal readback. The caller has already proven read authority
+    /// and matched the outcome, so this only records the readback's answer on
+    /// the receipt: the settled status and the canonical Thread history are
+    /// not rewritten. A read served afterwards therefore returns the
+    /// platform's reply, not a stale cache copy.
+    pub fn cloud_agent_operation_reconcile(
+        &self,
+        cloud_agent_id: &str,
+        operation_id: &str,
+        remote_operation_id: Option<&str>,
+        reply_text: Option<&str>,
+        error: Option<(&str, &str)>,
+    ) -> Result<CloudOperation> {
+        self.write_tx(|conn| {
+            conn.execute(
+                "UPDATE cloud_agent_operations SET \
+                 remote_operation_id=COALESCE(?3, remote_operation_id), \
+                 reply_text=COALESCE(?4, reply_text), \
+                 error_code=?5, error_message=?6, updated=?7 \
+                 WHERE cloud_agent_id=?1 AND operation_id=?2 \
+                 AND status IN ('completed','failed')",
+                params![
+                    cloud_agent_id,
+                    operation_id,
+                    remote_operation_id,
+                    reply_text,
                     error.map(|e| e.0),
                     error.map(|e| e.1),
                     now(),

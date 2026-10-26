@@ -3257,6 +3257,10 @@ impl Shared {
             "agent_show" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
+                // CAD-1853 review: this projection serialises the alias'
+                // messages (cloud requests and their reply text), so it takes
+                // the same source/owner decision as the dedicated cloud read.
+                self.admit_cloud_projection(&alias, peer_pid, "agent show")?;
                 let include_profile_instructions = match params.get("include_profile_instructions")
                 {
                     None | Some(Value::Null) => false,
@@ -3516,7 +3520,7 @@ impl Shared {
             }
             "agent_send" => self.rpc_send_from(params, peer_pid),
             "agent_ask" => self.rpc_ask(params, peer_pid),
-            "thread_read" => self.rpc_thread_read(params),
+            "thread_read" => self.rpc_thread_read(params, peer_pid),
             "activity_query" => self.rpc_activity_query(params, peer_pid),
             "activity_export" => self.rpc_activity_export(params, peer_pid),
             "pm_activity_prepare" => self.rpc_pm_activity_prepare(params, peer_pid),

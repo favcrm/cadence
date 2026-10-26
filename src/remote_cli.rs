@@ -2136,6 +2136,22 @@ pub fn cloud_agent_save_peer(
     Ok(())
 }
 
+/// Refuse a persisted cloud-peer child credential whose recorded
+/// `expires_at` has passed. The platform would refuse that token, so nothing
+/// is derived, sent or read from it; the operator must enroll the peer again.
+fn peer_unexpired(record: &Value) -> Result<()> {
+    let expires_at = record["record"]["expires_at"]
+        .as_u64()
+        .ok_or_else(|| reject("cloud-peer credential is missing its expiry"))?;
+    if expires_at <= now()? {
+        return Err(reject(
+            "the enrolled cloud-peer credential has expired — the operator must enroll this \
+             peer again",
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve the ONE verified parent recorded for this native source. Peers
 /// never fall back to the current human login: their custody is this record.
 pub fn cloud_agent_peer_owner(
@@ -2148,6 +2164,10 @@ pub fn cloud_agent_peer_owner(
         if !peer_matches(&record, target, uid, epoch) {
             continue;
         }
+        // The record IS this source's authority: once its recorded expiry has
+        // passed the stored token cannot be used, so no source is derived from
+        // it and nothing is traced upstream. Re-enrollment is the only exit.
+        peer_unexpired(&record)?;
         let pin = peer_parent(&record)?;
         if found.as_ref().is_some_and(|seen| seen != &pin) {
             return Err(reject(
@@ -2179,6 +2199,10 @@ fn load_peer(
             "cloud-peer credential belongs to a different verified parent owner",
         ));
     }
+    // A persisted child credential is only usable while it is unexpired: the
+    // platform would refuse an expired token, so this peer's cloud authority
+    // ends at its recorded `expires_at` instead of being traced upstream.
+    peer_unexpired(&record)?;
     let scopes = record["capabilities"]
         .as_array()
         .ok_or_else(|| reject("cloud-peer credential is missing its granted scopes"))?;
