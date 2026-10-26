@@ -393,7 +393,6 @@
   padding: 0;
 }
 .app-chat-list .chat-bubble:not([data-chat-message="user"] .chat-bubble),
-.app-chat-list .answer,
 .app-chat-list .typing {
   background: var(--color-ink-875);
 }

@@ -697,7 +697,6 @@ pre {
    turn owns. Tables lose their grid, a blockquote reads as the one staged
    callout, code and issue links as quiet chips. */
 .answer {
-  position: relative;
   display: inline-block;
   width: fit-content;
   min-width: 0;
@@ -752,8 +751,9 @@ pre {
   padding: 0;
   color: var(--color-ink-200);
 }
-.answer-body > :last-child {
-  margin-block-end: 0;
+.answer .issue-reader > :last-child,
+.chat-bubble.issue-reader > :last-child {
+  margin-bottom: 0;
 }
 .answer-fail {
   margin: .25rem 0 .5rem;

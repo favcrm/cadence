@@ -450,7 +450,7 @@ const ThreadList = memo(function ThreadList({
   ) => void;
   /** The live turn: its own `message` id picks the row the activity
    *  belongs to; `since` drives the elapsed clock. Null otherwise. */
-  working: { message: string; since: number | null } | null;
+  working: { message: string | null; since: number | null } | null;
   /** CAD-1782: the thread stream is down, so these rows are a snapshot. */
   stale: boolean;
 }) {
@@ -499,7 +499,7 @@ const ThreadList = memo(function ThreadList({
         items={shown}
         readOnly={readOnly}
         liveAfter={liveAfter}
-        running={working?.message ?? null}
+        running={working?.message ?? null} /* null while a send is only submitting */
         legacyTranscript={!items.some((item) => item.type === "answer")}
         onOpenIssue={onOpenIssue}
         onRetry={onRetry}
@@ -507,6 +507,11 @@ const ThreadList = memo(function ThreadList({
         activity={(item) => {
           if (!working || activityItem === null || item.key !== activityItem.key) return null;
           const live = <AssistantActivity since={working.since} />;
+          // The anchored row shows this turn's own newest entry time. A
+          // fallback row rides the tail item, which may belong to an
+          // EARLIER turn (a stale or failed reply), so it is stamped with
+          // the running turn's start — never with that foreign time
+          // (CAD-1533 review, finding 1).
           const at =
             anchorItem !== null
               ? anchorEntry
@@ -794,7 +799,7 @@ function MasterHome({
     turn.kind === "working"
       ? { message: turn.message, since: typeof turn.since === "number" ? turn.since : null }
       : turn.kind === "submitting"
-        ? { message: "", since: null }
+        ? { message: null, since: null }
         : null;
   // The ResizeObserver re-subscribes when the name-row indicator appears
   // or clears (its content lives inside the observed list): a running

@@ -16,8 +16,9 @@ export interface TurnBarActions {
 /**
  * One row above the composer for the conversation's current turn
  * (CAD-1700). Neutral surface; the state is in the dot and the words.
- * While the stream is down the bar shows the last known state, dashed,
- * with its actions hidden.
+ * While the stream is down the bar shows the last known state, dimmed and
+ * prefixed "last known", with its actions hidden. A finished turn renders
+ * nothing: the reply itself is the completion signal.
  */
 export function TurnBar({
   state,
@@ -34,7 +35,7 @@ export function TurnBar({
   const t = useTranslate();
   const live = state.kind === "working" || state.kind === "writing";
   const elapsed = useElapsed(live ? since : null);
-  if (state.kind === "idle" || state.kind === "done") return null;
+  if (state.kind === "idle") return null;
 
   const button = (label: string, onClick: () => void, danger = false, ariaLabel?: string) => (
     <button type="button" className={danger ? "tb-btn danger" : "tb-btn"} aria-label={ariaLabel} onClick={onClick}>

@@ -57,8 +57,9 @@ function Harness() {
   }));
 }
 function assert(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason); }
-// A finished turn unmounts the bar: `done` is not a state the operator needs
-// a lingering row for, and a 3 s banner sat over the composer's own space.
+// A finished turn has no bar state at all: the reply is the completion
+// signal, and the mapper returns idle rather than spending a variant nobody
+// renders. The bar still paints every state the operator must act on.
 {
   const { renderToStaticMarkup } = require<typeof import("react-dom/server")>("react-dom/server");
   const bar = (state: Parameters<typeof TurnBar>[0]["state"], reconnecting = false) =>
@@ -66,7 +67,11 @@ function assert(value: unknown, reason: string): asserts value { if (!value) thr
       state, since: null, reconnecting,
       actions: { onStop: () => undefined, onCancel: () => undefined, onReview: () => undefined },
     }));
-  assert(bar({ kind: "done", seconds: 6 }) === "", "a finished turn unmounts the bar instead of lingering");
+  const finished: ThreadEntry = { seq: 20, role: "agent", kind: "turn_result", text: "Done.", message: "m-done", created: new Date().toISOString() };
+  assert(
+    turnBarState({ master: null, entries: [finished], pendingMessages: [], awaitingApproval: false, reconnecting: false }, "conv-stream").kind === "idle",
+    "a completed turn reads as idle: no bar state carries a duration nobody renders",
+  );
   assert(bar({ kind: "idle" }) === "", "an idle conversation has no bar");
   assert(bar({ kind: "working", step: "planning", since: 1000, stopMessage: "m-1" }).includes('data-state="working"'), "a working turn still paints its bar");
   assert(bar({ kind: "working", step: "planning", since: 1000, stopMessage: "m-1" }, true).includes('data-stale="true"'), "a reconnect marks the bar stale");
