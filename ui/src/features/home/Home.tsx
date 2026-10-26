@@ -30,7 +30,7 @@ import {
   useAssistantActor,
   useConversationActor,
 } from "../assistant/AssistantIdentity";
-import { displayName, scopeDescriptor } from "../assistant/identity";
+import { displayName, readConversationIdentity, scopeDescriptor } from "../assistant/identity";
 import type { AttachDestination } from "../app-shell/chat/attach";
 import { atTail, jumpLabel, repinOnResize, showJumpPill, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
@@ -724,7 +724,16 @@ function MasterHome({
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const loaded = thread.data !== null;
   const moreBefore = thread.data?.moreBefore === true;
-  const homeConversation = thread.data?.conversation;
+  // The default master-state response already resolves Home before its first
+  // transcript exists. Keep that server-issued binding when the empty thread
+  // (or its first streamed entries) does not carry a thread ID yet.
+  const homeProjection = master.status === "ok" ? master.data?.actor_identity : null;
+  const homeConversation = thread.data?.conversation
+    ?? (homeProjection?.scope === "personal"
+      && typeof homeProjection.conversation_id === "string"
+      && readConversationIdentity(master.data, homeProjection.conversation_id).read.state === "ready"
+      ? homeProjection.conversation_id
+      : undefined);
   const attachDestination: AttachDestination | undefined = loaded && !missing
     ? homeConversation ? { conversation: homeConversation } : {}
     : undefined;
