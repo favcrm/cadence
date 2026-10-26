@@ -128,17 +128,6 @@ pub(super) struct CloudProjection {
 }
 
 impl CloudProjection {
-    /// No cloud authority on this alias: nothing to filter.
-    fn ordinary() -> Self {
-        Self {
-            scopes: Vec::new(),
-            derived: std::collections::HashMap::new(),
-            ordinary: std::collections::BTreeSet::new(),
-            viewer: None,
-            operator: false,
-        }
-    }
-
     /// A cloud alias, admitted per operation for this caller's own source.
     fn cloud(scopes: Vec<CloudScope>) -> Self {
         Self {
@@ -255,7 +244,7 @@ impl CloudProjection {
     ) -> Result<bool> {
         // No cloud content resolves on this alias: the alias' own mail
         // projects whole and there is nothing to re-prove.
-        if self.scopes.is_empty() && self.derived.is_empty() {
+        if self.scopes.is_empty() && self.derived.is_empty() && self.ordinary.is_empty() {
             return Ok(false);
         }
         for id in ids {
@@ -291,7 +280,7 @@ impl CloudProjection {
         store: &crate::store::Store,
         entries: Vec<crate::store::ThreadEntry>,
     ) -> Result<Vec<crate::store::ThreadEntry>> {
-        if self.scopes.is_empty() && self.derived.is_empty() {
+        if self.scopes.is_empty() && self.derived.is_empty() && self.ordinary.is_empty() {
             return Ok(entries);
         }
         let mut kept = Vec::with_capacity(entries.len());
@@ -321,7 +310,7 @@ impl CloudProjection {
         store: &crate::store::Store,
         messages: Vec<crate::store::Message>,
     ) -> Result<Vec<crate::store::Message>> {
-        if self.scopes.is_empty() && self.derived.is_empty() {
+        if self.scopes.is_empty() && self.derived.is_empty() && self.ordinary.is_empty() {
             return Ok(messages);
         }
         let mut kept = Vec::with_capacity(messages.len());
@@ -346,7 +335,7 @@ impl CloudProjection {
         store: &crate::store::Store,
         events: Vec<crate::store::Event>,
     ) -> Result<Vec<crate::store::Event>> {
-        if self.scopes.is_empty() && self.derived.is_empty() {
+        if self.scopes.is_empty() && self.derived.is_empty() && self.ordinary.is_empty() {
             return Ok(events);
         }
         let mut kept = Vec::with_capacity(events.len());
@@ -692,9 +681,13 @@ impl Shared {
     /// is withheld until a read re-resolves.
     fn admit_derived_cloud_rows(&self, alias: &str, peer_pid: u32) -> Result<CloudProjection> {
         let rows = self.store.cloud_derived_messages(alias)?;
-        if rows.is_empty() {
-            return Ok(CloudProjection::ordinary());
-        }
+        // An alias with no derived rows is NOT an alias that cannot grow one:
+        // the first routed delivery may resolve after this snapshot. So the
+        // absence of derived rows stays a fact about this snapshot and never
+        // becomes a promise about later observations — the ordinary ids are
+        // enumerated either way, and a row that resolves afterwards is in
+        // neither half, which is what makes `row` withhold it until a read
+        // re-resolves.
         let ordinary = self.store.ordinary_message_ids(alias)?;
         let (viewer, operator) = match self.connection_caller(peer_pid) {
             Ok(caller_rule::Who::Operator) => (None, true),
