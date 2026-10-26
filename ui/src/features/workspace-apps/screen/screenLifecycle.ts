@@ -243,6 +243,11 @@ export abstract class FrameChannel {
 }
 
 /** Each instance owns one frame generation. Teardown precedes replacement. */
+/** Verbs whose planner runs against the consumed mount receipt: the original download and
+ *  the social publish relays send the host-held action token, never a frame-supplied credential. */
+const RECEIPT_TOKEN_VERBS: readonly string[] = [ORIGINAL_DOWNLOAD_VERB, "publish.draft.confirm",
+  "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel"];
+
 export class ScreenChannel extends FrameChannel {
   /** Set once, by the child's `ready`: the PUSH shape it negotiated. */
   private shape: Shape = "v1";
@@ -411,7 +416,7 @@ export class ScreenChannel extends FrameChannel {
         if (index >= 0) this.callRetire.splice(index, 1);
       });
   }
-  /** Only a v2 child with an action host. At most one live slot per frame. */
+/** Only a v2 child with an action host. At most one live slot per frame. */
   protected slot(request: SlotRequest): void {
     const actions = this.actions;
     if (this.crmLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
@@ -420,9 +425,9 @@ export class ScreenChannel extends FrameChannel {
     if (csv && (this.csvBusy || this.csvSlot !== null && this.csvSlot !== request.id)) { this.close(true); return; }
     if (csv) this.csvSlot = request.id;
     if (request.verb === ORIGINAL_DOWNLOAD_VERB && !this.originalDownloadAdmits()) { this.close(true); return; }
-    // The download token comes only from the consumed receipt, never from the frame's args.
+    // The action token comes only from the consumed mount receipt, never from the frame's args.
     const token = this.receipt.action_token ?? undefined;
-    const planner: Planner = (verb, args) => actions.planner(verb, args, verb === ORIGINAL_DOWNLOAD_VERB
+    const planner: Planner = (verb, args) => actions.planner(verb, args, RECEIPT_TOKEN_VERBS.includes(verb)
       ? { actionToken: token, isCurrent: () => !this.closed && this.receipt.action_token === token } : undefined);
     this.slots ??= new SlotController(message => {
       if (message.op === "slot-state" && message.state !== "pending" && this.csvSlot === message.id) this.csvSlot = null;
