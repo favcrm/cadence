@@ -992,12 +992,27 @@ impl Shared {
         })
     }
 
+    /// CAD-1142/CAD-1141: re-quote every frozen slot so a provider outage or
+    /// quote refusal is observed, and survived: a failed PRICE probe is not
+    /// proof of authority loss, and the final locked receipt check remains
+    /// authoritative. Price drift is accepted, so a fresh quote is not
+    /// compared with the frozen one.
+    pub(super) fn probe_app_run_prices(&self, run: &Value) -> Result<()> {
+        if let Ok(requests) = self.prepare_app_run_quotes(run) {
+            for request in requests.into_values() {
+                let _ = request.and_then(|request| request.fetch());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn with_app_run_current<T>(
         &self,
         id: &str,
         callback: impl FnOnce(&str) -> Result<T>,
     ) -> Result<T> {
         let run = self.store.app_run_show(id)?;
+        self.probe_app_run_prices(&run)?;
         let pm = self.pm_at(&self.pm_dir()?)?;
         workspace::with_runtime_snapshot(&pm, run["install_id"].as_str().unwrap(), |row, files| {
             let _custody = self.custody_operation()?;
@@ -1096,6 +1111,7 @@ impl Shared {
             });
         let result = if account_run {
             self.account_frozen_lineage(&run)?;
+            self.probe_app_run_prices(&run)?;
             if let Some(sealed) = &approved_by {
                 self.fresh_run_human(sealed)?;
             }
@@ -1730,6 +1746,7 @@ impl Shared {
     fn app_artifact_current(&self, id: &str, turn: Option<(&str, &str)>) -> Result<Value> {
         let install = self.store.app_artifact_installation(id)?;
         let run_id = self.store.app_artifact_run_id(id)?;
+        self.probe_app_run_prices(&self.store.app_run_show(&run_id)?)?;
         let pm = self.pm_at(&self.pm_dir()?)?;
         workspace::with_runtime_snapshot(&pm, &install, |row, files| {
             let _custody = self.custody_operation()?;
@@ -1787,6 +1804,7 @@ impl Shared {
                     .store
                     .app_message_installation(&message.id)?
                     .ok_or_else(|| Error::rejected("app message association is absent"))?;
+                self.probe_app_run_prices(&checked)?;
                 let pm = self.pm_at(&self.pm_dir()?)?;
                 workspace::with_runtime_snapshot(&pm, &install, |row, files| {
                     let _custody = self.custody_operation()?;
@@ -1831,6 +1849,7 @@ impl Shared {
             .store
             .app_message_installation(&message.id)?
             .ok_or_else(|| Error::rejected("app association is absent"))?;
+        self.probe_app_run_prices(&self.store.app_run_show(&run_id)?)?;
         let pm = self.pm_at(&self.pm_dir()?)?;
         workspace::with_runtime_snapshot(&pm, &install, |row, files| {
             let _custody = self.custody_operation()?;

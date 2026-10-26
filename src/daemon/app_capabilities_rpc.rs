@@ -784,10 +784,11 @@ impl Shared {
                     .app_message_installation(&msg.id)?
                     .ok_or_else(|| Error::rejected("capability app association is absent"))?;
                 let checked_run = self.store.app_run_show(&run_id)?;
-                // Lineage covers every frozen slot, not only the one the
-                // worker named. It is offline and ignores non-account slots,
-                // so an unknown or mixed slot cannot skip it.
+                // The next probe prices every frozen slot, not only the one
+                // the worker named. Lineage is offline and ignores non-account
+                // slots, so an unknown or mixed slot cannot skip it.
                 self.account_frozen_lineage(&checked_run)?;
+                self.probe_app_run_prices(&checked_run)?;
                 let quote = self
                     .prepare_app_run_quotes(&checked_run)?
                     .remove(&slot)
@@ -1090,6 +1091,7 @@ impl Shared {
                     let receipt_id = required_str(params, "receipt_id")?;
                     let receipt = self.store.app_capability_result(receipt_id)?;
                     let run = self.store.app_run_show(required_str(&receipt, "run_id")?)?;
+                    self.probe_app_run_prices(&run)?;
                     let pm = self.pm_at(&self.pm_dir()?)?;
                     return workspace::with_runtime_snapshot(
                         &pm,
