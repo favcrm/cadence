@@ -80,12 +80,6 @@ export interface BindingDrift {
   changes?: BindingChange[];
   reason?: string;
 }
-export interface SocialDraftEffect {
-  effect_id:string; install_id:string; context_id:string; draft_id:string; revision:number;
-  request:string; digest:string; state:string; needs_you:boolean; approval_id:string;
-  authorization_kind:"social_draft"; authority:Record<string,unknown>; record:Record<string,unknown>;
-  outcome?:unknown; due_epoch?:number|null; timezone?:string|null; created_at:number; updated_at:number;
-}
 export interface AppBinding {
   id: string; install_id: string; context_id: string | null; slot: string;
   revision: number; state: string; digest: string;
@@ -380,7 +374,7 @@ export const workspaceApps = {
    *  `{action_token, asset_id, expected_revision, request_id}` only. */
   mediaPublish: (body: { action_token: string; asset_id: string; expected_revision: number; request_id: string }) =>
     request<Record<string, unknown>>("/api/app-media/publish", undefined, body),
-  socialDraftAction: (operation: "create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/save"|"effect-stage", body: Record<string, unknown> & { alias: string }) =>
+  socialDraftAction: (operation: "create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/save"|"effect-stage"|"confirm"|"schedule"|"reschedule"|"cancel", body: Record<string, unknown> & { alias: string }) =>
     request<Record<string, unknown>>(`/api/app-social-drafts/${operation}`, undefined, toolActionBody(body)),
   /** SOC-32: the host-owned image upload door. `file` goes as multipart; the
    *  daemon re-proves the live mount/context/slot, normalises the image and
@@ -475,14 +469,6 @@ export const workspaceApps = {
   artifact: (id: string, signal?: AbortSignal) => request<TextArtifact>(`/api/app-run-artifacts/${part(id)}`, signal),
   stageEffect: async (id: string, body: { artifact_id: string; slot: string; request_id: string; title: string }) => (await request<{ effect: AppEffect }>(`${run(id)}/effects`, undefined, body)).effect,
   decideEffect: async (id: string, body: { digest: string; decision: "accept" | "decline" }) => (await request<{ effect: AppEffect }>(`${effect(id)}/decide`, undefined, body)).effect,
-  decideSocialDraftEffect: async (id:string,body:{digest:string;decision:"accept"|"decline"})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/decide`,undefined,body)).effect,
-  socialDraftEffect: async (id:string,signal?:AbortSignal)=>(await request<{effect:SocialDraftEffect}>(effect(id),signal)).effect,
-  /** CAD-1328: one operator tap approves and sends a screen-staged social draft effect. */
-  confirmSocialDraftPublish: async (id:string,body:{digest:string})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/confirm-publish`,undefined,body)).effect,
-  publishSocialDraftNow: async (id:string,body:{digest:string})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/publish-now`,undefined,body)).effect,
-  scheduleSocialDraftEffect: async (id:string,body:{digest:string;due_epoch:number})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/schedule`,undefined,body)).effect,
-  rescheduleSocialDraftEffect: async (id:string,body:{digest:string;expected_due_epoch:number;due_epoch:number})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/reschedule`,undefined,body)).effect,
-  cancelSocialDraftEffect: async (id:string,body:{digest:string;expected_due_epoch:number})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/cancel`,undefined,body)).effect,
   resolveEffect: async (id: string, body: { digest: string; resolution: "close" | "acknowledge" }) => (await request<{ effect: AppEffect }>(`${effect(id)}/resolve`, undefined, body)).effect,
   outbox: (id: string, signal?: AbortSignal) => request<WorkspaceOutbox>(`/api/outbox?effect_id=${part(id)}`, signal),
 };
