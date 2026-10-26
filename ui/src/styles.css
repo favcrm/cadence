@@ -425,21 +425,19 @@ pre {
   --tb: var(--color-ink-500);
   display: flex;
   align-items: center;
-  gap: .625rem;
+  gap: .5rem;
   min-width: 0;
-  margin-bottom: .375rem;
-  padding: .4375rem .5rem .4375rem .75rem;
-  border: 1px solid var(--color-ink-700);
-  border-radius: .625rem;
-  background: var(--color-ink-850);
+  margin-bottom: .25rem;
+  padding: .2rem .25rem;
+  border: 0;
+  background: transparent;
 }
 .turnbar[data-state="working"],
 .turnbar[data-state="writing"] { --tb: var(--color-accent); }
 .turnbar[data-state="queued"],
 .turnbar[data-state="needs_approval"] { --tb: var(--color-warn); }
 .turnbar[data-state="failed"] { --tb: var(--color-fail); }
-.turnbar[data-state="done"] { --tb: var(--color-ok); }
-.turnbar[data-stale] { border-style: dashed; }
+.turnbar[data-stale] { opacity: .7; }
 .tb-dot {
   flex: none;
   width: .5rem;
@@ -571,8 +569,7 @@ pre {
 .steps-inner {
   overflow: hidden;
   min-height: 0;
-  border-left: 1px solid var(--color-ink-700);
-  padding-left: .625rem;
+  padding-left: .25rem;
   margin-top: .25rem;
   display: flex;
   flex-direction: column;
@@ -610,6 +607,7 @@ pre {
   align-items: center;
   gap: .4rem;
   min-width: 0;
+  max-width: min(100%, 40rem);
   margin-bottom: .375rem;
   color: var(--color-ink-500);
   font-size: var(--text-micro);
@@ -639,7 +637,8 @@ pre {
 /* The turn's one disclosure: same mechanics as the steps group (the grid
    rows animation and the caret), a quieter rhythm inside a turn. */
 .turntrace {
-  margin: 0 0 .375rem;
+  max-width: min(100%, 40rem);
+  margin: 0 0 .5rem;
 }
 .turntrace-head {
   color: var(--color-ink-500);
@@ -698,43 +697,63 @@ pre {
    turn owns. Tables lose their grid, a blockquote reads as the one staged
    callout, code and issue links as quiet chips. */
 .answer {
-  max-width: min(100%, 48rem);
+  position: relative;
+  display: inline-block;
+  width: fit-content;
+  min-width: 0;
+  max-width: min(100%, 40rem);
   margin-top: .25rem;
-  border-radius: .75rem;
+  padding: 1.125rem 1.375rem;
+  border-radius: .375rem 1.1rem 1.1rem 1.1rem;
   background: var(--color-ink-850);
+  border: 0;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.answer:has(pre, table) {
+  max-width: min(100%, 48rem);
 }
 .answer-head {
   display: flex;
   align-items: center;
   gap: .5rem;
-  padding: .5rem .875rem 0;
+  padding: 0;
   color: var(--color-ink-500);
   font-size: var(--text-micro);
 }
-.answer-kicker {
-  display: inline-flex;
-  align-items: center;
-  gap: .3rem;
-  color: var(--color-ink-400);
-  font-weight: 500;
-}
-.answer-dot {
-  width: .3rem;
-  height: .3rem;
-  border-radius: 9999px;
-  background: var(--color-accent);
+.answer[data-earlier] .answer-head {
+  margin-bottom: .5rem;
 }
 .answer-earlier {
   color: var(--color-ink-500);
   font-size: .5625rem;
 }
-.answer-copy {
-  margin-left: auto;
+.turn-copy {
+  margin-left: .5rem;
+  padding: 0 .1rem;
+  color: var(--color-ink-500);
   font-size: var(--text-micro);
+  text-decoration: none;
+  opacity: 0;
+  transition: opacity .14s ease, color .14s ease;
+}
+.turn:hover .turn-copy,
+.turn:focus-within .turn-copy,
+.turn-copy:focus-visible {
+  opacity: 1;
+}
+.turn-copy:hover {
+  color: var(--color-ink-100);
+}
+@media (hover: none) {
+  .turn-copy { opacity: 1; }
 }
 .answer-body {
-  padding: .375rem .875rem .875rem;
+  padding: 0;
   color: var(--color-ink-200);
+}
+.answer-body > :last-child {
+  margin-block-end: 0;
 }
 .answer-fail {
   margin: .25rem 0 .5rem;
@@ -764,10 +783,10 @@ pre {
   border-top: 1px solid color-mix(in srgb, var(--color-ink-800) 60%, transparent);
 }
 .answer .issue-reader blockquote {
-  padding: .5rem .625rem;
+  padding: .65rem .85rem;
   border-inline-start: 0;
   border-radius: .5rem;
-  background: color-mix(in srgb, var(--color-accent) 5%, var(--color-ink-900));
+  background: color-mix(in srgb, var(--color-ink-800) 65%, transparent);
   color: var(--color-ink-300);
 }
 .answer .issue-reader blockquote p {
@@ -776,11 +795,13 @@ pre {
 .answer .issue-reader blockquote strong {
   color: var(--color-ink-100);
 }
-.answer .issue-reader code {
-  padding: .05rem .25rem;
-  border: 1px solid var(--color-ink-800);
+.answer .issue-reader code,
+.chat-bubble.issue-reader code {
+  padding: .12rem .38rem;
+  border: 0;
   border-radius: .25rem;
-  background: var(--color-ink-900);
+  background: color-mix(in srgb, var(--color-ink-700) 55%, transparent);
+  color: var(--color-ink-100);
 }
 .answer .issue-reader td code {
   padding: 0;
@@ -810,22 +831,26 @@ pre {
 /* Streaming: the collapsed trace and three dots — never a skeleton or a
    made-up answer body. */
 .typing {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  min-height: 1.75rem;
-  padding: .15rem .1rem;
+  width: fit-content;
+  min-height: 2.25rem;
+  margin-top: .15rem;
+  padding: .6rem .95rem;
+  border-radius: .375rem 1.1rem 1.1rem 1.1rem;
+  background: var(--color-ink-850);
 }
 .typing-dots {
   display: inline-flex;
   align-items: center;
-  gap: .3rem;
+  gap: .35rem;
   height: 1rem;
 }
 .typing-dots i {
   width: .375rem;
   height: .375rem;
   border-radius: 9999px;
-  background: var(--color-ink-400);
+  background: var(--color-accent);
   animation: typing 1.2s ease-in-out infinite;
 }
 .typing-dots i:nth-child(2) {
@@ -868,7 +893,7 @@ pre {
   to { transform: rotate(360deg); }
 }
 .turntrace-head:focus-visible,
-.answer-copy:focus-visible {
+.turn-copy:focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 2px;
   border-radius: .25rem;
@@ -1079,17 +1104,21 @@ pre {
    language — round, with the sender's lower corner clipped to a tail. */
 .chat-bubble {
   display: inline-block;
+  width: fit-content;
   min-width: 0;
-  max-width: min(100%, 34rem);
-  padding: 0.75rem 1rem;
-  border-radius: 1.1rem 1.1rem 1.1rem 0.375rem;
+  max-width: min(100%, 40rem);
+  padding: 1rem 1.25rem;
+  border-radius: 0.375rem 1.1rem 1.1rem 1.1rem;
   background: var(--color-ink-850);
+  border: 0;
   text-align: left;
   overflow-wrap: anywhere;
 }
 [data-chat-message="user"] .chat-bubble {
-  border-radius: 1.1rem 1.1rem 0.375rem 1.1rem;
-  background: color-mix(in srgb, var(--color-accent) 11%, var(--color-ink-875));
+  max-width: min(100%, 34rem);
+  padding: 0.7rem 1rem;
+  border-radius: 1.1rem 1.1rem 0.35rem 1.1rem;
+  background: color-mix(in srgb, var(--color-accent) 11%, var(--color-ink-850));
   color: var(--color-ink-100);
 }
 [data-chat-message] .refsrow {
@@ -1180,13 +1209,52 @@ pre {
 .issue-reader table {
   margin-block: .6rem;
 }
+.answer .issue-reader,
+.chat-bubble.issue-reader {
+  line-height: 1.7;
+}
+.answer .issue-reader p,
+.chat-bubble.issue-reader p {
+  margin-block: .9rem;
+  text-wrap: pretty;
+}
+.answer .issue-reader ul,
+.answer .issue-reader ol,
+.chat-bubble.issue-reader ul,
+.chat-bubble.issue-reader ol {
+  margin-block: .6rem 1rem;
+  padding-inline-start: 1.25rem;
+}
+.answer .issue-reader ul + p,
+.answer .issue-reader ol + p,
+.chat-bubble.issue-reader ul + p,
+.chat-bubble.issue-reader ol + p {
+  margin-top: 1.25rem;
+}
+.answer .issue-reader > :is(h1, h2, h3, h4, h5, h6):not(:first-child),
+.answer .issue-reader > p:has(> strong:only-child):not(:first-child),
+.chat-bubble.issue-reader > :is(h1, h2, h3, h4, h5, h6):not(:first-child),
+.chat-bubble.issue-reader > p:has(> strong:only-child):not(:first-child) {
+  margin: 1.75rem 0 .75rem;
+  padding-top: 1.35rem;
+  border-top: 1px solid color-mix(in srgb, var(--color-ink-700) 60%, transparent);
+  color: var(--color-ink-100);
+  font-size: .9375rem;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.answer .issue-reader > :first-child,
+.chat-bubble.issue-reader > :first-child {
+  margin-top: 0;
+}
 .issue-reader ul,
 .issue-reader ol {
   padding-inline-start: 1.25rem;
 }
 .issue-reader ul { list-style: disc; }
 .issue-reader ol { list-style: decimal; }
-.issue-reader li + li { margin-top: .25rem; }
+.issue-reader li::marker { color: var(--color-ink-500); }
+.issue-reader li + li { margin-top: .5rem; }
 .issue-reader ul.contains-task-list { padding-inline-start: .25rem; }
 .issue-reader li.task-list-item { list-style: none; }
 .issue-reader li.task-list-item > input[type="checkbox"] {
@@ -1202,9 +1270,11 @@ pre {
 }
 .issue-reader del { color: var(--color-ink-400); }
 .issue-reader blockquote {
-  border-inline-start: 2px solid var(--color-ink-600);
-  color: var(--color-ink-400);
-  padding-inline-start: .8rem;
+  border-inline-start: 0;
+  border-radius: .5rem;
+  background: color-mix(in srgb, var(--color-ink-800) 65%, transparent);
+  color: var(--color-ink-300);
+  padding: .65rem .85rem;
 }
 .issue-reader code {
   overflow-wrap: anywhere;

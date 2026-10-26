@@ -34,8 +34,7 @@ export function TurnBar({
   const t = useTranslate();
   const live = state.kind === "working" || state.kind === "writing";
   const elapsed = useElapsed(live ? since : null);
-  const faded = useFadedDone(state.kind === "done");
-  if (state.kind === "idle" || faded) return null;
+  if (state.kind === "idle" || state.kind === "done") return null;
 
   const button = (label: string, onClick: () => void, danger = false, ariaLabel?: string) => (
     <button type="button" className={danger ? "tb-btn danger" : "tb-btn"} aria-label={ariaLabel} onClick={onClick}>
@@ -89,10 +88,6 @@ export function TurnBar({
       title = t("Stopped");
       detail = t("partial answer kept");
       break;
-    case "done":
-      title = t("Done");
-      detail = clock(state.seconds);
-      break;
   }
 
   return (
@@ -110,18 +105,6 @@ export function TurnBar({
       {!reconnecting && controls && <span className="tb-actions">{controls}</span>}
     </div>
   );
-}
-
-/** A finished turn's bar fades out after 3 s: a one-shot UI timer, not a poll. */
-function useFadedDone(done: boolean): boolean {
-  const [faded, setFaded] = useState(false);
-  useEffect(() => {
-    setFaded(false);
-    if (!done) return;
-    const timer = window.setTimeout(() => setFaded(true), 3000);
-    return () => window.clearTimeout(timer);
-  }, [done]);
-  return done && faded;
 }
 
 /** Seconds since `since`, ticking once a second while a turn runs (a clock, not a fetch). */

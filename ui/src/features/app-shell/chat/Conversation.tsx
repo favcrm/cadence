@@ -254,28 +254,26 @@ function HomeList({
     );
   };
   return (
-    <ol className="space-y-3 min-w-0" role="log" aria-live="polite" aria-relevant="additions" aria-label={t("messages")} data-rendered={items.length}>
+    <ol className="space-y-6 min-w-0" role="log" aria-live="polite" aria-relevant="additions" aria-label={t("messages")} data-rendered={items.length}>
       {runs.map((run) => {
         if (!run.turn) return row(run.item);
         const acts = run.items.map((item) => activity?.(item) ?? null);
-        // The unnamed-turn fallback rides an EARLIER item's row. Folding
-        // that item's run would hide the working row, so the run keeps the
-        // flat rendering it has today. A hire proposal is its own card;
-        // keep the existing flat row instead of folding it into a trace.
-        if (
-          acts.some((act) => act?.kind === "row" && act.fallback === true) ||
-          run.items.some((item) => item.type === "hire")
-        ) {
+        // A hire proposal is its own card; keep the existing flat row
+        // instead of folding it into a trace.
+        if (run.items.some((item) => item.type === "hire")) {
           return <Fragment key={run.key}>{run.items.map(row)}</Fragment>;
         }
-        // The turn's own live rows fold into the head and the typing dots.
+        const hasFallback = acts.some((act) => act?.kind === "row" && act.fallback === true);
+        // The turn's own live rows fold into the head and the typing dots;
+        // an unnamed-turn fallback rides after a completed turn without
+        // unfolding that earlier turn's answer.
         const busy =
-          acts.some((act) => act !== null) ||
+          (!hasFallback && acts.some((act) => act !== null)) ||
           (running !== null && run.items.some((item) => itemMessage(item) === running));
         const live = Number(run.key.slice(1)) > liveAfter;
         const answer = run.items.find((item) => item.type === "answer");
         return (
-          <li key={run.key} className={`min-w-0${live ? " msg-in" : ""}`}>
+          <li key={run.key} className={`min-w-0 space-y-4${live ? " msg-in" : ""}`}>
             <ThreadTurn
               items={run.items}
               running={busy}
@@ -292,6 +290,12 @@ function HomeList({
                 </>
               }
             />
+            {hasFallback &&
+              acts.map((act, idx) =>
+                act?.kind === "row" && act.fallback === true ? (
+                  <Fragment key={`fallback-${idx}`}>{act.node}</Fragment>
+                ) : null,
+              )}
           </li>
         );
       })}
@@ -807,7 +811,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     ro.observe(el);
     for (const child of Array.from(el.children)) ro.observe(child);
     return () => ro.disconnect();
-  }, [scrollPanel, items.length]);
+  }, [scrollPanel, items.length, masterState.data?.turn?.state]);
   // Older history does not change the tail identity and must not be
   // advertised as a new message. Reader-anchor restoration remains a
   // separate installed-app QA requirement.
@@ -1643,7 +1647,6 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           {t("No conversation yet. Start one with + New.")}
         </p>
       )}
-      <TurnBar state={turnState} since={masterState.data?.turn?.since ?? null} actions={turnActions} reconnecting={streamDown} />
       {thread.status === "failed" && (
         <p className="text-label text-fail" role="alert">
           {t("The thread could not be read")} — {thread.error}{" "}
@@ -1698,6 +1701,11 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
             />
           </li>
         ))}
+        {(turnState.kind === "sending" || turnState.kind === "working") && (
+          <li className="text-secondary text-ink-300 break-words" data-chat-typing>
+            <ThreadTurn items={[]} running density={density} />
+          </li>
+        )}
       </ol>
       <AssistantOperations key={operationScope} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} canDecide={viewer.operator === true && !viewer.readOnly} connectionRevision={streamRevision} onPendingChange={onOperationState} />
       {unseen > 0 && (
@@ -1831,6 +1839,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           ))}
         </div>
       )}
+      <TurnBar state={turnState} since={masterState.data?.turn?.since ?? null} actions={turnActions} reconnecting={streamDown} />
       <Composer
         key={composerKey}
         density="compact"

@@ -544,11 +544,14 @@ function lastCreated(items: ThreadItem[]): string | null {
 
 /** Three typing dots: the only streaming affordance. The transport sends
  *  whole entries, never token deltas, so there is no skeleton and no
- *  fabricated answer body to show while a turn works. */
+ *  fabricated answer body to show while a turn works. The row is not its
+ *  own live region: it mounts inside the thread's `role="log"` list, which
+ *  already announces the addition, so a second `role="status"` here would
+ *  announce the same row twice. */
 function TypingDots() {
   const t = useTranslate();
   return (
-    <div className="typing" role="status" data-kind="typing">
+    <div className="typing" data-kind="typing">
       <span className="typing-dots" aria-hidden>
         <i />
         <i />
@@ -630,9 +633,35 @@ function TurnTrace({
   );
 }
 
-/** The answer surface: the existing Markdown renderer, with the turn's
- *  chrome only (kicker, copy). Tables, callouts and code chips are scoped
- *  styles on `.answer`; the Markdown itself is never forked. */
+/** The one Copy affordance for an answer, hover/focus-revealed in the turn
+ *  head so it never sits on top of the answer text. */
+function CopyControl({ text }: { text: string }) {
+  const t = useTranslate();
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      className="lnk turn-copy"
+      aria-label={t("Copy answer")}
+      onClick={() => {
+        void navigator.clipboard
+          ?.writeText(text)
+          .then(() => {
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1600);
+          })
+          .catch(() => undefined);
+      }}
+    >
+      {copied ? t("Copied") : t("Copy")}
+    </button>
+  );
+}
+
+/** The answer surface: the existing Markdown renderer, on the turn's one
+ *  tonal bubble. Tables, callouts and code chips are scoped styles on
+ *  `.answer`; the Markdown itself is never forked. Copy lives in the turn
+ *  head, so the bubble carries no chrome of its own. */
 function AnswerSurface({
   entry,
   density,
@@ -646,7 +675,6 @@ function AnswerSurface({
   earlier?: boolean;
 }) {
   const t = useTranslate();
-  const [copied, setCopied] = useState(false);
   const failure = turnFailure(entry, t);
   return (
     <>
@@ -666,29 +694,11 @@ function AnswerSurface({
           data-earlier={earlier || undefined}
           aria-label={t("Assistant answer")}
         >
-          <div className="answer-head">
-            <span className="answer-kicker">
-              <span className="answer-dot" aria-hidden />
-              {t("Answer")}
-            </span>
-            {earlier && <span className="answer-earlier num">{t("Earlier transcript")}</span>}
-            <button
-              type="button"
-              className="lnk answer-copy"
-              aria-label={t("Copy answer")}
-              onClick={() => {
-                void navigator.clipboard
-                  ?.writeText(entry.text)
-                  .then(() => {
-                    setCopied(true);
-                    window.setTimeout(() => setCopied(false), 1600);
-                  })
-                  .catch(() => undefined);
-              }}
-            >
-              {copied ? t("Copied") : t("Copy")}
-            </button>
-          </div>
+          {earlier && (
+            <div className="answer-head">
+              <span className="answer-earlier num">{t("Earlier transcript")}</span>
+            </div>
+          )}
           <div className={`answer-body issue-reader ${density === "compact" ? "text-secondary" : "text-body"}`}>
             <Md text={entry.text} onOpen={onOpenIssue} />
           </div>
@@ -783,6 +793,7 @@ export function ThreadTurn({
         </span>
         <span className="turn-name">{t("Assistant")}</span>
         <span className="turn-time num">{streaming ? t("now") : time(headAt)}</span>
+        {shown && shown.entry.text.trim() !== "" && <CopyControl text={shown.entry.text} />}
       </div>
       {trace.length > 0 && (
         <TurnTrace
