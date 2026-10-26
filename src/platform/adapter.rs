@@ -290,8 +290,10 @@ pub trait PlatformAdapter: Send + Sync {
     /// call, not merely compare an earlier discovery response — unless the
     /// operator policy is pass-through pricing, in which case the provider
     /// bills at the upstream rate and records the actual charge in the
-    /// receipt. Either way the daemon's execution-time re-quote still refuses
-    /// a rate that changed since approval. The default refuses every provider.
+    /// receipt. CAD-1141: the daemon's execution-time re-quote accepts a
+    /// changed rate; `authority.quote` is that fresh quote. It still refuses a
+    /// provider without the charge precondition or a quote outside the
+    /// supported bound. The default refuses every provider.
     fn execute_app_capability(
         &self,
         _credential: &[u8],

@@ -253,7 +253,6 @@ impl Shared {
                 || run["context_id"] != expected["context_id"]
                 || run["install_id"] != install
                 || run["snapshot"]["bundle_digest"] != bundle["digest"]
-                || run["snapshot"]["quotes"][slot] != json!(quote)
             {
                 return Err(Error::rejected(
                     "account capability run approval or snapshot changed",
@@ -785,11 +784,10 @@ impl Shared {
                     .app_message_installation(&msg.id)?
                     .ok_or_else(|| Error::rejected("capability app association is absent"))?;
                 let checked_run = self.store.app_run_show(&run_id)?;
-                // The next probe prices every frozen slot, not only the one
-                // the worker named. Lineage is offline and ignores non-account
-                // slots, so an unknown or mixed slot cannot skip it.
+                // Lineage covers every frozen slot, not only the one the
+                // worker named. It is offline and ignores non-account slots,
+                // so an unknown or mixed slot cannot skip it.
                 self.account_frozen_lineage(&checked_run)?;
-                self.probe_app_run_prices(&checked_run)?;
                 let quote = self
                     .prepare_app_run_quotes(&checked_run)?
                     .remove(&slot)
@@ -827,11 +825,12 @@ impl Shared {
                     // CAD-1374: the sealed approving human bound at approval
                     // time. Null for a legacy approval (no human recorded).
                     let sealed_human = run["approval"]["human"].clone();
-                    if run["snapshot_digest"] != checked_run["snapshot_digest"]
-                        || run["snapshot"]["quotes"][&slot] != json!(quote)
-                    {
+                    // CAD-1141: price drift is accepted. The fresh quote is
+                    // the call's `max_charge_minor` ceiling (authority below);
+                    // the frozen snapshot itself must still be unchanged.
+                    if run["snapshot_digest"] != checked_run["snapshot_digest"] {
                         return Err(Error::rejected(
-                            "capability price changed since run approval",
+                            "run snapshot digest changed since run approval",
                         ));
                     }
                     self.recheck_app_capability_quote(&proof, &quote)?;
@@ -904,7 +903,7 @@ impl Shared {
                         "install_id":install,"context_id":run["context_id"],
                         "step_id":step,"slot":slot,"binding":proof,
                         "inputs":run["snapshot"]["inputs"],"source":run["snapshot"]["source"],
-                        "quote":run["snapshot"]["quotes"][&slot],
+                        "quote":quote,
                         "call_id":call_id,
                     });
                     let credential = self.app_capability_credential(config)?;
@@ -1091,7 +1090,6 @@ impl Shared {
                     let receipt_id = required_str(params, "receipt_id")?;
                     let receipt = self.store.app_capability_result(receipt_id)?;
                     let run = self.store.app_run_show(required_str(&receipt, "run_id")?)?;
-                    self.probe_app_run_prices(&run)?;
                     let pm = self.pm_at(&self.pm_dir()?)?;
                     return workspace::with_runtime_snapshot(
                         &pm,
