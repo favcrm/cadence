@@ -253,7 +253,6 @@ impl Shared {
                 || run["context_id"] != expected["context_id"]
                 || run["install_id"] != install
                 || run["snapshot"]["bundle_digest"] != bundle["digest"]
-                || run["snapshot"]["quotes"][slot] != json!(quote)
             {
                 return Err(Error::rejected(
                     "account capability run approval or snapshot changed",
@@ -827,11 +826,12 @@ impl Shared {
                     // CAD-1374: the sealed approving human bound at approval
                     // time. Null for a legacy approval (no human recorded).
                     let sealed_human = run["approval"]["human"].clone();
-                    if run["snapshot_digest"] != checked_run["snapshot_digest"]
-                        || run["snapshot"]["quotes"][&slot] != json!(quote)
-                    {
+                    // CAD-1141: price drift is accepted. The fresh quote is
+                    // the call's `max_charge_minor` ceiling (authority below);
+                    // the frozen snapshot itself must still be unchanged.
+                    if run["snapshot_digest"] != checked_run["snapshot_digest"] {
                         return Err(Error::rejected(
-                            "capability price changed since run approval",
+                            "run snapshot digest changed since run approval",
                         ));
                     }
                     self.recheck_app_capability_quote(&proof, &quote)?;
@@ -904,7 +904,7 @@ impl Shared {
                         "install_id":install,"context_id":run["context_id"],
                         "step_id":step,"slot":slot,"binding":proof,
                         "inputs":run["snapshot"]["inputs"],"source":run["snapshot"]["source"],
-                        "quote":run["snapshot"]["quotes"][&slot],
+                        "quote":quote,
                         "call_id":call_id,
                     });
                     let credential = self.app_capability_credential(config)?;

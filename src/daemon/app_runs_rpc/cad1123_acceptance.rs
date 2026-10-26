@@ -16,7 +16,8 @@
 //!      no run row, no dispatch;
 //!   2. a forged team (a team-role input or an owner/assignments field
 //!      in the request) and a missing team;
-//!   3. a changed `expected_quotes` -> `price_changed`;
+//!   3. an `expected_quotes` drawn for another slot set -> the stale
+//!      slot-set refusal (CAD-1141: same-slot price drift is accepted);
 //!   4. a replayed `request_id` -> the same run, one dispatch;
 //!   5. `app_install_team_set` operator-only (RPC and HTTP), a stale
 //!      compare-and-swap refused;
@@ -33,7 +34,8 @@
 //!     default and `admit_operator_read` for the team GET;
 //!   - the role-forgery refusal and the `no default team` refusal in
 //!     `Shared::create_app_run`/`start_app_run` (app_runs_rpc.rs);
-//!   - the `expected_quotes` frozen-quote comparison (price_changed);
+//!   - the `expected_quotes` slot-set comparison (stale capability slot
+//!     set; CAD-1141 dropped the price-equality half);
 //!   - `UNIQUE(install_id, request_id)` replay in
 //!     `Store::app_run_create_with_capabilities`;
 //!   - the `expected_revision` compare-and-swap in `rpc_app_team`.
@@ -195,12 +197,15 @@ fn accept_no_forged_team_and_no_missing_team() {
     assert_eq!(run["snapshot"]["owner_pm"], json!("lead"));
 }
 
-/// Case 3: `expected_quotes` must equal the quotes the run freezes —
-/// any difference (an extra slot, a missing map) is `price_changed` —
-/// and nothing is created. Control: the exact frozen set (`{}` for a
-/// workflow with no capability slots) is served.
+/// Case 3: `expected_quotes` must name exactly the slots the run freezes
+/// — an extra slot or a slot the workflow does not declare is the stale
+/// slot-set refusal, a missing map is refused — and nothing is created.
+/// CAD-1141 (operator decision 2026-10-26): same-slot price drift is
+/// accepted, so only the slot set is compared here; drift itself is
+/// covered by `daemon::cad1141_drift_acceptance`. Control: the exact
+/// frozen set (`{}` for a workflow with no capability slots) is served.
 #[test]
-fn accept_price_drift_is_refused_with_price_changed() {
+fn accept_stale_quote_slot_set_is_refused() {
     let fx = Fx::new();
     fx.start_team();
     team_set(&fx, 0).unwrap();
@@ -211,12 +216,12 @@ fn accept_price_drift_is_refused_with_price_changed() {
         let mut params = start_params(&fx, "drift");
         params["expected_quotes"] = expected;
         let err = refusal(fx.operator("app_run_start", params));
-        assert!(err.contains("price_changed"), "{err}");
+        assert!(err.contains("stale capability slot set"), "{err}");
     }
     let mut missing = start_params(&fx, "drift-missing");
     missing.as_object_mut().unwrap().remove("expected_quotes");
     assert!(refusal(fx.operator("app_run_start", missing)).contains("expected_quotes"));
-    assert_eq!(runs_of(&fx), 0, "a price-drifted start wrote a run row");
+    assert_eq!(runs_of(&fx), 0, "a stale-slot-set start wrote a run row");
     let run = fx
         .operator("app_run_start", start_params(&fx, "exact"))
         .unwrap();

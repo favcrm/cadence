@@ -56,8 +56,8 @@ const TOOL: &str = "read_probe_listing";
 /// transport carrying a price schema that fails `valid()` — a corrupt
 /// price response, which is not a probe-liveness miss and must be
 /// refused like any error; `Priced` is a healthy door reporting a
-/// *different* live price than the frozen one — the real `Rejected`
-/// drift path (authority intact, price moved), which still invalidates.
+/// *different* live price than the frozen one — authority intact, price
+/// moved, which since CAD-1141 is accepted and does not invalidate.
 #[derive(Clone, Copy, Debug)]
 enum Posture {
     Up,
@@ -201,8 +201,7 @@ impl PlatformAdapter for Probe {
             }
             // A live quote that moved since approval: a well-formed,
             // valid quote whose total/revision differ from the frozen
-            // one. The run's drift comparison must reject — a genuine
-            // `Rejected`, not a probe miss — so the run invalidates.
+            // one. Since CAD-1141 the run accepts it and re-quotes.
             Posture::Priced => {
                 self.quotes_priced.fetch_add(1, SeqCst);
                 Ok(AppCapabilityQuote {
@@ -934,43 +933,56 @@ fn stale_binding_revoked_while_queued_invalidates_with_reason() {
     );
 }
 
-/// A healthy door reporting a *moved* price is not a probe miss — it is
-/// the real `Rejected` drift verdict: authority intact, price changed.
-/// The monitor tick re-validates a live `running` run; a drifted quote
-/// still invalidates it, naming the price/capability, while a *transient*
-/// outage (asserted above) does not. This is the mirror image of the
-/// Demo bug: the probe's answer is read, not its liveness.
-///
-/// Intended to fail on pre-fix code is moot here — this drift already
-/// invalidated before; the row pins that the *fixed* path still
-/// distinguishes a real `Rejected` verdict from a liveness miss.
-/// UNPROVEN.
+/// CAD-1141 (operator decision 2026-10-26, "Proceed within bound"): a
+/// healthy door reporting a *moved* price no longer invalidates a live
+/// run. The monitor tick still re-quotes (the `Priced` counter is the
+/// positive witness that the moved price was actually observed), the
+/// run stays `running` with its kickoff intact, no replacement run is
+/// minted, and the frozen snapshot quote is unchanged — the fresh quote
+/// is only the call-time `max_charge_minor` ceiling, which this fixture
+/// cannot reach (see the coverage boundary above; it is proven against
+/// the real adapter by `daemon::cad1141_drift_acceptance`). A genuine
+/// authority loss after the drift still invalidates with its reason, so
+/// the monitor still reads the verdict, not merely the price.
 #[test]
-fn a_moved_live_price_still_invalidates() {
+fn a_moved_live_price_no_longer_invalidates() {
     let fx = Fx::start();
-    let (install, _binding_id, run_id) = fx.approved_run("drift");
+    let (install, binding_id, run_id) = fx.approved_run("drift");
     fx.dispatch_first(&run_id);
+    let frozen = fx.show(&run_id)["snapshot"]["quotes"]["source"].clone();
+    assert_eq!(frozen["total_price_micros"], 2000, "{frozen}");
     // The binding is untouched and the door is up — but the price moved.
     let baseline = fx.provider.quotes(Posture::Priced);
     fx.provider.set_posture(Posture::Priced);
-    // Wait for the drift verdict's own quote attempt (positive witness
-    // that the monitor re-quoted the moved price) then the invalidation.
-    fx.wait_quote_attempts(Posture::Priced, baseline, 1, "price drift re-quote");
-    fx.wait_state(&run_id, "failed", "a moved price invalidates");
+    // At least two re-quotes of the moved price, so the monitor really
+    // re-validated inside the drift window before survival is asserted.
+    fx.wait_quote_attempts(Posture::Priced, baseline, 2, "price drift re-quote");
     let shown = fx.show(&run_id);
-    assert_eq!(shown["steps"][0]["state"], "failed", "{shown}");
-    let reason = step_reason(&shown, 0);
-    assert!(
-        !reason.trim().is_empty(),
-        "price-drift step carries no reason: {shown}"
+    assert_eq!(
+        shown["state"], "running",
+        "a moved price invalidated: {shown}"
     );
-    assert!(
-        reason.contains("price") || reason.contains("capability"),
-        "reason names the price/capability drift: {reason}"
+    assert_eq!(shown["steps"][0]["state"], "dispatched", "{shown}");
+    assert!(shown["steps"][0]["message_id"].is_string(), "{shown}");
+    assert_eq!(
+        shown["snapshot"]["quotes"]["source"], frozen,
+        "the frozen snapshot quote is never rewritten"
     );
     assert_eq!(
         fx.run_list(&install)["runs"].as_array().unwrap().len(),
         1,
         "a drifted quote spawned a replacement run"
+    );
+    // A real authority loss still invalidates, with its reason.
+    fx.op(
+        "app_binding_revoke",
+        json!({"install_id": install, "binding_id": binding_id,
+            "expected_revision": 1}),
+    );
+    fx.wait_state(&run_id, "failed", "stale binding invalidates after drift");
+    let reason = step_reason(&fx.show(&run_id), 0);
+    assert!(
+        reason.contains("binding") || reason.contains("authorization"),
+        "revoke after drift carries the authority reason: {reason}"
     );
 }

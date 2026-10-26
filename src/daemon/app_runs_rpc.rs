@@ -577,13 +577,15 @@ impl Shared {
                 self.recheck_app_capability_quote(proof, quote)?;
             }
             if let Some(expected) = expected {
-                // The quote the host fetched when it drew the slot must
-                // be exactly the quote this run freezes (no slot, no
-                // extra slot, no different price or revision).
-                let frozen = json!(quotes);
-                if *expected != frozen {
+                // CAD-1141: price drift is accepted; the run freezes the live
+                // quotes taken above. Only a host request drawn for another
+                // slot set (a missing or extra slot) is refused.
+                let same_slots = expected.as_object().is_some_and(|map| {
+                    map.len() == quotes.len() && map.keys().all(|slot| quotes.contains_key(slot))
+                });
+                if !same_slots {
                     return Err(Error::rejected(
-                        "price_changed: capability price changed since the host quoted it",
+                        "stale capability slot set: the host quoted different slots",
                     ));
                 }
             }
@@ -990,18 +992,15 @@ impl Shared {
         })
     }
 
+    /// CAD-1142/CAD-1141: re-quote every frozen slot so a provider outage or
+    /// quote refusal is observed, and survived: a failed PRICE probe is not
+    /// proof of authority loss, and the final locked receipt check remains
+    /// authoritative. Price drift is accepted, so a fresh quote is not
+    /// compared with the frozen one.
     pub(super) fn probe_app_run_prices(&self, run: &Value) -> Result<()> {
-        // As before, a failed PRICE probe is not proof of authority loss.
-        // The final locked receipt check remains authoritative.
         if let Ok(requests) = self.prepare_app_run_quotes(run) {
-            for (slot, request) in requests {
-                if let Ok(quote) = request.and_then(|request| request.fetch()) {
-                    if run["snapshot"]["quotes"][&slot] != json!(quote) {
-                        return Err(Error::rejected(
-                            "capability price changed since run creation",
-                        ));
-                    }
-                }
+            for request in requests.into_values() {
+                let _ = request.and_then(|request| request.fetch());
             }
         }
         Ok(())
@@ -1259,8 +1258,9 @@ impl Shared {
     /// CAD-1171: run a host-execution run's capability slots in-process.
     /// Mirrors the worker path (`app_run_capability_call`) minus the
     /// message/turn proof: the approved, dispatched step is the proof,
-    /// the frozen quote is re-checked, and the provider response is
-    /// retained through the same claim/record store calls.
+    /// each slot is re-quoted (the fresh quote is the ceiling), and the
+    /// provider response is retained through the same claim/record store
+    /// calls.
     fn execute_host_run(&self, run: &Value) -> Result<()> {
         use crate::contract_fixture::{classify_call, Effect};
         let install = required_str(run, "install_id")?;
@@ -1370,11 +1370,8 @@ impl Shared {
                     let quote = quotes
                         .get(slot)
                         .ok_or_else(|| Error::rejected("run capability quote is absent"))?;
-                    if run["snapshot"]["quotes"][slot] != json!(quote) {
-                        return Err(Error::rejected(
-                            "capability price changed since run approval",
-                        ));
-                    }
+                    // CAD-1141: price drift is accepted; the fresh quote is
+                    // the call's `max_charge_minor` ceiling (authority below).
                     self.recheck_app_capability_quote(&proof, quote)?;
                     let config = &proof.config;
                     let provider = required_str(config, "provider")?;
@@ -1404,7 +1401,7 @@ impl Shared {
                         "install_id":install,"context_id":run["context_id"],
                         "step_id":step_id,"slot":slot,"binding":proof,
                         "inputs":run["snapshot"]["inputs"],"source":run["snapshot"]["source"],
-                        "quote":run["snapshot"]["quotes"][slot],
+                        "quote":quote,
                         "call_id":call_id,
                     });
                     if effect == "draft"

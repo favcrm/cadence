@@ -72,10 +72,11 @@ fn start_refuses_forged_roles_owner_quotes_and_extra_fields() {
         params[field] = value;
         assert!(refusal(fx.operator("app_run_start", params)).contains("unsupported fields"));
     }
-    // A quote for a slot the workflow does not freeze is a price mismatch.
+    // A quote for a slot the workflow does not freeze is a stale slot set
+    // (CAD-1141: only the slot set is compared, never the price).
     let mut quoted = fx.start_params("f3");
     quoted["expected_quotes"] = json!({"image": {"schema": 1}});
-    assert!(refusal(fx.operator("app_run_start", quoted)).contains("price_changed"));
+    assert!(refusal(fx.operator("app_run_start", quoted)).contains("stale capability slot set"));
     let mut missing = fx.start_params("f4");
     missing.as_object_mut().unwrap().remove("expected_quotes");
     assert!(refusal(fx.operator("app_run_start", missing)).contains("expected_quotes"));
