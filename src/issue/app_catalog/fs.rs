@@ -11,7 +11,7 @@ use std::path::{Component, Path};
 
 use crate::error::{Error, Result};
 
-pub(super) struct Root(File);
+pub(in crate::issue) struct Root(File);
 
 #[cfg(test)]
 mod cad1385_acceptance;
@@ -37,7 +37,7 @@ fn open_at(parent: &File, value: &[u8], flags: i32) -> std::io::Result<File> {
 const DIRECTORY: i32 = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC;
 
 impl Root {
-    pub(super) fn open(path: &Path) -> Result<Self> {
+    pub(in crate::issue) fn open(path: &Path) -> Result<Self> {
         let start = if path.is_absolute() { "/" } else { "." };
         let c = name(start.as_bytes())?;
         let fd = unsafe { libc::open(c.as_ptr(), DIRECTORY) };
@@ -109,7 +109,7 @@ impl Root {
         Ok(Some(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT))
     }
 
-    pub(super) fn read(&self, path: &Path, cap: u64) -> Result<Option<String>> {
+    pub(in crate::issue) fn read(&self, path: &Path, cap: u64) -> Result<Option<String>> {
         let (parent, leaf) = match self.parent(path) {
             Ok(p) => p,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

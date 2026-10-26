@@ -168,43 +168,60 @@ impl Shared {
         if already_accepted && self.store.context_pin(&alias, &mid)?.is_some() {
             self.store.ensure_thread(&alias)?;
         }
+        // CAD-1846: the sender's `--no-lessons` is daemon-side selection
+        // policy, so it must reach the shared guard rather than being
+        // re-derived here.
+        let no_lessons = match params.get("no_lessons") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(Error::rejected(format!(
+                    "{VERB} takes `no_lessons` as a boolean"
+                )))
+            }
+        };
         // Derive the context selection for a genuinely new dispatch and pass
         // it into the store's admission transaction. The selection commits
         // only with an accepted NEW row: a rejected or duplicate envelope
         // writes nothing, so a colliding same-id request cannot retarget a
-        // queued turn's context.
+        // queued turn's context. The guard pins first: when the project is not
+        // opted in it returns without this closure, so no source is read.
         let selection = if already_accepted {
             None
         } else {
-            let items = issue::parse::acceptance_items(&issue_body);
+            let context_target = issue::dispatch::ContextTarget {
+                team_role: target.team_role.as_deref(),
+                provider: &target.provider,
+                endpoint_kind: &target.endpoint_kind,
+            };
+            let make = || {
+                let (request, items) = issue::parse::task_request(issue_body);
+                let contract = crate::context_pack::TaskContract::new(
+                    &front.id,
+                    &front.title,
+                    issue_source.as_bytes(),
+                    &items,
+                    request,
+                );
+                Ok((contract, std::borrow::Cow::Borrowed(text)))
+            };
             match issue::dispatch::context_guard(
+                &pm,
                 &project,
-                issue_source.as_bytes(),
                 &front,
-                &items,
-                target.team_role.as_deref(),
-                &target.provider,
-                &target.endpoint_kind,
-                text,
+                context_target,
+                no_lessons,
+                make,
             )? {
-                Some(manifest) => {
+                Some(prepared) => {
                     // Opted-in delivery shares the alias's native home
                     // conversation from the first send onward: the enqueue
                     // note, provider compaction notes and later receipts must
                     // name one real thread id.
                     self.store.ensure_thread(&alias)?;
-                    let manifest_value = serde_json::to_value(&manifest)?;
-                    Some(store::IssueSelection::Pin(json!({
-                        "message": mid,
-                        "task": manifest.task.task,
-                        "task_revision": manifest.task.revision,
-                        "project": manifest.project,
-                        "project_revision": manifest.project_revision,
-                        "role": manifest.role,
-                        "assigned_role": manifest.assigned_role,
-                        "manifest_digest": manifest.digest,
-                        "manifest": manifest_value,
-                    })))
+                    Some(store::IssueSelection::Pin(
+                        prepared.manifest.pin_payload(&mid),
+                    ))
                 }
                 None => Some(store::IssueSelection::Disabled {
                     task: id.clone(),
@@ -285,7 +302,7 @@ impl Shared {
     /// repo's worktrees dir. Exactly one must resolve — none means
     /// `issue start` never ran (or its lane is gone), several means the
     /// tracker names competing lanes and a pick would be a guess.
-    fn dispatch_lane(
+    pub(super) fn dispatch_lane(
         &self,
         verb: &str,
         project: &issue::project::Project,

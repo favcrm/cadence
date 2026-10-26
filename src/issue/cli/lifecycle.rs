@@ -29,6 +29,7 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                 owner: owner.clone(),
                 job: if *job {
                     Some(start::JobArgs {
+                        id: None,
                         pm: pm.clone().unwrap_or_default(),
                         spec: spec.clone().unwrap_or_default(),
                         assignee: assignee.clone(),

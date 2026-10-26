@@ -350,7 +350,7 @@ impl Store {
 
     /// [`Self::ensure_thread`] inside the caller's transaction; the
     /// caller has already proved the agent exists.
-    fn ensure_thread_in(tx: &impl super::StoreConn, alias: &str) -> Result<Thread> {
+    pub(super) fn ensure_thread_in(tx: &impl super::StoreConn, alias: &str) -> Result<Thread> {
         if let Some(thread) = Self::thread_in(tx, alias)? {
             return Ok(thread);
         }

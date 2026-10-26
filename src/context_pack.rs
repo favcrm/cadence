@@ -28,6 +28,8 @@
 //! Supply is a delivery fact, never model use: the receipt says what was
 //! appended and to which session/generation, not what the model read.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -37,7 +39,7 @@ use crate::issue::context::PinnedContext;
 use crate::issue::parse::AcceptanceItem;
 
 /// Manifest schema version.
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 /// Event kind carrying one kickoff message's pinned contract.
 pub const PIN_EVENT: &str = "context_pin";
 /// Event kind carrying one confirmed delivery receipt.
@@ -168,25 +170,70 @@ impl Refusal {
     }
 }
 
-/// The exact task revision and complete acceptance.
+/// The exact task revision, complete request prose and complete acceptance.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskContract {
     pub task: String,
+    /// Parent issue used for native project/repository resolution. A job task
+    /// has its own task identity and must not masquerade as its parent issue.
+    pub issue: String,
     pub title: String,
-    /// SHA-256 of the issue source bytes the acceptance was read from.
+    /// Plain issues hash their exact captured source. Job tasks hash their
+    /// complete captured contract, native revision and scope/report inputs.
     pub revision: String,
+    /// Canonical task prose, excluding only the separately captured criteria.
+    /// Required on stored pins: an older acceptance-only pin cannot claim
+    /// that it supplies this complete contract.
+    pub request: String,
     /// Every criterion, verbatim and in order. Never truncated.
     pub acceptance: Vec<String>,
+    /// Native metadata/report-only kickoff, needed when a new session no
+    /// longer has the original message. Never duplicated into that message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<String>,
 }
 
 impl TaskContract {
-    pub fn new(task: &str, title: &str, source: &[u8], items: &[AcceptanceItem]) -> Self {
+    pub fn new(
+        task: &str,
+        title: &str,
+        source: &[u8],
+        items: &[AcceptanceItem],
+        request: String,
+    ) -> Self {
         Self {
             task: task.to_string(),
+            issue: task.to_string(),
             title: title.to_string(),
             revision: digest(source),
+            request,
             acceptance: items.iter().map(|item| item.text.clone()).collect(),
+            execution: None,
         }
+    }
+
+    /// Completed plain-dispatch comparison only. Tracker bookkeeping changes
+    /// the raw source revision, not necessarily the actionable contract.
+    /// This never replaces provenance, manifest identity or residency proofs.
+    pub(crate) fn semantic_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"cadence-task-content-v1");
+        let field = |hasher: &mut Sha256, value: &str| {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        };
+        for value in [&self.task, &self.issue, &self.title, &self.request] {
+            field(&mut hasher, value);
+        }
+        hasher.update((self.acceptance.len() as u64).to_le_bytes());
+        for criterion in &self.acceptance {
+            field(&mut hasher, criterion);
+        }
+        hasher.update([u8::from(self.execution.is_some())]);
+        if let Some(execution) = &self.execution {
+            field(&mut hasher, execution);
+        }
+        format!("{:x}", hasher.finalize())
     }
 }
 
@@ -204,11 +251,16 @@ pub struct Source {
     pub path: String,
     pub title: String,
     pub required: bool,
-    /// The project revision the blob was read at (40-hex SHA-1).
+    /// Repository commit for a document, or content-addressed lesson selection.
     pub revision: String,
     /// SHA-256 of the exact blob bytes.
     pub digest: String,
     pub bytes: usize,
+    /// Exact native-selected lesson render. Repository documents never set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lesson_ids: Vec<String>,
 }
 
 /// One selected-but-withheld source or optional omission.
@@ -219,6 +271,14 @@ pub struct Gap {
     pub state: String,
     pub reason: String,
     pub required: bool,
+}
+
+/// Optional current-policy lessons, already selected by the native owner.
+/// The pure builder performs no memory lookup, verification or policy change.
+#[derive(Default)]
+pub struct LessonSelection {
+    pub source: Option<Source>,
+    pub withheld: Vec<Gap>,
 }
 
 /// The deterministic task manifest. Serialized into the pin event.
@@ -235,6 +295,24 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub withheld: Vec<Gap>,
     pub digest: String,
+}
+
+impl Manifest {
+    /// One native pin shape shared by issue and job admission transactions.
+    pub fn pin_payload(&self, message: &str) -> Value {
+        json!({
+            "message": message,
+            "task": self.task.task,
+            "issue": self.task.issue,
+            "task_revision": self.task.revision,
+            "project": self.project,
+            "project_revision": self.project_revision,
+            "role": self.role,
+            "assigned_role": self.assigned_role,
+            "manifest_digest": self.digest,
+            "manifest": self,
+        })
+    }
 }
 
 /// The receipt stored after a confirmed delivery. Saved as event payload
@@ -327,6 +405,7 @@ pub fn build(
     pin: &PinnedContext,
     role: &str,
     assigned_role: Option<&str>,
+    lessons: Option<LessonSelection>,
 ) -> std::result::Result<Option<Manifest>, Refusal> {
     if pin.state == "unconfigured" {
         return Ok(None);
@@ -400,6 +479,8 @@ pub fn build(
                 revision: revision.clone(),
                 digest,
                 bytes,
+                inline: None,
+                lesson_ids: Vec::new(),
             });
         } else if !document.selected {
             withheld.push(Gap {
@@ -421,6 +502,12 @@ pub fn build(
                 required: document.required,
             });
         }
+    }
+    if let Some(lessons) = lessons {
+        if let Some(source) = lessons.source {
+            documents.push(source);
+        }
+        withheld.extend(lessons.withheld);
     }
     let digest = manifest_digest(&task, project, &revision, role, &documents, &withheld);
     Ok(Some(Manifest {
@@ -448,9 +535,12 @@ fn manifest_digest(
         "schema": SCHEMA,
         "task": {
             "id": task.task,
+            "issue": task.issue,
             "title": task.title,
             "revision": task.revision,
+            "request": task.request,
             "acceptance": task.acceptance,
+            "execution": task.execution,
         },
         "project": project,
         "revision": revision,
@@ -463,6 +553,7 @@ fn manifest_digest(
             "revision": document.revision,
             "digest": document.digest,
             "bytes": document.bytes,
+            "lesson_ids": document.lesson_ids,
         })).collect::<Vec<_>>(),
         "withheld": withheld.iter().map(|gap| json!({
             "id": gap.id,
@@ -562,12 +653,12 @@ pub fn plan(
     };
     let mut withheld: Vec<Value> = manifest.withheld.iter().map(gap_value).collect();
     let supersedes = delta.map(|previous| previous.manifest.as_str());
-    let acceptance_changed =
+    let contract_changed =
         delta.is_some_and(|previous| previous.task_revision != manifest.task.revision);
-    // The contract is only rendered for a full delivery or a changed
-    // acceptance. Verify it against the actual body at that point; retained and
-    // unchanged-delta turns never scan.
-    let contract_in_body = (mode == Mode::Full || acceptance_changed)
+    // Only full delivery or a changed contract renders the complete request
+    // and criteria. Check criteria already in the actual body at that point;
+    // retained and unchanged-delta turns never scan.
+    let contract_in_body = (mode == Mode::Full || contract_changed)
         && acceptance_present(&manifest.task.acceptance, body);
 
     let mut required = String::new();
@@ -575,8 +666,9 @@ pub fn plan(
         &mut required,
         manifest,
         mode,
-        acceptance_changed,
+        contract_changed,
         contract_in_body,
+        body,
     );
     let mut included = Vec::new();
     let mut optional = Vec::new();
@@ -594,12 +686,13 @@ pub fn plan(
                 ));
                 included.push(source_receipt(document, "unchanged"));
             } else {
-                let text =
-                    reader(document).map_err(|(state, reason)| Refusal::MissingRequiredSource {
+                let text = read_source(document, reader).map_err(|(state, reason)| {
+                    Refusal::MissingRequiredSource {
                         id: document.id.clone(),
                         state,
                         reason,
-                    })?;
+                    }
+                })?;
                 required.push_str(&source_block(document, supersedes, &text));
                 included.push(source_receipt(document, "appended"));
             }
@@ -642,7 +735,7 @@ pub fn plan(
     }
     let mut context = required;
     for document in optional {
-        let text = match reader(document) {
+        let text = match read_source(document, reader) {
             Ok(text) => text,
             Err((state, reason)) => {
                 withheld.push(json!({
@@ -710,6 +803,24 @@ fn gap_value(gap: &Gap) -> Value {
            "reason": gap.reason, "required": gap.required})
 }
 
+fn read_source<'a>(
+    source: &'a Source,
+    reader: SourceReader<'_>,
+) -> std::result::Result<Cow<'a, str>, (String, String)> {
+    match source.inline.as_deref() {
+        Some(text) => {
+            if text.len() != source.bytes || digest(text.as_bytes()) != source.digest {
+                return Err((
+                    "conflict".to_string(),
+                    "the pinned inline source does not match its recorded bytes/digest".to_string(),
+                ));
+            }
+            Ok(Cow::Borrowed(text))
+        }
+        None => reader(source).map(Cow::Owned),
+    }
+}
+
 fn unchanged_source(previous: &Receipt, document: &Source) -> bool {
     previous
         .sources
@@ -732,17 +843,22 @@ fn resident_source(entry: &Value, document: &Source) -> bool {
 }
 
 fn source_receipt(document: &Source, disposition: &str) -> Value {
-    json!({"id": document.id, "path": document.path, "revision": document.revision,
-           "digest": document.digest, "bytes": document.bytes,
-           "required": document.required, "disposition": disposition})
+    let mut receipt = json!({"id": document.id, "path": document.path, "revision": document.revision,
+                            "digest": document.digest, "bytes": document.bytes,
+                            "required": document.required, "disposition": disposition});
+    if !document.lesson_ids.is_empty() {
+        receipt["lesson_ids"] = json!(document.lesson_ids);
+    }
+    receipt
 }
 
 fn render_contract(
     out: &mut String,
     manifest: &Manifest,
     mode: Mode,
-    acceptance_changed: bool,
+    contract_changed: bool,
     contract_in_body: bool,
+    body: &str,
 ) {
     out.push_str("## Task contract\n");
     out.push_str(&format!("> task: {}\n", quote_inline(&manifest.task.task)));
@@ -751,9 +867,34 @@ fn render_contract(
         quote_inline(&manifest.task.title)
     ));
     out.push_str(&format!(
-        "> acceptance revision: sha256:{}\n",
+        "> task contract revision: sha256:{}\n",
         manifest.task.revision
     ));
+    if (mode != Mode::Delta || contract_changed) && !manifest.task.request.is_empty() {
+        out.push_str("### Request (complete prose; criteria below)\n");
+        for line in manifest.task.request.lines() {
+            out.push_str("> ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    if mode != Mode::Delta || contract_changed {
+        if let Some(execution) = manifest
+            .task
+            .execution
+            .as_deref()
+            .filter(|execution| !body.contains(execution))
+        {
+            out.push_str("### Native task scope and report obligation\n");
+            for line in execution.lines() {
+                out.push_str("> ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+    }
     if contract_in_body {
         out.push_str(
             "The complete acceptance at this revision is carried by this turn's \
@@ -762,7 +903,7 @@ fn render_contract(
         );
         return;
     }
-    if mode == Mode::Delta && !acceptance_changed {
+    if mode == Mode::Delta && !contract_changed {
         out.push_str(
             "The complete acceptance at this revision is already resident in this \
              conversation; it is unchanged.\n\n",
@@ -880,9 +1021,12 @@ mod tests {
     fn task() -> TaskContract {
         TaskContract {
             task: "CAD-9".to_string(),
+            issue: "CAD-9".to_string(),
             title: "refunds".to_string(),
             revision: digest(b"issue source"),
+            request: String::new(),
             acceptance: vec!["inside pays".to_string(), "outside refuses".to_string()],
+            execution: None,
         }
     }
 
@@ -896,6 +1040,8 @@ mod tests {
             revision: "a".repeat(40),
             digest: digest(id.as_bytes()),
             bytes: id.len(),
+            inline: None,
+            lesson_ids: Vec::new(),
         }
     }
 
@@ -962,7 +1108,7 @@ mod tests {
             errors: Vec::new(),
         };
         assert!(matches!(
-            build(task(), "cad", &pin, "dev", None),
+            build(task(), "cad", &pin, "dev", None, None),
             Err(Refusal::MissingRequiredSource { .. })
         ));
     }

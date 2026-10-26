@@ -123,6 +123,7 @@ pub mod crm_sends;
 pub mod crm_smtp;
 mod plans;
 pub mod social_publish;
+pub(crate) use plans::DispatchPlan;
 pub use plans::{current_verdict, AssigneeTask, Job, Task, Verdict, JOB_STATES};
 mod quota;
 mod schema;

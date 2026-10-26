@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use super::events::row_event;
 use super::kickoff::kickoff_body;
-use super::messages::Priority;
-use super::plans::Task;
+use super::messages::{IssueSelection, Priority};
+use super::plans::{DispatchPlan, DispatchPreparation, Task};
 use super::quota::automatic_quota_error;
 use super::StoreConn;
 use super::{is_terminal, now, Sender, Store};
@@ -418,6 +418,46 @@ impl Store {
         pending_aliases: &HashSet<String>,
         by: &str,
     ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_automatic_monitor_task_inner(
+            monitor_id,
+            task_id,
+            pending_aliases,
+            by,
+            None,
+            None,
+        )
+    }
+
+    /// Prepared native context is consumed by the original monitor admission
+    /// transaction; readiness, approvals and queue occupancy are not prechecks.
+    pub(crate) fn dispatch_automatic_monitor_task_planned(
+        &self,
+        monitor_id: &str,
+        plan: &DispatchPlan,
+        delivery: Option<(String, IssueSelection)>,
+        pending_aliases: &HashSet<String>,
+        by: &str,
+        expect: Option<&super::AssistDispatchExpect>,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_automatic_monitor_task_inner(
+            monitor_id,
+            &plan.task.id,
+            pending_aliases,
+            by,
+            Some(DispatchPreparation { plan, delivery }),
+            expect,
+        )
+    }
+
+    fn dispatch_automatic_monitor_task_inner(
+        &self,
+        monitor_id: &str,
+        task_id: &str,
+        pending_aliases: &HashSet<String>,
+        by: &str,
+        prepared: Option<DispatchPreparation<'_>>,
+        expect: Option<&super::AssistDispatchExpect>,
+    ) -> Result<(Task, String, bool, bool)> {
         self.write_tx(|conn| {
 
                     let tx = &mut *conn;
@@ -451,6 +491,9 @@ impl Store {
 
                     let task = self.task_in(&tx, task_id)?;
                     let job = self.job_in(&tx, &task.job_id)?;
+                    if prepared.is_some() {
+                        self.task_dispatch_authority_in(&tx, &task, expect)?;
+                    }
                     if job.state != "open" || job.repo.as_deref() != Some(monitor.project.as_str()) {
                         return Err(Error::rejected(format!(
                             "Task '{task_id}' is not in monitor project '{}' with an open job",
@@ -568,9 +611,28 @@ impl Store {
                     )
                     .simple()
                     .to_string();
-                    let body = kickoff_body(&job, &task, revision, &kickoff, &worker)?;
+                    if let Some(prepared) = prepared.as_ref() {
+                        prepared
+                            .plan
+                            .verify_current(&task, &job, &worker, revision, &kickoff)?;
+                    }
+                    let (body, selection) = match prepared {
+                        Some(prepared) => {
+                            let (body, selection) = prepared.delivery.ok_or_else(|| {
+                                Error::rejected(format!(
+                                    "Task '{}' no longer has the captured live kickoff — retry to select its new task context before dispatch",
+                                    prepared.plan.task.id
+                                ))
+                            })?;
+                            (body, Some(selection))
+                        }
+                        None => (kickoff_body(&job, &task, revision, &kickoff, &worker)?, None),
+                    };
                     let reply_to = (assignee != job.pm_alias).then_some(job.pm_alias.as_str());
-                    let (duplicate, _state) = self.enqueue_tx(
+                    if matches!(&selection, Some(IssueSelection::Pin(_))) {
+                        Self::ensure_thread_in(&tx, assignee)?;
+                    }
+                    let (duplicate, _state) = self.enqueue_tx_with_conversation(
                         &tx,
                         assignee,
                         &body,
@@ -582,9 +644,14 @@ impl Store {
                         task.worktree.as_deref(),
                         &Sender::Unattributed,
                         Priority::Normal,
+                        false,
                         None,
                         None,
                         None,
+                        None,
+                        None,
+                        None,
+                        selection,
                     )?;
                     if duplicate {
                         return Ok((task, kickoff, true, false));
