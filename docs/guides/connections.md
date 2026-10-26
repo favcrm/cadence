@@ -121,6 +121,9 @@ Connections and grants before explicit unlock: reference authentication is not
 proof that restored authority is the freshest snapshot. Restart always locks
 custody. A contended encrypted operation returns busy without scheduling a later
 lock, rotation or revoke.
+An uncertain guarded core commit fences encrypted use. Inspect current
+Connections, then explicitly lock/unlock to reconcile. A provider's unknown
+delivery result is not permission to resend.
 
 Under this selection, new credential-bearing enrollment supports only the typed
 SMTP shape. Direct authenticated owner Connections management and native operator

@@ -219,7 +219,20 @@ impl Shared {
                 self,
                 super::custody_acceptance_fixture::smtp_scope7::Point::AfterProof,
             )?;
-            action(&operation)
+            let result = action(&operation);
+            // A typed core/link/RecordStore commit uncertainty leaves
+            // the durable outcome unproven. Fence (drop) the encrypted
+            // vault before the guards release, then propagate the same
+            // error. Provider unknown and known metadata refusals carry
+            // no such code and must not fence.
+            let vault = match result.as_ref().err().and_then(|error| error.code()) {
+                Some("outcome_unknown") => self.platform_custody.encrypted(),
+                _ => None,
+            };
+            if let Some(vault) = vault {
+                vault.fence();
+            }
+            result
         })
     }
 
@@ -480,9 +493,9 @@ impl Shared {
                         // screened against the secret just decoded,
                         // before the core write or its event.
                         let screen: &dyn Fn(&Value) -> Result<()> = &|material: &Value| {
-                            crate::platform::refuse_leak(
+                            crate::platform::refuse_json_leak(
                                 "SMTP binding",
-                                &material.to_string(),
+                                material,
                                 transport.secret(),
                             )
                         };
@@ -534,9 +547,9 @@ impl Shared {
                         let (transport, projection) =
                             self.crm_smtp_authority_witnessed(connection, revision, Some(witness))?;
                         let screen: &dyn Fn(&Value) -> Result<()> = &|material: &Value| {
-                            crate::platform::refuse_leak(
+                            crate::platform::refuse_json_leak(
                                 "SMTP rebinding",
-                                &material.to_string(),
+                                material,
                                 transport.secret(),
                             )
                         };
@@ -755,9 +768,9 @@ impl Shared {
             // response against the secret just decoded, before it
             // leaves the daemon. Legacy show keeps its existing shape.
             if let (Some(_), Some(transport)) = (witness, transport.as_ref()) {
-                crate::platform::refuse_leak(
+                crate::platform::refuse_json_leak(
                     "SMTP binding show",
-                    &binding.to_string(),
+                    &binding,
                     transport.secret(),
                 )?;
             }
@@ -838,6 +851,10 @@ impl Shared {
                 "auth_revision": link.auth_revision,
                 "link_digest": link.digest,
             }));
+            const ACCEPTED_MESSAGE: &str = "SMTP message accepted";
+            const UNCERTAIN_MESSAGE: &str =
+                "SMTP send outcome is unknown; delivery may have occurred";
+            const REJECTED_MESSAGE: &str = "SMTP test send was not accepted";
             let public_smtp_message = |mut message: String, fixed: &'static str| {
                 if witness.is_some() {
                     zeroize::Zeroize::zeroize(&mut message);
@@ -888,30 +905,30 @@ impl Shared {
                         idempotency_key: None,
                     };
                     if witness.is_some() {
-                        // The prepared receipt already holds every known
-                        // receipt field; borrow it plus the raw message
-                        // and the fixed encrypted outcome text. Only the
-                        // provider outcome remains unknown and is
-                        // screened after submission.
-                        let screened = (
-                            &receipt,
-                            &message.to,
-                            &message.subject,
-                            &message.html,
-                            &message.text,
-                            &message.unsubscribe_url,
-                            &projection.username,
-                            "SMTP message accepted",
-                            "SMTP send outcome is unknown; delivery may have occurred",
-                            "SMTP test send was not accepted",
-                        );
-                        crate::platform::refuse_leak(
+                        // Decoded receipt first — serialization would
+                        // escape punctuation a raw credential can carry
+                        // — then the raw message/username and every
+                        // fixed encrypted outcome text as borrowed &str.
+                        // Only the provider outcome remains unknown and
+                        // is screened after submission.
+                        crate::platform::refuse_json_leak(
                             "SMTP input",
-                            &serde_json::to_string(&screened).map_err(|_| {
-                                Error::internal("SMTP input screen could not serialize")
-                            })?,
+                            &receipt,
                             envelope.secret(),
                         )?;
+                        for text in [
+                            message.to.as_str(),
+                            message.subject.as_str(),
+                            message.html.as_str(),
+                            message.text.as_str(),
+                            message.unsubscribe_url.as_str(),
+                            projection.username.as_str(),
+                            ACCEPTED_MESSAGE,
+                            UNCERTAIN_MESSAGE,
+                            REJECTED_MESSAGE,
+                        ] {
+                            crate::platform::refuse_leak("SMTP input", text, envelope.secret())?;
+                        }
                     } else {
                         crate::platform::refuse_leak(
                             "SMTP input",
@@ -929,14 +946,14 @@ impl Shared {
                         crate::platform::smtp::SmtpOutcome::Accepted { code, message } => {
                             crate::platform::smtp::SmtpOutcome::Accepted {
                                 code,
-                                message: public_smtp_message(message, "SMTP message accepted"),
+                                message: public_smtp_message(message, ACCEPTED_MESSAGE),
                             }
                         }
                         crate::platform::smtp::SmtpOutcome::Uncertain { message } => {
                             // DATA was transmitted; a missing reply cannot prove non-delivery.
                             return Err(Error::unknown(public_smtp_message(
                                 message,
-                                "SMTP send outcome is unknown; delivery may have occurred",
+                                UNCERTAIN_MESSAGE,
                             )));
                         }
                         crate::platform::smtp::SmtpOutcome::Deferred { message, .. }
@@ -945,7 +962,7 @@ impl Shared {
                         | crate::platform::smtp::SmtpOutcome::PendingApproval { message } => {
                             return Err(Error::rejected(public_smtp_message(
                                 message,
-                                "SMTP test send was not accepted",
+                                REJECTED_MESSAGE,
                             )))
                         }
                     }
@@ -1004,11 +1021,19 @@ impl Shared {
             // The receipt must not carry the secret even when
             // the server echoed credential-shaped bytes — the
             // send path screens first; this is the second bar.
-            crate::platform::refuse_leak(
-                "smtp test receipt",
-                &receipt.to_string(),
-                transport.secret(),
-            )?;
+            if witness.is_some() {
+                crate::platform::refuse_json_leak(
+                    "smtp test receipt",
+                    &receipt,
+                    transport.secret(),
+                )?;
+            } else {
+                crate::platform::refuse_leak(
+                    "smtp test receipt",
+                    &receipt.to_string(),
+                    transport.secret(),
+                )?;
+            }
             // CAD-786: an accepted test send is the only
             // "sent after preview" evidence a campaign
             // prepare accepts, and it binds this exact
