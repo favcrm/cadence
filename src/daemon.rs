@@ -260,6 +260,7 @@ mod turn_project;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRecord;
 mod bootstrap_files;
+mod endpoints_rpc;
 mod human_current;
 mod human_threads_rpc;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -3598,6 +3599,13 @@ impl Shared {
             "monitor_alert_ack" => self.rpc_monitor_alert_ack(params),
             "monitor_stop" => self.rpc_monitor_stop(params, peer_pid),
             "monitor_dispatch" => self.rpc_monitor_dispatch(params, peer_pid),
+            "endpoint_add" => self.rpc_endpoint_add(params, peer_pid),
+            "endpoint_list" => self.rpc_endpoint_list(params),
+            "endpoint_show" => self.rpc_endpoint_show(params),
+            "endpoint_verify" => self.rpc_endpoint_verify(params),
+            "endpoint_enable" => self.rpc_endpoint_set_enabled(params, true),
+            "endpoint_disable" => self.rpc_endpoint_set_enabled(params, false),
+            "endpoint_remove" => self.rpc_endpoint_remove(params),
             "agent_unfence" => self.rpc_unfence(params, peer_pid),
             "agent_stop" => self.rpc_stop(params),
             "agent_remove" => {

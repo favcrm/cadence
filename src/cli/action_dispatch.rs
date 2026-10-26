@@ -632,6 +632,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         | Commands::Thread { .. }
         | Commands::Topic { .. }
         | Commands::Monitor { .. }
+        | Commands::Endpoint { .. }
         | Commands::Status { .. }
         | Commands::LocalAgent { .. }
         | Commands::Team { .. }

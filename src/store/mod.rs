@@ -85,6 +85,8 @@ pub use messages::{
 };
 mod monitors;
 pub use monitors::{Monitor, MonitorAlert, MonitorCheck};
+mod endpoint;
+pub use endpoint::AgentEndpoint;
 mod business_templates;
 pub(crate) use business_templates::SCHEMA as BUSINESS_TEMPLATE_SCHEMA;
 pub use business_templates::{BusinessDocument, TemplateVersion};

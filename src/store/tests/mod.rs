@@ -398,6 +398,7 @@ include!("schema.rs");
 
 mod app_runs;
 mod cloud_dispatch_outbox;
+mod endpoint;
 
 mod app_contexts;
 

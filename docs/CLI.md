@@ -271,6 +271,33 @@ The hosted binding lives under the `agent` noun:
 (the same path as the hidden `message ask`). A remote send is a durable
 enqueue only and refuses `--wait`.
 
+## Agent endpoints (CAD-1857)
+
+An endpoint is one agent's receiving identity — `email`, `webhook` or
+`schedule` — bound to exactly one stored workflow. It is created **disabled
+and unverified**; `verify` and `enable` are separate steps. Skills are not
+chosen on the endpoint: a workflow step declares its own `uses:` skill.
+
+```
+cadence endpoint add <agent> --kind email --slug billing \
+  --project <key> --workflow <name>
+cadence endpoint ls [--agent <alias>] [--state enabled|disabled]
+cadence endpoint show <id>
+cadence endpoint verify <id>
+cadence endpoint enable <id>
+cadence endpoint disable <id>
+cadence endpoint rm <id>
+```
+
+`add` pins the stored workflow's source digest (`sha256:…`). A duplicate
+`(kind, slug)`, an unknown agent or workflow, an invalid slug and a malformed
+digest are refused. A slug is 1–20 lowercase letters, digits or hyphens. The
+endpoint is bound to the agent's durable `uid`; re-registering an alias does
+not move it.
+
+Ingress, wake, address/secret allocation and the v2 projection are separate
+tickets; this registry does not accept events by itself.
+
 ## Settings > Agents management (CAD-1586)
 
 `cadence settings agents` manages the same authoritative document and revision
