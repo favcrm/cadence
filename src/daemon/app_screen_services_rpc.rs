@@ -248,7 +248,10 @@ args!(SendPrepare { campaign_id: String, binding_id: String, audience_freeze_id:
 args!(SendPrepareArgs {
     campaign_id: String,
     audience_freeze_id: String,
-    request_id: String
+    request_id: String,
+    base: Option<Value>,
+    exclusion_list_id: Option<String>,
+    max_recipients: Option<i64>
 });
 args!(SendId { send_id: String });
 args!(ResolveArgs {
