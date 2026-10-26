@@ -1021,7 +1021,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             ) : <span className="truncate text-ink-200 capitalize">{route.screen === "issue" ? route.id : t(SCREEN_LABEL[screen])}</span>}
           </nav>
 
-          <HeaderSearch issues={issuesState} route={route} navHref={hrefFor} />
+          <HeaderSearch hosted={meta?.hosted === true} issues={issuesState} route={route} navHref={hrefFor} />
 
           <div className="ml-auto flex items-center gap-1 shrink-0">
             {screen === "home" && meta?.signed_in === true && <DecisionsPanel />}

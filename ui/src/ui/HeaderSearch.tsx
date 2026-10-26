@@ -84,10 +84,13 @@ export default function HeaderSearch({
   issues,
   route,
   navHref,
+  hosted = false,
 }: {
   issues: ResourceState<IssueCard[]>;
   route: Route;
   navHref: (route: Route) => string;
+  /** A hosted tenant does not serve /api/wiki; the Knowledge group is absent there. */
+  hosted?: boolean;
 }) {
   const t = useTranslate();
   const currentProject = routeProject(route);
@@ -156,7 +159,7 @@ export default function HeaderSearch({
   // Knowledge: debounced; a request id drops replies superseded by a newer query or scope.
   useEffect(() => {
     requestRef.current += 1;
-    if (!open || !trimmed) {
+    if (!open || !trimmed || hosted) {
       setWikiState({ status: "idle", key: wikiKey });
       return;
     }
@@ -176,14 +179,18 @@ export default function HeaderSearch({
         });
     }, DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [open, trimmed, wikiRoot, wikiKey]);
+  }, [open, trimmed, wikiRoot, wikiKey, hosted]);
 
   const issueMatches = useMemo(
     () => rankIssues(issues.data ?? [], trimmed, projectKey),
     [issues.data, trimmed, projectKey],
   );
   const issueShown = issueMatches.slice(0, LIMIT);
-  const knowledge = wikiState.key === wikiKey ? wikiState : { status: "loading" as const, key: wikiKey };
+  const knowledge = hosted
+    ? { status: "idle" as const, key: wikiKey }
+    : wikiState.key === wikiKey
+      ? wikiState
+      : { status: "loading" as const, key: wikiKey };
   const hitCount = knowledge.status === "ok" ? knowledge.hits.length : 0;
   const hitShown = knowledge.status === "ok" ? knowledge.hits.slice(0, LIMIT) : [];
 
