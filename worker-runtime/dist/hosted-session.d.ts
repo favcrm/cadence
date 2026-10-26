@@ -34,6 +34,8 @@ export declare class HostedSession<Env extends object = Record<string, unknown>>
     ask(prompt: string, operationId?: string): Promise<AskResult>;
     /** Map the engine's committed records, including durable input metadata, for the board. */
     transcript(includeThinking: boolean): Promise<ThreadEntry[]>;
+    /** Stored runtime records, not expanded presentation entries. Read-only. */
+    recordCount(): Promise<number>;
     /** Abort this instance; durable state is retained when it is reconstructed. */
     reload(): string;
     /**
