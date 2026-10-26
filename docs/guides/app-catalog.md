@@ -580,3 +580,9 @@ possible future app-domain input path: contract review and consumer regressions
 remain necessary. CI compares against the trusted event base (fetching only
 that exact missing base commit in CI) and refuses when the base or its baseline
 is unavailable or malformed.
+
+Type-only edits to an included module still change its dependency hash, even
+when the emitted producer and canonical golden are identical. Regenerate the
+derived baseline with `node ui/scripts/build-app-fixtures.mjs --write` and
+review its dependency changes; retain the artifact, golden, trusted-base and
+version checks rather than bypassing freshness verification.

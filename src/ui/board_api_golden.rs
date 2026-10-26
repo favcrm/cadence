@@ -90,35 +90,82 @@ fn agents_payload_bytes_are_unchanged() {
     );
 }
 
-/// CAD-1795: what a member sees of the daemon's `master_state` and
-/// `thread_read` replies, redacted from the operator goldens the daemon
-/// producers are pinned to (`daemon::board_producer_golden`).
 #[test]
-fn member_views_of_master_state_and_threads_are_unchanged() {
-    let read = |name: &str| {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src/ui/board_api_golden")
-            .join(name);
-        parse(&std::fs::read_to_string(path).unwrap())
-    };
-    for name in ["idle", "queued", "running"] {
-        let mut state = read(&format!("master_state_{name}.json"));
-        redact_master_state(&mut state);
-        golden(&format!("master_state_{name}_member.json"), &state);
+fn member_master_state_keeps_routing_but_hides_private_turn_content() {
+    let mut state = serde_json::json!({
+        "turn": {
+            "state": "running",
+            "message": "operator-message",
+            "conversation": "operator-conversation",
+            "text": "private operator instruction",
+            "body": "private operator context",
+            "result": {"text": "private operator result"},
+            "future_private_field": {"secret": "private future content"}
+        }
+    });
+    redact_master_state(&mut state);
+    assert_eq!(state["turn"]["state"], "running");
+    assert_eq!(state["turn"]["message"], "operator-message");
+    assert_eq!(state["turn"]["conversation"], "operator-conversation");
+    for field in ["text", "body", "result", "future_private_field"] {
+        assert!(
+            state["turn"].get(field).is_none(),
+            "member turn exposes {field}: {state}"
+        );
     }
-    for name in ["forward", "tail"] {
-        let mut page = read(&format!("thread_page_{name}.json"));
+}
+
+#[test]
+fn member_home_pages_hide_content_without_losing_pagination_progress() {
+    for mut page in [
+        serde_json::json!({"alias": "master", "thread": {"id": "home", "install_id": null}}),
+        serde_json::json!({"thread": {"id": "unproven-home"}}),
+        serde_json::json!({"alias": "master"}),
+    ] {
+        page["entries"] = serde_json::json!([
+            {"seq": 1, "kind": "message", "text": "private operator instruction"},
+            {"seq": 2, "kind": "assistant_text", "text": "private assistant reply"}
+        ]);
+        page["cursor"] = Value::from(7);
+        page["more_after"] = Value::from(true);
+        page["scanned_before"] = Value::from(3);
         member_view(&mut page);
-        golden(&format!("thread_page_{name}_member.json"), &page);
+        assert_eq!(page["entries"], serde_json::json!([]));
+        assert!(
+            page["thread"].is_null(),
+            "member sees Home identity: {page}"
+        );
+        assert_eq!(page["cursor"], 7);
+        assert_eq!(page["more_after"], true);
+        assert_eq!(page["scanned_before"], 3);
     }
-    // A worker's thread: members keep its entries, minus the operator-only kinds.
-    let mut worker = read("thread_page_forward.json");
-    worker["alias"] = Value::from("w1");
-    let mut hire = worker["entries"][0].clone();
-    hire["kind"] = Value::from("hire_proposal");
-    worker["entries"].as_array_mut().unwrap().push(hire);
-    member_view(&mut worker);
-    golden("thread_page_worker_member.json", &worker);
+}
+
+#[test]
+fn member_worker_pages_keep_messages_but_hide_operator_only_cards() {
+    let mut page = serde_json::json!({
+        "alias": "worker",
+        "thread": {"id": "worker-conversation", "install_id": null},
+        "entries": [
+            {"seq": 1, "kind": "message", "text": "visible request"},
+            {"seq": 2, "kind": "hire_proposal", "text": "private hire proposal"},
+            {"seq": 3, "kind": "artifact", "text": "private artifact card"},
+            {"seq": 4, "kind": "assistant_text", "text": "visible reply"}
+        ],
+        "cursor": 4,
+        "more_after": true
+    });
+    member_view(&mut page);
+    assert_eq!(
+        page["entries"],
+        serde_json::json!([
+            {"seq": 1, "kind": "message", "text": "visible request"},
+            {"seq": 4, "kind": "assistant_text", "text": "visible reply"}
+        ])
+    );
+    assert_eq!(page["thread"]["id"], "worker-conversation");
+    assert_eq!(page["cursor"], 4);
+    assert_eq!(page["more_after"], true);
 }
 
 /// CAD-1795: `GET /api/issues/:id` and `issue show --json`, byte for byte.
