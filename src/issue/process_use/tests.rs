@@ -500,3 +500,328 @@ mod cad1558_acceptance {
         drop(child);
     }
 }
+
+/// CAD-1845 reviewer-written acceptance check (cc13-rev-spec) for the
+/// EACCES answer on a namespace link. The real guard
+/// (`ProcView::validate_completeness` through `read_namespace_link`) runs
+/// unchanged; the only seam is the kernel's own seccomp user notification
+/// on `readlinkat`: a supervisor thread answers the targeted link's read
+/// with a chosen errno and lets every other read continue to the kernel.
+/// The filter sits on one worker thread of a re-executed test process, so
+/// it never reaches another test.
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod cad1845_acceptance {
+    use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+    use tempfile::{Builder, TempDir};
+
+    const ISOLATED: &str = "CADENCE_CAD1845_ACCEPT_ISOLATED";
+    const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+
+    struct Outcome {
+        result: std::result::Result<(), String>,
+        seen: Vec<String>,
+        injected: Vec<String>,
+    }
+
+    /// Only `readlinkat` with the 64-byte buffer `read_namespace_link`
+    /// uses is sent to the supervisor; everything else is allowed.
+    fn install_listener() -> OwnedFd {
+        let stmt = |code: u16, k: u32| libc::sock_filter {
+            code,
+            jt: 0,
+            jf: 0,
+            k,
+        };
+        let jeq = |k: u32, jt: u8, jf: u8| libc::sock_filter {
+            code: 0x05 | 0x10, // BPF_JMP | BPF_JEQ | BPF_K
+            jt,
+            jf,
+            k,
+        };
+        let load = 0x20; // BPF_LD | BPF_W | BPF_ABS
+        let ret = 0x06; // BPF_RET | BPF_K
+        let mut filter = [
+            stmt(load, 4), // seccomp_data.arch
+            jeq(AUDIT_ARCH_X86_64, 0, 4),
+            stmt(load, 0), // seccomp_data.nr
+            jeq(libc::SYS_readlinkat as u32, 0, 2),
+            stmt(load, 40), // low word of args[3] (bufsiz)
+            jeq(64, 1, 0),
+            stmt(ret, libc::SECCOMP_RET_ALLOW),
+            stmt(ret, libc::SECCOMP_RET_USER_NOTIF),
+        ];
+        let prog = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_mut_ptr(),
+        };
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            let fd = libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_SET_MODE_FILTER,
+                libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+                &prog as *const libc::sock_fprog,
+            );
+            assert!(fd >= 0, "seccomp listener: {}", io::Error::last_os_error());
+            OwnedFd::from_raw_fd(fd as i32)
+        }
+    }
+
+    fn supervise(
+        listener: &OwnedFd,
+        target: Option<&str>,
+        errno: i32,
+        stop: &AtomicBool,
+        seen: &Mutex<Vec<String>>,
+        injected: &Mutex<Vec<String>>,
+    ) {
+        loop {
+            let mut pfd = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut pfd, 1, 50) };
+            if ready == 0 {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                continue;
+            }
+            if ready < 0 || pfd.revents & libc::POLLIN == 0 {
+                return;
+            }
+            let mut req: libc::seccomp_notif = unsafe { std::mem::zeroed() };
+            if unsafe {
+                libc::ioctl(
+                    listener.as_raw_fd(),
+                    libc::SECCOMP_IOCTL_NOTIF_RECV,
+                    &mut req,
+                )
+            } != 0
+            {
+                continue;
+            }
+            let path =
+                std::fs::read_link(format!("/proc/{}/fd/{}", req.pid, req.data.args[0] as i32))
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+            seen.lock().unwrap().push(path.clone());
+            let mut resp: libc::seccomp_notif_resp = unsafe { std::mem::zeroed() };
+            resp.id = req.id;
+            if target.is_some_and(|suffix| path.ends_with(suffix)) {
+                resp.error = -errno;
+                injected.lock().unwrap().push(path);
+            } else {
+                resp.flags = libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32;
+            }
+            let sent =
+                unsafe { libc::ioctl(listener.as_raw_fd(), libc::SECCOMP_IOCTL_NOTIF_SEND, &resp) };
+            assert_eq!(sent, 0, "notif send: {}", io::Error::last_os_error());
+        }
+    }
+
+    /// Runs the real completeness proof over `root`, answering the read of
+    /// the link whose held path ends with `target` with `errno`.
+    fn validate(root: &Path, target: Option<String>, errno: i32) -> Outcome {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let injected = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel::<OwnedFd>();
+        let supervisor = {
+            let (seen, injected, stop) = (seen.clone(), injected.clone(), stop.clone());
+            std::thread::spawn(move || {
+                if let Ok(listener) = rx.recv() {
+                    supervise(&listener, target.as_deref(), errno, &stop, &seen, &injected);
+                }
+            })
+        };
+        let root = root.to_path_buf();
+        let result = std::thread::spawn(move || {
+            let view = ProcView::open(&root).map_err(|error| error.to_string())?;
+            tx.send(install_listener()).unwrap();
+            view.validate_completeness()
+                .map_err(|error| error.to_string())
+        })
+        .join()
+        .unwrap();
+        stop.store(true, Ordering::SeqCst);
+        supervisor.join().unwrap();
+        let seen = seen.lock().unwrap().clone();
+        let injected = injected.lock().unwrap().clone();
+        Outcome {
+            result,
+            seen,
+            injected,
+        }
+    }
+
+    /// A synthetic view that completes cleanly; every link in it is owned
+    /// by the caller.
+    fn synthetic() -> (TempDir, PathBuf) {
+        let root = Builder::new().prefix("c1845u-").tempdir_in("/tmp").unwrap();
+        let proc_root = root.path().join("proc");
+        std::fs::create_dir_all(proc_root.join("self/ns")).unwrap();
+        std::fs::create_dir_all(proc_root.join("2/ns")).unwrap();
+        let canon = proc_root.canonicalize().unwrap();
+        std::fs::write(
+            proc_root.join("self/mountinfo"),
+            format!(
+                "1 23 0:55 / {} rw,nosuid,nodev,noexec,relatime - proc proc rw\n",
+                canon.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(proc_root.join("self/kernel-release"), "7.0.0\n").unwrap();
+        std::fs::write(
+            proc_root.join("2/stat"),
+            "2 (kthreadd) S 0 0 0 0 -1 2097152 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+        symlink("pid:[42]", proc_root.join("self/ns/pid")).unwrap();
+        symlink("pid:[42]", proc_root.join("2/ns/pid")).unwrap();
+        std::fs::write(
+            proc_root.join("self/status"),
+            "Name:\tt\nState:\tR (running)\nNSpid:\t7\nCapPrm:\t0000000000000000\n",
+        )
+        .unwrap();
+        (root, proc_root)
+    }
+
+    fn refused(outcome: &Outcome, case: &str, expect: &[&str]) {
+        assert!(
+            !outcome.injected.is_empty(),
+            "{case}: the targeted link was never read (seen {:?})",
+            outcome.seen
+        );
+        let error = outcome
+            .result
+            .as_ref()
+            .err()
+            .unwrap_or_else(|| panic!("{case}: accepted; seen {:?}", outcome.seen));
+        for part in expect {
+            assert!(
+                error.contains(part),
+                "{case}: expected {part:?} in {error:?}"
+            );
+        }
+    }
+
+    fn link_owner(path: &str) -> Option<u32> {
+        std::fs::symlink_metadata(path).ok().map(|meta| meta.uid())
+    }
+
+    #[test]
+    fn cad1845_namespace_link_refusals() {
+        if std::env::var_os(ISOLATED).is_none() {
+            let name = module_path!().split_once("::").unwrap().1.to_string()
+                + "::cad1845_namespace_link_refusals";
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--test-threads", "1", "--nocapture"])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "{text}");
+            assert!(text.contains("1 passed"), "{text}");
+            return;
+        }
+        let euid = unsafe { libc::geteuid() };
+        let pid2 = Some("/2/ns/pid".to_string());
+
+        // 0. The seam itself changes nothing: an uninjected synthetic view
+        // completes and both namespace links pass through the supervisor.
+        let (_keep, root) = synthetic();
+        let base = validate(&root, None, 0);
+        assert!(base.result.is_ok(), "{:?}", base.result);
+        assert!(
+            base.seen.iter().any(|p| p.ends_with("/self/ns/pid"))
+                && base.seen.iter().any(|p| p.ends_with("/2/ns/pid")),
+            "supervisor did not see both links: {:?}",
+            base.seen
+        );
+
+        // 1. EACCES on a PID 2 link the caller owns is not the CAD-1196
+        // answer: it refuses.
+        assert_eq!(
+            link_owner(root.join("2/ns/pid").to_str().unwrap()),
+            Some(euid)
+        );
+        let own = validate(&root, pid2.clone(), libc::EACCES);
+        refused(
+            &own,
+            "own-uid EACCES on 2/ns/pid",
+            &["2/ns/pid", "Permission denied"],
+        );
+
+        // 2. The caller's own link unreadable refuses.
+        let me = validate(&root, Some("/self/ns/pid".into()), libc::EACCES);
+        refused(&me, "EACCES on self/ns/pid", &["self/ns/pid"]);
+
+        // 3. Any other errno on PID 2's link refuses.
+        for errno in [libc::EIO, libc::EPERM, libc::ENOENT] {
+            let other = validate(&root, pid2.clone(), errno);
+            refused(&other, &format!("errno {errno} on 2/ns/pid"), &["2/ns/pid"]);
+        }
+
+        // 4-6. The real /proc, where PID 2's link is root's (foreign to a
+        // non-root caller). Driven wherever the uninjected proof completes;
+        // a container whose PID 2 is not kthreadd cannot reach the link.
+        let real = Path::new("/proc");
+        let base = validate(real, None, 0);
+        let foreign = link_owner("/proc/2/ns/pid").is_some_and(|uid| uid != euid);
+        if let Err(reason) = &base.result {
+            eprintln!(
+                "cad1845: real /proc proof does not complete here ({reason}); cases 4-6 not run"
+            );
+            return;
+        }
+        // 4. A foreign link answering EACCES is the accepted residual: the
+        // proof completes through the kthreadd + NSpid path.
+        if foreign {
+            let excused = validate(real, pid2.clone(), libc::EACCES);
+            assert!(!excused.injected.is_empty(), "{:?}", excused.seen);
+            assert!(excused.result.is_ok(), "{:?}", excused.result);
+        }
+        // 5. A foreign link answering any other errno still refuses.
+        for errno in [libc::EIO, libc::EPERM] {
+            let other = validate(real, pid2.clone(), errno);
+            refused(
+                &other,
+                &format!("real errno {errno} on 2/ns/pid"),
+                &["2/ns/pid"],
+            );
+        }
+        // 6. The caller's own link made foreign (non-dumpable: the kernel
+        // then reports root as its owner) and unreadable still refuses: an
+        // excused None for the caller proves nothing.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+        let self_link = format!("/proc/{}/ns/pid", std::process::id());
+        let self_foreign = link_owner(&self_link).is_some_and(|uid| uid != euid);
+        let me = validate(
+            real,
+            Some(format!("/{}/ns/pid", std::process::id())),
+            libc::EACCES,
+        );
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) }, 0);
+        // Root owns every link, so there the own-uid refusal answers instead.
+        assert!(
+            self_foreign || euid == 0,
+            "non-dumpable self link still owned by caller"
+        );
+        let expect = if self_foreign {
+            "own pid namespace"
+        } else {
+            "self/ns/pid"
+        };
+        refused(&me, "EACCES on a foreign self/ns/pid", &[expect]);
+    }
+}
