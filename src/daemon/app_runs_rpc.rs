@@ -79,10 +79,10 @@ fn freeze_content_inputs(
     (effective, origins)
 }
 
-/// The installed bundle checks an installation approval rests on: a
-/// typed manifest with no legacy untyped connection slots and at least one
-/// supported local workflow. Shared by the explicit operator approval and
-/// the consent an operator install or update records (CAD-1119).
+/// The installed bundle checks an installation approval rests on: supported
+/// host requirements, paired storage declarations, no legacy untyped connection
+/// slots and at least one supported local workflow. Shared by explicit approval
+/// and the consent an operator install or update records (CAD-1119).
 pub(super) fn local_execution_contract(
     files: &BTreeMap<String, String>,
 ) -> Result<crate::issue::app::Manifest> {
@@ -91,6 +91,10 @@ pub(super) fn local_execution_contract(
             .get("app.md")
             .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
     )?;
+    crate::issue::app::validate_storage_members(&manifest, files.keys().map(String::as_str))?;
+    manifest
+        .requires
+        .check(&cadence_core::app_compat::host(env!("CARGO_PKG_VERSION"))?)?;
     if !manifest.connections.is_empty() {
         return Err(Error::rejected(
             "local text execution does not support connection capabilities",

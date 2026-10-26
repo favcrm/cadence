@@ -1561,6 +1561,30 @@ pub(crate) fn validate_texts(
     validate_contents(files, warnings, Vec::new(), agents, agent_sources)
 }
 
+/// Storage members and their requirement are one package contract, including
+/// when already-installed bytes are explicitly approved again.
+pub(crate) fn validate_storage_members<'a>(
+    manifest: &Manifest,
+    paths: impl Iterator<Item = &'a str>,
+) -> Result<()> {
+    let declared = manifest.requires.contracts.get("app-storage");
+    let mut root = false;
+    let mut members = false;
+    for path in paths {
+        root |= path == "app-storage.json";
+        members |= path.starts_with("storage/");
+    }
+    if (root || members) && declared.is_none_or(|majors| majors.as_slice() != [1]) {
+        return Err(Error::rejected(
+            "app storage members require needs.requires.contracts.app-storage: [1]",
+        ));
+    }
+    if declared.is_some() && !root {
+        return Err(Error::rejected("app-storage requires app-storage.json"));
+    }
+    Ok(())
+}
+
 fn validate_contents(
     files: Vec<(String, String)>,
     secret_warnings: Vec<crate::secret::Finding>,
@@ -1602,18 +1626,10 @@ fn validate_contents(
             guide: String::new(),
         },
     };
-    // Recognizing inert bundle members is not a native storage capability.
-    // A declared target contract still fails the native compatibility check.
-    let storage_declared = manifest.requires.contracts.get("app-storage");
-    let storage_root = files.iter().any(|(path, _)| path == "app-storage.json");
-    let storage_members = files.iter().any(|(path, _)| path.starts_with("storage/"));
-    if (storage_root || storage_members)
-        && storage_declared.is_none_or(|majors| majors.as_slice() != [1])
+    if let Err(error) =
+        validate_storage_members(&manifest, files.iter().map(|(path, _)| path.as_str()))
     {
-        errors.push("app storage members require needs.requires.contracts.app-storage: [1]".into());
-    }
-    if storage_declared.is_some() && !storage_root {
-        errors.push("app-storage requires app-storage.json".into());
+        errors.push(error.to_string());
     }
     // CAD-1129 §3: every asset `listing` references must be in this
     // bundle's own inventory — `assets/` flat *.svg, nothing outside.

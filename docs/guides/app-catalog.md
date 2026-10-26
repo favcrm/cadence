@@ -120,6 +120,9 @@ explicit incompatible-host receipt for a storage-bearing package. A hosted
 implementation must separately validate the declaration and checksums, enforce
 its tenant-local storage contract and bind activation to the same immutable
 bundle. An unknown requirement is never treated as supported.
+Explicit approval of edited installed bytes rechecks the same requirement and
+storage-member pairing before recording execution authority. Unsupported bytes
+remain inspectable; an operator approval cannot supply a missing runtime.
 
 
 The JSON report carries `ok`, a stable `refusal.code` (`app_check_transport`,
