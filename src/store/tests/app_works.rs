@@ -160,10 +160,24 @@ fn cad1649_trash_restore_and_context_scope() {
         .app_works_create("ctx-1", &doc("Retention"), "alice", "create-1", None)
         .unwrap();
     assert_eq!(created["revision"], 1);
+    // Trash does not clear a pending review, so a review of a trashed record
+    // must refuse as missing before the revision or pending checks — and the
+    // hosted `works.review.check` reads the same host-proven trash flag.
+    store
+        .app_works_request_review("ctx-1", "retention", 1, "alice", None)
+        .unwrap();
     let trashed = store
         .app_works_trash("ctx-1", "retention", 1, "alice", "trash-1", None)
         .unwrap();
     assert_eq!(trashed["trashed"], true);
+    let error = store
+        .app_works_review("ctx-1", "retention", 1, "approve", None, "bob", None)
+        .unwrap_err();
+    assert_eq!(error.code(), Some("not_found"));
+    let error = store
+        .app_works_review("ctx-1", "retention", 2, "approve", None, "bob", None)
+        .unwrap_err();
+    assert_eq!(error.code(), Some("not_found"));
     let error = store.app_works_get("ctx-1", "retention").unwrap_err();
     assert_eq!(error.code(), Some("not_found"));
     let restored = store

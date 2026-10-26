@@ -7,6 +7,7 @@
       "revision": 2,
       "review_status": "pending",
       "pending": 2,
+      "trashed": false,
       "author": "human:acme:alice",
       "reviewer": "human:acme:bob",
       "decision": "changes",

@@ -86,35 +86,59 @@ pub struct ManifestPreflightInput {
 #[derive(Serialize, JsonSchema)]
 pub struct ManifestPreflightValue {}
 
+/// One optional draft field. Absent and JSON `null` are different to the
+/// native create: an absent `content` refuses as missing while an explicit
+/// `null` refuses as "not an object". `Option<Value>` collapses both into
+/// `None`, so presence is tracked explicitly and no dependency is added.
+#[derive(Clone, Debug, Default)]
+pub enum Field {
+    #[default]
+    Absent,
+    Present(Value),
+}
+
+impl<'de> Deserialize<'de> for Field {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Value::deserialize(deserializer).map(Field::Present)
+    }
+}
+
 /// Input of `works.draft.validate`: the fields a Works create parses. They
 /// stay untyped so a wrong type reaches the same refusal a native caller gets
 /// instead of failing envelope decoding.
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DraftInput {
+    #[serde(default)]
     #[schemars(with = "Option<Value>")]
-    pub kind: Option<Value>,
+    pub kind: Field,
+    #[serde(default)]
     #[schemars(with = "Option<Value>")]
-    pub title: Option<Value>,
+    pub title: Field,
+    #[serde(default)]
     #[schemars(with = "Option<Value>")]
-    pub content: Option<Value>,
+    pub content: Field,
     /// Optional; an absent or null value means no tags.
+    #[serde(default)]
     #[schemars(with = "Option<Value>")]
-    pub tags: Option<Value>,
+    pub tags: Field,
 }
 
 impl DraftInput {
     /// The create parameters the shared grammar parses, with absent fields
-    /// still absent (an absent and a null `content` refuse differently).
+    /// still absent and an explicit `null` still present.
     fn params(&self) -> Value {
         let mut params = serde_json::Map::new();
-        for (key, value) in [
+        for (key, field) in [
             ("kind", &self.kind),
             ("title", &self.title),
             ("content", &self.content),
             ("tags", &self.tags),
         ] {
-            if let Some(value) = value {
+            if let Field::Present(value) = field {
                 params.insert(key.to_string(), value.clone());
             }
         }
@@ -177,6 +201,10 @@ pub struct ReviewInput {
     pub review_status: String,
     /// The revision a pending review was requested for.
     pub pending: Option<i64>,
+    /// Whether the record is trashed. Trash state does not clear a pending
+    /// review, so a review of a trashed record must refuse as missing — the
+    /// host proves this value, it is not a caller claim.
+    pub trashed: bool,
     /// The stored author of the revision.
     pub author: String,
     /// The verified human presenting the decision.
@@ -251,14 +279,14 @@ pub fn draft_validate(input: &DraftInput) -> DraftValue {
 }
 
 pub fn review_check(input: &ReviewInput) -> ReviewValue {
-    // The review gate reads current, review_status and pending; `reviewed`
-    // and trash state are not part of it.
+    // The review gate reads current, review_status, pending and trash state;
+    // `reviewed` is not part of it.
     let state = State {
         current: input.current,
         reviewed: 0,
         review_status: &input.review_status,
         pending: input.pending,
-        trashed: false,
+        trashed: input.trashed,
     };
     let admitted = works::review_decision(&input.decision, input.note.as_deref())
         .and_then(|decision| works::review(&state, input.revision).map(|()| decision))

@@ -267,6 +267,10 @@
           "description": "The revision under review.",
           "type": "integer",
           "format": "int64"
+        },
+        "trashed": {
+          "description": "Whether the record is trashed. Trash state does not clear a pending\nreview, so a review of a trashed record must refuse as missing — the\nhost proves this value, it is not a caller claim.",
+          "type": "boolean"
         }
       },
       "additionalProperties": false,
@@ -274,6 +278,7 @@
         "current",
         "revision",
         "review_status",
+        "trashed",
         "author",
         "reviewer",
         "decision"
