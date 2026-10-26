@@ -54,6 +54,46 @@ Sources: native [`local_assignment/events.rs`](../../src/local_assignment/events
 [`cli/remote.rs`](../../src/cli/remote.rs), and the [canonical kernel boundary](app-catalog.md#host-requirements-needsrequires).
 The hosted source/revision references are listed under verification.
 
+### Hosted conversations without a connected native runner
+
+The separate [`worker-runtime/`](../../worker-runtime/) package owns hosted
+browser conversations inside a Cloudflare Durable Object. Its public name is
+`@cadence/hosted-runtime`; `HostedSession`, JSON tool contracts and opaque
+generation identities do not expose a provider SDK. This is a library used by
+the tenant host, not a second daemon or a new hosted service.
+
+Cadence owns the execution loop, model transport adaptation, transcript and
+task recovery, bundled prompts/skills and stream lifecycle. The current private
+adapter uses Pi Durable; another backend is not implemented or claimed.
+AgenticOS supplies the authenticated model proxy and domain capabilities.
+Provider credentials, model routing, financial authorization, current tenant
+membership and human approval decisions remain with that platform.
+
+Every tool execution rechecks the supplied refusal and live authorization,
+including recovered executions and runtime-owned skill tools. Cancellation is
+checked before and after the authority check. Tool handlers receive only the
+neutral invocation identity, clock and cancellation context, not the engine's
+model registry or nested-execution API.
+
+From `worker-runtime/`, using its pinned Bun version:
+
+```sh
+bun install --frozen-lockfile --ignore-scripts
+bun run verify
+```
+
+The committed `dist/` artifact includes self-contained declarations, bundles,
+Apache-2.0 provenance, third-party notices and file digests. CI rebuilds it and
+refuses generated drift. Consumers pin a full Cadence source revision and exact
+hashes; normal consumer CI can verify those bytes offline without fetching this
+private repository or building the engine.
+
+The existing conversation DO export, private SQLite names, history metadata and
+funding identities are preserved. Browser chat does not require a connected PC;
+repository work still belongs to the native runner. This module does not move
+tenant business storage, add a shell, grant effect authority or establish a
+production deployment or abrupt-crash qualification.
+
 ## Join once per person; connect explicitly
 
 An existing owner can invite a teammate from an ordinary human shell:

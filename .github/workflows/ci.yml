@@ -592,6 +592,17 @@ jobs:
         run: node --test ../scripts/app-dev/*.test.mjs
       - run: bun run build
         if: ${{ needs.change-scope.outputs.ui != 'false' }}
+      # CAD-1850: consumers vendor exact, committed runtime bytes and hashes.
+      # Check the canonical source and deterministic output in this same gate.
+      - name: Hosted runtime package checks
+        if: ${{ needs.change-scope.outputs.ui != 'false' }}
+        working-directory: worker-runtime
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun run typecheck
+          bun run test
+          bun run build
+          git diff --exit-code -- dist
       # This job had no install step and built on the runner's preinstalled
       # (floating) Rust; the default working directory here is ui/.
       - run: $GITHUB_WORKSPACE/scripts/ci-rust-toolchain --profile minimal
