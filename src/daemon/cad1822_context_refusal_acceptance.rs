@@ -1874,3 +1874,153 @@ fn cad1822_pi_guard_is_inside_the_retained_cap() {
         "retained context must not hide the known Pi guard overhead from the hard cap"
     );
 }
+
+#[test]
+fn cad1822_context_revision_and_contract_share_the_selected_issue_snapshot() {
+    let fixture = Fixture::new();
+    let pm = Pm::at(&fixture.pm).unwrap();
+    let original_source = fs::read_to_string(fixture.issue_file(CONTROL)).unwrap();
+    let (original_front, original_body) =
+        crate::issue::parse::parse_issue(&original_source).unwrap();
+    let original_items = crate::issue::parse::acceptance_items(&original_body);
+    let expected_title = original_front.title;
+    let expected_acceptance: Vec<String> = original_items
+        .iter()
+        .map(|item| item.text.clone())
+        .collect();
+    let expected_revision = crate::delegation::sha256_hex(original_source.as_bytes());
+
+    // Capture the same parsed issue snapshot that preflight passes to the
+    // shared guard, before another ordinary tracker writer changes it.
+    let gated = crate::issue::dispatch::gate_issue(&pm, CONTROL, true).unwrap();
+    assert_eq!(gated.front.title, expected_title);
+    assert_eq!(gated.items, original_items);
+
+    let select = || {
+        crate::issue::dispatch::context_guard(
+            &gated.project,
+            gated.source.as_bytes(),
+            &gated.front,
+            &gated.items,
+            None,
+            "fake",
+            "fake",
+            "Execute the originally selected task using its required project policy.",
+        )
+        .expect("the real required Git policy must remain deliverable")
+        .expect("the fixture project is explicitly opted in")
+    };
+
+    // Positive control: without an intervening edit the real guard agrees
+    // with the selected source, including its exact byte revision.
+    let stable = select();
+    assert_eq!(stable.task.title, expected_title);
+    assert_eq!(stable.task.acceptance, expected_acceptance);
+    assert_eq!(stable.task.revision, expected_revision);
+
+    // These are normal tracker writes, completed exactly between the two
+    // reads. They are not an authorized revision of the captured dispatch.
+    let revised_title = "CAD-1822 independently revised task title";
+    write::set_fields(
+        &pm,
+        &[CONTROL.to_string()],
+        &[format!("title={revised_title}")],
+        "cad1822-acceptance",
+        None,
+    )
+    .unwrap();
+    let input = fixture._dir.path().join("revised-acceptance.md");
+    fs::write(
+        &input,
+        "- [ ] The revised task has a different canonical acceptance.\n",
+    )
+    .unwrap();
+    write::set_acceptance(&pm, CONTROL, &input, "cad1822-acceptance").unwrap();
+
+    let revised = crate::issue::dispatch::gate_issue(&pm, CONTROL, true).unwrap();
+    assert_eq!(revised.front.title, revised_title);
+    assert_ne!(revised.items, original_items);
+    let revised_source = fs::read(fixture.issue_file(CONTROL)).unwrap();
+    assert_ne!(
+        crate::delegation::sha256_hex(&revised_source),
+        expected_revision,
+        "the controlled normal edits must actually change the issue revision"
+    );
+
+    let pinned = select();
+    assert_eq!(pinned.task.title, expected_title);
+    assert_eq!(pinned.task.acceptance, expected_acceptance);
+    assert_eq!(
+        pinned.task.revision, expected_revision,
+        "the original title and criteria must retain their original source revision; \
+         a later issue edit cannot relabel an already selected contract"
+    );
+}
+
+#[test]
+fn cad1822_empty_project_context_still_requires_a_prompt_capable_endpoint() {
+    let fixture = Fixture::new();
+    fixture.kickoff_rpc(CONTROL, RESTORED_WORKER).unwrap();
+    let target = "ctxp-empty-contract-inbox";
+    fixture.op(
+        "agent_register",
+        json!({
+            "alias": target, "provider": "inbox", "endpoint_kind": "inbox",
+            "role": "worker", "cwd": fixture.repo
+        }),
+    );
+    let (_, issue_body) = write::load_front(fixture.issue_file(CONTROL).parent().unwrap()).unwrap();
+    assert!(
+        !crate::issue::parse::acceptance_items(&issue_body).is_empty(),
+        "the empty document set must still have a mandatory canonical task contract"
+    );
+    let acceptance_before = fixture.acceptance(CONTROL);
+    let manifest = fixture.repo.join(MANIFEST);
+    let enabled = format!("schema: 1\nproject: {PROJECT}\nagent_delivery: true\ndocuments: []\n");
+    fs::write(&manifest, &enabled).unwrap();
+    commit_all(
+        &fixture.repo,
+        "opt in with a mandatory task contract and no document bodies",
+    );
+
+    let id = "cad1822-empty-contract-inbox";
+    let request = json!({
+        "alias": target, "issue": CONTROL, "reply_to": GROUP,
+        "message": id, "text": "Execute the assigned task."
+    });
+    let baseline = fixture.message_ids(target, None);
+    let error = fixture.try_op("dispatch_send", request.clone()).expect_err(
+        "an opted-in canonical task contract cannot be silently discarded by an Inbox endpoint",
+    );
+    assert_eq!(error.kind(), "rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("context refused: unsupported-endpoint:"),
+        "expected the native mandatory-contract endpoint refusal, got: {error}"
+    );
+    assert_eq!(fixture.message_ids(target, None), baseline);
+    assert_eq!(fixture.acceptance(CONTROL), acceptance_before);
+    let store = crate::store::Store::open_side(&fixture.state.join("cadence.sqlite3")).unwrap();
+    assert!(store.message(id).unwrap().is_none());
+    assert!(store.context_pin(target, id).unwrap().is_none());
+
+    fs::write(
+        &manifest,
+        enabled.replacen("agent_delivery: true", "agent_delivery: false", 1),
+    )
+    .unwrap();
+    commit_all(
+        &fixture.repo,
+        "leave the legacy Inbox assignment explicitly opted out",
+    );
+    let accepted = fixture
+        .try_op("dispatch_send", request)
+        .expect("an opted-out legacy Inbox dispatch must remain supported");
+    assert_eq!(accepted["message"], id);
+    assert_eq!(accepted["state"], "queued");
+    assert_eq!(accepted["duplicate"], false);
+    assert!(store.message(id).unwrap().is_some());
+    assert!(store.context_pin(target, id).unwrap().is_none());
+    assert_eq!(fixture.acceptance(CONTROL), acceptance_before);
+}

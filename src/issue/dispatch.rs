@@ -497,11 +497,14 @@ pub(crate) struct GatedIssue {
     pub dir: PathBuf,
     pub front: Front,
     pub items: Vec<AcceptanceItem>,
+    /// Exact source from which `front` and `items` were parsed.
+    pub source: String,
 }
 
 pub(crate) fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<GatedIssue> {
     let (project, dir) = write::issue_dir(pm, id)?;
-    let (front, body) = write::load_front(&dir)?;
+    let source = std::fs::read_to_string(dir.join("issue.md"))?;
+    let (front, body) = parse::parse_issue(&source)?;
     let items = parse::acceptance_items(&body);
     if require_acceptance && items.is_empty() {
         return Err(Error::rejected(format!(
@@ -515,6 +518,7 @@ pub(crate) fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<
         dir,
         front,
         items,
+        source,
     })
 }
 
@@ -588,7 +592,7 @@ pub(crate) fn check_seat(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn context_guard(
     project: &crate::issue::project::Project,
-    dir: &Path,
+    source: &[u8],
     front: &Front,
     items: &[AcceptanceItem],
     team_role: Option<&str>,
@@ -596,13 +600,7 @@ pub(crate) fn context_guard(
     endpoint_kind: &str,
     body: &str,
 ) -> Result<Option<crate::context_pack::Manifest>> {
-    let source = std::fs::read(dir.join("issue.md")).map_err(|_| {
-        crate::context_pack::Refusal::ScopeConflict {
-            detail: "the issue source is unreadable".to_string(),
-        }
-        .error()
-    })?;
-    let contract = crate::context_pack::TaskContract::new(&front.id, &front.title, &source, items);
+    let contract = crate::context_pack::TaskContract::new(&front.id, &front.title, source, items);
     let (role, assigned) = crate::context_pack::selection_role(team_role);
     let pinned = crate::issue::context::pin(project, Some(role));
     let manifest =
@@ -611,7 +609,7 @@ pub(crate) fn context_guard(
     let Some(manifest) = manifest else {
         return Ok(None);
     };
-    if !crate::continuity::endpoint_takes_packs(endpoint_kind) && !manifest.documents.is_empty() {
+    if !crate::continuity::endpoint_takes_packs(endpoint_kind) {
         return Err(crate::context_pack::Refusal::UnsupportedEndpoint {
             endpoint: endpoint_kind.to_string(),
         }
@@ -646,7 +644,7 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
         dir,
         front,
         items,
-        ..
+        source,
     } = gate_issue(pm, id, false)?;
     // CAD-159: the CAD-238 section-scoped readback. No items warns;
     // it never refuses (PM decision, ADR-0002 §8.3).
@@ -768,7 +766,7 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
     if let Some(body) = body.as_deref() {
         context_active = context_guard(
             &project,
-            &dir,
+            source.as_bytes(),
             &front,
             &items,
             agent["team_role"].as_str(),

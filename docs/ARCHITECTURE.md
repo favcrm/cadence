@@ -103,6 +103,12 @@ and each selected tracked document's path/revision/digest/bytes, plus the
 selection role and explicit gaps. Selection reuses the bounded project-context
 reader and its documentation allowlist (`src/issue/context.rs`) against the
 project's declared repository — never a client-supplied path or revision.
+`gate_issue` and native `dispatch_send` derive the title, acceptance and task
+revision from one captured issue-source snapshot; `context_guard` never rereads
+the issue to relabel already-selected criteria after a concurrent tracker edit.
+An opted-in manifest always requires a prompt-capable endpoint, even when no
+document body is selected: the canonical task contract is still mandatory.
+
 Required sources are mandatory; optional ones are best-effort. The pin is an
 event on the target alias bound to the exact message id. Opting in
 also establishes the alias's native home conversation when the pin is written,

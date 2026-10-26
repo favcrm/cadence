@@ -125,7 +125,8 @@ impl Shared {
         .map_err(Error::rejected)?;
         let pm = self.pm()?;
         let (project, dir) = issue::write::issue_dir(&pm, &id)?;
-        let (front, issue_body) = issue::write::load_front(&dir)?;
+        let issue_source = std::fs::read_to_string(dir.join("issue.md"))?;
+        let (front, issue_body) = issue::parse::parse_issue(&issue_source)?;
         // The dispatch-side claim check `dispatch::run` runs before
         // `issue start`, repeated here against the connection-bound
         // caller (never `reply_to`, which is a request field): an issue
@@ -178,7 +179,7 @@ impl Shared {
             let items = issue::parse::acceptance_items(&issue_body);
             match issue::dispatch::context_guard(
                 &project,
-                &dir,
+                issue_source.as_bytes(),
                 &front,
                 &items,
                 target.team_role.as_deref(),
