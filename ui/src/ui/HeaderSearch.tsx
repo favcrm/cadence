@@ -272,7 +272,7 @@ export default function HeaderSearch({
         onClick={openSearch}
       >
         <IconSearch size={14} />
-        <span>{t("Search issues and knowledge…")}</span>
+        <span>{t(hosted ? "Search issues…" : "Search issues and knowledge…")}</span>
         <kbd>Ctrl K</kbd>
       </button>
       <div className="lg:hidden">
@@ -280,7 +280,7 @@ export default function HeaderSearch({
           ref={mobileTriggerRef}
           type="button"
           className="header-icon header-search-icon"
-          aria-label={t("Search issues and knowledge")}
+          aria-label={t(hosted ? "Search issues" : "Search issues and knowledge")}
           aria-expanded={open}
           onClick={openSearch}
         >
@@ -296,7 +296,7 @@ export default function HeaderSearch({
             className="card header-search-dialog"
             role="dialog"
             aria-modal="true"
-            aria-label={t("Search issues and knowledge")}
+            aria-label={t(hosted ? "Search issues" : "Search issues and knowledge")}
             onKeyDown={onKeyDown}
           >
             <div className="header-search-controls">
@@ -309,8 +309,8 @@ export default function HeaderSearch({
                 aria-controls="header-search-results"
                 aria-activedescendant={rows[active] ? `header-search-row-${active}` : undefined}
                 aria-autocomplete="list"
-                aria-label={t("Search issues and knowledge")}
-                placeholder={t("Search issues by ID, title, owner or tag, or knowledge…")}
+                aria-label={t(hosted ? "Search issues" : "Search issues and knowledge")}
+                placeholder={t(hosted ? "Search issues by ID, title, owner or tag…" : "Search issues by ID, title, owner or tag, or knowledge…")}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
               />
@@ -364,7 +364,7 @@ export default function HeaderSearch({
                   )}
                 </section>
 
-                <section aria-labelledby="header-search-knowledge-h">
+                {!hosted && <section aria-labelledby="header-search-knowledge-h">
                   <h3 id="header-search-knowledge-h" className="slabel">{t("Knowledge")}{projectKey ? ` · ${projectKey}` : ""}</h3>
                   {knowledge.status === "loading" || knowledge.status === "idle" ? (
                     <p className="text-label text-ink-400">{t("Searching knowledge…")}</p>
@@ -377,7 +377,7 @@ export default function HeaderSearch({
                   ) : (
                     <ResultList rows={hitRows} offset={issueRows.length} active={active} onHover={setActive} onPick={choose} />
                   )}
-                </section>
+                </section>}
 
                 {truncated && (
                   <p className="text-label text-ink-400">{fill(t("Showing the first {n} of each group. Refine your search to narrow results."), { n: String(LIMIT) })}</p>
