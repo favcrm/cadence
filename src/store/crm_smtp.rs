@@ -71,6 +71,10 @@ fn link_digest(
     }))
 }
 
+/// A pre-write screen over prepared link metadata. Borrowed so it can
+/// capture the caller's decoded secret; never stored beyond the write.
+type LinkScreen<'a> = &'a dyn Fn(&Value) -> Result<()>;
+
 fn link_json(install: &str, context: &str, row: &SmtpLink, projection: &SmtpProjection) -> Value {
     json!({
         "install_id": install,
@@ -96,7 +100,7 @@ fn screened_binding(
     context: &str,
     prepared: &SmtpLink,
     projection: &SmtpProjection,
-    screen: Option<&dyn Fn(&Value) -> Result<()>>,
+    screen: Option<LinkScreen<'_>>,
 ) -> Result<Value> {
     // Build the normal public response by moving the one binding Value
     // into its envelope — no serialize round-trip, no second copy.
@@ -180,7 +184,7 @@ impl Store {
         auth_revision: i64,
         projection: &SmtpProjection,
         request_id: &str,
-        screen: Option<&dyn Fn(&Value) -> Result<()>>,
+        screen: Option<LinkScreen<'_>>,
     ) -> Result<Value> {
         crate::proto::identifier(install, "installation ID")?;
         crate::proto::identifier(context, "context ID")?;
@@ -232,9 +236,9 @@ impl Store {
                             "SMTP binding request ID is already used for different material",
                         ));
                     }
-                    return Err(Error::rejected(
+                    Err(Error::rejected(
                         "this installation and context already has a live SMTP sender; rebind or revoke it first",
-                    ));
+                    ))
                 }
                 Some(row) => {
                     // Revoked rows re-bind only under a fresh request ID,
@@ -298,7 +302,7 @@ impl Store {
         auth_revision: i64,
         projection: &SmtpProjection,
         expected_revision: i64,
-        screen: Option<&dyn Fn(&Value) -> Result<()>>,
+        screen: Option<LinkScreen<'_>>,
     ) -> Result<Value> {
         crate::proto::identifier(install, "installation ID")?;
         crate::proto::identifier(context, "context ID")?;

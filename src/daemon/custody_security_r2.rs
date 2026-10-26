@@ -15,8 +15,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
-const A: &str = "cad1128-independent-A-7cde03b9";
-const B: &str = "cad1128-independent-B-261a84f0";
+const A: &str = "p7N4x9Q2v6R8m3K5t1W0y4H7c8L2z9F6";
+const B: &str = "s5D8u2J9a4V7e1G6b3T0k8P5n9C2r4X7";
 
 // Fixed diagnostics deliberately omit raw errors, credentials and JSON values.
 fn must<T, E>(result: std::result::Result<T, E>, stage: &'static str) -> T {

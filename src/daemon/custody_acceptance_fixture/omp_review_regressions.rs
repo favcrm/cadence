@@ -480,3 +480,169 @@ fn legacy_token_expectations_reject_malformed_without_dropping_cas() {
 fn encrypted_smtp_expectations_refuse_malformed_omitted_and_token_shape() {
     expectation_matrix(true, false);
 }
+
+#[test]
+fn encrypted_smtp_raw_escaped_subject_refuses_before_provider_or_receipt_effects() {
+    // Every eight-character window crosses a JSON-escaped quote or backslash.
+    // Literal matching of serialized JSON therefore cannot stand in for
+    // screening the raw subject that the SMTP encoder actually transmits.
+    let secret = r#"q9"x1\k2"v3\p4"t5\z6"n7\h8"#;
+    let characters: Vec<_> = secret.chars().collect();
+    assert!(
+        characters.len() >= 8,
+        "fixture password must exercise fragment policy"
+    );
+    assert!(
+        characters
+            .windows(8)
+            .all(|window| { window.iter().any(|ch| matches!(*ch, '\"' | '\\')) }),
+        "every fixture password window must require JSON escaping"
+    );
+    let root = tempfile::Builder::new()
+        .prefix("omp1128-raw-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(std::env::temp_dir())
+        .expect("private raw-input regression root");
+    let rig = Rig::start(root.path(), secret.as_bytes(), B.as_bytes())
+        .expect("real encrypted raw-input Rig");
+    for method in ["connection_custody_initialize", "connection_custody_unlock"] {
+        op(&rig, method, json!({"accept_same_uid_risk": true}));
+    }
+    let created = op(
+        &rig,
+        "connection_create",
+        json!({"provider": "smtp", "account": "omp-raw-subject", "shape": "smtp",
+            "host": "localhost", "port": rig.smtp_port, "tls_mode": "implicit",
+            "username": "fixture-user", "secret": secret, "sender": "sender@example.test",
+            "sender_name": "Regression Sender", "scopes": ["email:send"],
+            "accept_same_uid_risk": true}),
+    );
+    let id = created["connection"]["id"]
+        .as_str()
+        .expect("created identity");
+    assert!(
+        rig.core_record(id)
+            .expect("genuine encrypted credential")
+            .custody
+            .starts_with("encrypted-sqlite-v1:"),
+        "raw-input control must use genuine encrypted custody"
+    );
+    op(
+        &rig,
+        "crm_smtp_bind",
+        json!({"install_id": rig.install_id, "context_id": rig.context_id,
+            "connection_id": id, "request_id": "omp-raw-subject-bind"}),
+    );
+    let before_control = rig.smtp_barrier().expect("safe-content provider barrier");
+    let control = send(&rig).unwrap_or_else(|_| panic!("safe-content TLS control refused"));
+    assert!(
+        control["receipt"]["accepted"] == true,
+        "safe-content control was not accepted"
+    );
+    let after_control = rig.smtp_barrier().expect("safe-content TLS completion");
+    sent_once(before_control, after_control, false);
+
+    // Fixture-owned content is seeded through the real typed RecordStore API,
+    // not a fake adapter or a write into the renderer output. The real renderer
+    // must return the raw password as its subject before the refusal is tested.
+    let records = crate::store::app_records::RecordStore::open(&rig.state_dir, &rig.install_id)
+        .expect("real content fixture store");
+    let current = records
+        .app_content_show(&rig.context_id, &rig.campaign_id)
+        .unwrap_or_else(|_| panic!("current content fixture unavailable"));
+    let revision = current["content"]["revision"]
+        .as_i64()
+        .expect("content fixture revision");
+    let draft = crate::store::app_content::Draft::parse(
+        secret,
+        "Safe preheader",
+        &[json!({"type": "paragraph", "text": "Safe body."})],
+    )
+    .unwrap_or_else(|_| panic!("raw-subject fixture must be valid content"));
+    records
+        .app_content_save(&rig.context_id, &rig.campaign_id, Some(revision), &draft)
+        .unwrap_or_else(|_| panic!("typed raw-subject fixture save failed"));
+    let rendered = records
+        .app_content_verified_test_bytes(
+            &rig.context_id,
+            &rig.campaign_id,
+            "Regression Sender",
+            "sender@example.test",
+        )
+        .unwrap_or_else(|_| panic!("real raw-subject rendering failed"));
+    assert!(
+        rendered["subject"].as_str() == Some(secret),
+        "real renderer must preserve the raw subject used by this counterexample"
+    );
+    let content_digest = rendered["content_digest"]
+        .as_str()
+        .expect("rendered content digest");
+    let link_digest = control["receipt"]["link_digest"]
+        .as_str()
+        .expect("control link digest");
+    assert!(
+        !records
+            .app_campaign_test_send_accepted(
+                &rig.context_id,
+                &rig.campaign_id,
+                content_digest,
+                link_digest,
+            )
+            .expect("pre-attempt receipt observation"),
+        "new raw-subject content must have no prior accepted receipt"
+    );
+    let receipts = || -> i64 {
+        records
+            .conn()
+            .query_row("SELECT count(*) FROM app_campaign_test_sends", [], |r| {
+                r.get(0)
+            })
+            .expect("real receipt count")
+    };
+    let core = rusqlite::Connection::open_with_flags(
+        &rig.core_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("read-only event observation");
+    let events = || -> i64 {
+        core.query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .expect("real core event count")
+    };
+    let receipts_before = receipts();
+    let events_before = events();
+    let provider_before = rig.smtp_barrier().expect("raw-subject pre-attempt barrier");
+    let attempted = send(&rig);
+    let provider_after = rig
+        .smtp_barrier()
+        .expect("raw-subject post-attempt barrier");
+    let receipts_after = receipts();
+    let events_after = events();
+    let accepted_after = records
+        .app_campaign_test_send_accepted(
+            &rig.context_id,
+            &rig.campaign_id,
+            content_digest,
+            link_digest,
+        )
+        .expect("post-attempt receipt observation");
+    drop(core);
+    drop(records);
+    rig.finish().expect("owned raw-input regression teardown");
+
+    assert!(
+        provider_after == provider_before,
+        "raw secret-bearing subject reached TCP, AUTH or DATA before refusal"
+    );
+    assert!(
+        receipts_after == receipts_before && !accepted_after,
+        "raw secret-bearing subject created accepted-send receipt evidence"
+    );
+    assert!(
+        events_after == events_before,
+        "raw secret-bearing subject emitted a new core event"
+    );
+    assert!(
+        attempted.is_err(),
+        "raw secret-bearing subject was accepted"
+    );
+}
