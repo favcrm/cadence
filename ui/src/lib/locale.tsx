@@ -9,6 +9,9 @@ type Scope = "user" | "organization";
 type Preferences = { organization_locale: Locale | null; user_locale: Locale | null };
 
 const zhTW: Record<string, string> = {
+  "Type an issue ID, title word, owner or tag. Issue search covers card fields only, not descriptions or comments.": "輸入議題編號、標題字詞、負責人或標籤。議題搜尋僅涵蓋卡片欄位，不包括描述或留言。",
+  "Search issues…": "搜尋議題…", "Search issues by ID, title, owner or tag…": "依編號、標題、負責人或標籤搜尋議題…",
+  "The wiki isn’t available on this board.": "此看板尚未提供知識庫。", "This board carries the tracker, apps and the assistant.": "此看板僅提供議題、應用程式與助理。", "Back to Home": "返回首頁",
   "Home": "首頁", "Overview": "總覽", "Projects": "專案", "Apps": "應用程式", "Agents": "代理程式", "Wiki": "知識庫", "Outbox": "寄件匣", "Settings": "設定", "Sign in": "登入", "Account": "帳戶", "Account menu": "帳戶選單", "Sign out": "登出", "Theme": "佈景主題", "System": "系統", "Light": "淺色", "Dark": "深色",
   "Language": "語言", "Follow organization": "依組織設定", "English": "English", "Traditional Chinese": "繁體中文", "Organization default": "組織預設語言", "Save": "儲存", "Saving…": "儲存中…", "Language preference saved.": "語言偏好已儲存。", "Could not save language preference.": "無法儲存語言偏好。",
   "Workspace waking or unreachable": "工作區正在啟動或無法連線", "Workspace waking or unreachable.": "工作區正在啟動或無法連線。", "Workspace waking": "工作區啟動中", "Retry when ready.": "準備就緒後重試。", "Checking again for up to 60 seconds…": "正在重新檢查，最長 60 秒…", "Retry workspace": "重試工作區",

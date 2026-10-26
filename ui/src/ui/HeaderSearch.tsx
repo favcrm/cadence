@@ -84,10 +84,13 @@ export default function HeaderSearch({
   issues,
   route,
   navHref,
+  hosted = false,
 }: {
   issues: ResourceState<IssueCard[]>;
   route: Route;
   navHref: (route: Route) => string;
+  /** A hosted tenant does not serve /api/wiki; the Knowledge group is absent there. */
+  hosted?: boolean;
 }) {
   const t = useTranslate();
   const currentProject = routeProject(route);
@@ -156,7 +159,7 @@ export default function HeaderSearch({
   // Knowledge: debounced; a request id drops replies superseded by a newer query or scope.
   useEffect(() => {
     requestRef.current += 1;
-    if (!open || !trimmed) {
+    if (!open || !trimmed || hosted) {
       setWikiState({ status: "idle", key: wikiKey });
       return;
     }
@@ -176,14 +179,18 @@ export default function HeaderSearch({
         });
     }, DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [open, trimmed, wikiRoot, wikiKey]);
+  }, [open, trimmed, wikiRoot, wikiKey, hosted]);
 
   const issueMatches = useMemo(
     () => rankIssues(issues.data ?? [], trimmed, projectKey),
     [issues.data, trimmed, projectKey],
   );
   const issueShown = issueMatches.slice(0, LIMIT);
-  const knowledge = wikiState.key === wikiKey ? wikiState : { status: "loading" as const, key: wikiKey };
+  const knowledge = hosted
+    ? { status: "idle" as const, key: wikiKey }
+    : wikiState.key === wikiKey
+      ? wikiState
+      : { status: "loading" as const, key: wikiKey };
   const hitCount = knowledge.status === "ok" ? knowledge.hits.length : 0;
   const hitShown = knowledge.status === "ok" ? knowledge.hits.slice(0, LIMIT) : [];
 
@@ -265,7 +272,7 @@ export default function HeaderSearch({
         onClick={openSearch}
       >
         <IconSearch size={14} />
-        <span>{t("Search issues and knowledge…")}</span>
+        <span>{t(hosted ? "Search issues…" : "Search issues and knowledge…")}</span>
         <kbd>Ctrl K</kbd>
       </button>
       <div className="lg:hidden">
@@ -273,7 +280,7 @@ export default function HeaderSearch({
           ref={mobileTriggerRef}
           type="button"
           className="header-icon header-search-icon"
-          aria-label={t("Search issues and knowledge")}
+          aria-label={t(hosted ? "Search issues" : "Search issues and knowledge")}
           aria-expanded={open}
           onClick={openSearch}
         >
@@ -289,7 +296,7 @@ export default function HeaderSearch({
             className="card header-search-dialog"
             role="dialog"
             aria-modal="true"
-            aria-label={t("Search issues and knowledge")}
+            aria-label={t(hosted ? "Search issues" : "Search issues and knowledge")}
             onKeyDown={onKeyDown}
           >
             <div className="header-search-controls">
@@ -302,8 +309,8 @@ export default function HeaderSearch({
                 aria-controls="header-search-results"
                 aria-activedescendant={rows[active] ? `header-search-row-${active}` : undefined}
                 aria-autocomplete="list"
-                aria-label={t("Search issues and knowledge")}
-                placeholder={t("Search issues by ID, title, owner or tag, or knowledge…")}
+                aria-label={t(hosted ? "Search issues" : "Search issues and knowledge")}
+                placeholder={t(hosted ? "Search issues by ID, title, owner or tag…" : "Search issues by ID, title, owner or tag, or knowledge…")}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
               />
@@ -331,7 +338,9 @@ export default function HeaderSearch({
 
             {!trimmed ? (
               <p className="header-search-guide text-label text-ink-400">
-                {t("Type an issue ID, title word, owner or tag. Knowledge comes from the Wiki. Issue search covers card fields only, not descriptions or comments.")}
+                {hosted
+                  ? t("Type an issue ID, title word, owner or tag. Issue search covers card fields only, not descriptions or comments.")
+                  : t("Type an issue ID, title word, owner or tag. Knowledge comes from the Wiki. Issue search covers card fields only, not descriptions or comments.")}
               </p>
             ) : (
               <div id="header-search-results" className="header-search-results">
@@ -357,7 +366,7 @@ export default function HeaderSearch({
                   )}
                 </section>
 
-                <section aria-labelledby="header-search-knowledge-h">
+                {!hosted && <section aria-labelledby="header-search-knowledge-h">
                   <h3 id="header-search-knowledge-h" className="slabel">{t("Knowledge")}{projectKey ? ` · ${projectKey}` : ""}</h3>
                   {knowledge.status === "loading" || knowledge.status === "idle" ? (
                     <p className="text-label text-ink-400">{t("Searching knowledge…")}</p>
@@ -370,7 +379,7 @@ export default function HeaderSearch({
                   ) : (
                     <ResultList rows={hitRows} offset={issueRows.length} active={active} onHover={setActive} onPick={choose} />
                   )}
-                </section>
+                </section>}
 
                 {truncated && (
                   <p className="text-label text-ink-400">{fill(t("Showing the first {n} of each group. Refine your search to narrow results."), { n: String(LIMIT) })}</p>

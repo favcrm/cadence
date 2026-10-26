@@ -33,9 +33,11 @@ interface Props {
   appMenu?: AppNav | null;
   /** Pending To do items, for the Home row's badge. */
   homeCount?: number;
+  /** A hosted tenant does not serve the wiki; do not advertise it there. */
+  hosted?: boolean;
 }
 
-export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, account, accountOpen = false, appMenu = null, homeCount = 0 }: Props) {
+export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null, account, accountOpen = false, appMenu = null, homeCount = 0, hosted = false }: Props) {
   const { t } = useLocale();
   return (
     <aside data-account-open={accountOpen || undefined} className={`hidden lg:flex sticky top-0 ${accountOpen ? "z-[35]" : ""} h-screen flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[16px] pb-1`}>
@@ -49,7 +51,7 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
             </span>
           </span>
         </div>
-        <NavList screen={screen} navHref={navHref} appMenu={appMenu} homeCount={homeCount} />
+        <NavList screen={screen} navHref={navHref} appMenu={appMenu} homeCount={homeCount} hosted={hosted} />
         <ProjectsSection project={project} projectHref={projectHref} projects={projects} issues={issues} projectsError={projectsError} />
       </div>
       <div data-sidebar-footer className="pt-1 border-t border-ink-700 text-label text-ink-500">
