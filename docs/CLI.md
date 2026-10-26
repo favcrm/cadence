@@ -260,10 +260,10 @@ Two selectors, never one:
 - `--org <slug>` selects whose board the command acts on — `local` (the
   default) or a hosted workspace. It never says where an agent runs.
 - `--placement local|cloud|queue` filters `agent list` and `status` by
-  where the agent's process runs: `local` on the daemon's host, `cloud`
-  for a provider-hosted session (`devin · cloud`), `queue` for a mailbox
-  with no process. The value is derived from `(provider, endpoint_kind)`;
-  the flag only selects it.
+  where the runtime executes: `local` on the daemon's host, `cloud`
+  for a provider-hosted runtime (including Worker/Pi conversations),
+  `queue` for a mailbox. The value is derived from
+  `(provider, endpoint_kind)`; the flag only selects it.
 
 `--org acme --placement local` is therefore the local-assignment plane:
 the board owns the ticket and this machine runs it. `--org local` alone
@@ -277,6 +277,63 @@ The hosted binding lives under the `agent` noun:
 `cadence send <alias> --wait[=SECS]` waits for the turn's terminal state
 (the same path as the hidden `message ask`). A remote send is a durable
 enqueue only and refuses `--wait`.
+
+## Native cloud-agent connections (CAD-1853)
+
+This unreleased integration connects a **local** Cadence coordinator to the
+matching AgenticOS Worker/Pi cloud-chat runtime. It is not a hosted Linux/git
+executor, the personal assistant, or the existing `agent connect` pickup flow.
+Both native and platform versions must support the new contract.
+
+From an operator connection, grant the saved workspace explicit cloud scopes,
+then connect it to a local alias:
+
+```sh
+cadence login --org acme --cloud-agent
+cadence cloud-agent connect --workspace acme --alias cloud --accept-assistant-consent
+cadence send cloud --text "Explain this task" --wait 60
+```
+
+`--workspace` selects the saved cloud login; it does **not** change the local
+coordinator. Global `--org` selects a coordinator and must not be used as the
+cloud connection's target flag. A local `--state-dir` pin remains supported.
+Connect performs identity/capability discovery, not a model invocation.
+Existing `cli.*`, wiki or settings permission does not imply cloud consent.
+
+The login requests `bridge.enroll`, `cloud_agent.read` and
+`cloud_agent.write`. An operator can enroll a managed local peer with
+`cloud-agent enroll-peer <connection-id> --agent <alias>`. It requires the
+supported split-UID process boundary and live registration proof; same-UID
+peers are refused before cloud access. Each peer uses its own cloud-only child
+credential, never the human login. Credentials stay with the daemon and are
+not exported to the peer, browser or command output.
+
+Normal `send` and its terminal wait use canonical messages. An asynchronous
+peer request receives the existing UID-bound result report automatically.
+**Threads owns the conversation**; Agent pages show runtime, capabilities and
+provider-session metadata and link to it. Provider transcripts are distinct
+from local work history. Refreshing the same owner's credential preserves
+context; another issuer/subject or agent registration cannot inherit it.
+
+`cloud-agent ls|show` inspect connections. `cloud-agent read <connection-id>
+<operation-id>` reconciles an existing receipt without a new submission.
+`cloud-agent send` accepts an explicit `--operation-id`; reuse that ID and the
+identical payload when resolving an interrupted request, not a new ID. A
+`--no-wake` request stays locally queued until explicitly woken. One unsettled
+turn holds its provider session; a busy refusal does not retain another turn.
+Unknown outcomes retain their original binding and reconcile by readback.
+
+This runtime advertises no tools, skills, MCP, profile/memory sync, shell, git,
+business-effect approval or cancellation. `cloud-agent cancel` reports
+unsupported rather than claiming a stop. `cloud-agent disconnect` stops local
+admission/readback and drops local consent; it does not cancel accepted remote
+work. A new grant cannot revive queued work whose original cloud authority
+was revoked.
+
+Local Workerd/scripted-model and native transport fixtures do not establish a
+live Cloudflare/model qualification. That requires an explicitly authorized
+isolated tenant/model route and a real split-UID peer runtime, separately from
+source checks, reviews, deployment and installation.
 
 ## Settings > Agents management (CAD-1586)
 

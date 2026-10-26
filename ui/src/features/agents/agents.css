@@ -368,3 +368,11 @@
     align-items: center;
   }
 }
+
+/* CAD-1853: the cloud-agent projection on an agent page. Identity, runtime,
+   model label, the enforced conversational-only ceiling and canonical Threads
+   links; no remote PID, read receipt, stop or execution authority. */
+.ap-cloud { display: grid; gap: 8px; margin: 0 0 16px; }
+.ap-cloud-card { border: 1px solid var(--color-line, #e5e5e5); border-radius: 10px; padding: 10px 12px; }
+.ap-cloud-card ul { margin: 6px 0 0; padding-left: 18px; }
+.ap-cloud-card a { text-decoration: underline; }

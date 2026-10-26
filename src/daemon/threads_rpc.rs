@@ -259,6 +259,34 @@ impl Shared {
         self.operator_chat("thread send", peer_pid)?;
         let human = self.verified_owner_human(params)?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // CAD-1591: the identity constraint is parsed BEFORE the cloud
+        // branch so a cloud target can never bypass it.
+        let cloud_expected_uid = match params.get("expected_recipient_uid") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(uid)) if !uid.is_empty() => Some(uid.as_str()),
+            Some(_) => {
+                return Err(Error::rejected(
+                    "expected_recipient_uid must be a nonempty recipient uid string",
+                ));
+            }
+        };
+        if self
+            .store
+            .agent_opt(&alias)?
+            .is_some_and(|agent| agent.provider == crate::cloud_agent::PROVIDER)
+        {
+            let conversation = optional_str(params, "conversation").map(str::to_string);
+            let mut routed = params.clone();
+            routed["alias"] = json!(alias);
+            return self.cloud_send_from(
+                &alias,
+                &routed,
+                peer_pid,
+                conversation.as_deref(),
+                cloud_expected_uid,
+                "cloud agent thread send",
+            );
+        }
         // CAD-1591: the contextual-reply recipient constraint — an
         // optional nonempty uid, checked against the alias's live row
         // inside the enqueue transaction (never a precheck that can

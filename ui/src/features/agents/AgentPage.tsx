@@ -24,6 +24,24 @@ import {
 } from "./agentView";
 import "./agents.css";
 
+/** CAD-1853: the daemon's truthful cloud-agent projection on an agent page.
+ *  Remote ids are distinct from local ids; capabilities are the enforced
+ *  ceiling (conversational only), never a claimed shell/git/effect grant. */
+interface CloudAgentView {
+  id: string;
+  state: string;
+  connected: boolean;
+  principal?: { kind: string; label: string };
+  remote_agent_id: string;
+  runtime: string;
+  model?: string | null;
+  provider_session_id?: string | null;
+  capabilities?: Record<string, boolean>;
+  thread?: { id: string; link?: string | null } | null;
+  sessions?: { remote_session_id: string; conversation_id: string; thread?: { id: string; link?: string | null } }[];
+  operations?: { operation_id: string; status: string; reply?: { text: string } | null }[];
+}
+
 const TONE: Record<string, string> = {
   fail: "var(--color-fail)",
   warn: "var(--color-warn)",
@@ -105,6 +123,7 @@ export default function AgentPage({
         on: detail.on ?? observed?.on ?? [],
       }
     : observed;
+  const isCloud = profile?.endpoint_kind === "cloud";
   const fenced = detail?.fenced ?? observed?.fenced;
   const recovery = detail?.recovery ?? observed?.recovery;
   const resume = detail?.resume ?? observed?.resume;
@@ -116,12 +135,15 @@ export default function AgentPage({
     : null;
   const hosted = roles.data?.install.hosted ?? false;
   const badge = profile ? lifecycleBadge(profile, t) : null;
-  const where =
-    profile && agentLocation(profile) === "cloud"
+  const where = isCloud
+    ? t("a cloud runtime")
+    : profile && agentLocation(profile) === "cloud"
       ? t("a cloud sandbox")
       : t(runsOnText(hosted));
   const categoryText = role ? `${role.title} · ${t(categoryLabel(roles.data, role.category))}` : null;
   const figures = detail?.stats ?? null;
+  const cloud =
+    (a as unknown as { cloud_agents?: CloudAgentView[] } | undefined)?.cloud_agents ?? [];
   const count = (n: number | null | undefined) => (n === null || n === undefined ? "—" : String(n));
   const stats: [string, string][] =
     role?.kind === "apps"
@@ -204,12 +226,65 @@ export default function AgentPage({
           >
             {t("Message")}
           </Button>
-          <Button onClick={() => onTab("work")}>{t("Assign work")}</Button>
-          <Button variant="ghost" size="sm" disabled aria-label={t("More")} title={t("No more actions yet")}>
-            ⋯
-          </Button>
+          {!isCloud && (
+            <>
+              <Button onClick={() => onTab("work")}>{t("Assign work")}</Button>
+              <Button variant="ghost" size="sm" disabled aria-label={t("More")} title={t("No more actions yet")}>
+                ⋯
+              </Button>
+            </>
+          )}
         </div>
       </header>
+
+      {cloud.length > 0 && (
+        <section className="ap-cloud" aria-label={t("Cloud runtime")}>
+          {cloud.map((c) => (
+            <div key={c.id} className="ap-cloud-card">
+              <div className="ap-sub">
+                <strong>{t("Cloud runtime")}</strong>
+                <span aria-hidden="true">·</span>
+                <span>{c.runtime}</span>
+                <span aria-hidden="true">·</span>
+                <span>{c.state}</span>
+                {c.principal && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span>
+                      {c.principal.kind === "agent"
+                        ? `${t("enrolled peer")} ${c.principal.label}`
+                        : t("operator connection")}
+                    </span>
+                  </>
+                )}
+              </div>
+              <p className="text-micro text-ink-500">
+                {t("Model:")} {c.model ?? t("gateway label pending")} · {t("Remote agent:")} {c.remote_agent_id}
+              </p>
+              <p className="text-micro text-ink-500">
+                {t("Capabilities:")} {t("conversation")}
+                {", "}
+                {t("no tools, MCP, skills, approvals or shell")}
+              </p>
+              {(c.sessions ?? []).length > 1 && (
+                <ul className="text-micro text-ink-500">
+                  {(c.sessions ?? []).map((s) => (
+                    <li key={s.conversation_id}>
+                      {s.thread?.link ? (
+                        <a href={s.thread.link}>{s.thread.id}</a>
+                      ) : (
+                        s.thread?.id ?? s.conversation_id
+                      )}
+                      {" · "}
+                      {s.remote_session_id}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ))}
+        </section>
+      )}
 
       {!detail && !err && (
         <p role="status" className="text-label text-ink-500 mb-3">
@@ -254,37 +329,41 @@ export default function AgentPage({
         </section>
       )}
 
-      <div className="ap-stats">
-        {stats.map(([label, value]) => (
-          <div
-            key={label}
-            className="ap-stat"
-            title={value === "—" ? t("Not recorded for this agent") : undefined}
-          >
-            <b className="num">{value}</b>
-            <small>{t(label)}</small>
+      {!isCloud && (
+        <>
+          <div className="ap-stats">
+            {stats.map(([label, value]) => (
+              <div
+                key={label}
+                className="ap-stat"
+                title={value === "—" ? t("Not recorded for this agent") : undefined}
+              >
+                <b className="num">{value}</b>
+                <small>{t(label)}</small>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
-      <nav className="ap-tabs" role="tablist" aria-label={t("Agent sections")}>
-        {AGENT_TABS.map((entry) => (
-          <button
-            key={entry.id}
-            type="button"
-            role="tab"
-            id={`ap-tab-${entry.id}`}
-            aria-selected={tab === entry.id}
-            aria-controls="ap-panel"
-            className="ap-tab"
-            onClick={() => onTab(entry.id)}
-          >
-            {t(entry.label)}
-          </button>
-        ))}
-      </nav>
-      <div id="ap-panel" role="tabpanel" aria-labelledby={`ap-tab-${tab}`}>
-        <AgentTabBody key={`${alias}:${tab}:${detail ? "d" : "n"}`} tab={tab} c={ctx} />
-      </div>
+          <nav className="ap-tabs" role="tablist" aria-label={t("Agent sections")}>
+            {AGENT_TABS.map((entry) => (
+              <button
+                key={entry.id}
+                type="button"
+                role="tab"
+                id={`ap-tab-${entry.id}`}
+                aria-selected={tab === entry.id}
+                aria-controls="ap-panel"
+                className="ap-tab"
+                onClick={() => onTab(entry.id)}
+              >
+                {t(entry.label)}
+              </button>
+            ))}
+          </nav>
+          <div id="ap-panel" role="tabpanel" aria-labelledby={`ap-tab-${tab}`}>
+            <AgentTabBody key={`${alias}:${tab}:${detail ? "d" : "n"}`} tab={tab} c={ctx} />
+          </div>
+        </>
+      )}
     </main>
   );
 }

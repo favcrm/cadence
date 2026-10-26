@@ -30,6 +30,7 @@ import {
 import type { AgentTab } from "./agentTabModel";
 import {
   AGENT_FILTERS,
+  agentLocation,
   agentMatchesFilter,
   agentMatchesSearch,
   agentOrder,
@@ -47,7 +48,8 @@ function roleLine(a: Agent, roleTitle: string | undefined, hosted: boolean, t: (
   const label = (id: string | null | undefined) => ROLES.find(([key]) => key === id)?.[1];
   const title =
     roleTitle ?? (a.alias === MASTER ? t("Master") : (label(a.team_role) ?? label(a.role) ?? t("Agent")));
-  return `${title} · ${hosted ? t("workspace") : t("this computer")}`;
+  const where = agentLocation(a) === "cloud" ? t("cloud") : hosted ? t("workspace") : t("this computer");
+  return `${title} · ${where}`;
 }
 
 export default function Agents({

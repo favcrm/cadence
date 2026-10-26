@@ -1816,6 +1816,34 @@ pub(crate) fn write_route(
         send(request, resp);
         return;
     }
+    // CAD-1853: cloud-agent writes. `WRITE_ROUTES` classifies them
+    // OperatorOnly and `admit` ran before this handler, so a peer or
+    // forged-identity caller never reaches the daemon relay.
+    if let Some(tail) = path.strip_prefix("/api/cloud-agents/") {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let mut segments = tail.split('/');
+        let id = segments.next().unwrap_or_default();
+        let handled = if id.is_empty() || id.contains('?') {
+            err_response(400, "bad cloud agent id")
+        } else {
+            match (segments.next(), segments.next(), segments.next()) {
+                (Some("messages"), None, None) => {
+                    super::cloud_agents::post_message(&mut request, state_dir, id)
+                }
+                (Some("operations"), Some(operation), Some("read"))
+                    if segments.next().is_none() =>
+                {
+                    super::cloud_agents::post_read(&mut request, state_dir, id, operation)
+                }
+                _ => err_response(404, "no such cloud agent write route"),
+            }
+        };
+        send(request, handled);
+        return;
+    }
     // The operator's chat message to an agent (CAD-319) — guarded and
     // caller-attributed inside `threads::post_message`.
     if let Some((alias, sub)) = threads::route(path) {

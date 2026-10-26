@@ -115,7 +115,10 @@ pub use migration::{
 /// v55 (CAD-1353) adds `messages.stall_secs`, the budget chosen for one
 /// dispatch, leaving `jobs.stall_secs` as the shared default.
 /// v56 (CAD-1726) adds `artifacts`, the agent canvas artifact versions.
-pub const SCHEMA_VERSION: i64 = 56;
+/// v57 (CAD-1853) adds the cloud-agent connection, its per-thread remote
+/// session bindings, the explicit local assistant consent and the durable
+/// operation correlation rows.
+pub const SCHEMA_VERSION: i64 = 57;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

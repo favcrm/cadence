@@ -101,6 +101,7 @@ mod cad1726_artifact_put_file_confinement;
 mod cad1752_recruit_refusal_acceptance;
 mod cad1767_followup_acceptance;
 mod cad1772_recruit_page_acceptance;
+mod cad1853_cloud_agent_guard_acceptance;
 mod cad508_restart_window;
 mod cad832_sharing_refusal;
 mod cad848_lifecycle_serialization;

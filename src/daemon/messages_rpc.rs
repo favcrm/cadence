@@ -113,6 +113,16 @@ impl Shared {
     /// who queued it, derived from the connection (CAD-319); a steering
     /// send's caller is derived the same way (CAD-158).
     pub(super) fn rpc_send_from(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        // CAD-1853: a cloud target is not a local queue. The normal send
+        // path reaches the same canonical Thread through the cloud transport.
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        if self
+            .store
+            .agent_opt(&alias)?
+            .is_some_and(|agent| agent.provider == crate::cloud_agent::PROVIDER)
+        {
+            return self.cloud_send_from(&alias, params, peer_pid, None, None, "cloud agent send");
+        }
         self.send_with(
             params,
             &|alias| self.thread_sender(alias, peer_pid),

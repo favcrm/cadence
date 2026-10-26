@@ -2621,6 +2621,11 @@ enum LoginScope {
     Settings,
     /// Both opt-ins on one consent: `--web --settings`.
     WebAndSettings,
+    /// CAD-1853: `cadence login --cloud-agent` requests ONLY the cloud-agent
+    /// scopes. It is a distinct, explicitly consented device grant for the
+    /// cloud assistant; it does not silently widen an existing CLI login and
+    /// carries no cli/wiki/settings authority.
+    CloudAgent,
 }
 
 impl LoginScope {
@@ -2639,6 +2644,12 @@ impl LoginScope {
                 "settings.read",
                 "settings.write",
             ],
+            LoginScope::CloudAgent => {
+                // CAD-1853: bridge.enroll is the narrow extra authority that
+                // lets this explicit consent enroll a cloud-purpose peer;
+                // the child requests only the cloud-agent subset.
+                vec!["bridge.enroll", "cloud_agent.read", "cloud_agent.write"]
+            }
         }
     }
 }
@@ -2650,6 +2661,28 @@ pub fn login_portal(
     show_code: impl FnOnce(&str, &str) -> Result<()>,
 ) -> Result<LoginGrant> {
     login_portal_scoped(issuer, hint, dir, show_code, false, false)
+}
+
+/// CAD-1853: the explicit cloud-assistant device grant. One PKCE browser
+/// approval for exactly `cloud_agent.read`/`cloud_agent.write`; no CLI,
+/// wiki or settings capability is requested, and no existing saved login is
+/// mutated or reused.
+pub fn login_portal_cloud(
+    issuer: &str,
+    hint: Option<&str>,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+) -> Result<LoginGrant> {
+    let issuer = origin(issuer, cfg!(test))?;
+    login_device_flow(
+        &issuer,
+        None,
+        hint,
+        dir,
+        show_code,
+        &mut RealLoginRuntime,
+        LoginScope::CloudAgent,
+    )
 }
 
 /// The portal login; `web` adds the Publish Web scopes (`cadence login

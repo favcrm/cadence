@@ -35,11 +35,12 @@
 
 use base64::Engine;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
@@ -1905,6 +1906,411 @@ fn local_status_at(dir: &Path, target: &RemoteTarget) -> Value {
     };
     out["state"] = json!(state);
     out
+}
+
+/// The exact capability the published cloud-agent contract requires on the
+/// saved hosted login. Kept separate from `cli.write`: the default login
+/// never authorizes a paid model turn, and a login missing this scope is
+/// refused before a request is built.
+pub fn cloud_agent_credential(target: &RemoteTarget, scope: &str) -> Result<()> {
+    cloud_agent_credential_owned(target, scope, None)
+}
+
+/// Scope AND full-owner check against the saved login. `owner` is the source
+/// already admitted locally; the saved credential's verified issuer + subject
+/// must still be exactly that parent. This runs immediately before every
+/// transport call AND before serving any cached row, so a replaced human can
+/// neither spend a new turn nor read an earlier owner's reply.
+pub fn cloud_agent_credential_owned(
+    target: &RemoteTarget,
+    scope: &str,
+    owner: Option<&crate::store::cloud_agent::Owner>,
+) -> Result<()> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let cred = load_credential(&dir, target)?;
+    if !cred.capabilities.iter().any(|cap| cap == scope) {
+        return Err(Error::gate_coded(
+            "cloud_agent_scope_revoked",
+            format!(
+                "this remote login for org '{}' does not carry the {scope} capability — \
+                 nothing was sent. `cadence login` does not request cloud-agent access by \
+                 default; it needs a login the workspace owner grants with {scope}",
+                target.org
+            ),
+        ));
+    }
+    if let Some(owner) = owner {
+        let pin = identity_of(&cred, target)?;
+        if pin.issuer != owner.issuer || pin.subject_id != owner.subject {
+            return Err(Error::gate_coded(
+                "cloud_agent_owner_changed",
+                "the saved cloud login now names a different verified owner (issuer/subject) \
+                 than this source was admitted under; no request or cached reply is served",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The saved login's verified logical owner for this exact target: the stable
+/// issuer + subject pair, never a credential/token/session generation. A
+/// legacy login without either half is refused rather than approximated.
+pub fn cloud_agent_identity(target: &RemoteTarget) -> Result<CliIdentityPin> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let cred = load_credential(&dir, target)?;
+    identity_of(&cred, target)
+}
+
+fn identity_of(cred: &Credential, target: &RemoteTarget) -> Result<CliIdentityPin> {
+    let issuer = cred
+        .issuer
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            reject(format!(
+                "the saved cloud login for org '{}' records no verified issuer — run \
+                 `cadence login --cloud-agent` again; nothing was sent",
+                target.org
+            ))
+        })?;
+    let subject_id = cred
+        .subject_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            reject(
+                "the saved cloud login records no verified subject id — run \
+                 `cadence login --cloud-agent` again; nothing was sent",
+            )
+        })?;
+    if cred.organization_id != target.org_id || cred.audience != target.endpoint {
+        return Err(reject(
+            "the saved credential does not name this exact workspace; nothing was sent",
+        ));
+    }
+    Ok(CliIdentityPin { subject_id, issuer })
+}
+
+/// CAD-1853: the owner-only record of one enrolled cloud-peer credential.
+/// The token is never returned to a child, prompt, argv or log; this module
+/// makes exactly one HTTP call with it and drops it.
+const PEER_RECORD_VERSION: &str = "hosted-cadence-cloud-agent-peer.v1";
+
+fn peer_dir(target: &RemoteTarget) -> Result<PathBuf> {
+    let base = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let dir = base.join("cloud-agent");
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    let meta = fs::symlink_metadata(&dir)?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return Err(reject("cloud-agent credential directory is not private"));
+    }
+    let _ = target;
+    Ok(dir)
+}
+
+fn peer_path(
+    target: &RemoteTarget,
+    owner: &crate::store::cloud_agent::Owner,
+    uid: &str,
+    epoch: i64,
+) -> Result<PathBuf> {
+    // The key includes BOTH halves of the verified parent identity and the
+    // native sender uid/stamp: the same uid+stamp enrolled under another
+    // human is a different credential, never a replacement of this one.
+    let digest = Sha256::digest(
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            target.org_id, target.endpoint, owner.issuer, owner.subject, uid, epoch
+        )
+        .as_bytes(),
+    );
+    let name: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    Ok(peer_dir(target)?.join(format!("{name}.json")))
+}
+
+fn read_peer_record(path: &Path) -> Option<Value> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return None;
+    }
+    let mut raw = Vec::new();
+    file.take(16385).read_to_end(&mut raw).ok()?;
+    if raw.len() > 16384 {
+        return None;
+    }
+    serde_json::from_slice(&raw).ok()
+}
+
+fn peer_records(dir: &Path) -> Result<Vec<(PathBuf, Value)>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir)?.take(64) {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(record) = read_peer_record(&path) {
+            out.push((path, record));
+        }
+    }
+    Ok(out)
+}
+
+fn peer_matches(record: &Value, target: &RemoteTarget, uid: &str, epoch: i64) -> bool {
+    record["version"] == PEER_RECORD_VERSION
+        && record["purpose"] == "cloud_agent"
+        && record["organization_id"] == target.org_id
+        && record["audience"] == target.endpoint
+        && record["uid"] == uid
+        && record["registration_epoch"] == epoch
+}
+
+fn peer_parent(record: &Value) -> Result<CliIdentityPin> {
+    let issuer = record["issuer"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| reject("cloud-peer credential is missing its verified parent issuer"))?;
+    let subject_id = record["parent_subject"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| reject("cloud-peer credential is missing its verified parent subject"))?;
+    Ok(CliIdentityPin {
+        subject_id: subject_id.to_string(),
+        issuer: issuer.to_string(),
+    })
+}
+
+/// Persist the enrolled child credential for exactly this source. The caller
+/// has already validated the contract response; no secret is logged. Any
+/// other-owner record for the same native uid/stamp is removed first: one
+/// peer enrollment has exactly one verified parent, so resolution can never
+/// silently pick between two owners.
+pub fn cloud_agent_save_peer(
+    target: &RemoteTarget,
+    owner: &crate::store::cloud_agent::Owner,
+    uid: &str,
+    epoch: i64,
+    record: &Value,
+) -> Result<()> {
+    let path = peer_path(target, owner, uid, epoch)?;
+    for (other, existing) in peer_records(&peer_dir(target)?)? {
+        if other != path && peer_matches(&existing, target, uid, epoch) {
+            let _ = fs::remove_file(&other);
+        }
+    }
+    let body = serde_json::to_vec(&json!({
+        "version": PEER_RECORD_VERSION,
+        "purpose": "cloud_agent",
+        "organization_id": target.org_id,
+        "audience": target.endpoint,
+        "issuer": owner.issuer,
+        "parent_subject": owner.subject,
+        "uid": uid,
+        "registration_epoch": epoch,
+        "capabilities": ["cloud_agent.read", "cloud_agent.write"],
+        "record": record,
+    }))?;
+    let tmp = path.with_extension("tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)?;
+    file.write_all(&body)?;
+    file.sync_all()?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Resolve the ONE verified parent recorded for this native source. Peers
+/// never fall back to the current human login: their custody is this record.
+pub fn cloud_agent_peer_owner(
+    target: &RemoteTarget,
+    uid: &str,
+    epoch: i64,
+) -> Result<CliIdentityPin> {
+    let mut found: Option<CliIdentityPin> = None;
+    for (_path, record) in peer_records(&peer_dir(target)?)? {
+        if !peer_matches(&record, target, uid, epoch) {
+            continue;
+        }
+        let pin = peer_parent(&record)?;
+        if found.as_ref().is_some_and(|seen| seen != &pin) {
+            return Err(reject(
+                "ambiguous cloud-peer enrollment for this native source; re-enroll it \
+                 explicitly under the intended owner",
+            ));
+        }
+        found = Some(pin);
+    }
+    found.ok_or_else(|| reject("no enrolled cloud-peer credential for this source"))
+}
+
+fn load_peer(
+    target: &RemoteTarget,
+    owner: &crate::store::cloud_agent::Owner,
+    uid: &str,
+    epoch: i64,
+    scope: Option<&str>,
+) -> Result<String> {
+    let path = peer_path(target, owner, uid, epoch)?;
+    let record = read_peer_record(&path)
+        .ok_or_else(|| reject("no enrolled cloud-peer credential for this source"))?;
+    if !peer_matches(&record, target, uid, epoch) {
+        return Err(reject("cloud-peer credential does not match this source"));
+    }
+    let parent = peer_parent(&record)?;
+    if parent.issuer != owner.issuer || parent.subject_id != owner.subject {
+        return Err(reject(
+            "cloud-peer credential belongs to a different verified parent owner",
+        ));
+    }
+    let scopes = record["capabilities"]
+        .as_array()
+        .ok_or_else(|| reject("cloud-peer credential is missing its granted scopes"))?;
+    if scopes.len() != 2
+        || !["cloud_agent.read", "cloud_agent.write"]
+            .iter()
+            .all(|scope| scopes.iter().any(|value| value.as_str() == Some(*scope)))
+    {
+        return Err(reject(
+            "cloud-peer credential does not carry exactly the cloud-agent scopes",
+        ));
+    }
+    if let Some(scope) = scope {
+        if !scopes.iter().any(|value| value.as_str() == Some(scope)) {
+            return Err(Error::gate_coded(
+                "cloud_agent_scope_revoked",
+                "the enrolled cloud-peer credential does not carry this action's scope",
+            ));
+        }
+    }
+    record["record"]["token"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| reject("cloud-peer credential is missing its token"))
+}
+
+/// POST the bridge enrollment call with the saved bridge login (never a
+/// service token). Only the cloud-purpose body is built by the caller.
+pub fn cloud_agent_enroll_post(
+    target: &RemoteTarget,
+    body: &Value,
+) -> Result<(u16, Option<Value>, CliIdentityPin)> {
+    let dir = auth_dir(None).map_err(|_| reject("remote credential directory unavailable"))?;
+    // ONE credential snapshot: the same verified owner and token that prove
+    // the parent also perform the enrollment POST, so a login replaced in
+    // between cannot enroll a child under a different human.
+    let cred = load_credential(&dir, target)?;
+    let pin = identity_of(&cred, target)?;
+    let issuer = pin.issuer.trim_end_matches('/').to_string();
+    post(
+        &issuer,
+        "/v1/hosted-cadence/enroll",
+        &cred.access_token,
+        body,
+        Duration::from_secs(20),
+    )
+    .map(|(status, _, body)| (status, body, pin))
+    .map_err(|_| Error::unknown("cloud-peer enrollment transport failed; outcome unknown"))
+}
+
+/// Whether this exact source has a private enrolled peer credential under
+/// this verified parent. The token is loaded only to validate the record and
+/// immediately dropped.
+pub fn cloud_agent_peer_ready(
+    target: &RemoteTarget,
+    owner: &crate::store::cloud_agent::Owner,
+    uid: &str,
+    epoch: i64,
+    scope: &str,
+) -> Result<()> {
+    load_peer(target, owner, uid, epoch, Some(scope)).map(|_| ())
+}
+
+/// One contract POST authenticated by an enrolled peer's own credential.
+/// There is no fallback to the current human login: a peer whose own custody
+/// is missing or was re-enrolled under another owner is refused here.
+pub fn cloud_agent_peer_post(
+    target: &RemoteTarget,
+    owner: &crate::store::cloud_agent::Owner,
+    uid: &str,
+    epoch: i64,
+    path: &str,
+    body: &Value,
+    scope: &str,
+) -> Result<(u16, Option<Value>)> {
+    if !path.starts_with("/__platform/") || path.contains(['\\', '#', '?']) {
+        return Err(reject("cloud-agent contract path is invalid"));
+    }
+    let token = load_peer(target, owner, uid, epoch, Some(scope))?;
+    let origin = target.endpoint.trim_end_matches('/');
+    post(origin, path, &token, body, Duration::from_secs(20))
+        .map(|(status, _, body)| (status, body))
+        .map_err(|_| Error::unknown("cloud-peer transport failed; outcome uncertain"))
+}
+
+/// One bounded POST for the published cloud-agent contract. The saved
+/// credential is loaded, checked against the exact stored org/audience and
+/// never returned; only the HTTP status and parsed JSON leave this function.
+/// The caller supplies the contract path (a single published constant) and
+/// the credential is never placed in a prompt, argument or response.
+pub fn cloud_agent_post(
+    target: &RemoteTarget,
+    path: &str,
+    body: &Value,
+    scope: &str,
+) -> Result<(u16, Option<Value>)> {
+    if !path.starts_with("/__platform/") || path.contains(['\\', '#', '?']) || path.len() > 200 {
+        return Err(reject("cloud-agent contract path is invalid"));
+    }
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    // ONE load supplies both the proof and the token actually sent. The
+    // target pins the verified owner, so a login replaced between the
+    // daemon's early check and this request is refused here instead of
+    // being charged under the new human.
+    let cred = load_credential(&dir, target)?;
+    if !cred.capabilities.iter().any(|cap| cap == scope) {
+        return Err(Error::gate_coded(
+            "cloud_agent_scope_revoked",
+            "this saved login does not carry the action's cloud-agent scope",
+        ));
+    }
+    // The saved audience is an origin without a trailing slash; normalize so
+    // one slash joins it to the contract path (never `//__platform/...`).
+    let origin = target.endpoint.trim_end_matches('/');
+    post(
+        origin,
+        path,
+        &cred.access_token,
+        body,
+        Duration::from_secs(20),
+    )
+    .map(|(status, _, body)| (status, body))
+    .map_err(|error| match error {
+        // A transport failure may happen after the request reached the
+        // server (a queued turn). Never a rejection and never a retry.
+        Error::Internal(_) | Error::Rejected(_) => Error::unknown(
+            "cloud-agent transport failed before an answer — the remote outcome is unknown",
+        ),
+        other => other,
+    })
 }
 
 /// Revoke one remote device/workspace session before removing its protected

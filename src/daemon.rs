@@ -225,6 +225,7 @@ mod cad1822_context_refusal_acceptance;
 mod cad1852_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1868_acceptance;
+mod cloud_agent_rpc;
 mod connection_test;
 mod connections_rpc;
 /// CAD-1128: the `connection_custody_*` operator verbs.
@@ -3155,12 +3156,14 @@ impl Shared {
                     let (dead, resumable) = self.agent_liveness(&agent);
                     j["dead"] = json!(dead);
                     j["resumable"] = json!(resumable);
-                    // CAD-1266: `inbox_status` answers `None` for any row with
-                    // an actor; skip the store read the answer is known without.
-                    let inbox = if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
-                        None
-                    } else {
+                    // Only queue placement is a mailbox. A hosted runtime
+                    // intentionally has no local actor, but is not an inbox.
+                    let inbox = if registry::placement(&agent.provider, &agent.endpoint_kind)
+                        == registry::Placement::Queue
+                    {
                         self.store.inbox_status(&agent.alias)?
+                    } else {
+                        None
                     };
                     if let Some(inbox) = inbox {
                         j["inbox"] = inbox;
@@ -3340,6 +3343,26 @@ impl Shared {
                 agent_json["turn_project"] = json!(self.turn_project(&agent).map(|t| t.key));
                 agent_json["capabilities"] =
                     registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
+                // CAD-1853: a cloud agent's truthful projection. Its remote
+                // identity, runtime, model label, capability ceiling and
+                // canonical Threads links are distinct from local runtime
+                // capabilities; `agent show` never invents a remote PID,
+                // read receipt, stop or execution authority.
+                if agent.provider == crate::cloud_agent::PROVIDER {
+                    let rows = self.store.cloud_agents_for_alias(&agent.alias)?;
+                    let mut views = Vec::new();
+                    for row in &rows {
+                        views.push(crate::cloud_agent::agent_view(&self.store, row)?);
+                    }
+                    agent_json["cloud_agents"] = json!(views);
+                    // Truthful placement/endpoint: a cloud agent has no local
+                    // process and no inbox; the daemon field must not imply
+                    // either just because the adapter registry is unknown.
+                    agent_json["placement"] = json!("cloud");
+                    agent_json["endpoint"] = Value::Null;
+                    agent_json["pid"] = Value::Null;
+                    agent_json["pid_start"] = Value::Null;
+                }
                 agent_json["native_turn_steering_enabled"] = json!(
                     agent.enabled
                         && matches!(agent.state.as_str(), "idle" | "busy")
@@ -3485,6 +3508,11 @@ impl Shared {
                     out["messages_omitted"] = json!(n);
                 }
                 Ok(out)
+            }
+            // CAD-1853: the explicit cloud-agent connection and its durable
+            // operation correlation. Admission is the caller rule inside.
+            method if method.starts_with("cloud_agent_") => {
+                self.rpc_cloud_agent(method, params, peer_pid)
             }
             "agent_send" => self.rpc_send_from(params, peer_pid),
             "agent_ask" => self.rpc_ask(params, peer_pid),
@@ -6022,6 +6050,13 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             })
         })
         .flatten();
+    // CAD-1853: the bounded cloud-agent READBACK driver. It resumes
+    // non-terminal operations after a restart and keeps reconciling an
+    // ordinary queued turn until the contract settles it — never a resubmit.
+    if !fenced {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || shared.run_cloud_agent_driver());
+    }
     // Report router (CAD-339): workers' reports and unanswered
     // questions reach the master's thread. Idle without a master.
     if !fenced {
