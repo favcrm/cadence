@@ -56025,7 +56025,7 @@ class IdentitySnapshots {
 
 // src/master.ts
 function masterState(model, status, conversationId, metadata) {
-  return {
+  const state = {
     ...metadata,
     alias: "master",
     provider: "cadence",
@@ -56053,6 +56053,9 @@ function masterState(model, status, conversationId, metadata) {
     queue: [],
     queued: status.queued
   };
+  if (typeof state.toJSON === "function")
+    throw new TypeError("Master metadata cannot replace root serialization.");
+  return state;
 }
 
 // src/model.ts

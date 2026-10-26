@@ -21,7 +21,7 @@ export function masterState(
   conversationId: string | null,
   metadata?: MasterMetadata,
 ): Record<string, unknown> {
-  return {
+  const state: Record<string, unknown> = {
     ...metadata,
     alias: "master",
     // The board only requires an unrestricted string here; `cadence` names
@@ -59,4 +59,8 @@ export function masterState(
     queue: [],
     queued: status.queued,
   };
+  // A callable root hook could replace the whole authoritative frame.
+  if (typeof state.toJSON === "function")
+    throw new TypeError("Master metadata cannot replace root serialization.");
+  return state;
 }

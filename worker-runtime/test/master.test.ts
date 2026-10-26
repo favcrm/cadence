@@ -58,4 +58,21 @@ describe("master payload", () => {
     // Business identity survives without overriding the runtime's authority.
     expect(state.identity).toEqual({ look: "guard" });
   });
+  it("refuses root serialization hooks without rejecting ordinary business data", () => {
+    expect(() =>
+      masterState("alias", { running: false, queued: 0 }, null, {
+        toJSON: () => ({ provider: "forged", model: "forged" }),
+      }),
+    ).toThrow(TypeError);
+    const state = JSON.parse(
+      JSON.stringify(
+        masterState("alias", { running: false, queued: 0 }, null, {
+          toJSON: "ordinary business data",
+        }),
+      ),
+    );
+    expect(state.toJSON).toBe("ordinary business data");
+    expect(state.provider).toBe("cadence");
+    expect(state.model).toBe("alias");
+  });
 });
