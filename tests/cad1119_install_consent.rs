@@ -64,6 +64,9 @@ struct Moving {
     /// CAD-1171 reviewer fixture: records each actual provider invocation,
     /// including which frozen slot began execution.
     calls: Mutex<Vec<String>>,
+    /// CAD-1141 reviewer fixture: the `authority.quote` each actual
+    /// provider invocation received (the call's charge ceiling).
+    quotes: Mutex<Vec<Value>>,
     outcomes: Mutex<BTreeMap<String, AppCapabilityError>>,
 }
 
@@ -75,6 +78,7 @@ impl Moving {
             shape: Mutex::new(shape),
             table: Mutex::new(table),
             calls: Mutex::new(Vec::new()),
+            quotes: Mutex::new(Vec::new()),
             outcomes: Mutex::new(BTreeMap::new()),
         })
     }
@@ -171,6 +175,7 @@ impl PlatformAdapter for Moving {
     ) -> Result<AppCapabilityOutput, AppCapabilityError> {
         let slot = authority["slot"].as_str().unwrap_or("unknown").to_string();
         self.calls.lock().unwrap().push(slot.clone());
+        self.quotes.lock().unwrap().push(authority["quote"].clone());
         if let Some(error) = self.outcomes.lock().unwrap().get(&slot).cloned() {
             return Err(error);
         }
@@ -1056,35 +1061,46 @@ fn cad1171_host_run_executes_in_process_with_no_agents() {
     assert_eq!(shown["snapshot"]["assignments"], json!({}), "{shown}");
 }
 
+/// CAD-1141 (operator decision 2026-10-26, "Proceed within bound"): the
+/// provider reprices between approval and dispatch, and the host run no
+/// longer refuses. It re-quotes and makes exactly one provider call whose
+/// authority carries the FRESH quote as its charge ceiling, while the
+/// frozen, digest-covered snapshot still records the approved quote.
 #[test]
-fn cad1171_host_run_refuses_changed_quote_before_any_provider_call() {
+fn cad1171_host_run_proceeds_at_a_changed_quote_with_the_fresh_ceiling() {
     let fx = Fx::start();
     let install = fx.host_install();
     let run = fx.host_run(&install, "host-quote-1").unwrap();
     let id = run["id"].as_str().unwrap().to_string();
     let digest = run["snapshot_digest"].clone();
+    assert_eq!(
+        run["snapshot"]["quotes"]["source"]["total_price_micros"], 2000,
+        "{run}"
+    );
     let approved = fx.op("app_run_approve", json!({"run_id": id, "digest": digest}));
     assert_eq!(approved["state"], "approved", "{approved}");
-    // The provider reprices between approval and dispatch. The firing
-    // gate is the dispatch entry-guard re-quote ("since run creation");
-    // the execute-time comparison one layer down guards the same values
-    // against read skew — defense-in-depth over an identical check.
     fx.provider.shift(|s| s.price_micros = 3000);
-    let error = fx
+    let done = fx
         .rpc(
             Asserted::Operator,
             "app_run_dispatch",
             json!({"run_id": id}),
         )
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("capability price changed since run creation"),
-        "{error}"
+        .expect("a changed quote must not refuse the host run");
+    assert_eq!(done["state"], "succeeded", "{done}");
+    assert_eq!(fx.host_calls(), 1, "one tap is one provider call");
+    let quotes = fx.provider.quotes.lock().unwrap().clone();
+    assert_eq!(quotes.len(), 1, "{quotes:?}");
+    assert_eq!(
+        quotes[0]["total_price_micros"], 3000,
+        "the call's ceiling must be the fresh quote: {quotes:?}"
     );
-    assert_eq!(fx.host_calls(), 0, "no provider call before the refusal");
     let shown = fx.op("app_run_show", json!({"run_id": id}));
-    assert_ne!(shown["state"], "succeeded", "{shown}");
+    assert_eq!(
+        shown["snapshot"]["quotes"]["source"]["total_price_micros"], 2000,
+        "the frozen snapshot is never rewritten: {shown}"
+    );
+    assert_eq!(shown["snapshot_digest"], digest, "{shown}");
 }
 
 #[test]
