@@ -56523,31 +56523,30 @@ data: ${JSON.stringify(entry)}
       const thinking = url.searchParams.get("reader") === "owner";
       const requested = Number(url.searchParams.get("after") ?? "0");
       let last = Number.isSafeInteger(requested) && requested > 0 ? requested : 0;
-      let master = null;
-      if (this.options.threadContext) {
-        try {
-          master = this.validatedThreadContext(await this.options.threadContext());
-        } catch {
-          return Response.json({
-            ok: false,
-            error: {
-              code: "capability_unavailable",
-              message: "The master identity projection is unavailable."
-            }
-          }, { status: 503 });
-        }
+      let masterFrame;
+      try {
+        const master = this.options.threadContext ? this.validatedThreadContext(await this.options.threadContext()) : null;
+        const model = await this.modelLabel();
+        masterFrame = `event: master
+data: ${JSON.stringify(masterState(model, { running: false, queued: 0 }, master?.conversationId ?? null, master?.metadata))}
+
+`;
+      } catch {
+        return Response.json({
+          ok: false,
+          error: {
+            code: "capability_unavailable",
+            message: "The master identity projection is unavailable."
+          }
+        }, { status: 503 });
       }
       const stream = await this.harness.session().events();
-      const model = await this.modelLabel();
       return sessionEventResponse(stream, {
         snapshot: (send) => {
           send(`: connected
 
 `);
-          send(`event: master
-data: ${JSON.stringify(master === null ? masterState(model, { running: false, queued: 0 }, null) : masterState(model, { running: false, queued: 0 }, master.conversationId, master.metadata))}
-
-`);
+          send(masterFrame);
           for (const entry of threadEntries(stream.snapshot.entries, thinking))
             emit(entry, send);
         },

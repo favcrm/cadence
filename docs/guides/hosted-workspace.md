@@ -103,6 +103,9 @@ replaces the model, provider, session, turn or queue state. An unavailable or
 malformed projection fails the connection with a `503` capability refusal
 instead of serving a stale or partial header. `masterState` applies the same
 precedence to the HTTP header read.
+The composed master frame is serialized once before opening the watch or
+returning SSE `200`: cyclic or non-JSON business values refuse with `503`.
+Values shadowed by the runtime's reserved fields do not invalidate the frame.
 
 `HostedSession.recordCount()` reports active stored runtime records, not the
 number of expanded UI transcript parts. A host can combine it with `state()`

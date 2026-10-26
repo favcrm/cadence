@@ -163,29 +163,38 @@ export class HostedSession<
       // revision/avatar/name over a newer committed edit; an unavailable or
       // malformed projection fails the connection rather than serving a
       // partial header.
-      let master: ThreadContext | null = null;
-      if (this.options.threadContext) {
-        try {
-          master = this.validatedThreadContext(
-            await this.options.threadContext(),
-          );
-        } catch {
-          return Response.json(
-            {
-              ok: false,
-              error: {
-                code: "capability_unavailable",
-                message: "The master identity projection is unavailable.",
-              },
+      let masterFrame: string;
+      try {
+        const master = this.options.threadContext
+          ? this.validatedThreadContext(await this.options.threadContext())
+          : null;
+        const model = await this.modelLabel();
+        // Serialize the actual composed payload once, before opening a watch
+        // or returning SSE 200. Metadata may contain non-JSON values, while
+        // reserved fields it cannot override must retain runtime precedence.
+        masterFrame = `event: master\ndata: ${JSON.stringify(
+          masterState(
+            model,
+            { running: false, queued: 0 },
+            master?.conversationId ?? null,
+            master?.metadata,
+          ),
+        )}\n\n`;
+      } catch {
+        return Response.json(
+          {
+            ok: false,
+            error: {
+              code: "capability_unavailable",
+              message: "The master identity projection is unavailable.",
             },
-            { status: 503 },
-          );
-        }
+          },
+          { status: 503 },
+        );
       }
       // Capture the watch before reading its snapshot so commits between the
       // initial read and subscription are buffered, not silently missed.
       const stream = await this.harness.session().events();
-      const model = await this.modelLabel();
       function emit(entry: ThreadEntry, send: (frame: string) => void): void {
         if (entry.seq <= last) return;
         send(
@@ -202,18 +211,7 @@ export class HostedSession<
           // This object is the master: it answered, and it holds no live
           // native turn, so the honest snapshot is idle. A host projection
           // composes under those runtime fields and cannot replace them.
-          send(
-            `event: master\ndata: ${JSON.stringify(
-              master === null
-                ? masterState(model, { running: false, queued: 0 }, null)
-                : masterState(
-                    model,
-                    { running: false, queued: 0 },
-                    master.conversationId,
-                    master.metadata,
-                  ),
-            )}\n\n`,
-          );
+          send(masterFrame);
           for (const entry of threadEntries(stream.snapshot.entries, thinking))
             emit(entry, send);
         },
