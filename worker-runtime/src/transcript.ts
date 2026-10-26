@@ -1,5 +1,60 @@
+import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import type { EntryRecord } from "@earendil-works/pi-durable";
 import { BOARD_MESSAGE_KIND, type ThreadEntry } from "./contract.ts";
+
+/** The private engine's default retry.maxRetries: attempts 1..3 retry. */
+const PI_MAX_RETRIES = 3;
+
+const word = (alternatives: string) =>
+  new RegExp(`(?<![a-z0-9])(?:${alternatives})(?![a-z0-9])`, "i");
+const TIMEOUT = /timed?.?out|timeout|deadline.?exceeded/i;
+const UNREACHABLE =
+  /connection.?(?:refused|reset|lost|error)|network.?error|(?:temporarily.?)?unavailable|upstream.?(?:connect|request.?failed)/i;
+const UNREACHABLE_STATUS = word("502|503|504");
+const BUSY = /rate.?limit|too many requests|overloaded|server.?busy/i;
+const BUSY_STATUS = word("429");
+const REFUSED = /refused|forbidden|unauthori[sz]ed|denied/i;
+const REFUSED_STATUS = word("401|402|403");
+
+/** Classify private provider text; never expose its URLs, keys or diagnostics. */
+function failedTurnReason(errorMessage: string | undefined): string {
+  const raw = errorMessage ?? "";
+  if (raw.includes("billing_unavailable")) return "billing_unavailable";
+  if (TIMEOUT.test(raw)) return "The model request timed out.";
+  if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw))
+    return "The model service could not be reached.";
+  if (BUSY.test(raw) || BUSY_STATUS.test(raw))
+    return "The model is busy right now.";
+  if (REFUSED.test(raw) || REFUSED_STATUS.test(raw))
+    return "The model request was refused.";
+  return "The model request failed.";
+}
+
+type PiMessage = NonNullable<EntryRecord["model"]>[number];
+
+/**
+ * Retry/compaction errors stay hidden until their outcome is known. A stream
+ * must never emit a failure entry that a subsequent successful retry removes.
+ */
+function terminalError(messages: readonly PiMessage[], index: number): boolean {
+  const message = messages[index];
+  if (message?.role !== "assistant" || message.stopReason !== "error")
+    return false;
+  const next = messages[index + 1];
+  if (next !== undefined) return next.role === "user";
+  if (isRetryableAssistantError(message)) {
+    let failures = 0;
+    for (let i = index; i >= 0; i--) {
+      const earlier = messages[i];
+      if (earlier?.role !== "assistant" || earlier.stopReason !== "error")
+        break;
+      failures += 1;
+    }
+    return failures > PI_MAX_RETRIES;
+  }
+  return !isContextOverflow(message);
+}
 
 /** One line for the trace's tool row; never the full argument JSON. */
 function toolCallText(name: string, args: Record<string, unknown>): string {
@@ -25,6 +80,8 @@ export function threadEntries(
   includeThinking: boolean,
 ): ThreadEntry[] {
   const entries: ThreadEntry[] = [];
+  const all = records.flatMap((record) => record.model ?? []);
+  let position = -1;
   for (const record of records) {
     const data = record.data;
     const messageId =
@@ -36,6 +93,7 @@ export function threadEntries(
         ? data.messageId
         : undefined;
     for (const message of record.model ?? []) {
+      position += 1;
       // Tool results live in their own message, paired to the assistant tool
       // call by id. The board's tools group consumes both kinds; mapping them
       // here keeps the result out of a standalone system/Details row.
@@ -110,6 +168,18 @@ export function threadEntries(
           ...(operator && messageId !== undefined
             ? { message: messageId }
             : {}),
+        });
+      }
+      if (message.role === "assistant" && terminalError(all, position)) {
+        entries.push({
+          seq: entries.length + 1,
+          role: "agent",
+          kind: "turn_result",
+          text: "",
+          payload: {
+            status: "failed",
+            error: failedTurnReason(message.errorMessage),
+          },
         });
       }
     }

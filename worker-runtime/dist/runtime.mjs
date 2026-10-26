@@ -56135,6 +56135,48 @@ function sessionEventResponse(watch, format) {
 }
 
 // src/transcript.ts
+var PI_MAX_RETRIES = 3;
+var word = (alternatives) => new RegExp(`(?<![a-z0-9])(?:${alternatives})(?![a-z0-9])`, "i");
+var TIMEOUT = /timed?.?out|timeout|deadline.?exceeded/i;
+var UNREACHABLE = /connection.?(?:refused|reset|lost|error)|network.?error|(?:temporarily.?)?unavailable|upstream.?(?:connect|request.?failed)/i;
+var UNREACHABLE_STATUS = word("502|503|504");
+var BUSY = /rate.?limit|too many requests|overloaded|server.?busy/i;
+var BUSY_STATUS = word("429");
+var REFUSED = /refused|forbidden|unauthori[sz]ed|denied/i;
+var REFUSED_STATUS = word("401|402|403");
+function failedTurnReason(errorMessage) {
+  const raw = errorMessage ?? "";
+  if (raw.includes("billing_unavailable"))
+    return "billing_unavailable";
+  if (TIMEOUT.test(raw))
+    return "The model request timed out.";
+  if (UNREACHABLE.test(raw) || UNREACHABLE_STATUS.test(raw))
+    return "The model service could not be reached.";
+  if (BUSY.test(raw) || BUSY_STATUS.test(raw))
+    return "The model is busy right now.";
+  if (REFUSED.test(raw) || REFUSED_STATUS.test(raw))
+    return "The model request was refused.";
+  return "The model request failed.";
+}
+function terminalError(messages, index) {
+  const message = messages[index];
+  if (message?.role !== "assistant" || message.stopReason !== "error")
+    return false;
+  const next = messages[index + 1];
+  if (next !== undefined)
+    return next.role === "user";
+  if (isRetryableAssistantError(message)) {
+    let failures = 0;
+    for (let i = index;i >= 0; i--) {
+      const earlier = messages[i];
+      if (earlier?.role !== "assistant" || earlier.stopReason !== "error")
+        break;
+      failures += 1;
+    }
+    return failures > PI_MAX_RETRIES;
+  }
+  return !isContextOverflow(message);
+}
 function toolCallText(name, args) {
   for (const key of ["command", "cmd", "path", "query", "url"]) {
     const value = args[key];
@@ -56146,10 +56188,13 @@ function toolCallText(name, args) {
 }
 function threadEntries(records, includeThinking) {
   const entries = [];
+  const all = records.flatMap((record) => record.model ?? []);
+  let position = -1;
   for (const record of records) {
     const data = record.data;
     const messageId = record.kind === BOARD_MESSAGE_KIND && data !== null && typeof data === "object" && !Array.isArray(data) && typeof data.messageId === "string" ? data.messageId : undefined;
     for (const message of record.model ?? []) {
+      position += 1;
       if (message.role === "toolResult") {
         const text = message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join(`
 `).trim();
@@ -56204,6 +56249,18 @@ function threadEntries(records, includeThinking) {
           kind: agent ? final ? "turn_result" : "assistant_text" : "message",
           text: part.text,
           ...operator && messageId !== undefined ? { message: messageId } : {}
+        });
+      }
+      if (message.role === "assistant" && terminalError(all, position)) {
+        entries.push({
+          seq: entries.length + 1,
+          role: "agent",
+          kind: "turn_result",
+          text: "",
+          payload: {
+            status: "failed",
+            error: failedTurnReason(message.errorMessage)
+          }
         });
       }
     }
@@ -56317,6 +56374,9 @@ data: ${JSON.stringify(masterState(model, { running: false, queued: 0 }, null))}
   }
   async transcript(includeThinking) {
     return threadEntries(await this.harness.session().messages(), includeThinking);
+  }
+  async recordCount() {
+    return (await this.harness.session().messages()).length;
   }
   reload() {
     this.ctx.abort();

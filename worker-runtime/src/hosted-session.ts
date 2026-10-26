@@ -201,6 +201,11 @@ export class HostedSession<
     );
   }
 
+  /** Stored runtime records, not expanded presentation entries. Read-only. */
+  async recordCount(): Promise<number> {
+    return (await this.harness.session().messages()).length;
+  }
+
   /** Abort this instance; durable state is retained when it is reconstructed. */
   reload(): string {
     this.ctx.abort();

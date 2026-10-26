@@ -33,6 +33,9 @@ export interface ThreadEntry {
         redacted?: true;
         tool_use_id?: string;
         is_error?: true;
+        /** Safe terminal failure projection; never raw provider diagnostics. */
+        status?: "failed";
+        error?: string;
     };
 }
 /**

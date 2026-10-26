@@ -331,6 +331,124 @@ describe("board transcript identity", () => {
     ).toEqual([
       { seq: 1, role: "agent", kind: "turn_result", text: "Truncated answer" },
       { seq: 2, role: "agent", kind: "assistant_text", text: "Provider error" },
+      {
+        seq: 3,
+        role: "agent",
+        kind: "turn_result",
+        text: "",
+        payload: { status: "failed", error: "The model request failed." },
+      },
     ]);
+  });
+
+  // Preserved from AgenticOS AOS-389; only test-runner/module imports move.
+  describe("failed assistant turns", () => {
+    const failed = (id: string, errorMessage?: string): EntryRecord => {
+      const record = assistant(id, [], "error");
+      const [message] = record.model as [AssistantMessage];
+      return {
+        ...record,
+        model: [{ ...message, ...(errorMessage ? { errorMessage } : {}) }],
+      };
+    };
+    const failures = (records: EntryRecord[]) =>
+      threadEntries(records, false).filter(
+        (entry) => entry.payload?.status === "failed",
+      );
+    const reason = (message?: string) =>
+      failures([failed("2", message), input("3", "again")])[0]?.payload?.error;
+
+    it("projects a terminal error as a failed turn_result with a safe reason", () => {
+      const entries = threadEntries(
+        [
+          input("1", "hi"),
+          failed("2", "400 from https://gw.internal/v1?key=sk-secret refused"),
+        ],
+        false,
+      );
+      expect(entries[1]).toEqual({
+        seq: 2,
+        role: "agent",
+        kind: "turn_result",
+        text: "",
+        payload: { status: "failed", error: "The model request was refused." },
+      });
+      expect(JSON.stringify(entries)).not.toContain("sk-secret");
+      expect(JSON.stringify(entries)).not.toContain("gw.internal");
+    });
+
+    it("shows nothing for a retryable error that Pi then retried successfully", () => {
+      const entries = threadEntries(
+        [
+          input("1", "hi"),
+          failed("2", "429 too many requests"),
+          assistant("3", [{ type: "text", text: "Hello" }], "stop"),
+        ],
+        false,
+      );
+      expect(entries.map((entry) => [entry.seq, entry.kind])).toEqual([
+        [1, "message"],
+        [2, "turn_result"],
+      ]);
+      expect(entries[1]?.text).toBe("Hello");
+    });
+
+    it("holds a last-message retryable error until retries are exhausted", () => {
+      const retrying = [
+        input("1", "hi"),
+        failed("2", "503"),
+        failed("3", "503"),
+        failed("4", "503"),
+      ];
+      expect(failures(retrying)).toEqual([]);
+      const exhausted = [...retrying, failed("5", "503")];
+      expect(failures(exhausted)).toHaveLength(1);
+      expect(failures(exhausted)[0]?.seq).toBe(2);
+    });
+
+    it("keeps earlier seqs stable while a held error resolves (live stream)", () => {
+      const held = [input("1", "hi"), failed("2", "529 overloaded")];
+      const before = threadEntries(held, false);
+      const after = threadEntries(
+        [...held, assistant("3", [{ type: "text", text: "ok" }], "stop")],
+        false,
+      );
+      expect(after.slice(0, before.length)).toEqual(before);
+      expect(
+        after.filter((entry) => entry.payload?.status === "failed"),
+      ).toEqual([]);
+    });
+
+    it("treats a retryable error followed by a new user message as final", () => {
+      expect(
+        failures([input("1", "hi"), failed("2", "503"), input("3", "again")]),
+      ).toHaveLength(1);
+    });
+
+    it("passes our billing code through and classifies the rest", () => {
+      expect(reason("403 billing_unavailable")).toBe("billing_unavailable");
+      expect(reason("request timed out")).toBe("The model request timed out.");
+      expect(reason("429 too many requests")).toBe(
+        "The model is busy right now.",
+      );
+      expect(reason("403 forbidden")).toBe("The model request was refused.");
+      expect(reason(undefined)).toBe("The model request failed.");
+    });
+
+    it("does not misclassify on look-alikes", () => {
+      expect(reason("connection refused")).toBe(
+        "The model service could not be reached.",
+      );
+      expect(reason("request id req-4290-x403y failed")).toBe(
+        "The model request failed.",
+      );
+      expect(reason("read 14031 bytes then failed")).toBe(
+        "The model request failed.",
+      );
+    });
+
+    it("does not surface an aborted turn", () => {
+      expect(threadEntries([assistant("2", [], "aborted")], false)).toEqual([]);
+    });
   });
 });

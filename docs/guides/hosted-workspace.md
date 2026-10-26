@@ -75,6 +75,13 @@ checked before and after the authority check. Tool handlers receive only the
 neutral invocation identity, clock and cancellation context, not the engine's
 model registry or nested-execution API.
 
+`HostedSession.recordCount()` reports active stored runtime records, not the
+number of expanded UI transcript parts. A host can combine it with `state()`
+for release inspection without reading engine snapshots or starting a turn.
+Terminal failed turns carry only a safe `payload.status`/`payload.error`
+projection. Retry and compaction errors stay hidden while their outcome is
+uncertain; raw provider diagnostics, URLs and keys are not presentation data.
+
 From `worker-runtime/`, using its pinned Bun version:
 
 ```sh
