@@ -17,12 +17,15 @@ export default function ProjectScope({
   context,
   contextLoading,
   onOpenContext,
+  hosted = false,
 }: {
   project: string;
   projects: Project[];
   context: ProjectContext | null;
   contextLoading: boolean;
   onOpenContext: () => void;
+  /** A hosted tenant does not serve the wiki; the context page is wiki-backed. */
+  hosted?: boolean;
 }) {
   const t = useTranslate();
   const meta = projects.find((p) => p.key === project);
@@ -83,12 +86,14 @@ export default function ProjectScope({
             {t("Showing")} {shown.length} {t("of")} {docs.length} {t("source documents")}
           </p>
         )}
-        <button
-          onClick={onOpenContext}
-          className="lnk text-label"
-        >
-          {t("Open project context →")}
-        </button>
+        {!hosted && (
+          <button
+            onClick={onOpenContext}
+            className="lnk text-label"
+          >
+            {t("Open project context →")}
+          </button>
+        )}
       </div>
     </section>
   );
