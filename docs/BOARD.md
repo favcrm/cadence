@@ -198,6 +198,23 @@ confinement profiles (`pi_confine.rs`), the generated tool guard
 (`pi_guard.rs`), and provider catalogues (`pi_devin_catalog.rs` and
 `pi_agenticos.rs`). Public adapter entry points remain at `adapter::pi`.
 
+The managed master and worker confinement profiles resolve the real Pi program
+and grant the same validated read-only managed dependencies — the install's
+version pointer, the selected release and the selected Node. A confined worker
+can therefore start a managed Pi launcher without receiving neighboring
+releases, release/private credentials, the operator's `HOME`, or any write
+access outside its existing profile. A non-managed launcher layout grants none
+of these.
+
+The worker profile additionally grants the canonical resolver target of
+`/etc/resolv.conf` as a read-only file, and only when that exact target is
+`/run/systemd/resolve/stub-resolv.conf` or `/run/systemd/resolve/resolv.conf`.
+Only the selected regular file is granted: never `/run`, `/run/systemd`, the
+`resolve` directory, a sibling resolver file, an arbitrary symlink target, or
+private files. A `/etc/resolv.conf` that is already a regular file needs no
+extra grant. The master profile and the confinement helper validation are
+unchanged.
+
 ## `[pi]` in pm.yaml — the operator's Pi policy (CAD-559)
 
 `pm.yaml` can carry a `[pi]` table pinning what a managed pi agent may
@@ -930,6 +947,96 @@ or running — the output says so. Delivery itself stays the daemon's
 business: no `--ready`, no forced claims; the output prints the queued
 message id and the worker's probe verdict so the operator knows
 whether it lands now or when the pane idles.
+
+**Task context delivery (CAD-1822).** A plain dispatch to a managed
+endpoint also pins the task contract and the assigned project's tracked
+sources, but only when that project's tracked
+`docs/cadence/project-context.yaml` at HEAD sets `agent_delivery: true`.
+Absent or false leaves every existing dispatch path unchanged. A
+tracked manifest the daemon cannot read or parse cannot prove the
+opt-in, so delivery stays off and dispatch is unchanged; once
+`agent_delivery: true` is parsed, an invalid manifest, a missing
+required source or an over-cap payload refuses. Selection
+is daemon-side: the issue's registered project's declared local
+repository and the manifest at HEAD. Required documents are
+selected regardless of role; optional ones by the worker's runtime
+role (`dev` by default, `qa` for reviewer/QA, `pm`/`devops` exact).
+The pin records the task revision (SHA-256 of `issue.md`), the complete
+acceptance, the project revision and each source's `id`/`path`/
+`revision`/`sha256`/bytes as a `context_pin` event bound to that
+message id — a retried send keeps its first pin, and two queued
+dispatches cannot share one. Before the first managed turn the daemon
+appends the full contract and sources, quoted as data inside its own
+envelope; a confirmed retained session with the same task, conversation
+and provider session/generation receives no duplicate source body, and
+a new, lost or compacted session restores the complete mandatory
+payload. Optional continuity history is a prefix: it is delivered only
+when the whole pack fits the remaining combined budget, otherwise it
+is omitted whole with a recorded reason — never at the expense of the
+task contract or required sources. A definite provider result — completed,
+failed or interrupted — writes a `context_supplied` receipt (target,
+task/source revisions, included/withheld/omitted reasons,
+session/generation, appended bytes) — supply, not model use. A
+pre-submission refusal, an uncertain outcome or a not-rendered paste
+writes none. For an
+opted-in task the daemon establishes the alias's native home
+conversation at pin time, so enqueue notes, provider compaction notes
+and receipts all name the same thread. Before delivery the actor also
+records one durable activation binding per pin in that conversation —
+the exact pin, task and task revision. A follow-up with no pin of its
+own restores from that binding, never from the alias's latest queued
+pin and never from optional event rollups, so losing a supply receipt
+never loses the task; only `context_supplied` proves residency. A
+failed activation write refuses the turn before provider submission. The
+pin (or a disabled selection) commits in the same admission transaction
+as the accepted message row, so a kickoff becomes claimable only after
+both are durable and a rejected or duplicate envelope writes nothing. A
+native dispatch whose assigned scope is not opted in passes a disabled
+selection that persists one exact-message `context_disabled` marker only
+if the alias already has feature state at that commit — never for a
+never-opted-in legacy alias. Before delivering it the actor clears the
+conversation's active binding (one `context_deactivated` marker, only for
+a real prior binding) and a failed clear refuses the turn before the
+provider. An already-accepted id is decided by the store's exact-envelope
+comparison: an exact lost-acknowledgement retry returns the known accepted
+outcome without re-capturing project context or adding metadata, while a
+genuinely new id is still evaluated for required sources. Same-issue
+re-dispatch after opt-out therefore
+cannot reuse the previous pin, while a legitimate issue follow-up
+without a disabled marker keeps the immutable current pin. These
+markers carry no source bodies and are not written per turn. Delivery
+planning verifies acceptance presence against the actual delivered body
+in order — never inferred from the message source or a non-empty
+manifest; a body that does not carry every criterion gets the complete
+canonical acceptance. A retained turn reports only sources confirmed
+resident by an earlier receipt, plus the actual prior gap
+state/reason for anything still undelivered; if a required source is
+not confirmed resident the turn degrades to a delta and appends it.
+The body itself must fit the combined cap, and the actor's two-byte
+join is counted in every budget. Known local adapter-added prompt
+material is reserved conservatively in the same cap — currently the
+44-byte guarded Pi-adapter task prefix for every registry-defined Pi-family
+provider, even while its guard is off. This is a local byte reservation, not provider-window
+accounting; the receipt records it as `adapter_reserved_bytes`, never as
+appended source. Only an opted-in project's changed
+kickoff body supersedes a reported duplicate. A
+missing
+required source, an unusable manifest, a combined payload over 48 000
+bytes, a pinned project context on an endpoint that cannot receive
+prompt content, or a pin naming another task refuses before the turn
+(and, before `issue start`, at dispatch) with `context refused: <code>: …`, where
+`<code>` is `missing-required-source`, `scope-conflict`,
+`unavailable-project`, `unsupported-endpoint`, `mandatory-overflow` or
+`cross-task-binding`. Required acceptance is never truncated. An agent's
+own later file or `message read` calls are its tool use, recorded in the
+thread; they are never counted as the daemon's automatic injection. A
+required document over the reader's
+64 KiB cap, or a required set that cannot fit the combined cap, refuses
+by design — the project must split or demote it in its tracked manifest
+rather than have it silently truncated. A revised task dispatched again
+keeps the earlier message and ref as history: a different kickoff body
+for the same completed worker/lane is an explicit revision, not a
+duplicate.
 
 ### Claims — who may start or dispatch an issue in flight (CAD-383)
 

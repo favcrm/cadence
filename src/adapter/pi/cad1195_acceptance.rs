@@ -298,3 +298,141 @@ fn fixture_from_root(root: PathBuf) -> ManagedFixture {
         state: root.join("state"),
     }
 }
+
+// CAD-1822: authored independently of the worker-profile implementation.
+// These probes apply the actual worker Landlock policy, not a list-only
+// approximation. Runtime readability must not expose adjacent/private data.
+fn worker_policy(fixture: &ManagedFixture) -> crate::confine::Policy {
+    let env = ProviderEnv::default();
+    env.set(
+        "PATH",
+        fixture
+            .root
+            .join(".local/bin")
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.set("HOME", fixture.root.to_string_lossy().to_string());
+    env.set(
+        "XDG_DATA_HOME",
+        fixture.xdg_data.to_string_lossy().to_string(),
+    );
+    env.set("CADENCE_CONFINE_COMMAND", "/usr/bin/true");
+    env.set(
+        "CADENCE_PM_DIR",
+        fixture
+            .root
+            .join("no-pm-here")
+            .to_string_lossy()
+            .to_string(),
+    );
+    let cwd = fixture.root.join("worker-repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let store = crate::store::Store::open(&fixture.state.join("cadence.sqlite3")).unwrap();
+    if store.agent_opt("managed-worker").unwrap().is_none() {
+        store
+            .register_agent(&crate::store::NewAgent {
+                alias: "managed-worker",
+                provider: "pi",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: cwd.to_str().unwrap(),
+                sandbox: "workspace-write",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+    }
+    let agent = store.agent("managed-worker").unwrap();
+    pi_worker_confinement(&env, &fixture.state, &agent).1
+}
+
+fn assert_worker_read(fixture: &ManagedFixture, path: &Path, expected: Option<&str>) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "adapter::pi::cad1195_acceptance::managed_pi_worker_confinement_acceptance",
+            "--nocapture",
+        ])
+        .env("CAD1822_WORKER_PROBE", &fixture.root)
+        .env("CAD1822_WORKER_PROBE_PATH", path)
+        .output()
+        .unwrap();
+    match expected {
+        Some(text) => {
+            assert!(
+                output.status.success(),
+                "worker cannot read {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(text));
+        }
+        None => {
+            assert!(
+                !output.status.success(),
+                "worker read private/adjacent data at {}",
+                path.display()
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("Permission denied"),
+                "guard did not refuse {}: {:?}",
+                path.display(),
+                output
+            );
+        }
+    }
+}
+
+#[test]
+fn managed_pi_worker_confinement_acceptance() {
+    if let Some(root) = std::env::var_os("CAD1822_WORKER_PROBE") {
+        let fixture = fixture_from_root(PathBuf::from(root));
+        let path = std::env::var("CAD1822_WORKER_PROBE_PATH").unwrap();
+        let error =
+            crate::confine::exec(&worker_policy(&fixture), &["/bin/cat".into(), path]).unwrap_err();
+        panic!("worker guard probe could not exec: {error}");
+    }
+    let valid = ManagedFixture::new("1.1.0\n", None);
+    let neighbor = valid.release.with_file_name("2.0.0").join("sentinel");
+    std::fs::create_dir_all(neighbor.parent().unwrap()).unwrap();
+    std::fs::write(&neighbor, "neighbor release must remain private").unwrap();
+    let credential = valid.root.join(".pi/agent/auth.json");
+    std::fs::write(&credential, "test-only private credential sentinel").unwrap();
+    // DNS follows the system resolver symlink; only its selected public
+    // target may become readable, never the surrounding runtime directory.
+    let resolver = std::fs::canonicalize("/etc/resolv.conf").unwrap();
+    assert_worker_read(&valid, Path::new("/etc/resolv.conf"), Some("nameserver"));
+    assert_worker_read(&valid, Path::new("/run"), None);
+    for sibling in [
+        "/run/systemd/resolve/stub-resolv.conf",
+        "/run/systemd/resolve/resolv.conf",
+    ] {
+        let path = Path::new(sibling);
+        if path.is_file() && std::fs::canonicalize(path).unwrap() != resolver {
+            assert_worker_read(&valid, path, None);
+        }
+    }
+    assert_worker_read(&valid, &valid.pointer, Some("1.1.0"));
+    assert_worker_read(
+        &valid,
+        &valid
+            .release
+            .join("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"),
+        Some("// fixture"),
+    );
+    assert_worker_read(&valid, &valid.node_file, Some("managed node runtime"));
+    assert_worker_read(&valid, &neighbor, None);
+    assert_worker_read(&valid, &credential, None);
+    assert_worker_read(&valid, &valid.private, None);
+    assert_worker_read(&valid, &valid.node_private, None);
+    let traversing = ManagedFixture::new("../../../.pi-private-sibling\n", None);
+    assert_worker_read(&traversing, &traversing.private, None);
+    let symlinked = ManagedFixture::new(
+        "1.1.0\n",
+        Some(Path::new("../../../.pi-private-sibling/sentinel")),
+    );
+    assert_worker_read(&symlinked, &symlinked.private, None);
+}

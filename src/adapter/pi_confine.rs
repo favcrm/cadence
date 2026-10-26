@@ -487,6 +487,16 @@ pub fn pi_worker_confinement(
         if let Some(root) = package_root(&p) {
             programs.push(root);
         }
+        // CAD-1822: a managed Pi launcher resolves its version pointer,
+        // selected release and selected Node from the installed tree before
+        // the provider starts. Reuse the same validated read-only dependency
+        // list the master policy grants; neighboring releases, credentials
+        // and the operator's HOME stay denied.
+        for dependency in managed_pi_dependencies(&p, env) {
+            if !read.contains(&dependency) {
+                read.push(dependency);
+            }
+        }
     }
     if let Some(p) = which("cadence", path.as_deref()) {
         programs.push(p);
@@ -606,6 +616,26 @@ pub fn pi_worker_confinement(
             if !read.contains(&pkg.dir) {
                 read.push(pkg.dir);
             }
+        }
+    }
+    // CAD-1822: a managed worker's Node resolves names through the system
+    // resolver. `/etc/resolv.conf` may point at a systemd-resolved file
+    // outside the base read set; grant ONLY the canonical selected regular
+    // file from the two public resolver targets — never the directory, a
+    // sibling, an arbitrary symlink target or a private file. A plain
+    // regular `/etc/resolv.conf` is already covered by the system read set.
+    if let Ok(selected) = std::fs::canonicalize("/etc/resolv.conf") {
+        const RESOLVER_TARGETS: &[&str] = &[
+            "/run/systemd/resolve/stub-resolv.conf",
+            "/run/systemd/resolve/resolv.conf",
+        ];
+        if selected.is_file()
+            && RESOLVER_TARGETS
+                .iter()
+                .any(|allowed| selected.as_path() == Path::new(allowed))
+            && !read.contains(&selected)
+        {
+            read.push(selected);
         }
     }
     read.extend(split_paths(env.var(CONFINE_WORKER_EXTRA_READ_ENV)));

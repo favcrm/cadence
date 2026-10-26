@@ -53,9 +53,12 @@ versions, not only the short injected summary.
 ## Capability evidence
 
 Durable message/job storage, issue/worktree tools, scoped memory, report intake,
-relay foundations, monitor observations, UI alerts, provider profile display,
-build/test slots and structured review evidence exist in source. This list does
-not certify every adapter, configuration or deployment.
+relay foundations, revisioned task-context delivery for managed issue dispatch
+(`src/context_pack.rs`, pinned at dispatch, opted in per project with
+`agent_delivery: true`), monitor observations, UI alerts,
+provider profile display, build/test slots and structured review evidence exist
+in source. This list does not certify every adapter, configuration or
+deployment.
 
 The bounded acceptance harness was removed in the CAD-1073 clean-slate
 retirement. Its former labels and ticket evidence are preserved in git history;

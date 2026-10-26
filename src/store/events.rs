@@ -412,6 +412,108 @@ impl Store {
         })
     }
 
+    /// CAD-1822: the task contract pinned for one exact kickoff message. The
+    /// first pin wins — a retried enqueue keeps the contract its first
+    /// attempt pinned, and a second queued dispatch can never borrow this
+    /// message's pin. A malformed payload reads as no pin.
+    pub fn context_pin(&self, alias: &str, message_id: &str) -> Result<Option<Value>> {
+        let raw: Option<String> = self.read_tx(|conn| {
+            let raw = conn
+                .query_row(
+                    "SELECT payload FROM events WHERE alias=?1 AND kind='context_pin' \
+                     AND json_extract(payload,'$.message')=?2 ORDER BY seq LIMIT 1",
+                    params![alias, message_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(raw)
+        })?;
+        Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()))
+    }
+
+    /// CAD-1822: the newest confirmed delivery receipt in `alias`'s
+    /// conversation. Conversation-scoped: another conversation (or another
+    /// task's pin) can never inherit it. A malformed payload reads as no
+    /// receipt, because an unprovable supply is never residency.
+    pub fn last_context_supply(&self, alias: &str, conversation: &str) -> Result<Option<Value>> {
+        let raw: Option<String> = self.read_tx(|conn| {
+            let raw = conn
+                .query_row(
+                    "SELECT payload FROM events WHERE alias=?1 AND kind='context_supplied' \
+                     AND json_extract(payload,'$.conversation')=?2 ORDER BY seq DESC LIMIT 1",
+                    params![alias, conversation],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(raw)
+        })?;
+        Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()))
+    }
+
+    /// CAD-1822: the disabled-selection marker for one exact message. A native
+    /// dispatch whose assigned scope is not opted in carries this marker
+    /// instead of a pin; the actor uses it to clear the conversation's active
+    /// task binding before delivering the assignment.
+    pub fn context_disabled(&self, alias: &str, message_id: &str) -> Result<Option<Value>> {
+        let raw: Option<String> = self.read_tx(|conn| {
+            let raw = conn
+                .query_row(
+                    "SELECT payload FROM events WHERE alias=?1 AND kind='context_disabled' \
+                     AND json_extract(payload,'$.message')=?2 ORDER BY seq LIMIT 1",
+                    params![alias, message_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(raw)
+        })?;
+        Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()))
+    }
+
+    /// CAD-1822: whether this alias has ever carried feature context state,
+    /// read inside the caller's existing admission transaction. Used to decide
+    /// whether a disabled selection is persisted; never opens a second store
+    /// lock.
+    pub(super) fn has_context_state_in(tx: &impl StoreConn, alias: &str) -> Result<bool> {
+        let n: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM events WHERE alias=?1 \
+             AND kind IN ('context_pin','context_activated')",
+            params![alias],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// CAD-1822: the newest durable active-task binding in `alias`'s
+    /// conversation. This is task identity, not residency: it names the exact
+    /// kickoff pin the conversation currently serves, so an unbound follow-up
+    /// can restore its mandatory context even when the first turn's supply
+    /// receipt was lost. Conversation-scoped, never alias-latest. A newer
+    /// deactivation hides the older binding.
+    pub fn last_context_activation(
+        &self,
+        alias: &str,
+        conversation: &str,
+    ) -> Result<Option<Value>> {
+        let row: Option<(String, String)> = self.read_tx(|conn| {
+            let row = conn
+                .query_row(
+                    "SELECT kind, payload FROM events WHERE alias=?1 \
+                     AND kind IN ('context_activated','context_deactivated') \
+                     AND json_extract(payload,'$.conversation')=?2 ORDER BY seq DESC LIMIT 1",
+                    params![alias, conversation],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            Ok(row)
+        })?;
+        Ok(match row {
+            Some((kind, payload)) if kind == "context_activated" => {
+                serde_json::from_str(&payload).ok()
+            }
+            _ => None,
+        })
+    }
+
     /// CAD-405: record the operator's approval of a project's work gate
     /// keys (`project`, `digest`, `by`, `at`, …) on [`APPROVAL_STREAM`]
     /// — never pruned, and not a mailbox anything can cancel.

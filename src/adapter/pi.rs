@@ -97,6 +97,12 @@ use super::{AdapterHooks, Identity, ProviderAdapter, ProviderEnv, TurnResult};
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
+/// The literal a guarded Pi submission prepends to the task prompt. The
+/// daemon reserves these bytes in its combined payload cap even when the guard
+/// is currently off: readiness can change between planning and the turn, so
+/// the reservation is conservative, not conditional.
+pub(crate) const TASK_INPUT_PREFIX: &str = "Cadence task input (not a runtime command):\n";
+
 /// Default inactivity window before a turn is `unknown`
 /// (`params.turn_idle_secs`); `params.turn_max_secs` is the optional
 /// absolute cap. Same rule as the Claude adapter.
@@ -1486,7 +1492,7 @@ impl ProviderAdapter for PiAdapter {
         let submitted = if guarded {
             // RPC does not expose expandPromptTemplates:false. Do not let a
             // plain task body invoke our private slash-control commands.
-            format!("Cadence task input (not a runtime command):\n{prompt}")
+            format!("{TASK_INPUT_PREFIX}{prompt}")
         } else {
             prompt.to_string()
         };

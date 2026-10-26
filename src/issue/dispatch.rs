@@ -481,6 +481,11 @@ struct Preflight {
     endpoint_kind: String,
     cwd_override: Option<String>,
     body: Option<String>,
+    /// CAD-1822: this plain dispatch's assigned project is opted in to task
+    /// context delivery. Only then may a changed kickoff body supersede a
+    /// reported duplicate; `--job` and non-opted projects keep the legacy
+    /// duplicate behavior.
+    context_active: bool,
 }
 
 /// The one pre-dispatch gate every caller shares: resolve the issue, read
@@ -492,11 +497,14 @@ pub(crate) struct GatedIssue {
     pub dir: PathBuf,
     pub front: Front,
     pub items: Vec<AcceptanceItem>,
+    /// Exact source from which `front` and `items` were parsed.
+    pub source: String,
 }
 
 pub(crate) fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<GatedIssue> {
     let (project, dir) = write::issue_dir(pm, id)?;
-    let (front, body) = write::load_front(&dir)?;
+    let source = std::fs::read_to_string(dir.join("issue.md"))?;
+    let (front, body) = parse::parse_issue(&source)?;
     let items = parse::acceptance_items(&body);
     if require_acceptance && items.is_empty() {
         return Err(Error::rejected(format!(
@@ -510,6 +518,7 @@ pub(crate) fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<
         dir,
         front,
         items,
+        source,
     })
 }
 
@@ -568,13 +577,74 @@ pub(crate) fn check_seat(
     })
 }
 
+/// CAD-1822: pin and validate the assigned project's task context before a
+/// kickoff exists. Shared by [`preflight`] (CLI and `issue_kickoff` HTTP/RPC,
+/// before any lane is created) and the daemon's `dispatch_send` (the last gate
+/// before enqueue). Returns the manifest the send must record, or `None` when
+/// the project does not participate in context delivery.
+///
+/// Selection is daemon-side: the issue's own project, its declared local
+/// repository and its tracked manifest at HEAD. No request field can name a
+/// source, revision or path. A required source that cannot be read, an
+/// unusable manifest, a combined mandatory payload over the local cap and a
+/// non-managed endpoint that cannot receive required prompt context all refuse
+/// with [`crate::context_pack::Refusal`] before anything is created.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn context_guard(
+    project: &crate::issue::project::Project,
+    source: &[u8],
+    front: &Front,
+    items: &[AcceptanceItem],
+    team_role: Option<&str>,
+    provider: &str,
+    endpoint_kind: &str,
+    body: &str,
+) -> Result<Option<crate::context_pack::Manifest>> {
+    let contract = crate::context_pack::TaskContract::new(&front.id, &front.title, source, items);
+    let (role, assigned) = crate::context_pack::selection_role(team_role);
+    let pinned = crate::issue::context::pin(project, Some(role));
+    let manifest =
+        crate::context_pack::build(contract, &project.key, &pinned, role, assigned.as_deref())
+            .map_err(|refusal| refusal.error())?;
+    let Some(manifest) = manifest else {
+        return Ok(None);
+    };
+    if !crate::continuity::endpoint_takes_packs(endpoint_kind) {
+        return Err(crate::context_pack::Refusal::UnsupportedEndpoint {
+            endpoint: endpoint_kind.to_string(),
+        }
+        .error());
+    }
+    let root = crate::issue::context::repository_root(project).map_err(|(state, detail)| {
+        crate::context_pack::Refusal::UnavailableProject { state, detail }.error()
+    })?;
+    let mut reader = |document: &crate::context_pack::Source| {
+        crate::issue::context::read_pinned_blob(
+            &root,
+            &document.revision,
+            &document.path,
+            &document.digest,
+        )
+    };
+    crate::context_pack::plan(
+        &manifest,
+        None,
+        false,
+        body,
+        crate::context_pack::adapter_reserved_bytes(provider),
+        &mut reader,
+    )
+    .map_err(|refusal| refusal.error())?;
+    Ok(Some(manifest))
+}
+
 fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result<Preflight> {
     let GatedIssue {
         project,
         dir,
         front,
         items,
-        ..
+        source,
     } = gate_issue(pm, id, false)?;
     // CAD-159: the CAD-238 section-scoped readback. No items warns;
     // it never refuses (PM decision, ADR-0002 §8.3).
@@ -688,6 +758,24 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
         }
         None
     };
+    // CAD-1822: the task contract and the project's required sources are
+    // validated before `issue start`, so a refusal leaves no lane, branch or
+    // queued message behind. `--job` kickoffs are daemon-templated and keep
+    // their existing path.
+    let mut context_active = false;
+    if let Some(body) = body.as_deref() {
+        context_active = context_guard(
+            &project,
+            source.as_bytes(),
+            &front,
+            &items,
+            agent["team_role"].as_str(),
+            &provider,
+            &endpoint_kind,
+            body,
+        )?
+        .is_some();
+    }
 
     // `issue start` — idempotent; --owner <worker>, and for --job the
     // PM is the return address and the worker the assignee.
@@ -705,6 +793,7 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
         endpoint_kind,
         cwd_override,
         body,
+        context_active,
     })
 }
 
@@ -1001,6 +1090,8 @@ fn duplicate(
     started: &Value,
     show_now: &Value,
     items: &[AcceptanceItem],
+    next_body: Option<&str>,
+    context_active: bool,
     out: &mut Value,
 ) -> Result<bool> {
     let mut live: Option<Value> = None;
@@ -1068,6 +1159,40 @@ fn duplicate(
         return Ok(true);
     }
     if let Some(msg) = reported {
+        // An opted-in task's changed kickoff body is an explicit revision, not
+        // a duplicate. History is preserved: the old message and its ref stay,
+        // and the new kickoff is added beside them. A live duplicate above
+        // still suppresses, so an in-flight task is never silently retargeted,
+        // and a non-opted project keeps the legacy reported-duplicate outcome
+        // even when `--summary` changes the body.
+        if let Some(next) = next_body {
+            let same = msg["body"].as_str().is_some_and(|previous| {
+                previous == next
+                    || previous
+                        .strip_prefix(next)
+                        .is_some_and(|suffix| suffix.starts_with(" Lessons:"))
+            });
+            if context_active && !same {
+                out["revised"] = json!(true);
+                out["previous_message"] = msg["id"].clone();
+                let _ = write::add_comment(
+                    pm,
+                    id,
+                    &format!(
+                        "Revised dispatch to {}: kickoff {} already reported a \
+                         different task revision; a new kickoff is dispatched and \
+                         the earlier message/ref stay as history.",
+                        args.to,
+                        msg["id"].as_str().unwrap_or_default(),
+                    ),
+                    None,
+                    Some("dispatch"),
+                    None,
+                    actor,
+                );
+                return Ok(false);
+            }
+        }
         // The kickoff's own report sha against the lane's head now —
         // equal is the cleanest late duplicate; either way the issue
         // was reported by this worker in this lane, so nothing
@@ -1141,6 +1266,7 @@ pub fn run(
         endpoint_kind,
         cwd_override,
         body,
+        context_active,
     } = preflight(pm, id, args, state_dir)?;
     let agent = &show["agent"];
     let start_args = start::StartArgs {
@@ -1218,7 +1344,18 @@ pub fn run(
     let show_now = client::rpc(state_dir, "agent_show", json!({"alias": args.to}))
         .unwrap_or_else(|_| show.clone());
     if duplicate(
-        pm, id, args, actor, state_dir, &front, &started, &show_now, &items, &mut out,
+        pm,
+        id,
+        args,
+        actor,
+        state_dir,
+        &front,
+        &started,
+        &show_now,
+        &items,
+        body.as_deref(),
+        context_active,
+        &mut out,
     )? {
         return Ok(out);
     }
