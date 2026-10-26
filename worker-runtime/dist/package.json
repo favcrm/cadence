@@ -1,0 +1,19 @@
+{
+  "name": "@cadence/hosted-runtime",
+  "version": "0.1.0",
+  "description": "Provider-neutral hosted agent conversation runtime behind one Durable Object.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./runtime.mjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./runtime.mjs"
+    },
+    "./testing": {
+      "types": "./testing.d.ts",
+      "import": "./testing.mjs"
+    }
+  }
+}

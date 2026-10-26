@@ -1,0 +1,68 @@
+import type { AgentEvent, AgentEventStream } from "@earendil-works/pi-durable";
+
+type Emit = (frame: string) => void;
+
+/**
+ * Both wire formats own the same watch lifecycle and cancellation rules.
+ *
+ * The returned body closes when the engine retires the watch (so a browser
+ * reconnects to a fresh snapshot), fails when the watch reports a failure, and
+ * stops the subscription when the client cancels.
+ */
+export function sessionEventResponse(
+  watch: Pick<AgentEventStream, "start" | "stop" | "closed">,
+  format: {
+    snapshot: (emit: Emit) => void;
+    events: (events: readonly AgentEvent[], emit: Emit) => Promise<void>;
+  },
+): Response {
+  const encoder = new TextEncoder();
+  let closed = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const emit: Emit = (frame) => {
+        if (!closed) controller.enqueue(encoder.encode(frame));
+      };
+      const fail = (error: unknown) => {
+        if (!closed) {
+          closed = true;
+          controller.error(error);
+        }
+      };
+      // Observe termination before attaching the consumer, including a watch
+      // that was already closed when its snapshot was obtained.
+      void watch.closed.then((end) => {
+        if (
+          end.reason === "session_failed" ||
+          end.reason === "listener_error"
+        ) {
+          fail(end.error);
+          return;
+        }
+        if (!closed) {
+          closed = true;
+          controller.close();
+        }
+      }, fail);
+      try {
+        format.snapshot(emit);
+        watch.start(async (events) => {
+          if (!closed) await format.events(events, emit);
+        });
+      } catch (error) {
+        fail(error);
+        void watch.stop();
+      }
+    },
+    async cancel() {
+      closed = true;
+      await watch.stop();
+    },
+  });
+  return new Response(body, {
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-store",
+    },
+  });
+}
