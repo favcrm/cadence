@@ -24,6 +24,9 @@ use crate::worktree::{self, layout};
 /// Optional M3 job creation: `--job --pm <alias> --spec <file>
 /// [--assignee <alias>]`.
 pub struct JobArgs {
+    /// Native client key when dispatch has proved an existing draft binding.
+    /// `None` creates a fresh job through the unchanged one-open-job guard.
+    pub id: Option<String>,
     pub pm: String,
     pub spec: PathBuf,
     pub assignee: Option<String>,
@@ -1340,7 +1343,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         let created_job = client::rpc(
             &state_dir,
             "job_new",
-            json!({"pm": job.pm, "spec": spec, "spec_sha256": spec_sha256,
+            json!({"job": job.id, "pm": job.pm, "spec": spec, "spec_sha256": spec_sha256,
                    "title": front.title, "issue": front.id,
                    "repo": root, "base_ref": lane_base_sha,
                    "task_worktree": wt_name, "task_branch": branch,

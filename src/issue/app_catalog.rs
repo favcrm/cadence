@@ -3,7 +3,7 @@
 pub mod builtin;
 pub(crate) mod catalogue;
 pub(crate) mod client;
-mod fs;
+pub(super) mod fs;
 pub mod workspace;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

@@ -294,6 +294,7 @@ pub(super) fn kickoff_body(
         message_id,
         &assignee.provider,
         &assignee.endpoint_kind,
+        false,
     )
 }
 
@@ -308,6 +309,9 @@ const KNOWLEDGE_POINTER: &str = " Company questions: read the \"Business knowled
 /// `endpoint_kind`. Public so `cadence dispatch --job` can build the
 /// same text before `issue start` and refuse a list that will not fit
 /// (CAD-160) instead of leaving a worktree and job behind.
+/// When `contract_in_context` is true, the complete captured spec and
+/// acceptance are already mandatory context; the envelope keeps scope and the
+/// report obligation without copying those source bodies.
 pub fn job_kickoff(
     job: &Job,
     task: &Task,
@@ -315,8 +319,9 @@ pub fn job_kickoff(
     message_id: &str,
     provider: &str,
     endpoint_kind: &str,
+    contract_in_context: bool,
 ) -> Result<String> {
-    if cloud_session(provider, endpoint_kind) {
+    if !contract_in_context && cloud_session(provider, endpoint_kind) {
         let ceiling = if provider == "sandbox" && endpoint_kind == "sandbox" {
             crate::adapter::sandbox::SANDBOX_SPEC_BYTES
         } else {
@@ -348,11 +353,14 @@ pub fn job_kickoff(
             scope += " Do the work inside that worktree (cd there first).";
         }
     }
-    let acceptance = task
-        .acceptance
-        .as_deref()
-        .map(|a| format!(" Acceptance: {}.", clean(a)))
-        .unwrap_or_default();
+    let acceptance = if contract_in_context {
+        String::new()
+    } else {
+        task.acceptance
+            .as_deref()
+            .map(|a| format!(" Acceptance: {}.", clean(a)))
+            .unwrap_or_default()
+    };
     let issue = job
         .issue_id
         .as_deref()
@@ -382,13 +390,20 @@ pub fn job_kickoff(
              HEAD)\"` — `cadence self` shows the turn_id."
         )
     };
-    let head = format!(
-        "Cadence task {} (job {}, revision {}): implement per spec at {}.",
-        task.id,
-        job.id,
-        revision,
-        clean(spec)
-    );
+    let head = if contract_in_context {
+        format!(
+            "Cadence task {} (job {}, revision {}): implement the complete task contract supplied in context.",
+            task.id, job.id, revision
+        )
+    } else {
+        format!(
+            "Cadence task {} (job {}, revision {}): implement per spec at {}.",
+            task.id,
+            job.id,
+            revision,
+            clean(spec)
+        )
+    };
     // Explicit envelopes end with the per-message correlation: the
     // screen probe slices the body's tail, and without it every
     // kickoff shares the same boilerplate ending. Managed envelopes
@@ -491,6 +506,7 @@ mod cad1373_kickoff_pointer_tests {
             "m1",
             "sandbox",
             "sandbox",
+            false,
         )
         .unwrap();
         assert!(body.contains("Do the sandbox task."), "{body}");

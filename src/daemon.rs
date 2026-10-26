@@ -2028,7 +2028,36 @@ impl Shared {
         // conversation switch, which opens a new provider session and
         // rewrites thread_id/generation in the store.
         let current = self.store.agent(&agent.alias)?;
-        let expected_task = message.issue.as_deref();
+        // CAD-1846: which native task identity this exact message carries.
+        // Derived only from immutable message provenance — never from the
+        // task's current assignee, which a native reassignment can change
+        // while an ad-hoc follow-up is already queued.
+        let expected_task = match message.task_id.as_deref() {
+            // Native `job_dispatch` kickoff: the message itself owns the
+            // task identity its pin and report contract are pinned to.
+            Some(task) if message.source == "job_dispatch" => Some(task),
+            // Passive internal deliveries ABOUT a task never become the
+            // recipient's assignment: routed worker_result/worker_notice/
+            // job_event, assist job events, and the daemon effect outcome.
+            // Their sources are reserved at enqueue: caller sources reject
+            // `_` (proto::identifier) and the daemon source set — which
+            // includes `effect` — is refused for non-daemon enqueues
+            // (proto::caller_message), so a caller cannot forge them.
+            Some(_)
+                if message.is_routed()
+                    || message.source == "assist_job_event"
+                    || message.source == "effect" =>
+            {
+                message.issue.as_deref()
+            }
+            // Every other explicit task tag is a caller-composed ad-hoc
+            // execution follow-up under any allowed caller source tag. Its
+            // queued intent is immutable, so it stays task-scoped even after
+            // the task is reassigned.
+            Some(task) => Some(task),
+            // No task tag: existing issue/followup identity.
+            None => message.issue.as_deref(),
+        };
         // A task-bound kickoff's own pin proves opt-in. Its delivery shares
         // the alias's native home conversation, so the enqueue note, provider
         // compaction notes and this receipt all name one real thread id
@@ -2075,13 +2104,46 @@ impl Shared {
         }
         let pin_message = match expected_task {
             Some(_) if task_pin.is_some() => message.id.clone(),
-            Some(task) => match activation
-                .as_ref()
-                .filter(|activation| activation.get("task").and_then(Value::as_str) == Some(task))
-                .and_then(|activation| activation.get("pin").and_then(Value::as_str))
-            {
-                Some(pin) => pin.to_string(),
+            Some(task) => match activation.as_ref() {
+                // Nothing is bound in this conversation: an ad-hoc task
+                // message has no pin to restore and adopts nothing.
                 None => return Ok(None),
+                Some(active) => {
+                    let active_task = active.get("task").and_then(Value::as_str);
+                    let active_pin = active.get("pin").and_then(Value::as_str);
+                    // A different task's binding must never be adopted for
+                    // this message, and silently dropping the requirement is
+                    // just as wrong: fail closed before activation/supply.
+                    if active_task != Some(task) {
+                        return Err(self.context_refusal(
+                            &agent.alias,
+                            message,
+                            crate::context_pack::Refusal::ScopeConflict {
+                                detail: format!(
+                                    "the conversation's active task binding belongs to task \
+                                     '{}' (pin {}), not the message's task '{task}'",
+                                    active_task.unwrap_or("unknown"),
+                                    active_pin.unwrap_or("unavailable")
+                                ),
+                            },
+                        ));
+                    }
+                    match active_pin {
+                        Some(pin) => pin.to_string(),
+                        None => {
+                            return Err(self.context_refusal(
+                                &agent.alias,
+                                message,
+                                crate::context_pack::Refusal::MissingRequiredSource {
+                                    id: "active-task-pin".to_string(),
+                                    state: "unavailable".to_string(),
+                                    reason: "the active task's durable pin is unavailable"
+                                        .to_string(),
+                                },
+                            ))
+                        }
+                    }
+                }
             },
             None => match activation
                 .as_ref()
@@ -2115,10 +2177,39 @@ impl Shared {
                 &agent.alias,
                 message,
                 crate::context_pack::Refusal::ScopeConflict {
-                    detail: "the pinned manifest is malformed".to_string(),
+                    detail: "the pinned manifest is malformed or predates complete task contracts; reconcile outstanding work, then explicitly reassign the task".to_string(),
                 },
             ));
         };
+        // The pin record and its manifest must name the same task and parent
+        // issue; a disagreement is corruption, never a contract to guess.
+        if pin.get("task").and_then(Value::as_str) != Some(manifest.task.task.as_str())
+            || pin.get("issue").and_then(Value::as_str) != Some(manifest.task.issue.as_str())
+        {
+            return Err(self.context_refusal(
+                &agent.alias,
+                message,
+                crate::context_pack::Refusal::ScopeConflict {
+                    detail: "the pinned task/issue identity disagrees with its manifest"
+                        .to_string(),
+                },
+            ));
+        }
+        if let Some(issue) = message.issue.as_deref() {
+            if manifest.task.issue != issue {
+                return Err(self.context_refusal(
+                    &agent.alias,
+                    message,
+                    crate::context_pack::Refusal::ScopeConflict {
+                        detail: format!(
+                            "pin {pin_message} belongs to parent issue '{}', not the \
+                             message's issue '{issue}'",
+                            manifest.task.issue
+                        ),
+                    },
+                ));
+            }
+        }
         if let Some(task) = expected_task {
             if manifest.task.task != task {
                 return Err(self.context_refusal(
@@ -2165,7 +2256,7 @@ impl Shared {
             });
         let pm = self.pm()?;
         let (project, _) =
-            crate::issue::write::issue_dir(&pm, &manifest.task.task).map_err(|_| {
+            crate::issue::write::issue_dir(&pm, &manifest.task.issue).map_err(|_| {
                 self.context_refusal(
                     &agent.alias,
                     message,

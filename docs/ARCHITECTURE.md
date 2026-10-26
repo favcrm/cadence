@@ -88,7 +88,7 @@ Resource admission and provider quota are also different. A free build slot does
 not prove provider allowance, and attaching/detaching a terminal does not prove
 its provider process ended. Reclamation must prove ownership at action time.
 
-### Task context delivery (CAD-1822)
+### Task context delivery (CAD-1822, CAD-1846)
 
 A project opts in by setting `agent_delivery: true` in its tracked
 `docs/cadence/project-context.yaml` at HEAD; absent or false leaves every
@@ -96,16 +96,23 @@ existing dispatch path unchanged. A manifest the daemon cannot read or parse
 cannot prove the opt-in, so delivery stays off; once `agent_delivery: true` is
 parsed, an invalid manifest, a missing required source or an over-cap payload
 refuses. An
-opted-in issue-bound managed dispatch pins one deterministic task manifest
-(`src/context_pack.rs`) before the kickoff becomes claimable: the issue id,
-SHA-256 of the issue source, complete acceptance, the assigned project's HEAD
-and each selected tracked document's path/revision/digest/bytes, plus the
-selection role and explicit gaps. Selection reuses the bounded project-context
-reader and its documentation allowlist (`src/issue/context.rs`) against the
-project's declared repository — never a client-supplied path or revision.
-`gate_issue` and native `dispatch_send` derive the title, acceptance and task
-revision from one captured issue-source snapshot; `context_guard` never rereads
-the issue to relabel already-selected criteria after a concurrent tracker edit.
+opted-in issue-bound managed dispatch pins one deterministic schema-2 task
+manifest (`src/context_pack.rs`) before the kickoff becomes claimable.
+Plain issue dispatch, explicit issue `--job` and native issue-linked task
+dispatch share project-document and current-policy eligible-lesson selection.
+The contract contains canonical issue prose, complete criteria, distinct
+parent issue/task identities, and the job's full effective spec and native
+execution/report contract where applicable. Tracker frontmatter and comments
+are not task prose; criteria and spec are not repeated in the kickoff.
+Plain revisions hash the one captured issue source; job composite revisions
+also cover the effective spec, task criteria and execution contract.
+`context_guard` never rereads the issue to relabel already-selected criteria.
+Selection reuses the bounded documentation allowlist (`src/issue/context.rs`)
+against the assigned project's declared repository at HEAD, never a
+client-supplied project or revision. Job specs are separately restricted to
+the canonical issue directory, its real task worktree or a tracked regular
+file in that declared repository. Descriptor-relative bounded reads reject
+escapes; a spec's working-byte digest is not Git verification.
 An opted-in manifest always requires a prompt-capable endpoint, even when no
 document body is selected: the canonical task contract is still mandatory.
 
@@ -145,8 +152,8 @@ Known local adapter-added prompt material is reserved in the same cap — the
 44-byte guarded Pi-adapter task prefix for every registry-defined Pi-family
 provider, even while the guard is off (readiness can change). This is a local byte
 reservation, not provider-window accounting; the receipt carries
-`adapter_reserved_bytes`, never as appended source. Only an opted-in project's
-changed kickoff body supersedes a reported duplicate.
+`adapter_reserved_bytes`, never as appended source. Only an opted-in plain
+issue's changed kickoff body supersedes a reported plain duplicate.
 Pre-turn delivery
 (`src/daemon.rs`, `src/daemon/actor.rs`) appends the full payload when the
 provider session is new, lost or compacted, and appends nothing when the same
@@ -163,6 +170,27 @@ residency. Required-source failure, an unusable manifest and a combined payload
 over the local 48 000-byte cap refuse before provider submission; a required
 document over the reader's 64 KiB cap refuses rather than being truncated.
 Source text is quoted data, never instruction or authorization.
+
+Job admission plans capture the full task/job/worker preimage outside the
+write transaction. Inside the existing manual/automatic admission guards,
+the store rechecks that preimage before atomically writing the message, its
+pin/disabled selection and the task revision. Accepted retries return their
+original binding without source I/O. CLI preflight separates plain and job
+kickoffs before lane/job creation, proves a unique open job's canonical task,
+and only reuses an undispatched draft whose material scope matches.
+An explicit task-bound follow-up must match its own pin or active binding,
+never an undispatched sibling's context. Passive routed results do not
+activate a reported task. Lost sessions restore the current complete
+contract, including native execution/report requirements; old incomplete
+pins are not relabeled as complete.
+
+Eligible lessons remain governed by current memory acceptance, scope and
+staleness rules. Their one bounded optional inline source records selected
+IDs and explicit gaps; it is omitted whole when it cannot fit, and
+`--no-lessons` selects none. This replaces, rather than duplicates, the
+opted-in path's legacy lesson sidecar. Neither inclusion nor a supply receipt
+claims source verification, business correctness or billed savings.
+
 
 ### Bounded workflow preauthorization
 

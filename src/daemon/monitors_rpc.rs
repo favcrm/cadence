@@ -175,6 +175,24 @@ impl Shared {
             .unwrap_or_else(|e| e.into_inner());
         if automatic {
             self.plan_gate_task(task_id)?;
+            // CAD-1846: capture the exact planned worker/revision/message and
+            // prepare the issue-linked job context outside the write
+            // transaction. The monitor's own coverage/readiness/quota/queue
+            // gates stay in the store's admission transaction, unchanged.
+            let plan = self.store.plan_task_dispatch(task_id, None, None)?;
+            if matches!(plan.task.state.as_str(), "dispatched" | "running") && !plan.duplicate {
+                return Err(Error::rejected(format!(
+                    "Task '{task_id}' has no live kickoff — only draft or revising \
+                     tasks are eligible"
+                )));
+            }
+            // An accepted live kickoff keeps its original selection and never
+            // recaptures moved sources; a fresh kickoff prepares them here.
+            let delivery = if plan.duplicate {
+                None
+            } else {
+                Some(self.prepare_job_delivery(&plan, false)?)
+            };
             // Hold the pending-request mutex across the store transaction.
             // The snapshot contains every alias, while the transaction
             // re-reads the task's current assignee before applying it, so an
@@ -185,11 +203,13 @@ impl Shared {
                 .map(|request| request.alias.clone())
                 .collect();
             let (task, message, duplicate, behind_dead) =
-                self.store.dispatch_automatic_monitor_task(
+                self.store.dispatch_automatic_monitor_task_planned(
                     monitor_id,
-                    task_id,
+                    &plan,
+                    delivery,
                     &pending_aliases,
                     &format!("monitor:{monitor_id}"),
+                    None,
                 )?;
             drop(pending);
             let assignee = task.assignee.clone().ok_or_else(|| {
@@ -348,9 +368,19 @@ impl Shared {
                 "Assignee '{assignee}' already has unfinished task work"
             )));
         }
-        let (task, message, duplicate, behind_dead) =
-            self.store
-                .dispatch_task(task_id, None, None, &format!("monitor:{monitor_id}"))?;
+        // CAD-1846: the same planned preparation and admission as an explicit
+        // `task dispatch`, with the monitor's pre-transaction readiness gates
+        // above intact. The store re-fences the task, job and exact worker;
+        // an accepted live kickoff could not reach here (it returned above).
+        let plan = self.store.plan_task_dispatch(task_id, None, None)?;
+        let delivery = Some(self.prepare_job_delivery(&plan, false)?);
+        let (task, message, duplicate, behind_dead) = self.store.dispatch_task_planned(
+            &plan,
+            delivery,
+            &format!("monitor:{monitor_id}"),
+            None,
+            None,
+        )?;
         self.store.resolve_monitor_dispatch_blocked(
             monitor_id,
             task_id,

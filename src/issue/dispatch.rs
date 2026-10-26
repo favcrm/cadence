@@ -285,31 +285,57 @@ fn plain_kickoff(
     )))
 }
 
-/// CAD-160: a `--job` dispatch whose kickoff cannot carry its
-/// acceptance items whole is refused before `issue start` creates a
-/// worktree, branch or job. The check builds the kickoff `job dispatch`
-/// will send — same spec path, scope, criteria and report contract, for
-/// the assignee's own endpoint and ceiling (48000 for a Devin cloud
-/// session) — with placeholders the length of what the daemon mints
-/// (`job-` + 8 hex, a 32-hex message id). `agent` is the assignee's
-/// `agent_show` row.
-fn check_job_kickoff(
+/// The plain kickoff with every acceptance item appended, checked against
+/// the pty rules. Built by the caller for the legacy opt-out path, or by
+/// the context guard's lazy factory for an opted-in one — never both.
+#[allow(clippy::too_many_arguments)]
+fn plain_body(
+    front: &Front,
+    summary: &str,
+    note: &Path,
+    wt_dir: &Path,
+    branch: &str,
+    base_sha: &str,
+    reply_to: &str,
+    items: &[AcceptanceItem],
+    provider: &str,
+    endpoint_kind: &str,
+) -> Result<String> {
+    let body = plain_kickoff(
+        &front.id,
+        summary,
+        note,
+        wt_dir,
+        branch,
+        base_sha,
+        reply_to,
+        items,
+        provider,
+        endpoint_kind,
+    )?;
+    check_body(&body, provider)?;
+    Ok(body)
+}
+
+/// The placeholder job/task `issue start --job` is about to create, with
+/// the exact spec path, scope, criteria and id lengths the daemon mints
+/// (`job-` + 8 hex, `-t1`, a 32-hex message id). Both the legacy kickoff
+/// size check and the pre-admission context guard use it.
+fn job_prototype(
     issue: &str,
     items: &[AcceptanceItem],
     spec: &Path,
     wt_name: &str,
     branch: &str,
     base_sha: &str,
-    agent: &Value,
-) -> Result<()> {
+) -> (store::Job, store::Task) {
     // `issue start --job` records the canonical spec path on the job.
     let spec = spec.canonicalize().unwrap_or_else(|_| spec.to_path_buf());
-    let spec = spec.to_string_lossy().into_owned();
     let job_id = "job-00000000";
     let job = store::Job {
         id: job_id.to_string(),
         title: None,
-        spec_path: spec.clone(),
+        spec_path: spec.to_string_lossy().into_owned(),
         spec_sha256: None,
         pm_alias: String::new(),
         issue_id: Some(issue.to_string()),
@@ -341,18 +367,42 @@ fn check_job_kickoff(
         created: 0.0,
         updated: 0.0,
     };
+    (job, task)
+}
+
+/// CAD-160: a `--job` dispatch whose kickoff cannot carry its
+/// acceptance items whole is refused before `issue start` creates a
+/// worktree, branch or job. The check builds the legacy kickoff `job
+/// dispatch` will send — same spec path, scope, criteria and report
+/// contract, for the assignee's own endpoint and ceiling (48000 for a
+/// Devin cloud session) — with placeholders the length of what the daemon
+/// mints. `agent` is the assignee's `agent_show` row. An opted-in
+/// kickoff's exact body and combined cap are checked by [`job_context`]
+/// instead.
+fn check_job_kickoff(
+    issue: &str,
+    items: &[AcceptanceItem],
+    spec: &Path,
+    wt_name: &str,
+    branch: &str,
+    base_sha: &str,
+    agent: &Value,
+) -> Result<()> {
+    let (job, task) = job_prototype(issue, items, spec, wt_name, branch, base_sha);
     let provider = agent["provider"].as_str().unwrap_or_default();
     let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
-    let Err(_) = store::job_kickoff(&job, &task, 1, &"0".repeat(32), provider, kind) else {
+    // Legacy preview: no pinned context, so the acceptance rides the body.
+    let Err(_) = store::job_kickoff(&job, &task, 1, &"0".repeat(32), provider, kind, false) else {
         return Ok(());
     };
     Err(Error::rejected(format!(
         "{issue}'s acceptance criteria ({} bytes) do not fit the {}-char kickoff ceiling \
          beside its fixed fields — criteria are never truncated or dropped (CAD-160). \
          Shorten them (`cadence issue acceptance {issue} --from <file>`) and keep the \
-         detail in the spec file {spec}. Nothing was created or queued.",
+         detail in the spec file {}. Nothing was created or queued.",
         acceptance_listing(items).unwrap_or_default().len(),
         store::kickoff_ceiling(provider, kind),
+        job.spec_path,
     )))
 }
 
@@ -458,6 +508,48 @@ fn lane_head(worktree: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Lesson facts the pinned context carries, read back from the manifest it
+/// produced. The legacy `<message>-lessons.md` sidecar is not written when
+/// context is active, so the dispatch comment and its JSON report the same
+/// selection from the pinned record instead of a second memory match.
+struct ContextFacts {
+    lessons: Vec<String>,
+    lessons_withheld: Vec<(String, String)>,
+    lessons_error: Option<String>,
+}
+
+impl ContextFacts {
+    fn from_manifest(manifest: &crate::context_pack::Manifest) -> Self {
+        let mut lessons = Vec::new();
+        for document in &manifest.documents {
+            if document.kind == LESSON_KIND {
+                lessons.extend(document.lesson_ids.iter().cloned());
+            }
+        }
+        let mut lessons_withheld = Vec::new();
+        let mut lessons_error = None;
+        for gap in &manifest.withheld {
+            if gap.path != LESSON_PATH {
+                continue;
+            }
+            // Each lesson gap is already one bounded aggregate fact, so it is
+            // reported as written; re-wrapping it would only duplicate text.
+            match gap.state.as_str() {
+                "withheld" => {
+                    lessons_withheld.push((gap.id.clone(), gap.reason.clone()));
+                }
+                "unreadable" | "unavailable" => lessons_error = Some(gap.reason.clone()),
+                _ => {}
+            }
+        }
+        ContextFacts {
+            lessons,
+            lessons_withheld,
+            lessons_error,
+        }
+    }
+}
+
 /// `dispatch <ISSUE> --to <worker> --note <path> [--job --spec f]`.
 ///
 /// `dispatch_pm`: `Some(alias)` when the daemon itself dispatches
@@ -483,15 +575,26 @@ struct Preflight {
     body: Option<String>,
     /// CAD-1822: this plain dispatch's assigned project is opted in to task
     /// context delivery. Only then may a changed kickoff body supersede a
-    /// reported duplicate; `--job` and non-opted projects keep the legacy
-    /// duplicate behavior.
+    /// reported duplicate; non-opted projects keep the legacy duplicate
+    /// behavior.
     context_active: bool,
+    /// CAD-1846: the lesson facts the pinned context carries for the plain
+    /// kickoff. Present exactly when this dispatch's own plain context was
+    /// prepared, so the legacy lesson sidecar is skipped instead of injected
+    /// twice; a `--job` kickoff carries its selection in the task pin.
+    context_lessons: Option<ContextFacts>,
+    /// CAD-1846: the issue's open native job whose default task was created
+    /// but never accepted, verified against every material scope/spec input.
+    /// `start` reuses this binding instead of minting another job; the store's
+    /// own idempotency and one-open-job guard still decide.
+    reuse_job: Option<String>,
 }
 
 /// The one pre-dispatch gate every caller shares: resolve the issue, read
 /// it, require acceptance when the caller does, and apply the plan gate.
 /// Authority, claim and target checks stay with the caller — this only
 /// removes the duplicated load/acceptance/plan sequence.
+#[derive(Clone)]
 pub(crate) struct GatedIssue {
     pub project: crate::issue::project::Project,
     pub dir: PathBuf,
@@ -499,27 +602,110 @@ pub(crate) struct GatedIssue {
     pub items: Vec<AcceptanceItem>,
     /// Exact source from which `front` and `items` were parsed.
     pub source: String,
+    /// Complete canonical prose from that same parse, without criteria copies.
+    pub request: String,
 }
 
-pub(crate) fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<GatedIssue> {
-    let (project, dir) = write::issue_dir(pm, id)?;
-    let source = std::fs::read_to_string(dir.join("issue.md"))?;
-    let (front, body) = parse::parse_issue(&source)?;
-    let items = parse::acceptance_items(&body);
-    if require_acceptance && items.is_empty() {
-        return Err(Error::rejected(format!(
-            "{id} has no acceptance criteria — add them with \
-             `cadence issue acceptance {id} --from <file>` before kickoff"
-        )));
+/// One issue read: the project and folder that hold it, its frontmatter, its
+/// complete body and the exact `issue.md` source. Callers apply their own
+/// policy to this one snapshot, so a gate and a context capture never
+/// disagree about what the issue said.
+struct IssueSnapshot {
+    project: crate::issue::project::Project,
+    dir: PathBuf,
+    front: Front,
+    body: String,
+    source: String,
+}
+
+impl IssueSnapshot {
+    /// The same lookup rule as `write::issue_dir`: `None` only when no
+    /// project holds a real folder with a real `issue.md` for `id`. A
+    /// tracker that cannot be listed, or a held issue that cannot be read or
+    /// parsed, is an error — never "not ours".
+    fn read(pm: &Pm, id: &str) -> Result<Option<Self>> {
+        crate::issue::model::check_id(id)?;
+        for project in crate::issue::project::list(&pm.dir)? {
+            let dir = pm.dir.join(&project.key).join(id);
+            if !board::is_real_dir(&dir) || !board::is_real_file(&dir.join("issue.md")) {
+                continue;
+            }
+            let source = std::fs::read_to_string(dir.join("issue.md"))?;
+            let (front, body) = parse::parse_issue(&source)?;
+            return Ok(Some(IssueSnapshot {
+                project,
+                dir,
+                front,
+                body,
+                source,
+            }));
+        }
+        Ok(None)
     }
-    crate::issue::plan::gate(&pm.dir, &front, &body)?;
-    Ok(GatedIssue {
-        project,
-        dir,
-        front,
-        items,
-        source,
-    })
+
+    /// The dispatch snapshot from this one read. `gate` adds the plain
+    /// dispatch plan policy; `require_acceptance` adds the plain kickoff's
+    /// acceptance requirement. A context capture opts out of both.
+    fn into_gated(
+        self,
+        pm_dir: &Path,
+        id: &str,
+        gate: bool,
+        require_acceptance: bool,
+    ) -> Result<GatedIssue> {
+        let IssueSnapshot {
+            project,
+            dir,
+            front,
+            body,
+            source,
+        } = self;
+        if gate {
+            crate::issue::plan::gate(pm_dir, &front, &body)?;
+        }
+        let (request, items) = parse::task_request(body);
+        if require_acceptance && items.is_empty() {
+            return Err(Error::rejected(format!(
+                "{id} has no acceptance criteria — add them with \
+                 `cadence issue acceptance {id} --from <file>` before kickoff"
+            )));
+        }
+        Ok(GatedIssue {
+            project,
+            dir,
+            front,
+            items,
+            source,
+            request,
+        })
+    }
+}
+
+/// CAD-1846: the one-read parent capture a native job's context needs, with
+/// no plain-dispatch policy of its own. `None` means no project holds an
+/// issue of that id — a job may legitimately name one (`plan_gate_task`
+/// allows it: jobs need not name a tracker issue), and such a job keeps its
+/// legacy kickoff instead of gaining a new refusal merely because context
+/// capture was attempted. A held issue that cannot be read, and a tracker
+/// that cannot be listed, still fail closed.
+pub(crate) fn capture_issue(pm: &Pm, id: &str) -> Result<Option<GatedIssue>> {
+    let Some(snapshot) = IssueSnapshot::read(pm, id)? else {
+        return Ok(None);
+    };
+    snapshot.into_gated(&pm.dir, id, false, false).map(Some)
+}
+
+/// The one plain pre-dispatch gate every caller shares: resolve the issue,
+/// read it, apply the plan gate and require acceptance when the caller does.
+/// Authority, claim and target checks stay with the caller — this only
+/// removes the duplicated load/acceptance/plan sequence.
+pub(crate) fn gate_issue(pm: &Pm, id: &str, require_acceptance: bool) -> Result<GatedIssue> {
+    let Some(snapshot) = IssueSnapshot::read(pm, id)? else {
+        return Err(Error::rejected(format!(
+            "Unknown issue '{id}' — `cadence issue ls` lists what exists"
+        )));
+    };
+    snapshot.into_gated(&pm.dir, id, true, require_acceptance)
 }
 
 /// The worker-only checks every dispatch runs before it creates a lane:
@@ -577,44 +763,189 @@ pub(crate) fn check_seat(
     })
 }
 
-/// CAD-1822: pin and validate the assigned project's task context before a
-/// kickoff exists. Shared by [`preflight`] (CLI and `issue_kickoff` HTTP/RPC,
-/// before any lane is created) and the daemon's `dispatch_send` (the last gate
-/// before enqueue). Returns the manifest the send must record, or `None` when
-/// the project does not participate in context delivery.
-///
-/// Selection is daemon-side: the issue's own project, its declared local
-/// repository and its tracked manifest at HEAD. No request field can name a
-/// source, revision or path. A required source that cannot be read, an
-/// unusable manifest, a combined mandatory payload over the local cap and a
-/// non-managed endpoint that cannot receive required prompt context all refuse
-/// with [`crate::context_pack::Refusal`] before anything is created.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn context_guard(
+/// The runtime facts that pick a task's context role and delivery
+/// envelope. They come from the actual assigned worker row, never from a
+/// request field, a project default or a guessed model.
+pub(crate) struct ContextTarget<'a> {
+    pub team_role: Option<&'a str>,
+    pub provider: &'a str,
+    pub endpoint_kind: &'a str,
+}
+
+/// A validated opted-in task context: the manifest the admission
+/// transaction must pin, and the exact body that turn delivers.
+pub(crate) struct PreparedContext<'a> {
+    pub manifest: crate::context_pack::Manifest,
+    pub body: std::borrow::Cow<'a, str>,
+}
+
+/// One job task's dispatch snapshot: the store-captured rows, the
+/// proposed dispatch revision and message id, the actual assignee's
+/// runtime facts and — for a native admission — the caller's proof of the
+/// issue lane the job actually holds.
+pub(crate) struct JobContext<'a> {
+    pub job: &'a store::Job,
+    pub task: &'a store::Task,
+    pub revision: i64,
+    pub message: &'a str,
+    pub target: ContextTarget<'a>,
+    /// The native caller's scope proof for `(project, front)`: the exact
+    /// issue lane, the job's declared repo and the task's lane must agree
+    /// before any spec byte enters the contract. `None` is a preview (the
+    /// preflight of a dispatch whose lane does not exist yet) and is never
+    /// an admission; no fake proof stands in for it.
+    pub admission_scope: Option<AdmissionScope<'a>>,
+}
+
+/// The native caller's issue-lane proof, run once inside the guard's lazy
+/// factory — after opt-in and endpoint confirmation, before any spec read.
+pub(crate) type AdmissionScope<'a> =
+    &'a dyn Fn(&crate::issue::project::Project, &Front) -> crate::error::Result<()>;
+
+/// Synthetic identity of the optional lesson source and its aggregate gap
+/// facts. Nothing is read from this path: it names the source family in a
+/// manifest/receipt and keeps lesson gaps distinguishable from repository
+/// documents. Provenance is deliberately one fact per category — a count and
+/// a representative reason — so a large memory pool can never turn optional
+/// metadata into a mandatory-overflow refusal.
+const LESSON_SOURCE_ID: &str = "native:lessons";
+const LESSON_KIND: &str = "lessons";
+const LESSON_PATH: &str = "memory://accepted-lessons";
+const LESSON_WITHHELD_ID: &str = "native:lessons-withheld";
+const LESSON_LOAD_ID: &str = "native:lessons-load";
+const LESSON_OMITTED_ID: &str = "native:lessons-omitted";
+
+/// One aggregate lesson fact stays this small. A memory record's own text
+/// (for example a `stale:` note) is file-controlled, so it can never be
+/// copied whole into mandatory metadata: the optional lesson source carries
+/// the renderer-capped detail, and this fact names the count and a bounded
+/// reason.
+const LESSON_FACT_MAX: usize = 480;
+
+fn lesson_fact(text: &str) -> String {
+    if text.len() <= LESSON_FACT_MAX {
+        return text.to_string();
+    }
+    let mut end = LESSON_FACT_MAX;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+fn content_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Select the project-memory lessons current policy applies to this issue
+/// and the actual assignee's provider, exactly once. The rendered Markdown
+/// becomes one optional content-addressed source whose included IDs are the
+/// entries the renderer actually emitted; withheld, load-error and omitted
+/// counts stay visible as bounded aggregate facts. Eligibility, ranking,
+/// withholding and the render caps are the existing memory policy; nothing
+/// here re-verifies or re-renders.
+fn lesson_selection(
+    pm: &Pm,
     project: &crate::issue::project::Project,
-    source: &[u8],
     front: &Front,
-    items: &[AcceptanceItem],
-    team_role: Option<&str>,
     provider: &str,
-    endpoint_kind: &str,
-    body: &str,
-) -> Result<Option<crate::context_pack::Manifest>> {
-    let contract = crate::context_pack::TaskContract::new(&front.id, &front.title, source, items);
-    let (role, assigned) = crate::context_pack::selection_role(team_role);
-    let pinned = crate::issue::context::pin(project, Some(role));
+) -> crate::context_pack::LessonSelection {
+    let issue = board::Issue {
+        project: project.key.clone(),
+        dir: pm.dir.join(&project.key).join(&front.id),
+        front: front.clone(),
+        body: String::new(),
+        comments: vec![],
+        artifacts: vec![],
+    };
+    let gap = |id: &str, state: &str, reason: String| crate::context_pack::Gap {
+        id: id.to_string(),
+        path: LESSON_PATH.to_string(),
+        state: state.to_string(),
+        reason,
+        required: false,
+    };
+    let mut withheld = Vec::new();
+    let source = match memory::match_for_issue(pm, &issue, Some(provider)) {
+        Err(error) => {
+            withheld.push(gap(
+                LESSON_SOURCE_ID,
+                "unavailable",
+                lesson_fact(&format!("memory match failed: {error}")),
+            ));
+            None
+        }
+        Ok((matched, errors)) => {
+            if !matched.withheld.is_empty() {
+                // Count only, with a fixed reason: a stale note is memory-file
+                // text and must not inflate the mandatory payload. The full
+                // (renderer-capped) reasons ride the optional lesson source.
+                withheld.push(gap(
+                    LESSON_WITHHELD_ID,
+                    "withheld",
+                    format!(
+                        "{} in-scope lesson(s) withheld for stale evidence; \
+                         `cadence memory ls --stale` lists them",
+                        matched.withheld.len()
+                    ),
+                ));
+            }
+            if let Some(line) = memory::load_errors_line(&errors) {
+                withheld.push(gap(LESSON_LOAD_ID, "unreadable", lesson_fact(&line)));
+            }
+            let (text, slugs) = memory::render_lessons(&matched);
+            if text.is_empty() {
+                None
+            } else {
+                let omitted = matched.lessons.len().saturating_sub(slugs.len());
+                if omitted > 0 {
+                    withheld.push(gap(
+                        LESSON_OMITTED_ID,
+                        "overflow",
+                        format!("{omitted} matched lesson(s) omitted by the lesson injection cap"),
+                    ));
+                }
+                let digest = content_digest(text.as_bytes());
+                Some(crate::context_pack::Source {
+                    id: LESSON_SOURCE_ID.to_string(),
+                    kind: LESSON_KIND.to_string(),
+                    path: LESSON_PATH.to_string(),
+                    title: "Project lessons".to_string(),
+                    required: false,
+                    revision: digest.clone(),
+                    digest,
+                    bytes: text.len(),
+                    inline: Some(text),
+                    lesson_ids: slugs,
+                })
+            }
+        }
+    };
+    crate::context_pack::LessonSelection { source, withheld }
+}
+
+/// Build, validate and return the manifest a new kickoff's admission
+/// transaction will pin. `body` is the exact delivered text; the required
+/// sources and that body plus known adapter material must fit the combined
+/// cap before anything is admitted.
+#[allow(clippy::too_many_arguments)]
+fn admit_context<'a>(
+    project: &crate::issue::project::Project,
+    pinned: crate::issue::context::PinnedContext,
+    role: &str,
+    assigned: Option<&str>,
+    lessons: Option<crate::context_pack::LessonSelection>,
+    contract: crate::context_pack::TaskContract,
+    body: std::borrow::Cow<'a, str>,
+    provider: &str,
+) -> Result<Option<PreparedContext<'a>>> {
     let manifest =
-        crate::context_pack::build(contract, &project.key, &pinned, role, assigned.as_deref())
+        crate::context_pack::build(contract, &project.key, &pinned, role, assigned, lessons)
             .map_err(|refusal| refusal.error())?;
     let Some(manifest) = manifest else {
         return Ok(None);
     };
-    if !crate::continuity::endpoint_takes_packs(endpoint_kind) {
-        return Err(crate::context_pack::Refusal::UnsupportedEndpoint {
-            endpoint: endpoint_kind.to_string(),
-        }
-        .error());
-    }
     let root = crate::issue::context::repository_root(project).map_err(|(state, detail)| {
         crate::context_pack::Refusal::UnavailableProject { state, detail }.error()
     })?;
@@ -630,21 +961,1000 @@ pub(crate) fn context_guard(
         &manifest,
         None,
         false,
-        body,
+        body.as_ref(),
         crate::context_pack::adapter_reserved_bytes(provider),
         &mut reader,
     )
     .map_err(|refusal| refusal.error())?;
-    Ok(Some(manifest))
+    Ok(Some(PreparedContext { manifest, body }))
 }
 
-fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result<Preflight> {
+/// CAD-1822/CAD-1846: pin and validate a task's context for `target`
+/// before a kickoff exists. Shared by [`preflight`] (CLI and
+/// `issue_kickoff` HTTP/RPC, before any lane is created) and the daemon's
+/// `dispatch_send` (the last gate before enqueue).
+///
+/// The pin comes first: a project that does not participate returns
+/// `None` without calling `make`, so an opt-out dispatch builds no new
+/// contract and reads no new source. Selection is daemon-side — the
+/// issue's own project, its declared local repository and its tracked
+/// manifest at HEAD; no request field can name a source, revision or
+/// path. `make` supplies the complete contract and the exact body this
+/// turn delivers.
+///
+/// A required source that cannot be read, an unusable manifest, a
+/// combined mandatory payload over the local cap and a non-managed
+/// endpoint that cannot receive required prompt context all refuse with
+/// [`crate::context_pack::Refusal`] before anything is created.
+pub(crate) fn context_guard<'a>(
+    pm: &Pm,
+    project: &crate::issue::project::Project,
+    front: &Front,
+    target: ContextTarget<'_>,
+    no_lessons: bool,
+    make: impl FnOnce() -> Result<(crate::context_pack::TaskContract, std::borrow::Cow<'a, str>)>,
+) -> Result<Option<PreparedContext<'a>>> {
+    let (role, assigned) = crate::context_pack::selection_role(target.team_role);
+    let pinned = crate::issue::context::pin(project, Some(role));
+    if pinned.state == "unconfigured" {
+        return Ok(None);
+    }
+    if !crate::continuity::endpoint_takes_packs(target.endpoint_kind) {
+        return Err(crate::context_pack::Refusal::UnsupportedEndpoint {
+            endpoint: target.endpoint_kind.to_string(),
+        }
+        .error());
+    }
+    let lessons = (!no_lessons).then(|| lesson_selection(pm, project, front, target.provider));
+    let (contract, body) = make()?;
+    admit_context(
+        project,
+        pinned,
+        role,
+        assigned.as_deref(),
+        lessons,
+        contract,
+        body,
+        target.provider,
+    )
+}
+
+/// Does `lane`'s directory name belong to issue `id` under the layout
+/// (`<id-lower>-<slug>`)? A layout lane named for another issue is a foreign
+/// source even when it lives under the same declared repository.
+fn lane_of_issue(lane: &Path, issue_id: &str) -> bool {
+    lane.file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.starts_with(&crate::worktree::layout::issue_stem(issue_id)))
+}
+
+/// The canonical task lane a recorded `worktree` names: an exact layout lane
+/// (`<declared repo>/.cadence/wt/<name>`) of this issue, below a repository
+/// the project declares. A bare name is resolved under the declared repos; an
+/// ambiguous match is refused rather than guessed, and a path of any other
+/// shape is never an approved lane.
+fn task_spec_lane(declared: &[PathBuf], worktree: Option<&str>, issue_id: &str) -> Option<PathBuf> {
+    let worktree = worktree?;
+    let raw = Path::new(worktree);
+    if raw.is_absolute() {
+        let lane = raw.canonicalize().ok()?;
+        let root = crate::worktree::layout::root_of(&lane)?;
+        return (declared.contains(&root)
+            && lane.starts_with(crate::worktree::layout::worktrees_dir(&root))
+            && lane_of_issue(&lane, issue_id))
+        .then_some(lane);
+    }
+    let mut parts = raw.components();
+    match (parts.next(), parts.next()) {
+        (Some(std::path::Component::Normal(_)), None) => {}
+        _ => return None,
+    }
+    let mut found = declared.iter().filter_map(|root| {
+        let lane = crate::worktree::layout::worktree_dir(root, worktree)
+            .canonicalize()
+            .ok()?;
+        (crate::worktree::layout::root_of(&lane).as_ref() == Some(root)
+            && lane_of_issue(&lane, issue_id))
+        .then_some(lane)
+    });
+    let lane = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    Some(lane)
+}
+
+/// The base a relative *task override* resolves against: the task's own lane,
+/// or the declared repo root a cloud task records as its worktree. Never the
+/// daemon's working directory.
+fn task_spec_base(declared: &[PathBuf], worktree: Option<&str>, issue_id: &str) -> Option<PathBuf> {
+    if let Some(lane) = task_spec_lane(declared, worktree, issue_id) {
+        return Some(lane);
+    }
+    let raw = Path::new(worktree?);
+    if !raw.is_absolute() {
+        return None;
+    }
+    let base = raw.canonicalize().ok()?;
+    (base.is_dir() && declared.contains(&base)).then_some(base)
+}
+
+/// The base a relative *job* spec resolves against: the repository the job
+/// declares, else the project's single declared repository. Zero or several
+/// candidates is ambiguity, refused rather than guessed.
+fn default_spec_base(declared: &[PathBuf], job_repo: Option<&str>) -> Option<PathBuf> {
+    match job_repo {
+        Some(repo) => {
+            let repo = crate::issue::project::expand_home(repo);
+            let repo = repo.canonicalize().ok()?;
+            declared.iter().find(|root| **root == repo).cloned()
+        }
+        None => match declared {
+            [only] => Some(only.to_path_buf()),
+            _ => None,
+        },
+    }
+}
+
+/// Is `rel` a tracked regular blob at `root`'s HEAD? The bounded `ls-tree`
+/// proof the project-context reader uses, without its document allowlist: a
+/// task spec may be any tracked text file. This tests the server-derived
+/// repository, never the caller's path as a capability, and makes no claim
+/// that the working bytes match HEAD.
+fn tracked_at_head(root: &Path, rel: &Path) -> Result<bool> {
+    let path = rel.to_str().ok_or_else(|| {
+        Error::rejected("context refused: spec-scope-unverifiable: the task spec path is not UTF-8")
+    })?;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(root)
+        .args(["--literal-pathspecs", "ls-tree", "-z", "HEAD", "--", path]);
+    let out = crate::proc::run_bounded(&mut cmd, Duration::from_secs(30)).map_err(|error| {
+        Error::rejected(format!(
+            "context refused: spec-scope-unverifiable: {} could not prove tracked task \
+             specs ({error}) — nothing was read",
+            root.display()
+        ))
+    })?;
+    if !out.status.success() {
+        return Ok(false);
+    }
+    Ok(out
+        .stdout
+        .split(|byte| *byte == 0)
+        .next()
+        .is_some_and(|record| {
+            record.starts_with(b"100644 blob ") || record.starts_with(b"100755 blob ")
+        }))
+}
+
+fn spec_scope_error(path: &str, why: &str) -> Error {
+    crate::context_pack::Refusal::ScopeConflict {
+        detail: format!("the task spec {path} is outside the approved source scope: {why}"),
+    }
+    .error()
+}
+
+/// Approve and read one job task spec. The canonical target must be the
+/// task's own lane, the captured issue directory, or a tracked file of a
+/// declared project repository; anything else is a scope conflict before a
+/// byte is read. The read itself is descriptor-relative beneath the approved
+/// root, nofollow, bounded to the existing local combined cap and UTF-8 only;
+/// a failure states that bounded reader's actual error rather than pretending
+/// the file was unavailable or verified at a commit.
+fn read_job_spec(
+    project: &crate::issue::project::Project,
+    issue_dir: &Path,
+    task: &store::Task,
+    job: &store::Job,
+    spec_path: &str,
+) -> Result<(String, PathBuf, &'static str)> {
+    let declared = start::declared_repos(project);
+    let issue_id = job.issue_id.as_deref().unwrap_or_default();
+    let raw = Path::new(spec_path);
+    let candidate = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        let base = if task.spec_path.is_some() {
+            task_spec_base(&declared, task.worktree.as_deref(), issue_id)
+        } else {
+            default_spec_base(&declared, job.repo.as_deref())
+        };
+        let Some(base) = base else {
+            return Err(spec_scope_error(
+                spec_path,
+                "a relative spec has no approved task lane or declared repository",
+            ));
+        };
+        base.join(raw)
+    };
+    let file = candidate.canonicalize().map_err(|error| {
+        Error::rejected(format!(
+            "context refused: spec-unavailable: the task spec {spec_path} could not be \
+             resolved ({error}) — nothing was read or queued"
+        ))
+    })?;
+    if !file.is_file() {
+        return Err(spec_scope_error(spec_path, "it is not a regular file"));
+    }
+    let issue_dir = issue_dir.canonicalize().map_err(|error| {
+        Error::rejected(format!(
+            "context refused: spec-scope-unverifiable: the captured issue directory {} \
+             could not be resolved ({error}) — nothing was read",
+            issue_dir.display()
+        ))
+    })?;
+    let lane = task_spec_lane(&declared, task.worktree.as_deref(), issue_id);
+    let (root, label) = if file.starts_with(&issue_dir) {
+        (issue_dir, "issue")
+    } else if let Some(lane) = lane.filter(|lane| file.starts_with(lane)) {
+        (lane, "lane")
+    } else {
+        let mut approved = None;
+        for root in &declared {
+            if !file.starts_with(root) {
+                continue;
+            }
+            let Ok(rel) = file.strip_prefix(root) else {
+                continue;
+            };
+            if tracked_at_head(root, rel)? {
+                approved = Some((root.to_path_buf(), "tracked-repo"));
+                break;
+            }
+        }
+        approved.ok_or_else(|| {
+            spec_scope_error(
+                spec_path,
+                "it is outside the task lane and captured issue directory and is not a \
+                 tracked file of a declared project repository",
+            )
+        })?
+    };
+    let relative = file
+        .strip_prefix(&root)
+        .map_err(|_| spec_scope_error(spec_path, "it is not beneath the approved root"))?;
+    let reader = super::app_catalog::fs::Root::open(&root).map_err(|error| {
+        Error::rejected(format!(
+            "context refused: spec-unavailable: the approved root {} could not be opened \
+             by the bounded source reader ({error}) — nothing was read or queued",
+            root.display()
+        ))
+    })?;
+    let text = reader
+        .read(relative, crate::context_pack::MAX_COMBINED_BYTES as u64)
+        .map_err(|error| {
+            Error::rejected(format!(
+                "context refused: spec-unavailable: the approved task spec {} could not \
+                 be read by the bounded source reader ({error}) — nothing was truncated \
+                 or queued",
+                file.display()
+            ))
+        })?;
+    let Some(text) = text else {
+        return Err(Error::rejected(format!(
+            "context refused: spec-unavailable: the approved task spec {} does not exist",
+            file.display()
+        )));
+    };
+    Ok((text, file, label))
+}
+
+/// CAD-1846: the same mandatory pipeline for an issue-linked job task.
+/// The caller proves the job's issue binding and real lane from its own
+/// captured rows; this captures the complete effective spec once, the
+/// parent issue's complete prose and the task's own acceptance, and
+/// builds the contract at the job task's identity. `None` means the
+/// project has not opted in — the caller renders the legacy kickoff and
+/// never labels it a complete contract.
+pub(crate) fn job_context(
+    pm: &Pm,
+    gated: GatedIssue,
+    job: JobContext<'_>,
+    no_lessons: bool,
+) -> Result<Option<PreparedContext<'static>>> {
+    let GatedIssue {
+        project,
+        dir,
+        front,
+        items: _,
+        source,
+        request: parent_request,
+    } = gated;
+    let JobContext {
+        job: job_row,
+        task,
+        revision,
+        message,
+        target,
+        admission_scope,
+    } = job;
+    if task.job_id != job_row.id || job_row.issue_id.as_deref() != Some(front.id.as_str()) {
+        return Err(Error::rejected(
+            "context refused: the job task is not bound to this issue — nothing was queued",
+        ));
+    }
+    let provider = target.provider;
+    let endpoint_kind = target.endpoint_kind;
+    context_guard(pm, &project, &front, target, no_lessons, || {
+        // The caller's own scope proof runs only after this project is
+        // confirmed opted in and its endpoint can receive context, and
+        // before any spec byte is read: an opt-out dispatch never pays for
+        // a lane proof, and its legacy kickoff needs none.
+        if let Some(check) = admission_scope {
+            check(&project, &front)?;
+        }
+        // The complete effective spec, approved and captured once. The
+        // canonical locator must be the task's own lane, the captured issue
+        // directory, or a tracked file of a declared project repository; the
+        // bytes come through the descriptor-relative bounded reader, never a
+        // daemon-cwd path or an unbounded fs::read.
+        let spec_path = task
+            .spec_path
+            .as_deref()
+            .unwrap_or(job_row.spec_path.as_str());
+        let (spec, spec_file, spec_scope) =
+            read_job_spec(&project, &dir, task, job_row, spec_path)?;
+        let spec_digest = content_digest(spec.as_bytes());
+        // The job's recorded digest still gates its own spec. The working
+        // bytes may be dirty; this digest is the captured data revision, not
+        // a claim that the file matches HEAD.
+        if task.spec_path.is_none() {
+            if let Some(expected) = job_row.spec_sha256.as_deref() {
+                if spec_digest != expected {
+                    return Err(Error::rejected(format!(
+                        "context refused: spec-changed: the task spec {} no longer \
+                         matches the revision the job was opened with — reopen the task or \
+                         restore the pinned spec; nothing was queued",
+                        spec_file.display()
+                    )));
+                }
+            }
+        }
+        // A spec that IS the parent issue file is not re-embedded: its
+        // frontmatter and criteria would duplicate the contract, and the
+        // canonical parent prose plus the task criteria already are the
+        // complete logical issue-spec.
+        let issue_file = std::fs::canonicalize(dir.join("issue.md")).ok();
+        let spec_is_issue = spec.as_bytes() == source.as_bytes()
+            || issue_file.as_deref() == Some(spec_file.as_path());
+        let acceptance = task_acceptance(task);
+        let title = task
+            .title
+            .as_deref()
+            .or(job_row.title.as_deref())
+            .unwrap_or(front.title.as_str());
+        // The identity contract first, so its parent source digest is the
+        // captured issue SHA that both provenance and the composite use
+        // without hashing the issue source a second time.
+        let mut contract = crate::context_pack::TaskContract::new(
+            &task.id,
+            title,
+            source.as_bytes(),
+            &acceptance,
+            String::new(),
+        );
+        contract.issue = front.id.clone();
+        let parent_revision = contract.revision.clone();
+        let mut request = String::with_capacity(
+            spec.len() + parent_request.len() + spec_file.as_os_str().len() + 192,
+        );
+        // Provenance first: the approved canonical locator, the exact
+        // captured content digest and the approved scope. This is the data
+        // revision of the working bytes — never a fabricated Git-verified SHA.
+        request.push_str(&format!(
+            "Task spec source: {} (sha256 {}; scope {}; captured working bytes, not a \
+             Git-verified revision)\n\n",
+            spec_file.display(),
+            spec_digest,
+            spec_scope,
+        ));
+        if spec_is_issue {
+            request.push_str(&parent_request);
+        } else {
+            request.push_str("## Task spec\n\n");
+            request.push_str(&spec);
+            if !request.ends_with('\n') {
+                request.push('\n');
+            }
+            if !parent_request.trim().is_empty() {
+                request.push_str(&format!(
+                    "\n## Parent issue {}: {}\n\n",
+                    front.id, front.title
+                ));
+                request.push_str(&parent_request);
+                if !request.ends_with('\n') {
+                    request.push('\n');
+                }
+            }
+        }
+        contract.request = request;
+        // The metadata/report envelope, rendered once. Its exact bytes are
+        // persisted as the contract's execution so a lost session restores
+        // the scope and report/SHA obligation, not only the spec and
+        // criteria; the clone is the small necessary copy.
+        let body = store::job_kickoff(
+            job_row,
+            task,
+            revision,
+            message,
+            provider,
+            endpoint_kind,
+            true,
+        )?;
+        contract.execution = Some(body.clone());
+        // The issue digest alone cannot tell a changed spec, acceptance,
+        // title, execution or scope/report envelope from an unchanged one,
+        // and a delta keyed on it would leave the previous contract resident.
+        // This composite is job-only; the plain path keeps the source SHA.
+        let composite = job_contract_digest(&parent_revision, &contract, revision, job_row);
+        contract.revision = composite;
+        Ok((contract, std::borrow::Cow::Owned(body)))
+    })
+}
+
+/// The complete acceptance a job task carries, from its own recorded text.
+/// A task with no acceptance carries none: the parent issue's criteria are a
+/// different contract and are never substituted. A generated CAD-300 listing
+/// round-trips exactly; anything else is one free-form criterion whose
+/// original bytes are kept (trimming only decides emptiness).
+fn task_acceptance(task: &store::Task) -> Vec<AcceptanceItem> {
+    let Some(text) = task
+        .acceptance
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    else {
+        return Vec::new();
+    };
+    match parse_acceptance_listing(text) {
+        Some((items, "")) => items,
+        _ => vec![AcceptanceItem {
+            text: text.to_string(),
+            checked: false,
+        }],
+    }
+}
+
+/// Stream one length-prefixed field into a contract digest. The prefix keeps
+/// concatenation unambiguous without serializing or copying the (possibly
+/// large) spec/request text merely to hash it.
+fn digest_field(hasher: &mut sha2::Sha256, bytes: &[u8]) {
+    use sha2::Digest;
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+/// The job-only contract revision: the captured parent source SHA, the
+/// job/task identity and selected native revision, the exact rendered title,
+/// request and acceptance, and the exact execution envelope persisted for
+/// recovery. The envelope subsumes the scope, provider/report and issue
+/// fields, so it is hashed once whole — including a real explicit report
+/// message id when the body carries one: restoring that exact obligation
+/// after session loss is worth more than excluding delivery ids. A delta
+/// keyed on the parent digest alone would leave the previous contract
+/// resident whenever only these changed.
+fn job_contract_digest(
+    parent_revision: &str,
+    contract: &crate::context_pack::TaskContract,
+    revision: i64,
+    job: &store::Job,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    digest_field(&mut hasher, b"cadence-job-contract-v2");
+    digest_field(&mut hasher, parent_revision.as_bytes());
+    digest_field(&mut hasher, contract.issue.as_bytes());
+    digest_field(&mut hasher, contract.task.as_bytes());
+    digest_field(&mut hasher, job.id.as_bytes());
+    digest_field(&mut hasher, revision.to_string().as_bytes());
+    digest_field(&mut hasher, contract.title.as_bytes());
+    digest_field(&mut hasher, contract.request.as_bytes());
+    digest_field(
+        &mut hasher,
+        &(contract.acceptance.len() as u64).to_le_bytes(),
+    );
+    for item in &contract.acceptance {
+        digest_field(&mut hasher, item.as_bytes());
+    }
+    digest_field(
+        &mut hasher,
+        contract.execution.as_deref().unwrap_or_default().as_bytes(),
+    );
+    format!("{:x}", hasher.finalize())
+}
+
+// ── Early accepted-kickoff gate (CAD-1846) ───────────────────────
+//
+// An accepted kickoff is answered from the daemon's own rows before a second
+// source capture, contract render, lane setup or job creation. A tracker ref
+// only locates a candidate; the row itself proves identity and kind.
+
+/// The two kickoff kinds. They have different duplicate identities: a plain
+/// kickoff carries no task, a job kickoff is its task's `job_dispatch` row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DispatchMode {
+    Plain,
+    Job,
+}
+
+impl DispatchMode {
+    fn label(self) -> &'static str {
+        match self {
+            DispatchMode::Plain => "plain",
+            DispatchMode::Job => "job",
+        }
+    }
+}
+
+/// The kickoff kind a stored message row actually is. `None` for anything
+/// else, so an arbitrary user-authored row can never count as a kickoff.
+fn row_mode(row: &Value) -> Option<DispatchMode> {
+    match (row["source"].as_str(), row["task_id"].as_str()) {
+        (Some("dispatch"), None) => Some(DispatchMode::Plain),
+        (Some("job_dispatch"), Some(_)) => Some(DispatchMode::Job),
+        _ => None,
+    }
+}
+
+/// The issue's open `message` refs as `(id, recorded owner)` — a locator
+/// only; every caller proves the daemon's own row.
+fn message_refs(front: &Front, worker: &str) -> Vec<(String, String)> {
+    front
+        .refs
+        .iter()
+        .filter(|r| r.kind == "message" && r.closed != Some(true))
+        .filter_map(|r| {
+            let mid = r.path.clone()?;
+            let owner = r
+                .agent
+                .clone()
+                .or_else(|| {
+                    r.label
+                        .as_deref()
+                        .and_then(|label| label.strip_prefix("dispatch → "))
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| worker.to_string());
+            Some((mid, owner))
+        })
+        .collect()
+}
+
+fn find_row(show: &Value, mid: &str) -> Option<Value> {
+    show["messages"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str() == Some(mid))
+        .cloned()
+}
+
+/// The daemon's own row for `mid` on `owner`'s history.
+fn message_row(
+    state_dir: &Path,
+    owner: &str,
+    worker: &str,
+    show: &Value,
+    mid: &str,
+) -> Option<Value> {
+    if owner == worker {
+        return find_row(show, mid);
+    }
+    client::rpc(state_dir, "agent_show", json!({"alias": owner}))
+        .ok()
+        .and_then(|show| find_row(&show, mid))
+}
+
+fn lexical(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Canonical when both sides resolve, else the absolute lexical path — a
+/// recorded string and a live path compare without inventing a root.
+fn same_path(recorded: &Path, expected: &Path) -> bool {
+    let left = recorded
+        .canonicalize()
+        .unwrap_or_else(|_| lexical(recorded));
+    let right = expected
+        .canonicalize()
+        .unwrap_or_else(|_| lexical(expected));
+    left == right
+}
+
+/// A task's recorded worktree against the lane this dispatch resolved: a bare
+/// name names the lane, a path must resolve to it.
+fn same_lane(recorded: &str, lane: &Path) -> bool {
+    let recorded = Path::new(recorded);
+    if recorded.is_absolute() || recorded.components().count() != 1 {
+        return same_path(recorded, lane);
+    }
+    match (recorded.file_name(), lane.file_name()) {
+        (Some(recorded), Some(lane)) => recorded == lane,
+        _ => false,
+    }
+}
+
+/// The approved spec locator as given: canonical when it resolves, else the
+/// absolute lexical path. Never read, never hashed.
+fn spec_locator(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| lexical(path))
+}
+
+fn same_locator(recorded: &str, locator: &Path) -> bool {
+    spec_locator(Path::new(recorded)) == spec_locator(locator)
+}
+
+/// The issue's single OPEN native job and its canonical default task. A
+/// terminal job is never a retry candidate — the store's one-open-job guard
+/// then governs a fresh job.
+struct OpenJob {
+    job: Value,
+    task: Value,
+}
+
+fn open_job(state_dir: &Path, front: &Front) -> Result<Option<OpenJob>> {
+    let list = client::rpc(
+        state_dir,
+        "job_list",
+        json!({"states": ["open"], "tasks_detail": true}),
+    )?;
+    let jobs: Vec<Value> = list["jobs"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|job| {
+                    job["state"].as_str() == Some("open")
+                        && job["issue"].as_str() == Some(front.id.as_str())
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let job = match jobs.as_slice() {
+        [] => return Ok(None),
+        [job] => job.clone(),
+        many => {
+            return Err(Error::rejected(format!(
+                "{} maps to {} open jobs ({}) — refusing to guess which native \
+                 binding a dispatch retries; close the stale ones first",
+                front.id,
+                many.len(),
+                many.iter()
+                    .filter_map(|job| job["id"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )))
+        }
+    };
+    let id = job["id"].as_str().unwrap_or_default().to_string();
+    let task_id = format!("{id}-t1");
+    let show = client::rpc(state_dir, "job_show", json!({"job": id}))?;
+    let job = show["job"].clone();
+    let task = job["tasks"].as_array().and_then(|tasks| {
+        tasks
+            .iter()
+            .find(|task| task["id"].as_str() == Some(task_id.as_str()))
+            .cloned()
+    });
+    let Some(task) = task else {
+        return Err(Error::rejected(format!(
+            "open job {id} does not carry its canonical task {task_id} — refusing to \
+             infer a native binding from it"
+        )));
+    };
+    Ok(Some(OpenJob { job, task }))
+}
+
+/// The read-only facts an early duplicate gate needs about this dispatch.
+struct EarlyDispatch<'a> {
+    state_dir: &'a Path,
+    front: &'a Front,
+    mode: DispatchMode,
+    worker: &'a str,
+    reply_to: &'a str,
+    show: &'a Value,
+    repo_root: &'a Path,
+    lane: &'a Path,
+    branch: &'a str,
+    job_locator: Option<&'a Path>,
+    acceptance: &'a [AcceptanceItem],
+}
+
+/// What the daemon's own rows already say about this dispatch.
+enum EarlyKickoff {
+    /// Nothing accepted yet: the normal flow runs.
+    None,
+    /// This request's own accepted kickoff — return it, create nothing.
+    Duplicate {
+        row: Value,
+        job: Option<Value>,
+        task: Option<Value>,
+        kind: &'static str,
+    },
+    /// The issue's open job exists but was never accepted: reuse its native
+    /// binding instead of minting another job.
+    ReuseJob { job: Value },
+}
+
+fn busy_error(issue: &str, lane: &Path, mode: DispatchMode, row: &Value) -> Error {
+    Error::rejected(format!(
+        "{issue}'s lane {} already has a live {} kickoff {} ({}) — wait for it to finish \
+         or reconcile it; nothing was created or queued",
+        lane.display(),
+        mode.label(),
+        row["id"].as_str().unwrap_or("?"),
+        row["state"].as_str().unwrap_or("?"),
+    ))
+}
+
+/// Which of this request's material inputs the open job's own scope disagrees
+/// with. Job identity, PM, repository, assignee, lane and spec locator are
+/// the binding a retry may never re-point.
+fn binding_mismatches(binding: &OpenJob, d: &EarlyDispatch<'_>) -> Vec<&'static str> {
+    let job = &binding.job;
+    let task = &binding.task;
+    let mut wrong = Vec::new();
+    if job["issue"].as_str() != Some(d.front.id.as_str()) {
+        wrong.push("issue");
+    }
+    if job["pm"].as_str() != Some(d.reply_to) {
+        wrong.push("pm");
+    }
+    if !job["repo"]
+        .as_str()
+        .is_some_and(|repo| same_path(Path::new(repo), d.repo_root))
+    {
+        wrong.push("repo");
+    }
+    if task["job"].as_str() != job["id"].as_str() {
+        wrong.push("task job");
+    }
+    if task["assignee"].as_str() != Some(d.worker) {
+        wrong.push("assignee");
+    }
+    if !task["worktree"]
+        .as_str()
+        .is_some_and(|worktree| same_lane(worktree, d.lane))
+    {
+        wrong.push("worktree");
+    }
+    if task["branch"].as_str() != Some(d.branch) {
+        wrong.push("branch");
+    }
+    let locator_matches = d.job_locator.is_some_and(|locator| {
+        task["spec_path"]
+            .as_str()
+            .or_else(|| job["spec_path"].as_str())
+            .is_some_and(|recorded| same_locator(recorded, locator))
+    });
+    if !locator_matches {
+        wrong.push("spec");
+    }
+    wrong
+}
+
+/// The material inputs a never-accepted draft must still agree on before its
+/// native binding is reused. The lane's own recorded base is the authority:
+/// the default branch moves after the lane was cut, and a legitimate frozen
+/// lane must not be refused because `main` advanced.
+fn draft_mismatches(binding: &OpenJob, d: &EarlyDispatch<'_>) -> Result<Vec<&'static str>> {
+    let job = &binding.job;
+    let task = &binding.task;
+    let mut wrong = binding_mismatches(binding, d);
+    if task["state"].as_str() != Some("draft") {
+        wrong.push("task state");
+    }
+    let recorded = crate::worktree::lifecycle::recoverable_record(
+        d.repo_root,
+        d.lane,
+        "development",
+        "cadence issue start",
+        Some(d.branch),
+        Some(d.front.id.as_str()),
+    )?;
+    if let Some(base) = recorded.and_then(|record| record.base_sha) {
+        if job["base_ref"].as_str() != Some(base.as_str()) {
+            wrong.push("job base");
+        }
+        if task["base_sha"].as_str() != Some(base.as_str()) {
+            wrong.push("task base");
+        }
+    } else if job["base_ref"].as_str() != task["base_sha"].as_str() {
+        wrong.push("base");
+    }
+    let acceptance = acceptance_listing(d.acceptance);
+    if task["acceptance"].as_str() != acceptance.as_deref() {
+        wrong.push("acceptance");
+    }
+    Ok(wrong)
+}
+
+/// The task's own kickoff row, from the native task view: an id-targeted read,
+/// so a bounded agent history can never hide an accepted row.
+fn task_message_row(state_dir: &Path, task_id: &str, mid: &str) -> Result<Option<Value>> {
+    let show = client::rpc(state_dir, "task_show", json!({"task": task_id}))?;
+    Ok(show["task"]["messages"].as_array().and_then(|rows| {
+        rows.iter()
+            .find(|row| row["id"].as_str() == Some(mid))
+            .cloned()
+    }))
+}
+
+fn accepted_row_ok(row: &Value, d: &EarlyDispatch<'_>, task_id: &str) -> bool {
+    row["alias"].as_str() == Some(d.worker)
+        && row["issue"].as_str() == Some(d.front.id.as_str())
+        && row["worktree"]
+            .as_str()
+            .is_some_and(|worktree| same_path(Path::new(worktree), d.lane))
+        && row["task_id"].as_str() == Some(task_id)
+        && row_mode(row) == Some(DispatchMode::Job)
+}
+
+/// Decide the early outcome from the daemon's rows.
+fn early_kickoff(d: &EarlyDispatch<'_>) -> Result<EarlyKickoff> {
+    // 1. Live rows the issue's open `message` refs name.
+    let mut live_plain = None;
+    let mut live_job = None;
+    for (mid, owner) in message_refs(d.front, d.worker) {
+        let Some(row) = message_row(d.state_dir, &owner, d.worker, d.show, &mid) else {
+            continue;
+        };
+        if !LIVE_MESSAGE_STATES.contains(&row["state"].as_str().unwrap_or_default()) {
+            continue;
+        }
+        if row["alias"].as_str() != Some(d.worker)
+            || row["issue"].as_str() != Some(d.front.id.as_str())
+            || !row["worktree"]
+                .as_str()
+                .is_some_and(|worktree| same_path(Path::new(worktree), d.lane))
+        {
+            continue;
+        }
+        match row_mode(&row) {
+            Some(DispatchMode::Plain) => live_plain = Some(row),
+            Some(DispatchMode::Job) => live_job = Some(row),
+            None => {}
+        }
+    }
+    if let Some(row) = live_plain {
+        if d.mode == DispatchMode::Plain {
+            return Ok(EarlyKickoff::Duplicate {
+                row,
+                job: None,
+                task: None,
+                kind: "live",
+            });
+        }
+        return Err(busy_error(&d.front.id, d.lane, DispatchMode::Plain, &row));
+    }
+
+    // 2. The issue's one open native job and its canonical default task.
+    let Some(binding) = open_job(d.state_dir, d.front)? else {
+        return match live_job {
+            Some(row) => Err(busy_error(&d.front.id, d.lane, DispatchMode::Job, &row)),
+            None => Ok(EarlyKickoff::None),
+        };
+    };
+    let job_id = binding.job["id"].as_str().unwrap_or_default().to_string();
+    let task_id = binding.task["id"].as_str().unwrap_or_default().to_string();
+    let accepted = binding.task["dispatch_message"]
+        .as_str()
+        .map(str::to_string);
+    let on_lane = binding.task["worktree"]
+        .as_str()
+        .is_some_and(|worktree| same_lane(worktree, d.lane))
+        && binding.task["branch"].as_str() == Some(d.branch);
+
+    if d.mode == DispatchMode::Plain {
+        // A live job kickoff on this lane is a busy lane, never a duplicate.
+        // A recorded kickoff that cannot be proven as this issue's job row is
+        // reconciled, never treated as absent.
+        if let Some(mid) = &accepted {
+            if on_lane {
+                let stored = task_message_row(d.state_dir, &task_id, mid)?;
+                match stored {
+                    Some(row) if accepted_row_ok(&row, d, &task_id) => {
+                        if LIVE_MESSAGE_STATES.contains(&row["state"].as_str().unwrap_or_default())
+                        {
+                            return Err(busy_error(&d.front.id, d.lane, DispatchMode::Job, &row));
+                        }
+                    }
+                    _ => {
+                        return Err(Error::rejected(format!(
+                            "{} maps to open job {job_id} whose task {task_id} records \
+                             kickoff {mid} that the daemon cannot prove as this issue's \
+                             job row — reconcile the task before dispatching again; \
+                             nothing was created",
+                            d.front.id
+                        )))
+                    }
+                }
+            }
+        }
+        // A ref may still name a live job row of another (closed) job on this
+        // lane; the lane is busy either way.
+        if let Some(row) = live_job {
+            return Err(busy_error(&d.front.id, d.lane, DispatchMode::Job, &row));
+        }
+        return Ok(EarlyKickoff::None);
+    }
+
+    // Job mode: the binding must be this request's own scope.
+    let wrong = binding_mismatches(&binding, d);
+    if !wrong.is_empty() {
+        return Err(Error::rejected(format!(
+            "{} already maps to open job {job_id} but its native binding differs from this \
+             request ({}); use native reopen/revise or cancel the job — nothing was created",
+            d.front.id,
+            wrong.join(", "),
+        )));
+    }
+    if let Some(mid) = &accepted {
+        let stored = task_message_row(d.state_dir, &task_id, mid)?;
+        let row = stored.filter(|row| accepted_row_ok(row, d, &task_id));
+        let Some(row) = row else {
+            return Err(Error::rejected(format!(
+                "{} maps to open job {job_id} whose task {task_id} records kickoff {mid} \
+                 that the daemon cannot prove as this issue's accepted job row — reconcile \
+                 the task before dispatching again; nothing was created",
+                d.front.id
+            )));
+        };
+        let state = row["state"].as_str().unwrap_or_default().to_string();
+        return match state.as_str() {
+            "completed" => Ok(EarlyKickoff::Duplicate {
+                row,
+                job: Some(binding.job),
+                task: Some(binding.task),
+                kind: "reported",
+            }),
+            live if LIVE_MESSAGE_STATES.contains(&live) => Ok(EarlyKickoff::Duplicate {
+                row,
+                job: Some(binding.job),
+                task: Some(binding.task),
+                kind: "live",
+            }),
+            _ => Err(Error::rejected(format!(
+                "{} maps to open job {job_id} whose task {task_id} kickoff {mid} ended \
+                 '{}' without being accepted — reconcile the task before dispatching \
+                 again; nothing was created",
+                d.front.id,
+                row["state"].as_str().unwrap_or("unknown"),
+            ))),
+        };
+    }
+    if let Some(row) = live_job {
+        return Err(busy_error(&d.front.id, d.lane, DispatchMode::Job, &row));
+    }
+    let wrong = draft_mismatches(&binding, d)?;
+    if !wrong.is_empty() {
+        return Err(Error::rejected(format!(
+            "{} already maps to open job {job_id} whose draft binding differs from this \
+             request ({}); use native reopen/revise or cancel the job — nothing was created",
+            d.front.id,
+            wrong.join(", "),
+        )));
+    }
+    Ok(EarlyKickoff::ReuseJob { job: binding.job })
+}
+
+fn preflight(
+    pm: &Pm,
+    id: &str,
+    args: &DispatchArgs,
+    state_dir: &Path,
+) -> Result<std::ops::ControlFlow<Value, Preflight>> {
     let GatedIssue {
         project,
         dir,
         front,
         items,
         source,
+        request,
     } = gate_issue(pm, id, false)?;
     // CAD-159: the CAD-238 section-scoped readback. No items warns;
     // it never refuses (PM decision, ADR-0002 §8.3).
@@ -722,29 +2032,137 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
     // the daemon's own kickoff (`check_job_kickoff`).
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = start::resolve_repo(&project, args.repo.as_deref(), &cwd)?;
-    let base_sha = start::resolve_base(
+    let base = start::resolve_base(
         &root,
         args.base.as_deref(),
         start::configured_integration(&project, &root),
-    )?
-    .sha;
+    )?;
+    let base_sha = base.sha.clone();
     let (wt_dir, branch) = start::resolve_lane(&front, args.name.as_deref(), &root)?;
+    // CAD-1846: an accepted kickoff is answered from the daemon's own rows
+    // before any source capture, contract render, lane setup or job creation.
+    // Only a fresh dispatch pays for sources, and only the native guards
+    // decide whether it is admitted.
+    let mode = if args.job_spec.is_some() {
+        DispatchMode::Job
+    } else {
+        DispatchMode::Plain
+    };
+    let job_locator = args.job_spec.as_deref().map(spec_locator);
+    let mut reuse_job: Option<String> = None;
+    match early_kickoff(&EarlyDispatch {
+        state_dir,
+        front: &front,
+        mode,
+        worker: &args.to,
+        reply_to: &reply_to,
+        show: &show,
+        repo_root: &root,
+        lane: &wt_dir,
+        branch: &branch,
+        job_locator: job_locator.as_deref(),
+        acceptance: &items,
+    })? {
+        EarlyKickoff::None => {}
+        EarlyKickoff::Duplicate {
+            row,
+            job,
+            task,
+            kind,
+        } => {
+            let mut out = json!({
+                "issue": front.id,
+                "worker": args.to,
+                "reply_to": reply_to,
+                "note": note,
+                "worktree": wt_dir,
+                "branch": branch,
+                "base": {"ref": base.name, "sha": base.sha},
+                "acceptance": acceptance,
+                "claim": claim::json(&front, crate::issue::time::now_epoch()),
+                "dispatched": false,
+                "duplicate": true,
+                "duplicate_kind": kind,
+                "message": row["id"],
+                "message_state": row["state"],
+            });
+            if let Some(job) = job {
+                out["job"] = job["id"].clone();
+            }
+            if let Some(task) = task {
+                out["task"] = task["id"].clone();
+                out["task_revision"] = task["revision"].clone();
+            }
+            if items.is_empty() {
+                out["acceptance"]["warning"] = json!(self::acceptance_warning(&front.id, false));
+            }
+            return Ok(std::ops::ControlFlow::Break(out));
+        }
+        EarlyKickoff::ReuseJob { job } => {
+            reuse_job = job["id"].as_str().map(str::to_string);
+        }
+    }
+    // CAD-1822/CAD-1846: both entry points run the same mandatory pipeline.
+    // The task contract and the project's required sources are validated
+    // before `issue start`, so a refusal leaves no lane, branch, job or
+    // queued message behind. The guard pins first, so its factory — the only
+    // place a contract, spec or body is captured — never runs on opt-out.
+    let mut context_active = false;
+    let mut context_lessons: Option<ContextFacts> = None;
     let body = if args.job_spec.is_none() {
         let summary = args.summary.as_deref().unwrap_or(&front.title);
-        let body = plain_kickoff(
-            &front.id,
-            summary,
-            &note,
-            &wt_dir,
-            &branch,
-            &base_sha,
-            &reply_to,
-            &items,
-            &provider,
-            &endpoint_kind,
+        let prepared = context_guard(
+            pm,
+            &project,
+            &front,
+            ContextTarget {
+                team_role: agent["team_role"].as_str(),
+                provider: &provider,
+                endpoint_kind: &endpoint_kind,
+            },
+            args.no_lessons,
+            || {
+                let body = plain_body(
+                    &front,
+                    summary,
+                    &note,
+                    &wt_dir,
+                    &branch,
+                    &base_sha,
+                    &reply_to,
+                    &items,
+                    &provider,
+                    &endpoint_kind,
+                )?;
+                let contract = crate::context_pack::TaskContract::new(
+                    &front.id,
+                    &front.title,
+                    source.as_bytes(),
+                    &items,
+                    request,
+                );
+                Ok((contract, std::borrow::Cow::Owned(body)))
+            },
         )?;
-        check_body(&body, &provider)?;
-        Some(body)
+        match prepared {
+            Some(prepared) => {
+                context_active = true;
+                context_lessons = Some(ContextFacts::from_manifest(&prepared.manifest));
+                Some(prepared.body.into_owned())
+            }
+            None => Some(plain_body(
+                &front,
+                summary,
+                &note,
+                &wt_dir,
+                &branch,
+                &base_sha,
+                &reply_to,
+                &items,
+                &provider,
+                &endpoint_kind,
+            )?),
+        }
     } else {
         if let Some(spec) = &args.job_spec {
             // `issue start --job` scopes the task to the lane's dir name.
@@ -752,34 +2170,52 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            check_job_kickoff(
-                &front.id, &items, spec, &wt_name, &branch, &base_sha, &agent,
+            let (prototype_job, prototype_task) =
+                job_prototype(&front.id, &items, spec, &wt_name, &branch, &base_sha);
+            let placeholder = "0".repeat(32);
+            let prepared = job_context(
+                pm,
+                GatedIssue {
+                    project: project.clone(),
+                    dir: dir.clone(),
+                    front: front.clone(),
+                    items: items.clone(),
+                    source: source.clone(),
+                    request: request.clone(),
+                },
+                JobContext {
+                    job: &prototype_job,
+                    task: &prototype_task,
+                    revision: 1,
+                    message: &placeholder,
+                    target: ContextTarget {
+                        team_role: agent["team_role"].as_str(),
+                        provider: &provider,
+                        endpoint_kind: &endpoint_kind,
+                    },
+                    // Preview only: `issue start` has not created this lane
+                    // yet, so there is no admission proof to make.
+                    admission_scope: None,
+                },
+                args.no_lessons,
             )?;
+            if prepared.is_some() {
+                // The daemon re-selects and pins the same mandatory contract
+                // for the real task and message; the combined cap was checked
+                // here against exact-length placeholders.
+                context_active = true;
+            } else {
+                check_job_kickoff(
+                    &front.id, &items, spec, &wt_name, &branch, &base_sha, &agent,
+                )?;
+            }
         }
         None
     };
-    // CAD-1822: the task contract and the project's required sources are
-    // validated before `issue start`, so a refusal leaves no lane, branch or
-    // queued message behind. `--job` kickoffs are daemon-templated and keep
-    // their existing path.
-    let mut context_active = false;
-    if let Some(body) = body.as_deref() {
-        context_active = context_guard(
-            &project,
-            source.as_bytes(),
-            &front,
-            &items,
-            agent["team_role"].as_str(),
-            &provider,
-            &endpoint_kind,
-            body,
-        )?
-        .is_some();
-    }
 
     // `issue start` — idempotent; --owner <worker>, and for --job the
     // PM is the return address and the worker the assignee.
-    Ok(Preflight {
+    Ok(std::ops::ControlFlow::Continue(Preflight {
         project,
         dir,
         front,
@@ -794,11 +2230,12 @@ fn preflight(pm: &Pm, id: &str, args: &DispatchArgs, state_dir: &Path) -> Result
         cwd_override,
         body,
         context_active,
-    })
+        context_lessons,
+        reuse_job,
+    }))
 }
 
 struct Lessons {
-    mid: String,
     lessons: Vec<String>,
     lessons_file: Option<PathBuf>,
     lessons_error: Option<String>,
@@ -808,6 +2245,7 @@ struct Lessons {
 
 #[allow(clippy::too_many_arguments)]
 fn lessons(
+    mid: &str,
     pm: &Pm,
     project: &crate::issue::project::Project,
     dir: &Path,
@@ -824,11 +2262,6 @@ fn lessons(
     // reason — recorded on the dispatch comment and in the output so
     // "why did I not get this?" is answerable.
     let mut lessons_withheld: Vec<(String, String)> = vec![];
-    // The message id is minted up front so the `message` ref commits
-    // BEFORE the send: a finish racing the dispatch sees the binding
-    // the moment the ref lands. The old send→add_ref order left the
-    // kickoff live but unbound for a window (CAD-107).
-    let mid = Uuid::new_v4().simple().to_string();
     let mut body = body;
     if !args.no_lessons {
         if let Some(b) = body.as_mut() {
@@ -894,7 +2327,6 @@ fn lessons(
         }
     }
     Lessons {
-        mid,
         lessons,
         lessons_file,
         lessons_error,
@@ -1094,53 +2526,55 @@ fn duplicate(
     context_active: bool,
     out: &mut Value,
 ) -> Result<bool> {
+    let mode = if args.job_spec.is_some() {
+        DispatchMode::Job
+    } else {
+        DispatchMode::Plain
+    };
+    let started_task = started["task"].as_str();
     let mut live: Option<Value> = None;
     let mut reported: Option<Value> = None;
-    for r in front
-        .refs
-        .iter()
-        .filter(|r| r.kind == "message" && r.closed != Some(true))
-    {
-        let Some(mid) = r.path.as_deref() else {
+    for (mid, owner) in message_refs(front, &args.to) {
+        let Some(found) = message_row(state_dir, &owner, &args.to, show_now, &mid) else {
             continue;
         };
-        let owner = r
-            .agent
-            .as_deref()
-            .or_else(|| {
-                r.label
-                    .as_deref()
-                    .and_then(|l| l.strip_prefix("dispatch → "))
-            })
-            .unwrap_or(&args.to);
-        let messages = if owner == args.to {
-            Some(show_now.clone())
-        } else {
-            client::rpc(state_dir, "agent_show", json!({"alias": owner})).ok()
-        };
-        let Some(found) = messages.and_then(|s| {
-            s["messages"]
-                .as_array()
-                .and_then(|ms| ms.iter().find(|m| m["id"].as_str() == Some(mid)).cloned())
-        }) else {
+        // An arbitrary user-authored row is never a kickoff of either mode.
+        let Some(found_mode) = row_mode(&found) else {
             continue;
         };
         let state = found["state"].as_str().unwrap_or_default();
         if LIVE_MESSAGE_STATES.contains(&state) {
+            if found_mode != mode {
+                // Another kind of kickoff already holds this lane; a second
+                // one would run two tasks against it. Nothing more is queued.
+                return Err(Error::rejected(format!(
+                    "{}'s lane {} already has a live {} kickoff {} ({}) — wait for it \
+                     to finish or reconcile it; no kickoff was queued",
+                    front.id,
+                    Path::new(started["worktree"].as_str().unwrap_or_default()).display(),
+                    found_mode.label(),
+                    found["id"].as_str().unwrap_or("?"),
+                    state,
+                )));
+            }
             live = Some(found);
             break;
         }
         // The proof is the daemon-recorded row: this issue's kickoff,
         // delivered to THIS worker (the row's `alias` is the send's
         // target — a kickoff reported by another worker is their
-        // history, not this dispatch's), on THIS lane's worktree.
+        // history, not this dispatch's), on THIS lane's worktree, of THIS
+        // dispatch's kind — and for a job, this exact native task, so a
+        // sibling task can never suppress another.
         let reported_here = state == "completed"
             && found["alias"].as_str() == Some(args.to.as_str())
             && found["issue"].as_str() == Some(front.id.as_str())
             && match (found["worktree"].as_str(), started["worktree"].as_str()) {
-                (Some(m), Some(lane)) => m == lane,
+                (Some(recorded), Some(lane)) => same_path(Path::new(recorded), Path::new(lane)),
                 _ => false,
-            };
+            }
+            && found_mode == mode
+            && (mode == DispatchMode::Plain || found["task_id"].as_str() == started_task);
         if reported_here {
             reported = Some(found);
         }
@@ -1252,6 +2686,10 @@ pub fn run(
     dispatch_pm: Option<&str>,
     origin: DispatchOrigin,
 ) -> Result<Value> {
+    let preflight = match preflight(pm, id, args, state_dir)? {
+        std::ops::ControlFlow::Break(accepted) => return Ok(accepted),
+        std::ops::ControlFlow::Continue(preflight) => preflight,
+    };
     let Preflight {
         project,
         dir,
@@ -1267,7 +2705,9 @@ pub fn run(
         cwd_override,
         body,
         context_active,
-    } = preflight(pm, id, args, state_dir)?;
+        context_lessons,
+        reuse_job,
+    } = preflight;
     let agent = &show["agent"];
     let start_args = start::StartArgs {
         repo: args.repo.clone(),
@@ -1275,6 +2715,7 @@ pub fn run(
         base: args.base.clone(),
         owner: Some(args.to.clone()),
         job: args.job_spec.as_ref().map(|spec| start::JobArgs {
+            id: reuse_job,
             pm: reply_to.clone(),
             spec: spec.clone(),
             assignee: Some(args.to.clone()),
@@ -1360,23 +2801,39 @@ pub fn run(
         return Ok(out);
     }
 
+    // The message id is minted up front so the `message` ref commits BEFORE
+    // the send: a finish racing the dispatch sees the binding the moment the
+    // ref lands (CAD-107).
+    let mid = Uuid::new_v4().simple().to_string();
     // Project-memory lessons: accepted memories matching the issue's
-    // component/tags/recorded-commit paths and the worker's provider
-    // render into `<state>/dispatch/<message>-lessons.md`, written
-    // before the send so the kickoff can name it. `--job`'s kickoff
-    // is daemon-templated and cannot carry the path — it is skipped.
-    // Memory failures never sink the dispatch — the worktree already
-    // exists by now. A malformed file, an unwritable lessons file or a
-    // suffix that pushes the body over the cap degrades to no lessons
-    // with `lessons_error` naming the reason.
+    // component/tags/recorded-commit paths and the worker's provider render
+    // into `<state>/dispatch/<message>-lessons.md`, written before the send
+    // so the kickoff can name it. An opted-in dispatch already carries that
+    // same selection inside its pinned context, so the legacy sidecar and
+    // its `Lessons:` suffix are skipped there — never injected twice — and
+    // `--job`'s kickoff likewise carries it in the pinned task context.
+    // Memory failures never sink the dispatch — the worktree already exists
+    // by now. A malformed file, an unwritable lessons file or a suffix that
+    // pushes the body over the cap degrades to no lessons with
+    // `lessons_error` naming the reason.
     let Lessons {
-        mid,
         lessons,
         lessons_file,
         lessons_error,
         lessons_withheld,
         body,
-    } = lessons(pm, &project, &dir, &front, args, state_dir, &provider, body);
+    } = match context_lessons {
+        Some(facts) => Lessons {
+            lessons: facts.lessons,
+            lessons_file: None,
+            lessons_error: facts.lessons_error,
+            lessons_withheld: facts.lessons_withheld,
+            body,
+        },
+        None => lessons(
+            &mid, pm, &project, &dir, &front, args, state_dir, &provider, body,
+        ),
+    };
 
     // CAD-467: a freshly joined worker's `bootstrap-<alias>` still
     // `queued` would deliver as a bare onboarding turn AHEAD of this
@@ -1497,8 +2954,10 @@ pub fn run(
     // later re-dispatch can prove this kickoff's report belongs to
     // THIS issue and lane (CAD-467).
     let (message, sent_state) = if let Some(body) = send_body {
+        // `no_lessons` is the caller's existing opt-out, carried to the
+        // daemon so its own context selection honors it too.
         let mut send = json!({"alias": args.to, "text": body, "reply_to": reply_to,
-                              "message": mid,
+                              "message": mid, "no_lessons": args.no_lessons,
                               "issue": front.id, "worktree": started["worktree"]});
         if matches!(origin, DispatchOrigin::Automatic) {
             send["unattended"] = json!(true);
@@ -1513,7 +2972,8 @@ pub fn run(
         let sent = client::rpc(
             state_dir,
             "task_dispatch",
-            json!({"task": task, "by": reply_to, "message": mid}),
+            json!({"task": task, "by": reply_to, "message": mid,
+                   "no_lessons": args.no_lessons}),
         )
         .map_err(send_failed)?;
         (

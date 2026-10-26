@@ -948,8 +948,10 @@ business: no `--ready`, no forced claims; the output prints the queued
 message id and the worker's probe verdict so the operator knows
 whether it lands now or when the pane idles.
 
-**Task context delivery (CAD-1822).** A plain dispatch to a managed
-endpoint also pins the task contract and the assigned project's tracked
+**Task context delivery (CAD-1822, CAD-1846).** Plain dispatch, explicit
+`dispatch --job --spec`, and native issue-linked job task dispatch use the
+same project-source and current-policy lesson selection for the actual
+worker's role. They pin the task contract and the assigned project's tracked
 sources, but only when that project's tracked
 `docs/cadence/project-context.yaml` at HEAD sets `agent_delivery: true`.
 Absent or false leaves every existing dispatch path unchanged. A
@@ -961,9 +963,15 @@ is daemon-side: the issue's registered project's declared local
 repository and the manifest at HEAD. Required documents are
 selected regardless of role; optional ones by the worker's runtime
 role (`dev` by default, `qa` for reviewer/QA, `pm`/`devops` exact).
-The pin records the task revision (SHA-256 of `issue.md`), the complete
-acceptance, the project revision and each source's `id`/`path`/
-`revision`/`sha256`/bytes as a `context_pin` event bound to that
+The schema-2 pin includes canonical issue prose (without tracker frontmatter
+or duplicated acceptance lines), complete acceptance, the project revision
+and each source's `id`/`path`/`revision`/`sha256`/bytes. Plain task revisions
+are SHA-256 of the captured `issue.md`. A job task retains its distinct task
+and parent issue identities; its composite revision also covers the complete
+effective spec, stored task criteria, native revision and exact execution/report
+contract, so a spec-only change cannot masquerade as retained context. The
+kickoff carries scope and the native report/SHA contract without duplicating
+the spec or criteria. These persist in a `context_pin` event bound to that
 message id — a retried send keeps its first pin, and two queued
 dispatches cannot share one. Before the first managed turn the daemon
 appends the full contract and sources, quoted as data inside its own
@@ -1018,9 +1026,9 @@ material is reserved conservatively in the same cap — currently the
 44-byte guarded Pi-adapter task prefix for every registry-defined Pi-family
 provider, even while its guard is off. This is a local byte reservation, not provider-window
 accounting; the receipt records it as `adapter_reserved_bytes`, never as
-appended source. Only an opted-in project's changed
-kickoff body supersedes a reported duplicate. A
-missing
+appended source. Only an opted-in plain issue's changed kickoff body
+supersedes a reported plain duplicate.
+A missing
 required source, an unusable manifest, a combined payload over 48 000
 bytes, a pinned project context on an endpoint that cannot receive
 prompt content, or a pin naming another task refuses before the turn
@@ -1037,6 +1045,36 @@ rather than have it silently truncated. A revised task dispatched again
 keeps the earlier message and ref as history: a different kickoff body
 for the same completed worker/lane is an explicit revision, not a
 duplicate.
+
+For opted-in job tasks, spec files must resolve within the canonical issue
+directory, that issue's actual task worktree, or a tracked regular-file path
+at HEAD in the declared project repository. Descriptor-relative reads reject
+symlink escapes and hardlinks; arbitrary external paths are refused. Tracked
+spec paths supply their current bounded UTF-8 working bytes with an exact
+content digest, **not** a claim that those bytes were verified at a Git SHA.
+Opt-out does not read the spec through this context pipeline. Old incomplete
+pins are not silently upgraded to complete contracts; dispatch a new revision.
+
+Eligible lessons reuse the existing accepted-memory matching/rendering policy;
+no approval or verification rule is relaxed. One optional `native:lessons`
+source carries the bounded rendered lessons and selected IDs. Stale/withheld,
+load-failure and whole-source budget omissions remain explicit gaps.
+`--no-lessons` suppresses this source. The opted-in path does not also append
+the legacy lessons sidecar. Supply receipts record lesson IDs, not proof of
+model use or source verification.
+
+CLI retry identity is checked before source capture or `issue start`.
+A live plain kickoff cannot suppress an explicit job kickoff, nor can a
+completed kickoff for a sibling task. A matching open job's canonical
+`<job>-t1` task returns its accepted live/completed message without recapturing
+sources or creating another job. An unaccepted draft is reused only after
+its assignee, issue/lane, branch/base, criteria and spec locator match.
+Ambiguous open jobs, conflicting live modes or an unprovable/ceased accepted
+binding refuse for reconciliation; native task redispatch remains explicit.
+Material task/job/worker identity is rechecked in the admission transaction
+before the pin, message and task revision become visible together.
+An explicit task-bound follow-up cannot borrow another task's active pack;
+a passive report remains ambient rather than activating its reported task.
 
 ### Claims — who may start or dispatch an issue in flight (CAD-383)
 
