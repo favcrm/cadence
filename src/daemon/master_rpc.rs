@@ -32,8 +32,8 @@ use crate::issue::{self, task_report};
 use crate::master::{self, ALIAS};
 use crate::peer::AgentCaller;
 use crate::store;
-// Serialize workspace identity writers across the protected files and params.
-static MASTER_IDENTITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// Readers and protected writers share the file/digest/params publication boundary.
+pub(super) static MASTER_IDENTITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The daemon methods a master connection may call — everything else is
 /// refused (review round 1, C2). Reads, proposing a plan, registering a
@@ -738,8 +738,8 @@ impl Shared {
             ));
         }
         let pm = self.pm()?;
-        let identity_file = slug == ALIAS && matches!(name, "IDENTITY.md" | "SOUL.md");
-        let _identity_guard = if identity_file {
+        let protected_master_file = slug == ALIAS;
+        let _identity_guard = if protected_master_file {
             Some(
                 MASTER_IDENTITY_LOCK
                     .lock()
@@ -750,7 +750,7 @@ impl Shared {
         };
         let out = master::write_file(&pm, slug, name, text, "operator")?;
         master::record(&self.state_dir, slug, name, &master::digest(text))?;
-        if identity_file {
+        if protected_master_file {
             self.bump_master_rev();
         }
         Ok(out)
@@ -823,10 +823,10 @@ impl Shared {
             ));
         }
         let pm = self.pm()?;
-        let _identity_guard = MASTER_IDENTITY_LOCK
+        let identity_guard = MASTER_IDENTITY_LOCK
             .lock()
             .map_err(|_| Error::internal("master identity lock poisoned"))?;
-        let current = self.master_identity()?;
+        let current = self.master_identity_locked(&identity_guard)?;
         if current.revision != expected_revision {
             return Err(Error::rejected(format!(
                 "master identity revision is stale (current {}); reload the \
@@ -876,7 +876,7 @@ impl Shared {
                 &super::caller_audit(&AgentCaller::Operator),
             )?;
         }
-        let identity = self.master_identity()?;
+        let identity = self.master_identity_locked(&identity_guard)?;
         // The board's master push frame keys on this revision, so an open
         // header refetches the identity it just missed.
         self.bump_master_rev();
@@ -911,11 +911,16 @@ impl Shared {
         let pm = self.pm()?;
         // Files edited around the writer refuse BEFORE anything is
         // installed or registered — a refusal writes nothing.
-        master::verify(
-            &self.state_dir,
-            ALIAS,
-            &master::read_files(&pm.dir, ALIAS, false)?,
-        )?;
+        {
+            let _guard = MASTER_IDENTITY_LOCK
+                .lock()
+                .map_err(|_| Error::internal("master identity lock poisoned"))?;
+            master::verify(
+                &self.state_dir,
+                ALIAS,
+                &master::read_files(&pm.dir, ALIAS, false)?,
+            )?;
+        }
         // `claude` and `pi` (CAD-322) — a Codex master still waits for a
         // read-only sandbox with its writes through daemon verbs.
         let requested = optional_str(params, "provider");
@@ -972,9 +977,15 @@ impl Shared {
                 ))
             }
         }
-        let installed = master::install_defaults(&pm, "operator")?;
-        let files = master::read_files(&pm.dir, ALIAS, true)?;
-        master::verify(&self.state_dir, ALIAS, &files)?;
+        let (installed, files) = {
+            let _guard = MASTER_IDENTITY_LOCK
+                .lock()
+                .map_err(|_| Error::internal("master identity lock poisoned"))?;
+            let installed = master::install_defaults(&pm, "operator")?;
+            let files = master::read_files(&pm.dir, ALIAS, true)?;
+            master::verify(&self.state_dir, ALIAS, &files)?;
+            (installed, files)
+        };
         let agent_md = files
             .iter()
             .find(|(n, _)| n == "AGENT.md")

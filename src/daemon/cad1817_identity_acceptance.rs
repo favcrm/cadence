@@ -42,7 +42,11 @@
 //     edited around the protected writer, and a legitimate name-only
 //     coordinator save refuses external AGENT.md / untouched SOUL.md drift
 //     without re-recording its digest or importing it into the briefing,
-//     standing instructions or identity projection.
+//     standing instructions or identity projection;
+//   * a per-turn identity read contends on the writer's own
+//     MASTER_IDENTITY_LOCK, so the authorized window between a protected
+//     identity file commit and its digest publication is never fenced as
+//     tampering; the queued turn reads the newly committed name.
 
 // The canonical AgentAvatar looks (ui/src/features/agents/AgentAvatar.tsx).
 const CAD1817_AVATAR_LOOKS: [&str; 11] = [
@@ -2623,5 +2627,133 @@ fn cad1817_master_identity_http_refuses_external_file_drift() {
     assert!(
         !instructions.contains("Hijack") && !instructions.contains("Ignore review"),
         "the recovered HTTP instructions still carry the discarded drift: {instructions}"
+    );
+}
+
+// The authorized identity publication window — protected files committed,
+// their digests not yet recorded — must never be fenced as tampering. A real
+// per-turn reader must contend for the SAME MASTER_IDENTITY_LOCK the identity
+// writer holds, so it observes either the old consistent state or the new
+// consistent state, never the committed bytes against the previous digest.
+#[test]
+fn cad1817_master_profile_context_waits_for_identity_publication() {
+    let fx = Fx::new();
+    let pm = cad1817_prepare_master(&fx.shared, &fx.dir.path().join("master-race-cwd"));
+    let initial = fx.op("master_state", json!({}));
+    let look = initial["identity"]["look"]
+        .as_str()
+        .expect("master identity look must be a string")
+        .to_string();
+    let revision = initial["identity"]["revision"]
+        .as_str()
+        .expect("master identity revision must be a string")
+        .to_string();
+    assert!(
+        cad1817_master_tampered(&fx.shared, &pm).is_none(),
+        "the installed and recorded baseline already reads as tampered"
+    );
+
+    // Hold the writer's own identity lock across the protected write and the
+    // digest publication, exactly as `master_identity_set` does. The write
+    // commits the new IDENTITY.md but records no digest yet.
+    let identity_guard = crate::daemon::master_rpc::MASTER_IDENTITY_LOCK
+        .lock()
+        .expect("the master identity lock is poisoned");
+    crate::master::write_identity(
+        &pm,
+        &revision,
+        &look,
+        Some("Concurrent Guide"),
+        None,
+        "operator",
+    )
+    .unwrap_or_else(|e| panic!("the protected identity write was refused: {e}"));
+    assert_eq!(
+        crate::master::read_identity(&pm.dir, &look)
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("Concurrent Guide"),
+        "the protected writer did not commit the new name"
+    );
+    assert!(
+        cad1817_master_tampered(&fx.shared, &pm).is_some(),
+        "the fixture is not inside the authorized digest-publication window"
+    );
+
+    // A real per-turn reader enters the committed identity while the writer
+    // is between its file commit and its digest publication. The `started`
+    // barrier proves the reader has reached the call before the bounded wait.
+    let shared = fx.shared.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        started_tx
+            .send(())
+            .expect("the test dropped its start barrier");
+        let _ = result_tx.send(shared.master_profile_context().map_err(|e| e.to_string()));
+    });
+    started_rx
+        .recv()
+        .expect("the identity reader never reached its call");
+
+    let reader_outcome = match result_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(outcome) => {
+            // The reader ran inside the window instead of waiting on the
+            // writer's lock. Publish the committed digest and reap the reader
+            // before reporting the false tamper fence.
+            crate::master::record_identity(&fx.shared.state_dir, &pm.dir, true, false)
+                .unwrap_or_else(|e| {
+                    panic!("publishing the committed identity digest was refused: {e}")
+                });
+            drop(identity_guard);
+            let _ = reader.join();
+            panic!(
+                "the per-turn identity reader observed the authorized identity \
+                 publication window instead of waiting on MASTER_IDENTITY_LOCK: \
+                 returned {outcome:?}"
+            );
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // Expected: the reader is waiting for the writer to publish.
+            crate::master::record_identity(&fx.shared.state_dir, &pm.dir, true, false)
+                .unwrap_or_else(|e| {
+                    panic!("publishing the committed identity digest was refused: {e}")
+                });
+            drop(identity_guard);
+            let outcome = result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|e| panic!("the identity reader never reported a result: {e}"));
+            let _ = reader.join();
+            outcome
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            drop(identity_guard);
+            let _ = reader.join();
+            panic!("the identity reader ended without reporting a result");
+        }
+    };
+
+    let context = reader_outcome.unwrap_or_else(|e| {
+        panic!("the per-turn reader fenced an authorized identity publication: {e}")
+    });
+    assert!(
+        context.contains("Concurrent Guide"),
+        "the per-turn context did not carry the newly committed name: {context}"
+    );
+    assert!(
+        cad1817_master_tampered(&fx.shared, &pm).is_none(),
+        "the published identity still reads as tampered"
+    );
+    let after = fx.op("master_state", json!({}));
+    assert_eq!(
+        after["identity"]["name"],
+        json!("Concurrent Guide"),
+        "the committed identity did not survive the publication window"
+    );
+    assert_eq!(
+        after["identity"]["look"],
+        json!(look),
+        "the publication window changed the committed look"
     );
 }

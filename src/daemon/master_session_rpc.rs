@@ -12,18 +12,25 @@ impl Shared {
     /// unpinned). A malformed or refused file read is an error, never a silent
     /// unset; a missing file is genuinely unset.
     pub(super) fn master_identity(&self) -> Result<MasterIdentity> {
+        let guard = super::master_rpc::MASTER_IDENTITY_LOCK
+            .lock()
+            .map_err(|_| Error::internal("master identity lock poisoned"))?;
+        self.master_identity_locked(&guard)
+    }
+
+    /// The writer already holds the publication lock; do not re-enter it.
+    pub(super) fn master_identity_locked(
+        &self,
+        _guard: &std::sync::MutexGuard<'_, ()>,
+    ) -> Result<MasterIdentity> {
         let pm_dir = self.pm_dir()?;
-        let pinned = self
-            .store
-            .agent_opt(crate::master::ALIAS)?
-            .and_then(|agent| agent.params)
-            .and_then(|params| {
-                params
-                    .get("look")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            });
-        let look = crate::agent_roles::effective_look(crate::master::ALIAS, pinned.as_deref());
+        let agent = self.store.agent_opt(crate::master::ALIAS)?;
+        let pinned = agent
+            .as_ref()
+            .and_then(|agent| agent.params.as_ref())
+            .and_then(|params| params.get("look"))
+            .and_then(Value::as_str);
+        let look = crate::agent_roles::effective_look(crate::master::ALIAS, pinned);
         let identity = crate::master::read_verified_identity(&self.state_dir, &pm_dir, look)?;
         Ok(MasterIdentity {
             name: identity.name,

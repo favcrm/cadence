@@ -2270,6 +2270,9 @@ Identity reads check the protected source digests before per-turn use. A
 coordinator identity save refuses existing drift in any protected source before
 writing; it records only the fields changed and verifies the post-save briefing
 sources rather than blessing unrelated edits.
+`MASTER_IDENTITY_LOCK` serializes verified reads with protected file/digest/params
+publication, including direct Master file edits and installation. A legitimate
+save cannot be mistaken for external drift while its digest is being published.
 `Shared::prompt_with_profile` includes committed name/personality in the initial
 prompt and any permitted fresh-session retry, including Pi `/new` and pre-tool
 history recovery. The UI reports next-turn application, not a change to an
