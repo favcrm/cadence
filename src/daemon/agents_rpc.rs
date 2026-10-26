@@ -551,7 +551,7 @@ impl Shared {
         // result detail, so it applies the same source/owner decision as the
         // dedicated cloud read before projecting anything — current READ
         // authority, and only the caller's own source's rows.
-        let projection = self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
+        let mut projection = self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
         // CAD-1380: daemon `assist_intent` rows are member-private routing. Only
         // the operator reads them from the shared stream; every other caller gets
         // the same page with those rows removed, cursors unchanged.
@@ -560,7 +560,9 @@ impl Shared {
                 self.connection_caller(peer_pid)?,
                 caller_rule::Who::Operator
             );
-        let visible = |events: Vec<crate::store::Event>| -> Result<Vec<crate::store::Event>> {
+        let visible = |projection: &cloud_agent_rpc::CloudProjection,
+                       events: Vec<crate::store::Event>|
+         -> Result<Vec<crate::store::Event>> {
             let events = projection.events(&self.store, events)?;
             Ok(if hide_intents {
                 events
@@ -589,7 +591,7 @@ impl Shared {
             }
             let cursor = events.last().map(|e| e.seq).unwrap_or(0);
             return Ok(json!({
-                "events": visible(events)?.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
+                "events": visible(&projection, events)?.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
                 "cursor": cursor,
                 "has_older": has_older,
             }));
@@ -598,9 +600,22 @@ impl Shared {
         loop {
             let events = self.store.events(&alias, after, 100)?;
             if !events.is_empty() || self.closing.load(Ordering::SeqCst) {
+                // A waiting read can observe an event about a turn that
+                // settled after this admission was taken. Re-prove the
+                // caller's current authority before projecting it, exactly as
+                // `thread_read` does: the old admission never covered it. This
+                // page is returned either way, so one re-proof is the bound.
+                if projection.needs_readmission(
+                    &self.store,
+                    events
+                        .iter()
+                        .filter_map(|event| event.payload.get("message").and_then(Value::as_str)),
+                )? {
+                    projection = self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
+                }
                 let cursor = events.last().map(|e| e.seq).unwrap_or(after);
                 return Ok(json!({
-                    "events": visible(events)?.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
+                    "events": visible(&projection, events)?.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
                     "cursor": cursor,
                 }));
             }

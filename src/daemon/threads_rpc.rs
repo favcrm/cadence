@@ -112,7 +112,7 @@ impl Shared {
         // dedicated cloud read — current READ authority for the caller's own
         // source, and only that source's rows — so a peer with no grant is
         // refused and an enrolled peer never sees another source's reply.
-        let projection = self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
+        let mut projection = self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
         // CAD-1098: `conversation` selects one thread of this alias by
         // id (validated; unknown answers an error and creates nothing).
         // Without it the read is the home thread, unchanged.
@@ -168,6 +168,13 @@ impl Shared {
             // the caller's cursor short of rows it must move past, and the
             // filtered content is exactly what must not be exposed.
             let cursor = raw.last().map(|e| e.seq).unwrap_or(0);
+            // A backward scan needs the same honesty in the other direction:
+            // the LOWEST seq this page scanned is the continuation point. A
+            // partially (or wholly) filtered page keeps fewer rows than it
+            // scanned, so `entries[0]` may not move at all; without this
+            // boundary the consumer would re-read the same hidden page
+            // forever and never reach the history below it.
+            let scanned_before = raw.first().map(|e| e.seq);
             let entries = projection.entries(&self.store, raw)?;
             // CAD-1700: the complete watermark of the authorized thread,
             // never just this (bounded) page or the cursor's window.
@@ -181,12 +188,17 @@ impl Shared {
                 entries: self.entries_json(&alias, &entries)?,
                 cursor,
                 more_before: Some(more),
+                scanned_before,
+                more_after: None,
                 reply_seq,
             })
             .expect("thread page serializes"));
         }
         let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
         let deadline = Instant::now() + Duration::from_secs(wait);
+        // At most one re-proof per call, so a wait cannot turn a revoked or
+        // unsettled operation into a readback loop.
+        let mut readmitted = false;
         loop {
             let thread = match &conversation {
                 Some(thread) => Some(thread.clone()),
@@ -196,12 +208,34 @@ impl Shared {
                 Some(thread) => self.store.thread_entries_of(&thread.id, after, limit)?,
                 None => self.store.thread_entries(&alias, after, limit)?,
             };
+            // A read that WAITED can observe content that settled after its
+            // admission was taken — its own queued turn woken by another
+            // connection, for instance. That settlement was never admitted,
+            // so re-prove the caller's current authority before projecting
+            // it: the new admission either covers it under the platform's own
+            // answer or refuses/withholds it. Projecting it under the old
+            // admission would serve a reply the platform's readback never
+            // covered.
+            if !readmitted
+                && projection.needs_readmission(
+                    &self.store,
+                    raw.iter().filter_map(|entry| entry.message_id.as_deref()),
+                )?
+            {
+                projection = self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
+                readmitted = true;
+            }
             // The cursor is the last row this page SCANNED, never the last
             // row the projection kept. Filtering another source's cloud
             // entries out must not leave the caller's `after` on a seq it has
             // already passed, or a consumer would re-read the same hidden
             // page forever; the filtered content itself is never exposed.
             let scanned = raw.last().map(|e| e.seq).unwrap_or(after);
+            // Whether the scan reached the page's end is a property of the
+            // RAW page, never of the kept one: a projection can hide every
+            // row of a full page, so the visible count says nothing about
+            // exhaustion.
+            let more_after = raw.len() as i64 == limit;
             let entries = projection.entries(&self.store, raw)?;
             if !entries.is_empty()
                 || Instant::now() >= deadline
@@ -219,6 +253,8 @@ impl Shared {
                     entries: self.entries_json(&alias, &entries)?,
                     cursor: scanned,
                     more_before: None,
+                    scanned_before: None,
+                    more_after: Some(more_after),
                     reply_seq,
                 })
                 .expect("thread page serializes"));

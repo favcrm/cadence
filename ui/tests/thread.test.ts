@@ -252,6 +252,102 @@ async function main() {
     equal(threw, true, "a 503 is a failure");
   }
 
+  // CAD-1853: paging past rows a projection filtered out. The daemon reports
+  // what it SCANNED, so a page that kept nothing still advances, and the
+  // forward catch-up trusts the raw-page answer instead of the visible count.
+  {
+    const calls: string[] = [];
+    const filtered: PageReader = {
+      after: async (after, limit) => {
+        calls.push(`after:${after}`);
+        if (after === 100) {
+          // A full raw page the projection reduced to one entry.
+          return {
+            thread: { id: "t1" },
+            entries: [entry(101, "agent", "turn_result", "kept")].slice(0, limit),
+            cursor: 101,
+            more_after: true,
+          };
+        }
+        return {
+          thread: { id: "t1" },
+          entries: [entry(102, "agent", "turn_result", "next")].slice(0, limit),
+          cursor: 102,
+          more_after: false,
+        };
+      },
+      tail: async () => {
+        calls.push("tail");
+        // The newest page is entirely another source's: nothing kept, but the
+        // scan still stopped at 901.
+        return {
+          thread: { id: "t1" },
+          entries: [],
+          cursor: 1000,
+          scanned_before: 901,
+          more_before: true,
+        };
+      },
+      before: async (before, limit) => {
+        calls.push(`before:${before}`);
+        if (before === 901) {
+          return {
+            thread: { id: "t1" },
+            entries: [entry(850, "operator", "message", "older")].slice(0, limit),
+            cursor: 899,
+            scanned_before: 801,
+            more_before: true,
+          };
+        }
+        return {
+          thread: { id: "t1" },
+          entries: [],
+          cursor: 800,
+          scanned_before: 701,
+          more_before: false,
+        };
+      },
+    };
+
+    // The forward catch-up keeps going on `more_after` even though the kept
+    // page was short: the RAW scan filled the page.
+    const held = mergePage(null, {
+      thread: { id: "t1" },
+      entries: [entry(100, "operator", "message", "start")],
+    });
+    const caught = await loadThread(filtered, held, 2);
+    equal(calls, ["after:100", "after:101"], "a full raw page keeps catching up");
+    equal(lastSeq(caught), 102, "catch-up ends on the daemon's exhausted page");
+    calls.length = 0;
+
+    // A fully filtered tail still carries a backward boundary: older history
+    // stays reachable even with nothing held.
+    let s = await loadThread(filtered, null, 100);
+    equal(
+      [s.entries.length, s.older, s.moreBefore],
+      [0, 901, true],
+      "a filtered tail keeps its scanned boundary",
+    );
+    const older = await fetchEarlier(filtered, s, 100)!;
+    equal(calls, ["tail", "before:901"], "earlier continues below the scan, not from an empty page");
+    s = applyEarlier(s, await older);
+    equal(
+      [s.entries.map((e) => e.seq), s.older, s.moreBefore],
+      [[850], 801, true],
+      "a kept page moves the boundary down",
+    );
+    // The next press continues below the SCAN (801), never from the held entry
+    // (850): otherwise a partially filtered page is read again.
+    const bottom = await fetchEarlier(filtered, s, 100)!;
+    equal(calls[calls.length - 1], "before:801", "the next press continues below the scan");
+    s = applyEarlier(s, await bottom);
+    equal(
+      [s.entries.map((e) => e.seq), s.older, s.moreBefore],
+      [[850], 701, false],
+      "a fully filtered page still advances and reports exhaustion",
+    );
+  }
+
   // Plan cards: each epic once, at its first mention.
   {
     equal(planRef(entry(1, "agent", "tool_result", '{"epic": "D-2", "tickets": ["D-3"]}')), "D-2", "json epic");

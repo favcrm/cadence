@@ -725,13 +725,25 @@ export interface ThreadMessageReq {
 }
 
 /** `thread_read` (daemon RPC; `GET /api/threads/<alias>` relays it).
- * A forward read carries `cursor`; a backward one also `more_before`. */
+ * 
+ * `cursor` is the last row the page scanned in the direction it was read —
+ * the forward resume point, and the newest scanned row of a `tail` page. A
+ * projection can filter another source's rows out of a page, so a consumer
+ * must move by what was SCANNED and never by what was kept:
+ * 
+ * - `more_before` (backward) says raw rows remain below the page;
+ * - `scanned_before` (backward) is the lowest seq scanned, the `before`
+ *   continuation — present even when the page kept nothing;
+ * - `more_after` (forward) says the scan filled the page, so raw rows may
+ *   remain beyond it. */
 export interface ThreadPage {
   alias: string;
   cursor: number;
   entries: ThreadEntryRow[];
+  more_after?: boolean | null;
   more_before?: boolean | null;
   reply_seq: number;
+  scanned_before?: number | null;
   thread?: ThreadInfo | null;
 }
 

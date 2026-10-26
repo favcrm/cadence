@@ -47,30 +47,188 @@ fn cloud_agent_id(params: &Value) -> Result<&str> {
     Ok(id)
 }
 
-/// The caller's own admitted view of one cloud alias.
+/// What one admission covers for one operation, fixed when the read began.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// The operation had settled before this read was admitted, and — for the
+    /// one operation the platform was asked about — the platform's own answer
+    /// is terminal-completed. Its whole durable row set may be projected.
+    Settled,
+    /// The operation was admitted but had NOT settled when this read began.
+    /// Only the caller's own request text may be projected: a settlement that
+    /// lands later is never served under an admission that did not cover it.
+    Request,
+}
+
+/// What a single row may project under this admission.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Row {
+    /// Project the row whole.
+    Full,
+    /// Project only the caller's own request text (an unsettled operation).
+    Request,
+    /// Never project this row.
+    Never,
+}
+
+/// What the platform itself reported for the one operation an admission
+/// asked about.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlatformState {
+    /// Terminal-completed: the stored receipt is the caller's own settled
+    /// content, so it may be projected.
+    Completed,
+    /// Nonterminal or failed — or a settled receipt its terminal answer
+    /// contradicts, which the read above refuses outright. Either way no
+    /// stored reply text is presented.
+    Unsettled,
+}
+
+/// One cloud connection's admitted operation states.
+struct CloudScope {
+    cloud_agent_id: String,
+    source: Source,
+    admitted: std::collections::BTreeMap<String, Admission>,
+}
+
+/// The caller's own admitted view of one alias.
 ///
-/// An ordinary local alias carries no scopes and projects unchanged. A cloud
-/// alias carries the caller's own source per connection, and every projected
-/// row must resolve to an operation that source was admitted for.
+/// A cloud alias carries the caller's own source per connection, and every
+/// projected row must resolve to an operation that source was admitted for,
+/// in the state the admission covered. An ordinary local alias projects
+/// unchanged — except for cloud-DERIVED rows (a routed `worker_result` whose
+/// immutable origin reaches a cloud request/result): those are cloud content
+/// off the cloud alias too, and only a UID the delivery was bound to, or the
+/// operator, may read them.
 pub(super) struct CloudProjection {
-    scopes: Vec<(String, Source)>,
+    scopes: Vec<CloudScope>,
+    /// Cloud-derived rows on an ordinary alias by message id, with the
+    /// delivered UID binding.
+    derived: std::collections::HashMap<String, crate::store::cloud_agent::CloudDerivedRow>,
+    /// The caller's verified agent UID, when the connection derives one.
+    viewer: Option<String>,
+    /// The connection is provably the operator.
+    operator: bool,
 }
 
 impl CloudProjection {
     /// No cloud authority on this alias: nothing to filter.
     fn ordinary() -> Self {
-        Self { scopes: Vec::new() }
+        Self {
+            scopes: Vec::new(),
+            derived: std::collections::HashMap::new(),
+            viewer: None,
+            operator: false,
+        }
     }
 
-    /// Whether the operation a projected row belongs to was admitted for the
-    /// caller's own source. The operation row is the attribution witness: the
-    /// cloud request/reply carries no caller-supplied owner, and the canonical
-    /// message id IS the operation id. A row whose operation does not resolve
-    /// on this connection is never projected.
-    fn owns(&self, store: &crate::store::Store, message_id: &str) -> Result<bool> {
-        for (cloud_agent_id, source) in &self.scopes {
-            if let Some(operation) = store.cloud_agent_operation(cloud_agent_id, message_id)? {
-                return Ok(source.matches(&operation));
+    /// A cloud alias, admitted per operation for this caller's own source.
+    fn cloud(scopes: Vec<CloudScope>) -> Self {
+        Self {
+            scopes,
+            derived: std::collections::HashMap::new(),
+            viewer: None,
+            operator: false,
+        }
+    }
+
+    /// An ordinary alias holding cloud-derived rows: those rows are bound to
+    /// the UIDs their delivery carried.
+    fn derived_rows(
+        rows: Vec<crate::store::cloud_agent::CloudDerivedRow>,
+        viewer: Option<String>,
+        operator: bool,
+    ) -> Self {
+        Self {
+            scopes: Vec::new(),
+            derived: rows
+                .into_iter()
+                .map(|row| (row.message_id.clone(), row))
+                .collect(),
+            viewer,
+            operator,
+        }
+    }
+
+    /// The admission covering the operation that a projected row's canonical
+    /// message id names, on this caller's own source. The operation row is the
+    /// attribution witness: the cloud request/reply carries no caller-supplied
+    /// owner, and the canonical message id IS the operation id. `None` means
+    /// the row is not the caller's own admitted operation.
+    fn admission(
+        &self,
+        store: &crate::store::Store,
+        message_id: &str,
+    ) -> Result<Option<Admission>> {
+        for scope in &self.scopes {
+            if let Some(operation) =
+                store.cloud_agent_operation(&scope.cloud_agent_id, message_id)?
+            {
+                // The operation resolves on this connection: it belongs to
+                // this source or to no one the caller may read.
+                if !scope.source.matches(&operation) {
+                    return Ok(None);
+                }
+                return Ok(scope.admitted.get(message_id).copied());
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether the delivery binding of a derived row reaches this caller.
+    fn bound(&self, row: &crate::store::cloud_agent::CloudDerivedRow) -> bool {
+        if self.operator {
+            return true;
+        }
+        let Some(viewer) = self.viewer.as_deref() else {
+            return false;
+        };
+        row.sender_uid.as_deref() == Some(viewer) || row.recipient_uid.as_deref() == Some(viewer)
+    }
+
+    fn row(&self, store: &crate::store::Store, message_id: &str) -> Result<Row> {
+        if !self.scopes.is_empty() {
+            return Ok(match self.admission(store, message_id)? {
+                Some(Admission::Settled) => Row::Full,
+                Some(Admission::Request) => Row::Request,
+                None => Row::Never,
+            });
+        }
+        match self.derived.get(message_id) {
+            None => Ok(Row::Full),
+            Some(row) => Ok(if self.bound(row) {
+                Row::Full
+            } else {
+                Row::Never
+            }),
+        }
+    }
+
+    /// Whether these rows carry content this admission does not cover because
+    /// one of the caller's own operations settled after it was taken. A
+    /// waiting read re-proves authority before it may project such rows.
+    pub(super) fn needs_readmission<'a>(
+        &self,
+        store: &crate::store::Store,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<bool> {
+        for id in ids {
+            for scope in &self.scopes {
+                let Some(operation) = store.cloud_agent_operation(&scope.cloud_agent_id, id)?
+                else {
+                    continue;
+                };
+                if !scope.source.matches(&operation) {
+                    continue;
+                }
+                let covered = match scope.admitted.get(id) {
+                    Some(Admission::Settled) => true,
+                    Some(Admission::Request) => !operation.settled(),
+                    None => false,
+                };
+                if !covered {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
@@ -81,19 +239,25 @@ impl CloudProjection {
         store: &crate::store::Store,
         entries: Vec<crate::store::ThreadEntry>,
     ) -> Result<Vec<crate::store::ThreadEntry>> {
-        if self.scopes.is_empty() {
+        if self.scopes.is_empty() && self.derived.is_empty() {
             return Ok(entries);
         }
         let mut kept = Vec::with_capacity(entries.len());
         for entry in entries {
-            let owned = match entry.message_id.as_deref() {
-                Some(id) => self.owns(store, id)?,
+            let row = match entry.message_id.as_deref() {
+                Some(id) => self.row(store, id)?,
                 // A cloud thread carries no unattributable entry: an entry
                 // with no canonical message cannot be shown to be the
-                // caller's own.
-                None => false,
+                // caller's own. An ordinary alias keeps its own.
+                None if self.scopes.is_empty() => Row::Full,
+                None => Row::Never,
             };
-            if owned {
+            let keep = match row {
+                Row::Full => true,
+                Row::Request => entry.kind == crate::store::KIND_MESSAGE,
+                Row::Never => false,
+            };
+            if keep {
                 kept.push(entry);
             }
         }
@@ -105,13 +269,21 @@ impl CloudProjection {
         store: &crate::store::Store,
         messages: Vec<crate::store::Message>,
     ) -> Result<Vec<crate::store::Message>> {
-        if self.scopes.is_empty() {
+        if self.scopes.is_empty() && self.derived.is_empty() {
             return Ok(messages);
         }
         let mut kept = Vec::with_capacity(messages.len());
-        for message in messages {
-            if self.owns(store, &message.id)? {
-                kept.push(message);
+        for mut message in messages {
+            match self.row(store, &message.id)? {
+                Row::Full => kept.push(message),
+                Row::Request => {
+                    // The request is the caller's own text; the settled
+                    // receipt on the same row is not.
+                    message.result = None;
+                    message.error = None;
+                    kept.push(message);
+                }
+                Row::Never => {}
             }
         }
         Ok(kept)
@@ -122,19 +294,26 @@ impl CloudProjection {
         store: &crate::store::Store,
         events: Vec<crate::store::Event>,
     ) -> Result<Vec<crate::store::Event>> {
-        if self.scopes.is_empty() {
+        if self.scopes.is_empty() && self.derived.is_empty() {
             return Ok(events);
         }
         let mut kept = Vec::with_capacity(events.len());
         for event in events {
-            let owned = match event.payload.get("message").and_then(Value::as_str) {
-                Some(id) => self.owns(store, id)?,
+            let row = match event.payload.get("message").and_then(Value::as_str) {
+                Some(id) => self.row(store, id)?,
                 // Alias-level metadata (the connection itself) carries no
                 // request or result text; the read authority above already
                 // admitted the caller to this connection.
-                None => true,
+                None => Row::Full,
             };
-            if owned {
+            let keep = match row {
+                Row::Full => true,
+                // An unsettled operation keeps only its non-result events:
+                // the settlement payload is exactly what must not be shown.
+                Row::Request => event.payload.get("result").is_none(),
+                Row::Never => false,
+            };
+            if keep {
                 kept.push(event);
             }
         }
@@ -327,20 +506,26 @@ impl Shared {
     /// authority the dedicated cloud reads require — CURRENT read authority
     /// on its own source (the operator, or an enrolled peer whose source
     /// grant and credential are current on this connection, on the split
-    /// agent UID boundary). A plain local alias is untouched, so a peer's own
-    /// UID-bound reports keep working.
+    /// agent UID boundary). A plain local alias keeps projecting, so a peer's
+    /// own UID-bound reports keep working; what does not keep projecting are
+    /// the alias' cloud-DERIVED rows, which are bound to their delivery UIDs
+    /// by [`Self::admit_derived_cloud_rows`].
     ///
     /// That authority is checked twice, and only the second check can refuse
     /// a revocation that landed after this workspace saved its login: the
     /// local credential/enrollment scope first, then the platform's own
     /// current answer via [`Self::cloud_read_authority`]. A projection never
-    /// serves stored reply text on the strength of the local copy alone.
+    /// serves stored reply text on the strength of the local copy alone — and
+    /// the platform's answer is also what decides whether an operation is
+    /// settled enough to present: only a terminal-completed answer covers its
+    /// stored receipt, anything else withholds that operation's text.
     ///
-    /// The returned admission also binds every projected row: a cloud row is
-    /// shown only to the source/owner its operation was admitted for. The
-    /// operator is the owner of its own user source, never a blanket reader
-    /// of a peer's entries, and an enrolled peer never reads another
-    /// source's alias-wide history. When cloud content exists but no
+    /// The returned admission also binds every projected row to the state it
+    /// had when the read began: a cloud row is shown only to the source/owner
+    /// its operation was admitted for, and only as far as that snapshot
+    /// reaches. The operator is the owner of its own user source, never a
+    /// blanket reader of a peer's entries, and an enrolled peer never reads
+    /// another source's alias-wide history. When cloud content exists but no
     /// authority metadata resolves at all — a restored workspace whose four
     /// cloud tables were omitted — the projection fails closed.
     pub(super) fn admit_cloud_projection(
@@ -364,7 +549,7 @@ impl Shared {
                     ),
                 ));
             }
-            return Ok(CloudProjection::ordinary());
+            return self.admit_derived_cloud_rows(alias, peer_pid);
         }
         let mut scopes = Vec::with_capacity(cloud_agents.len());
         for agent in cloud_agents {
@@ -377,30 +562,100 @@ impl Shared {
             // The local copy proves what the workspace STORED, not what the
             // platform still allows: a read scope revoked upstream leaves the
             // saved login valid and unexpired. The platform's own answer is
-            // required before any stored cloud text is projected.
-            self.cloud_read_authority(&agent, &source)?;
-            scopes.push((agent.id, source));
+            // required before any stored cloud text is projected — and its
+            // state decides whether the stored receipt may be shown at all.
+            let answer = self.cloud_read_authority(&agent, &source)?;
+            // Every operation this caller's own source owns is admitted in
+            // the state it had WHEN this read began: a row may only be
+            // projected as far as that snapshot reaches, so a settlement
+            // that lands while a read waits is never served under an
+            // admission that did not cover it. The waiting readers re-prove
+            // authority before projecting such content (see
+            // [`CloudProjection::needs_readmission`]).
+            let mut admitted = std::collections::BTreeMap::new();
+            for operation in self.store.cloud_agent_operations(&agent.id, None)? {
+                if !source.matches(&operation) {
+                    continue;
+                }
+                let admission = if operation.settled() {
+                    Admission::Settled
+                } else {
+                    Admission::Request
+                };
+                admitted.insert(operation.operation_id, admission);
+            }
+            if let Some((operation_id, state)) = answer {
+                match state {
+                    // Only the platform's own terminal-completed answer
+                    // covers the stored receipt.
+                    PlatformState::Completed => {
+                        admitted.insert(operation_id, Admission::Settled);
+                    }
+                    // Nonterminal or failed: the platform does not report
+                    // this operation settled, so no stored reply text for it
+                    // is presented — an unsettled projection, not the cached
+                    // completed receipt.
+                    PlatformState::Unsettled => {
+                        admitted.remove(&operation_id);
+                    }
+                }
+            }
+            scopes.push(CloudScope {
+                cloud_agent_id: agent.id,
+                source,
+                admitted,
+            });
         }
-        Ok(CloudProjection { scopes })
+        Ok(CloudProjection::cloud(scopes))
     }
 
-    /// The platform's own answer to "may this source read its cloud turn
-    /// now?" — one readback of the caller's own newest submitted turn.
+    /// An ordinary alias can still carry cloud content: settling a turn routes
+    /// the reply to its sender as a `worker_result` (or `worker_notice`), and
+    /// that copy's immutable `origin` names the cloud operation. Cloud-ness is
+    /// a property of that provenance — never of the alias' provider or of a
+    /// `source` label on the alias — so those rows are bound to the UIDs the
+    /// delivery carried. The reporting worker and its recipient read them, the
+    /// operator reads them, and any other connection on the same socket UID
+    /// (an unrelated, unenrolled agent) does not. The alias' ordinary local
+    /// mail is untouched: a UID-bound report that did not derive from cloud
+    /// content has no such provenance and projects exactly as before.
+    fn admit_derived_cloud_rows(&self, alias: &str, peer_pid: u32) -> Result<CloudProjection> {
+        let rows = self.store.cloud_derived_messages(alias)?;
+        if rows.is_empty() {
+            return Ok(CloudProjection::ordinary());
+        }
+        let (viewer, operator) = match self.connection_caller(peer_pid) {
+            Ok(caller_rule::Who::Operator) => (None, true),
+            Ok(caller_rule::Who::Agent(caller)) => {
+                (self.store.agent(&caller).ok().map(|agent| agent.uid), false)
+            }
+            // A connection that derives no identity reads none of the cloud
+            // rows; its ordinary mail still projects as before.
+            Ok(caller_rule::Who::Unproven(_)) | Err(_) => (None, false),
+        };
+        Ok(CloudProjection::derived_rows(rows, viewer, operator))
+    }
+
+    /// The platform's own answer for "may this source read its cloud turn
+    /// now, and is that turn settled?" — one readback of the caller's own
+    /// newest submitted turn.
     ///
     /// The saved login/enrollment proves only the scope this workspace
     /// stored; the contract is the sole authority on whether it is still
     /// live. A refusal refuses the projection, an unreachable or uncertain
     /// answer propagates as uncertainty, and neither serves stored content.
-    /// The readback's answer is discarded: projections are rendered from the
-    /// store, so this call exists to prove permission, never to become a
-    /// second read path or a cache. Nothing is probed when the caller owns no
-    /// turn that crossed the submission boundary — such an alias holds only
-    /// the caller's own unsent request, and there is no receipt to vouch for.
+    /// The answer is not turned into a second read path: [`cloud_agent::
+    /// read_operation`] reconciles the durable receipt (a settled reply is
+    /// never withdrawn), and this projection only decides what that receipt
+    /// may show. Nothing is probed when the caller owns no turn that crossed
+    /// the submission boundary — and, crucially, such a caller's later
+    /// settlement is not covered by this admission either, so the waiting
+    /// readers re-prove rather than serve it.
     fn cloud_read_authority(
         &self,
         agent: &crate::store::CloudAgent,
         source: &Source,
-    ) -> Result<()> {
+    ) -> Result<Option<(String, PlatformState)>> {
         let Some(operation) = self
             .store
             .cloud_agent_operations(&agent.id, None)?
@@ -415,30 +670,29 @@ impl Shared {
                     .then_with(|| a.operation_id.cmp(&b.operation_id))
             })
         else {
-            return Ok(());
+            return Ok(None);
         };
         let target = Self::cloud_agent_target_for(agent, Some(source));
-        HostedCloudTransport
-            .read(
-                &target,
-                &operation.conversation_id,
-                &operation.operation_id,
-                source,
-            )
-            // A projection that cannot prove current read authority must not
-            // answer from the local receipt, and the caller must be able to
-            // tell that apart from a refusal: the dedicated read already
-            // reports an unreachable readback as `cloud_agent_uncertain`, so
-            // the generic projections report the same code.
-            .map(|_| ())
-            .map_err(|error| match error {
-                Error::OutcomeUnknown(_) => Error::unknown_coded(
-                    "cloud_agent_uncertain",
-                    "the platform could not be asked whether this caller may still read \
-                     this cloud agent; nothing was projected from the local receipt",
-                ),
-                error => error,
-            })
+        let authorize = || self.cloud_agent_authority(agent, source, SCOPE_READ);
+        // The dedicated read's own reconciliation: it proves the read
+        // authority again, refuses a terminal answer that contradicts the
+        // settled receipt, and reports an unreachable platform as the coded
+        // uncertainty a generic projection must not answer from cache.
+        let answer = cloud_agent::read_operation(
+            &self.store,
+            &HostedCloudTransport,
+            agent,
+            &target,
+            &operation.operation_id,
+            source,
+            authorize,
+        )?;
+        let state = if answer.status == crate::store::cloud_agent::STATUS_COMPLETED {
+            PlatformState::Completed
+        } else {
+            PlatformState::Unsettled
+        };
+        Ok(Some((answer.operation_id, state)))
     }
 
     pub(super) fn rpc_cloud_agent(

@@ -81,6 +81,12 @@ export interface ThreadState {
    *  catch-up from it is what keeps a fully filtered page from being read
    *  again forever. Absent on a daemon that predates the page cursor. */
   cursor?: number;
+  /** CAD-1853: the lowest `seq` the daemon has SCANNED BACKWARDS for this
+   *  thread (`scanned_before` of the oldest page read). The oldest HELD entry
+   *  is not a continuation point once a projection can hide a whole page —
+   *  it may not move at all — so "earlier" continues below this boundary
+   *  instead. Absent on a daemon that predates it. */
+  older?: number;
   entries: ThreadEntry[];
   pending: PendingMessage[];
 }
@@ -591,6 +597,13 @@ export interface ThreadPageLike {
   /** CAD-1853: the last `seq` this page scanned, past every row the
    *  projection filtered out. Absent on a daemon that predates it. */
   cursor?: number;
+  /** CAD-1853: backward reads only — the LOWEST `seq` this page scanned, the
+   *  `before` continuation past every row the projection filtered out. */
+  scanned_before?: number;
+  /** CAD-1853: forward reads only — the scan filled the page, so raw rows may
+   *  remain beyond it. `false` is exhaustion; absent on a daemon that
+   *  predates it. */
+  more_after?: boolean;
 }
 
 /** How the store reads pages: forward after a seq, the newest page, or
@@ -646,7 +659,16 @@ export async function loadThread(
             ? page.cursor
             : (lastSeq(state) ?? after);
         if (next > after) state = { ...state, cursor: next };
-        if (visible > 0 && visible < limit) return state;
+        // Exhaustion is a property of the RAW scan, not of the kept rows: a
+        // projection can hide every row of a FULL page, so a small visible
+        // count no longer proves the thread's end. Prefer the daemon's own
+        // raw-page answer; a daemon that predates it keeps the visible-count
+        // rule.
+        const exhausted =
+          typeof page.more_after === "boolean"
+            ? !page.more_after
+            : visible > 0 && visible < limit;
+        if (exhausted) return state;
         if (next <= after) return state;
         after = next;
       }
@@ -663,9 +685,20 @@ export async function loadThread(
         : 0,
       resumeSeq(fresh) ?? 0,
     );
+    // The tail is a BACKWARD read too. Its lowest scanned seq is where
+    // "earlier" continues, even when the projection kept none of the page —
+    // without it a fully filtered tail leaves older history unreachable,
+    // because there is no held entry to page below.
+    const older =
+      typeof page.scanned_before === "number" &&
+      Number.isSafeInteger(page.scanned_before) &&
+      page.scanned_before > 0
+        ? page.scanned_before
+        : null;
     return {
       ...fresh,
       ...(scanned > 0 ? { cursor: scanned } : {}),
+      ...(older !== null ? { older } : {}),
       moreBefore: typeof page.more_before === "boolean" ? page.more_before : null,
     };
   } catch (e) {
@@ -680,9 +713,20 @@ export function fetchEarlier(
   state: ThreadState,
   limit = PAGE,
 ): Promise<ThreadPageLike> | null {
+  // Continue below the last BACKWARD SCAN, not below the oldest held entry:
+  // a projection can hide a whole page, so the oldest held seq does not move
+  // and paging from it would re-read the same hidden page forever. The
+  // daemon's `scanned_before` is that boundary; without it (an older daemon)
+  // the first held entry is all we have.
   const first = state.entries[0]?.seq;
-  if (first === undefined || first <= 1) return null;
-  return read.before(first, limit);
+  const before =
+    first === undefined
+      ? state.older
+      : state.older === undefined
+        ? first
+        : Math.min(first, state.older);
+  if (before === undefined || before <= 1) return null;
+  return read.before(before, limit);
 }
 
 /**
@@ -692,7 +736,26 @@ export function fetchEarlier(
  */
 export function applyEarlier(state: ThreadState | null, page: ThreadPageLike): ThreadState {
   const merged = mergePage(state, page);
-  return { ...merged, moreBefore: page.more_before === true };
+  // The backward boundary only moves DOWN as pages fold in; keeping the
+  // smallest boundary read so far is what makes repeated "earlier" presses
+  // cross hidden pages instead of asking for the same one again.
+  const scanned =
+    typeof page.scanned_before === "number" &&
+    Number.isSafeInteger(page.scanned_before) &&
+    page.scanned_before > 0
+      ? page.scanned_before
+      : undefined;
+  const older =
+    scanned === undefined
+      ? state?.older
+      : state?.older === undefined
+        ? scanned
+        : Math.min(state.older, scanned);
+  return {
+    ...merged,
+    moreBefore: page.more_before === true,
+    ...(older !== undefined ? { older } : {}),
+  };
 }
 
 /** Items rendered at most, until the operator asks for earlier ones. */

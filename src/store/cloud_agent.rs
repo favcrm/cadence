@@ -306,6 +306,15 @@ impl CloudSession {
     }
 }
 
+/// One row on an ordinary alias whose immutable origin provenance reaches a
+/// cloud request/result, with the UID binding the delivery carried.
+#[derive(Debug, Clone)]
+pub struct CloudDerivedRow {
+    pub message_id: String,
+    pub sender_uid: Option<String>,
+    pub recipient_uid: Option<String>,
+}
+
 /// One durable request ⇄ remote operation correlation.
 #[derive(Debug, Clone)]
 pub struct CloudOperation {
@@ -1541,6 +1550,39 @@ impl Store {
                 |row| row.get(0),
             )?;
             Ok(present != 0)
+        })
+    }
+
+    /// The alias' rows whose IMMUTABLE origin provenance reaches a cloud
+    /// request/result — a routed `worker_result`/`worker_notice`, and anything
+    /// derived from that in turn. They are cloud content off the cloud alias
+    /// too, so a projection must bind them to the UIDs the delivery carried
+    /// instead of treating them as ordinary local mail.
+    ///
+    /// `messages.origin` is written by the daemon's outbox and never by a
+    /// request, so following it is not a caller-controlled claim. Rows with no
+    /// origin are ordinary.
+    pub fn cloud_derived_messages(&self, alias: &str) -> Result<Vec<CloudDerivedRow>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_vec(
+                "WITH RECURSIVE cloud(id) AS ( \
+                   SELECT id FROM messages \
+                    WHERE source='cloud_agent' \
+                       OR alias IN (SELECT alias FROM agents WHERE provider=?2) \
+                   UNION \
+                   SELECT m.id FROM messages m JOIN cloud c ON m.origin=c.id \
+                 ) \
+                 SELECT id, sender_uid, recipient_uid FROM messages \
+                  WHERE alias=?1 AND id IN (SELECT id FROM cloud)",
+                params![alias, crate::cloud_agent::PROVIDER],
+                |row| {
+                    Ok(CloudDerivedRow {
+                        message_id: row.get(0)?,
+                        sender_uid: row.get(1)?,
+                        recipient_uid: row.get(2)?,
+                    })
+                },
+            )?)
         })
     }
 

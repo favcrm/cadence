@@ -668,7 +668,17 @@ pub struct ThreadEntryRow {
 }
 
 /// `thread_read` (daemon RPC; `GET /api/threads/<alias>` relays it).
-/// A forward read carries `cursor`; a backward one also `more_before`.
+///
+/// `cursor` is the last row the page scanned in the direction it was read —
+/// the forward resume point, and the newest scanned row of a `tail` page. A
+/// projection can filter another source's rows out of a page, so a consumer
+/// must move by what was SCANNED and never by what was kept:
+///
+/// - `more_before` (backward) says raw rows remain below the page;
+/// - `scanned_before` (backward) is the lowest seq scanned, the `before`
+///   continuation — present even when the page kept nothing;
+/// - `more_after` (forward) says the scan filled the page, so raw rows may
+///   remain beyond it.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct ThreadPage {
     pub alias: String,
@@ -677,6 +687,10 @@ pub struct ThreadPage {
     pub cursor: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub more_before: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scanned_before: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub more_after: Option<bool>,
     pub reply_seq: i64,
 }
 

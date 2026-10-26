@@ -1843,6 +1843,22 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
         ),
         [cloud],
     )?;
+    // The closure is by REFERENCE as well as by row. A completed delivery
+    // duplicates its result into the alias' own `turn_finished` event
+    // (`payload.message` = the delivered message id, `payload.result` = the
+    // result text), so an event on an ordinary alias can carry a cloud reply
+    // that the message row no longer does. Every event naming a closed-over
+    // message — the routed copy, its delivery, or the cloud request itself —
+    // travels with it, whichever alias holds the event. Runs BEFORE the
+    // message delete: the closure is derived from `messages`.
+    tx.execute(
+        &format!(
+            "{cloud_messages} DELETE FROM events WHERE \
+               json_extract(payload,'$.message') IN (SELECT id FROM cloud_message) \
+               OR json_extract(payload,'$.delivery') IN (SELECT id FROM cloud_message)"
+        ),
+        [cloud],
+    )?;
     tx.execute(
         &format!(
             "{cloud_messages} DELETE FROM messages WHERE id IN (SELECT id FROM cloud_message)"

@@ -5257,6 +5257,716 @@ fn a_refused_reconnect_leaves_the_pin_and_the_session_unchanged() {
     assert_eq!(again["agent"]["id"], json!(id));
 }
 
+// ---------- round five: platform-state admission, derived bindings, waits ----------
+
+/// The platform's own answer — not the local receipt — decides what a
+/// projection may show: a nonterminal answer withholds that whole operation, a
+/// terminal failed answer that contradicts the settled receipt refuses, and a
+/// terminal-completed answer still serves the reply.
+#[test]
+fn a_nonterminal_or_failed_platform_answer_withholds_the_settled_receipt() {
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_read",
+        json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+    )
+    .unwrap();
+
+    let projections = [
+        ("thread_read", json!({"alias": ALIAS})),
+        ("agent_show", json!({"alias": ALIAS})),
+        ("agent_events", json!({"alias": ALIAS, "after": 0})),
+    ];
+
+    // 1. The platform reports the same operation nonterminal: the durable
+    // receipt is not an answer, and the whole operation is withheld.
+    fx.stub.set(|script| script.read_state = "running".into());
+    for (method, params) in projections.clone() {
+        let value = fx
+            .call(Asserted::Operator, method, params)
+            .unwrap_or_else(|e| panic!("{method} refused instead of withholding: {e}"));
+        let text = value.to_string();
+        assert!(
+            !text.contains("genuine stub reply"),
+            "{method} served the withheld reply: {value}"
+        );
+        assert!(
+            !text.contains(TEXT),
+            "{method} served the withheld request: {value}"
+        );
+    }
+    let kept = fx
+        .store()
+        .cloud_agent_operation(&id, OPERATION)
+        .unwrap()
+        .expect("settled receipt");
+    assert_eq!(
+        kept.status, "completed",
+        "a nonterminal answer rewrote the receipt"
+    );
+    assert_eq!(kept.reply_text.as_deref(), Some("genuine stub reply"));
+
+    // 2. A terminal failed answer contradicts the settled receipt.
+    fx.stub.set(|script| script.read_state = "failed".into());
+    for (method, params) in projections.clone() {
+        let error = fx.call(Asserted::Operator, method, params).unwrap_err();
+        assert_eq!(
+            code(&error),
+            Some("cloud_agent_receipt_conflict"),
+            "{method}: {error}"
+        );
+        assert!(
+            !error.to_string().contains("genuine stub reply"),
+            "{method} disclosed the reply: {error}"
+        );
+    }
+
+    // 3. Positive control: the platform's terminal-completed answer serves the
+    // stored receipt.
+    fx.stub.set(|script| script.read_state = "completed".into());
+    for (method, params) in projections {
+        let value = fx
+            .call(Asserted::Operator, method, params)
+            .unwrap_or_else(|e| panic!("{method} refused the completed answer: {e}"));
+        assert!(
+            value.to_string().contains("genuine stub reply"),
+            "{method} did not serve the reply: {value}"
+        );
+    }
+}
+
+/// A cloud reply routed onto an ordinary alias stays bound to the UIDs its
+/// delivery carried: the reporting peer and the operator read it, an unrelated
+/// registered agent on the same socket reads neither the message, nor its
+/// thread entry, nor the events naming it — while that alias' ordinary mail
+/// still projects.
+#[test]
+fn a_routed_cloud_result_is_not_projected_to_an_unrelated_agent() {
+    use cadence_agent::cloud_agent::{
+        self, CloudTransport, RemoteAgent, RemoteOperation, RemoteStatus, Sender, Source,
+        SubmitRequest,
+    };
+    use cadence_agent::remote_cli::RemoteTarget;
+    use cadence_agent::store::cloud_agent::{CloudSource, Owner};
+
+    const ROUTED: &str = "routed cloud reply";
+    const PEER_OPERATION: &str = "peer-operation-0005";
+
+    struct PeerReply;
+    impl CloudTransport for PeerReply {
+        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+            Err(cadence_agent::Error::rejected("connect unused"))
+        }
+        fn submit(
+            &self,
+            _: &RemoteTarget,
+            request: &SubmitRequest<'_>,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Ok(RemoteOperation {
+                status: RemoteStatus::Completed,
+                remote_operation_id: Some(request.operation_id.to_string()),
+                remote_session_id: None,
+                provider_session_id: None,
+                reply: Some(ROUTED.into()),
+                error: None,
+                invoker_id: Some("inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+            })
+        }
+        fn read(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Err(cadence_agent::Error::rejected("read unused"))
+        }
+        fn cancel(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<()> {
+            Err(cadence_agent::Error::rejected("cancel unused"))
+        }
+    }
+
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    for alias in ["peer", "outsider"] {
+        fx.call(
+            Asserted::Operator,
+            "agent_register",
+            json!({"alias": alias, "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
+        )
+        .unwrap();
+    }
+    // Ordinary mail on the peer alias first: it creates the thread and is the
+    // positive control the derived-row binding must leave alone.
+    fx.call(
+        Asserted::Operator,
+        "thread_send",
+        json!({
+            "alias": "peer", "text": "ordinary peer mail",
+            "message": "m-peer-ordinary",
+        }),
+    )
+    .unwrap();
+    let store = fx.store();
+    let cloud = store.cloud_agent(&id).unwrap().expect("cloud agent");
+    let peer = store.agent("peer").unwrap();
+    let stamp = cadence_agent::cloud_agent::registration_epoch(peer.created);
+    let owner = Owner::new("https://issuer.example.test", "stub-subject");
+    store
+        .cloud_agent_source_grant(&CloudSource {
+            cloud_agent_id: id.clone(),
+            kind: "local_peer".into(),
+            uid: peer.uid.clone(),
+            registration_epoch: stamp,
+            owner: owner.clone(),
+            label: "peer".into(),
+            scope: "cloud_agent.write".into(),
+            granted_by: "operator".into(),
+            granted_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+            invoker_id: None,
+            state: "active".into(),
+        })
+        .unwrap();
+    let target = RemoteTarget {
+        org: cloud.org_slug.clone(),
+        endpoint: cloud.endpoint.clone(),
+        org_id: cloud.organization_id.clone(),
+        identity: None,
+    };
+    let source = Source::registered(&peer, owner);
+    cloud_agent::send(
+        &store,
+        &PeerReply,
+        &cloud,
+        &target,
+        &home,
+        &Sender::Agent("peer".into()),
+        &source,
+        PEER_OPERATION,
+        "peer request body",
+        true,
+        None,
+        || Ok(()),
+    )
+    .expect("the admitted peer source settles its own turn");
+    let routed = store
+        .messages("peer")
+        .unwrap()
+        .into_iter()
+        .find(|row| row.source == "worker_result" && row.origin.as_deref() == Some(PEER_OPERATION))
+        .expect("the peer alias should hold the routed cloud result");
+    // Terminal, so the delivery's result event and thread entry really exist.
+    let delivered = store
+        .message(&routed.id)
+        .unwrap()
+        .expect("routed delivery row");
+    store
+        .finish(
+            &delivered,
+            "completed",
+            &json!({
+                "status": "completed",
+                "text": format!("peer turn observed: {}", delivered.body),
+                "via": "cad1853_guard_delivery",
+            }),
+            None,
+        )
+        .expect("the routed delivery must reach a terminal state");
+    let peer_entry = store
+        .thread_entries("peer", 0, 100)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.message_id.as_deref() == Some(routed.id.as_str()))
+        .expect("the delivered completion's result entry");
+    assert!(
+        peer_entry.text.contains(ROUTED),
+        "the result entry lost the reply: {}",
+        peer_entry.text
+    );
+
+    // The unrelated agent: no message, no entry, no naming event.
+    let outsider_show = fx
+        .call(
+            Asserted::Agent("outsider".into()),
+            "agent_show",
+            json!({"alias": "peer"}),
+        )
+        .unwrap();
+    assert!(
+        !outsider_show.to_string().contains(ROUTED),
+        "the unrelated agent read the routed cloud reply: {outsider_show}"
+    );
+    assert!(
+        !outsider_show.to_string().contains(&routed.id),
+        "the unrelated agent read the routed delivery: {outsider_show}"
+    );
+    assert!(
+        outsider_show.to_string().contains("ordinary peer mail"),
+        "the unrelated agent lost the alias' ordinary mail: {outsider_show}"
+    );
+    let outsider_thread = fx
+        .call(
+            Asserted::Agent("outsider".into()),
+            "thread_read",
+            json!({"alias": "peer"}),
+        )
+        .unwrap();
+    assert!(
+        !outsider_thread.to_string().contains(ROUTED),
+        "the unrelated agent read the result entry: {outsider_thread}"
+    );
+    assert!(
+        !outsider_thread.to_string().contains(&routed.id),
+        "the unrelated agent read the delivery's entry: {outsider_thread}"
+    );
+    assert!(
+        outsider_thread.to_string().contains("ordinary peer mail"),
+        "the unrelated agent lost the ordinary thread entry: {outsider_thread}"
+    );
+    let outsider_events = fx
+        .call(
+            Asserted::Agent("outsider".into()),
+            "agent_events",
+            json!({"alias": "peer", "after": 0}),
+        )
+        .unwrap();
+    assert!(
+        !outsider_events.to_string().contains(ROUTED),
+        "the unrelated agent read the result event: {outsider_events}"
+    );
+    assert!(
+        !outsider_events.to_string().contains(&routed.id),
+        "the unrelated agent read an event naming the delivery: {outsider_events}"
+    );
+
+    // The posting peer (a delivery UID) and the operator still read it.
+    for who in [Asserted::Agent("peer".into()), Asserted::Operator] {
+        let shown = fx
+            .call(who.clone(), "agent_show", json!({"alias": "peer"}))
+            .unwrap();
+        assert!(
+            shown.to_string().contains(ROUTED),
+            "the bound reader lost the routed reply: {shown}"
+        );
+        let thread = fx
+            .call(who, "thread_read", json!({"alias": "peer"}))
+            .unwrap();
+        assert!(
+            thread.to_string().contains(ROUTED),
+            "the bound reader lost the result entry: {thread}"
+        );
+    }
+}
+
+/// An admission is fixed when a read begins: a long-poll that observes a turn
+/// it was not admitted for re-proves authority before projecting it, so a
+/// revocation landing during the wait withholds the reply — while the same
+/// interleaving under a live grant serves the new request.
+#[test]
+fn a_waiting_thread_read_re_proves_authority_before_projecting_a_new_turn() {
+    let fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    // One settled turn gives the caller an admitted receipt the platform can
+    // be asked about during the wait.
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_read",
+        json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+    )
+    .unwrap();
+    let last = fx
+        .store()
+        .thread_entries(ALIAS, 0, 100)
+        .unwrap()
+        .last()
+        .expect("the settled turn wrote entries")
+        .seq;
+
+    // 1. The wait is admitted while read authority is live...
+    let waiting = {
+        let state = fx.state.clone();
+        thread::spawn(move || {
+            scoped(Asserted::Operator, || {
+                client::rpc(
+                    &state,
+                    "thread_read",
+                    json!({"alias": ALIAS, "after": last, "wait": 20}),
+                )
+            })
+        })
+    };
+    thread::sleep(Duration::from_millis(150));
+    // ...then the platform revokes read upstream and a new turn lands. The
+    // stub answers the submit as completed, so the trigger settles under
+    // WRITE authority alone — the wait must still re-prove its READ authority
+    // before projecting it.
+    fx.stub.set(|script| {
+        script.read_status = 403;
+        script.submit_state = "completed".into();
+        script.submit_text = Some("revoked wait reply".into());
+    });
+    let landed = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_send",
+            json!({
+                "cloud_agent_id": id, "thread_id": home,
+                "text": "revoked wait request",
+                "operation_id": "operation-00000031", "wake": true,
+            }),
+        )
+        .expect("submitting a turn needs write authority, not read");
+    assert_eq!(landed["operation"]["status"], json!("completed"));
+    let error = waiting
+        .join()
+        .unwrap()
+        .expect_err("the revoked wait must refuse, not serve from its old admission");
+    assert_eq!(code(&error), Some("cloud_agent_scope_revoked"), "{error}");
+    assert!(
+        !error.to_string().contains("revoked wait request")
+            && !error.to_string().contains("revoked wait reply"),
+        "the refused wait projected the newly settled turn: {error}"
+    );
+
+    // 2. Positive control: the same wait under a live grant serves the turn it
+    // was not admitted for.
+    fx.stub.set(|script| {
+        script.read_status = 0;
+        script.submit_text = Some("second reply".into());
+    });
+    let last = fx
+        .store()
+        .thread_entries(ALIAS, 0, 100)
+        .unwrap()
+        .last()
+        .expect("the settled trigger wrote entries")
+        .seq;
+    let waiting = {
+        let state = fx.state.clone();
+        thread::spawn(move || {
+            scoped(Asserted::Operator, || {
+                client::rpc(
+                    &state,
+                    "thread_read",
+                    json!({"alias": ALIAS, "after": last, "wait": 20}),
+                )
+            })
+        })
+    };
+    thread::sleep(Duration::from_millis(150));
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": "second request",
+            "operation_id": "operation-00000032", "wake": true,
+        }),
+    )
+    .unwrap();
+    let page = waiting
+        .join()
+        .unwrap()
+        .expect("the wait must serve the new turn under a live grant");
+    assert!(
+        page.to_string().contains("second request"),
+        "the re-proved wait withheld the new request: {page}"
+    );
+}
+
+/// The board thread page the UI consumes moves by what each page SCANNED: a
+/// fully filtered forward page advances `cursor`, a fully filtered backward
+/// page advances `scanned_before`, and a consumer in either direction neither
+/// repeats nor skips a kept entry.
+#[test]
+fn the_board_thread_page_advances_each_direction_past_filtered_pages() {
+    use cadence_agent::cloud_agent::{
+        self, CloudTransport, RemoteAgent, RemoteOperation, RemoteStatus, Sender, Source,
+        SubmitRequest,
+    };
+    use cadence_agent::remote_cli::RemoteTarget;
+    use cadence_agent::store::cloud_agent::{CloudSource, Owner};
+
+    const PEER_REQUEST: &str = "peer page request";
+    const PEER_REPLY: &str = "peer page reply";
+    const PEER_OPERATION: &str = "peer-operation-0006";
+
+    struct PeerReply;
+    impl CloudTransport for PeerReply {
+        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+            Err(cadence_agent::Error::rejected("connect unused"))
+        }
+        fn submit(
+            &self,
+            _: &RemoteTarget,
+            request: &SubmitRequest<'_>,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Ok(RemoteOperation {
+                status: RemoteStatus::Completed,
+                remote_operation_id: Some(request.operation_id.to_string()),
+                remote_session_id: None,
+                provider_session_id: None,
+                reply: Some(PEER_REPLY.into()),
+                error: None,
+                invoker_id: Some("inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+            })
+        }
+        fn read(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<RemoteOperation> {
+            Err(cadence_agent::Error::rejected("read unused"))
+        }
+        fn cancel(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: &str,
+            _: &Source,
+        ) -> cadence_agent::Result<()> {
+            Err(cadence_agent::Error::rejected("cancel unused"))
+        }
+    }
+
+    let mut fx = Fx::start();
+    let connect = fx.connect();
+    let id = cloud_agent_id(&connect);
+    let home = thread_of(&connect);
+    fx.call(
+        Asserted::Operator,
+        "agent_register",
+        json!({"alias": "peer", "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
+    )
+    .unwrap();
+    let store = fx.store();
+    let cloud = store.cloud_agent(&id).unwrap().expect("cloud agent");
+    let peer = store.agent("peer").unwrap();
+    let stamp = cadence_agent::cloud_agent::registration_epoch(peer.created);
+    let source = Source::registered(
+        &peer,
+        Owner::new("https://issuer.example.test", "stub-subject"),
+    );
+    store
+        .cloud_agent_source_grant(&CloudSource {
+            cloud_agent_id: id.clone(),
+            kind: "local_peer".into(),
+            uid: peer.uid.clone(),
+            registration_epoch: stamp,
+            owner: source.owner.clone(),
+            label: "peer".into(),
+            scope: "cloud_agent.write".into(),
+            granted_by: "operator".into(),
+            granted_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+            invoker_id: None,
+            state: "active".into(),
+        })
+        .unwrap();
+    let target = RemoteTarget {
+        org: cloud.org_slug.clone(),
+        endpoint: cloud.endpoint.clone(),
+        org_id: cloud.organization_id.clone(),
+        identity: None,
+    };
+    // The other source's rows come FIRST, so the caller's first page in either
+    // direction is entirely filtered.
+    cloud_agent::send(
+        &store,
+        &PeerReply,
+        &cloud,
+        &target,
+        &home,
+        &Sender::Agent("peer".into()),
+        &source,
+        PEER_OPERATION,
+        PEER_REQUEST,
+        true,
+        None,
+        || Ok(()),
+    )
+    .expect("the admitted peer source settles its own turn");
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_read",
+        json!({"cloud_agent_id": id, "operation_id": OPERATION}),
+    )
+    .unwrap();
+    fx.start_board();
+
+    let raw = store.thread_entries(ALIAS, 0, 100).unwrap();
+    assert_eq!(raw.len(), 4, "{raw:?}");
+    let raw_texts: Vec<&str> = raw.iter().map(|entry| entry.text.as_str()).collect();
+    assert_eq!(
+        raw_texts,
+        vec![PEER_REQUEST, PEER_REPLY, TEXT, "genuine stub reply"],
+        "the fixture's rows are not the other source's page followed by the caller's"
+    );
+
+    // Forward: the first page scans only the other source's rows.
+    let (status, first) = fx.get(
+        "operator",
+        &format!("/api/threads/{ALIAS}?after=0&limit=2"),
+        true,
+    );
+    assert_eq!(status, 200, "{first}");
+    assert!(
+        first["entries"].as_array().unwrap().is_empty(),
+        "a fully filtered board page leaked rows: {first}"
+    );
+    assert_eq!(
+        first["cursor"],
+        json!(raw[1].seq),
+        "the board forward cursor did not advance past the filtered page: {first}"
+    );
+    assert_eq!(first["more_after"], json!(true), "{first}");
+
+    // A forward consumer moves by `cursor` and never repeats a kept entry.
+    let mut after = first["cursor"].as_i64().unwrap();
+    let mut kept: Vec<i64> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    for _ in 0..6 {
+        let (status, page) = fx.get(
+            "operator",
+            &format!("/api/threads/{ALIAS}?after={after}&limit=2"),
+            true,
+        );
+        assert_eq!(status, 200, "{page}");
+        for entry in page["entries"].as_array().unwrap() {
+            let seq = entry["seq"].as_i64().unwrap();
+            assert!(
+                !kept.contains(&seq),
+                "the forward pager repeated entry {seq}: {page}"
+            );
+            kept.push(seq);
+            if let Some(text) = entry["text"].as_str() {
+                texts.push(text.to_string());
+            }
+        }
+        if page["more_after"] != json!(true) {
+            break;
+        }
+        after = page["cursor"].as_i64().unwrap();
+    }
+    assert_eq!(
+        kept,
+        vec![raw[2].seq, raw[3].seq],
+        "the forward pager did not reach the caller's rows in order"
+    );
+    assert_eq!(
+        texts.iter().filter(|text| **text == TEXT).count(),
+        1,
+        "{texts:?}"
+    );
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|text| **text == "genuine stub reply")
+            .count(),
+        1,
+        "{texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text == PEER_REQUEST || text == PEER_REPLY),
+        "the forward pager surfaced the other source's rows: {texts:?}"
+    );
+
+    // Backward: the newest page keeps the caller's rows and carries the lowest
+    // scanned row as its continuation; the next page is entirely filtered.
+    let (status, tail) = fx.get(
+        "operator",
+        &format!("/api/threads/{ALIAS}?tail=1&limit=2"),
+        true,
+    );
+    assert_eq!(status, 200, "{tail}");
+    assert_eq!(tail["cursor"], json!(raw[3].seq), "{tail}");
+    assert_eq!(
+        tail["scanned_before"],
+        json!(raw[2].seq),
+        "the backward boundary is not the lowest scanned row: {tail}"
+    );
+    assert_eq!(tail["more_before"], json!(true), "{tail}");
+    let (status, filtered) = fx.get(
+        "operator",
+        &format!("/api/threads/{ALIAS}?before={}&limit=2", raw[2].seq),
+        true,
+    );
+    assert_eq!(status, 200, "{filtered}");
+    assert!(
+        filtered["entries"].as_array().unwrap().is_empty(),
+        "a fully filtered backward board page leaked rows: {filtered}"
+    );
+    assert_eq!(
+        filtered["scanned_before"],
+        json!(raw[0].seq),
+        "the backward boundary did not advance past the filtered page: {filtered}"
+    );
+    assert_eq!(filtered["more_before"], json!(false), "{filtered}");
+    // Continuing from the boundary reaches the end instead of re-reading the
+    // hidden page.
+    let (status, end) = fx.get(
+        "operator",
+        &format!("/api/threads/{ALIAS}?before={}&limit=2", raw[0].seq),
+        true,
+    );
+    assert_eq!(status, 200, "{end}");
+    assert!(end["entries"].as_array().unwrap().is_empty(), "{end}");
+    assert!(
+        end["scanned_before"].is_null(),
+        "the exhausted backward scan still names a boundary: {end}"
+    );
+}
+
 // ---------- round four: platform-proven projection, derived copies, paging ----------
 
 /// The saved login proves only what this workspace STORED. A read scope
@@ -5329,12 +6039,14 @@ fn an_upstream_read_revocation_refuses_every_generic_projection() {
     });
     for (method, params) in projections.clone() {
         let error = fx.call(Asserted::Operator, method, params).unwrap_err();
-        // Uncertainty survives as an UNKNOWN outcome (not a rejection) with
-        // no stored content. NOTE: the round-four brief expected the coded
-        // `cloud_agent_uncertain` here; `cloud_read_authority` currently
-        // propagates the transport's own uncoded unknown instead, so this
-        // case asserts the observable contract (kind + no content) and the
-        // missing code is reported, not papered over.
+        // The projection asks the platform through the dedicated read again,
+        // so an unreachable platform is the same coded uncertainty the
+        // dedicated read reports — never a rejection and never stored text.
+        assert_eq!(
+            code(&error),
+            Some("cloud_agent_uncertain"),
+            "{method}: {error}"
+        );
         assert_eq!(error.kind(), "unknown", "{method}: {error}");
         assert!(
             !error.to_string().contains("genuine stub reply"),
@@ -5486,7 +6198,8 @@ fn a_portable_round_trip_with_an_enrolled_peer_drops_the_routed_result() {
     );
     // An unrelated local message on the same peer alias must survive the same
     // export: what is omitted is the DERIVED cloud copy, never the alias'
-    // own coordination history.
+    // own coordination history. It also gives the peer alias the thread the
+    // completion below appends its result entry to.
     fx.call(
         Asserted::Operator,
         "thread_send",
@@ -5496,6 +6209,54 @@ fn a_portable_round_trip_with_an_enrolled_peer_drops_the_routed_result() {
         }),
     )
     .unwrap();
+    // Drive the routed delivery to a terminal state BEFORE the export, instead
+    // of racing the delivery actor: the store's own completion primitive is
+    // what the daemon calls on a finished turn, and its result echoes the
+    // routed prompt, so the peer alias gets the `turn_finished` event and the
+    // result entry that quote the cloud reply. That is exactly the state the
+    // event closure has to drop.
+    let delivered = store
+        .message(&routed.id)
+        .unwrap()
+        .expect("routed delivery row");
+    let turn = json!({
+        "status": "completed",
+        "text": format!("peer turn observed: {}", delivered.body),
+        "via": "cad1853_guard_delivery",
+    });
+    store
+        .finish(&delivered, "completed", &turn, None)
+        .expect("the routed delivery must reach a terminal state");
+    let settled = store
+        .message(&routed.id)
+        .unwrap()
+        .expect("routed delivery row");
+    assert_eq!(
+        settled.state, "completed",
+        "the routed delivery was not terminal before the export"
+    );
+    let naming = store
+        .events("peer", 0, 100)
+        .unwrap()
+        .into_iter()
+        .find(|event| {
+            event.kind == "turn_finished"
+                && event.payload.get("message").and_then(Value::as_str) == Some(routed.id.as_str())
+        })
+        .expect("a delivered completion writes a turn_finished event naming it");
+    assert!(
+        naming.payload.to_string().contains(ROUTED),
+        "the delivered completion's result does not quote the reply: {}",
+        naming.payload
+    );
+    assert!(
+        store
+            .thread_entries("peer", 0, 100)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.text.contains(ROUTED)),
+        "the delivered completion wrote no result entry to drop"
+    );
 
     let tracker = fx.root.path().join("tracker-peer");
     std::fs::create_dir_all(&tracker).unwrap();
@@ -5574,6 +6335,14 @@ fn a_portable_round_trip_with_an_enrolled_peer_drops_the_routed_result() {
             (
                 "routed copy",
                 format!("SELECT COUNT(*) FROM messages WHERE origin='{PEER_OPERATION}'"),
+            ),
+            (
+                "naming event",
+                format!(
+                    "SELECT COUNT(*) FROM events WHERE payload LIKE '%{}%' \
+                     OR payload LIKE '%{PEER_OPERATION}%'",
+                    routed.id
+                ),
             ),
         ] {
             assert_eq!(

@@ -3,7 +3,7 @@ import type { Resource } from "../../../lib/cache";
 import { streamInto, type SseErrorState } from "../../../lib/sse";
 import { resources } from "../../../lib/resources";
 import type { MasterState } from "../../../lib/types";
-import { EMPTY_THREAD, applyEarlier, fetchEarlier, lastSeq, reduceFrame, threadItems, type PageReader, type ThreadPageLike, type ThreadState } from "../../home/thread";
+import { EMPTY_THREAD, applyEarlier, fetchEarlier, reduceFrame, resumeSeq, threadItems, type PageReader, type ThreadPageLike, type ThreadState } from "../../home/thread";
 
 /**
  * The one conversation thread engine Home and every app pane share
@@ -61,7 +61,11 @@ export function useThreadStream(
     }, {
       url,
       events: ["master", "entry"],
-      lastEventId: String(lastSeq(store.get().data) ?? 0),
+      // Resume from what the daemon has SCANNED, not from the newest held
+      // entry: a projection can hide rows past the last kept seq, and
+      // resuming below them would re-request the same hidden page on every
+      // (re)connect.
+      lastEventId: String(resumeSeq(store.get().data) ?? 0),
       onOpen: () => onLink("reconnecting"),
       onError: (state) => {
         onLink(state);
