@@ -91,8 +91,11 @@ impl CloudTransport for ProjectionReadTransport {
         &self,
         target: &RemoteTarget,
         conversation_id: &str,
+        source: Option<&Source>,
     ) -> Result<cloud_agent::RemoteAgent> {
-        HostedCloudTransport.connect(target, conversation_id)
+        let answer = HostedCloudTransport.connect(target, conversation_id, source);
+        self.remote_failed.set(answer.is_err());
+        answer
     }
 
     fn submit(
@@ -1040,126 +1043,26 @@ impl Shared {
             }
         };
         let target = Self::cloud_agent_target_for(agent, Some(source));
-        let body = json!({
-            "version": cloud_agent::wire::CONTRACT_VERSION,
-            "action": "agent",
-            "arguments": {"conversation_id": conversation_id},
-        });
         self.cloud_agent_authority(agent, source, SCOPE_READ)?;
-        let (status, answer) = match source.kind {
-            SOURCE_USER => crate::remote_cli::cloud_agent_post(
-                &target,
-                cloud_agent::wire::CONTRACT_PATH,
-                &body,
-                SCOPE_READ,
-            )?,
-            SOURCE_PEER => crate::remote_cli::cloud_agent_peer_post(
-                &target,
-                &source.owner,
-                &source.uid,
-                source.epoch,
-                cloud_agent::wire::CONTRACT_PATH,
-                &body,
-                SCOPE_READ,
-            )?,
-            _ => {
-                return Err(Error::gate_coded(
-                    "cloud_agent_source_refused",
-                    "unknown discovery source kind",
-                ))
-            }
-        };
-        match status {
-            200..=299 => {}
-            401 => {
-                return Err(Error::gate_coded(
-                    "cloud_agent_unauthorized",
-                    "cloud-agent discovery refused the current credential",
-                ))
-            }
-            403 => {
-                return Err(Error::gate_coded(
-                    "cloud_agent_scope_revoked",
-                    "cloud-agent discovery refused current read scope",
-                ))
-            }
-            503 => {
-                return Err(Error::unknown_coded(
-                    "cloud_agent_unavailable",
-                    "cloud-agent discovery is unavailable",
-                ))
-            }
-            500..=599 => {
-                return Err(Error::unknown_coded(
-                    "cloud_agent_uncertain",
-                    "cloud-agent discovery did not prove read authority",
-                ))
-            }
-            _ => {
-                return Err(Error::gate_coded(
-                    "cloud_agent_discovery_refused",
-                    "cloud-agent discovery refused its published contract",
-                ))
-            }
-        }
-        let answer = answer
-            .filter(|a| a["ok"].as_bool() == Some(true))
-            .ok_or_else(|| {
-                Error::unknown_coded(
-                    "cloud_agent_uncertain",
-                    "discovery returned no successful answer",
-                )
-            })?;
-        let remote = &answer["agent"];
-        if remote["agent_id"].as_str() != Some(agent.remote_agent_id.as_str())
-            || remote["organization_id"].as_str() != Some(agent.organization_id.as_str())
-            || remote["audience"].as_str() != Some(agent.endpoint.as_str())
-        {
-            return Err(Error::gate_coded(
-                "cloud_agent_wrong_tenant",
-                "discovery changed the immutable cloud target",
-            ));
-        }
-        let provenance = &remote["provenance"];
-        let peer = &provenance["peer"];
-        if provenance["kind"].as_str() != Some(source.kind)
-            || (source.kind == SOURCE_USER && !peer.is_null())
-            || (source.kind == SOURCE_PEER
-                && (peer["role"].as_str() != Some("cloud_agent")
-                    || peer["sender"]["uid"].as_str() != Some(source.uid.as_str())
-                    || peer["sender"]["registration_epoch"].as_i64() != Some(source.epoch)))
-        {
-            return Err(Error::gate_coded(
-                "cloud_agent_provenance_mismatch",
-                "discovery changed the immutable caller source",
-            ));
-        }
-        if provenance["invoker_id"].as_str() != Some(pinned_invoker) {
-            return Err(Error::gate_coded(
-                "cloud_agent_invoker_changed",
-                "discovery changed the source's stable upstream owner",
-            ));
-        }
-        let conversation = &answer["conversation"];
-        if conversation["conversation_id"].as_str() != Some(conversation_id.as_ref())
-            || session.as_ref().is_some_and(|s| {
-                conversation["remote_session_id"].as_str() != Some(s.remote_session_id.as_str())
-            })
-        {
+        let remote = cloud_agent::discover_source(
+            &HostedCloudTransport,
+            agent,
+            &target,
+            conversation_id.as_ref(),
+            source,
+            Some(pinned_invoker),
+        )?;
+        if session.as_ref().is_some_and(|session| {
+            session.remote_session_id != remote.remote_session_id
+                || session
+                    .provider_session_id
+                    .as_deref()
+                    .zip(remote.provider_session_id.as_deref())
+                    .is_some_and(|(pinned, incoming)| pinned != incoming)
+        }) {
             return Err(Error::gate_coded(
                 "cloud_agent_session_mismatch",
                 "discovery changed the source's conversation binding",
-            ));
-        }
-        let capabilities = &answer["capabilities"];
-        if capabilities["conversation"].as_bool() != Some(true)
-            || ["tools", "mcp", "skills", "approvals", "cancellation"]
-                .iter()
-                .any(|name| capabilities[*name].as_bool() == Some(true))
-        {
-            return Err(Error::gate_coded(
-                "cloud_agent_capability_refused",
-                "discovery did not prove the admitted conversational capability",
             ));
         }
         Ok(())

@@ -551,6 +551,63 @@ fn is_unique_violation(error: &rusqlite::Error) -> bool {
     )
 }
 
+/// Keep source, session and operation binding writes in the caller's sealed
+/// transaction: a refused session must not publish a first invoker pin.
+fn pin_source_invoker_in(
+    tx: &mut super::WriteTxn<'_>,
+    cloud_agent_id: &str,
+    kind: &str,
+    uid: &str,
+    epoch: i64,
+    owner: &Owner,
+    invoker_id: &str,
+) -> Result<()> {
+    let existing: Option<Option<String>> = tx.query_opt(
+        "SELECT invoker_id FROM cloud_agent_sources \
+         WHERE cloud_agent_id=?1 AND source_kind=?2 AND source_uid=?3 \
+           AND registration_epoch=?4 AND owner_issuer=?5 AND owner_subject=?6",
+        params![
+            cloud_agent_id,
+            kind,
+            uid,
+            epoch,
+            owner.issuer,
+            owner.subject
+        ],
+        |row| row.get(0),
+    )?;
+    match existing {
+        None => Err(Error::gate_coded(
+            "cloud_agent_consent_required",
+            "this invoker source has no explicit cloud-agent consent on this target",
+        )),
+        Some(Some(pinned)) if pinned != invoker_id => Err(Error::gate_coded(
+            "cloud_agent_invoker_changed",
+            "the contract reported a different stable owner (invoker_id) than this \
+             source is pinned to; no reply was recorded",
+        )),
+        Some(Some(_)) => Ok(()),
+        Some(None) => {
+            tx.execute(
+                "UPDATE cloud_agent_sources SET invoker_id=?7 \
+                 WHERE cloud_agent_id=?1 AND source_kind=?2 AND source_uid=?3 \
+                   AND registration_epoch=?4 AND owner_issuer=?5 AND owner_subject=?6 \
+                   AND invoker_id IS NULL",
+                params![
+                    cloud_agent_id,
+                    kind,
+                    uid,
+                    epoch,
+                    owner.issuer,
+                    owner.subject,
+                    invoker_id
+                ],
+            )?;
+            Ok(())
+        }
+    }
+}
+
 impl Store {
     pub fn cloud_agent(&self, id: &str) -> Result<Option<CloudAgent>> {
         self.read_tx(|conn| {
@@ -854,55 +911,8 @@ impl Store {
         owner: &Owner,
         invoker_id: &str,
     ) -> Result<()> {
-        self.write_tx(|conn| {
-            let existing = conn.query_opt(
-                &format!(
-                    "SELECT {SOURCE_COLUMNS} FROM cloud_agent_sources \
-                     WHERE cloud_agent_id=?1 AND source_kind=?2 AND source_uid=?3 \
-                     AND registration_epoch=?4 AND owner_issuer=?5 AND owner_subject=?6"
-                ),
-                params![
-                    cloud_agent_id,
-                    kind,
-                    uid,
-                    epoch,
-                    owner.issuer,
-                    owner.subject
-                ],
-                source_row,
-            )?;
-            let Some(existing) = existing else {
-                return Err(Error::gate_coded(
-                    "cloud_agent_consent_required",
-                    "this invoker source has no explicit cloud-agent consent on this target",
-                ));
-            };
-            match existing.invoker_id.as_deref() {
-                Some(pinned) if pinned == invoker_id => Ok(()),
-                Some(_) => Err(Error::gate_coded(
-                    "cloud_agent_invoker_changed",
-                    "the contract reported a different stable owner (invoker_id) than this \
-                     source is pinned to; no reply was recorded",
-                )),
-                None => {
-                    conn.execute(
-                        "UPDATE cloud_agent_sources SET invoker_id=?7 \
-                         WHERE cloud_agent_id=?1 AND source_kind=?2 AND source_uid=?3 \
-                         AND registration_epoch=?4 AND owner_issuer=?5 AND owner_subject=?6 \
-                         AND invoker_id IS NULL",
-                        params![
-                            cloud_agent_id,
-                            kind,
-                            uid,
-                            epoch,
-                            owner.issuer,
-                            owner.subject,
-                            invoker_id
-                        ],
-                    )?;
-                    Ok(())
-                }
-            }
+        self.write_tx(|tx| {
+            pin_source_invoker_in(tx, cloud_agent_id, kind, uid, epoch, owner, invoker_id)
         })
     }
 
@@ -998,114 +1008,125 @@ impl Store {
         provider_session_id: Option<&str>,
         invoker_id: Option<&str>,
     ) -> Result<CloudSession> {
-        if let Some(invoker_id) = invoker_id {
-            self.cloud_agent_source_pin_invoker(
-                cloud_agent_id,
-                kind,
-                uid,
-                epoch,
-                owner,
-                invoker_id,
-            )?;
-        }
-        self.write_tx(|conn| {
-            if let Some(existing) = conn.query_opt(
+        self.write_tx(|tx| {
+            let existing = tx.query_opt(
                 &format!(
                     "SELECT {SESSION_COLUMNS} FROM cloud_agent_sessions \
                      WHERE cloud_agent_id=?1 AND source_kind=?2 AND source_uid=?3 \
-                     AND registration_epoch=?4 AND owner_issuer=?5 AND owner_subject=?6 \
-                     AND thread_id=?7"
+                       AND registration_epoch=?4 AND owner_issuer=?5 AND owner_subject=?6 \
+                       AND thread_id=?7"
                 ),
-                params![
-                    cloud_agent_id,
-                    kind,
-                    uid,
-                    epoch,
-                    owner.issuer,
-                    owner.subject,
-                    thread_id
-                ],
+                params![cloud_agent_id, kind, uid, epoch, owner.issuer, owner.subject, thread_id],
                 session_row,
-            )? {
-                if existing.conversation_id != conversation_id {
+            )?;
+            if let Some(session) = &existing {
+                if session.conversation_id != conversation_id
+                    || session.remote_session_id != remote_session_id
+                    || session.provider_session_id.as_deref().zip(provider_session_id)
+                        .is_some_and(|(pinned, incoming)| pinned != incoming)
+                {
                     return Err(Error::gate_coded(
                         "cloud_agent_session_mismatch",
-                        "this source's work conversation is bound to a different opaque \
-                         conversation key",
+                        "this source's work conversation already has a different provider binding",
                     ));
                 }
-                if existing.remote_session_id != remote_session_id {
-                    // An ordinary access-credential renewal is not consent to
-                    // a new empty provider context. The original binding is
-                    // retained and the unexpected rotation is refused; a
-                    // genuinely new context needs an explicit new connection.
+                if session.invoker_id.as_deref().zip(invoker_id)
+                    .is_some_and(|(pinned, incoming)| pinned != incoming)
+                {
                     return Err(Error::gate_coded(
-                        "cloud_agent_session_mismatch",
-                        "the contract derived a different provider session for this source \
-                         and work conversation; the original binding is retained — open an \
-                         explicit new connection/context instead of replacing it",
+                        "cloud_agent_invoker_changed",
+                        "the work conversation belongs to a different stable invoker",
                     ));
                 }
-                return Ok(existing);
             }
-            let at = now();
-            let id = format!(
-                "clds-{}",
-                &digest(&[
-                    cloud_agent_id,
-                    kind,
-                    uid,
-                    &epoch.to_string(),
-                    &owner.issuer,
-                    &owner.subject,
-                    thread_id
-                ])[..24]
-            );
-            conn.execute(
-                "INSERT INTO cloud_agent_sessions(id, cloud_agent_id, source_kind, source_uid, \
-                 registration_epoch, owner_issuer, owner_subject, thread_id, conversation_id, \
-                 remote_session_id, provider_session_id, invoker_id, created) \
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-                params![
-                    id,
-                    cloud_agent_id,
-                    kind,
-                    uid,
-                    epoch,
-                    owner.issuer,
-                    owner.subject,
-                    thread_id,
-                    conversation_id,
-                    remote_session_id,
-                    provider_session_id,
-                    invoker_id,
-                    at
-                ],
-            )
-            .map_err(|error| {
-                if is_unique_violation(&error) {
-                    Error::gate_coded(
-                        "cloud_agent_session_mismatch",
-                        "remote session or conversation is already bound under another source",
-                    )
-                } else {
-                    error.into()
+            let conflict: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM cloud_agent_operations \
+                 WHERE cloud_agent_id=?1 AND source_kind=?2 AND source_uid=?3 \
+                   AND registration_epoch=?4 AND owner_issuer=?5 AND owner_subject=?6 \
+                   AND thread_id=?7 AND (conversation_id<>?8 \
+                     OR (remote_session_id<>'' AND remote_session_id<>?9)))",
+                params![cloud_agent_id, kind, uid, epoch, owner.issuer, owner.subject,
+                    thread_id, conversation_id, remote_session_id],
+                |row| row.get(0),
+            )?;
+            if conflict {
+                return Err(Error::gate_coded(
+                    "cloud_agent_session_mismatch",
+                    "a retained operation already belongs to a different provider binding",
+                ));
+            }
+            if let Some(invoker_id) = invoker_id {
+                pin_source_invoker_in(tx, cloud_agent_id, kind, uid, epoch, owner, invoker_id)?;
+            }
+            let session = if let Some(mut session) = existing {
+                let fill_provider = session.provider_session_id.is_none() && provider_session_id.is_some();
+                let fill_invoker = session.invoker_id.is_none() && invoker_id.is_some();
+                if fill_provider || fill_invoker {
+                    tx.execute(
+                        "UPDATE cloud_agent_sessions \
+                         SET provider_session_id=COALESCE(provider_session_id,?2), \
+                             invoker_id=COALESCE(invoker_id,?3) WHERE id=?1",
+                        params![session.id, provider_session_id, invoker_id],
+                    )?;
+                    if fill_provider {
+                        session.provider_session_id = provider_session_id.map(str::to_string);
+                    }
+                    if fill_invoker {
+                        session.invoker_id = invoker_id.map(str::to_string);
+                    }
                 }
-            })?;
-            Ok(CloudSession {
-                id,
-                cloud_agent_id: cloud_agent_id.to_string(),
-                source_kind: kind.to_string(),
-                source_uid: uid.to_string(),
-                registration_epoch: epoch,
-                owner: owner.clone(),
-                thread_id: thread_id.to_string(),
-                conversation_id: conversation_id.to_string(),
-                remote_session_id: remote_session_id.to_string(),
-                provider_session_id: provider_session_id.map(str::to_string),
-                invoker_id: invoker_id.map(str::to_string),
-                created: at,
-            })
+                session
+            } else {
+                let at = now();
+                let id = format!(
+                    "clds-{}",
+                    &digest(&[cloud_agent_id, kind, uid, &epoch.to_string(),
+                        &owner.issuer, &owner.subject, thread_id])[..24]
+                );
+                tx.execute(
+                    "INSERT INTO cloud_agent_sessions(id, cloud_agent_id, source_kind, source_uid, \
+                     registration_epoch, owner_issuer, owner_subject, thread_id, conversation_id, \
+                     remote_session_id, provider_session_id, invoker_id, created) \
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    params![id, cloud_agent_id, kind, uid, epoch, owner.issuer, owner.subject,
+                        thread_id, conversation_id, remote_session_id, provider_session_id, invoker_id, at],
+                ).map_err(|error| {
+                    if is_unique_violation(&error) {
+                        Error::gate_coded(
+                            "cloud_agent_session_mismatch",
+                            "remote session or conversation is already bound under another source",
+                        )
+                    } else {
+                        error.into()
+                    }
+                })?;
+                CloudSession {
+                    id,
+                    cloud_agent_id: cloud_agent_id.to_string(),
+                    source_kind: kind.to_string(),
+                    source_uid: uid.to_string(),
+                    registration_epoch: epoch,
+                    owner: owner.clone(),
+                    thread_id: thread_id.to_string(),
+                    conversation_id: conversation_id.to_string(),
+                    remote_session_id: remote_session_id.to_string(),
+                    provider_session_id: provider_session_id.map(str::to_string),
+                    invoker_id: invoker_id.map(str::to_string),
+                    created: at,
+                }
+            };
+            // The first accepted turn was persisted before its session was
+            // known. Complete only empty fields under this exact source/work
+            // binding, including an intent recovered after a lost first ACK.
+            tx.execute(
+                "UPDATE cloud_agent_operations SET remote_session_id=?9 \
+                 WHERE cloud_agent_id=?1 AND source_kind=?2 AND source_uid=?3 \
+                   AND registration_epoch=?4 AND owner_issuer=?5 AND owner_subject=?6 \
+                   AND thread_id=?7 AND conversation_id=?8 AND remote_session_id=''",
+                params![cloud_agent_id, kind, uid, epoch, owner.issuer, owner.subject,
+                    thread_id, conversation_id, remote_session_id],
+            )?;
+            Ok(session)
         })
     }
 

@@ -327,6 +327,22 @@ impl Store {
                 return Ok(false);
             }
             self.finish_in(&tx, &current, status, result, error)?;
+            if !operation.remote_session_id.is_empty() {
+                // Only this verified cloud completion may add its non-secret
+                // session binding. Keep generic result/token whitelisting
+                // unchanged; take the value from the durable operation, not
+                // arbitrary producer result JSON.
+                tx.execute(
+                    "UPDATE thread_entries \
+                     SET payload=json_set(COALESCE(payload,'{}'),'$.remote_session_id',?1) \
+                     WHERE message_id=?2 AND kind=?3",
+                    params![
+                        operation.remote_session_id,
+                        operation_id,
+                        super::KIND_TURN_RESULT
+                    ],
+                )?;
+            }
             let changed = tx.execute(
                 "UPDATE cloud_agent_operations SET status=?3, \
                  remote_operation_id=COALESCE(?4, remote_operation_id), reply_text=?5, \

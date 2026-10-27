@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::remote_cli::RemoteTarget;
-use crate::store::cloud_agent::{CloudSource, Owner};
+use crate::store::cloud_agent::{CloudSource, Owner, SOURCE_PEER, SOURCE_USER};
 use crate::store::{CloudAgent, CloudOperation, Store, CLOUD_AGENT_CONSENT_SCOPE};
 
 pub const PROVIDER: &str = "agenticos-cloud";
@@ -213,7 +213,12 @@ pub struct RemoteOperation {
 /// [`wire::HostedCloudTransport`]; there is no scripted/mock transport in a
 /// release build.
 pub trait CloudTransport {
-    fn connect(&self, target: &RemoteTarget, conversation_id: &str) -> Result<RemoteAgent>;
+    fn connect(
+        &self,
+        target: &RemoteTarget,
+        conversation_id: &str,
+        source: Option<&Source>,
+    ) -> Result<RemoteAgent>;
     fn submit(&self, target: &RemoteTarget, request: &SubmitRequest<'_>)
         -> Result<RemoteOperation>;
     fn read(
@@ -357,43 +362,9 @@ pub fn connect(
         ..target.clone()
     };
     let conversation_id = home_conversation_id(store.instance_identity(), &target.org_id, alias);
-    let remote = transport.connect(&bound_target, &conversation_id)?;
-    if remote.remote_agent_id.is_empty() || remote.remote_agent_id.len() > 200 {
-        return Err(Error::rejected(
-            "cloud-agent contract returned an invalid remote agent id",
-        ));
-    }
-    if remote.organization_id != target.org_id || remote.audience != target.endpoint {
-        return Err(Error::gate_coded(
-            "cloud_agent_wrong_tenant",
-            "cloud-agent contract answered for a different organization or audience",
-        ));
-    }
-    // Rev2: the human bridge credential's provenance kind is `user`.
-    if remote.provenance["kind"].as_str() != Some(crate::store::cloud_agent::SOURCE_USER) {
-        return Err(Error::gate_coded(
-            "cloud_agent_provenance_mismatch",
-            "cloud-agent contract derived a different principal than this connection \
-             was created for",
-        ));
-    }
-    for capability in ["tools", "mcp", "skills", "approvals", "cancellation"] {
-        if remote.capabilities[capability].as_bool() == Some(true) {
-            return Err(Error::gate_coded(
-                "cloud_agent_capability_refused",
-                format!(
-                    "cloud runtime advertises unsupported {capability} capability; this \
-                     connection is conversational-only"
-                ),
-            ));
-        }
-    }
-    if remote.capabilities["conversation"].as_bool() != Some(true) {
-        return Err(Error::gate_coded(
-            "cloud_agent_capability_refused",
-            "cloud runtime does not advertise conversational capability",
-        ));
-    }
+    let remote = transport.connect(&bound_target, &conversation_id, None)?;
+    validate_remote_agent(target, None, &remote)?;
+    check_discovery_source(None, &remote.provenance)?;
 
     // A reconnect refreshes CONSENT, never identity: the retained invoker pin
     // and provider session are validated BEFORE any row is written. A refused
@@ -428,6 +399,15 @@ pub fn connect(
         )? {
             if session.conversation_id != conversation_id
                 || session.remote_session_id != remote.remote_session_id
+                || session
+                    .provider_session_id
+                    .as_deref()
+                    .zip(remote.provider_session_id.as_deref())
+                    .is_some_and(|(pinned, incoming)| pinned != incoming)
+                || session
+                    .invoker_id
+                    .as_deref()
+                    .is_some_and(|pinned| pinned != remote.invoker_id)
             {
                 return Err(Error::gate_coded(
                     "cloud_agent_session_mismatch",
@@ -870,6 +850,7 @@ fn submit_queued(
             None,
             Some("cloud_agent_source_stale"),
             None,
+            &operation.remote_session_id,
         );
         return Err(Error::gate_coded(
             "cloud_agent_source_stale",
@@ -909,7 +890,7 @@ fn submit_queued(
         Ok(outcome) => outcome,
         Err(error) => return Err(record_transport_failure(store, agent, operation, error)),
     };
-    apply_remote(store, agent, operation, outcome)
+    apply_remote(store, agent, operation, &outcome)
 }
 
 fn record_transport_failure(
@@ -965,6 +946,7 @@ fn record_transport_failure(
             None,
             Some(&code),
             None,
+            &operation.remote_session_id,
         )
         .is_err()
         {
@@ -982,40 +964,103 @@ fn record_transport_failure(
     }
 }
 
+fn validate_remote_agent(
+    target: &RemoteTarget,
+    expected_agent: Option<&str>,
+    remote: &RemoteAgent,
+) -> Result<()> {
+    if remote.remote_agent_id.is_empty() || remote.remote_agent_id.len() > 200 {
+        return Err(Error::rejected(
+            "cloud-agent contract returned an invalid remote agent id",
+        ));
+    }
+    if remote.organization_id != target.org_id
+        || remote.audience != target.endpoint
+        || expected_agent.is_some_and(|id| id != remote.remote_agent_id)
+    {
+        return Err(Error::gate_coded(
+            "cloud_agent_wrong_tenant",
+            "cloud-agent contract answered for a different target, organization or audience",
+        ));
+    }
+    if remote.remote_session_id.is_empty() {
+        return Err(Error::unknown_coded(
+            "cloud_agent_uncertain",
+            "cloud-agent discovery returned no provider session binding",
+        ));
+    }
+    for capability in ["tools", "mcp", "skills", "approvals", "cancellation"] {
+        if remote.capabilities[capability].as_bool() == Some(true) {
+            return Err(Error::gate_coded(
+                "cloud_agent_capability_refused",
+                format!(
+                    "cloud runtime advertises unsupported {capability} capability; \
+                    this connection is conversational-only"
+                ),
+            ));
+        }
+    }
+    if remote.capabilities["conversation"].as_bool() != Some(true) {
+        return Err(Error::gate_coded(
+            "cloud_agent_capability_refused",
+            "cloud runtime does not advertise conversational capability",
+        ));
+    }
+    Ok(())
+}
+
+fn check_discovery_source(source: Option<&Source>, provenance: &Value) -> Result<()> {
+    let kind = source.map_or(SOURCE_USER, |source| source.kind);
+    let peer = &provenance["peer"];
+    let same_source = match kind {
+        SOURCE_USER => peer.is_null(),
+        SOURCE_PEER => source.is_some_and(|source| {
+            peer["role"].as_str() == Some("cloud_agent")
+                && peer["sender"]["uid"].as_str() == Some(source.uid.as_str())
+                && peer["sender"]["registration_epoch"].as_i64() == Some(source.epoch)
+        }),
+        _ => false,
+    };
+    if provenance["kind"].as_str() != Some(kind) || !same_source {
+        return Err(Error::gate_coded(
+            "cloud_agent_provenance_mismatch",
+            "cloud-agent discovery did not describe this verified invoking source",
+        ));
+    }
+    Ok(())
+}
+
+/// Read-scoped, model-free metadata for one caller's work conversation.
+/// The caller authorizes immediately before this transport call. Nothing is
+/// persisted here, and a known invoker pin may never be replaced.
+pub fn discover_source(
+    transport: &dyn CloudTransport,
+    agent: &CloudAgent,
+    target: &RemoteTarget,
+    conversation_id: &str,
+    source: &Source,
+    expected_invoker: Option<&str>,
+) -> Result<RemoteAgent> {
+    let remote = transport.connect(target, conversation_id, Some(source))?;
+    validate_remote_agent(target, Some(&agent.remote_agent_id), &remote)?;
+    check_discovery_source(Some(source), &remote.provenance)?;
+    if expected_invoker.is_some_and(|pinned| pinned != remote.invoker_id) {
+        return Err(Error::gate_coded(
+            "cloud_agent_invoker_changed",
+            "cloud-agent discovery changed this source's stable upstream owner",
+        ));
+    }
+    Ok(remote)
+}
+
 fn apply_remote(
     store: &Store,
     agent: &CloudAgent,
     operation: &CloudOperation,
-    outcome: RemoteOperation,
+    outcome: &RemoteOperation,
 ) -> Result<CloudOperation> {
-    // The contract's stable owner id is pinned on the source the first time
-    // it is seen. A different one is a different logical owner: no reply is
-    // recorded and no session is adopted.
-    if let Some(invoker) = outcome.invoker_id.as_deref() {
-        store.cloud_agent_source_pin_invoker(
-            &operation.cloud_agent_id,
-            &operation.source_kind,
-            &operation.source_uid,
-            operation.registration_epoch,
-            &operation.owner,
-            invoker,
-        )?;
-    }
     if let Some(session) = outcome.remote_session_id.as_deref() {
-        if operation.remote_session_id.is_empty() {
-            store.cloud_agent_bind_session(
-                &agent.id,
-                &operation.source_kind,
-                &operation.source_uid,
-                operation.registration_epoch,
-                &operation.owner,
-                &operation.thread_id,
-                &operation.conversation_id,
-                session,
-                outcome.provider_session_id.as_deref(),
-                outcome.invoker_id.as_deref(),
-            )?;
-        } else if operation.remote_session_id != session {
+        if !operation.remote_session_id.is_empty() && operation.remote_session_id != session {
             store.cloud_agent_operation_set(
                 &operation.cloud_agent_id,
                 &operation.operation_id,
@@ -1036,7 +1081,32 @@ fn apply_remote(
                  source's work conversation is bound to; no reply was recorded",
             ));
         }
+        store.cloud_agent_bind_session(
+            &agent.id,
+            &operation.source_kind,
+            &operation.source_uid,
+            operation.registration_epoch,
+            &operation.owner,
+            &operation.thread_id,
+            &operation.conversation_id,
+            session,
+            outcome.provider_session_id.as_deref(),
+            outcome.invoker_id.as_deref(),
+        )?;
+    } else if let Some(invoker) = outcome.invoker_id.as_deref() {
+        store.cloud_agent_source_pin_invoker(
+            &operation.cloud_agent_id,
+            &operation.source_kind,
+            &operation.source_uid,
+            operation.registration_epoch,
+            &operation.owner,
+            invoker,
+        )?;
     }
+    let remote_session_id = outcome
+        .remote_session_id
+        .as_deref()
+        .unwrap_or(operation.remote_session_id.as_str());
     if outcome.status == RemoteStatus::Completed {
         let Some(reply) = outcome.reply.as_deref() else {
             store.cloud_agent_operation_set(
@@ -1065,6 +1135,7 @@ fn apply_remote(
             Some(reply),
             None,
             outcome.remote_operation_id.as_deref(),
+            remote_session_id,
         );
     }
     let error = match (outcome.status, &outcome.error) {
@@ -1087,6 +1158,7 @@ fn apply_remote(
             None,
             Some("cloud_agent_uncertain"),
             outcome.remote_operation_id.as_deref(),
+            remote_session_id,
         );
     }
     if let Some((code, message)) = error {
@@ -1098,6 +1170,7 @@ fn apply_remote(
             None,
             Some(code),
             outcome.remote_operation_id.as_deref(),
+            remote_session_id,
         )
         .map_err(|finish_error| {
             Error::unknown_coded(
@@ -1187,7 +1260,8 @@ fn read_operation_with(
     }
     let settled_before = operation.settled();
     let target = &target_for_source(target, source);
-    let outcome = match transport.read(target, &operation.conversation_id, operation_id, source) {
+    let mut outcome = match transport.read(target, &operation.conversation_id, operation_id, source)
+    {
         Ok(outcome) => outcome,
         Err(Error::OutcomeUnknown(_)) => {
             // An unreachable readback proves nothing about the platform's
@@ -1219,6 +1293,37 @@ fn read_operation_with(
         }
         Err(error) => return Err(error),
     };
+    if operation.remote_session_id.is_empty() && outcome.remote_session_id.is_none() {
+        // A first submit may have been accepted without its acknowledgement.
+        // Operation-only readback recovers text, not source/session metadata;
+        // discover that same conversation with this source's OWN read grant.
+        let grant = store
+            .cloud_agent_source(
+                &agent.id,
+                source.kind,
+                &source.uid,
+                source.epoch,
+                &source.owner,
+            )?
+            .ok_or_else(|| {
+                Error::gate_coded(
+                    "cloud_agent_authority_missing",
+                    "the retained operation has no source authority for metadata recovery",
+                )
+            })?;
+        authorize()?;
+        let remote = discover_source(
+            transport,
+            agent,
+            target,
+            &operation.conversation_id,
+            source,
+            grant.invoker_id.as_deref(),
+        )?;
+        outcome.remote_session_id = Some(remote.remote_session_id);
+        outcome.provider_session_id = remote.provider_session_id;
+        outcome.invoker_id = Some(remote.invoker_id);
+    }
     let terminal = matches!(
         outcome.status,
         RemoteStatus::Completed | RemoteStatus::Failed
@@ -1232,37 +1337,37 @@ fn read_operation_with(
         // history, but it is never this read's answer, because this read
         // never learned that reply, and returning it would disclose content
         // the caller's own authoritative answer did not contain.
-        let mut pending = operation.clone();
-        pending.status = outcome.status.as_str().to_string();
-        pending.remote_operation_id = outcome
-            .remote_operation_id
-            .clone()
-            .or_else(|| operation.remote_operation_id.clone());
-        pending.reply_text = None;
-        pending.reply_message_id = None;
-        pending.error_code = outcome.error.as_ref().map(|(code, _)| code.clone());
-        pending.error_message = outcome.error.as_ref().map(|(_, message)| message.clone());
         if !settled_before {
             // Record the observed nonterminal state for the reconciler. The
             // settle is a terminal-preserving compare-and-set, so a receipt
             // that settled concurrently stays settled (and stays the
             // reconciliation target) while this read keeps its own answer.
-            apply_remote(store, agent, &operation, outcome)?;
+            apply_remote(store, agent, &operation, &outcome)?;
         }
+        let mut pending = operation;
+        pending.status = outcome.status.as_str().to_string();
+        pending.remote_operation_id = outcome.remote_operation_id.or(pending.remote_operation_id);
+        if let Some(session) = outcome.remote_session_id {
+            pending.remote_session_id = session;
+        }
+        pending.reply_text = None;
+        pending.reply_message_id = None;
+        let (error_code, error_message) = match outcome.error {
+            Some((code, message)) => (Some(code), Some(message)),
+            None => (None, None),
+        };
+        pending.error_code = error_code;
+        pending.error_message = error_message;
         return Ok(pending);
     }
-    let answer_status = outcome.status;
-    let reply = outcome.reply.clone();
-    let remote_operation_id = outcome.remote_operation_id.clone();
-    let error = outcome.error.clone();
-    let answer = apply_remote(store, agent, &operation, outcome)?;
+    let answer = apply_remote(store, agent, &operation, &outcome)?;
     if !settled_before {
         // A non-settled row is answered by the readback itself. A settled row
         // that settles here from a concurrent read keeps its terminal
         // receipt (monotonic: the reply is never withdrawn by a late read).
         return Ok(answer);
     }
-    if answer_status.as_str() != operation.status {
+    if outcome.status.as_str() != operation.status {
         // The platform's terminal answer contradicts the settled receipt.
         // Neither copy may be presented as authorized, so this is an explicit
         // refusal to reconcile by hand — never the cached reply.
@@ -1280,9 +1385,10 @@ fn read_operation_with(
     store.cloud_agent_operation_reconcile(
         &operation.cloud_agent_id,
         &operation.operation_id,
-        remote_operation_id.as_deref(),
-        reply.as_deref(),
-        error
+        outcome.remote_operation_id.as_deref(),
+        outcome.reply.as_deref(),
+        outcome
+            .error
             .as_ref()
             .map(|(code, message)| (code.as_str(), message.as_str())),
     )
@@ -1369,6 +1475,7 @@ fn canonical_enqueue(
 /// duplicate the Thread result or its deterministic report id. An
 /// intermediate `unknown` is only a receipt update: it writes no result and
 /// consumes no report id, leaving the later real completion able to settle.
+#[allow(clippy::too_many_arguments)]
 fn canonical_finish(
     store: &Store,
     agent: &CloudAgent,
@@ -1377,6 +1484,7 @@ fn canonical_finish(
     reply: Option<&str>,
     error_code: Option<&str>,
     remote_operation_id: Option<&str>,
+    remote_session_id: &str,
 ) -> Result<CloudOperation> {
     if status == crate::store::cloud_agent::STATUS_UNKNOWN {
         return store.cloud_agent_operation_set(
@@ -1396,7 +1504,7 @@ fn canonical_finish(
         "cloud_agent_alias": agent.alias,
         "operation": operation.operation_id,
         "remote_operation_id": remote_operation_id,
-        "remote_session_id": operation.remote_session_id,
+        "remote_session_id": remote_session_id,
         "runtime": agent.runtime,
         "model": agent.model,
         "error": error_code,

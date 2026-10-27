@@ -33,6 +33,17 @@ fn call_for(
     action: &str,
     arguments: Value,
 ) -> Result<Value> {
+    if source.is_some_and(|source| {
+        !matches!(
+            source.kind,
+            crate::store::cloud_agent::SOURCE_USER | crate::store::cloud_agent::SOURCE_PEER
+        )
+    }) {
+        return Err(Error::gate_coded(
+            "cloud_agent_source_refused",
+            "unknown cloud-agent source; no credential was selected",
+        ));
+    }
     let body = json!({
         "version": CONTRACT_VERSION,
         "action": action,
@@ -142,6 +153,32 @@ fn text<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
 
 fn optional_text(value: &Value, name: &str) -> Option<String> {
     value.get(name).and_then(Value::as_str).map(str::to_string)
+}
+
+fn take_optional_text(value: &mut Value, name: &str) -> Option<String> {
+    match value.get_mut(name).map(Value::take) {
+        Some(Value::String(text)) => Some(text),
+        _ => None,
+    }
+}
+
+fn take_text(value: &mut Value, name: &str) -> Result<String> {
+    take_optional_text(value, name).ok_or_else(|| {
+        Error::unknown_coded(
+            "cloud_agent_uncertain",
+            format!("contract field {name} is missing"),
+        )
+    })
+}
+
+fn take_object(value: &mut Value, name: &str) -> Result<Value> {
+    match value.get_mut(name) {
+        Some(value) if value.is_object() => Ok(value.take()),
+        _ => Err(Error::unknown_coded(
+            "cloud_agent_uncertain",
+            format!("contract field {name} is missing"),
+        )),
+    }
 }
 
 fn object<'a>(value: &'a Value, name: &str) -> Result<&'a Value> {
@@ -270,42 +307,48 @@ fn operation_from(
 pub struct HostedCloudTransport;
 
 impl CloudTransport for HostedCloudTransport {
-    fn connect(&self, target: &RemoteTarget, conversation_id: &str) -> Result<RemoteAgent> {
-        let answer = call_for(
+    fn connect(
+        &self,
+        target: &RemoteTarget,
+        conversation_id: &str,
+        source: Option<&Source>,
+    ) -> Result<RemoteAgent> {
+        let mut answer = call_for(
             target,
-            None,
+            source,
             "agent",
             json!({"conversation_id": conversation_id}),
         )?;
-        let agent = object(&answer, "agent")?;
-        let conversation = object(&answer, "conversation")?;
-        let capabilities = object(&answer, "capabilities")?;
-        let runtime = object(&answer, "runtime")?;
-        let provenance = object(agent, "provenance")?;
-        if provenance["kind"].as_str() != Some("user") || !provenance["peer"].is_null() {
+        let mut agent = take_object(&mut answer, "agent")?;
+        let mut conversation = take_object(&mut answer, "conversation")?;
+        let capabilities = take_object(&mut answer, "capabilities")?;
+        let mut runtime = take_object(&mut answer, "runtime")?;
+        let provenance = take_object(&mut agent, "provenance")?;
+        let invoker_id = invoker_id(&provenance)?.to_string();
+        if take_text(&mut conversation, "conversation_id")? != conversation_id {
             return Err(Error::gate_coded(
-                "cloud_agent_provenance_mismatch",
-                "the contract derived a non-user principal for this explicit connection",
+                "cloud_agent_session_mismatch",
+                "discovery answered for a different work conversation",
             ));
         }
-        let invoker_id = invoker_id(provenance)?.to_string();
-        if text(conversation, "conversation_id")? != conversation_id {
+        let remote_session_id = take_text(&mut conversation, "remote_session_id")?;
+        if remote_session_id.is_empty() {
             return Err(Error::unknown_coded(
                 "cloud_agent_uncertain",
-                "contract answered for a different conversation",
+                "discovery returned no provider session binding",
             ));
         }
         Ok(RemoteAgent {
-            remote_agent_id: text(agent, "agent_id")?.to_string(),
-            organization_id: text(agent, "organization_id")?.to_string(),
-            audience: text(agent, "audience")?.to_string(),
-            provenance: agent.get("provenance").cloned().unwrap_or(Value::Null),
+            remote_agent_id: take_text(&mut agent, "agent_id")?,
+            organization_id: take_text(&mut agent, "organization_id")?,
+            audience: take_text(&mut agent, "audience")?,
+            provenance,
             invoker_id,
-            remote_session_id: text(conversation, "remote_session_id")?.to_string(),
-            provider_session_id: optional_text(conversation, "provider_session_id"),
-            capabilities: capabilities.clone(),
-            runtime: text(runtime, "kind")?.to_string(),
-            model_label: optional_text(runtime, "model_label"),
+            remote_session_id,
+            provider_session_id: take_optional_text(&mut conversation, "provider_session_id"),
+            capabilities,
+            runtime: take_text(&mut runtime, "kind")?,
+            model_label: take_optional_text(&mut runtime, "model_label"),
         })
     }
 
