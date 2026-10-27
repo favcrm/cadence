@@ -775,7 +775,7 @@ impl Shared {
             // [`CloudProjection::needs_readmission`]).
             let mut admitted = std::collections::BTreeMap::new();
             for operation in &operations {
-                if !source.matches(&operation) {
+                if !source.matches(operation) {
                     continue;
                 }
                 let admission = if operation.settled() {
