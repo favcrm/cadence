@@ -24,6 +24,17 @@ export interface ActivityEntry {
   title?: string | null;
 }
 
+/** The actor actually serving a conversation, independent of its transport alias. */
+export type ActorIdentity = {
+  conversation_id: string;
+  identity: PersonalAssistantIdentity;
+  scope: "personal";
+} | {
+  conversation_id: string;
+  identity: MasterIdentity;
+  scope: "workspace";
+};
+
 /** A provider allowance record as the store keeps it. The envelope is fixed;
  * `data` is the provider's own report (for Codex, its rate-limit buckets). */
 export interface AgentQuota {
@@ -169,6 +180,9 @@ export interface ArtifactRow {
   name: string;
   size: number;
 }
+
+/** A canonical avatar look (the board's eleven `AgentAvatar` palettes). */
+export type AvatarLook = "builder" | "guard" | "bookkeeper" | "content" | "designer" | "reception" | "operations" | "support" | "tester" | "robot" | "custom";
 
 /** One bound agent on an issue card or drawer — from the job binding. */
 export interface CardAgent {
@@ -374,6 +388,18 @@ export interface MasterContext {
   window?: number | null;
 }
 
+/** The workspace coordinator's effective identity (`master_state.identity`).
+ * 
+ * `name`/`tone` are the operator-owned protected files' agreed values (`null`
+ * = unset); `look` is the pinned `params.look` (the existing robot when
+ * unpinned); `revision` fences the next protected update. */
+export interface MasterIdentity {
+  look: AvatarLook;
+  name?: string | null;
+  revision: string;
+  tone?: string | null;
+}
+
 /** One queued turn's routing metadata; never its body. */
 export interface MasterQueued {
   conversation?: string | null;
@@ -391,12 +417,16 @@ export interface MasterSession {
 /** `master_state` (daemon RPC; `GET /api/master/state` relays it): what the
  * master header shows. A member's copy drops the turn's `summary`. */
 export interface MasterState {
+  /** Hosted conversations may be personal even when the transport alias is `master`.
+   * An absent projection retains the native workspace-coordinator contract. */
+  actor_identity?: ActorIdentity | null;
   alias: string;
   /** The session verbs the live provider accepts. */
   commands: string[];
   context?: MasterContext | null;
   effort?: string | null;
   endpoint_kind: string;
+  identity: MasterIdentity;
   live: boolean;
   model?: string | null;
   model_label?: string | null;
@@ -494,6 +524,14 @@ export interface PatchReq {
   /** Replaces the tag list; `[]` clears it. */
   tags?: string[] | null;
   title?: string | null;
+}
+
+/** A member's committed identity. Private address/preferences are never a UI projection. */
+export interface PersonalAssistantIdentity {
+  look: AvatarLook;
+  name?: string | null;
+  revision: number;
+  tone?: string | null;
 }
 
 /** Work-item counts by status bucket. */

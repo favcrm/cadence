@@ -1,7 +1,7 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import PermissionCard from "../src/features/home/PermissionCard";
-import { entryRefs, StreamBanner, ThreadItemView, ThreadTurn, type Density } from "../src/features/home/ThreadView";
+import type * as ThreadViewModule from "../src/features/home/ThreadView";
 declare function require(name: string): any;
 declare const process: { cwd(): string };
 import {
@@ -10,6 +10,20 @@ import {
   type ThreadItem,
   type ThreadState,
 } from "../src/features/home/thread";
+
+type Density = ThreadViewModule.Density;
+
+// Install the existing Node fixture seam before loading the shared identity UI.
+const loader = require("module"), originalRequire = loader.prototype.require;
+loader.prototype.require = function (this: unknown, id: string) {
+  if (id.endsWith(".css")) return {};
+  if (id === "@hugeicons/core-free-icons") return new Proxy({}, { get: () => ({}) });
+  if (id === "@hugeicons/react") return { HugeiconsIcon: () => null };
+  return originalRequire.apply(this, arguments);
+};
+const { entryRefs, StreamBanner, ThreadItemView, ThreadTurn } =
+  require("../src/features/home/ThreadView") as typeof ThreadViewModule;
+loader.prototype.require = originalRequire;
 
 /**
  * CAD-1029: the shared master-thread renderer. "full" is what Home has

@@ -52,6 +52,13 @@ pub struct AssistantBinding {
     pub bootstrap_revision: i64,
 }
 
+/// The lifecycle/profile mutation committed under one bootstrap revision fence.
+pub struct AssistantBootstrapUpdate<'a> {
+    pub action: &'a str,
+    pub expected_revision: i64,
+    pub look: Option<&'a str>,
+}
+
 /// The pin prefix of a stored `assist_requests.authority_rev` —
 /// `"<pin>.<job_updated_ms>"`. The pin is the sequence the reconcile
 /// bumps; the suffix is a watermark snapshot, not authority. A legacy
@@ -308,7 +315,8 @@ impl Store {
     /// assistant, original credential), the generation-current agent, the
     /// binding active for the same tuple, and `bootstrap_revision` equal to
     /// `expected_revision`. Only then does `apply_files` run (local profile
-    /// files, no network), and only after it succeeds is the state written.
+    /// files, no network), the owning agent's `params.look` is pinned when
+    /// `look` is given, and only after both succeed is the state written.
     /// Unknown actions or states refuse before any effect. Any refusal writes
     /// nothing and returns the error unchanged.
     pub fn assistant_bootstrap_apply(
@@ -316,10 +324,14 @@ impl Store {
         expect: &AssistDispatchExpect,
         message_id: &str,
         turn_token: &str,
-        action: &str,
-        expected_revision: i64,
+        update: AssistantBootstrapUpdate<'_>,
         apply_files: impl FnOnce() -> Result<()>,
     ) -> Result<AssistantBinding> {
+        let AssistantBootstrapUpdate {
+            action,
+            expected_revision,
+            look,
+        } = update;
         let now = crate::issue::time::now_epoch() as f64;
         self.write_tx(|tx| {
             let refused = |why: &str| Error::rejected(format!("bootstrap refused: {why}"));
@@ -426,8 +438,43 @@ impl Store {
                 }
             }
             .to_string();
-            // Local profile files only; a failure here leaves state untouched.
+            // REQ-011: an explicit avatar pick is the owning assistant's
+            // ordinary `params.look`, written in this same fenced transaction
+            // so the projection, the pin and the committed revision move
+            // together. No second look store exists.
+            let stored_params = if let Some(look) = look {
+                let stored: Option<String> = tx
+                    .query_row(
+                        "SELECT params FROM agents WHERE alias=?",
+                        [&expect.alias],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let mut params = stored
+                    .as_deref()
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                    .unwrap_or_else(|| json!({}));
+                let object = params
+                    .as_object_mut()
+                    .ok_or_else(|| refused("the assistant runtime's params are not an object"))?;
+                object.insert("look".to_string(), json!(look));
+                let stored = params.to_string();
+                if stored.len() > 4_000 {
+                    return Err(refused("the avatar look does not fit the params cap"));
+                }
+                Some(stored)
+            } else {
+                None
+            };
+            // An invalid avatar merge must refuse before any profile file changes.
             apply_files()?;
+            if let Some(stored) = stored_params {
+                tx.execute(
+                    "UPDATE agents SET params=?, updated=? WHERE alias=?",
+                    params![stored, now, expect.alias],
+                )?;
+            }
             tx.execute(
                 "UPDATE assistants SET bootstrap_state=?, \
                  bootstrap_revision=bootstrap_revision+1, updated=? \

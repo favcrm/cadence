@@ -94,6 +94,30 @@ pub fn valid_look(look: &str) -> bool {
     canonical_look(look).is_some()
 }
 
+/// The stable alias → avatar look assignment, matching the board's
+/// `AgentAvatar.tsx::lookFor`: `(hash * 31 + code unit) >>> 0`, modulo the
+/// catalogue. Literal aliases are ASCII, so code points and code units agree.
+pub fn look_for_alias(alias: &str) -> &'static str {
+    let mut hash: u32 = 0;
+    for ch in alias.chars() {
+        hash = hash.wrapping_mul(31).wrapping_add(u32::from(ch) & 0xffff);
+    }
+    LOOKS[(hash % LOOKS.len() as u32) as usize]
+}
+
+/// The effective look: a canonical pin wins, Master defaults to the existing
+/// robot when unpinned, and every other alias wears its stable alias look.
+pub fn effective_look(alias: &str, pinned: Option<&str>) -> &'static str {
+    if let Some(look) = pinned.and_then(canonical_look) {
+        return look;
+    }
+    if alias == crate::master::ALIAS {
+        "robot"
+    } else {
+        look_for_alias(alias)
+    }
+}
+
 /// Is this agent a catalogue hire? Its launch params carry `catalogue`.
 pub fn is_catalogue_hire(params: Option<&Value>) -> bool {
     params.is_some_and(|p| p.get("catalogue").is_some())
@@ -391,5 +415,24 @@ mod tests {
             .starts_with("You are a Developer."));
         let ids = ids();
         assert!(ROLES.iter().all(|r| ids.contains(r.id)));
+    }
+
+    /// CAD-1817: the board's wire enum and the UI's palette list stay the same
+    /// eleven slugs, and an unpinned master keeps the existing robot.
+    #[test]
+    fn avatar_look_contract_matches_the_catalogue() {
+        for look in LOOKS {
+            let parsed = cadence_core::board_api::AvatarLook::parse(look)
+                .unwrap_or_else(|| panic!("wire AvatarLook lacks '{look}'"));
+            assert_eq!(parsed.as_str(), *look);
+        }
+        assert!(cadence_core::board_api::AvatarLook::parse("dragon").is_none());
+        assert!(valid_look(look_for_alias("assist-0123456789abcdef")));
+        assert_eq!(effective_look("master", None), "robot");
+        assert_eq!(effective_look("assist-x", Some("support")), "support");
+        assert_eq!(
+            effective_look("assist-x", Some("dragon")),
+            look_for_alias("assist-x")
+        );
     }
 }

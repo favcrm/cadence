@@ -1085,6 +1085,68 @@ fn master_command_err(e: &Error) -> HttpResp {
     }
 }
 
+/// `POST /api/master/identity` (CAD-1817) — the operator's bounded workspace
+/// identity write, relayed to the daemon's `master_identity_set`.
+///
+/// The relay is no wider than the native verb: the closed field set, the
+/// required revision, a string-only name/tone and the canonical look list are
+/// checked here before the daemon is asked, and the daemon re-proves the
+/// operator connection (an agent cannot reach it).
+pub(super) fn master_identity(request: &mut Request, state_dir: &std::path::Path) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    let body: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return err_response(400, "body must be a JSON object"),
+    };
+    let Some(object) = body.as_object() else {
+        return err_response(400, "body must be a JSON object");
+    };
+    const FIELDS: [&str; 4] = ["expected_revision", "name", "tone", "look"];
+    if let Some(field) = object.keys().find(|key| !FIELDS.contains(&key.as_str())) {
+        return err_response(400, &format!("unknown field '{field}'"));
+    }
+    let Some(expected_revision) = object
+        .get("expected_revision")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    else {
+        return err_response(400, "expected_revision must be a non-empty string");
+    };
+    let mut params = json!({"expected_revision": expected_revision});
+    for key in ["name", "tone"] {
+        let Some(value) = object.get(key) else {
+            continue;
+        };
+        let Some(text) = value.as_str() else {
+            return err_response(400, &format!("{key} must be a string"));
+        };
+        if text.chars().count() > 240 {
+            return err_response(400, &format!("{key} is too long"));
+        }
+        params[key] = json!(text);
+    }
+    if let Some(value) = object.get("look") {
+        let Some(text) = value.as_str() else {
+            return err_response(400, "look must be a string");
+        };
+        let Some(look) = crate::agent_roles::canonical_look(text.trim()) else {
+            return err_response(400, &format!("unknown look '{text}'"));
+        };
+        params["look"] = json!(look);
+    }
+    if !object.contains_key("name") && !object.contains_key("tone") && !object.contains_key("look")
+    {
+        return err_response(400, "at least one of name, tone, look is required");
+    }
+    match client::rpc(state_dir, "master_identity_set", params) {
+        Ok(out) => json_response(out),
+        Err(e) => rpc_err(&e, "master_identity_set"),
+    }
+}
+
 /// `GET /api/outbox[?effect_id=]` (CAD-546) — the `local` platform's
 /// outbox listing, relayed through the daemon's operator-only
 /// `platform_outbox`.

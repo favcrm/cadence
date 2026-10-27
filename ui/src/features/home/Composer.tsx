@@ -3,6 +3,7 @@ import SharedComposer from "../app-shell/chat/Composer";
 import type { AttachDestination } from "../app-shell/chat/attach";
 import { sendToMaster } from "./send";
 import { newMessageId } from "./thread";
+import { useAssistantComposerLabels } from "../assistant/AssistantIdentity";
 
 /**
  * Home's composer is the shared one (CAD-1168) at full density: the
@@ -34,6 +35,7 @@ export default function Composer({
   attachDestination?: AttachDestination;
   attachReason?: string;
 }) {
+  const { placeholder, ariaLabel } = useAssistantComposerLabels();
   return (
     <SharedComposer
       density="full"
@@ -52,8 +54,8 @@ export default function Composer({
         destination: attachDestination,
       }}
       className="card p-2.5 relative"
-      placeholder="Message Assistant…"
-      ariaLabel="Message to Assistant"
+      placeholder={placeholder}
+      ariaLabel={ariaLabel}
       // Home's `data-composer` hook — tests and the dock find the form by it.
       formProps={{ "data-composer": "" }}
     />

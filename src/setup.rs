@@ -800,7 +800,7 @@ fn master_check() -> Check {
         "master",
         |ctx| {
             let dir = ctx.pm_dir.join("agents").join("master");
-            let missing: Vec<&str> = ["SOUL.md", "AGENT.md"]
+            let missing: Vec<&str> = crate::master::FILES
                 .into_iter()
                 .filter(|f| !dir.join(f).is_file())
                 .collect();

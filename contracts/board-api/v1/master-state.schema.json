@@ -4,6 +4,17 @@
   "description": "`master_state` (daemon RPC; `GET /api/master/state` relays it): what the\nmaster header shows. A member's copy drops the turn's `summary`.",
   "type": "object",
   "properties": {
+    "actor_identity": {
+      "description": "Hosted conversations may be personal even when the transport alias is `master`.\nAn absent projection retains the native workspace-coordinator contract.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ActorIdentity"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "alias": {
       "type": "string"
     },
@@ -32,6 +43,9 @@
     },
     "endpoint_kind": {
       "type": "string"
+    },
+    "identity": {
+      "$ref": "#/$defs/MasterIdentity"
     },
     "live": {
       "type": "boolean"
@@ -84,6 +98,7 @@
   },
   "required": [
     "alias",
+    "identity",
     "provider",
     "endpoint_kind",
     "live",
@@ -92,6 +107,51 @@
     "queued"
   ],
   "$defs": {
+    "ActorIdentity": {
+      "description": "The actor actually serving a conversation, independent of its transport alias.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "identity": {
+              "$ref": "#/$defs/PersonalAssistantIdentity"
+            },
+            "scope": {
+              "type": "string",
+              "const": "personal"
+            }
+          },
+          "required": [
+            "scope",
+            "conversation_id",
+            "identity"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "identity": {
+              "$ref": "#/$defs/MasterIdentity"
+            },
+            "scope": {
+              "type": "string",
+              "const": "workspace"
+            }
+          },
+          "required": [
+            "scope",
+            "conversation_id",
+            "identity"
+          ]
+        }
+      ]
+    },
     "AppOrigin": {
       "description": "The app conversation a Home turn belongs to, proven from the message's\npersisted provenance; `context_id` is `\"\"` for an installation-only chat.",
       "type": "object",
@@ -110,6 +170,23 @@
         "install_id",
         "context_id",
         "conversation_id"
+      ]
+    },
+    "AvatarLook": {
+      "description": "A canonical avatar look (the board's eleven `AgentAvatar` palettes).",
+      "type": "string",
+      "enum": [
+        "builder",
+        "guard",
+        "bookkeeper",
+        "content",
+        "designer",
+        "reception",
+        "operations",
+        "support",
+        "tester",
+        "robot",
+        "custom"
       ]
     },
     "MasterContext": {
@@ -135,6 +212,34 @@
           ]
         }
       }
+    },
+    "MasterIdentity": {
+      "description": "The workspace coordinator's effective identity (`master_state.identity`).\n\n`name`/`tone` are the operator-owned protected files' agreed values (`null`\n= unset); `look` is the pinned `params.look` (the existing robot when\nunpinned); `revision` fences the next protected update.",
+      "type": "object",
+      "properties": {
+        "look": {
+          "$ref": "#/$defs/AvatarLook"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "type": "string"
+        },
+        "tone": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "look",
+        "revision"
+      ]
     },
     "MasterQueued": {
       "description": "One queued turn's routing metadata; never its body.",
@@ -236,6 +341,36 @@
         "state",
         "message",
         "since"
+      ]
+    },
+    "PersonalAssistantIdentity": {
+      "description": "A member's committed identity. Private address/preferences are never a UI projection.",
+      "type": "object",
+      "properties": {
+        "look": {
+          "$ref": "#/$defs/AvatarLook"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tone": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "look",
+        "revision"
       ]
     }
   }

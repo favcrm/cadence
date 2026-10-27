@@ -1782,6 +1782,7 @@ exactly one git commit whose subject carries the actor:
 | `POST /api/epics/:epic/stage` | `{stage, note?}` — CAD-432: move an epic's stage over the daemon's `epic_stage` (CAD-405); the board never writes the tracker for it. The relay runs on the board's own connection, which the daemon attributes to the operator, so **every** board move needs the operator, not only moves into an `operator_stages` stage: read-only, the write guards, `403 operator_only` for an agent-attributed caller and `403 operator_proof` for a peer without the positive proof — the plan routes' path — before anything is written; no identity field is read (`deny_unknown_fields`). The relay sets `operator_decision: true`, and the daemon then requires the operator on the board's connection for any target, so a board an agent started is refused too (`403 operator_proof`) instead of landing the move as that agent's. Agents move stages with `cadence issue epic stage` over their own connection. The daemon's rules still apply: one step forward, any step back to the floor | `200` `{epic, from, to, forward, needs_operator, by, at, …}`; `400` a skip or unknown stage; `409` already there; `404` unknown epic |
 | `POST /api/issues/:id/answers` | `{question, text}` — the operator's answer (CAD-328) to the open question report `question` on `:id`: an `answer` task report (CAD-341) authored `operator`, never from the request or the board's environment; `403 operator_only` for an agent caller and `403 operator_proof` for a peer that is not provably the operator (same proof as the plan routes); `400` when `question` is not a question report on the ticket or `text` is blank. Then the daemon's `answer_route` (CAD-447) queues one message to the question's author with the answer and the report path — the reply's `route` says whether it was sent (`undeliverable` when the asker is gone; the answer stands either way) — and a best-effort `reports_changed` so the master's report router (CAD-339) picks it up at once | `201` `{issue, card, warnings, route}` |
 | `POST /api/threads/:alias/messages` | `{text, message?, expected_recipient_uid?}` — the operator's chat message (CAD-319): starts the thread on first use and queues `text` to the agent like `cadence send`. `expected_recipient_uid` (CAD-1591) is an optional identity constraint, never authority: a nonempty uid the daemon's enqueue transaction compares to the recipient's current uid — a mismatch refuses before any message or thread side effect, and an omitted field keeps the ordinary path. Refused `403 caller_agent` when the caller is attributed to an agent (pane or managed endpoint tool process); the daemon refuses agent connections again. Tied to no agent is the operator by default, not positive proof (CAD-313) | `200` with the send receipt and `thread` |
+| `POST /api/master/identity` | `{expected_revision, name?, tone?, look?}` — at least one of name/tone/look; operator session and positive native operator proof, no actor/alias selectors. The opaque revision covers the protected identity files and effective avatar; a stale editor is refused before mutation. `look` uses the existing eleven-slug avatar catalogue | `{identity: {name, tone, look, revision}, applies: "next_turn"}`; the actor includes committed identity in its next model turn, including after a provider session reset |
 
 Success bodies are `{issue, card, warnings}` — the fresh payloads, so
 the UI needs no second fetch. `warnings` notes a `ready`/`doing`/`review`
@@ -2234,6 +2235,83 @@ missing acceptable compressed sibling falls back to the original bytes.
 Start an isolated sandbox board and use the Rust restart loop in
 [CONTRIBUTING.md](../CONTRIBUTING.md#isolated-board-development) before running
 the Vite server. The configured dev port must match that sandbox board.
+
+### Assistant identity
+
+The chat header, answer sender, composer and About panel use the committed
+identity of that conversation's actor. A custom name is literal in English and
+Traditional Chinese; the localized role label is only the unset-name fallback.
+An unavailable profile is not reported as an unnamed or successfully saved one.
+
+Member-assistant setup is optional and request-first. The assistant may ask
+"What would you like to call me?" and "How would you like me to communicate?",
+one question per turn; skip/later do not block work. On Native, the existing
+fenced ACK accepts `name` (the assistant), `tone`, `user_name` (how to address the
+user), `preferences` and `look`. Later edits preserve the existing bootstrap
+state and conversation. Name/tone remain in the managed IDENTITY.md/SOUL.md
+sections; user address/preferences stay in private USER.md. Subsequent valid turns read
+the committed profile. A personal avatar selection is an ordinary chat request,
+not a browser-side profile write, and remains pending until state confirms it.
+The profile patch is bounded by UTF-8 value bytes: 4096 per field and 16384
+across supplied values (including a supplied look), not JSON encoding or the
+merged stored profile. Avatar params are validated before profile-file effects.
+
+The avatar renderer and eleven looks are the existing `AgentAvatar` catalogue.
+A new personal assistant pins its immutable alias-derived look once in
+`params.look`; renaming, setup deferral, reload and login never reroll it.
+Existing pins win, and an unpinned Master keeps the robot.
+
+Native Master-backed Home/app conversations are still workspace-owned. Their
+headers keep that scope visible at narrow widths too. The About panel offers
+proven operators a bounded name/personality/avatar editor through
+`POST /api/master/identity` (`master_identity_set` natively). IDENTITY.md and
+SOUL.md use the protected writer and digest record, never agent self-edit.
+Identity reads check the protected source digests before per-turn use. A
+coordinator identity save refuses existing drift in any protected source before
+writing; it records only the fields changed and verifies the post-save briefing
+sources rather than blessing unrelated edits.
+`MASTER_IDENTITY_LOCK` serializes verified reads with protected file/digest/params
+publication, including direct Master file edits and installation. A legitimate
+save cannot be mistaken for external drift while its digest is being published.
+`Shared::prompt_with_profile` includes committed name/personality in the initial
+prompt and any permitted fresh-session retry, including Pi `/new` and pre-tool
+history recovery. The UI reports next-turn application, not a change to an
+already-running turn. An editor retains its draft and base revision on a
+concurrent update; explicitly reload the saved identity to edit the newer base.
+The About panel preserves Escape dismissal and returns focus after a save.
+A rename does not change the `master` routing alias, ownership, permissions or
+retained history. Personal-assistant Home/app routing
+and scoped assistant-to-Master queries remain the separate CAD-1818 phase.
+
+The tenant Worker port (AOS-378) uses the same shared UI without changing its
+existing recipients: subject-owned Home/app conversations are personal, while
+the reserved owner-only Recruit conversation uses the workspace coordinator.
+The server adds `actor_identity: {scope, conversation_id, identity}` to the
+selected conversation's master state and initial streamed snapshot; the UI
+reads `/api/master/state?conversation=<id>` and refuses mismatched projections.
+Only an absent projection retains Native's coordinator contract. A present
+malformed projection or failed/stale canonical read is unavailable, with no
+borrowed profile, ownership claim or edit control.
+Before the first hosted Home message, the thread may still be null. Home binds
+the valid personal projection from its default master-state response, whose
+server-issued conversation ID already exists; the first streamed entries do
+not need a reload to acquire the name or scope. That validated binding is also
+adopted by the empty thread before its hosted stream opens, so initial turn
+snapshots and Stop/Cancel use the same ID without relaxing stream admission.
+App/Recruit panes still require their selected conversation ID and never borrow
+that default Home projection.
+Hosted app turn indicators and Stop/Cancel reconciliation use the selected
+conversation's state too; an idle Home snapshot cannot hide its running turn.
+
+Worker personal profiles are canonical actor-private Workspace-DO rows, not
+Native Markdown files. The actor-bound `assistant_profile` tool uses the same
+fields and bootstrap states, while protected workspace edits remain owner-only
+HTTP actions. Initial personal avatars are pinned from the immutable
+tenant-scoped subject; a rename never rerolls them. User address/preferences
+never enter UI identity projections or workspace context. Recruit's About panel
+is the workspace editor; editing it does not rename the user's assistant.
+Both source repositories and the matching UI release must pass their normal
+promotion/release gates before this behavior is available in a hosted tenant.
 
 ### App routing QA handovers
 

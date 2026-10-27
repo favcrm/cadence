@@ -1120,6 +1120,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             viewerSub={meta?.session?.user?.sub ?? null}
             viewerIsMember={meta?.session?.user?.role === "member"}
             sessionId={meta?.session?.id ?? null}
+            operator={meta?.operator === true}
             overview={overviewState}
             onOpenIssue={openHomeWork}
             onOpenDecision={openDecision}

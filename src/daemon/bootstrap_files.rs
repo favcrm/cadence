@@ -39,16 +39,25 @@ const USER_TEMPLATE: &str = include_str!("../../agents/member-assistant/USER.md"
 const AGENTS_TEMPLATE: &str = include_str!("../../agents/member-assistant/AGENTS.md");
 
 /// The closed profile object a member may agree to.
+///
+/// `name` and `tone` are the ASSISTANT's display name and agreed way of
+/// speaking (IDENTITY.md, SOUL.md). `user_name` is how the assistant addresses
+/// the USER and lives in its own USER.md section — never IDENTITY.md.
+/// `preferences` holds other agreed user preferences. `look` is the avatar
+/// slug (`params.look`, not a file) and must be one of the catalogue's eleven.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Profile {
     pub name: Option<String>,
     pub tone: Option<String>,
     pub preferences: Option<String>,
+    pub user_name: Option<String>,
+    pub look: Option<String>,
 }
 
 impl Profile {
     /// Refuse unknown fields, non-strings and oversized values before any
     /// effect. Reserved managed-section markers are refused, not stored.
+    /// An empty `name`/`tone`/`user_name` is the explicit clear.
     pub fn parse(object: &serde_json::Map<String, serde_json::Value>) -> Result<Self> {
         let mut total = 0usize;
         let mut out = Profile::default();
@@ -65,17 +74,34 @@ impl Profile {
                 ));
             }
             total += text.len();
+            if key == "look" {
+                let look = crate::agent_roles::canonical_look(text.trim()).ok_or_else(|| {
+                    Error::rejected(format!(
+                        "bootstrap profile look '{text}' is not one of: {}",
+                        crate::agent_roles::LOOKS.join(", ")
+                    ))
+                })?;
+                out.look = Some(look.to_string());
+                continue;
+            }
             let slot = match key.as_str() {
                 "name" => &mut out.name,
                 "tone" => &mut out.tone,
                 "preferences" => &mut out.preferences,
+                "user_name" => &mut out.user_name,
                 other => {
                     return Err(Error::rejected(format!(
                         "bootstrap profile field '{other}' is not accepted"
                     )))
                 }
             };
-            *slot = Some(clean(text));
+            let cleaned = crate::managed_section::clean(text);
+            if cleaned.len() > crate::managed_section::VALUE_MAX {
+                return Err(Error::rejected(
+                    "bootstrap profile field is too long after escaping",
+                ));
+            }
+            *slot = Some(cleaned);
         }
         if total > PROFILE_MAX {
             return Err(Error::rejected("bootstrap profile is too long"));
@@ -84,16 +110,26 @@ impl Profile {
     }
 }
 
-/// One managed line per field: control characters removed and any HTML
-/// comment opener neutralised, so a value can never open or close a section.
-fn clean(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>()
-        .replace("<!--", "&lt;!--")
-        .replace("-->", "--&gt;")
-        .trim()
-        .to_string()
+/// The committed scalar identity of one member assistant.
+///
+/// Read from the managed sections only: `name` from IDENTITY.md and `tone`
+/// from SOUL.md. `None` means the file has no block or the agreed value is
+/// empty/the seeded placeholder; a malformed block or a read failure is an
+/// error, never a silent unset.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Identity {
+    pub name: Option<String>,
+    pub tone: Option<String>,
+}
+
+/// Read the effective identity from the assistant's private root.
+pub fn read_identity(root: &Path) -> Result<Identity> {
+    let identity = read_profile_file(root, IDENTITY)?;
+    let soul = read_profile_file(root, SOUL)?;
+    Ok(Identity {
+        name: crate::managed_section::value(&identity, "name")?,
+        tone: crate::managed_section::value(&soul, "tone")?,
+    })
 }
 
 /// Open `root` as a directory fd, refusing a symlink at the root itself.
@@ -224,29 +260,6 @@ fn fsync_dir(root: &OwnedFd) -> Result<()> {
     Ok(())
 }
 
-/// Replace one managed section (or append it), keeping all other text.
-fn set_section(text: &str, marker: &str, body: &str) -> String {
-    let begin = format!("<!-- cadence:managed-begin {marker} -->");
-    let end = format!("<!-- cadence:managed-end {marker} -->");
-    let block = format!("{begin}\n{body}\n{end}");
-    match (text.find(&begin), text.find(&end)) {
-        (Some(b), Some(e)) if e > b => {
-            let after = e + end.len();
-            format!("{}{}{}", &text[..b], block, &text[after..])
-        }
-        _ => {
-            let mut out = text.to_string();
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push('\n');
-            out.push_str(&block);
-            out.push('\n');
-            out
-        }
-    }
-}
-
 /// Replace one managed file atomically: bounded read, exclusive temp file,
 /// fsync, `renameat` within the trusted root. The temp name is removed on any
 /// failure. Existing content is never truncated in place.
@@ -300,10 +313,11 @@ fn replace_file(root: &OwnedFd, name: &str, next: &str) -> Result<()> {
 /// or symlinked target refuses rather than being created or followed.
 pub fn write_profile(root: &Path, profile: &Profile) -> Result<()> {
     let dir = open_root(root)?;
-    let plan: [(&str, &str, Option<&String>); 3] = [
+    let plan: [(&str, &str, Option<&String>); 4] = [
         (IDENTITY, "name", profile.name.as_ref()),
         (SOUL, "tone", profile.tone.as_ref()),
         (USER, "preferences", profile.preferences.as_ref()),
+        (USER, "user_name", profile.user_name.as_ref()),
     ];
     for (name, marker, value) in plan {
         let Some(value) = value else { continue };
@@ -311,7 +325,11 @@ pub fn write_profile(root: &Path, profile: &Profile) -> Result<()> {
             .ok_or_else(|| Error::rejected(format!("bootstrap file '{name}' is missing")))?;
         let current = read_bounded(&mut file, name)?;
         drop(file);
-        let next = set_section(&current, marker, &format!("{marker}: {value}"));
+        let next = crate::managed_section::set(
+            &current,
+            marker,
+            &crate::managed_section::line(marker, value),
+        )?;
         if next.len() as u64 > FILE_MAX {
             return Err(Error::rejected(format!(
                 "bootstrap file '{name}' would exceed the cap"

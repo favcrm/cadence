@@ -25,12 +25,15 @@ use super::unattended::DispatchAuthority;
 use super::{
     optional_str, optional_strs, reject_identity_fields, required_str, Caller, Shared, DAEMON_ALIAS,
 };
+
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::{self, task_report};
 use crate::master::{self, ALIAS};
 use crate::peer::AgentCaller;
 use crate::store;
+// Readers and protected writers share the file/digest/params publication boundary.
+pub(super) static MASTER_IDENTITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The daemon methods a master connection may call — everything else is
 /// refused (review round 1, C2). Reads, proposing a plan, registering a
@@ -735,17 +738,160 @@ impl Shared {
             ));
         }
         let pm = self.pm()?;
+        let protected_master_file = slug == ALIAS;
+        let _identity_guard = if protected_master_file {
+            Some(
+                MASTER_IDENTITY_LOCK
+                    .lock()
+                    .map_err(|_| Error::internal("master identity lock poisoned"))?,
+            )
+        } else {
+            None
+        };
         let out = master::write_file(&pm, slug, name, text, "operator")?;
         master::record(&self.state_dir, slug, name, &master::digest(text))?;
+        if protected_master_file {
+            self.bump_master_rev();
+        }
         Ok(out)
+    }
+
+    /// `master_identity_set` (CAD-1817) — the workspace coordinator's bounded
+    /// identity write, for a proven operator only (an agent, the master
+    /// included, is refused by the connection gate before any effect).
+    ///
+    /// Closed request: `expected_revision` plus at least one of `name`,
+    /// `tone`, `look`. `name`/`tone` go to the protected IDENTITY.md/SOUL.md
+    /// managed sections through the same writer/digest path as
+    /// `agent_file_write`; `look` is the master's ordinary `params.look` and
+    /// requires a registered master. Every write is fenced on the identity
+    /// revision, so a stale editor never overwrites a newer identity. The
+    /// response reports `next_turn`: the actor briefs each new turn from the
+    /// committed name/tone, including after a provider session reset.
+    pub(super) fn rpc_master_identity_set(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("master identity", params, peer_pid)?;
+        const FIELDS: [&str; 4] = ["expected_revision", "name", "tone", "look"];
+        if let Some(field) = params
+            .as_object()
+            .and_then(|object| object.keys().find(|key| !FIELDS.contains(&key.as_str())))
+        {
+            return Err(Error::rejected(format!(
+                "master identity takes {} only; field '{field}' is not accepted",
+                FIELDS.join(", ")
+            )));
+        }
+        let expected_revision = required_str(params, "expected_revision")?;
+        if expected_revision.is_empty() {
+            return Err(Error::rejected(
+                "master identity needs a non-empty expected_revision",
+            ));
+        }
+        let scalar = |key: &str, max: usize| -> Result<Option<String>> {
+            match params.get(key) {
+                None => Ok(None),
+                Some(Value::String(text)) => {
+                    let value = crate::managed_section::clean(text);
+                    if value.chars().count() > max {
+                        return Err(Error::rejected(format!(
+                            "master identity {key} is longer than {max} characters"
+                        )));
+                    }
+                    Ok(Some(value))
+                }
+                Some(_) => Err(Error::rejected(format!(
+                    "master identity {key} must be a string"
+                ))),
+            }
+        };
+        let name = scalar("name", 80)?;
+        let tone = scalar("tone", 240)?;
+        let look = match params.get("look") {
+            None => None,
+            Some(Value::String(text)) => Some(
+                crate::agent_roles::canonical_look(text.trim()).ok_or_else(|| {
+                    Error::rejected(format!(
+                        "master identity look '{text}' is not one of: {}",
+                        crate::agent_roles::LOOKS.join(", ")
+                    ))
+                })?,
+            ),
+            Some(_) => return Err(Error::rejected("master identity look must be a string")),
+        };
+        if name.is_none() && tone.is_none() && look.is_none() {
+            return Err(Error::rejected(
+                "master identity needs at least one of name, tone, look",
+            ));
+        }
+        let pm = self.pm()?;
+        let identity_guard = MASTER_IDENTITY_LOCK
+            .lock()
+            .map_err(|_| Error::internal("master identity lock poisoned"))?;
+        let current = self.master_identity_locked(&identity_guard)?;
+        if current.revision != expected_revision {
+            return Err(Error::rejected(format!(
+                "master identity revision is stale (current {}); reload the \
+                 identity and retry",
+                current.revision
+            )));
+        }
+        if look.is_some() && self.store.agent_opt(ALIAS)?.is_none() {
+            return Err(Error::rejected(
+                "the master is not started — `cadence master start` registers it \
+                 before its avatar can change",
+            ));
+        }
+        let files_changed = name.is_some() || tone.is_some();
+        if files_changed {
+            master::write_identity(
+                &pm,
+                expected_revision,
+                current.look.as_str(),
+                name.as_deref(),
+                tone.as_deref(),
+                "operator",
+            )?;
+            master::record_identity(&self.state_dir, &pm.dir, name.is_some(), tone.is_some())?;
+            // Keep the launch briefing and stored instructions current too;
+            // per-turn identity context is the live provider's refresh path.
+            let files = master::read_files(&pm.dir, ALIAS, false)?;
+            master::verify(&self.state_dir, ALIAS, &files)?;
+            let briefing = master::compose(&files);
+            let file = client::briefing_path(&self.state_dir, &Value::Null, ALIAS);
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&file, &briefing)?;
+            if self.store.agent_opt(ALIAS)?.is_some() {
+                self.store.set_instructions_by(
+                    ALIAS,
+                    &briefing,
+                    &super::caller_audit(&AgentCaller::Operator),
+                )?;
+            }
+        }
+        if let Some(look) = look {
+            self.store.set_params_by(
+                ALIAS,
+                &json!({ "look": look }),
+                &super::caller_audit(&AgentCaller::Operator),
+            )?;
+        }
+        let identity = self.master_identity_locked(&identity_guard)?;
+        // The board's master push frame keys on this revision, so an open
+        // header refetches the identity it just missed.
+        self.bump_master_rev();
+        Ok(json!({
+            "identity": identity,
+            "applies": "next_turn",
+        }))
     }
 
     /// `master_start` — operator only. Installs any missing default agent
     /// file, refuses files changed around the writer, then registers the
     /// one `master` agent — managed Claude, in an empty working dir under
     /// the state dir — and queues its bootstrap: the briefing built from
-    /// SOUL.md + AGENT.md. Its thread starts here, so reports routed to
-    /// it land in the chat.
+    /// IDENTITY.md + SOUL.md + AGENT.md. Its thread starts here, so reports
+    /// routed to it land in the chat.
     pub(super) fn rpc_master_start(
         self: &Arc<Self>,
         params: &Value,
@@ -765,11 +911,16 @@ impl Shared {
         let pm = self.pm()?;
         // Files edited around the writer refuse BEFORE anything is
         // installed or registered — a refusal writes nothing.
-        master::verify(
-            &self.state_dir,
-            ALIAS,
-            &master::read_files(&pm.dir, ALIAS, false)?,
-        )?;
+        {
+            let _guard = MASTER_IDENTITY_LOCK
+                .lock()
+                .map_err(|_| Error::internal("master identity lock poisoned"))?;
+            master::verify(
+                &self.state_dir,
+                ALIAS,
+                &master::read_files(&pm.dir, ALIAS, false)?,
+            )?;
+        }
         // `claude` and `pi` (CAD-322) — a Codex master still waits for a
         // read-only sandbox with its writes through daemon verbs.
         let requested = optional_str(params, "provider");
@@ -826,9 +977,15 @@ impl Shared {
                 ))
             }
         }
-        let installed = master::install_defaults(&pm, "operator")?;
-        let files = master::read_files(&pm.dir, ALIAS, true)?;
-        master::verify(&self.state_dir, ALIAS, &files)?;
+        let (installed, files) = {
+            let _guard = MASTER_IDENTITY_LOCK
+                .lock()
+                .map_err(|_| Error::internal("master identity lock poisoned"))?;
+            let installed = master::install_defaults(&pm, "operator")?;
+            let files = master::read_files(&pm.dir, ALIAS, true)?;
+            master::verify(&self.state_dir, ALIAS, &files)?;
+            (installed, files)
+        };
         let agent_md = files
             .iter()
             .find(|(n, _)| n == "AGENT.md")
@@ -953,7 +1110,7 @@ impl Shared {
             format!(
                 "Cadence bootstrap: you are 'master', the operator's company assistant. \
                  Your briefing is on disk at {} and too long to inline; ask the operator \
-                 to shorten SOUL.md/AGENT.md. Reply to the operator in this thread.",
+                 to shorten IDENTITY.md/SOUL.md/AGENT.md. Reply to the operator in this thread.",
                 file.display()
             )
         };

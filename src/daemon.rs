@@ -4099,6 +4099,7 @@ impl Shared {
             "master_dispatch" => self.rpc_master_dispatch(params, peer_pid),
             "question_escalate" => self.rpc_question_escalate(params, peer_pid),
             "agent_file_write" => self.rpc_agent_file_write(params, peer_pid),
+            "master_identity_set" => self.rpc_master_identity_set(params, peer_pid),
             "master_start" => self.rpc_master_start(params, peer_pid),
             "master_summary" => self.rpc_master_summary(params, peer_pid),
             "master_state" => self.rpc_master_state(params),

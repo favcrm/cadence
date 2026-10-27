@@ -69,14 +69,14 @@ const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { sta
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const url = new URL(String(input), "http://localhost");
   fetched.push({ url: url.pathname, method: init?.method ?? "GET" });
-  if (url.pathname.endsWith("/stream")) return streamFixture(url.href, { alias: "master", provider: "p", endpoint_kind: "k", live: true, turn: null }, init?.signal);
+  if (url.pathname.endsWith("/stream")) return streamFixture(url.href, { alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "p", endpoint_kind: "k", live: true, turn: null }, init?.signal);
   // The generic descriptor route, serving the approved package's file.
   if (url.pathname === `/api/app-installations/${INSTALL}/chat-descriptor`) return json({ descriptor, digest: DIGEST, app: "notes" });
   if (url.pathname === `/api/app-installations/${INSTALL}/conversations`) {
     return json({ conversations: [{ id: "c-gen", title: null, subject: null, is_general: true }] });
   }
   if (url.pathname === "/api/threads/master") return json({ entries, more_before: false });
-  if (url.pathname === "/api/master/state") return json({ alias: "master", provider: "p", endpoint_kind: "k", live: true, turn: null });
+  if (url.pathname === "/api/master/state") return json({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "p", endpoint_kind: "k", live: true, turn: null });
   throw new Error(`Unexpected request ${url.pathname}`);
 }) as typeof fetch;
 

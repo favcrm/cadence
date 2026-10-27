@@ -1,7 +1,7 @@
 //! The master agent (CAD-339): one per install, alias `master`, a
 //! managed Claude or Pi session (CAD-322; Codex waits for a read-only
 //! sandbox) the daemon starts from the agent files `agents/master/
-//! SOUL.md` and `AGENT.md`.
+//! IDENTITY.md`, `SOUL.md` and `AGENT.md`.
 //!
 //! **Where the files live.** CAD-338 (the agent filesystem) is not
 //! implemented yet, so this uses the smallest location its design
@@ -11,10 +11,12 @@
 //! The repo carries the default templates (`agents/master/`); the
 //! daemon installs any that are missing on `master start`.
 //!
-//! **One writer.** SOUL.md and AGENT.md change only through
+//! **One writer.** IDENTITY.md, SOUL.md and AGENT.md change only through
 //! [`write_file`] (`cadence master edit`, daemon RPC `agent_file_write`),
-//! which the daemon runs for the proven operator only — an agent, the
-//! master included, is refused before anything is written. Each write
+//! or IDENTITY.md/SOUL.md through the bounded [`write_identity`]
+//! (`master_identity_set`), which the daemon runs for the proven operator
+//! only — an agent, the master included, is refused before anything is
+//! written. Each write
 //! (and each install) records the files' digest in the state dir;
 //! `master start` refuses files whose digest does not match — an edit
 //! made around the writer is caught at the next launch instead of
@@ -103,11 +105,13 @@ pub const ALIAS: &str = "master";
 /// place.
 pub const PROVIDERS: &[&str] = &["claude", "pi"];
 /// The agent files the briefing is built from, in briefing order.
-pub const FILES: [&str; 2] = ["SOUL.md", "AGENT.md"];
+pub const FILES: [&str; 3] = ["IDENTITY.md", "SOUL.md", "AGENT.md"];
 /// Size caps from the agent-filesystem design record (characters).
+pub const IDENTITY_MAX_CHARS: usize = 1_000;
 pub const SOUL_MAX_CHARS: usize = 4_000;
 pub const AGENT_MAX_CHARS: usize = 20_000;
 
+const IDENTITY_TEMPLATE: &str = include_str!("../agents/master/IDENTITY.md");
 const SOUL_TEMPLATE: &str = include_str!("../agents/master/SOUL.md");
 const AGENT_TEMPLATE: &str = include_str!("../agents/master/AGENT.md");
 
@@ -1332,6 +1336,7 @@ fn check_slug(slug: &str) -> Result<()> {
 /// truncated.
 pub fn check_file(name: &str, text: &str) -> Result<()> {
     let cap = match name {
+        "IDENTITY.md" => IDENTITY_MAX_CHARS,
         "SOUL.md" => SOUL_MAX_CHARS,
         "AGENT.md" => AGENT_MAX_CHARS,
         "permissions.yaml" => {
@@ -1382,6 +1387,7 @@ fn real_dir(pm_dir: &Path, slug: &str) -> Result<PathBuf> {
 /// without installing anything.
 pub(crate) fn default_template(slug: &str, name: &str) -> Option<&'static str> {
     match (slug, name) {
+        (ALIAS, "IDENTITY.md") => Some(IDENTITY_TEMPLATE),
         (ALIAS, "SOUL.md") => Some(SOUL_TEMPLATE),
         (ALIAS, "AGENT.md") => Some(AGENT_TEMPLATE),
         _ => None,
@@ -1446,8 +1452,8 @@ pub fn install_defaults(pm: &Pm, actor: &str) -> Result<Vec<String>> {
     Ok(missing.iter().map(|s| s.to_string()).collect())
 }
 
-/// Replace one agent file — the only writer of SOUL.md and AGENT.md.
-/// The daemon calls it for the proven operator only. Validated and
+/// Replace one agent file — the only writer of IDENTITY.md, SOUL.md and
+/// AGENT.md. The daemon calls it for the proven operator only. Validated and
 /// secret-scanned before anything is written; one tracker commit.
 pub fn write_file(pm: &Pm, slug: &str, name: &str, text: &str, actor: &str) -> Result<Value> {
     check_file(name, text)?;
@@ -1564,6 +1570,202 @@ pub fn read_files(pm_dir: &Path, slug: &str, all: bool) -> Result<Vec<(String, S
     Ok(out)
 }
 
+/// The workspace coordinator's committed identity: its display name and agreed
+/// tone from the protected files, plus the content revision a write fences on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub name: Option<String>,
+    pub tone: Option<String>,
+    /// sha256 over IDENTITY.md+SOUL.md; opaque, changes on every applied write.
+    pub revision: String,
+}
+
+/// Read one master file, refusing a symlink and a file over its cap. `None`
+/// only when the file is genuinely absent (an install from before
+/// IDENTITY.md existed, or a never-installed `agents/master`).
+fn read_one(pm_dir: &Path, slug: &str, name: &str) -> Result<Option<String>> {
+    let dir = real_dir(pm_dir, slug)?;
+    let path = dir.join(name);
+    let meta = path.symlink_metadata();
+    if meta.as_ref().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{} is a symlink — agent files are never read through links",
+            path.display()
+        )));
+    }
+    match meta {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(Error::rejected(format!(
+                "cannot read {}: {e}",
+                path.display()
+            )))
+        }
+        Ok(_) => {}
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| Error::rejected(format!("cannot read {}: {e}", path.display())))?;
+    check_file(name, &text)?;
+    Ok(Some(text))
+}
+
+/// The revision of the identity files and effective avatar: length-prefixed
+/// so no distinct set of values can concatenate alike.
+pub fn identity_revision(identity_text: &str, soul_text: &str, look: &str) -> String {
+    digest(&format!(
+        "{}:{identity_text}|{}:{soul_text}|{}:{look}",
+        identity_text.len(),
+        soul_text.len(),
+        look.len()
+    ))
+}
+
+/// Read the effective workspace identity. A missing file is unset; a
+/// malformed managed section or a refused read is an error, never a silent
+/// unset.
+pub fn read_identity(pm_dir: &Path, look: &str) -> Result<Identity> {
+    let identity = read_one(pm_dir, ALIAS, "IDENTITY.md")?.unwrap_or_default();
+    let soul = read_one(pm_dir, ALIAS, "SOUL.md")?.unwrap_or_default();
+    identity_from_sources(&identity, &soul, look)
+}
+
+/// Read only verified source bytes for UI and per-turn context. Unlike the
+/// launch check, this never trusts-once or updates the protected baseline.
+pub fn read_verified_identity(state_dir: &Path, pm_dir: &Path, look: &str) -> Result<Identity> {
+    let identity = read_one(pm_dir, ALIAS, "IDENTITY.md")?.unwrap_or_default();
+    let soul = read_one(pm_dir, ALIAS, "SOUL.md")?.unwrap_or_default();
+    let agent = read_one(pm_dir, ALIAS, "AGENT.md")?.unwrap_or_default();
+    if let Some(reason) = tampered_sources(
+        state_dir,
+        ALIAS,
+        [
+            ("IDENTITY.md", identity.as_str()),
+            ("SOUL.md", soul.as_str()),
+            ("AGENT.md", agent.as_str()),
+        ],
+    ) {
+        return Err(Error::invalid("agent_files_changed", reason));
+    }
+    identity_from_sources(&identity, &soul, look)
+}
+
+fn identity_from_sources(identity: &str, soul: &str, look: &str) -> Result<Identity> {
+    Ok(Identity {
+        name: crate::managed_section::value(identity, "name")?,
+        tone: crate::managed_section::value(soul, "tone")?,
+        revision: identity_revision(identity, soul, look),
+    })
+}
+
+/// Write the workspace identity through the same protected-writer path as
+/// [`write_file`]: bounded managed sections, secret scan, one tracker commit
+/// for both files, rollback on a failed commit. `expected_revision` is
+/// re-checked under the writer lock, so a stale editor never overwrites a
+/// newer identity. `None` leaves a field untouched; an empty value clears it.
+pub fn write_identity(
+    pm: &Pm,
+    expected_revision: &str,
+    look: &str,
+    name: Option<&str>,
+    tone: Option<&str>,
+    actor: &str,
+) -> Result<Identity> {
+    let dir = real_dir(&pm.dir, ALIAS)?;
+    let _lock = pm.lock()?;
+    std::fs::create_dir_all(&dir)?;
+    // Fence on what `read_identity` reports — the RAW files, where a missing
+    // file is empty — then seed a missing target from its template only for
+    // the new text. Substituting the template before the comparison would
+    // make a never-installed IDENTITY.md look stale to its own projection.
+    let identity_raw = read_one(&pm.dir, ALIAS, "IDENTITY.md")?;
+    let soul_raw = read_one(&pm.dir, ALIAS, "SOUL.md")?;
+    let current = identity_revision(
+        identity_raw.as_deref().unwrap_or(""),
+        soul_raw.as_deref().unwrap_or(""),
+        look,
+    );
+    if current != expected_revision {
+        return Err(Error::rejected(format!(
+            "master identity revision is stale (current {current}) — reload the \
+             identity and retry"
+        )));
+    }
+    let identity_before = identity_raw.unwrap_or_else(|| IDENTITY_TEMPLATE.to_string());
+    let soul_before = soul_raw.unwrap_or_else(|| SOUL_TEMPLATE.to_string());
+    let mut staged: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+    let apply = (|| -> Result<()> {
+        let mut stage = |next: String, file: &str| -> Result<()> {
+            check_file(file, &next)?;
+            crate::secret::guard(&format!("agents/{ALIAS}/{file}"), &next)?;
+            let path = dir.join(file);
+            let before = std::fs::read(&path).ok();
+            write_atomic(&path, &next)?;
+            staged.push((path, before));
+            Ok(())
+        };
+        if let Some(name) = name {
+            let next = crate::managed_section::set(
+                &identity_before,
+                "name",
+                &crate::managed_section::line("name", name),
+            )?;
+            stage(next, "IDENTITY.md")?;
+        }
+        if let Some(tone) = tone {
+            let next = crate::managed_section::set(
+                &soul_before,
+                "tone",
+                &crate::managed_section::line("tone", tone),
+            )?;
+            stage(next, "SOUL.md")?;
+        }
+        if !staged.is_empty() {
+            let paths: Vec<PathBuf> = staged.iter().map(|(path, _)| path.clone()).collect();
+            crate::issue::write::commit(
+                pm,
+                &paths,
+                &format!("agents/{ALIAS}: set identity"),
+                &[],
+                actor,
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = apply {
+        for (path, before) in staged {
+            match before {
+                Some(old) => {
+                    let _ = std::fs::write(&path, old);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        return Err(e);
+    }
+    read_identity(&pm.dir, look)
+}
+
+/// Record only the identity sources explicitly changed by the protected writer;
+/// an unrelated source must retain its baseline for the post-write check.
+pub fn record_identity(
+    state_dir: &Path,
+    pm_dir: &Path,
+    name_changed: bool,
+    tone_changed: bool,
+) -> Result<()> {
+    for (name, changed) in [("IDENTITY.md", name_changed), ("SOUL.md", tone_changed)] {
+        if !changed {
+            continue;
+        }
+        if let Some(text) = read_one(pm_dir, ALIAS, name)? {
+            record(state_dir, ALIAS, name, &digest(&text))?;
+        }
+    }
+    Ok(())
+}
+
 /// sha256 of one file's text.
 pub fn digest(text: &str) -> String {
     Sha256::digest(text.as_bytes())
@@ -1635,6 +1837,20 @@ pub fn verify(state_dir: &Path, slug: &str, files: &[(String, String)]) -> Resul
 /// refusal `verify` raises — without the trust-once recording `verify`
 /// performs. `master status` reports drift; it never records.
 pub fn tampered_file(state_dir: &Path, slug: &str, files: &[(String, String)]) -> Option<String> {
+    tampered_sources(
+        state_dir,
+        slug,
+        files
+            .iter()
+            .map(|(name, text)| (name.as_str(), text.as_str())),
+    )
+}
+
+fn tampered_sources<'a>(
+    state_dir: &Path,
+    slug: &str,
+    files: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<String> {
     let all = load_records(state_dir);
     for (name, text) in files {
         match all[slug][name]["digest"].as_str() {
@@ -1687,12 +1903,12 @@ pub fn record_escalation(state_dir: &Path, key: &str, record: Value) -> Result<(
     Ok(())
 }
 
-/// The briefing text: SOUL.md then AGENT.md, verbatim and byte-stable
-/// (the prefix caches), under one heading naming their source.
+/// The briefing text: IDENTITY.md, SOUL.md then AGENT.md, verbatim and
+/// byte-stable (the prefix caches), under one heading naming their source.
 pub fn compose(files: &[(String, String)]) -> String {
     let mut out = String::from(
-        "# Master briefing\n\nBuilt by the daemon from agents/master/ (SOUL.md, AGENT.md). \
-         Only the operator changes these files.\n",
+        "# Master briefing\n\nBuilt by the daemon from agents/master/ (IDENTITY.md, SOUL.md, \
+         AGENT.md). Only the operator changes these files.\n",
     );
     for (name, text) in files {
         out.push_str(&format!("\n<!-- agents/master/{name} -->\n"));

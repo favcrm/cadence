@@ -409,6 +409,9 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // CAD-551: the composer's slash commands and Stop — the daemon's
     // `master_command` is operator-only, so the relay is too.
     route("POST", "/api/master/command", RouteClass::OperatorOnly),
+    // CAD-1817: the workspace coordinator's bounded identity write. The
+    // daemon's `master_identity_set` proves the operator connection again.
+    route("POST", "/api/master/identity", RouteClass::OperatorOnly),
     // CAD-574: the rail's needs-row snooze/dismiss and agent
     // resume/unfence — the relays cross the daemon's operator gate, so
     // the board routes are the operator's alone (unlisted writes would

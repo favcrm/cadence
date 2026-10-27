@@ -32,10 +32,10 @@ pub(crate) enum MasterAction {
         #[arg(long)]
         copy_login: bool,
     },
-    /// Replace the master's SOUL.md or AGENT.md (operator only; one
-    /// tracker commit). Takes effect at the next `master start`.
+    /// Replace the master's IDENTITY.md, SOUL.md or AGENT.md (operator
+    /// only; one tracker commit). Takes effect at the next `master start`.
     Edit {
-        /// SOUL.md or AGENT.md.
+        /// IDENTITY.md, SOUL.md or AGENT.md.
         name: String,
         /// The new content; `-` reads stdin.
         #[arg(long)]

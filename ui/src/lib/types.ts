@@ -8,6 +8,13 @@ export type CardAgent = Api.CardAgent;
 
 export type Ref = Api.Ref;
 
+/** CAD-1817: the canonical avatar catalog slug — the daemon's closed union,
+ *  matching `AVATAR_LOOKS` in `features/agents/AgentAvatar.tsx`. */
+export type AvatarLook = Api.AvatarLook;
+
+/** CAD-1817: the workspace coordinator's committed identity projection. */
+export type MasterIdentity = Api.MasterIdentity;
+
 /** A board card (`GET /api/issues` row): the core card, its work block and
  *  the bound-agent strip. Generated from the daemon's Rust type. */
 export type IssueCard = Api.IssueListItem;
@@ -672,6 +679,12 @@ export interface MasterState {
   /** Queued master messages in delivery order (max 20). */
   queue?: { message: string; conversation?: string | null }[];
   queued?: number;
+  /** CAD-1817: the workspace coordinator's committed identity — its own
+   *  protected IDENTITY/SOUL projection, never a member's private profile.
+   *  Generated as `MasterIdentity` from the daemon's Rust type. */
+  identity: MasterIdentity;
+  /** Hosted-only actor projection, bound to its selected conversation. */
+  actor_identity?: Api.MasterState["actor_identity"];
 }
 
 /** `POST /api/master/command` — one allowlisted session verb's answer. */

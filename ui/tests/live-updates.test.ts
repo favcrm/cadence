@@ -107,6 +107,7 @@ async function startupGap(initialAlreadyLanded: boolean) {
 }
 async function masterDoesNotWaitForTheLegacyBatch() {
   const state = (message: string): MasterState => ({
+    identity: { name: null, tone: null, look: "robot", revision: "fixture" },
     alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true,
     turn: { state: "working", message, conversation: "current", position: null }, queue: [],
   });

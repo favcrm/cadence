@@ -1899,8 +1899,11 @@ impl Shared {
             &expect,
             &message.id,
             token,
-            action,
-            expected_revision,
+            store::AssistantBootstrapUpdate {
+                action,
+                expected_revision,
+                look: profile.as_ref().and_then(|p| p.look.as_deref()),
+            },
             || {
                 if let Some(p) = profile.as_ref() {
                     bootstrap_files::write_profile(&root, p)?;

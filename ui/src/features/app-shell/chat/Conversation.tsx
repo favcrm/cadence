@@ -90,6 +90,13 @@ import type { AppChat } from "./contract";
 import ChatFrame from "./ChatFrame";
 import DirectiveCard, { ConfirmationCard } from "./DirectiveCard";
 import AssistantOperations from "./AssistantOperations";
+import {
+  AssistantAboutButton,
+  AssistantActorProvider,
+  AssistantFace,
+  useConversationActor,
+} from "../../assistant/AssistantIdentity";
+import { displayName, messageLabel, messagePlaceholder, scopeDescriptor } from "../../assistant/identity";
 import { carriesSecret, hideIds, matchDirective, type Directive } from "./directive";
 import { planFrames, type FrameRow } from "./frames";
 import type { FileUploadProjection } from "./descriptorClient";
@@ -487,7 +494,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const store = active.store ?? idleThread;
   const convId = active.state === "ready" ? (active.selected?.id ?? null) : null;
   const thread = useResource(store);
-  const masterState = useQuery(resources.masterState);
+  const homeMasterState = useQuery(resources.masterState);
+  const hosted = homeMasterState.data !== null && Object.hasOwn(homeMasterState.data, "actor_identity");
+  // Hosted turn state belongs to the selected session, just like identity.
+  // Native retains the install-wide coordinator queue.
+  const masterSource = hosted && convId !== null ? resources.masterConversation(convId) : resources.masterState;
+  const masterState = useQuery(masterSource);
   const homeThread = useResource(resources.masterThread);
   // One draft per conversation: the composer remounts per store, so
   // switching conversations keeps each one's typed text (the stores and
@@ -1102,7 +1114,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           composerKeyRef.current === origin.key && visitRef.current === origin.visit && frameRef.current === origin.frame;
         if (current) setSendError(e instanceof ApiError ? e.message : String(e));
       })
-      .finally(() => void resources.masterState.refresh());
+      .finally(() => void masterSource.refresh());
   };
   const turnActions = {
     onStop: canControlTurns ? (message: string) => turnCommand("stop", message) : undefined,
@@ -1126,8 +1138,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // (the `master` stream frame keeps it live while it is queued).
   const unanswered = hasUnansweredOperator(thread.data?.entries ?? []);
   useEffect(() => {
-    if (unanswered) void resources.masterState.refresh();
-  }, [unanswered, convId]);
+    if (unanswered) void masterSource.refresh();
+  }, [unanswered, masterSource]);
 
   // "+ New", `/new` and `/clear` are one call: a fresh conversation.
   const startNew = () => {
@@ -1181,7 +1193,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           await api.threadSend(MASTER, body, message, refs, app, id ?? undefined, attachments, op, mediaRefs);
           op.assertCurrent();
           dest.write((s) => settlePending(s, message, { ok: true }));
-          void resources.masterState.refresh();
+          void (hosted && id !== null ? resources.masterConversation(id) : resources.masterState).refresh();
         } catch (e: unknown) {
           if (op.signal.aborted || op.generation !== privateSessionGeneration()) {
             releaseAbandoned();
@@ -1209,7 +1221,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         dest.write((s) => settlePending(s, message, { ok: false, error }));
       });
     },
-    [],
+    [hosted],
   );
 
   /** Adopt one immutable submitted envelope into its destination store:
@@ -1399,6 +1411,20 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     return Promise.resolve();
   };
 
+  const actor = useConversationActor(
+    masterState,
+    viewer.operator === true && !viewer.readOnly,
+    convId,
+    canSend && convId !== null ? (text) => send(text, []) : null,
+  );
+  const composerLabels = useMemo(
+    () => ({
+      placeholder: messagePlaceholder(actor.read, actor.scope, t),
+      ariaLabel: messageLabel(actor.read, actor.scope, t),
+    }),
+    [actor.read, actor.scope, t],
+  );
+
   /** Retry one failed submitted envelope: the same message id, body,
    *  refs, file ids and captured destination — never the current draft
    *  or route. */
@@ -1535,6 +1561,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           : null;
 
   return (
+    <AssistantActorProvider actor={actor}>
     <div className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
       <button
         type="button"
@@ -1548,18 +1575,29 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         <span className="app-chat-rail-label text-micro text-ink-400">{t("ASSISTANT")}</span>
       </button>
       <div className="app-chat-head">
-        <div className="app-chat-title min-w-0">
-          <span className="app-chat-mark" aria-hidden>✳</span>
-          <strong>{t("Assistant")}</strong>
-          {(convLabel !== null || streamDown) && (
-            <span
-              className="app-chat-conv truncate text-ink-500 text-label"
-              data-chat-conv-label
-              data-state={streamDown ? "offline" : undefined}
-            >
-              · {streamDown ? t("Reconnecting…") : convLabel}
-            </span>
-          )}
+        <div
+          className="app-chat-title min-w-0"
+          data-assistant-identity={actor.scope ?? undefined}
+          data-identity-state={actor.read.state}
+        >
+          <AssistantFace size={20} />
+          <div className="assistant-heading-text">
+            <div className="flex min-w-0 items-baseline gap-2">
+              <strong className="truncate" title={`${displayName(actor.read, actor.scope, t)} — ${scopeDescriptor(actor.scope, t)}`} data-assistant-name>
+                {displayName(actor.read, actor.scope, t)}
+              </strong>
+              {(convLabel !== null || streamDown) && (
+                <span
+                  className="app-chat-conv truncate text-ink-500 text-label"
+                  data-chat-conv-label
+                  data-state={streamDown ? "offline" : undefined}
+                >
+                  · {streamDown ? t("Reconnecting…") : convLabel}
+                </span>
+              )}
+            </div>
+            <span className="assistant-scope truncate">{scopeDescriptor(actor.scope, t)}</span>
+          </div>
         </div>
         <div className="app-chat-head-tools" role="toolbar" aria-label={t("Assistant tools")}>
           {lastAnswer !== null && (
@@ -1601,6 +1639,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
               {hasUnreadOther && <span className="app-chat-iconbtn-dot" aria-hidden />}
             </button>
           )}
+          <AssistantAboutButton />
           <span className="app-chat-sep" aria-hidden />
           <button
             type="button"
@@ -1855,7 +1894,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                   );
                   op.assertCurrent();
                   void store.refresh();
-                  void resources.masterState.refresh();
+                  void masterSource.refresh();
                 });
                 return null;
               } catch (e: unknown) {
@@ -1913,10 +1952,11 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         onResolveOriginal={() => outboxRef.current?.scrollIntoView?.({ block: "nearest" })}
         textareaId={COMPOSER_ID}
         actions={csvActions}
-        ariaLabel={t("Message to Assistant")}
-        placeholder={t("Message Assistant…")}
+        ariaLabel={composerLabels.ariaLabel}
+        placeholder={composerLabels.placeholder}
         className="app-chat-form"
       />
     </div>
+    </AssistantActorProvider>
   );
 }

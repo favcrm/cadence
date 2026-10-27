@@ -227,3 +227,60 @@ fn a_refusal_after_the_reset_fails_the_message_once() {
     );
     assert_eq!(m.resets_for(&msg), 1, "{:?}", m.thread());
 }
+
+/// CAD-1817 TEST-004 / identity-to-model state transition: after the gateway
+/// refuses session 0's history, the SAME user turn retried in a fresh session
+/// must still receive the actor's committed master name and tone. This is a
+/// synthetic Pi RPC state-transition regression, not genuine-provider
+/// acceptance; no production logging and no reply is fabricated by the test.
+#[test]
+fn a_refused_master_session_retry_carries_the_saved_identity() {
+    let m = Master::start();
+    let state = m.rpc("master_state", json!({}));
+    let revision = state["identity"]["revision"]
+        .as_str()
+        .expect("master_state carries the identity revision");
+    let name = "Nova Reset 1817";
+    let tone = "measured and direct";
+    m.rpc(
+        "master_identity_set",
+        json!({"expected_revision": revision, "name": name, "tone": tone}),
+    );
+
+    // The user's request deliberately contains neither the committed name nor
+    // the committed tone, so their presence can only come from actor context.
+    let msg = m.ask("what is running? REFUSED");
+    assert_eq!(msg["state"], "completed", "{msg}");
+    assert_eq!(m.count("new_session", None), 1, "{:?}", m.journal());
+    assert_eq!(m.count("prompt", Some("REFUSED")), 2, "{:?}", m.journal());
+    assert_eq!(m.resets_for(&msg), 1, "{:?}", m.thread());
+
+    let prompts: Vec<Value> = m
+        .journal()
+        .into_iter()
+        .filter(|entry| entry["rpc"] == "prompt" && entry["marker"] == "REFUSED")
+        .collect();
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    let sessions: Vec<i64> = prompts
+        .iter()
+        .map(|prompt| prompt["session"].as_i64().unwrap_or(-1))
+        .collect();
+    assert_eq!(
+        sessions,
+        vec![0, 1],
+        "the retry must be the one fresh session: {prompts:?}"
+    );
+    for (leg, prompt) in prompts.iter().enumerate() {
+        let text = prompt["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("prompt journal lacks its received text: {prompt}"));
+        assert!(
+            text.contains(name),
+            "session {leg} prompt lacks the committed master name: {text}"
+        );
+        assert!(
+            text.contains(tone),
+            "session {leg} prompt lacks the committed master tone: {text}"
+        );
+    }
+}

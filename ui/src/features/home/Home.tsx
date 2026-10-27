@@ -23,6 +23,14 @@ import {
 } from "./master";
 import { useCanvasFeed } from "../canvas/feed";
 import Composer from "./Composer";
+import {
+  AssistantAboutButton,
+  AssistantActorProvider,
+  AssistantFace,
+  useAssistantActor,
+  useConversationActor,
+} from "../assistant/AssistantIdentity";
+import { displayName, readConversationIdentity, scopeDescriptor } from "../assistant/identity";
 import type { AttachDestination } from "../app-shell/chat/attach";
 import { atTail, jumpLabel, repinOnResize, showJumpPill, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
@@ -144,9 +152,10 @@ function AssistantActivity({ since }: { since: number | null }) {
  *  one header. `at` is the anchored entry's own timestamp. */
 function AssistantNameRow({ at, live }: { at?: string; live: ReactNode }) {
   const t = useTranslate();
+  const actor = useAssistantActor();
   return (
     <div className="flex gap-2 items-center text-micro text-ink-400" data-kind="assistant-name">
-      <span className="text-ink-100 font-medium">{t("Assistant")}</span>
+      <span className="text-ink-100 font-medium">{displayName(actor.read, actor.scope, t)}</span>
       {at ? <span>{at}</span> : null}
       {/* The same `.chat-live` wrapper Bubble uses: right-aligned accent. */}
       <span className="chat-live num">{live}</span>
@@ -383,9 +392,10 @@ function NotStarted({ status, hosted }: { status: MasterStatus; hosted: boolean 
 
 function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabled: boolean }) {
   const t = useTranslate();
+  const actor = useAssistantActor();
   return (
     <div className="card px-4 py-4" data-empty="thread">
-      <h2 className="text-cardtitle font-semibold text-ink-100">{t("Ask the master for work")}</h2>
+      <h2 className="text-cardtitle font-semibold text-ink-100">{`${t("Ask")} ${displayName(actor.read, actor.scope, t)}`}</h2>
       <p className="text-secondary text-ink-400 mt-1">{t("No conversation yet. Try one of these:")}</p>
       <div className="mt-3 grid gap-2">
         {EXAMPLES.map((ex) => (
@@ -581,17 +591,23 @@ export default function Home({
   permissionsHref,
   resolveAppPath,
   setupNotice = null,
+  operator = null,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
+  /** CAD-1817: the verified session proves operator authority, the only
+   *  viewer that may edit the workspace coordinator's identity. `null`
+   *  is unproven, never an operator. */
+  operator?: boolean | null;
   /** CAD-1485: the verified public session's subject — member or
    *  operator/owner — when the session names one. `?chat=assistant`
    *  keys the owner's private chat on it; a member's default view is
    *  already private. */
   viewerSub?: string | null;
-  /** The verified session's `role === "member"`. Members always land on
-   *  their own private assistant; owners/operators keep Master unless
-   *  they explicitly ask for their own assistant. */
+  /** The verified session's `role === "member"`. Members use the private
+   *  assistant layout; owners/operators keep the master-transport layout
+   *  unless they select the private layout. The backend still determines
+   *  the actual conversation actor. */
   viewerIsMember?: boolean;
   /** The verified session's id — scopes the member-chat store so a
    *  re-login as another member never reads the previous chat. */
@@ -641,12 +657,13 @@ export default function Home({
       permissionsHref={permissionsHref}
       resolveAppPath={resolveAppPath}
       setupNotice={setupNotice}
+      operator={operator}
     />
   );
 }
 
-/** The Master workspace — unchanged, mounted only when the outer Home
- *  did NOT route to the member's private assistant. */
+/** The shared master-transport pane: Native coordinator or verified hosted
+ *  actor. The outer Home chooses the layout without changing recipients. */
 function MasterHome({
   readOnly,
   hosted = null,
@@ -657,9 +674,11 @@ function MasterHome({
   permissionsHref,
   resolveAppPath,
   setupNotice = null,
+  operator = null,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
+  operator?: boolean | null;
   overview: ResourceState<Overview>;
   onOpenIssue: (id: string) => void;
   onOpenDecision: (open: HomeDecisionOpen) => void;
@@ -705,7 +724,26 @@ function MasterHome({
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const loaded = thread.data !== null;
   const moreBefore = thread.data?.moreBefore === true;
-  const homeConversation = thread.data?.conversation;
+  // The default master-state response already resolves Home before its first
+  // transcript exists. Keep that server-issued binding when the empty thread
+  // (or its first streamed entries) does not carry a thread ID yet.
+  const homeProjection = master.status === "ok" ? master.data?.actor_identity : null;
+  const homeConversation = thread.data?.conversation
+    ?? (homeProjection?.scope === "personal"
+      && typeof homeProjection.conversation_id === "string"
+      && readConversationIdentity(master.data, homeProjection.conversation_id).read.state === "ready"
+      ? homeProjection.conversation_id
+      : undefined);
+  useEffect(() => {
+    if (homeConversation === undefined || thread.data === null
+      || thread.data.conversation !== undefined
+      || resources.masterState.get().data !== master.data) return;
+    // Stream admission and turn controls use the same canonical binding.
+    // Never replace a transcript's ID or seed a superseded session's store.
+    resources.masterThread.mutate((current) => current.conversation === undefined
+      ? { ...current, conversation: homeConversation }
+      : current);
+  }, [homeConversation, thread.data, master.data]);
   const attachDestination: AttachDestination | undefined = loaded && !missing
     ? homeConversation ? { conversation: homeConversation } : {}
     : undefined;
@@ -812,7 +850,14 @@ function MasterHome({
   // resumes after its last seq — never a replay of the history. On a
   // reconnect `streamInto` resumes with `?after=<last id>` and the
   // reducer dedupes by seq: no gaps, no repeats.
-  useThreadStream(resources.masterThread, `/api/threads/${MASTER}/stream`, loaded && !missing, setLink);
+  useThreadStream(
+    resources.masterThread,
+    `/api/threads/${MASTER}/stream`,
+    loaded && !missing && (master.data === null
+      || !Object.hasOwn(master.data, "actor_identity")
+      || thread.data?.conversation !== undefined),
+    setLink,
+  );
 
   // The seq watermark for the enter animation: items at or below the
   // mount tail are history — they render still; only what lands after
@@ -875,6 +920,18 @@ function MasterHome({
     setActivity(false);
     setGlideTick((n) => n + 1);
   }, []);
+  const sendPersonalRequest = useCallback(async (text: string) => {
+    if (readOnly || block || homeConversation === undefined) throw new Error("Sending is unavailable.");
+    engage();
+    const receipt = await sendToMaster(text, newMessageId(), undefined, undefined, homeConversation);
+    if (!receipt.ok) throw new Error(receipt.error);
+  }, [readOnly, block, homeConversation, engage]);
+  const actor = useConversationActor(
+    master,
+    operator === true && !readOnly,
+    homeConversation ?? null,
+    readOnly || !!block || homeConversation === undefined ? null : sendPersonalRequest,
+  );
   const onRetrySend = useCallback(
     (
       message: string,
@@ -1148,6 +1205,7 @@ function MasterHome({
   };
 
   return (
+    <AssistantActorProvider actor={actor}>
     <main
       className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
         railCollapsed
@@ -1185,24 +1243,36 @@ function MasterHome({
             bottom. It fills the height below the board header; the page
             itself never scrolls for the chat. */}
         <div className="relative flex-1 min-h-0 flex flex-col" data-chat-panel>
-          <div className="master-heading flex items-center gap-2 flex-wrap pb-2.5 border-b border-ink-700/70">
-            <span className="text-accent text-section" aria-hidden>✳</span>
-            <h1 className="text-section font-semibold text-ink-100">{t("Assistant")}</h1>
-            <span
-              className={`chip ${
-                status.kind === "running"
-                  ? "bg-ok/15 text-ok"
-                  : status.kind === "unknown"
-                    ? "bg-ink-800 text-ink-400"
-                    : "bg-warn/10 text-warn"
-              }`}
-            >
-              {status.kind === "running" ? status.state : status.kind === "absent" ? t("not started") : status.kind}
-            </span>
-            <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
-            {streamReconnecting && activeTurn && status.kind === "running" && (
-              <span className="text-micro text-ink-500">{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
-            )}
+          <div
+            className="master-heading assistant-heading pb-2.5 border-b border-ink-700/70"
+            data-assistant-identity={actor.scope ?? undefined}
+            data-identity-state={actor.read.state}
+          >
+            <AssistantFace size={30} active={status.kind === "running"} />
+            <div className="assistant-heading-text">
+              <div className="assistant-heading-name">
+                <h1 className="text-section font-semibold text-ink-100" data-assistant-name>{displayName(actor.read, actor.scope, t)}</h1>
+                <span
+                  className={`chip ${
+                    status.kind === "running"
+                      ? "bg-ok/15 text-ok"
+                      : status.kind === "unknown"
+                        ? "bg-ink-800 text-ink-400"
+                        : "bg-warn/10 text-warn"
+                  }`}
+                >
+                  {status.kind === "running" ? status.state : status.kind === "absent" ? t("not started") : status.kind}
+                </span>
+                <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
+                {streamReconnecting && activeTurn && status.kind === "running" && (
+                  <span className="text-micro text-ink-500">{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
+                )}
+              </div>
+              <p className="assistant-scope">{scopeDescriptor(actor.scope, t)}</p>
+            </div>
+            <div className="assistant-heading-actions">
+              <AssistantAboutButton />
+            </div>
           </div>
 
           {setupNotice}
@@ -1340,5 +1410,6 @@ function MasterHome({
         </div>
       </section>
     </main>
+    </AssistantActorProvider>
   );
 }

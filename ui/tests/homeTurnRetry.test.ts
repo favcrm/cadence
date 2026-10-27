@@ -42,7 +42,7 @@ globalThis.fetch = async (input, init) => {
     return json({ message: posts.at(-1)?.message, state: "queued", duplicate: false });
   }
   if (url.pathname === "/api/threads/master") return json({ thread: { id: "home-thread", alias: "master" }, entries, more_before: false });
-  if (url.pathname === "/api/master/state") return json({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] });
+  if (url.pathname === "/api/master/state") return json({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] });
   if (url.pathname === "/api/agents") return json({ daemon: "reachable", agents: [{ alias: "master", state: "idle" }], totals: null });
   if (url.pathname === "/api/meta") return json({ operator: true, read_only: false });
   throw new Error(`Unexpected request ${url.pathname}`);
@@ -79,18 +79,20 @@ async function main() {
   await render(true);
   await React.act(async () => {
     resources.masterState.write(() => ({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true,
+      identity: { name: null, tone: null, look: "robot", revision: "fixture" },
       turn: { state: "working", message: "turn-b", conversation: "home-thread" }, queue: [] }));
   });
   await settle();
   assert(host.querySelector("[data-turn-bar]") && !host.querySelector('[aria-label="Stop this turn"]'), "read-only Home observes its working turn without a mutating Stop");
   await React.act(async () => {
     resources.masterState.write(() => ({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true,
+      identity: { name: null, tone: null, look: "robot", revision: "fixture" },
       turn: { state: "working", message: "elsewhere", conversation: "other-home" }, queue: [{ message: "turn-b", conversation: "home-thread" }] }));
   });
   await settle();
   assert(!Array.from(host.querySelectorAll("[data-turn-bar] button")).some((button) => button.textContent === "Cancel"), "read-only Home cannot cancel a queued turn");
   await React.act(async () => {
-    resources.masterState.write(() => ({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
     resources.masterThread.write((state) => ({ ...state!, pending: state!.pending.filter((row) => row.state === "failed") }));
   });
   await settle();
@@ -101,7 +103,7 @@ async function main() {
   // rides the operator's own row rather than a stored entry of this turn.
   await render(false);
   await React.act(async () => {
-    resources.masterState.write(() => ({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
     resources.masterThread.write((state) => ({
       ...state!,
       pending: [{ message: "ui-submitting", text: "While the POST is in flight", state: "sending", at: 2 }],
@@ -110,8 +112,8 @@ async function main() {
   await settle();
   const typingRows = Array.from(host.querySelectorAll('[data-kind="typing"]')) as HTMLElement[];
   assert(typingRows.length === 1, `a submitting turn shows exactly one inline typing bubble (got ${typingRows.length})`);
-  const typingTurn = typingRows[0].closest('li, [data-kit="turn"]') as HTMLElement | null;
-  assert(typingTurn !== null && typingTurn.textContent?.includes("Assistant"), "the typing bubble paints as an assistant turn, not a status bar");
+  const typingTurn = typingRows[0].closest('[data-kind="turn"][data-turn-state="running"]');
+  assert(typingTurn !== null && !typingRows[0].closest("[data-turn-bar]"), "the typing bubble paints inside the assistant turn, not the dock status bar");
   assert(
     host.querySelector('[data-turn-bar][data-state="sending"]') !== null,
     "the dock bar reports the send as sending, not as a working banner",

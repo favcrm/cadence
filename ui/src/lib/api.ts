@@ -30,6 +30,7 @@ import type {
   IssueDetail,
   IssueHistoryEntry,
   MasterCommandResult,
+  MasterIdentity,
   MasterModels,
   MasterState,
   MemoryCard,
@@ -53,6 +54,7 @@ import type {
   ThreadRef,
   WorkflowPreview,
   WorkflowsPayload,
+  AvatarLook,
 } from "./types";
 
 /** The daemon-minted retained-file row `POST /api/chat/upload` answers
@@ -139,8 +141,39 @@ export interface MemberAssistState {
     authority_rev?: number;
     created?: number;
     updated?: number;
+    /** CAD-1817: the binding's committed identity. `name`/`tone` null
+     *  mean unset; `look` is always a canonical catalog slug; `revision`
+     *  is the binding's integer bootstrap revision. An unreadable
+     *  identity fails the read rather than silently reporting unset. */
+    identity: MemberAssistantIdentity;
   };
   conversation_id: string | null;
+}
+
+/** The private assistant's committed identity projection. User address
+ *  and preferences are deliberately absent — they stay private and are
+ *  not part of the displayed identity. */
+export interface MemberAssistantIdentity {
+  name: string | null;
+  tone: string | null;
+  look: AvatarLook;
+  revision: number;
+}
+
+/** `POST /api/master/identity` (CAD-1817): the proven operator's
+ *  workspace-identity edit. Only the supplied fields change; an empty
+ *  string clears `name`/`tone`. */
+export interface MasterIdentityUpdate {
+  expected_revision: string;
+  name?: string;
+  tone?: string;
+  look?: AvatarLook;
+}
+
+/** The committed result and when it takes effect for the coordinator. */
+export interface MasterIdentityUpdateResult {
+  identity: MasterIdentity;
+  applies: "next_turn";
 }
 
 /** `POST /api/member-assistant/history` — the member's bound conversation
@@ -1087,7 +1120,14 @@ export const api = {
     get<Record<string, unknown>>(`/api/master/summary?since=${Math.floor(since)}`),
   /** `GET /api/master/state` — session chips + in-flight turn (CAD-551);
    *  501 on a daemon that predates it. */
-  masterState: () => get<MasterState>("/api/master/state"),
+  masterState: (conversation?: string) =>
+    get<MasterState>(conversation === undefined ? "/api/master/state" : `/api/master/state?conversation=${encodeURIComponent(conversation)}`),
+  /** `POST /api/master/identity` (CAD-1817) — the proven operator edits
+   *  the workspace coordinator's name/personality/avatar. The response is
+   *  the committed identity plus when it applies; the UI never assumes a
+   *  save from the request alone. */
+  masterIdentityUpdate: (body: MasterIdentityUpdate) =>
+    post<MasterIdentityUpdateResult>("/api/master/identity", body),
   /** `POST /api/master/command` — an allowlisted session verb (CAD-551);
    *  operator-only, 400 `unknown_command` outside the board's set. */
   masterCommand: (command: string, arg?: string, wait?: number, message?: string) =>

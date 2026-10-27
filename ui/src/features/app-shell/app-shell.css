@@ -1069,8 +1069,7 @@
 .app-chat-rail {
   display: none;
 }
-/* CAD-1700 header (approved mockup): one row — "✳ Assistant · <conversation>"
-   on the left, three quiet borderless icon buttons on the right. */
+/* Keep named actor and workspace scope visible beside the conversation tools. */
 .app-chat-head {
   position: relative;
   display: flex;
@@ -1083,7 +1082,7 @@
 }
 .app-chat-title {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 0.5rem;
   font-size: var(--text-body);
   color: var(--color-ink-100);

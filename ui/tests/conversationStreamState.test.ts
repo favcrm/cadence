@@ -39,6 +39,7 @@ globalThis.fetch = async (input, init) => {
   return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
 };
 const snapshot = (message: string): MasterState => ({
+  identity: { name: null, tone: null, look: "robot", revision: "fixture" },
   alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true,
   turn: { state: "working", message, conversation: "conv-stream", position: null }, queue: [],
 });

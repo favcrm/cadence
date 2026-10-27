@@ -19,6 +19,7 @@ import {
   File01Icon,
   Folder01Icon,
   Home01Icon,
+  InformationCircleIcon,
   KanbanIcon,
   MailSend01Icon,
   Menu01Icon,
@@ -186,4 +187,9 @@ export const IconUpdate = ({ size = 18, ...rest }: IconProps = {}) => (
 /** Daemon connection — paired plugs, distinct from activity and refresh. */
 export const IconConnection = ({ size = 18, ...rest }: IconProps = {}) => (
   <Glyph icon={ConnectIcon} size={size} {...rest} />
+);
+
+/** Assistant details / About — an information affordance, not a warning. */
+export const IconInfo = ({ size = 14, ...rest }: IconProps = {}) => (
+  <Glyph icon={InformationCircleIcon} size={size} {...rest} />
 );

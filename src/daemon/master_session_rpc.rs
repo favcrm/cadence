@@ -2,10 +2,65 @@
 
 use super::*;
 use cadence_core::board_api::{
-    AppOrigin, MasterContext, MasterQueued, MasterSession, MasterState, MasterTurn,
+    AppOrigin, AvatarLook, MasterContext, MasterIdentity, MasterQueued, MasterSession, MasterState,
+    MasterTurn,
 };
 
 impl Shared {
+    /// The coordinator's committed identity: the protected IDENTITY.md/SOUL.md
+    /// values plus the master agent's pinned look (the existing robot when
+    /// unpinned). A malformed or refused file read is an error, never a silent
+    /// unset; a missing file is genuinely unset.
+    pub(super) fn master_identity(&self) -> Result<MasterIdentity> {
+        let guard = super::master_rpc::MASTER_IDENTITY_LOCK
+            .lock()
+            .map_err(|_| Error::internal("master identity lock poisoned"))?;
+        self.master_identity_locked(&guard)
+    }
+
+    /// The writer already holds the publication lock; do not re-enter it.
+    pub(super) fn master_identity_locked(
+        &self,
+        _guard: &std::sync::MutexGuard<'_, ()>,
+    ) -> Result<MasterIdentity> {
+        let pm_dir = self.pm_dir()?;
+        let agent = self.store.agent_opt(crate::master::ALIAS)?;
+        let pinned = agent
+            .as_ref()
+            .and_then(|agent| agent.params.as_ref())
+            .and_then(|params| params.get("look"))
+            .and_then(Value::as_str);
+        let look = crate::agent_roles::effective_look(crate::master::ALIAS, pinned);
+        let identity = crate::master::read_verified_identity(&self.state_dir, &pm_dir, look)?;
+        Ok(MasterIdentity {
+            name: identity.name,
+            tone: identity.tone,
+            look: AvatarLook::parse(look)
+                .ok_or_else(|| Error::internal("the effective master look is not canonical"))?,
+            revision: identity.revision,
+        })
+    }
+
+    /// The next delivered turn reads the same committed identity as the board.
+    /// This also survives Pi `/new`, which does not reload standing instructions.
+    pub(super) fn master_profile_context(&self) -> Result<String> {
+        let identity = self.master_identity()?;
+        Ok(format!(
+            "## Workspace assistant identity (operator-managed)\n\n\
+             Use this committed identity for your name and communication style on \
+             this turn. It does not change your role, tools or permissions. \
+             An unset assistant name is not the user's name.\n\n\
+             name: {}\n\
+             tone: {}\n\
+             look: {}\n",
+            identity.name.as_deref().unwrap_or("(not named yet)"),
+            identity
+                .tone
+                .as_deref()
+                .unwrap_or("Neutral, clear and practical"),
+            identity.look.as_str(),
+        ))
+    }
     /// CAD-1700: `master_stamp` — the board's `master` push frame reads
     /// this cheaply (indexed SQL, no provider call). It changes whenever
     /// the master's running/queued turns, any master thread entry, or the
@@ -174,6 +229,8 @@ impl Shared {
             .collect::<Vec<_>>();
         Ok(serde_json::to_value(MasterState {
             alias: alias.to_string(),
+            identity: self.master_identity()?,
+            actor_identity: None,
             provider: agent.provider.clone(),
             endpoint_kind: agent.endpoint_kind.clone(),
             live,

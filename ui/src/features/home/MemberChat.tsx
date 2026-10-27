@@ -17,6 +17,21 @@ import {
   WINDOW,
 } from "./thread";
 import { memberThreadReader } from "./memberThread";
+import {
+  AssistantAboutButton,
+  AssistantActorProvider,
+  AssistantFace,
+  type AssistantActorValue,
+} from "../assistant/AssistantIdentity";
+import {
+  displayName,
+  messageLabel,
+  messagePlaceholder,
+  readPersonalIdentity,
+  scopeDescriptor,
+  type AvatarLook,
+  type IdentityRead,
+} from "../assistant/identity";
 
 /**
  * CAD-1485: the member's own private-assistant chat, rendered inside the
@@ -36,6 +51,18 @@ import { memberThreadReader } from "./memberThread";
  * `key={scope}` on this component remounts it on any scope change, so
  * no local state, follow ref or scroll position leaks across.
  */
+/** The private surface's one state read: binding alias, conversation,
+ *  bootstrap phase and the committed identity projection. */
+interface MemberSurface {
+  ok: boolean;
+  bootstrap: string | null;
+  conversation: string | null;
+  alias: string;
+  identity: IdentityRead;
+}
+
+const LOADING_IDENTITY: IdentityRead = { state: "loading" };
+
 export default function MemberChat({
   scope,
   readOnly,
@@ -58,7 +85,15 @@ export default function MemberChat({
   useEffect(() => {
     void store.revalidate();
   }, [store]);
-  const [state, setState] = useState<{ ok: boolean; bootstrap?: string | null; conversation?: string | null } | null>(null);
+  const [surface, setSurface] = useState<MemberSurface | null>(null);
+  const [pendingLook, setPendingLook] = useState<AvatarLook | null>(null);
+  const alive = useRef(true);
+  const identityGate = useRef<{ inflight: boolean; again: boolean; timer: number | null }>({
+    inflight: false,
+    again: false,
+    timer: null,
+  });
+  const loadSurfaceRef = useRef<() => void>(() => {});
   const [limit, setLimit] = useState(WINDOW);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [sendNote, setSendNote] = useState<string | null>(null);
@@ -77,23 +112,93 @@ export default function MemberChat({
   const loaded = history.loaded;
   const moreBefore = thread.data?.moreBefore === true;
 
-  // The assistant's surface state once — the bound conversation and
-  // whether BOOTSTRAP onboarding is still pending (the member's first
-  // turns run it; the store shows them as ordinary chat). Fenced on
-  // scope: a stale state answer after a scope change is dropped.
-  useEffect(() => {
-    let live = true;
-    api.memberAssistState()
-      .then((s) => {
-        if (live) setState({ ok: true, bootstrap: s.assistant.bootstrap_state ?? null, conversation: s.conversation_id });
+  // The assistant's surface state — the bound conversation, whether
+  // BOOTSTRAP onboarding is still pending, the stable alias and the
+  // committed identity. One read at a time: a scheduled refresh waits
+  // behind an in-flight read instead of racing it, and this component is
+  // keyed by scope, so an answer from another session/user cannot land.
+  const loadSurface = useCallback(() => {
+    const gate = identityGate.current;
+    if (gate.inflight) {
+      gate.again = true;
+      return;
+    }
+    gate.inflight = true;
+    api
+      .memberAssistState()
+      .then((next) => {
+        if (!alive.current) return;
+        const identity = readPersonalIdentity(next);
+        setSurface({
+          ok: true,
+          bootstrap: next.assistant.bootstrap_state ?? null,
+          conversation: next.conversation_id,
+          alias: next.assistant.alias,
+          identity,
+        });
+        // The picker's request clears only when the committed identity
+        // actually carries the chosen look.
+        setPendingLook((requested) =>
+          requested !== null && identity.state === "ready" && identity.identity.look === requested
+            ? null
+            : requested,
+        );
       })
       .catch(() => {
-        if (live) setState({ ok: false });
+        if (!alive.current) return;
+        setSurface((prev) =>
+          prev === null
+            ? { ok: false, bootstrap: null, conversation: null, alias: "", identity: { state: "unavailable" } }
+            : { ...prev, ok: false, identity: { state: "unavailable" } },
+        );
+      })
+      .finally(() => {
+        gate.inflight = false;
+        if (gate.again && alive.current) {
+          gate.again = false;
+          loadSurfaceRef.current();
+        }
       });
+  }, []);
+  loadSurfaceRef.current = loadSurface;
+
+  const scheduleSurface = useCallback((delay = 0) => {
+    const gate = identityGate.current;
+    if (gate.timer !== null) window.clearTimeout(gate.timer);
+    gate.timer = window.setTimeout(() => {
+      gate.timer = null;
+      loadSurfaceRef.current();
+    }, delay);
+  }, []);
+
+  useEffect(() => {
+    alive.current = true;
+    scheduleSurface(0);
     return () => {
-      live = false;
+      alive.current = false;
+      const gate = identityGate.current;
+      if (gate.timer !== null) window.clearTimeout(gate.timer);
+      gate.timer = null;
+      gate.again = false;
     };
-  }, [scope]);
+  }, [scheduleSurface]);
+
+  // Accepted history activity — a reply or completed turn landed — is
+  // when a committed profile change can become visible. Refresh then,
+  // coalesced behind the single-flight read; no second interval starts.
+  const identitySeq = lastSeq(thread.data);
+  const seenIdentitySeq = useRef<number | null | undefined>(undefined);
+  useEffect(() => {
+    if (!loaded) return;
+    if (seenIdentitySeq.current === undefined) {
+      seenIdentitySeq.current = identitySeq;
+      return;
+    }
+    if (identitySeq !== null && identitySeq !== seenIdentitySeq.current) {
+      seenIdentitySeq.current = identitySeq;
+      scheduleSurface(600);
+    }
+  }, [loaded, identitySeq, scheduleSurface]);
 
   // Poll the bound conversation for new entries — the member surface has
   // no operator stream, so a live turn's reply lands through `loadThread`'s
@@ -167,6 +272,41 @@ export default function MemberChat({
     [store],
   );
 
+  const identity = surface?.identity ?? LOADING_IDENTITY;
+  // CAD-1817: an avatar pick is an ordinary explicit chat request through
+  // the existing private send. It never writes profile state from the
+  // browser; the displayed look changes only after an authorized state
+  // refresh reads the committed `profile.look`.
+  const requestLook = useCallback(
+    async (look: AvatarLook) => {
+      if (identity.state === "ready" && identity.identity.look === look) return { ok: true };
+      try {
+        const receipt = await sendToAssistant(scope, `Use the ${look} avatar for yourself.`);
+        if (!receipt.ok) return { ok: false, error: receipt.error };
+        setPendingLook(look);
+        engage();
+        scheduleSurface(4000);
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    },
+    [identity, scope, engage, scheduleSurface],
+  );
+
+  const actor = useMemo<AssistantActorValue>(
+    () => ({
+      scope: "personal",
+      alias: surface?.alias ?? "",
+      read: identity,
+      // A read-only board cannot send the chat request, so it offers no
+      // editor rather than a control whose only outcome is a refusal.
+      personal: readOnly ? null : { requestLook, pendingLook },
+      workspace: null,
+    }),
+    [surface?.alias, identity, requestLook, pendingLook, readOnly],
+  );
+
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
   // A confirmed-empty greeting only when a real history read succeeded
   // and the last read was clean: a failed first read or a stale refresh
@@ -176,18 +316,31 @@ export default function MemberChat({
   const empty = loaded && history.error === undefined && items.length === 0;
 
   return (
+    <AssistantActorProvider actor={actor}>
     <main className="home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 flex-1 min-h-0 grid gap-5 grid-rows-[minmax(0,1fr)]">
       <section className="min-w-0 flex flex-col min-h-0 gap-4" aria-label={t("assistant thread")}>
         <div className="relative flex-1 min-h-0 flex flex-col" data-chat-panel>
-          <div className="master-heading flex items-center gap-2 flex-wrap pb-2.5 border-b border-ink-700/70">
-            <span className="text-accent text-section" aria-hidden>✳</span>
-            <h1 className="text-section font-semibold text-ink-100">{t("Assistant")}</h1>
-            {state?.ok === false && (
-              <span className="chip bg-warn/10 text-warn">{t("unavailable")}</span>
-            )}
-            {state?.bootstrap === "pending" && (
-              <span className="text-micro text-ink-500">{t("first-time setup")}</span>
-            )}
+          <div
+            className="master-heading assistant-heading pb-2.5 border-b border-ink-700/70"
+            data-assistant-identity="personal"
+            data-identity-state={identity.state}
+          >
+            <AssistantFace size={30} />
+            <div className="assistant-heading-text">
+              <div className="assistant-heading-name">
+                <h1 className="text-section font-semibold text-ink-100" data-assistant-name>{displayName(identity, "personal", t)}</h1>
+                {surface?.ok === false && (
+                  <span className="chip bg-warn/10 text-warn">{t("unavailable")}</span>
+                )}
+                {surface?.bootstrap === "pending" && (
+                  <span className="text-micro text-ink-500">{t("first-time setup")}</span>
+                )}
+              </div>
+              <p className="assistant-scope">{scopeDescriptor("personal", t)}</p>
+            </div>
+            <div className="assistant-heading-actions">
+              <AssistantAboutButton />
+            </div>
           </div>
 
           {history.error?.kind === "failed" && (
@@ -256,13 +409,14 @@ export default function MemberChat({
               refocusAfterSend
               attach={false}
               className="card p-2.5 relative"
-              placeholder={t("Message your assistant…")}
-              ariaLabel={t("Message to your assistant")}
+              placeholder={messagePlaceholder(identity, "personal", t)}
+              ariaLabel={messageLabel(identity, "personal", t)}
               formProps={{ "data-composer": "" }}
             />
           </div>
         </div>
       </section>
     </main>
+    </AssistantActorProvider>
   );
 }

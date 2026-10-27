@@ -1790,6 +1790,18 @@ pub(crate) fn write_route(
         send(request, resp);
         return;
     }
+    // CAD-1817: the workspace coordinator's identity write. OperatorOnly in
+    // `WRITE_ROUTES` (admitted above); the handler narrows the body and the
+    // daemon proves the operator connection again.
+    if path == "/api/master/identity" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = home::master_identity(&mut request, state_dir);
+        send(request, resp);
+        return;
+    }
     // CAD-1168: the chat attachment upload — OperatorOnly in
     // `WRITE_ROUTES` (admitted above with the multipart carve-out);
     // the handler streams the part into staging and relays

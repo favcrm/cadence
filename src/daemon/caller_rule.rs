@@ -951,6 +951,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("operator_connection (CAD-339)"),
     ),
     (
+        "master_identity_set",
+        Rule::Handler(
+            "operator_connection (CAD-1817): the workspace coordinator's bounded \
+             name/tone/look write; the operator's alone",
+        ),
+    ),
+    (
         "master_start",
         Rule::Handler("operator_connection (CAD-339)"),
     ),
