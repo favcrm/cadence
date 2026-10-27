@@ -50,6 +50,12 @@ pub(crate) fn run(action: &IssueAction, state_dir: &Path) -> Result<i32> {
                 print_json(&out);
                 Ok(0)
             }
+            ProjectAction::SetRemote { key, from, to } => {
+                let pm = open_pm()?;
+                let out = write::set_project_remote(&pm, key, from, to, "")?;
+                print_json(&out);
+                Ok(0)
+            }
             ProjectAction::Policy {
                 key,
                 visibility,

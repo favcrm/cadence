@@ -811,6 +811,21 @@ pub enum ProjectAction {
         /// Project key.
         key: String,
     },
+    /// Update a registered repository remote after a GitHub transfer or
+    /// rename. Run this after the GitHub transfer; old-slug PR URLs then
+    /// stop matching. `--from` is the current recorded remote and `--to`
+    /// is the new `host/owner/repo` (a git URL is fine). Local tracker
+    /// write, same caller model as `project add`.
+    SetRemote {
+        /// Project key.
+        key: String,
+        /// Current recorded remote (`host/owner/repo` or a git URL).
+        #[arg(long)]
+        from: String,
+        /// New remote (`host/owner/repo` or a git URL).
+        #[arg(long)]
+        to: String,
+    },
     /// Record a project's access policy: visibility and the callers it
     /// admits. `--grant` is the full member list and replaces whatever
     /// was recorded; omitting it clears grants. It does not merge.

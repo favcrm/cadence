@@ -160,8 +160,8 @@ pub fn project_add(
     let projects = project::list(&pm.dir)?;
     if projects.iter().any(|p| p.key == key) {
         return Err(Error::rejected(format!(
-            "Project '{key}' already exists — edit {} directly",
-            pm.dir.join(key).join("project.yaml").display()
+            "Project '{key}' already exists — update a registered remote with \
+             `cadence issue project set-remote {key} --from <old> --to <new>`"
         )));
     }
     if let Some(other) = projects.iter().find(|p| p.prefix == prefix) {
@@ -300,6 +300,122 @@ pub fn set_project_policy(
         "project": key,
         "policy": serde_json::to_value(&policy)
             .map_err(|e| Error::internal(format!("policy: {e}")))?,
+        "committed": true,
+    });
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
+}
+
+/// `host/owner/repo` after [`project::normalize_remote`]. A git URL is
+/// fine; extra path segments, empty parts and `.` / `..` are not.
+fn parse_remote(raw: &str) -> Result<String> {
+    let norm = project::normalize_remote(raw);
+    let parts: Vec<&str> = norm.split('/').collect();
+    let ok = parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && *p != "." && *p != ".." && !p.contains(char::is_whitespace));
+    if !ok {
+        return Err(Error::rejected(format!(
+            "malformed repository remote '{raw}' — expected host/owner/repo (a git URL is fine)"
+        )));
+    }
+    Ok(norm)
+}
+
+fn remotes_equal(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// CAD-1870: update one registered `repos[].remote` after a transfer or
+/// rename. `--from` must uniquely match the current recorded remote;
+/// `--to` must not already belong to another project (or another row).
+/// A no-op (`--from` equals `--to` equals the record) writes nothing.
+pub fn set_project_remote(pm: &Pm, key: &str, from: &str, to: &str, actor: &str) -> Result<Value> {
+    let key = crate::issue::model::check_key(key)?;
+    let from_norm = parse_remote(from)?;
+    let to_norm = parse_remote(to)?;
+    let dir = project_dir(pm, &key)?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&dir))?;
+    let yaml_path = dir.join("project.yaml");
+    if !crate::issue::board::is_real_file(&yaml_path) {
+        return Err(Error::rejected(format!(
+            "no project '{key}' — register it with `cadence issue project add`"
+        )));
+    }
+    let mut project = project::load(&yaml_path)?;
+    let matches: Vec<usize> = project
+        .repos
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            let remote = r.remote.as_deref()?;
+            remotes_equal(&project::normalize_remote(remote), &from_norm).then_some(i)
+        })
+        .collect();
+    let idx = match matches.as_slice() {
+        [] => {
+            return Err(Error::rejected(format!(
+                "project '{key}' has no registered remote {from_norm} — \
+                 pass --from matching one recorded repos[].remote"
+            )));
+        }
+        [idx] => *idx,
+        _ => {
+            return Err(Error::rejected(format!(
+                "project '{key}' has more than one repository recorded as {from_norm} — \
+                 refusing an ambiguous update"
+            )));
+        }
+    };
+    if remotes_equal(&from_norm, &to_norm) {
+        return Ok(json!({
+            "project": key,
+            "from": from_norm,
+            "to": to_norm,
+            "changed": false,
+            "committed": false,
+        }));
+    }
+    let projects = project::list(&pm.dir)?;
+    if let Some(other) = projects.iter().find(|p| {
+        p.repos.iter().enumerate().any(|(i, r)| {
+            let Some(remote) = r.remote.as_deref() else {
+                return false;
+            };
+            if !remotes_equal(&project::normalize_remote(remote), &to_norm) {
+                return false;
+            }
+            !(p.key == key && i == idx)
+        })
+    }) {
+        return Err(Error::rejected(format!(
+            "{to_norm} is already project '{}' — one repo, one project",
+            other.key
+        )));
+    }
+    project.repos[idx].remote = Some(to_norm.clone());
+    let prev = file_preimage(&yaml_path);
+    write_project_yaml(&yaml_path, &project)?;
+    let foreign = match commit_scoped(
+        pm,
+        &lock,
+        std::slice::from_ref(&yaml_path),
+        &format!("project {key} remote {from_norm} -> {to_norm}"),
+        &[],
+        actor,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            restore_preimage(&yaml_path, prev);
+            return Err(e);
+        }
+    };
+    let mut out = json!({
+        "project": key,
+        "from": from_norm,
+        "to": to_norm,
+        "changed": true,
         "committed": true,
     });
     attach_foreign(&mut out, &foreign);

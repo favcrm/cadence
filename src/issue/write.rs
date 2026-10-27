@@ -43,7 +43,7 @@ pub(crate) use plan::{check_structure, create_granted_plan, granted_semantics, G
 pub use plan::{create_plan, decide_plan};
 use projects::check_component;
 pub(crate) use projects::{check_tags, issue_dir, load_front, save_front, split_tags};
-pub use projects::{project_add, set_acceptance, set_project_policy};
+pub use projects::{project_add, set_acceptance, set_project_policy, set_project_remote};
 #[allow(unused_imports)] // CAD-1680: the original crate-visible path stays.
 pub(crate) use rev::blocked_warnings;
 use rev::check_rev;
@@ -505,6 +505,249 @@ mod tests {
             head
         );
         assert!(clean(&pm), "refused project add left tracker changes");
+    }
+
+    fn git_with_origin(origin: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        crate::issue::git(dir.path(), &["-c", "init.defaultBranch=main", "init", "-q"]).unwrap();
+        crate::issue::git(dir.path(), &["remote", "add", "origin", origin]).unwrap();
+        dir
+    }
+
+    fn add_with_remote(pm: &Pm, key: &str, prefix: &str, origin: &str) -> tempfile::TempDir {
+        let repo = git_with_origin(origin);
+        project_add(
+            pm,
+            key,
+            prefix,
+            &[repo.path().to_string_lossy().into_owned()],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        repo
+    }
+
+    /// CAD-1870: set-remote is a compare-and-swap on one `repos[].remote`.
+    #[test]
+    fn set_project_remote_updates_one_remote_and_drives_delivery_matching() {
+        let (_dir, pm) = tracker();
+        let _repo = add_with_remote(
+            &pm,
+            "mkt",
+            "MKT",
+            "https://github.com/favcrm/marketing-v2.git",
+        );
+        let yaml = pm.dir.join("mkt").join("project.yaml");
+        let before = project::load(&yaml).unwrap();
+        let id = before.id.clone();
+        let prefix = before.prefix.clone();
+        let path = before.repos[0].path.clone();
+        let policy = before.policy.clone();
+        let cadence_yaml = std::fs::read(pm.dir.join("cadence").join("project.yaml")).unwrap();
+        let new_pr = "https://github.com/agenticos-stack/marketing-v2/pull/1";
+        let old_pr = "https://github.com/favcrm/marketing-v2/pull/1";
+        let other_pr = "https://github.com/acme/other/pull/9";
+        assert!(
+            crate::delivery::project_pr_refusal(&pm.dir, "mkt", old_pr)
+                .unwrap()
+                .is_none(),
+            "the recorded remote should accept the old slug before the update"
+        );
+        assert!(crate::delivery::project_pr_refusal(&pm.dir, "mkt", new_pr)
+            .unwrap()
+            .is_some());
+
+        let out = set_project_remote(
+            &pm,
+            "mkt",
+            "github.com/favcrm/marketing-v2",
+            "github.com/agenticos-stack/marketing-v2",
+            "",
+        )
+        .unwrap();
+        assert_eq!(out["changed"], true);
+        assert_eq!(out["committed"], true);
+        assert_eq!(out["from"], "github.com/favcrm/marketing-v2");
+        assert_eq!(out["to"], "github.com/agenticos-stack/marketing-v2");
+
+        let after = project::load(&yaml).unwrap();
+        assert_eq!(after.id, id);
+        assert_eq!(after.prefix, prefix);
+        assert_eq!(after.policy, policy);
+        assert_eq!(after.repos[0].path, path);
+        assert_eq!(
+            after.repos[0].remote.as_deref(),
+            Some("github.com/agenticos-stack/marketing-v2")
+        );
+        assert_eq!(
+            std::fs::read(pm.dir.join("cadence").join("project.yaml")).unwrap(),
+            cadence_yaml,
+            "an unrelated project.yaml changed"
+        );
+        assert!(
+            crate::delivery::project_pr_refusal(&pm.dir, "mkt", new_pr)
+                .unwrap()
+                .is_none(),
+            "delivery must accept a PR on the new remote"
+        );
+        let unrelated = crate::delivery::project_pr_refusal(&pm.dir, "mkt", other_pr)
+            .unwrap()
+            .expect("unrelated remote must still be refused");
+        assert!(
+            unrelated.contains("not a repo of project mkt"),
+            "{unrelated}"
+        );
+        let old_now = crate::delivery::project_pr_refusal(&pm.dir, "mkt", old_pr)
+            .unwrap()
+            .expect("old slug stops matching; no compatibility shim");
+        assert!(old_now.contains("not a repo of project mkt"), "{old_now}");
+    }
+
+    #[test]
+    fn set_project_remote_refuses_stale_conflict_malformed_and_is_idempotent() {
+        let (_dir, pm) = tracker();
+        let _a = add_with_remote(
+            &pm,
+            "mkt",
+            "MKT",
+            "https://github.com/favcrm/marketing-v2.git",
+        );
+        let _b = add_with_remote(&pm, "other", "OTH", "https://github.com/acme/widgets.git");
+        let yaml = pm.dir.join("mkt").join("project.yaml");
+        let before = std::fs::read(&yaml).unwrap();
+        let head = crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+
+        let stale = set_project_remote(
+            &pm,
+            "mkt",
+            "github.com/nobody/missing",
+            "github.com/agenticos-stack/marketing-v2",
+            "",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(stale.contains("no registered remote"), "{stale}");
+
+        let conflict = set_project_remote(
+            &pm,
+            "mkt",
+            "github.com/favcrm/marketing-v2",
+            "github.com/acme/widgets",
+            "",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(conflict.contains("already project 'other'"), "{conflict}");
+
+        for bad in [
+            "",
+            "not-a-repo",
+            "github.com/onlyowner",
+            "github.com/a/b/c",
+            "../escape/x",
+        ] {
+            let err = set_project_remote(&pm, "mkt", bad, "github.com/acme/ok", "")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("malformed"), "{bad}: {err}");
+        }
+
+        let add_err = project_add(&pm, "mkt", "ZZZ", &[], &[], &[], None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            add_err.contains("set-remote") && !add_err.contains("edit "),
+            "{add_err}"
+        );
+
+        let missing = set_project_remote(
+            &pm,
+            "ghost",
+            "github.com/favcrm/marketing-v2",
+            "github.com/agenticos-stack/marketing-v2",
+            "",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing.contains("no project 'ghost'"), "{missing}");
+
+        assert_eq!(std::fs::read(&yaml).unwrap(), before);
+        assert_eq!(
+            crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(),
+            head
+        );
+        assert!(clean(&pm), "a refused set-remote left tracker changes");
+
+        let noop = set_project_remote(
+            &pm,
+            "mkt",
+            "https://github.com/favcrm/marketing-v2.git",
+            "github.com/favcrm/marketing-v2",
+            "",
+        )
+        .unwrap();
+        assert_eq!(noop["changed"], false);
+        assert_eq!(noop["committed"], false);
+        assert_eq!(std::fs::read(&yaml).unwrap(), before);
+        assert_eq!(
+            crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(),
+            head
+        );
+
+        let r1 = git_with_origin("https://github.com/dup/one.git");
+        let r2 = git_with_origin("https://github.com/dup/one.git");
+        project_add(
+            &pm,
+            "dupes",
+            "DUP",
+            &[
+                r1.path().to_string_lossy().into_owned(),
+                r2.path().to_string_lossy().into_owned(),
+            ],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        let ambiguous =
+            set_project_remote(&pm, "dupes", "github.com/dup/one", "github.com/dup/two", "")
+                .unwrap_err()
+                .to_string();
+        assert!(ambiguous.contains("more than one"), "{ambiguous}");
+        assert_eq!(std::fs::read(&yaml).unwrap(), before);
+    }
+
+    #[test]
+    fn a_refused_set_remote_commit_leaves_the_record_alone() {
+        let (_dir, pm) = tracker();
+        let _repo = add_with_remote(
+            &pm,
+            "mkt",
+            "MKT",
+            "https://github.com/favcrm/marketing-v2.git",
+        );
+        let path = pm.dir.join("mkt").join("project.yaml");
+        let before = std::fs::read(&path).unwrap();
+        let hook = failing_hook(&pm);
+        assert!(
+            set_project_remote(
+                &pm,
+                "mkt",
+                "github.com/favcrm/marketing-v2",
+                "github.com/agenticos-stack/marketing-v2",
+                "",
+            )
+            .is_err(),
+            "the refused commit was reported as a success"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            clean(&pm),
+            "a refused set-remote write left something behind"
+        );
+        std::fs::remove_file(hook).unwrap();
     }
 
     /// CAD-449: a failed done commit restores `issue.md` and its index
