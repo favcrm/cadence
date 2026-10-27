@@ -472,14 +472,6 @@ impl Channel {
         self.timeout()?;
         serde_json::from_slice(&frame).map_err(|_| refused())
     }
-    pub(crate) fn authorize(
-        &mut self,
-        request: &Request,
-        selection: &Selection,
-    ) -> io::Result<Authorized> {
-        self.authorize_signed(request, selection)
-            .map(|(launch, _)| launch)
-    }
     /// Helper MUST additionally authenticate signed against independently
     /// qualified fixed-media trust BEFORE any view/graph/Node effects.
     pub(crate) fn authorize_signed(
@@ -503,6 +495,10 @@ impl Channel {
             _ => Err(refused()),
         }
     }
+    // The daemon's lib path authorizes and then drops the channel; only the
+    // fixed helper binary (`cadence-agent-exec`, which compiles this module
+    // separately) consumes the one-use permit before effects.
+    #[allow(dead_code)]
     pub(crate) fn consume(mut self, launch: &Authorized) -> io::Result<()> {
         match self.exchange(&Request::Consume {
             version: 1,

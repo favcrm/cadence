@@ -5,6 +5,9 @@ use std::os::unix::ffi::OsStrExt;
 
 /// Fixed image topology. Digests/entrypoints come only from the authenticated
 /// private image owner, never a candidate capture or a helper caller.
+// The daemon's lib path never opens the image; only the fixed helper binary
+// (`cadence-agent-exec`), which compiles the graph module separately, reads it.
+#[allow(dead_code)]
 pub(crate) const IMAGE_ROOT: &str = "/opt/cadence/pi";
 #[cfg_attr(not(all(unix, target_os = "linux")), allow(dead_code))] // only pi_guest (linux) uses this
 pub(crate) const NODE_PATH: &str = "/opt/cadence/pi/node";
