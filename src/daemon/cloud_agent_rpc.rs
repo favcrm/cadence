@@ -723,13 +723,15 @@ impl Shared {
     /// same predicate the thread readers use, so a revoked scope, a replaced
     /// credential or an unverifiable answer cannot be read around through a
     /// different verb.
-    pub(super) fn admit_cloud_rows(
-        &self,
-        alias: &str,
-        peer_pid: u32,
-        verb: &str,
-    ) -> Result<CloudRowAdmission> {
-        let projection = self.admit_cloud_projection(alias, peer_pid, verb)?;
+    pub(super) fn admit_cloud_rows(&self, alias: &str, peer_pid: u32) -> Result<CloudRowAdmission> {
+        // The cross-agent pair view is a DELIVERY-BOUND surface: the operator
+        // and the delivery's own sender or recipient may read the row, and
+        // each backing connection still proves its current read authority.
+        // It is deliberately not the cloud alias' per-source projection,
+        // which admits only the caller's own operations — the operator audits
+        // the peer request it routed, and a revoked connection withholds it.
+        let projection = self.admit_derived_cloud_rows(alias, peer_pid, None)?;
+        self.observe_cloud_projection(alias, &projection);
         let cloud: std::collections::BTreeSet<String> = projection
             .known
             .iter()

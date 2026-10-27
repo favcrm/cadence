@@ -385,7 +385,7 @@ impl Shared {
         let mut readable = std::collections::BTreeSet::new();
         let mut withheld = None;
         for (alias, ids) in by_alias {
-            let admission = self.admit_cloud_rows(&alias, peer_pid, "work conversation read")?;
+            let admission = self.admit_cloud_rows(&alias, peer_pid)?;
             for id in ids {
                 if admission.cloud.contains(&id) {
                     if admission.readable.contains(&id) {
