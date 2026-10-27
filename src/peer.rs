@@ -52,7 +52,7 @@
 //! caller decides what that means — the board refuses the write. The
 //! one foreign peer the board accepts is the `tailscale serve` proxy,
 //! proven by [`crate::tailnet_proof`] from the owner uid
-//! [`client_socket`] reads, which `/proc/net/tcp` shows for any user.
+//! [`client_socket_exact`] reads, which `/proc/net/tcp` shows for any user.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -663,10 +663,12 @@ impl AgentRoots {
     }
 }
 
-/// Which live agent the TCP peer `peer` of a connection to our
-/// `server_port` is attributed as: the registered pane on its ancestry
-/// or whose pty it holds ([`PeerTies::attributed_agents`]), or the
-/// managed endpoint whose provider is on its ancestry
+/// Which live agent the TCP peer `peer` of a connection to our concrete
+/// bound address `server` is attributed as (CAD-760: the client socket
+/// is matched on the full four-tuple, never the port alone): the
+/// registered pane on its ancestry or whose pty it holds
+/// ([`PeerTies::attributed_agents`]), or the managed endpoint whose
+/// provider is on its ancestry
 /// ([`AgentRoots::managed`]) — each only while its recorded start time
 /// still matches ([`AgentPids::live`], CAD-385): a row whose pid was
 /// reused ties nothing. `Ok(None)` — the peer is a local process
@@ -678,17 +680,17 @@ impl AgentRoots {
 /// a row whose process cannot be proven): callers must fail closed,
 /// never read it as "no agent".
 pub(crate) fn tcp_peer_agent(
-    server_port: u16,
+    server: SocketAddr,
     peer: SocketAddr,
     roots: &AgentRoots,
 ) -> Result<Option<String>, String> {
     let peer = canonical(peer);
-    let Some((inode, _)) = client_socket(server_port, peer)? else {
+    let Some((inode, _)) = client_socket_exact(server, peer)? else {
         if !peer.ip().is_loopback() {
             return Ok(None);
         }
         return Err(format!(
-            "no local socket is the client end of {peer} → port {server_port}"
+            "no local socket is the client end of {peer} → {server}"
         ));
     };
     let pids = socket_owners(inode);
@@ -742,7 +744,8 @@ pub(crate) fn tcp_peer_agent(
 }
 
 /// Positive operator proof (CAD-276, [`operator_proof`]) for the TCP
-/// peer of a connection to our `server_port` — the board's gate for
+/// peer of a connection to our concrete bound address `server`, matched
+/// on the full four-tuple (CAD-760) — the board's gate for
 /// operator-only writes it relays to the daemon (CAD-328), which would
 /// otherwise see only the board's own process. Every process holding
 /// the client socket must pass: it runs as `uid`, walks cleanly, has
@@ -757,16 +760,16 @@ pub(crate) fn tcp_peer_agent(
 /// [`loopback_ownerless`]; the board accepts that only after an
 /// operator session.
 pub(crate) fn tcp_peer_operator_proof(
-    server_port: u16,
+    server: SocketAddr,
     peer: SocketAddr,
     uid: u32,
     daemon_pid: u32,
     roots: &AgentRoots,
 ) -> Result<(), String> {
     let peer = canonical(peer);
-    let Some((inode, _)) = client_socket(server_port, peer)? else {
+    let Some((inode, _)) = client_socket_exact(server, peer)? else {
         return Err(format!(
-            "no local socket is the client end of {peer} → port {server_port}"
+            "no local socket is the client end of {peer} → {server}"
         ));
     };
     let pids = socket_owners(inode);
@@ -781,16 +784,17 @@ pub(crate) fn tcp_peer_operator_proof(
     Ok(())
 }
 
-/// A live loopback client socket whose process is not in this pid
-/// namespace. Distinct from a closed socket (`client_socket` is
-/// `None`), which stays unprovable. The board treats this as the
-/// operator's tunnel only after a live operator session.
-pub(crate) fn loopback_ownerless(server_port: u16, peer: SocketAddr) -> bool {
+/// A live loopback client socket of a connection to `server` whose
+/// process is not in this pid namespace. Distinct from a closed socket
+/// (`client_socket_exact` is `None`), which stays unprovable. The board
+/// treats this as the operator's tunnel only after a live operator
+/// session.
+pub(crate) fn loopback_ownerless(server: SocketAddr, peer: SocketAddr) -> bool {
     let peer = canonical(peer);
     if !peer.ip().is_loopback() {
         return false;
     }
-    match client_socket(server_port, peer) {
+    match client_socket_exact(server, peer) {
         Ok(Some((inode, _))) => socket_owners(inode).is_empty(),
         _ => false,
     }
@@ -809,35 +813,15 @@ pub(crate) fn canonical(addr: SocketAddr) -> SocketAddr {
 }
 
 /// The client's half of the connection — the socket whose local end is
-/// `peer` and whose remote end is our `server_port`, not the accepted
-/// half this server holds: its inode and its owner uid (the uid column
-/// the kernel prints for every socket, readable for another user's
-/// socket too). `Ok(None)` when no table lists it; `Err` only when
-/// neither table could be read.
-pub(crate) fn client_socket(
-    server_port: u16,
-    peer: SocketAddr,
-) -> Result<Option<(u64, u32)>, String> {
-    let mut read_any = false;
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let Ok(text) = std::fs::read_to_string(table) else {
-            continue;
-        };
-        read_any = true;
-        if let Some(found) = find_client_socket(&text, server_port, peer) {
-            return Ok(Some(found));
-        }
-    }
-    if !read_any {
-        return Err("/proc/net/tcp and /proc/net/tcp6 are unreadable".to_string());
-    }
-    Ok(None)
-}
-
-/// Security-sensitive variant: require the client's remote endpoint to
-/// equal the board's concrete bound IP and port, not merely its port.
-/// A wildcard bind has no single destination and must be refused by
-/// the caller before invoking this lookup.
+/// `peer` and whose remote end is the board's concrete bound IP and
+/// port `server`, not the accepted half this server holds: its inode
+/// and its owner uid (the uid column the kernel prints for every
+/// socket, readable for another user's socket too). The full
+/// four-tuple, never the port alone (CAD-760): two clients may share a
+/// source IP:port towards different destinations. A wildcard bind has
+/// no single destination and must be refused by the caller before
+/// invoking this lookup. `Ok(None)` when no table lists it; `Err` only
+/// when neither table could be read.
 pub(crate) fn client_socket_exact(
     server: SocketAddr,
     peer: SocketAddr,
@@ -860,19 +844,8 @@ pub(crate) fn client_socket_exact(
 
 /// Scan one `/proc/net/tcp{,6}` table: `sl local rem st … uid timeout
 /// inode`. Inode 0 (a TIME_WAIT remnant) is owned by nobody — skipped.
-fn find_client_socket(table: &str, server_port: u16, peer: SocketAddr) -> Option<(u64, u32)> {
-    table.lines().skip(1).find_map(|line| {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        let local = canonical(parse_addr(cols.get(1)?)?);
-        let remote = canonical(parse_addr(cols.get(2)?)?);
-        let uid: u32 = cols.get(7)?.parse().ok()?;
-        let inode: u64 = cols.get(9)?.parse().ok()?;
-        (local == peer && remote.port() == server_port && inode != 0).then_some((inode, uid))
-    })
-}
-
-/// Security-sensitive board UID lookup; the destination address must be
-/// the actual concrete address the board bound, never an HTTP Host value.
+/// The destination address must be the actual concrete address the
+/// board bound, never an HTTP Host value.
 fn find_client_socket_exact(
     table: &str,
     server: SocketAddr,
@@ -982,27 +955,27 @@ mod tests {
     #[test]
     fn a_loopback_peer_resolves_to_its_process_and_pane() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let server = listener.local_addr().unwrap();
+        let client = TcpStream::connect(server).unwrap();
         let (_accepted, peer) = listener.accept().unwrap();
         assert_eq!(peer, client.local_addr().unwrap());
 
         let none = AgentRoots::default();
-        assert_eq!(tcp_peer_agent(port, peer, &none), Ok(None));
+        assert_eq!(tcp_peer_agent(server, peer, &none), Ok(None));
         let panes = AgentRoots {
             panes: recorded("w1", std::process::id()),
             ..Default::default()
         };
-        assert_eq!(tcp_peer_agent(port, peer, &panes), Ok(Some("w1".into())));
+        assert_eq!(tcp_peer_agent(server, peer, &panes), Ok(Some("w1".into())));
 
         // A loopback address no local socket holds is not "no pane" —
         // it is unattributable, and the caller must refuse.
         let ghost: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        assert!(tcp_peer_agent(port, ghost, &panes).is_err());
+        assert!(tcp_peer_agent(server, ghost, &panes).is_err());
         // A non-loopback address with no local client end is a
         // different host: no pane here can be it.
         let remote: SocketAddr = "192.0.2.7:40000".parse().unwrap();
-        assert_eq!(tcp_peer_agent(port, remote, &panes), Ok(None));
+        assert_eq!(tcp_peer_agent(server, remote, &panes), Ok(None));
     }
 
     /// CAD-335: a managed endpoint's provider on the peer's ancestry
@@ -1012,8 +985,8 @@ mod tests {
     #[test]
     fn a_loopback_peer_under_a_managed_provider_is_that_agent() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let server = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(server).unwrap();
         let (_accepted, peer) = listener.accept().unwrap();
         let me = std::process::id();
         let parent = std::os::unix::process::parent_id();
@@ -1023,7 +996,10 @@ mod tests {
             managed: recorded("wk", parent),
             ..Default::default()
         };
-        assert_eq!(tcp_peer_agent(port, peer, &managed), Ok(Some("wk".into())));
+        assert_eq!(
+            tcp_peer_agent(server, peer, &managed),
+            Ok(Some("wk".into()))
+        );
 
         // A provider that is not on our ancestry: a child we spawned.
         let mut other = std::process::Command::new("sleep")
@@ -1034,7 +1010,7 @@ mod tests {
             managed: recorded("wk", other.id()),
             ..Default::default()
         };
-        assert_eq!(tcp_peer_agent(port, peer, &unrelated), Ok(None));
+        assert_eq!(tcp_peer_agent(server, peer, &unrelated), Ok(None));
         let _ = other.kill();
         let _ = other.wait();
 
@@ -1042,7 +1018,7 @@ mod tests {
             panes: recorded("w1", me),
             managed: recorded("wk", parent),
         };
-        assert!(tcp_peer_agent(port, peer, &both).is_err());
+        assert!(tcp_peer_agent(server, peer, &both).is_err());
     }
 
     /// CAD-385: a recorded pid is the row's process only while its
@@ -1092,19 +1068,19 @@ mod tests {
     #[test]
     fn a_reused_or_unrecorded_pane_pid_never_attributes_a_board_write() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let server = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(server).unwrap();
         let (_accepted, peer) = listener.accept().unwrap();
         let me = std::process::id();
         let start = proc_starttime(me).unwrap();
-        let unregistered = tcp_peer_agent(port, peer, &AgentRoots::default());
+        let unregistered = tcp_peer_agent(server, peer, &AgentRoots::default());
         assert_eq!(unregistered, Ok(None));
 
         let reused = AgentRoots {
             panes: AgentPids::classify([("pm".to_string(), me, Some(start - 1))]),
             managed: AgentPids::classify([("wk".to_string(), me, Some(start + 1))]),
         };
-        assert_eq!(tcp_peer_agent(port, peer, &reused), unregistered);
+        assert_eq!(tcp_peer_agent(server, peer, &reused), unregistered);
 
         // CAD-390: the recorded start matching, the same managed row is
         // the agent — and a reused row beside it changes nothing.
@@ -1116,7 +1092,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            tcp_peer_agent(port, peer, &live),
+            tcp_peer_agent(server, peer, &live),
             Ok(Some("wk".to_string()))
         );
 
@@ -1124,7 +1100,7 @@ mod tests {
             panes: AgentPids::classify([("pm".to_string(), me, None)]),
             ..Default::default()
         };
-        let err = tcp_peer_agent(port, peer, &legacy).unwrap_err();
+        let err = tcp_peer_agent(server, peer, &legacy).unwrap_err();
         assert!(
             err.contains("'pm'") && err.contains("doctor --host"),
             "{err}"
@@ -1133,7 +1109,7 @@ mod tests {
             managed: AgentPids::classify([("wk".to_string(), me, None)]),
             ..Default::default()
         };
-        assert!(tcp_peer_agent(port, peer, &legacy_managed).is_err());
+        assert!(tcp_peer_agent(server, peer, &legacy_managed).is_err());
     }
 
     /// CAD-385 in the board's operator proof (CAD-328): the pane and
@@ -1144,13 +1120,13 @@ mod tests {
     #[test]
     fn board_operator_proof_denies_live_and_unproven_rows_but_not_reused_ones() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let server = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(server).unwrap();
         let (_accepted, peer) = listener.accept().unwrap();
         let me = std::process::id();
         let start = proc_starttime(me).unwrap();
         let (_, uid) = proc_uids(me).unwrap();
-        let proof = |roots: &AgentRoots| tcp_peer_operator_proof(port, peer, uid, 0, roots);
+        let proof = |roots: &AgentRoots| tcp_peer_operator_proof(server, peer, uid, 0, roots);
         let unregistered = proof(&AgentRoots::default());
 
         let reused = AgentRoots {
@@ -1180,17 +1156,17 @@ mod tests {
     #[test]
     fn a_visible_loopback_client_is_not_treated_as_an_ownerless_tunnel() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let server = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(server).unwrap();
         let (_accepted, peer) = listener.accept().unwrap();
-        let (inode, _) = client_socket(port, peer).unwrap().unwrap();
+        let (inode, _) = client_socket_exact(server, peer).unwrap().unwrap();
         assert!(
             !socket_owners(inode).is_empty(),
             "this process owns the socket, so operator proof must still inspect it"
         );
-        assert!(!loopback_ownerless(port, peer));
+        assert!(!loopback_ownerless(server, peer));
         let (_, uid) = proc_uids(std::process::id()).unwrap();
-        assert!(tcp_peer_operator_proof(port, peer, uid, 0, &AgentRoots::default()).is_ok());
+        assert!(tcp_peer_operator_proof(server, peer, uid, 0, &AgentRoots::default()).is_ok());
     }
 
     /// The client socket's uid column is read, and it is ours for a
@@ -1198,12 +1174,131 @@ mod tests {
     #[test]
     fn a_loopback_client_socket_carries_its_owner_uid() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let server = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(server).unwrap();
         let (_accepted, peer) = listener.accept().unwrap();
         let (_, own) = proc_uids(std::process::id()).unwrap();
-        let (_, uid) = client_socket(port, peer).unwrap().unwrap();
+        let (_, uid) = client_socket_exact(server, peer).unwrap().unwrap();
         assert_eq!(uid, own);
+    }
+
+    /// A loopback TCP client bound to `src` with `SO_REUSEADDR` and
+    /// connected to `dst`, so two clients can share one source IP:port.
+    fn reuse_connect(src: std::net::SocketAddrV4, dst: std::net::SocketAddrV4) -> TcpStream {
+        use std::os::fd::FromRawFd;
+        let sockaddr = |a: std::net::SocketAddrV4| libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: a.port().to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(a.ip().octets()),
+            },
+            sin_zero: [0; 8],
+        };
+        let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        // SAFETY: plain socket syscalls on a fresh fd that the returned
+        // stream owns from the first line on.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+            let stream = TcpStream::from_raw_fd(fd);
+            let one: libc::c_int = 1;
+            let rc = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                (&one as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            assert_eq!(rc, 0, "SO_REUSEADDR: {}", std::io::Error::last_os_error());
+            let rc = libc::bind(fd, (&sockaddr(src) as *const libc::sockaddr_in).cast(), len);
+            assert_eq!(rc, 0, "bind {src}: {}", std::io::Error::last_os_error());
+            let rc = libc::connect(fd, (&sockaddr(dst) as *const libc::sockaddr_in).cast(), len);
+            assert_eq!(rc, 0, "connect {dst}: {}", std::io::Error::last_os_error());
+            stream
+        }
+    }
+
+    /// CAD-760: two live loopback clients share one source IP:port and
+    /// differ only in destination — the agent's to the board at
+    /// 127.0.0.1:L, the operator's to another listener at 127.0.0.2:L.
+    /// Both connections reach their server as the same peer, so a lookup
+    /// keyed on the server port alone answers both alike and one answer
+    /// is wrong whatever order the kernel lists the rows in. Keyed on
+    /// the full four-tuple, the agent's connection is the agent's and
+    /// fails operator proof; the operator's passes.
+    #[test]
+    fn colliding_source_ports_resolve_to_their_own_destination() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let one = Ipv4Addr::new(127, 0, 0, 1);
+        let two = Ipv4Addr::new(127, 0, 0, 2);
+        let (board, decoy) = (0..20)
+            .find_map(|_| {
+                let board = TcpListener::bind((one, 0)).ok()?;
+                let port = board.local_addr().ok()?.port();
+                let decoy = TcpListener::bind((two, port)).ok()?;
+                Some((board, decoy))
+            })
+            .expect("two listeners on one port at 127.0.0.1 and 127.0.0.2");
+        let port = board.local_addr().unwrap().port();
+        // The operator's connection takes a source port first; the
+        // agent's reuses it towards the board.
+        let operator_conn = reuse_connect(SocketAddrV4::new(one, 0), SocketAddrV4::new(two, port));
+        let SocketAddr::V4(src) = operator_conn.local_addr().unwrap() else {
+            unreachable!("an AF_INET socket")
+        };
+        let agent_conn = reuse_connect(src, SocketAddrV4::new(one, port));
+        let peer = SocketAddr::V4(src);
+
+        // The agent: a registered pane process holding the board connection.
+        let held = agent_conn.as_raw_fd();
+        // SAFETY: dup2/fcntl are async-signal-safe; the child only
+        // moves the inherited socket to fd 3 and clears its CLOEXEC.
+        let mut agent = unsafe {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .pre_exec(move || {
+                    if libc::dup2(held, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .spawn()
+                .unwrap()
+        };
+        drop(agent_conn);
+        let roots = AgentRoots {
+            panes: recorded("agent", agent.id()),
+            ..Default::default()
+        };
+        let (_, uid) = proc_uids(std::process::id()).unwrap();
+
+        let (board, decoy) = (board.local_addr().unwrap(), decoy.local_addr().unwrap());
+        let to_board = (
+            tcp_peer_agent(board, peer, &roots),
+            tcp_peer_operator_proof(board, peer, uid, 0, &roots).is_ok(),
+        );
+        let to_decoy = (
+            tcp_peer_agent(decoy, peer, &roots),
+            tcp_peer_operator_proof(decoy, peer, uid, 0, &roots).is_ok(),
+        );
+        let _ = agent.kill();
+        let _ = agent.wait();
+        drop(operator_conn);
+        assert_eq!(
+            to_board,
+            (Ok(Some("agent".to_string())), false),
+            "the agent's connection to the board"
+        );
+        assert_eq!(
+            to_decoy,
+            (Ok(None), true),
+            "the operator's connection to 127.0.0.2"
+        );
     }
 
     #[test]
@@ -1213,10 +1308,6 @@ mod tests {
         let table = "sl local rem st tx tr retr uid timeout inode\n\
             0: 0100007F:A001 0200007F:0C2B 01 0 0 0 2000 0 111\n\
             1: 0100007F:A001 0100007F:0C2B 01 0 0 0 1000 0 222\n";
-        assert_eq!(
-            find_client_socket(table, board.port(), peer),
-            Some((111, 2000))
-        );
         assert_eq!(
             find_client_socket_exact(table, board, peer),
             Some((222, 1000))

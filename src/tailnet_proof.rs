@@ -35,7 +35,8 @@
 //!    untouched, where the HTTPS proxy replaces them. This catches a
 //!    standing or accidental forwarder; a deliberate one is checks 5-6's;
 //! 8. `client_socket` — the connection's client socket is listed in
-//!    `/proc/net/tcp{,6}`;
+//!    `/proc/net/tcp{,6}`, matched on the full four-tuple with the
+//!    board's concrete bound address (CAD-760);
 //! 9. `socket_owner` — that socket was created by tailscaled's uid (the
 //!    table's uid column, readable for another user's socket);
 //! 10. `foreign_uid` — tailscaled's uid is not the board's: otherwise any
@@ -60,7 +61,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::peer::{canonical, client_socket, proc_uids};
+use crate::peer::{canonical, client_socket_exact, proc_uids};
 
 /// Where tailscaled keeps its LocalAPI socket on Linux (`/var/run` is
 /// normally a symlink to `/run`).
@@ -230,16 +231,18 @@ impl OperatorLatch {
     }
 }
 
-/// Is the TCP peer `peer` of a connection to the board's `board_port`
-/// the `tailscale serve` HTTPS proxy? `socket` is tailscaled's LocalAPI
-/// socket — `None` looks in [`DEFAULT_SOCKETS`]; tests inject a fixture.
+/// Is the TCP peer `peer` of a connection to the board's concrete bound
+/// address `board` the `tailscale serve` HTTPS proxy? `socket` is
+/// tailscaled's LocalAPI socket — `None` looks in [`DEFAULT_SOCKETS`];
+/// tests inject a fixture.
 /// `latch` is this board process's [`OperatorLatch`].
 pub fn prove(
     socket: Option<&Path>,
     latch: &OperatorLatch,
-    board_port: u16,
+    board: SocketAddr,
     peer: SocketAddr,
 ) -> Result<(), Refusal> {
+    let board_port = board.port();
     let peer = canonical(peer);
     if !peer.ip().is_loopback() {
         return Err(refuse(
@@ -251,12 +254,12 @@ pub fn prove(
     let (_, own_uid) = proc_uids(std::process::id()).map_err(|e| refuse(Check::ForeignUid, e))?;
     let facts = facts(&path).map_err(|e| refuse(Check::Localapi, e))?;
     latch.observe(&facts.operator_uid, own_uid);
-    let socket_uid = match client_socket(board_port, peer) {
+    let socket_uid = match client_socket_exact(board, peer) {
         Ok(Some((_, uid))) => uid,
         Ok(None) => {
             return Err(refuse(
                 Check::ClientSocket,
-                format!("no local socket is the client end of {peer} → port {board_port}"),
+                format!("no local socket is the client end of {peer} → {board}"),
             ));
         }
         Err(e) => return Err(refuse(Check::ClientSocket, e)),
@@ -850,26 +853,31 @@ pub(crate) mod tests {
     #[test]
     fn prove_refuses_by_name_before_the_uid_checks() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let board = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(board).unwrap();
         let (_accepted, peer) = listener.accept().unwrap();
 
         let remote: SocketAddr = "192.0.2.7:40000".parse().unwrap();
         assert_eq!(
-            check(prove(None, &OperatorLatch::default(), port, remote)),
+            check(prove(None, &OperatorLatch::default(), board, remote)),
             Some(Check::Loopback)
         );
 
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("none.sock");
         assert_eq!(
-            check(prove(Some(&missing), &OperatorLatch::default(), port, peer)),
+            check(prove(
+                Some(&missing),
+                &OperatorLatch::default(),
+                board,
+                peer
+            )),
             Some(Check::TailscaledSocket)
         );
         let file = dir.path().join("file.sock");
         std::fs::write(&file, b"").unwrap();
         assert_eq!(
-            check(prove(Some(&file), &OperatorLatch::default(), port, peer)),
+            check(prove(Some(&file), &OperatorLatch::default(), board, peer)),
             Some(Check::TailscaledSocket)
         );
         // A socket that answers nothing useful: the LocalAPI refusal.
@@ -881,7 +889,7 @@ pub(crate) mod tests {
             }
         });
         assert_eq!(
-            check(prove(Some(&sock), &OperatorLatch::default(), port, peer)),
+            check(prove(Some(&sock), &OperatorLatch::default(), board, peer)),
             Some(Check::Localapi)
         );
     }

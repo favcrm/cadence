@@ -618,16 +618,22 @@ pub(crate) fn tailnet_proxy(
     if !tailnet_host(request, opts) {
         return None;
     }
-    Some(match request.remote_addr() {
-        Some(peer) => crate::tailnet_proof::prove(
+    // CAD-760: the proxy's socket is matched on the full four-tuple.
+    let server = super::operator::concrete_board_server(opts);
+    Some(match (request.remote_addr(), server) {
+        (Some(peer), Ok(server)) => crate::tailnet_proof::prove(
             opts.tailscaled_socket.as_deref(),
             &opts.tailnet_latch,
-            opts.port,
+            server,
             *peer,
         ),
-        None => Err(crate::tailnet_proof::Refusal {
+        (None, _) => Err(crate::tailnet_proof::Refusal {
             check: crate::tailnet_proof::Check::ClientSocket,
             why: "the request has no peer address".to_string(),
+        }),
+        (_, Err(why)) => Err(crate::tailnet_proof::Refusal {
+            check: crate::tailnet_proof::Check::ClientSocket,
+            why,
         }),
     })
 }
