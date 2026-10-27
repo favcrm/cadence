@@ -12,11 +12,23 @@ pub(crate) const IMAGE_ROOT: &str = "/opt/cadence/pi";
 #[cfg_attr(not(all(unix, target_os = "linux")), allow(dead_code))] // only pi_guest (linux) uses this
 pub(crate) const NODE_PATH: &str = "/opt/cadence/pi/node";
 /// Constructor-selected independently pinned artifact; no second helper/SUID election.
+#[cfg_attr(
+    not(all(unix, target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)] // only the protected helper/pi_guest path on linux x86_64 reads this
 pub(crate) const HELPER_PATH: &str = "/opt/protected/bin/cadence-agent-exec";
 #[cfg_attr(not(all(unix, target_os = "linux")), allow(dead_code))] // only pi_guest (linux) uses this
 pub(crate) const NODE_DIGEST: Option<[u8; 32]> = None;
+#[cfg_attr(
+    not(all(unix, target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)] // consumed only by the protected linux x86_64 helper/constructor path
 #[path = "adapter/pi_guest/authority.rs"]
 pub(crate) mod authority;
+#[cfg_attr(
+    not(all(unix, target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)] // consumed only by the protected linux x86_64 helper/constructor path
 #[path = "adapter/pi_guest/purpose.rs"]
 pub(crate) mod purpose;
 
