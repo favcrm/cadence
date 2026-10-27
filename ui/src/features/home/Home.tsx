@@ -6,7 +6,7 @@ import { resources, threadReader } from "../../lib/resources";
 import type { SseErrorState } from "../../lib/sse";
 import { useQuery, useResource } from "../../lib/useResource";
 import { useTranslate } from "../../lib/locale";
-import type { MasterAppOrigin, MasterCommandResult, Overview, ThreadRef } from "../../lib/types";
+import type { Agent, MasterAppOrigin, MasterCommandResult, MasterState, Overview, ThreadRef } from "../../lib/types";
 import Link from "../../ui/Link";
 import Md from "../../ui/Md";
 import {
@@ -197,6 +197,102 @@ export function activityAnchor(items: ThreadItem[], message: string | undefined 
   // An answer bubble carries the indicator on its own timestamped name
   // row — prefer it over in-progress steps/commentary of the same turn.
   return answerKey ?? found ?? cardKey;
+}
+
+/** CAD-1881: on a narrow screen the model, effort and About affordances
+ *  move behind one overflow sheet, so the header is a single 56px row
+ *  instead of a four-line stack. Desktop keeps the chips inline. */
+function HeaderMenu({
+  master,
+  row,
+  readOnly,
+  scope,
+}: {
+  master: MasterState | null | undefined;
+  row: Agent | undefined;
+  readOnly: boolean;
+  /** The header's scope line, moved here on a narrow screen. */
+  scope: string;
+}) {
+  const t = useTranslate();
+  const [open, setOpen] = useState(false);
+  const trigger = useRef<HTMLButtonElement | null>(null);
+  const panel = useRef<HTMLDivElement | null>(null);
+  // A modal sheet: focus enters it, Tab stays inside, Escape closes it, and
+  // the trigger gets the focus back — the About dialog's mechanics.
+  useEffect(() => {
+    if (!open) return;
+    const root = panel.current;
+    const focusables = () =>
+      Array.from(
+        root?.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), [href], input:not([disabled]), select, textarea, [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      );
+    focusables()[0]?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setOpen(false);
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const items = focusables();
+      if (items.length === 0) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      trigger.current?.focus();
+    };
+  }, [open]);
+  return (
+    <span className="assistant-menu">
+      <button
+        ref={trigger}
+        type="button"
+        className="assistant-about-trigger assistant-menu-trigger"
+        aria-label={t("Assistant settings")}
+        title={t("Assistant settings")}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        onClick={() => setOpen(true)}
+      >
+        <span aria-hidden>⋯</span>
+      </button>
+      {open && (
+        <>
+          <button
+            type="button"
+            aria-hidden
+            tabIndex={-1}
+            className="assistant-menu-scrim"
+            onClick={() => setOpen(false)}
+          />
+          <div ref={panel} className="assistant-menu-panel" role="dialog" aria-modal="true" aria-label={t("Assistant settings")}>
+            <div className="assistant-menu-head">
+              <span className="text-label font-medium text-ink-200">{t("Assistant settings")}</span>
+              <button type="button" className="lnk text-label" onClick={() => setOpen(false)}>
+                {t("Close")}
+              </button>
+            </div>
+            <p className="assistant-scope" data-menu-scope>{scope}</p>
+            <MasterChips master={master} row={row} readOnly={readOnly} />
+            <AssistantAboutButton className="assistant-menu-about" />
+          </div>
+        </>
+      )}
+    </span>
+  );
 }
 
 /** The dock's one-line turn status (CAD-551, placed in `chatdock` by
@@ -1269,6 +1365,7 @@ function MasterHome({
                   {status.kind === "running" ? status.state : status.kind === "absent" ? t("not started") : status.kind}
                 </span>
                 <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
+                <HeaderMenu master={master.data} row={masterRow} readOnly={readOnly} scope={scopeDescriptor(actor.scope, t)} />
                 {streamReconnecting && activeTurn && status.kind === "running" && (
                   <span className="text-micro text-ink-500" data-stale>{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
                 )}

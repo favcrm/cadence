@@ -144,7 +144,7 @@ export default function MasterChips({
   if (!model && !effort && pct == null) return null;
   const disabled = readOnly;
   return (
-    <span className="flex items-center gap-1.5 min-w-0 flex-wrap">
+    <span className="master-chips flex items-center gap-1.5 min-w-0 flex-wrap">
       {model && (
         <span className="relative">
           <button

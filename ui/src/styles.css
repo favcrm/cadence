@@ -538,14 +538,6 @@ pre {
 .steps[data-open] .steps-caret {
   transform: rotate(90deg);
 }
-/* The trace owns its head; a nested tool disclosure inside it must not
- * rotate merely because the outer trace opened. */
-.turntrace[data-open] .steps-body .steps-caret {
-  transform: none;
-}
-.turntrace .steps-body .steps[data-open] .steps-caret {
-  transform: rotate(90deg);
-}
 .steps-body {
   display: grid;
   grid-template-rows: 0fr;
@@ -738,6 +730,8 @@ pre {
   color: var(--color-ink-500);
   font-size: var(--text-micro);
 }
+
+
 .answer .issue-reader table {
   border-collapse: collapse;
   display: block;
@@ -2133,3 +2127,68 @@ button.project-focus-preview:hover { color: var(--color-accent); }
 .header-search-meta, .header-search-snippet { overflow-wrap: anywhere; }
 .header-search-snippet { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 @media (width < 640px) { .header-search-wrap { padding-top: 3.5rem; } }
+
+/* CAD-1881: on a narrow screen an answer reads as a page, not a quoted
+   bubble — full-bleed 16px/1.62 at the Markdown measure, section headings
+   as the only structure. The avatar + name row is the speaker cue. Declared
+   at the end of the sheet so it wins against the base prose rules. */
+@media (max-width: 1023.98px) {
+  .answer {
+    display: block;
+    width: auto;
+    max-width: none;
+    padding: 0;
+    border-radius: 0;
+    background: transparent;
+  }
+  .chat-bubble.issue-reader,
+  .app-chat-list li .chat-bubble.issue-reader:not([data-chat-message="user"] .chat-bubble) {
+    display: block;
+    width: auto;
+    max-width: 68ch;
+    padding: 0;
+    border-radius: 0;
+    background: transparent;
+  }
+  .answer-body,
+  .answer-body.issue-reader,
+  .chat-bubble.issue-reader {
+    max-width: 68ch;
+    font-size: 1rem;
+    line-height: 1.6;
+  }
+  :is(.answer-body, .chat-bubble.issue-reader) :is(h1, h2, h3, h4) {
+    margin-block: 1.1em 0.35em;
+    font-size: 0.9375rem;
+    line-height: 1.35;
+    font-weight: 600;
+  }
+  :is(.answer-body, .chat-bubble.issue-reader) :is(p, li) {
+    font-size: inherit;
+    line-height: inherit;
+  }
+  /* One disclosure per turn and every text action: a thumb, not a link. */
+  .turntrace-head,
+  .turn-copy,
+  .codeblock-copy,
+  .assistant-menu-panel .lnk,
+  .assistant-menu-panel .chip-btn,
+  .assistant-menu-panel .chipitem,
+  .assistant-menu-about,
+  .app-chat-iconbtn {
+    min-height: 2.75rem;
+  }
+  .assistant-menu-panel .chip-btn,
+  .assistant-menu-about,
+  .app-chat-iconbtn {
+    min-width: 2.75rem;
+  }
+  .turn-copy,
+  .codeblock-copy {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 2.75rem;
+    padding: 0 0.5rem;
+  }
+}

@@ -114,6 +114,27 @@ async function main() {
   await settle();
   assert(commands.at(-1)?.command === "stop" && commands.at(-1)?.message === "turn-b", "the composer's Stop posts the stop for the running turn's own message");
 
+  // CAD-1881: one overflow sheet on a narrow header — the model/effort chips
+  // and the About action live behind it, not in the header row.
+  await React.act(async () => {
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true,
+      model: "claude-sonnet", model_label: "Claude Sonnet", effort: "medium", context: { tokens: 10, window: 200000, percent: 1 },
+      turn: null, queue: [] }));
+  });
+  await settle();
+  const menu = host.querySelector<HTMLButtonElement>(".assistant-menu-trigger");
+  assert(menu !== null && menu.getAttribute("aria-expanded") === "false", "the header offers one overflow trigger");
+  await React.act(async () => { menu!.click(); });
+  await settle();
+  const panel = host.querySelector('.assistant-menu-panel[role="dialog"]');
+  assert(panel !== null, "the overflow trigger opens one sheet");
+  assert(panel!.querySelector(".master-chips") !== null, "the sheet hosts the model and effort chips");
+  assert(panel!.querySelector(".assistant-menu-about") !== null, "the sheet hosts the About action");
+  assert(panel!.querySelector("[data-menu-scope]") !== null, "the sheet carries the scope line the header drops");
+  await React.act(async () => { (panel!.querySelector(".assistant-menu-head button") as HTMLButtonElement).click(); });
+  await settle();
+  assert(host.querySelector(".assistant-menu-panel") === null, "Close dismisses the sheet");
+
   await render(true);
   // A fresh running message: the earlier turn-b already carries a failed
   // result, and a turn with an answer is not streaming.
