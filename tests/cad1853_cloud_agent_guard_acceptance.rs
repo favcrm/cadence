@@ -179,7 +179,7 @@ impl Stub {
         )
         .unwrap();
         let run = |command: &mut std::process::Command| {
-            let result = command.stdin(std::process::Stdio::null()).output().unwrap();
+            let result = cadence_agent::reaper::output(command).unwrap();
             assert!(
                 result.status.success(),
                 "ephemeral fixture PKI failed: {}",
