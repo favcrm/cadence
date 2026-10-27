@@ -200,7 +200,6 @@ pub(super) struct CloudProjection {
     /// delivered UID binding.
     derived: std::collections::HashMap<String, crate::store::cloud_agent::CloudDerivedRow>,
     /// Current read admission, separate from immutable delivery provenance.
-    admitted_origins: std::collections::BTreeSet<String>,
     /// The ordinary mail of an ordinary alias, enumerated in the same
     /// snapshot. This is what makes that alias' own rows admitted explicitly
     /// rather than by absence from [`Self::derived`]. Empty when this
@@ -209,11 +208,12 @@ pub(super) struct CloudProjection {
     ordinary: std::collections::BTreeSet<String>,
     /// The caller's verified agent UID, when the connection derives one.
     viewer: Option<String>,
-    /// The caller's verified logical owner (issuer + subject), learned from
-    /// the same per-origin proof. A derived row whose backing operation was
-    /// created for a different owner is a replaced human's content: the UID
-    /// binding alone never admits it.
-    viewer_owner: Option<crate::store::cloud_agent::Owner>,
+    /// The verified logical owner (issuer + subject) proved for EACH admitted
+    /// backing connection, by `cloud_agent_id`. One alias can hold several
+    /// connections, so a proof for one of them must never admit another's
+    /// retained content: every derived row is compared with the owner proved
+    /// for its OWN connection, and an unproved connection denies.
+    admitted_owners: std::collections::HashMap<String, crate::store::cloud_agent::Owner>,
     /// The connection is provably the operator.
     operator: bool,
     /// Why cloud content was withheld for this read, if it was. The read still
@@ -231,10 +231,9 @@ impl Default for CloudProjection {
             known: std::collections::BTreeSet::new(),
             scopes: Vec::new(),
             derived: std::collections::HashMap::new(),
-            admitted_origins: std::collections::BTreeSet::new(),
             ordinary: std::collections::BTreeSet::new(),
             viewer: None,
-            viewer_owner: None,
+            admitted_owners: std::collections::HashMap::new(),
             operator: false,
             withheld: None,
         }
@@ -249,10 +248,9 @@ impl CloudProjection {
             known,
             scopes,
             derived: std::collections::HashMap::new(),
-            admitted_origins: std::collections::BTreeSet::new(),
             ordinary: std::collections::BTreeSet::new(),
             viewer: None,
-            viewer_owner: None,
+            admitted_owners: std::collections::HashMap::new(),
             operator: false,
             withheld: None,
         }
@@ -276,10 +274,9 @@ impl CloudProjection {
                 .into_iter()
                 .map(|row| (row.message_id.clone(), row))
                 .collect(),
-            admitted_origins: std::collections::BTreeSet::new(),
             ordinary: ordinary.into_iter().collect(),
             viewer,
-            viewer_owner: None,
+            admitted_owners: std::collections::HashMap::new(),
             operator,
             withheld: None,
         }
@@ -329,12 +326,17 @@ impl CloudProjection {
             };
         }
         if let Some(row) = self.derived.get(message_id) {
-            // The backing operation's immutable owner must be the viewer's
-            // own verified owner. A different human who legitimately
-            // connects on the same tenant/alias proves authority for its own
-            // source, never for the retained content of the one it replaced.
+            // The backing operation's immutable owner must be the owner this
+            // caller proved for THAT connection. A different human who
+            // legitimately connects on the same tenant/alias proves authority
+            // for its own source, never for the retained content of the one it
+            // replaced — and a proof for one connection never covers another.
+            let proved = row
+                .cloud_agent_id
+                .as_ref()
+                .and_then(|id| self.admitted_owners.get(id));
             let same_owner = match (
-                self.viewer_owner.as_ref(),
+                proved,
                 row.owner_issuer.as_deref(),
                 row.owner_subject.as_deref(),
             ) {
@@ -343,13 +345,7 @@ impl CloudProjection {
                 }
                 _ => false,
             };
-            return if same_owner
-                && self.bound(row)
-                && row
-                    .cloud_agent_id
-                    .as_ref()
-                    .is_some_and(|id| self.admitted_origins.contains(id))
-            {
+            return if same_owner && self.bound(row) {
                 Row::Full
             } else {
                 Row::Never
@@ -972,33 +968,36 @@ impl Shared {
                     .map(|answer| (answer, source.owner.clone()))
             })();
             match proof {
-                Ok((Some((_, PlatformState::Unsettled)), owner)) => {
-                    projection.viewer_owner.get_or_insert(owner);
+                Ok((Some((_, PlatformState::Unsettled)), _)) => {
                     projection.withheld = Some("cloud_agent_not_settled".to_string());
                 }
                 Ok((_, owner)) => {
-                    projection.viewer_owner.get_or_insert(owner);
-                    projection.admitted_origins.insert(agent_id);
+                    projection.admitted_owners.insert(agent_id, owner);
                 }
                 Err(error) => projection.withheld = Some(projection_denial(error)?),
             }
         }
         // A row whose backing operation belongs to another verified owner is
         // never admitted, and the read says why rather than looking complete.
-        if projection.viewer_owner.is_some()
-            && projection.derived.values().any(|row| {
-                let same_owner = matches!(
-                    (
-                        projection.viewer_owner.as_ref(),
-                        row.owner_issuer.as_deref(),
-                        row.owner_subject.as_deref()
-                    ),
-                    (Some(viewer), Some(issuer), Some(subject))
-                        if viewer.issuer == issuer && viewer.subject == subject
-                );
-                !same_owner
-            })
-        {
+        // The comparison is per connection: a proof for one backing
+        // connection never speaks for another's retained rows.
+        let replaced = projection.derived.values().any(|row| {
+            let proved = row
+                .cloud_agent_id
+                .as_ref()
+                .and_then(|id| projection.admitted_owners.get(id));
+            match (
+                proved,
+                row.owner_issuer.as_deref(),
+                row.owner_subject.as_deref(),
+            ) {
+                (Some(viewer), Some(issuer), Some(subject)) => {
+                    viewer.issuer != issuer || viewer.subject != subject
+                }
+                _ => false,
+            }
+        });
+        if replaced {
             projection.withheld = Some("cloud_agent_owner_changed".to_string());
         }
         Ok(projection)
