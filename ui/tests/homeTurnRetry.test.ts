@@ -103,7 +103,7 @@ async function main() {
   // rides the operator's own row rather than a stored entry of this turn.
   await render(false);
   await React.act(async () => {
-    resources.masterState.write(() => ({ alias: "master", provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
+    resources.masterState.write(() => ({ alias: "master", identity: { name: null, tone: null, look: "robot", revision: "fixture" }, provider: "fixture", endpoint_kind: "fixture", live: true, turn: null, queue: [] }));
     resources.masterThread.write((state) => ({
       ...state!,
       pending: [{ message: "ui-submitting", text: "While the POST is in flight", state: "sending", at: 2 }],
@@ -112,8 +112,8 @@ async function main() {
   await settle();
   const typingRows = Array.from(host.querySelectorAll('[data-kind="typing"]')) as HTMLElement[];
   assert(typingRows.length === 1, `a submitting turn shows exactly one inline typing bubble (got ${typingRows.length})`);
-  const typingTurn = typingRows[0].closest('li, [data-kit="turn"]') as HTMLElement | null;
-  assert(typingTurn !== null && typingTurn.textContent?.includes("Assistant"), "the typing bubble paints as an assistant turn, not a status bar");
+  const typingTurn = typingRows[0].closest('[data-kind="turn"][data-turn-state="running"]');
+  assert(typingTurn !== null && !typingRows[0].closest("[data-turn-bar]"), "the typing bubble paints inside the assistant turn, not the dock status bar");
   assert(
     host.querySelector('[data-turn-bar][data-state="sending"]') !== null,
     "the dock bar reports the send as sending, not as a working banner",
