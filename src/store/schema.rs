@@ -1460,6 +1460,14 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=56", [])?;
                 tx.commit()?;
             }
+            if version < 57 {
+                // CAD-1857: agent ingress endpoints. New table only; an
+                // endpoint is created disabled and binds one workflow.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::endpoint::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=57", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

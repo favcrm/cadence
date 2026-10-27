@@ -52,6 +52,7 @@ const TRACKER_DIR: &str = "portable-tracker";
 const COORDINATION: &[&str] = &[
     "schema_version",
     "agents",
+    "agent_endpoints",
     "messages",
     "events",
     "jobs",
@@ -93,7 +94,13 @@ const DISABLED: &[(&str, &str)] = &[
     ("agents", "enabled"),
     ("monitors", "dispatch_enabled"),
     ("monitors", "auto_dispatch_enabled"),
+    ("agent_endpoints", "verified"),
 ];
+
+/// Text columns forced to a fixed safe value on the private copy and on
+/// import. An imported endpoint must not accept mail until the operator
+/// explicitly enables it again.
+const DISABLED_TEXT: &[(&str, &str, &str)] = &[("agent_endpoints", "state", "disabled")];
 
 /// The fixed catalog of the store tables with their exact columns.
 /// Export and restore refuse any table or column not listed here.
@@ -967,6 +974,22 @@ const CATALOG: &[(&str, &[&str])] = &[
             "created_at",
         ],
     ),
+    (
+        "agent_endpoints",
+        &[
+            "id",
+            "agent_uid",
+            "kind",
+            "slug",
+            "state",
+            "verified",
+            "project",
+            "workflow",
+            "digest",
+            "created",
+            "updated",
+        ],
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1540,7 +1563,11 @@ fn build_package(
         omitted_tables: omitted_names().iter().map(|t| t.to_string()).collect(),
         omitted_rows,
         nulled_columns: NULLED.iter().map(|(t, c)| format!("{t}.{c}")).collect(),
-        disabled_columns: DISABLED.iter().map(|(t, c)| format!("{t}.{c}")).collect(),
+        disabled_columns: DISABLED
+            .iter()
+            .map(|(t, c)| format!("{t}.{c}"))
+            .chain(DISABLED_TEXT.iter().map(|(t, c, _)| format!("{t}.{c}")))
+            .collect(),
         exclusions: package_exclusions,
         redacted_message_bodies: scrub.redacted_message_bodies,
         members,
@@ -1744,6 +1771,12 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
     }
     for (table, column) in DISABLED {
         tx.execute(&format!("UPDATE {table} SET {column}=0"), [])?;
+    }
+    for (table, column, value) in DISABLED_TEXT {
+        tx.execute(
+            &format!("UPDATE {table} SET {column}=?1"),
+            rusqlite::params![value],
+        )?;
     }
     tx.commit()?;
     conn.execute_batch("VACUUM")?;
@@ -2811,6 +2844,18 @@ fn validate_staged_store(db: &Path, manifest: &PortableManifest) -> Result<()> {
         if on > 0 {
             return Err(Error::rejected(format!(
                 "staged store enables {table}.{column}"
+            )));
+        }
+    }
+    for (table, column, value) in DISABLED_TEXT {
+        let on: i64 = conn.query_row(
+            &format!("SELECT count(*) FROM {table} WHERE {column}<>?1"),
+            rusqlite::params![value],
+            |r| r.get(0),
+        )?;
+        if on > 0 {
+            return Err(Error::rejected(format!(
+                "staged store sets {table}.{column} to an enabled value"
             )));
         }
     }

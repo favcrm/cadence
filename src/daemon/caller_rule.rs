@@ -457,6 +457,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     ("monitor_list", Rule::Read),
     ("monitor_show", Rule::Read),
+    ("endpoint_add", BY_OPERATOR),
+    ("endpoint_list", Rule::Read),
+    ("endpoint_show", Rule::Read),
+    ("endpoint_verify", BY_OPERATOR),
+    ("endpoint_enable", BY_OPERATOR),
+    ("endpoint_disable", BY_OPERATOR),
+    ("endpoint_remove", BY_OPERATOR),
     (
         "monitor_heartbeat",
         Rule::Handler(

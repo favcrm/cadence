@@ -1231,6 +1231,12 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: MonitorAction,
     },
+    /// Agent ingress endpoints: configure email/webhook/schedule that bind
+    /// one agent to one workflow. Created disabled; verify then enable.
+    Endpoint {
+        #[command(subcommand)]
+        action: EndpointAction,
+    },
     /// The issue board: folders under the PM dir (`~/pm` or
     /// `CADENCE_PM_DIR`); this CLI is the only writer.
     Issue {

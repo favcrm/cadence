@@ -1888,3 +1888,54 @@
         }
         assert!(has("chat_files"));
     }
+
+#[test]
+fn migration_v56_to_v57_adds_agent_endpoints_and_converges() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("t.sqlite3");
+    let cwd = dir.path().join("w");
+    std::fs::create_dir(&cwd).unwrap();
+    {
+        let s = Store::open(&db).unwrap();
+        reg(&s, "a1", &cwd);
+    }
+    let has = || -> bool {
+        Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_endpoints'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
+    };
+    assert!(has());
+    // Fabricate a genuine v56 database: no endpoint table, version 56.
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE agent_endpoints;
+             UPDATE schema_version SET version=56;",
+        )
+        .unwrap();
+    assert!(!has());
+    {
+        let s = Store::open_for_schema_tests(&db).unwrap();
+        // Pre-v57 rows survive; the new table starts empty.
+        assert_eq!(s.agent("a1").unwrap().alias, "a1");
+        assert!(s.endpoints(None, None).unwrap().is_empty());
+    }
+    assert!(has());
+    // Half-applied: table dropped, version rolled back — reopen converges.
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE agent_endpoints;
+             UPDATE schema_version SET version=56;",
+        )
+        .unwrap();
+    let _ = Store::open_for_schema_tests(&db).unwrap();
+    assert!(has());
+}

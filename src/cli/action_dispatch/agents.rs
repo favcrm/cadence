@@ -14,6 +14,7 @@ pub(super) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             }
         }
         Commands::Message { action } => message::run(state_dir, action),
+        Commands::Endpoint { action } => crate::cli::endpoint::run(state_dir, action),
         Commands::Send {
             alias,
             to,
