@@ -633,6 +633,317 @@ mod matrix {
         );
     }
 
+    /// CAD-1853 native operator checks only. Peer authority and hosted
+    /// delegation lifetime are deliberately outside this fixture.
+    mod cad1853_cloud_operator {
+        use super::*;
+
+        const CLOUD: [&str; 3] = ["cloud_agent.write", "bridge.enroll", "cloud_agent.read"];
+
+        fn cloud_store(
+            pending: Option<PendingRenewal>,
+        ) -> (tempfile::TempDir, RemoteTarget, Credential) {
+            let (root, mut target, mut prior) = store(pending);
+            prior.capabilities = CLOUD.iter().map(|scope| (*scope).to_owned()).collect();
+            target.identity = Some(CliIdentityPin {
+                issuer: ISSUER.into(),
+                subject_id: SUBJECT.into(),
+            });
+            save_credential(root.path(), ORG, &prior).unwrap();
+            (root, target, prior)
+        }
+
+        fn renew_cloud(
+            dir: &Path,
+            target: &RemoteTarget,
+            send: WireSend<'_>,
+        ) -> Result<Credential> {
+            renewed_cloud_credential_with(
+                dir,
+                target,
+                Instant::now() + Duration::from_secs(30),
+                |dir, issuer, path, bearer, body, deadline| {
+                    assert_eq!(issuer, ISSUER);
+                    assert_eq!(path, "/v1/hosted-cadence/cli-session/renew");
+                    assert_eq!(bearer, OLD_REFRESH);
+                    assert_eq!(body["version"], "hosted-cadence-cli-session.v1");
+                    assert_eq!(body["capabilities"], json!(CLOUD));
+                    assert_eq!(body["organization_id"], ORG_ID);
+                    assert_eq!(body["organization_slug"], ORG);
+                    assert_eq!(body["audience"], target.endpoint);
+                    assert_eq!(body["subject_id"], SUBJECT);
+                    assert_eq!(body["session_id"], SESSION_ID);
+                    assert_eq!(body["device_label"], "cadence CLI");
+                    assert_eq!(body["expected_generation"], 1);
+                    assert_eq!(body.as_object().unwrap().len(), 10);
+                    // This is disk state read before the real guarded issuer
+                    // transport boundary, not an in-memory intent assertion.
+                    let durable = load_credential(dir, target).unwrap();
+                    let pending = durable.pending.expect("intent must precede POST");
+                    assert_eq!(body["operation_id"], pending.operation_id);
+                    assert_eq!(pending.expected_generation, 1);
+                    assert_eq!(durable.access_token, OLD_ACCESS);
+                    crate::remote_enrollment::cli_session_post_for_test(
+                        dir, issuer, path, bearer, body, deadline, send,
+                    )
+                },
+            )
+        }
+
+        #[test]
+        fn due_and_expired_cloud_access_renew_without_changing_owner_consent_or_session() {
+            for expired in [false, true] {
+                let (root, target, mut prior) = cloud_store(None);
+                let at = now().unwrap();
+                prior.expires_at = if expired { at - 1 } else { at + 30 };
+                save_credential(root.path(), ORG, &prior).unwrap();
+                let pending = PendingRenewal {
+                    operation_id: format!("op_{}", "q".repeat(43)),
+                    expected_generation: 1,
+                };
+                let mut response = issuer_response(&prior, &pending, &target);
+                if expired {
+                    response["principal"]["current_role"] = json!("member");
+                }
+                let wire = Wire::new(vec![(200, response.clone())]);
+                let next = renew_cloud(root.path(), &target, wire.send())
+                    .expect("live original cloud consent must renew due/expired access");
+                assert_eq!(wire.posts(), 1, "renew once, never a model retry");
+                assert_eq!(next.access_token, NEW_ACCESS);
+                assert_eq!(next.issuer, prior.issuer);
+                assert_eq!(next.subject_id, prior.subject_id);
+                assert_eq!(next.organization_id, prior.organization_id);
+                assert_eq!(next.audience, prior.audience);
+                assert_eq!(next.capabilities, prior.capabilities);
+                assert!(next.pending.is_none());
+                let old_session = prior.cli_session.unwrap();
+                let session = next.cli_session.unwrap();
+                assert_eq!(session.session_id, old_session.session_id);
+                assert_eq!(session.device_label, old_session.device_label);
+                assert_eq!(session.absolute_expires_at, old_session.absolute_expires_at);
+                assert_eq!(session.generation, old_session.generation + 1);
+                assert_eq!(session.refresh_token, NEW_REFRESH);
+                let saved = load_credential(root.path(), &target).unwrap();
+                assert_eq!(saved.access_token, NEW_ACCESS);
+                assert_eq!(saved.capabilities, CLOUD);
+                assert_eq!(
+                    Some(saved.expires_at),
+                    response["credential"]["expires_at"].as_u64()
+                );
+                let no_more_wire = Wire::new(Vec::new());
+                let current = renew_cloud(root.path(), &target, no_more_wire.send()).unwrap();
+                assert_eq!(current.access_token, NEW_ACCESS);
+                assert_eq!(
+                    no_more_wire.posts(),
+                    0,
+                    "fresh access must not rotate again"
+                );
+            }
+        }
+
+        #[test]
+        fn cloud_purpose_refuses_invalid_saved_consent_even_when_access_is_not_due() {
+            for scopes in [
+                json!(["cloud_agent.read", "cloud_agent.write"]),
+                json!(["cloud_agent.write", "bridge.enroll"]),
+                json!([
+                    "cloud_agent.write",
+                    "bridge.enroll",
+                    "cloud_agent.read",
+                    "cli.read",
+                    "cli.write"
+                ]),
+                json!([
+                    "cloud_agent.write",
+                    "bridge.enroll",
+                    "cloud_agent.read",
+                    "cloud_agent.read"
+                ]),
+            ] {
+                for fresh in [false, true] {
+                    let (root, target, mut prior) = cloud_store(None);
+                    prior.capabilities = serde_json::from_value(scopes.clone()).unwrap();
+                    prior.expires_at = if fresh {
+                        now().unwrap() + 300
+                    } else {
+                        now().unwrap() - 1
+                    };
+                    save_credential(root.path(), ORG, &prior).unwrap();
+                    let path = root.path().join(format!("cli-{ORG}.json"));
+                    let before = std::fs::read(&path).unwrap();
+                    let wire = Wire::new(Vec::new());
+                    assert!(
+                        renew_cloud(root.path(), &target, wire.send()).is_err(),
+                        "cloud purpose accepted saved consent {scopes}, fresh={fresh}"
+                    );
+                    assert_eq!(wire.posts(), 0);
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                }
+            }
+        }
+
+        #[test]
+        fn lost_cloud_renewal_answer_reloads_and_replays_the_exact_durable_intent() {
+            let (root, target, prior) = cloud_store(None);
+            let path = root.path().join(format!("cli-{ORG}.json"));
+            let before: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let first_request = RefCell::new(None);
+            let first = renew_cloud(
+                root.path(),
+                &target,
+                Box::new(|_url, _bearer, _access, body, _timeout| {
+                    *first_request.borrow_mut() = Some(body.clone());
+                    // Only the response bytes are lost at the real checked
+                    // send boundary. No upstream D1 commit is claimed here.
+                    Err(Error::unknown("synthetic lost renewal acknowledgement"))
+                }),
+            );
+            assert!(first.is_err());
+            let sent = first_request
+                .into_inner()
+                .expect("cloud renewal never reached the checked send boundary");
+            let kept = load_credential(root.path(), &target).unwrap();
+            let pending = kept.pending.clone().expect("lost reply discarded intent");
+            let mut after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let mut authority_before = before;
+            after.as_object_mut().unwrap().remove("pending_renewal");
+            authority_before
+                .as_object_mut()
+                .unwrap()
+                .remove("pending_renewal");
+            assert_eq!(after, authority_before, "loss partially replaced authority");
+            assert_eq!(sent["operation_id"], pending.operation_id);
+            assert_eq!(sent["expected_generation"], pending.expected_generation);
+            let response = issuer_response(&prior, &pending, &target);
+            let wire = Wire::new(vec![(200, response)]);
+            // A separate invocation reacquires the real lock and reloads disk;
+            // no in-memory Credential or returned token is carried across.
+            let recovered = renew_cloud(root.path(), &target, wire.send()).unwrap();
+            assert_eq!(wire.posts(), 1);
+            assert_eq!(wire.hits.borrow()[0].1, sent, "replay changed request body");
+            assert_eq!(recovered.access_token, NEW_ACCESS);
+            assert!(recovered.pending.is_none());
+            assert_eq!(recovered.cli_session.unwrap().generation, 2);
+        }
+
+        #[test]
+        fn forged_cloud_renewal_answers_cannot_partially_publish_authority() {
+            let at = now().unwrap();
+            for (pointer, wrong) in [
+                ("", json!("not an exchange object")),
+                ("/organization_id", json!("ws_attacker")),
+                ("/organization_slug", json!("other")),
+                ("/audience", json!("https://other.cadencecloud.app")),
+                ("/principal/subject_id", json!("user_attacker")),
+                ("/principal/kind", json!("service")),
+                ("/principal/current_role", json!("admin")),
+                (
+                    "/capabilities",
+                    json!(["cloud_agent.read", "cloud_agent.write"]),
+                ),
+                (
+                    "/capabilities",
+                    json!([
+                        "cloud_agent.write",
+                        "bridge.enroll",
+                        "cloud_agent.read",
+                        "cli.write"
+                    ]),
+                ),
+                (
+                    "/capabilities",
+                    json!([
+                        "cloud_agent.write",
+                        "bridge.enroll",
+                        "cloud_agent.read",
+                        "cloud_agent.read"
+                    ]),
+                ),
+                (
+                    "/cli_session/session_id",
+                    json!("hcs_00000000-0000-4000-8000-000000000001"),
+                ),
+                ("/cli_session/device_label", json!("other device")),
+                ("/cli_session/generation", json!(1)),
+                ("/cli_session/refresh_token", json!(OLD_REFRESH)),
+                ("/cli_session/idle_expires_at", json!(at - 1)),
+                ("/cli_session/absolute_expires_at", json!(at + 20_000)),
+                ("/credential/issued_at", json!(at + 60)),
+                ("/credential/expires_at", json!(at - 1)),
+                ("/credential/expires_at", json!(at + 301)),
+                ("/credential/access_token", json!("hct_malformed")),
+                ("/credential/token_type", json!("Basic")),
+            ] {
+                let pending = PendingRenewal {
+                    operation_id: format!("op_{}", "v".repeat(43)),
+                    expected_generation: 1,
+                };
+                let (root, target, prior) = cloud_store(Some(pending.clone()));
+                let path = root.path().join(format!("cli-{ORG}.json"));
+                let before = std::fs::read(&path).unwrap();
+                let mut response = issuer_response(&prior, &pending, &target);
+                response["credential"]["issued_at"] = json!(at);
+                *response.pointer_mut(pointer).unwrap() = wrong;
+                let wire = Wire::new(vec![(200, response)]);
+                assert!(
+                    renew_cloud(root.path(), &target, wire.send()).is_err(),
+                    "accepted forged response field {pointer}"
+                );
+                assert_eq!(wire.posts(), 1, "{pointer}: failed before response guard");
+                assert_eq!(std::fs::read(&path).unwrap(), before, "{pointer}");
+            }
+        }
+
+        #[test]
+        fn cloud_owner_swap_while_waiting_for_the_lock_is_refused_before_renewal_send() {
+            use std::sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            };
+            let (root, target, prior) = cloud_store(None);
+            for replace_issuer in [false, true] {
+                save_credential(root.path(), ORG, &prior).unwrap();
+                let lock = private_lock(root.path(), ORG, Instant::now() + Duration::from_secs(10))
+                    .unwrap();
+                let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+                let posts = Arc::new(AtomicUsize::new(0));
+                let observed = posts.clone();
+                let dir = root.path().to_owned();
+                let frozen = target.clone();
+                let child = std::thread::spawn(move || {
+                    CREDENTIAL_WAITING.with(|observer| *observer.borrow_mut() = Some(waiting_tx));
+                    renew_cloud(
+                        &dir,
+                        &frozen,
+                        Box::new(move |_url, _bearer, _access, _body, _timeout| {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            Err(Error::unknown("owner replacement must not reach wire"))
+                        }),
+                    )
+                    .map(|_| ())
+                });
+                let contended = waiting_rx.recv_timeout(Duration::from_secs(5));
+                let mut replaced = prior.clone();
+                if replace_issuer {
+                    replaced.issuer = Some("https://other.example.test".into());
+                } else {
+                    replaced.subject_id = Some("user_attacker".into());
+                }
+                // The replacement writer owns the actual source lock. The
+                // waiter must reload and compare its original frozen pin.
+                save_credential(root.path(), ORG, &replaced).unwrap();
+                let path = root.path().join(format!("cli-{ORG}.json"));
+                let replacement_bytes = std::fs::read(&path).unwrap();
+                drop(lock);
+                let result = child.join().unwrap();
+                contended.expect("renewal did not contend on the source lock");
+                assert!(result.is_err(), "renewal adopted a different human/issuer");
+                assert_eq!(posts.load(Ordering::SeqCst), 0);
+                assert_eq!(std::fs::read(&path).unwrap(), replacement_bytes);
+            }
+        }
+    }
+
     #[test]
     fn a_refused_renewal_changes_only_the_pending_record_never_the_authority() {
         // Before the POST the pending operation is persisted (crash-safe). A
