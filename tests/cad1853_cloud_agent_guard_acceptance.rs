@@ -72,6 +72,8 @@ struct Script {
     provenance: Option<Value>,
     /// Only the replacement-owner case opts into its own server-issued session.
     remote_session: Option<String>,
+    /// Opt-in shared wire ordering for the two-origin replacement case only.
+    readback_trace: Option<Arc<Mutex<Vec<String>>>>,
     submit_status: u16,
     submit_state: String,
     submit_text: Option<String>,
@@ -113,6 +115,7 @@ impl Script {
             capabilities: None,
             provenance: None,
             remote_session: None,
+            readback_trace: None,
             submit_status: 0,
             submit_state: "queued".into(),
             submit_text: None,
@@ -531,6 +534,11 @@ fn serve_io(mut stream: impl Read + Write, script: Arc<Mutex<Script>>, close: im
             body: body.clone(),
             authorization: authorization.clone(),
         });
+        if action == "readback" {
+            if let Some(trace) = &recorded.readback_trace {
+                trace.lock().unwrap().push(recorded.endpoint.clone());
+            }
+        }
     }
     let first_ack = {
         let mut script = script.lock().unwrap_or_else(|e| e.into_inner());
@@ -1994,6 +2002,554 @@ fn a_replacement_owner_cannot_read_retained_cloud_pair_content() {
             }
             println!("V11_OWNER_CHECKPOINT stage={stage} method={method} passed=true readbacks={proofs} own_token=true ordinary=true submit_delta=0");
         }
+    }
+}
+
+#[test]
+fn mixed_origin_owner_admission_is_per_connection_in_both_proof_orders() {
+    use cadence_agent::cloud_agent::{self, Sender, Source};
+    use cadence_agent::remote_cli::RemoteTarget;
+    use cadence_agent::store::cloud_agent::{CloudSource, Owner};
+
+    const OTHER_ORG: &str = "stub-v12-other";
+    const OTHER_ORG_ID: &str = "ws-stub-v12-other";
+    const PROOF_X: &str = "v12-proof-owner-a-x";
+    const PROOF_Y_A: &str = "v12-proof-owner-a-y";
+    const PROOF_Y_B: &str = "v12-proof-owner-b-y";
+    const PEER_X: &str = "v12-peer-owner-a-x";
+    const PEER_Y_A: &str = "v12-peer-owner-a-y";
+    const PEER_Y_B: &str = "v12-peer-owner-b-y";
+    const REQUEST_X: &str = "v12 private owner A request on X";
+    const REQUEST_Y_A: &str = "v12 private owner A request on Y";
+    const REQUEST_Y_B: &str = "v12 private owner B request on Y";
+    const REPLY_X: &str = "v12 private owner A reply from X";
+    const REPLY_Y_A: &str = "v12 private owner A reply from Y";
+    const REPLY_Y_B: &str = "v12 private owner B reply from Y";
+    const USER_REPLY_B: &str = "v12 B own HTTP proof reply";
+    const SESSION_B: &str = "ns_v12_owner_b_000000000000000000";
+
+    for x_first in [true, false] {
+        let order = if x_first { "X-first" } else { "Y-first" };
+        println!("V12_OWNER_STAGE order={order} stage=seed-two-origins");
+        let fx = Fx::start();
+        let connected = fx.connect();
+        let second = Stub::start();
+        second.set(|script| script.agent_organization = Some(OTHER_ORG_ID.into()));
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        write_login(
+            OTHER_ORG,
+            OTHER_ORG_ID,
+            &second.url,
+            &["cloud_agent.read", "cloud_agent.write"],
+            expires,
+        );
+        let other = fx
+            .call(
+                Asserted::Operator,
+                "cloud_agent_connect",
+                json!({
+                    "org":OTHER_ORG, "org_id":OTHER_ORG_ID, "endpoint":second.url,
+                    "alias":ALIAS_B, "accept_assistant_consent":true,
+                }),
+            )
+            .unwrap();
+        let backings = [
+            (connected, &fx.stub, ORG, ORG_ID, ALIAS),
+            (other, &second, OTHER_ORG, OTHER_ORG_ID, ALIAS_B),
+        ];
+        let zero_first = cloud_agent_id(&backings[0].0) < cloud_agent_id(&backings[1].0);
+        let xi = usize::from(x_first != zero_first);
+        let yi = 1 - xi;
+        let (xc, xs, _, _, xa) = &backings[xi];
+        let (yc, ys, yo, yoid, ya) = &backings[yi];
+        let (xid, yid) = (cloud_agent_id(xc), cloud_agent_id(yc));
+        assert_ne!(xid, yid);
+        assert_eq!(
+            xid < yid,
+            x_first,
+            "fixture must reverse native origin processing"
+        );
+        let trace = Arc::new(Mutex::new(Vec::<String>::new()));
+        for (_, stub, _, _, _) in &backings {
+            stub.set(|script| {
+                script.submit_state = "completed".into();
+                script.submit_text = Some("genuine stub reply".into());
+                script.readback_trace = Some(Arc::clone(&trace));
+            });
+        }
+        let sorted_endpoints = if x_first {
+            vec![xs.url.clone(), ys.url.clone()]
+        } else {
+            vec![ys.url.clone(), xs.url.clone()]
+        };
+        fx.call(
+            Asserted::Operator,
+            "agent_register",
+            json!({
+                "alias":"peer", "provider":"fake", "endpoint_kind":"fake", "cwd":fx.cwd(),
+            }),
+        )
+        .unwrap();
+        fx.call(
+            Asserted::Operator,
+            "thread_send",
+            json!({
+                "alias":"peer", "message":"m-v12-ordinary", "text":"v12 ordinary control",
+            }),
+        )
+        .unwrap();
+        let store = fx.store();
+        let peer = store.agent("peer").unwrap();
+        let owner_a = Owner::new("https://issuer.example.test", "stub-subject");
+        let owner_b = Owner::new(
+            "https://replacement-issuer.example.test",
+            "replacement-owner-b",
+        );
+        // Reuse the existing admitted SERVICE producer, not an enrollment or
+        // reader-authority bypass. All observations use the real RPC guards.
+        let seed = |connect: &Value,
+                    owner: &Owner,
+                    operation: &str,
+                    request: &str,
+                    reply: &'static str|
+         -> String {
+            let id = cloud_agent_id(connect);
+            let home = thread_of(connect);
+            let source = Source::registered(&peer, owner.clone());
+            store
+                .cloud_agent_source_grant(&CloudSource {
+                    cloud_agent_id: id.clone(),
+                    kind: "local_peer".into(),
+                    uid: peer.uid.clone(),
+                    registration_epoch: source.epoch,
+                    owner: owner.clone(),
+                    label: "peer".into(),
+                    scope: "cloud_agent.write".into(),
+                    granted_by: "operator".into(),
+                    granted_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs_f64(),
+                    invoker_id: None,
+                    state: "active".into(),
+                })
+                .unwrap();
+            let cloud = store.cloud_agent(&id).unwrap().unwrap();
+            let target = RemoteTarget {
+                org: cloud.org_slug.clone(),
+                org_id: cloud.organization_id.clone(),
+                endpoint: cloud.endpoint.clone(),
+                identity: None,
+            };
+            cloud_agent::send(
+                &store,
+                &SettledFixtureReply(reply),
+                &cloud,
+                &target,
+                &home,
+                &Sender::Agent("peer".into()),
+                &source,
+                operation,
+                request,
+                true,
+                None,
+                || Ok(()),
+            )
+            .unwrap();
+            let routed = store
+                .messages("peer")
+                .unwrap()
+                .into_iter()
+                .find(|row| {
+                    row.source == "worker_result" && row.origin.as_deref() == Some(operation)
+                })
+                .expect("service completion must produce its real UID-bound routed report");
+            if !matches!(routed.state.as_str(), "completed" | "failed") {
+                store
+                    .finish(
+                        &routed,
+                        "completed",
+                        &json!({"status":"completed", "text":reply}),
+                        None,
+                    )
+                    .unwrap();
+            }
+            assert!(routed.body.contains(reply));
+            routed.id
+        };
+        for (connect, operation) in [(xc, PROOF_X), (yc, PROOF_Y_A)] {
+            fx.call(
+                Asserted::Operator,
+                "cloud_agent_send",
+                json!({
+                    "cloud_agent_id":cloud_agent_id(connect), "thread_id":thread_of(connect),
+                    "operation_id":operation, "text":format!("own proof {operation}"), "wake":true,
+                }),
+            )
+            .unwrap();
+        }
+        let routed_x = seed(xc, &owner_a, PEER_X, REQUEST_X, REPLY_X);
+        let routed_y_a = seed(yc, &owner_a, PEER_Y_A, REQUEST_Y_A, REPLY_Y_A);
+        let listed = fx
+            .call(
+                Asserted::Operator,
+                "work_conversation_list",
+                json!({"include_system":true}),
+            )
+            .unwrap();
+        let pair_for = |alias: &str| -> String {
+            listed["conversations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| {
+                    row["kind"] == json!("pair")
+                        && [alias, "peer"].iter().all(|wanted| {
+                            row["participants"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|participant| participant["alias"] == json!(wanted))
+                        })
+                })
+                .expect("each cloud connection must have its real peer pair")["id"]
+                .as_str()
+                .unwrap()
+                .into()
+        };
+        let (pair_x, pair_y) = (pair_for(xa), pair_for(ya));
+        let saved_y_a = std::fs::read(login_path(yo)).unwrap();
+        let token_a = format!("bearer hct_{}", "a".repeat(43));
+        let token_b = format!("bearer hct_{}", "b".repeat(43));
+        let invoker_b = format!("inv_{}", "b".repeat(32));
+        println!("V12_OWNER_STAGE order={order} stage=connect-b-on-y-only");
+        write_login_owner(LoginSpec {
+            org: yo,
+            org_id: yoid,
+            endpoint: &ys.url,
+            capabilities: &["cloud_agent.read", "cloud_agent.write"],
+            expires,
+            subject: &owner_b.subject,
+            issuer: &owner_b.issuer,
+            token_char: "b",
+        });
+        ys.set(|script| {
+            script.provenance = Some(json!({"kind":"user", "invoker_id":invoker_b, "peer":null}));
+            script.remote_session = Some(SESSION_B.into());
+            script.submit_text = Some(USER_REPLY_B.into());
+            script.read_text = USER_REPLY_B.into();
+        });
+        let (wx, wy) = (xs.seen().len(), ys.seen().len());
+        let connected_b = fx
+            .call(
+                Asserted::Operator,
+                "cloud_agent_connect",
+                json!({
+                    "org":yo, "org_id":yoid, "endpoint":ys.url, "alias":ya,
+                    "accept_assistant_consent":true,
+                }),
+            )
+            .expect("B must legitimately connect Y with its own scopes and explicit consent");
+        assert_eq!(cloud_agent_id(&connected_b), yid);
+        assert_eq!(xs.seen().len() - wx, 0, "replacing Y touched X");
+        assert_eq!(ys.seen().len() - wy, 1);
+        assert_eq!(&ys.auths()[wy..], std::slice::from_ref(&token_b));
+        assert_eq!(ys.seen()[wy]["action"], json!("agent"));
+        let grant_b = connected_b["agent"]["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == json!("user") && row["owner"] == owner_b.to_json())
+            .unwrap();
+        assert_eq!(grant_b["state"], json!("active"));
+        assert_eq!(grant_b["invoker_id"], json!(invoker_b));
+        let sessions = connected_b["agent"]["sessions"].as_array().unwrap();
+        let session_b = sessions
+            .iter()
+            .find(|row| {
+                row["source"]["kind"] == json!("user")
+                    && row["source"]["owner"] == owner_b.to_json()
+            })
+            .unwrap();
+        let session_a = sessions
+            .iter()
+            .find(|row| {
+                row["source"]["kind"] == json!("user")
+                    && row["source"]["owner"] == owner_a.to_json()
+            })
+            .unwrap();
+        assert_eq!(session_b["remote_session_id"], json!(SESSION_B));
+        assert_eq!(session_b["invoker_id"], json!(invoker_b));
+        assert_ne!(
+            session_b["remote_session_id"],
+            session_a["remote_session_id"]
+        );
+        let wy = ys.seen().len();
+        fx.call(
+            Asserted::Operator,
+            "cloud_agent_send",
+            json!({
+                "cloud_agent_id":yid, "thread_id":thread_of(&connected_b),
+                "operation_id":PROOF_Y_B, "text":"v12 B own legitimate proof", "wake":true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(ys.seen().len() - wy, 1);
+        assert_eq!(&ys.auths()[wy..], std::slice::from_ref(&token_b));
+        let by = proof_before(ys);
+        let wy = ys.seen().len();
+        let own = fx
+            .call(
+                Asserted::Operator,
+                "cloud_agent_read",
+                json!({
+                    "cloud_agent_id":yid, "operation_id":PROOF_Y_B,
+                }),
+            )
+            .expect("B must positively read its own Y receipt before any negative");
+        assert_eq!(own["operation"]["source"]["owner"], owner_b.to_json());
+        assert_eq!(own["operation"]["remote_session_id"], json!(SESSION_B));
+        assert_eq!(own["operation"]["reply"]["text"], json!(USER_REPLY_B));
+        assert_eq!(own["operation"]["status"], json!("completed"));
+        assert_proof_delta(ys, by, &[PROOF_Y_B], 1);
+        assert_eq!(ys.seen().len() - wy, 1);
+        assert_eq!(&ys.auths()[wy..], std::slice::from_ref(&token_b));
+        assert_eq!(xs.calls("submit"), 1);
+        assert_eq!(ys.calls("submit"), 2);
+        println!("V12_OWNER_CHECKPOINT order={order} stage=connect-b-own-read passed=true own_grant=true own_session=true own_bearer=true x_unchanged=true x_submits=1 y_submits=2");
+
+        let mut routed_y_b = None;
+        // First preserve the original Y preview under replacement and A's
+        // restoration. Then add B's own peer rows, proving mixed A/B rows on
+        // Y itself without making its newer B preview a false A-positive.
+        for phase in ["replaced-b", "restored-a", "mixed-b-own"] {
+            let original = phase == "restored-a";
+            println!("V12_OWNER_STAGE order={order} stage={phase}");
+            if original {
+                std::fs::write(login_path(yo), &saved_y_a).unwrap();
+            } else {
+                write_login_owner(LoginSpec {
+                    org: yo,
+                    org_id: yoid,
+                    endpoint: &ys.url,
+                    capabilities: &["cloud_agent.read", "cloud_agent.write"],
+                    expires,
+                    subject: &owner_b.subject,
+                    issuer: &owner_b.issuer,
+                    token_char: "b",
+                });
+            }
+            ys.set(|script| {
+                script.provenance = if original {
+                    None
+                } else {
+                    Some(json!({"kind":"user", "invoker_id":invoker_b, "peer":null}))
+                };
+                script.remote_session = if original {
+                    None
+                } else {
+                    Some(SESSION_B.into())
+                };
+                script.read_text = if original {
+                    "genuine stub reply"
+                } else {
+                    USER_REPLY_B
+                }
+                .into();
+            });
+            if phase == "mixed-b-own" {
+                routed_y_b = Some(seed(yc, &owner_b, PEER_Y_B, REQUEST_Y_B, REPLY_Y_B));
+            }
+            for (method, params, pair_kind) in [
+                (
+                    "work_conversation_read",
+                    json!({"conversation":pair_x, "include_system":true}),
+                    "X",
+                ),
+                (
+                    "work_conversation_read",
+                    json!({"conversation":pair_y, "include_system":true}),
+                    "Y",
+                ),
+                (
+                    "work_conversation_list",
+                    json!({"include_system":true}),
+                    "both",
+                ),
+                ("thread_read", json!({"alias":"peer"}), "alias"),
+                ("agent_show", json!({"alias":"peer"}), "alias"),
+                ("agent_events", json!({"alias":"peer", "after":0}), "alias"),
+            ] {
+                println!(
+                    "V12_OWNER_STAGE order={order} stage={phase} method={method} pair={pair_kind}"
+                );
+                let (bx, by) = (proof_before(xs), proof_before(ys));
+                let (wx, wy) = (xs.seen().len(), ys.seen().len());
+                let trace_before = trace.lock().unwrap().len();
+                let page = fx
+                    .call(Asserted::Operator, method, params)
+                    .expect("mixed-origin authority must preserve the ordinary reader");
+                let (nx, ny) = match (method, pair_kind) {
+                    ("work_conversation_read", "X") => (2, 1),
+                    ("work_conversation_read", "Y") => (1, 2),
+                    ("work_conversation_list", _) => (2, 2),
+                    _ => (1, 1),
+                };
+                assert_proof_delta(xs, bx, &vec![PROOF_X; nx], nx);
+                let y_proof = if original { PROOF_Y_A } else { PROOF_Y_B };
+                assert_proof_delta(ys, by, &vec![y_proof; ny], ny);
+                assert_eq!(xs.seen().len() - wx, nx);
+                assert_eq!(ys.seen().len() - wy, ny);
+                assert!(xs.auths()[wx..].iter().all(|auth| auth == &token_a));
+                let y_token = if original { &token_a } else { &token_b };
+                assert!(ys.auths()[wy..].iter().all(|auth| auth == y_token));
+                let mut expected_trace = Vec::new();
+                if method == "work_conversation_read" {
+                    expected_trace.push(if pair_kind == "X" {
+                        xs.url.clone()
+                    } else {
+                        ys.url.clone()
+                    });
+                }
+                expected_trace.extend(sorted_endpoints.iter().cloned());
+                if method == "work_conversation_list" {
+                    expected_trace.extend(sorted_endpoints.iter().cloned());
+                }
+                assert_eq!(
+                    &trace.lock().unwrap()[trace_before..],
+                    expected_trace.as_slice(),
+                    "wrong ACTUAL cross-server proof order: {order}/{phase}/{method}/{pair_kind}"
+                );
+                assert_eq!(xs.calls("submit"), 1, "read resubmitted X");
+                assert_eq!(ys.calls("submit"), 2, "read resubmitted Y");
+                let text = page.to_string();
+                if !original {
+                    assert!(
+                        !text.contains(REQUEST_Y_A),
+                        "retained A/Y request leaked: {page}"
+                    );
+                    assert!(
+                        !text.contains(REPLY_Y_A),
+                        "retained A/Y reply leaked: {page}"
+                    );
+                }
+                if method == "work_conversation_read" {
+                    let rows = page["messages"].as_array().unwrap();
+                    let is_x = pair_kind == "X";
+                    let (operation, routed, request, reply) = if is_x {
+                        (PEER_X, routed_x.as_str(), REQUEST_X, REPLY_X)
+                    } else {
+                        (PEER_Y_A, routed_y_a.as_str(), REQUEST_Y_A, REPLY_Y_A)
+                    };
+                    assert_eq!(
+                        rows.len(),
+                        if !is_x && routed_y_b.is_some() { 4 } else { 2 }
+                    );
+                    let request_row = rows
+                        .iter()
+                        .find(|row| row["id"] == json!(operation))
+                        .unwrap();
+                    let report = rows.iter().find(|row| row["id"] == json!(routed)).unwrap();
+                    if is_x || original {
+                        assert_eq!(request_row["body"], json!(request));
+                        assert!(request_row["result"].to_string().contains(reply));
+                        assert!(request_row["cloud_withheld"].is_null());
+                        assert!(request_row["routed"].as_array().unwrap().iter().any(|row| {
+                            row["id"] == json!(routed) && row["result"].to_string().contains(reply)
+                        }));
+                        assert!(report["body"].as_str().unwrap().contains(reply));
+                        assert!(report["result"].to_string().contains(reply));
+                        assert!(report["cloud_withheld"].is_null());
+                    } else {
+                        for row in [request_row, report] {
+                            assert_eq!(row["cloud_withheld"], json!("cloud_agent_owner_changed"));
+                            assert_eq!(row["body"], json!(""));
+                            assert!(row["result"].is_null());
+                            assert!(row["error"].is_null());
+                            assert_eq!(row["routed"], json!([]));
+                        }
+                    }
+                    if !is_x {
+                        if let Some(routed) = &routed_y_b {
+                            let own = rows
+                                .iter()
+                                .find(|row| row["id"] == json!(PEER_Y_B))
+                                .unwrap();
+                            assert_eq!(own["body"], json!(REQUEST_Y_B));
+                            assert!(own["result"].to_string().contains(REPLY_Y_B));
+                            assert!(own["cloud_withheld"].is_null());
+                            assert!(own["routed"].as_array().unwrap().iter().any(|row| {
+                                row["id"] == json!(routed)
+                                    && row["result"].to_string().contains(REPLY_Y_B)
+                            }));
+                            let report =
+                                rows.iter().find(|row| row["id"] == json!(routed)).unwrap();
+                            assert!(report["body"].as_str().unwrap().contains(REPLY_Y_B));
+                            assert!(report["result"].to_string().contains(REPLY_Y_B));
+                            assert!(report["cloud_withheld"].is_null());
+                        }
+                    }
+                } else if method == "work_conversation_list" {
+                    let rows = page["conversations"].as_array().unwrap();
+                    let x = rows.iter().find(|row| row["id"] == json!(pair_x)).unwrap();
+                    assert!(!x["last"]["preview"].as_str().unwrap().is_empty());
+                    assert!(
+                        x["last"]["cloud_withheld"].is_null(),
+                        "X falsely withheld by Y: {x}"
+                    );
+                    let y = rows.iter().find(|row| row["id"] == json!(pair_y)).unwrap();
+                    if original || routed_y_b.is_some() {
+                        assert!(!y["last"]["preview"].as_str().unwrap().is_empty());
+                        assert!(y["last"]["cloud_withheld"].is_null());
+                    } else {
+                        assert_eq!(y["last"]["preview"], json!(""));
+                        assert_eq!(
+                            y["last"]["cloud_withheld"],
+                            json!("cloud_agent_owner_changed")
+                        );
+                    }
+                } else {
+                    assert!(
+                        text.contains(REPLY_X),
+                        "Y falsely withheld X's A rows: {page}"
+                    );
+                    assert!(
+                        text.contains(&routed_x),
+                        "X's original report was replaced: {page}"
+                    );
+                    let ordinary = if method == "agent_events" {
+                        "m-v12-ordinary"
+                    } else {
+                        "v12 ordinary control"
+                    };
+                    assert!(text.contains(ordinary), "ordinary history lost: {page}");
+                    if original {
+                        assert!(text.contains(REPLY_Y_A));
+                        assert!(text.contains(&routed_y_a));
+                        assert!(page.get("cloud_withheld").is_none());
+                    } else {
+                        assert_eq!(page["cloud_withheld"], json!("cloud_agent_owner_changed"));
+                        assert!(
+                            !text.contains(&routed_y_a),
+                            "withheld A/Y routed copy leaked: {page}"
+                        );
+                    }
+                    if let Some(routed) = &routed_y_b {
+                        assert!(
+                            text.contains(REPLY_Y_B),
+                            "B's own Y row falsely withheld: {page}"
+                        );
+                        assert!(text.contains(routed));
+                    }
+                }
+                println!("V12_OWNER_CHECKPOINT order={order} stage={phase} method={method} pair={pair_kind} passed=true x_proofs={nx} y_proofs={ny} exact_wire_order=true own_bearers=true x_readable=true submit_delta=0");
+            }
+        }
+        println!("V12_OWNER_CHECKPOINT order={order} stage=complete passed=true all_three_phases=true x_submits=1 y_submits=2");
     }
 }
 
