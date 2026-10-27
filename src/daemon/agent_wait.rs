@@ -223,9 +223,25 @@ impl Shared {
                 // CAD-375 withhold redacts it for non-owners (I2); dead
                 // tokens stay visible like `agent_show` rows.
                 if let Some(id) = mid {
-                    obj.insert("message".to_string(), json!(id.clone()));
-                    if let Some(token) = self.store.message(&id)?.and_then(|m| m.turn_id) {
-                        obj.insert("turn".to_string(), json!(token));
+                    // CAD-1853: a routed cloud reply is a message this caller
+                    // may not read. The wait still reports that something
+                    // settled, but it does not name a row the body reader
+                    // would refuse.
+                    let readable = match self.store.message(&id)? {
+                        Some(m) => self.may_read_cloud_row(
+                            peer_pid,
+                            &m.alias,
+                            &m.id,
+                            m.sender_uid.as_deref(),
+                            m.recipient_uid.as_deref(),
+                        )?,
+                        None => true,
+                    };
+                    if readable {
+                        obj.insert("message".to_string(), json!(id.clone()));
+                        if let Some(token) = self.store.message(&id)?.and_then(|m| m.turn_id) {
+                            obj.insert("turn".to_string(), json!(token));
+                        }
                     }
                 }
                 obj.insert("waited_secs".to_string(), json!(t0.elapsed().as_secs_f64()));

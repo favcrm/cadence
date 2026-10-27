@@ -663,6 +663,34 @@ impl Shared {
         Ok(CloudProjection::cloud(scopes))
     }
 
+    /// The one policy for a routed cloud row: the operator, the delivery's
+    /// sender, or its recipient. A row with no cloud provenance is not this
+    /// policy's business and reads as before. Every reader of a message body
+    /// or a message id asks this, so the rule cannot drift between them.
+    pub(super) fn may_read_cloud_row(
+        &self,
+        peer_pid: u32,
+        alias: &str,
+        message_id: &str,
+        sender_uid: Option<&str>,
+        recipient_uid: Option<&str>,
+    ) -> Result<bool> {
+        let derived = self.store.cloud_derived_messages(alias)?;
+        if !derived.iter().any(|row| row.message_id == message_id) {
+            return Ok(true);
+        }
+        match self.connection_caller(peer_pid) {
+            Ok(caller_rule::Who::Operator) => Ok(true),
+            Ok(caller_rule::Who::Agent(caller)) => {
+                let uid = self.store.agent(&caller).ok().map(|agent| agent.uid);
+                Ok(uid.is_some_and(|uid| {
+                    sender_uid == Some(uid.as_str()) || recipient_uid == Some(uid.as_str())
+                }))
+            }
+            Ok(caller_rule::Who::Unproven(_)) | Err(_) => Ok(false),
+        }
+    }
+
     /// An ordinary alias can still carry cloud content: settling a turn routes
     /// the reply to its sender as a `worker_result` (or `worker_notice`), and
     /// that copy's immutable `origin` names the cloud operation. Cloud-ness is

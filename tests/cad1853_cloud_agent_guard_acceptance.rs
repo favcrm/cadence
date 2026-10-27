@@ -89,6 +89,10 @@ struct Script {
     slow_read_operation: Option<String>,
     slow_read_ms: u64,
     cancel_status: u16,
+    /// Readbacks the stub has ANSWERED (the response is on the wire), as
+    /// opposed to requests it has merely logged. A case that needs "the
+    /// proof completed" synchronizes on this, never on `seen`.
+    answered_readbacks: usize,
 }
 
 impl Script {
@@ -112,6 +116,7 @@ impl Script {
             slow_read_operation: None,
             slow_read_ms: 0,
             cancel_status: 501,
+            answered_readbacks: 0,
         }
     }
     fn calls(&self, action: &str) -> usize {
@@ -180,6 +185,15 @@ impl Stub {
     /// The operation id of every readback the platform was actually asked
     /// about, in order. This is the observable proof of which receipt a read
     /// proved authority against, and that a re-admission happened at all.
+    /// Readbacks the stub actually answered: the platform's proof COMPLETED,
+    /// not merely arrived.
+    fn answered_readbacks(&self) -> usize {
+        self.script
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .answered_readbacks
+    }
+
     fn readback_operations(&self) -> Vec<String> {
         self.script
             .lock()
@@ -437,6 +451,10 @@ fn serve(mut stream: TcpStream, script: Arc<Mutex<Script>>) {
             json!({"ok": false, "error": {"code": "invalid_request", "message": other}}),
         ),
     };
+    if action == "readback" {
+        let mut script = script.lock().unwrap_or_else(|e| e.into_inner());
+        script.answered_readbacks += 1;
+    }
     reply(&mut stream, status, &answer);
 }
 
@@ -5669,34 +5687,40 @@ fn a_routed_cloud_result_is_not_projected_to_an_unrelated_agent() {
     }
 }
 
-/// The projection's default is denial. An id it never admitted is withheld,
-/// never rendered as ordinary content: an entry whose message row no longer
-/// exists cannot be classified, so it is dropped rather than shown. The
-/// previous default (`Row::Full` for an unknown id) painted it as plain mail.
-/// The page must still advance past it, or a reader would stall on a row it
-/// is not allowed to see.
+/// The projection's default is denial, and the branch it has to hold is an
+/// ORDINARY alias before it has ever carried a cloud row: the projection used
+/// to hand such an alias back whole, so the alias' first routed delivery could
+/// be read under an admission taken before it existed. An id the snapshot
+/// enumerated neither as ordinary mail nor as a bound derived row is withheld,
+/// and the page still advances past it.
 #[test]
-fn an_id_outside_the_admission_snapshot_is_withheld_and_the_page_advances() {
+fn an_unadmitted_id_on_an_ordinary_alias_is_withheld_and_the_page_advances() {
     const MISSING: &str = "m-cad1853-vanished-row";
     const MISSING_TEXT: &str = "orphaned entry text that must never project";
+    const ORDINARY: &str = "ordinary peer mail";
+    const ORDINARY_ID: &str = "m-peer-ordinary";
 
     let fx = Fx::start();
-    let connect = fx.connect();
-    let id = cloud_agent_id(&connect);
-    let home = thread_of(&connect);
+    for alias in ["peer", "outsider"] {
+        fx.call(
+            Asserted::Operator,
+            "agent_register",
+            json!({"alias": alias, "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
+        )
+        .unwrap();
+    }
+    // An ordinary alias with no cloud provenance at all: this is the shape
+    // the empty-derived fast path used to wave through.
     fx.call(
         Asserted::Operator,
-        "cloud_agent_send",
-        json!({
-            "cloud_agent_id": id, "thread_id": home,
-            "text": TEXT, "operation_id": OPERATION, "wake": true,
-        }),
+        "thread_send",
+        json!({"alias": "peer", "text": ORDINARY, "message": ORDINARY_ID}),
     )
     .unwrap();
     let store = fx.store();
     let orphan = store
         .thread_append(
-            ALIAS,
+            "peer",
             cadence_agent::store::NewEntry {
                 role: "agent",
                 kind: "message",
@@ -5711,49 +5735,42 @@ fn an_id_outside_the_admission_snapshot_is_withheld_and_the_page_advances() {
         store.message(MISSING).unwrap().is_none(),
         "the fixture must not create the message row the entry names"
     );
+    assert!(
+        store.cloud_derived_messages("peer").unwrap().is_empty(),
+        "the fixture must hold no cloud-derived row"
+    );
 
-    let read = fx
-        .call(
-            Asserted::Operator,
-            "thread_read",
-            json!({"alias": ALIAS, "after": 0, "limit": 200}),
-        )
-        .unwrap();
-    let rendered = read.to_string();
-    assert!(
-        !rendered.contains(MISSING_TEXT),
-        "an unadmitted id was rendered as ordinary content: {rendered}"
-    );
-    assert!(
-        !rendered.contains(MISSING),
-        "an unadmitted id reached the projection: {rendered}"
-    );
-    assert!(
-        rendered.contains(TEXT),
-        "the admitted turn stopped projecting: {rendered}"
-    );
-    // The cursor follows what the projection scanned, so the withheld row is
-    // behind it rather than in front of every later read.
-    let cursor = read["cursor"]
-        .as_i64()
-        .or_else(|| read["scanned"].as_i64())
-        .or_else(|| read["page"]["cursor"].as_i64())
-        .unwrap_or_else(|| panic!("the page must report where it stopped: {read}"));
-    assert!(
-        cursor >= orphan,
-        "the page did not advance past the withheld row ({cursor} < {orphan})"
-    );
-    let after = fx
-        .call(
-            Asserted::Operator,
-            "thread_read",
-            json!({"alias": ALIAS, "after": cursor, "limit": 200}),
-        )
-        .unwrap();
-    assert!(
-        !after.to_string().contains(MISSING_TEXT),
-        "a later page re-served the withheld row: {after}"
-    );
+    for who in [Asserted::Operator, Asserted::Agent("outsider".into())] {
+        let read = fx
+            .call(
+                who.clone(),
+                "thread_read",
+                json!({"alias": "peer", "after": 0, "limit": 200}),
+            )
+            .unwrap();
+        let rendered = read.to_string();
+        assert!(
+            !rendered.contains(MISSING_TEXT),
+            "{who:?} was served an id the admission never enumerated: {rendered}"
+        );
+        assert!(
+            !rendered.contains(MISSING),
+            "{who:?} was served the unadmitted id itself: {rendered}"
+        );
+        assert!(
+            rendered.contains(ORDINARY),
+            "{who:?} lost the alias' ordinary mail: {rendered}"
+        );
+        let cursor = read["cursor"]
+            .as_i64()
+            .or_else(|| read["scanned"].as_i64())
+            .or_else(|| read["page"]["cursor"].as_i64())
+            .unwrap_or_else(|| panic!("the page must report where it stopped: {read}"));
+        assert!(
+            cursor >= orphan,
+            "the page did not advance past the withheld row ({cursor} < {orphan})"
+        );
+    }
 }
 
 /// An admission is fixed when a read begins, and that ordering is explicit
@@ -5797,7 +5814,7 @@ fn a_waiting_thread_read_re_proves_authority_before_projecting_a_new_turn() {
     fx.stub.set(|script| {
         script.refuse_read_operation = Some("operation-00000031".into());
     });
-    let before = fx.stub.readback_operations();
+    let answered_before = fx.stub.answered_readbacks();
     let waiting = {
         let state = fx.state.clone();
         thread::spawn(move || {
@@ -5810,14 +5827,15 @@ fn a_waiting_thread_read_re_proves_authority_before_projecting_a_new_turn() {
             })
         })
     };
-    // ORDERING, not a sleep: the wait's admission asks the platform about its
-    // own receipt before anything changes, which is what proves the snapshot
-    // and the proof both happened first.
+    // ORDERING, not a sleep: the wait's admission must have its platform
+    // answer IN HAND before anything changes. The stub counts answers it has
+    // written, not requests it has logged — a logged request proves only that
+    // the call started, which is exactly the race this case has to exclude.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while fx.stub.readback_operations().len() <= before.len() {
+    while fx.stub.answered_readbacks() <= answered_before {
         assert!(
             Instant::now() < deadline,
-            "the wait's admission never proved its receipt: {:?}",
+            "the wait's admission never completed its proof: {:?}",
             fx.stub.readback_operations()
         );
         thread::sleep(Duration::from_millis(20));
@@ -5879,7 +5897,7 @@ fn a_waiting_thread_read_re_proves_authority_before_projecting_a_new_turn() {
         .last()
         .expect("the settled trigger wrote entries")
         .seq;
-    let before = fx.stub.readback_operations();
+    let answered_before = fx.stub.answered_readbacks();
     let waiting = {
         let state = fx.state.clone();
         thread::spawn(move || {
@@ -5893,7 +5911,7 @@ fn a_waiting_thread_read_re_proves_authority_before_projecting_a_new_turn() {
         })
     };
     let deadline = Instant::now() + Duration::from_secs(10);
-    while fx.stub.readback_operations().len() <= before.len() {
+    while fx.stub.answered_readbacks() <= answered_before {
         assert!(
             Instant::now() < deadline,
             "the second wait's admission never proved its receipt"

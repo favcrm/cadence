@@ -948,28 +948,19 @@ impl Shared {
         // CAD-1853: a routed cloud reply lives in the body of a
         // `worker_result` on the invoker's ordinary alias. The projection
         // binds those rows to the UIDs the delivery carried; the body reader
-        // must apply the same policy, or an unproven or unrelated connection
-        // reads through `message_read` what `agent_show` withholds.
-        let derived = self.store.cloud_derived_messages(&message.alias)?;
-        if derived.iter().any(|row| row.message_id == message.id) {
-            let allowed = match self.connection_caller(peer_pid)? {
-                caller_rule::Who::Operator => true,
-                caller_rule::Who::Agent(caller) => {
-                    let uid = self.store.agent(&caller).ok().map(|agent| agent.uid);
-                    uid.is_some_and(|uid| {
-                        message.sender_uid.as_deref() == Some(uid.as_str())
-                            || message.recipient_uid.as_deref() == Some(uid.as_str())
-                    })
-                }
-                _ => false,
-            };
-            if !allowed {
-                return Err(Error::rejected(
-                    "message_read refused: this message carries another source's cloud \
-                     result and is readable only by its sender, its recipient or the \
-                     operator",
-                ));
-            }
+        // asks the same policy, or it reads what `agent_show` withholds.
+        if !self.may_read_cloud_row(
+            peer_pid,
+            &message.alias,
+            &message.id,
+            message.sender_uid.as_deref(),
+            message.recipient_uid.as_deref(),
+        )? {
+            return Err(Error::rejected(
+                "message_read refused: this message carries another source's cloud \
+                 result and is readable only by its sender, its recipient or the \
+                 operator",
+            ));
         }
         if let caller_rule::Who::Agent(caller) = self.connection_caller(peer_pid)? {
             if !self.store.agent_reads_message(&message, &caller)? {
