@@ -200,12 +200,14 @@ activate a reported task. Lost sessions restore the current complete
 contract, including native execution/report requirements; old incomplete
 pins are not relabeled as complete.
 
-Eligible lessons remain governed by current memory acceptance, scope and
-staleness rules. Their one bounded optional inline source records selected
-IDs and explicit gaps; it is omitted whole when it cannot fit, and
-`--no-lessons` selects none. This replaces, rather than duplicates, the
-opted-in path's legacy lesson sidecar. Neither inclusion nor a supply receipt
-claims source verification, business correctness or billed savings.
+Eligible lessons use the versioned native memory evaluator, scope/team-role
+selection and validity withholding (including v2 unused expiry). Their one
+bounded optional inline source records selected IDs and explicit gaps; it is
+omitted whole when it cannot fit, and `--no-lessons` selects none. This replaces,
+rather than duplicates, the opted-in path's legacy lesson sidecar. Its revision
+hashes rendered guidance, not policy audit history or feedback counters.
+Neither inclusion nor a supply receipt claims source verification, observed
+model consumption, business correctness or billed savings.
 
 
 ### Bounded workflow preauthorization

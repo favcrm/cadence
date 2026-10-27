@@ -128,7 +128,7 @@ fn dispatch_lessons(
     mid: &str,
 ) -> (crate::memory::Matched, String) {
     let pm = crate::issue::Pm::at(&world.pm()).expect("fixture pm");
-    let (matched, errors) = crate::memory::match_for_issue(&pm, ticket, Some(provider))
+    let (matched, errors) = crate::memory::match_for_issue(&pm, ticket, Some(provider), None)
         .expect("match must read the tracker");
     assert!(
         crate::memory::load_errors_line(&errors).is_none(),
@@ -247,6 +247,1134 @@ impl World {
     }
 }
 
+fn cad225_historical_v1_candidate(
+    world: &World,
+    author: &str,
+    slug: &str,
+    kind: &str,
+    scope: Value,
+    fact: &str,
+) -> crate::memory::Memory {
+    let row = world
+        .shared
+        .store
+        .agent(author)
+        .expect("historical author registration");
+    assert!(matches!(row.role.as_str(), "pm" | "worker"));
+    let generation = row
+        .generation
+        .as_deref()
+        .expect("historical native endpoint generation");
+    assert!(!generation.is_empty());
+    let process_start = u64::try_from(row.pid_start.expect("historical native process start"))
+        .expect("historical process start is positive");
+    assert_ne!(process_start, 0);
+    let front: crate::memory::Front = serde_json::from_value(json!({
+        "id": slug,
+        "type": kind,
+        "status": "proposed",
+        "scope": scope,
+        "source": "CAD-225 acceptance fixture",
+        "confidence": "high",
+        "created": "2026-01-01T00:00:00Z",
+        "author": author,
+        "author_proof": {
+            "alias": author,
+            "registration": row.created.to_bits(),
+            "generation": generation,
+            "process_start": process_start,
+            "role": row.role,
+        },
+        "contributors": [],
+        "review_cycle": 0,
+        "reviews": [],
+        "finalizations": [],
+    }))
+    .expect("explicit existing-v1 frontmatter fixture");
+    assert!(front.policy.is_none());
+    assert!(front.author_proof.as_ref().unwrap().uid.is_none());
+    assert!(front.active_operation.is_none());
+    assert!(front.reviews.is_empty());
+    assert!(front.finalizations.is_empty());
+    let pm = crate::issue::Pm::at(&world.pm()).expect("historical fixture PM");
+    let path = crate::memory::memory_dir(&pm, PROJECT).join(format!("{slug}.md"));
+    let body = lesson_body(fact);
+    let memory = crate::memory::Memory {
+        project: PROJECT.to_string(),
+        front,
+        body,
+        path,
+    };
+    let digest = crate::memory::semantic_digest(&memory);
+    let before_commits = world.snap().commits;
+    {
+        let lock = pm
+            .lock_for_paths(std::slice::from_ref(&memory.path))
+            .expect("historical fixture scoped lock");
+        assert!(
+            !memory.path.exists(),
+            "historical fixture cannot overwrite a record"
+        );
+        std::fs::create_dir_all(crate::memory::memory_dir(&pm, PROJECT)).unwrap();
+        std::fs::write(
+            &memory.path,
+            format!(
+                "---\n{}---\n\n{}",
+                serde_yaml::to_string(&memory.front).unwrap(),
+                memory.body
+            ),
+        )
+        .expect("write only historical fixture frontmatter/body");
+        pm.commit_scoped(
+            &lock,
+            std::slice::from_ref(&memory.path),
+            "Historical v1 candidate fixture; not a new proposal\n\nActor: test\n",
+        )
+        .expect("commit only historical candidate fixture");
+    }
+    assert_eq!(world.snap().commits, before_commits + 1);
+    let loaded = stored(world, slug);
+    assert!(loaded.front.policy.is_none());
+    assert!(loaded.front.author_proof.as_ref().unwrap().uid.is_none());
+    assert_eq!(loaded.front.status, "proposed");
+    assert!(loaded.front.reviews.is_empty() && loaded.front.finalizations.is_empty());
+    assert_eq!(loaded.body, memory.body);
+    assert_eq!(crate::memory::semantic_digest(&loaded), digest);
+    assert!(!crate::memory::retrieval_status(&loaded).0);
+    loaded
+}
+
+// CAD-347 vendor/authority oracles use the actual public JSON dispatcher.
+// In particular, memory_classify must be wired through BOTH caller_gate
+// and dispatch_method; these tests do not call an anticipated Rust API.
+fn cad347_vendor_rpc(world: &World, who: Asserted, method: &str, params: Value) -> Result<Value> {
+    world.call(who, |_| {
+        world.shared.dispatch(method, &params, std::process::id())
+    })
+}
+
+fn cad347_vendor_identity(world: &World, alias: &str, model: Option<&str>, generation: &str) {
+    world
+        .shared
+        .store
+        .set_identity(
+            alias,
+            &crate::adapter::Identity {
+                thread_id: format!("{alias}-thread"),
+                session_id: format!("{alias}-session"),
+                model: model.map(str::to_string),
+                effort: None,
+                pid: std::process::id(),
+                endpoint: None,
+                generation: Some(generation.to_string()),
+                attach: None,
+            },
+        )
+        .unwrap_or_else(|e| panic!("native ready snapshot for {alias}: {e}"));
+}
+
+fn cad347_vendor_agent(world: &World, alias: &str, transport: &str, model: Option<&str>) {
+    let endpoint_kind = match transport {
+        "inbox" => "inbox",
+        "pi" => "managed",
+        _ => panic!("unsupported acceptance transport"),
+    };
+    world
+        .shared
+        .store
+        .register_agent(&NewAgent {
+            alias,
+            provider: transport,
+            endpoint_kind,
+            role: "worker",
+            cwd: world.root.path().to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap_or_else(|e| panic!("register {alias}: {e}"));
+    cad347_vendor_identity(world, alias, model, "cad347-generation-1");
+}
+
+fn cad347_vendor_candidate(world: &World, slug: &str, audience: &str) -> String {
+    let mut params = propose_params(
+        slug,
+        "decision",
+        json!({}),
+        "Prefer independently accountable evidence review for this judgement",
+    );
+    params["source"] = json!("CAD-347 independent vendor acceptance");
+    params["audience"] = json!(audience);
+    let proposal = cad347_vendor_rpc(world, agent("cad347-author"), "memory_propose", params)
+        .expect("new native judgement proposal");
+    let digest = proposal["digest"]
+        .as_str()
+        .expect("proposal digest")
+        .to_string();
+    assert_eq!(digest_of(world, slug), digest);
+    assert!(!retrieval(world, slug).0);
+    digest
+}
+
+fn cad347_vendor_attest(world: &World, slug: &str, digest: &str) -> String {
+    cad347_vendor_rpc(
+        world,
+        Asserted::Operator,
+        "memory_classify",
+        json!({
+            "project": PROJECT,
+            "slug": slug,
+            "digest": digest,
+            "provenance": "agent-verified",
+            "evidence": "Operator attests the agent-authored source provenance; no mechanical check is claimed",
+        }),
+    )
+    .expect("operator source-provenance classification through native dispatch");
+    let classified_digest = digest_of(world, slug);
+    assert_ne!(
+        classified_digest, digest,
+        "source classification changes the semantic claim"
+    );
+    assert!(
+        !retrieval(world, slug).0,
+        "classification alone is not acceptance"
+    );
+    classified_digest
+}
+
+fn cad347_vendor_refuse(world: &World, slug: &str, who: Asserted, method: &str, params: Value) {
+    let path = stored(world, slug).path;
+    let before_bytes = std::fs::read(&path).expect("candidate before refused call");
+    refuse(world, |w| cad347_vendor_rpc(w, who, method, params));
+    assert_eq!(
+        std::fs::read(&path).expect("candidate after refused call"),
+        before_bytes,
+        "refused native call must preserve all candidate bytes"
+    );
+}
+
+// A nonqualifying review may be rejected at submission or retained as a
+// nonqualifying receipt. The authority assertion is at finalization,
+// not a prescription of which review-admission stage must reject it.
+fn cad347_vendor_try_review(world: &World, slug: &str, reviewer: &str, digest: &str) {
+    let before = world.snap();
+    let path = stored(world, slug).path;
+    let before_bytes = std::fs::read(&path).expect("candidate before review");
+    let result = cad347_vendor_rpc(
+        world,
+        agent(reviewer),
+        "memory_review",
+        review_params(slug, "accept", "pass", digest),
+    );
+    if result.is_err() {
+        world.assert_refused(result, &before);
+        assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+    }
+    assert_eq!(digest_of(world, slug), digest);
+    assert!(!retrieval(world, slug).0, "a review is not finalization");
+}
+
+// Snapshot the entire canonical memory subtree, including temporary
+// files and empty directories, not just parseable memory records.
+fn cad347_memory_tree(world: &World) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let root = world.pm().join(PROJECT).join("memory");
+    let mut found = BTreeMap::new();
+    let mut pending = vec![root.clone()];
+    while let Some(path) = pending.pop() {
+        if !path.exists() {
+            continue;
+        }
+        let relative = path.strip_prefix(&root).unwrap().to_path_buf();
+        if path.is_dir() {
+            found.insert(relative, None);
+            for entry in std::fs::read_dir(&path).unwrap() {
+                pending.push(entry.unwrap().path());
+            }
+        } else {
+            found.insert(relative, Some(std::fs::read(&path).unwrap()));
+        }
+    }
+    found
+}
+
+fn cad347_closed_refuse(world: &World, who: Asserted, method: &str, params: Value) {
+    let before_files = cad347_memory_tree(world);
+    refuse(world, |w| cad347_vendor_rpc(w, who, method, params));
+    assert_eq!(
+        cad347_memory_tree(world),
+        before_files,
+        "rejected input must not create, replace, or partially write memory files"
+    );
+}
+
+// These are deliberately UNTRUSTED request values. No entry is a native
+// check receipt, approval, active-turn proof, or execution result.
+fn cad347_forbidden_authority_fields() -> Vec<(&'static str, Value)> {
+    vec![
+        ("policy", json!({"revision": 1})),
+        ("policy_revision", json!(1)),
+        ("schema_revision", json!(1)),
+        ("author", json!("operator")),
+        ("author_proof", json!({"untrusted_fixture": true})),
+        ("contributors", json!(["operator"])),
+        ("provenance", json!("operator")),
+        ("model", json!("anthropic/claude-sonnet-4-5")),
+        ("provider", json!("anthropic")),
+        ("vendor", json!("anthropic")),
+        ("generation", json!("caller-selected-generation")),
+        ("check_receipt", json!({"untrusted_fixture": true})),
+        ("checks", json!([{"untrusted_fixture": true}])),
+        ("finalizations", json!([{"untrusted_fixture": true}])),
+        ("operator_approval", json!({"untrusted_fixture": true})),
+        ("usage_receipt", json!({"untrusted_fixture": true})),
+        ("feedback", json!({"used_reports": 999})),
+        ("used_reports", json!(999)),
+        ("wrong_reports", json!(999)),
+        ("reread_reports", json!(999)),
+        ("last_used_at", json!("2099-01-01T00:00:00Z")),
+        ("unexpected_cad347_field", json!(true)),
+    ]
+}
+
+#[test]
+fn cad347_new_proposal_rejects_trusted_and_unknown_request_fields_without_effects() {
+    let world = World::open();
+    cad347_vendor_agent(&world, "cad347-author", "inbox", Some("openai/gpt-5"));
+    for (index, (field, value)) in cad347_forbidden_authority_fields().into_iter().enumerate() {
+        let slug = format!("cad347-forbidden-{index}");
+        let mut params = propose_params(
+            &slug,
+            "decision",
+            json!({}),
+            "Only daemon-owned evidence can authorize this judgement",
+        );
+        params[field] = value;
+        cad347_closed_refuse(&world, agent("cad347-author"), "memory_propose", params);
+    }
+}
+
+#[test]
+fn cad347_imported_frontmatter_cannot_select_legacy_or_supply_trusted_authority() {
+    let world = World::open();
+    cad347_vendor_agent(&world, "cad347-author", "inbox", Some("openai/gpt-5"));
+    let seed_slug = "cad347-import-seed";
+    cad347_vendor_candidate(&world, seed_slug, "project");
+    let seed = stored(&world, seed_slug);
+    let mut template = serde_json::to_value(&seed.front).unwrap();
+    // A legacy-shaped imported document is not an EXISTING legacy
+    // canonical record. A successful NEW import must still be v2.
+    template.as_object_mut().unwrap().remove("policy");
+    for (index, (field, value)) in [
+        ("policy", json!({"revision": 1})),
+        ("schema_revision", json!(1)),
+        ("author", json!("operator")),
+        ("provenance", json!("operator")),
+        ("model", json!("anthropic/claude-sonnet-4-5")),
+        ("check_receipt", json!({"untrusted_fixture": true})),
+        ("feedback", json!({"used_reports": 999})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let slug = format!("cad347-import-{index}");
+        let mut front = template.clone();
+        front[field] = value;
+        let raw = format!(
+            "---\n{}---\n\n{}",
+            serde_yaml::to_string(&front).unwrap(),
+            seed.body
+        );
+        let mut params = propose_params(&slug, "decision", json!({}), "unused");
+        params.as_object_mut().unwrap().remove("text");
+        params["from"] = json!(raw);
+        let before = world.snap();
+        let before_files = cad347_memory_tree(&world);
+        let result = cad347_vendor_rpc(&world, agent("cad347-author"), "memory_propose", params);
+        match result {
+            Err(error) => {
+                world.assert_refused(Err(error), &before);
+                assert_eq!(cad347_memory_tree(&world), before_files);
+            }
+            Ok(proposal) => {
+                assert_eq!(proposal["policy_revision"].as_u64(), Some(2));
+                let imported = stored(&world, &slug);
+                assert_eq!(imported.front.status, "proposed");
+                assert_eq!(
+                    imported.front.author_proof.as_ref().unwrap().alias,
+                    "cad347-author"
+                );
+                assert!(imported.front.reviews.is_empty());
+                assert!(imported.front.finalizations.is_empty());
+                let front = serde_json::to_value(&imported.front).unwrap();
+                let policy = &front["policy"];
+                assert_eq!(policy["revision"].as_u64(), Some(2));
+                assert_eq!(policy["nature"].as_str(), Some("judgement"));
+                assert_eq!(policy["provenance"].as_str(), Some("agent-claimed"));
+                assert_eq!(policy["reviews"].as_array().unwrap().len(), 0);
+                assert_eq!(policy["finalizations"].as_array().unwrap().len(), 0);
+                assert_eq!(policy["feedback"]["used_reports"].as_u64(), Some(0));
+                assert!(!retrieval(&world, &slug).0);
+            }
+        }
+    }
+}
+
+#[test]
+fn cad347_classify_review_and_finalize_inputs_are_closed_even_for_valid_callers() {
+    let world = World::open();
+    cad347_vendor_agent(&world, "cad347-author", "inbox", Some("openai/gpt-5"));
+    cad347_vendor_agent(
+        &world,
+        "cad347-curator",
+        "inbox",
+        Some("anthropic/claude-sonnet-4-5"),
+    );
+    let slug = "cad347-closed-transitions";
+    let proposed = cad347_vendor_candidate(&world, slug, "project");
+    for (field, value) in cad347_forbidden_authority_fields() {
+        let mut params = json!({
+            "project": PROJECT,
+            "slug": slug,
+            "digest": proposed,
+            "provenance": "agent-verified",
+            "evidence": "Operator source attestation, not a check receipt",
+        });
+        params[field] = value;
+        cad347_closed_refuse(&world, Asserted::Operator, "memory_classify", params);
+    }
+    // Positive setup prevents missing endpoint or blanket caller refusal
+    // from satisfying the closed-input assertions as a whole.
+    let digest = cad347_vendor_attest(&world, slug, &proposed);
+    for (field, value) in cad347_forbidden_authority_fields() {
+        let mut params = review_params(slug, "accept", "pass", &digest);
+        params[field] = value;
+        cad347_closed_refuse(&world, agent("cad347-curator"), "memory_review", params);
+    }
+    cad347_vendor_rpc(
+        &world,
+        agent("cad347-curator"),
+        "memory_review",
+        review_params(slug, "accept", "pass", &digest),
+    )
+    .expect("the same native curator can submit an unmodified valid review");
+    for (field, value) in cad347_forbidden_authority_fields() {
+        let mut params = finalize_params(slug, "accept", &digest);
+        params[field] = value;
+        cad347_closed_refuse(&world, Asserted::Operator, "memory_finalize", params);
+    }
+    cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_finalize",
+        finalize_params(slug, "accept", &digest),
+    )
+    .expect("valid operator finalization after the mandatory cross-vendor curator");
+    assert!(retrieval(&world, slug).0);
+}
+
+#[test]
+fn cad347_mechanical_promotion_stays_blocked_without_genuine_executor_evidence() {
+    let world = World::open();
+    cad347_vendor_agent(&world, "cad347-author", "inbox", Some("openai/gpt-5"));
+    cad347_vendor_agent(
+        &world,
+        "cad347-curator",
+        "inbox",
+        Some("anthropic/claude-sonnet-4-5"),
+    );
+    cad347_vendor_agent(
+        &world,
+        "cad347-other-vendor",
+        "inbox",
+        Some("google/gemini-2.5-pro"),
+    );
+    world.memory_agent("cad347-pm", "pm");
+    cad347_vendor_identity(
+        &world,
+        "cad347-pm",
+        Some("openai/gpt-5"),
+        "cad347-pm-confirmed-generation",
+    );
+    // Prove this asserted operator is supported by the native matrix:
+    // judgement approval succeeds without inventing a human agent alias.
+    let control_slug = "cad347-operator-judgement-control";
+    let mut control_params = propose_params(
+        control_slug,
+        "decision",
+        json!({}),
+        "An operator judgement approval is not a mechanical check",
+    );
+    control_params["nature"] = json!("judgement");
+    let control = cad347_vendor_rpc(&world, Asserted::Operator, "memory_propose", control_params)
+        .expect("native operator judgement proposal");
+    let control_digest = control["digest"].as_str().unwrap();
+    cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_finalize",
+        finalize_params(control_slug, "accept", control_digest),
+    )
+    .expect("positive operator judgement authorization control");
+    assert!(retrieval(&world, control_slug).0);
+
+    for route in ["operator", "agent-claimed", "agent-verified"] {
+        let slug = format!("cad347-mechanical-{route}");
+        let mut params = propose_params(
+            &slug,
+            "rule",
+            json!({}),
+            "Mechanical validity requires a genuine qualifying executor receipt",
+        );
+        params["nature"] = json!("mechanical");
+        params["verification_condition"] = json!({"check_id": "cad347-evidence-unavailable"});
+        let who = if route == "operator" {
+            Asserted::Operator
+        } else {
+            agent("cad347-author")
+        };
+        let proposal = cad347_vendor_rpc(&world, who, "memory_propose", params)
+            .expect("mechanical candidate with declarative condition metadata");
+        let mut digest = proposal["digest"].as_str().unwrap().to_string();
+        if route == "agent-verified" {
+            digest = cad347_vendor_attest(&world, &slug, &digest);
+        }
+        // Review receipts and operator provenance attestations are not
+        // CAD-348 executor evidence. Admission may reject nonqualifying
+        // reviews or retain them without permitting promotion.
+        for reviewer in ["cad347-curator", "cad347-other-vendor"] {
+            cad347_vendor_try_review(&world, &slug, reviewer, &digest);
+        }
+        for finalizer in [agent("cad347-pm"), Asserted::Operator] {
+            cad347_closed_refuse(
+                &world,
+                finalizer,
+                "memory_finalize",
+                finalize_params(&slug, "accept", &digest),
+            );
+        }
+        assert!(!retrieval(&world, &slug).0);
+    }
+}
+
+#[test]
+fn cad347_verification_metadata_never_accepts_command_fields_or_executes_them() {
+    let world = World::open();
+    cad347_vendor_agent(&world, "cad347-author", "inbox", Some("openai/gpt-5"));
+    let marker = world.root.path().join("cad347-command-must-not-run");
+    let command = format!("touch {}", marker.display());
+    for (index, (field, value)) in [
+        ("command", json!(command)),
+        ("shell", json!(command)),
+        ("argv", json!(["/usr/bin/touch", marker.to_str().unwrap()])),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for nested in [false, true] {
+            let slug = format!("cad347-no-exec-{index}-{nested}");
+            let mut params = propose_params(
+                &slug,
+                "rule",
+                json!({}),
+                "A declared verification condition never authorizes command execution",
+            );
+            params["nature"] = json!("mechanical");
+            params["verification_condition"] = json!({"check_id": "cad347-evidence-unavailable"});
+            if nested {
+                params["verification_condition"][field] = value.clone();
+            } else {
+                params[field] = value.clone();
+            }
+            cad347_closed_refuse(&world, agent("cad347-author"), "memory_propose", params);
+            assert!(
+                !marker.exists(),
+                "untrusted verification metadata executed a command"
+            );
+        }
+    }
+}
+
+#[test]
+fn cad347_classification_digest_change_refuses_old_review_classify_and_finalize() {
+    let world = World::open();
+    cad347_vendor_agent(&world, "cad347-author", "inbox", Some("openai/gpt-5"));
+    cad347_vendor_agent(
+        &world,
+        "cad347-curator",
+        "inbox",
+        Some("anthropic/claude-sonnet-4-5"),
+    );
+    let slug = "cad347-stale-classification-digest";
+    let old_digest = cad347_vendor_candidate(&world, slug, "project");
+    let digest = cad347_vendor_attest(&world, slug, &old_digest);
+    cad347_closed_refuse(
+        &world,
+        agent("cad347-curator"),
+        "memory_review",
+        review_params(slug, "accept", "pass", &old_digest),
+    );
+    cad347_closed_refuse(
+        &world,
+        Asserted::Operator,
+        "memory_classify",
+        json!({
+            "project": PROJECT,
+            "slug": slug,
+            "digest": old_digest,
+            "provenance": "agent-verified",
+            "evidence": "An old revision cannot authorize a new classification",
+        }),
+    );
+    cad347_vendor_rpc(
+        &world,
+        agent("cad347-curator"),
+        "memory_review",
+        review_params(slug, "accept", "pass", &digest),
+    )
+    .expect("current-digest independent curator review");
+    cad347_closed_refuse(
+        &world,
+        Asserted::Operator,
+        "memory_finalize",
+        finalize_params(slug, "accept", &old_digest),
+    );
+    assert!(!retrieval(&world, slug).0);
+    cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_finalize",
+        finalize_params(slug, "accept", &digest),
+    )
+    .expect("current digest can finalize after the qualifying curator");
+    assert!(retrieval(&world, slug).0);
+}
+
+#[test]
+fn cad347_native_review_reloads_after_overlapping_operator_classification() {
+    let world = World::open();
+    cad347_vendor_agent(&world, "cad347-author", "inbox", Some("openai/gpt-5"));
+    cad347_vendor_agent(
+        &world,
+        "cad347-curator",
+        "inbox",
+        Some("anthropic/claude-sonnet-4-5"),
+    );
+    let slug = "cad347-overlapping-classification";
+    let old_digest = cad347_vendor_candidate(&world, slug, "project");
+    let path = stored(&world, slug).path;
+    let initial_front = serde_json::to_value(&stored(&world, slug).front).unwrap();
+    let initial_attestations = initial_front["policy"]["attestations"]
+        .as_array()
+        .expect("v2 native provenance history")
+        .len();
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+    let current_digest = std::thread::scope(|scope| {
+        let writer_world = &world;
+        let writer_digest = old_digest.clone();
+        let writer = scope.spawn(move || {
+            reached_rx
+                .recv_timeout(Duration::from_secs(15))
+                .expect("native review never reached the actual pre-lock handoff");
+            // This is the real operator-only native transition, not a
+            // direct file edit or a manually manufactured policy receipt.
+            let classified_digest = cad347_vendor_attest(writer_world, slug, &writer_digest);
+            // Classification has completed its own lock/commit discipline.
+            // Preserve the writer's resulting bytes/history/commit as the
+            // baseline: only the stale review must have no further effect.
+            let before_review = writer_world.snap();
+            let before_files = cad347_memory_tree(writer_world);
+            proceed_tx.send(()).unwrap();
+            (before_review, before_files, classified_digest)
+        });
+        crate::memory::set_review_after_initial_find_hook_for_test(Some((
+            path.clone(),
+            reached_tx,
+            proceed_rx,
+        )));
+        let result = cad347_vendor_rpc(
+            &world,
+            agent("cad347-curator"),
+            "memory_review",
+            review_params(slug, "accept", "pass", &old_digest),
+        );
+        crate::memory::set_review_after_initial_find_hook_for_test(None);
+        let (before_review, before_files, classified_digest) = writer
+            .join()
+            .expect("owned native classification writer failed");
+        world.assert_refused(result, &before_review);
+        assert_eq!(cad347_memory_tree(&world), before_files);
+        classified_digest
+    });
+    assert_ne!(current_digest, old_digest);
+    assert_eq!(digest_of(&world, slug), current_digest);
+    let classified = stored(&world, slug);
+    let front = serde_json::to_value(&classified.front).unwrap();
+    let attestations = front["policy"]["attestations"].as_array().unwrap();
+    assert_eq!(attestations.len(), initial_attestations + 1);
+    assert_eq!(
+        attestations.last().unwrap()["digest_before"].as_str(),
+        Some(old_digest.as_str()),
+        "the operator's actual provenance transition must remain in history"
+    );
+    assert!(!retrieval(&world, slug).0);
+    assert!(crate::memory::last_verified(&classified).is_none());
+    cad347_vendor_rpc(
+        &world,
+        agent("cad347-curator"),
+        "memory_review",
+        review_params(slug, "accept", "pass", &current_digest),
+    )
+    .expect("the same confirmed native curator can review the post-classification digest");
+}
+
+#[test]
+fn cad347_classify_rejects_secret_in_immutable_reference_without_echo_or_effects() {
+    use sha2::{Digest, Sha256};
+
+    let world = World::open();
+    cad347_vendor_agent(&world, "cad347-author", "inbox", Some("openai/gpt-5"));
+    let slug = "cad347-classify-secret-reference";
+    let digest = cad347_vendor_candidate(&world, slug, "project");
+    let revision = crate::issue::git(&world.pm(), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    // Identical deterministic credential-shaped construction to the
+    // existing memory unit secret test; not an actual credential.
+    let fixture_digest: String = Sha256::digest(b"memory-fixture")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let token = ["figd", "_", &fixture_digest[..40]].concat();
+    let before = world.snap();
+    let before_files = cad347_memory_tree(&world);
+    let before_front = serde_json::to_value(&stored(&world, slug).front).unwrap();
+    let before_history = before_front["policy"]["attestations"].clone();
+    let result = cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_classify",
+        json!({
+            "project": PROJECT,
+            "slug": slug,
+            "digest": digest,
+            "provenance": "agent-verified",
+            "evidence": "Operator source-provenance attestation with an immutable reference",
+            "evidence_refs": [{
+                "kind": "git",
+                "source": format!("fixture/{token}"),
+                "revision": revision,
+            }],
+        }),
+    );
+    // Never format the response/input into a failure: a regressing
+    // handler might otherwise echo the very secret this test protects.
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("classification accepted a credential-shaped evidence reference"),
+    };
+    assert_eq!(error.code(), Some("secret_detected"));
+    let message = error.to_string();
+    assert!(
+        !message.contains(&token),
+        "secret refusal echoed the synthetic credential"
+    );
+    assert!(
+        !message.contains(&fixture_digest[..40]),
+        "secret refusal echoed the synthetic credential material"
+    );
+    // Boolean comparisons deliberately avoid printing potentially
+    // sensitive file bytes or audit payloads if the guard regresses.
+    assert!(
+        world.snap() == before,
+        "secret rejection changed tracker or commit effects"
+    );
+    assert!(
+        cad347_memory_tree(&world) == before_files,
+        "secret rejection changed canonical memory files"
+    );
+    let after_front = serde_json::to_value(&stored(&world, slug).front).unwrap();
+    assert!(
+        after_front["policy"]["attestations"] == before_history,
+        "secret rejection changed provenance history"
+    );
+    assert_eq!(digest_of(&world, slug), digest);
+    assert!(!retrieval(&world, slug).0);
+
+    // Same actual operator, current candidate, reason and immutable
+    // revision; only the unsafe reference source is replaced. This
+    // reference names the candidate file at its genuine tracker commit.
+    let safe_source = format!("{PROJECT}/memory/{slug}.md");
+    cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_classify",
+        json!({
+            "project": PROJECT,
+            "slug": slug,
+            "digest": digest,
+            "provenance": "agent-verified",
+            "evidence": "Operator source-provenance attestation with an immutable reference",
+            "evidence_refs": [{
+                "kind": "git",
+                "source": safe_source,
+                "revision": revision,
+            }],
+        }),
+    )
+    .expect("safe immutable reference remains admissible for operator classification");
+    assert_ne!(digest_of(&world, slug), digest);
+    let classified = stored(&world, slug);
+    let front = serde_json::to_value(&classified.front).unwrap();
+    let history = front["policy"]["attestations"].as_array().unwrap();
+    assert_eq!(history.len(), before_history.as_array().unwrap().len() + 1);
+    let attestation = history.last().unwrap();
+    assert_eq!(attestation["digest_before"].as_str(), Some(digest.as_str()));
+    assert_eq!(
+        attestation["evidence_refs"][0]["source"].as_str(),
+        Some(safe_source.as_str())
+    );
+    assert_eq!(
+        attestation["evidence_refs"][0]["revision"].as_str(),
+        Some(revision.as_str())
+    );
+    assert!(!retrieval(&world, slug).0);
+    assert!(crate::memory::last_verified(&classified).is_none());
+}
+
+#[test]
+fn cad347_unknown_native_model_cannot_supply_cross_vendor_authority() {
+    for (author_model, curator_model) in [
+        (None, Some("anthropic/claude-sonnet-4-5")),
+        (Some("openai/gpt-5"), None),
+        (
+            Some("unidentified/model"),
+            Some("anthropic/claude-sonnet-4-5"),
+        ),
+        (Some("openai/gpt-5"), Some("unidentified/model")),
+    ] {
+        let world = World::open();
+        cad347_vendor_agent(&world, "cad347-author", "inbox", author_model);
+        cad347_vendor_agent(&world, "cad347-curator", "inbox", curator_model);
+        let slug = "cad347-unknown-vendor";
+        let proposed = cad347_vendor_candidate(&world, slug, "project");
+        let digest = cad347_vendor_attest(&world, slug, &proposed);
+        cad347_vendor_try_review(&world, slug, "cad347-curator", &digest);
+        // An operator cannot substitute for the first proven curator
+        // on an agent-verified judgement, including unknown-model cases.
+        cad347_vendor_refuse(
+            &world,
+            slug,
+            Asserted::Operator,
+            "memory_finalize",
+            finalize_params(slug, "accept", &digest),
+        );
+        assert!(!retrieval(&world, slug).0);
+    }
+}
+
+#[test]
+fn cad347_current_row_model_requires_matching_native_ready_evidence() {
+    for target in ["cad347-author", "cad347-curator"] {
+        for generation_drift in [false, true] {
+            let world = World::open();
+            for (alias, confirmed_model) in [
+                ("cad347-author", "openai/gpt-5"),
+                ("cad347-curator", "anthropic/claude-sonnet-4-5"),
+            ] {
+                let ready_model = if alias == target && !generation_drift {
+                    None
+                } else {
+                    Some(confirmed_model)
+                };
+                cad347_vendor_agent(&world, alias, "inbox", ready_model);
+            }
+            let model = if target == "cad347-author" {
+                "openai/gpt-5"
+            } else {
+                "anthropic/claude-sonnet-4-5"
+            };
+            let generation = if generation_drift {
+                "cad347-generation-2"
+            } else {
+                "cad347-generation-1"
+            };
+            // Deliberate adversarial persisted-state fixture, NOT a
+            // trusted identity event: make the current row look useful
+            // without publishing a corresponding native ready snapshot.
+            // The real native proposal/review/finalize guards run below.
+            world
+                .shared
+                .store
+                .write_tx(|tx| {
+                    let changed = tx.execute(
+                        "UPDATE agents SET model=?1,generation=?2 WHERE alias=?3",
+                        rusqlite::params![model, generation, target],
+                    )?;
+                    assert_eq!(changed, 1);
+                    Ok(())
+                })
+                .expect("seed row-only model evidence mismatch");
+            let slug = "cad347-row-only-model";
+            let proposed = cad347_vendor_candidate(&world, slug, "project");
+            let digest = cad347_vendor_attest(&world, slug, &proposed);
+            cad347_vendor_try_review(&world, slug, "cad347-curator", &digest);
+            cad347_vendor_refuse(
+                &world,
+                slug,
+                Asserted::Operator,
+                "memory_finalize",
+                finalize_params(slug, "accept", &digest),
+            );
+            assert!(!retrieval(&world, slug).0);
+        }
+    }
+}
+
+#[test]
+fn cad347_openai_provider_aliases_are_not_independent_vendors() {
+    for transport in ["inbox", "pi"] {
+        for (author_model, curator_model) in [
+            ("openai/gpt-5", "openai-codex/gpt-5"),
+            ("openai-codex/gpt-5", "openai/gpt-5"),
+        ] {
+            let world = World::open();
+            cad347_vendor_agent(&world, "cad347-author", transport, Some(author_model));
+            cad347_vendor_agent(&world, "cad347-curator", transport, Some(curator_model));
+            let slug = "cad347-same-openai-vendor";
+            let proposed = cad347_vendor_candidate(&world, slug, "project");
+            let digest = cad347_vendor_attest(&world, slug, &proposed);
+            cad347_vendor_try_review(&world, slug, "cad347-curator", &digest);
+            cad347_vendor_refuse(
+                &world,
+                slug,
+                Asserted::Operator,
+                "memory_finalize",
+                finalize_params(slug, "accept", &digest),
+            );
+            assert!(!retrieval(&world, slug).0);
+        }
+    }
+}
+
+#[test]
+fn cad347_shared_transport_preserves_real_cross_vendor_curator_authority() {
+    for transport in ["inbox", "pi"] {
+        let world = World::open();
+        cad347_vendor_agent(&world, "cad347-author", transport, Some("openai/gpt-5"));
+        cad347_vendor_agent(
+            &world,
+            "cad347-curator",
+            transport,
+            Some("anthropic/claude-sonnet-4-5"),
+        );
+        let slug = "cad347-shared-transport";
+        let proposed = cad347_vendor_candidate(&world, slug, "project");
+        let digest = cad347_vendor_attest(&world, slug, &proposed);
+        cad347_vendor_rpc(
+            &world,
+            agent("cad347-curator"),
+            "memory_review",
+            review_params(slug, "accept", "pass", &digest),
+        )
+        .expect("confirmed cross-vendor curator behind the same transport");
+        cad347_vendor_rpc(
+            &world,
+            agent("cad347-curator"),
+            "memory_finalize",
+            finalize_params(slug, "accept", &digest),
+        )
+        .expect("one qualifying curator can finalize project agent-verified judgement");
+        assert!(retrieval(&world, slug).0);
+    }
+}
+
+#[test]
+fn cad347_operator_classification_and_company_extra_approval_are_distinct() {
+    let world = World::open();
+    for (alias, model) in [
+        ("cad347-author", "openai/gpt-5"),
+        ("cad347-curator", "anthropic/claude-sonnet-4-5"),
+        ("cad347-same-vendor", "anthropic/claude-sonnet-4-5"),
+        ("cad347-other-vendor", "google/gemini-2.5-pro"),
+    ] {
+        cad347_vendor_agent(&world, alias, "inbox", Some(model));
+    }
+    let slug = "cad347-company-curators";
+    let proposed = cad347_vendor_candidate(&world, slug, "company");
+    let classification = json!({
+        "project": PROJECT,
+        "slug": slug,
+        "digest": proposed,
+        "provenance": "agent-verified",
+        "evidence": "Source-provenance attestation, not a mechanical check",
+    });
+    for who in [
+        agent("cad347-author"),
+        agent("cad347-curator"),
+        Asserted::Unproven,
+    ] {
+        cad347_vendor_refuse(&world, slug, who, "memory_classify", classification.clone());
+    }
+    let digest = cad347_vendor_attest(&world, slug, &proposed);
+    // Operator classification and even operator finalization cannot
+    // replace the first mandatory independent cross-vendor curator.
+    cad347_vendor_refuse(
+        &world,
+        slug,
+        Asserted::Operator,
+        "memory_finalize",
+        finalize_params(slug, "accept", &digest),
+    );
+    cad347_vendor_rpc(
+        &world,
+        agent("cad347-curator"),
+        "memory_review",
+        review_params(slug, "accept", "pass", &digest),
+    )
+    .expect("first company curator");
+    cad347_vendor_refuse(
+        &world,
+        slug,
+        agent("cad347-curator"),
+        "memory_finalize",
+        finalize_params(slug, "accept", &digest),
+    );
+    cad347_vendor_try_review(&world, slug, "cad347-same-vendor", &digest);
+    cad347_vendor_refuse(
+        &world,
+        slug,
+        agent("cad347-curator"),
+        "memory_finalize",
+        finalize_params(slug, "accept", &digest),
+    );
+    cad347_vendor_rpc(
+        &world,
+        agent("cad347-other-vendor"),
+        "memory_review",
+        review_params(slug, "accept", "pass", &digest),
+    )
+    .expect("second distinct-vendor company curator");
+    cad347_vendor_rpc(
+        &world,
+        agent("cad347-curator"),
+        "memory_finalize",
+        finalize_params(slug, "accept", &digest),
+    )
+    .expect("company judgement with two independent distinct-vendor curators");
+    assert!(retrieval(&world, slug).0);
+
+    // Alternative company route: a real operator can provide the extra
+    // approval AFTER the first mandatory curator, not instead of it.
+    let operator_slug = "cad347-company-operator";
+    let proposed = cad347_vendor_candidate(&world, operator_slug, "company");
+    let digest = cad347_vendor_attest(&world, operator_slug, &proposed);
+    cad347_vendor_rpc(
+        &world,
+        agent("cad347-curator"),
+        "memory_review",
+        review_params(operator_slug, "accept", "pass", &digest),
+    )
+    .expect("mandatory first curator on operator-extra-approval route");
+    cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_finalize",
+        finalize_params(operator_slug, "accept", &digest),
+    )
+    .expect("operator supplies company extra approval after independent curator");
+    assert!(retrieval(&world, operator_slug).0);
+}
+
+#[test]
+fn cad347_new_agent_claimed_judgement_two_agent_reviews_cannot_replace_operator() {
+    let world = World::open();
+    for (alias, role, model) in [
+        ("cad347-author", "worker", "gpt-5"),
+        ("cad347-r1", "worker", "claude-sonnet-4-5"),
+        ("cad347-r2", "worker", "gemini-2.5-pro"),
+        ("cad347-pm", "pm", "gpt-5"),
+    ] {
+        world.register(alias, role);
+        // Match the native adapter-open persistence seam: set_identity
+        // atomically records the confirmed model and generation both on
+        // the agent row and in its ready event. Request fields and
+        // configured transport labels provide no model authority here.
+        world
+            .shared
+            .store
+            .set_identity(
+                alias,
+                &crate::adapter::Identity {
+                    thread_id: format!("{alias}-thread"),
+                    session_id: format!("{alias}-session"),
+                    model: Some(model.to_string()),
+                    effort: None,
+                    pid: std::process::id(),
+                    endpoint: None,
+                    generation: Some(format!("{alias}-gen-1")),
+                    attach: None,
+                },
+            )
+            .unwrap_or_else(|e| panic!("confirmed native identity for {alias}: {e}"));
+    }
+
+    let slug = "cad347-operator-required";
+    let mut params = propose_params(
+        slug,
+        "decision",
+        json!({}),
+        "Prefer an explicit operator decision for judgement approval",
+    );
+    params["source"] = json!("CAD-347 independent authority acceptance");
+    // Deliberately omit policy, nature, provenance, and approval fields:
+    // a NEW native agent proposal must default to agent-claimed judgement.
+    let proposal = world
+        .memory_propose(agent("cad347-author"), params)
+        .expect("new native agent judgement proposal");
+    let digest = proposal["digest"]
+        .as_str()
+        .expect("proposal digest")
+        .to_string();
+    assert_eq!(stored(&world, slug).front.status, "proposed");
+    assert!(!retrieval(&world, slug).0);
+
+    // Both reviewers are distinct non-authors. Their native ready
+    // snapshots identify Anthropic and Google, independently of the
+    // author's OpenAI model; lack of model evidence must not be the
+    // reason this authority oracle refuses finalization.
+    for reviewer in ["cad347-r1", "cad347-r2"] {
+        world
+            .memory_review(
+                agent(reviewer),
+                review_params(slug, "accept", "pass", &digest),
+            )
+            .unwrap_or_else(|e| panic!("independent native review by {reviewer}: {e}"));
+    }
+    assert_eq!(digest_of(&world, slug), digest);
+    assert!(!retrieval(&world, slug).0);
+
+    let path = stored(&world, slug).path;
+    let before_bytes = std::fs::read(&path).expect("candidate bytes before refusal");
+    // A proven PM agent is still not a proven operator. Under v1 this
+    // exact call accepts; v2 must refuse without committing or changing
+    // the candidate, even after two independent native pass reviews.
+    refuse(&world, |w| {
+        w.memory_finalize(agent("cad347-pm"), finalize_params(slug, "accept", &digest))
+    });
+    assert_eq!(
+        std::fs::read(&path).expect("candidate bytes after refusal"),
+        before_bytes,
+        "refused agent finalization must preserve the entire candidate"
+    );
+    assert_eq!(stored(&world, slug).front.status, "proposed");
+    assert_eq!(digest_of(&world, slug), digest);
+    assert!(!retrieval(&world, slug).0);
+}
+
 #[test]
 fn cad225_lesson_needs_two_distinct_reviewer_proofs_pm_finalize_then_reuse() {
     let mut world = World::open();
@@ -255,50 +1383,42 @@ fn cad225_lesson_needs_two_distinct_reviewer_proofs_pm_finalize_then_reuse() {
     world.memory_agent("worker-r1", "worker");
     world.memory_agent("worker-r2", "worker");
 
-    // Three proposals: the scoped lesson under test, a never-reviewed
-    // file, and a lesson scoped to a provider this team does not run.
-    let p1 = world
-        .memory_propose(
-            agent("worker-author"),
-            propose_params(
-                "lane-lesson",
-                "gotcha",
-                json!({"tags": ["lane"]}),
-                "PINNED FACT — bound grants admit only the exact render",
-            ),
-        )
-        .expect("native worker proposal");
-    assert_eq!(p1["status"].as_str(), Some("proposed"));
-    assert_eq!(p1["committed"].as_bool(), Some(true));
-    assert_eq!(p1["quorum"]["eligible"].as_bool(), Some(false));
-    let d1 = p1["digest"].as_str().expect("proposal digest").to_string();
+    // Existing-v1 candidates: the scoped lesson, a never-reviewed file,
+    // and a provider-scoped lesson. Native reviews/finalization below
+    // exercise their preserved historical receipt semantics.
+    let p1 = cad225_historical_v1_candidate(
+        &world,
+        "worker-author",
+        "lane-lesson",
+        "gotcha",
+        json!({"tags": ["lane"]}),
+        "PINNED FACT — bound grants admit only the exact render",
+    );
+    assert_eq!(p1.front.status, "proposed");
+    assert!(p1.front.policy.is_none());
+    assert!(!crate::memory::retrieval_status(&p1).0);
+    let d1 = crate::memory::semantic_digest(&p1);
     assert!(d1.len() == 64 && d1.bytes().all(|b| b.is_ascii_hexdigit()));
 
-    let p3 = world
-        .memory_propose(
-            agent("worker-r1"),
-            propose_params(
-                "forged-status",
-                "gotcha",
-                json!({"tags": ["lane"]}),
-                "UNREVIEWED FACT — never evidence-checked",
-            ),
-        )
-        .expect("unreviewed proposal");
-    let d3 = p3["digest"].as_str().unwrap().to_string();
+    let p3 = cad225_historical_v1_candidate(
+        &world,
+        "worker-r1",
+        "forged-status",
+        "gotcha",
+        json!({"tags": ["lane"]}),
+        "UNREVIEWED FACT — never evidence-checked",
+    );
+    let d3 = crate::memory::semantic_digest(&p3);
 
-    let p4 = world
-        .memory_propose(
-            agent("worker-r2"),
-            propose_params(
-                "codex-only",
-                "recipe",
-                json!({"providers": ["codex"]}),
-                "CODEX FACT — provider-scoped lesson",
-            ),
-        )
-        .expect("provider-scoped proposal");
-    let d4 = p4["digest"].as_str().unwrap().to_string();
+    let p4 = cad225_historical_v1_candidate(
+        &world,
+        "worker-r2",
+        "codex-only",
+        "recipe",
+        json!({"providers": ["codex"]}),
+        "CODEX FACT — provider-scoped lesson",
+    );
+    let d4 = crate::memory::semantic_digest(&p4);
 
     // ── Refusals: none of these may touch the tracker ─────────────
     let bad64 = "0".repeat(64);
@@ -464,20 +1584,17 @@ fn cad225_lesson_needs_two_distinct_reviewer_proofs_pm_finalize_then_reuse() {
     assert_eq!(f1["status"].as_str(), Some("accepted"));
     assert_eq!(f1["cycle"].as_u64(), Some(1));
 
-    // A project-wide rule rides the briefing's `project_rules` — same
-    // supported path, proposed by a different worker.
-    let p2 = world
-        .memory_propose(
-            agent("worker-r2"),
-            propose_params(
-                "project-rule",
-                "rule",
-                json!({"project": true}),
-                "RULE FACT — never propose under a forged grant id",
-            ),
-        )
-        .expect("rule proposal");
-    let d2 = p2["digest"].as_str().unwrap().to_string();
+    // An existing-v1 project-wide rule follows the same preserved
+    // native review/finalization path.
+    let p2 = cad225_historical_v1_candidate(
+        &world,
+        "worker-r2",
+        "project-rule",
+        "rule",
+        json!({"project": true}),
+        "RULE FACT — never propose under a forged grant id",
+    );
+    let d2 = crate::memory::semantic_digest(&p2);
     // The re-registered worker-r1 is a valid actor for a memory it has
     // never reviewed — the alias bar is per cycle, not a ban.
     for who in ["worker-author", "worker-r1"] {
@@ -633,7 +1750,7 @@ fn cad225_lesson_needs_two_distinct_reviewer_proofs_pm_finalize_then_reuse() {
     // The briefing surface (`cli/briefing.rs` reads `project_rules`):
     // the project-wide rule lists, scoped/unreviewed lessons do not.
     let pm = crate::issue::Pm::at(&world.pm()).expect("fixture pm");
-    let (rules, errors) = crate::memory::project_rules(&pm, PROJECT);
+    let (rules, errors) = crate::memory::project_rules(&pm, PROJECT, None);
     assert!(errors.is_empty(), "{errors:?}");
     assert_eq!(slugs(&rules), BTreeSet::from(["project-rule".to_string()]));
     assert!(rules.withheld.is_empty());
@@ -654,18 +1771,15 @@ fn cad225_mutated_lesson_content_voids_its_acceptance_for_retrieval() {
     world.memory_agent("worker-b", "worker");
     world.memory_agent("worker-c", "worker");
 
-    let proposed = world
-        .memory_propose(
-            agent("worker-a"),
-            propose_params(
-                "mutable-rule",
-                "rule",
-                json!({"project": true}),
-                "PINNED FACT line v1",
-            ),
-        )
-        .expect("proposal");
-    let d = proposed["digest"].as_str().unwrap().to_string();
+    let proposed = cad225_historical_v1_candidate(
+        &world,
+        "worker-a",
+        "mutable-rule",
+        "rule",
+        json!({"project": true}),
+        "PINNED FACT line v1",
+    );
+    let d = crate::memory::semantic_digest(&proposed);
     for who in ["worker-b", "worker-c"] {
         world
             .memory_review(
@@ -784,21 +1898,25 @@ fn cad225_memory_rpcs_refuse_non_agent_and_identity_incomplete_callers() {
     let world = World::open();
     world.memory_agent("pm", "pm");
     world.memory_agent("worker-a", "worker");
-    let proposed = world
-        .memory_propose(
-            agent("worker-a"),
-            propose_params("review-target", "gotcha", json!({}), "TARGET FACT"),
-        )
-        .expect("baseline proposal");
-    let d = proposed["digest"].as_str().unwrap().to_string();
+    let proposed = cad225_historical_v1_candidate(
+        &world,
+        "worker-a",
+        "review-target",
+        "gotcha",
+        json!({}),
+        "TARGET FACT",
+    );
+    let d = crate::memory::semantic_digest(&proposed);
+    let baseline_bytes = std::fs::read(&proposed.path).unwrap();
 
+    // These callers remain forbidden on genuine NEW proposals as well
+    // as native review/finalization of the historical candidate.
     for who in [
         Asserted::Unproven,
-        Asserted::Operator,
         agent("ghost"),
         agent("reviewer"),
-        // `worker` was registered by World::open but has no endpoint
-        // identity: a row alone is not a memory actor.
+        // Registered by World::open but without an endpoint identity:
+        // a row alone is not an authenticated memory actor.
         agent("worker"),
     ] {
         refuse(&world, |w| {
@@ -807,16 +1925,37 @@ fn cad225_memory_rpcs_refuse_non_agent_and_identity_incomplete_callers() {
                 propose_params("should-not-exist", "gotcha", json!({}), "NOPE FACT"),
             )
         });
+        assert_eq!(std::fs::read(&proposed.path).unwrap(), baseline_bytes);
         refuse(&world, |w| {
             w.memory_review(
                 who.clone(),
                 review_params("review-target", "accept", "pass", &d),
             )
         });
+        assert_eq!(std::fs::read(&proposed.path).unwrap(), baseline_bytes);
         refuse(&world, |w| {
             w.memory_finalize(who.clone(), finalize_params("review-target", "accept", &d))
         });
+        assert_eq!(std::fs::read(&proposed.path).unwrap(), baseline_bytes);
     }
+
+    // Approved cutover: positive operator proof can originate NEW v2
+    // judgements, but cannot replace historical v1 curator/PM rules.
+    refuse(&world, |w| {
+        w.memory_review(
+            Asserted::Operator,
+            review_params("review-target", "accept", "pass", &d),
+        )
+    });
+    assert_eq!(std::fs::read(&proposed.path).unwrap(), baseline_bytes);
+    refuse(&world, |w| {
+        w.memory_finalize(
+            Asserted::Operator,
+            finalize_params("review-target", "accept", &d),
+        )
+    });
+    assert_eq!(std::fs::read(&proposed.path).unwrap(), baseline_bytes);
+
     let (all, errors) = crate::memory::load_project_report(&world.pm(), PROJECT);
     assert!(errors.is_empty(), "{errors:?}");
     assert_eq!(
@@ -826,9 +1965,7 @@ fn cad225_memory_rpcs_refuse_non_agent_and_identity_incomplete_callers() {
     );
     assert!(world.issues().is_empty(), "no tickets were created");
 
-    // A legitimate pass, then the alias-laundering case: remove the
-    // reviewer, re-register the alias with a new registration and
-    // generation — the stored receipt's alias still bars the retry.
+    // Actual native legacy review, then recycled-alias refusal.
     world.memory_agent("worker-b", "worker");
     world
         .memory_review(
@@ -850,4 +1987,2286 @@ fn cad225_memory_rpcs_refuse_non_agent_and_identity_incomplete_callers() {
         1,
         "the laundered retry attached no second receipt"
     );
+}
+
+#[test]
+fn cad347_unused_judgement_expires_at_28_days_without_destructive_expiry() {
+    use crate::memory::{self, Freshness, MatchCtx};
+
+    let world = World::open();
+    world.memory_agent("cad347-lifecycle-author", "worker");
+    let slug = "cad347-unused-judgement";
+    let proposed = world
+        .memory_propose(
+            agent("cad347-lifecycle-author"),
+            propose_params(
+                slug,
+                "gotcha",
+                json!({"project": true}),
+                "LIFECYCLE FACT — supplied guidance is not reported use",
+            ),
+        )
+        .expect("native agent proposal");
+    let digest = proposed["digest"].as_str().expect("proposal digest");
+    world
+        .memory_finalize(Asserted::Operator, finalize_params(slug, "accept", digest))
+        .expect("positive operator approval of agent-claimed judgement");
+
+    let accepted = stored(&world, slug);
+    let front = serde_json::to_value(&accepted.front).expect("serialize native front");
+    let policy = &front["policy"];
+    assert_eq!(accepted.front.status, "accepted");
+    assert_eq!(policy["revision"].as_u64(), Some(2));
+    assert_eq!(policy["nature"].as_str(), Some("judgement"));
+    assert_eq!(policy["provenance"].as_str(), Some("agent-claimed"));
+    assert_eq!(policy["author"]["actor"]["kind"].as_str(), Some("agent"));
+    assert_eq!(memory::semantic_digest(&accepted), digest);
+    assert!(memory::last_verified(&accepted).is_none());
+    assert!(accepted.front.verified_at.is_none());
+    for counter in ["used_reports", "wrong_reports", "reread_reports"] {
+        assert_eq!(policy["feedback"][counter].as_u64(), Some(0));
+    }
+    assert!(policy["feedback"]["last_use"].is_null());
+
+    let acceptances: Vec<_> = policy["finalizations"]
+        .as_array()
+        .expect("native policy finalization history")
+        .iter()
+        .filter(|receipt| {
+            receipt["operation"].as_str() == Some("accept")
+                && receipt["digest"].as_str() == Some(digest)
+        })
+        .collect();
+    assert_eq!(acceptances.len(), 1);
+    assert_eq!(
+        acceptances[0]["finalizer"]["kind"].as_str(),
+        Some("operator")
+    );
+    let accepted_at = crate::issue::time::parse_iso(
+        acceptances[0]["recorded_at"]
+            .as_str()
+            .expect("native acceptance timestamp"),
+    )
+    .expect("parse native acceptance timestamp");
+    let expiry = accepted_at + 28 * 86_400;
+    let original_bytes = std::fs::read(&accepted.path).expect("canonical bytes");
+    let ctx = MatchCtx::default();
+
+    let assert_supply = |memory: &memory::Memory, now: i64, window_days: u64, supplied: bool| {
+        let fresh = Freshness { window_days, now };
+        let matched = memory::match_memories(std::slice::from_ref(memory), &ctx, &fresh);
+        assert_eq!(
+            matched.lessons.iter().any(|lesson| lesson.front.id == slug),
+            supplied,
+            "unexpected matching eligibility at {now}, freshness window {window_days}"
+        );
+        let (_, rendered_slugs) = memory::render_lessons(&matched);
+        assert_eq!(
+            rendered_slugs.iter().any(|rendered| rendered == slug),
+            supplied,
+            "rendered supply disagrees with matching eligibility"
+        );
+        assert_eq!(memory::semantic_digest(memory), digest);
+    };
+
+    // A short evidence-age window is not a short inactivity lifetime.
+    // Judgement acceptance is not an at-SHA mechanical verification.
+    for window_days in [0, 7, 365] {
+        let fresh = Freshness {
+            window_days,
+            now: accepted_at + 27 * 86_400,
+        };
+        assert_eq!(
+            memory::evidence_json(&accepted, &fresh)["state"].as_str(),
+            Some("unverified")
+        );
+        assert_supply(&accepted, fresh.now, window_days, true);
+        assert_supply(&accepted, expiry - 1, window_days, true);
+        assert_supply(&accepted, expiry, window_days, false);
+        assert_supply(&accepted, expiry + 1, window_days, false);
+    }
+
+    // Perturb metadata on a native-qualified record, not its authority:
+    // create no receipt, proof, reported-use counter or different claim.
+    // A raw verification timestamp must not renew inactivity.
+    let mut recently_stamped = accepted.clone();
+    recently_stamped.front.verified_at = Some(crate::issue::time::iso(expiry - 1));
+    assert_eq!(memory::semantic_digest(&recently_stamped), digest);
+    assert!(memory::last_verified(&recently_stamped).is_none());
+    assert_supply(&recently_stamped, expiry, 365, false);
+    assert_supply(&recently_stamped, expiry + 1, 365, false);
+
+    // Reading, matching and rendering supply no authenticated-use report;
+    // expiry withholds but preserves the canonical claim and history.
+    assert_eq!(
+        std::fs::read(&accepted.path).expect("retained bytes"),
+        original_bytes
+    );
+    let retained = stored(&world, slug);
+    assert_eq!(serde_json::to_value(&retained.front).unwrap(), front);
+    assert_eq!(retained.body, accepted.body);
+    assert_eq!(memory::semantic_digest(&retained), digest);
+}
+
+fn cad347_feedback_world() -> (World, String, i64) {
+    let world = World::open();
+    world.memory_agent("cad347-feedback-pm", "pm");
+    world.memory_agent("cad347-feedback-author", "worker");
+    for alias in ["cad347-feedback-worker", "cad347-feedback-other"] {
+        cad347_vendor_agent(&world, alias, "pi", None);
+        cad347_vendor_identity(&world, alias, None, "0123456789abcdef0123456789abcdef");
+        world
+            .shared
+            .store
+            .set_params(alias, &json!({"upstream": "cad347-feedback-pm"}))
+            .expect("native job-group membership");
+    }
+    let proposal = cad347_vendor_rpc(
+        &world,
+        agent("cad347-feedback-author"),
+        "memory_propose",
+        propose_params(
+            "cad347-feedback-lesson",
+            "gotcha",
+            json!({"project": true}),
+            "FEEDBACK FACT — count authenticated reports, not inferred benefit",
+        ),
+    )
+    .expect("native agent judgement proposal");
+    let digest = proposal["digest"]
+        .as_str()
+        .expect("proposal digest")
+        .to_string();
+    cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_finalize",
+        finalize_params("cad347-feedback-lesson", "accept", &digest),
+    )
+    .expect("positive operator judgement approval");
+
+    // Historical-clock fixture ONLY: move timestamps on the ACTUAL
+    // native approval. Create no approval, review, usage or check receipt.
+    let mut memory = stored(&world, "cad347-feedback-lesson");
+    let mut front = serde_json::to_value(&memory.front).unwrap();
+    assert_eq!(front["policy"]["revision"].as_u64(), Some(2));
+    assert_eq!(front["policy"]["nature"].as_str(), Some("judgement"));
+    assert_eq!(
+        front["policy"]["provenance"].as_str(),
+        Some("agent-claimed")
+    );
+    assert!(front["policy"]["feedback"]["last_use"].is_null());
+    assert_eq!(
+        front["policy"]["feedback"]["used_reports"].as_u64(),
+        Some(0)
+    );
+    let acceptances: Vec<usize> = front["policy"]["finalizations"]
+        .as_array()
+        .expect("native finalization history")
+        .iter()
+        .enumerate()
+        .filter_map(|(i, receipt)| {
+            (receipt["operation"].as_str() == Some("accept")
+                && receipt["digest"].as_str() == Some(digest.as_str()))
+            .then_some(i)
+        })
+        .collect();
+    assert_eq!(acceptances.len(), 1);
+    let index = acceptances[0];
+    assert_eq!(
+        front["policy"]["finalizations"][index]["finalizer"]["kind"].as_str(),
+        Some("operator"),
+    );
+    let old_acceptance = crate::issue::time::now_epoch() - 27 * 86_400;
+    front["created"] = json!(crate::issue::time::iso(old_acceptance - 86_400));
+    front["policy"]["finalizations"][index]["recorded_at"] =
+        json!(crate::issue::time::iso(old_acceptance));
+    memory.front = serde_json::from_value(front).expect("historical native front");
+    assert_eq!(crate::memory::semantic_digest(&memory), digest);
+    let pm = crate::issue::Pm::at(&world.pm()).unwrap();
+    {
+        // Global lock + existing global commit: no scoped/unscoped mismatch.
+        let _lock = pm.lock().expect("historical fixture PM lock");
+        let yaml = serde_yaml::to_string(&memory.front).unwrap();
+        std::fs::write(&memory.path, format!("---\n{yaml}---\n\n{}", memory.body))
+            .expect("write historical timestamp fixture");
+        pm.commit(
+            std::slice::from_ref(&memory.path),
+            "Historical clock fixture for authenticated memory feedback\n\nActor: test\n",
+        )
+        .expect("commit only historical fixture metadata");
+    }
+    let loaded = stored(&world, "cad347-feedback-lesson");
+    assert_eq!(crate::memory::semantic_digest(&loaded), digest);
+    assert!(crate::memory::last_verified(&loaded).is_none());
+    (world, digest, old_acceptance + 28 * 86_400)
+}
+
+fn cad347_feedback_issue(world: &World, project: &str) -> String {
+    let pm = crate::issue::Pm::at(&world.pm()).unwrap();
+    let out = crate::issue::write::new_issue(
+        &pm,
+        &world.checkout(),
+        Some(project),
+        "Authenticated memory-feedback scope fixture",
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "pm",
+    )
+    .expect("canonical native issue");
+    out["id"].as_str().unwrap().to_string()
+}
+
+fn cad347_feedback_foreign_project(world: &World) -> String {
+    let pm = crate::issue::Pm::at(&world.pm()).unwrap();
+    crate::issue::write::project_add(&pm, "cad347-foreign", "FB", &[], &[], &[], None)
+        .expect("foreign canonical project");
+    cad347_feedback_issue(world, "cad347-foreign")
+}
+
+fn cad347_feedback_start(world: &World, alias: &str, message: &str) -> String {
+    let row = world.shared.store.agent(alias).unwrap();
+    let generation = row
+        .generation
+        .as_deref()
+        .expect("native endpoint generation");
+    let token = crate::adapter::registry::PI_MANAGED_TURN_TOKENS.mint(generation);
+    assert!(crate::adapter::registry::turn_token_current(
+        &row.provider,
+        &row.endpoint_kind,
+        Some(generation),
+        &token,
+    ));
+    world
+        .shared
+        .store
+        .mark_running(message, &token)
+        .expect("native provider turn-start effect");
+    let stored = world.shared.store.message(message).unwrap().unwrap();
+    assert_eq!(stored.alias, alias);
+    assert_eq!(stored.recipient_uid.as_deref(), Some(row.uid.as_str()));
+    assert_eq!(stored.state, "running");
+    assert_eq!(stored.turn_id.as_deref(), Some(token.as_str()));
+    token
+}
+
+fn cad347_feedback_turn(
+    world: &World,
+    alias: &str,
+    message: &str,
+    task: Option<&str>,
+    issue: Option<&str>,
+) -> String {
+    let source = if task.is_some() { "send" } else { "dispatch" };
+    let (duplicate, _) = world
+        .shared
+        .store
+        .enqueue_steered(
+            alias,
+            "Native feedback-turn fixture",
+            None,
+            message,
+            source,
+            task,
+            issue,
+            Some(world.checkout().to_str().unwrap()),
+            &Sender::Unattributed,
+            &crate::store::Steer::NONE,
+            None,
+            None,
+            None,
+        )
+        .expect("native durable message effect");
+    assert!(!duplicate);
+    cad347_feedback_start(world, alias, message)
+}
+
+fn cad347_feedback_job_turn(world: &World, issue: Option<&str>) -> (String, String, String) {
+    let spec = "Exercise authenticated memory feedback on the assigned native task.\n";
+    let path = world.root.path().join("cad347-feedback-spec.md");
+    std::fs::write(&path, spec).unwrap();
+    let spec_digest = format!("{:x}", Sha256::digest(spec.as_bytes()));
+    let (duplicate, job) = world
+        .shared
+        .store
+        .create_job(
+            "cad347-feedback-job",
+            Some("Feedback scope fixture"),
+            path.to_str().unwrap(),
+            &spec_digest,
+            "cad347-feedback-pm",
+            issue,
+            None,
+            None,
+            3,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("cad347-feedback-worker"),
+            Some("Report only authenticated current-scope use"),
+        )
+        .expect("native open job and initial task");
+    assert!(!duplicate);
+    assert_eq!(job.state, "open");
+    assert_eq!(job.issue_id.as_deref(), issue);
+    let task_id = "cad347-feedback-job-t1";
+    let (_, message, duplicate, _) = world
+        .shared
+        .store
+        .dispatch_task(task_id, None, None, "cad347-feedback-pm")
+        .expect("native current-revision task dispatch");
+    assert!(!duplicate);
+    let token = cad347_feedback_start(world, "cad347-feedback-worker", &message);
+    let task = world.shared.store.task(task_id).unwrap();
+    assert_eq!(task.state, "running");
+    assert_eq!(task.revision, 1);
+    assert_eq!(task.assignee.as_deref(), Some("cad347-feedback-worker"));
+    assert_eq!(task.dispatch_message.as_deref(), Some(message.as_str()));
+    (task.id, message, token)
+}
+
+fn cad347_feedback_params(digest: &str, message: &str, token: &str, kind: &str) -> Value {
+    json!({
+        "project": PROJECT,
+        "slug": "cad347-feedback-lesson",
+        "digest": digest,
+        "message": message,
+        "token": token,
+        "kind": kind,
+        "evidence": "Explicit feedback report; not a claim of unique benefit",
+    })
+}
+
+fn cad347_feedback_metadata(world: &World) -> Value {
+    let memory = stored(world, "cad347-feedback-lesson");
+    let front = serde_json::to_value(&memory.front).unwrap();
+    front["policy"]["feedback"].clone()
+}
+
+fn cad347_feedback_supplied(world: &World, now: i64) -> bool {
+    let memories = crate::memory::load_project(&world.pm(), PROJECT).unwrap();
+    let matched = crate::memory::match_memories(
+        &memories,
+        &crate::memory::MatchCtx::default(),
+        &crate::memory::Freshness {
+            window_days: 365,
+            now,
+        },
+    );
+    let (_, supplied) = crate::memory::render_lessons(&matched);
+    supplied.iter().any(|slug| slug == "cad347-feedback-lesson")
+}
+
+#[test]
+fn cad347_feedback_issue_turn_requires_connection_ownership_currency_and_scope() {
+    let (world, digest, old_expiry) = cad347_feedback_world();
+    let issue = cad347_feedback_issue(&world, PROJECT);
+    let foreign_issue = cad347_feedback_foreign_project(&world);
+    let message = "cad347-feedback-owned";
+    let token = cad347_feedback_turn(
+        &world,
+        "cad347-feedback-worker",
+        message,
+        None,
+        Some(&issue),
+    );
+    let valid = cad347_feedback_params(&digest, message, &token, "used");
+    let refuse_feedback = |who: Asserted, params: Value| {
+        cad347_vendor_refuse(
+            &world,
+            "cad347-feedback-lesson",
+            who,
+            "memory_feedback",
+            params,
+        );
+    };
+
+    // A token with the right generation/scheme is not authentication.
+    let row = world.shared.store.agent("cad347-feedback-worker").unwrap();
+    let forged =
+        crate::adapter::registry::PI_MANAGED_TURN_TOKENS.mint(row.generation.as_deref().unwrap());
+    assert_ne!(forged, token);
+    assert!(crate::adapter::registry::turn_token_current(
+        &row.provider,
+        &row.endpoint_kind,
+        row.generation.as_deref(),
+        &forged,
+    ));
+    let mut bad = valid.clone();
+    bad["token"] = json!(forged);
+    refuse_feedback(agent("cad347-feedback-worker"), bad);
+    refuse_feedback(agent("cad347-feedback-other"), valid.clone());
+    refuse_feedback(Asserted::Unproven, valid.clone());
+    refuse_feedback(Asserted::Operator, valid.clone());
+    for (field, value) in [
+        ("message", json!("cad347-nonexistent-message")),
+        ("digest", json!("0".repeat(64))),
+        ("project", json!("cad347-foreign")),
+    ] {
+        let mut bad = valid.clone();
+        bad[field] = value;
+        refuse_feedback(agent("cad347-feedback-worker"), bad);
+    }
+    for (field, value) in [
+        ("actor", json!("operator")),
+        ("provider", json!("openai")),
+        ("receipt", json!({"approved": true})),
+        ("timestamp", json!("2099-01-01T00:00:00Z")),
+        ("used_reports", json!(999)),
+    ] {
+        let mut bad = valid.clone();
+        bad[field] = value;
+        refuse_feedback(agent("cad347-feedback-worker"), bad);
+    }
+
+    // Same cwd and request project cannot replace native issue scope.
+    for (mid, bound_issue) in [
+        (
+            "cad347-feedback-foreign-scope",
+            Some(foreign_issue.as_str()),
+        ),
+        ("cad347-feedback-unbound", None),
+    ] {
+        let scoped_token =
+            cad347_feedback_turn(&world, "cad347-feedback-other", mid, None, bound_issue);
+        refuse_feedback(
+            agent("cad347-feedback-other"),
+            cad347_feedback_params(&digest, mid, &scoped_token, "used"),
+        );
+        let stored = world.shared.store.message(mid).unwrap().unwrap();
+        world
+            .shared
+            .store
+            .finish(&stored, "completed", &json!({"text": "fixture done"}), None)
+            .expect("finish native negative-scope turn");
+    }
+
+    for kind in ["wrong", "reread"] {
+        cad347_vendor_rpc(
+            &world,
+            agent("cad347-feedback-worker"),
+            "memory_feedback",
+            cad347_feedback_params(&digest, message, &token, kind),
+        )
+        .expect("authenticated non-use feedback report");
+    }
+    let feedback = cad347_feedback_metadata(&world);
+    assert_eq!(feedback["used_reports"].as_u64(), Some(0));
+    assert_eq!(feedback["wrong_reports"].as_u64(), Some(1));
+    assert_eq!(feedback["reread_reports"].as_u64(), Some(1));
+    assert!(feedback["last_use"].is_null());
+    assert!(cad347_feedback_supplied(&world, old_expiry - 1));
+    assert!(!cad347_feedback_supplied(&world, old_expiry));
+
+    // Repeated valid reports are reports, not deduplicated benefits.
+    for _ in 0..2 {
+        cad347_vendor_rpc(
+            &world,
+            agent("cad347-feedback-worker"),
+            "memory_feedback",
+            valid.clone(),
+        )
+        .expect("owned active same-project use report");
+    }
+    let feedback = cad347_feedback_metadata(&world);
+    assert_eq!(feedback["used_reports"].as_u64(), Some(2));
+    let use_receipt = feedback["last_use"].clone();
+    assert_eq!(use_receipt["digest"].as_str(), Some(digest.as_str()));
+    assert_eq!(
+        use_receipt["actor"]["alias"].as_str(),
+        Some("cad347-feedback-worker")
+    );
+    assert_eq!(use_receipt["actor"]["uid"].as_str(), Some(row.uid.as_str()));
+    assert_eq!(use_receipt["message"].as_str(), Some(message));
+    assert!(use_receipt["task"].is_null());
+    let used_at = crate::issue::time::parse_iso(
+        use_receipt["recorded_at"]
+            .as_str()
+            .expect("native use timestamp"),
+    )
+    .unwrap();
+    assert!(cad347_feedback_supplied(&world, old_expiry + 1));
+    assert!(cad347_feedback_supplied(&world, used_at + 28 * 86_400 - 1));
+    assert!(!cad347_feedback_supplied(&world, used_at + 28 * 86_400));
+    for kind in ["wrong", "reread"] {
+        cad347_vendor_rpc(
+            &world,
+            agent("cad347-feedback-worker"),
+            "memory_feedback",
+            cad347_feedback_params(&digest, message, &token, kind),
+        )
+        .expect("later non-use report");
+        assert_eq!(cad347_feedback_metadata(&world)["last_use"], use_receipt);
+    }
+    let retained = stored(&world, "cad347-feedback-lesson");
+    assert_eq!(crate::memory::semantic_digest(&retained), digest);
+    assert!(crate::memory::last_verified(&retained).is_none());
+    assert!(!std::fs::read_to_string(&retained.path)
+        .unwrap()
+        .contains(&token));
+    assert_eq!(
+        cad347_feedback_metadata(&world)["wrong_reports"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        cad347_feedback_metadata(&world)["reread_reports"].as_u64(),
+        Some(2)
+    );
+
+    let stored_turn = world.shared.store.message(message).unwrap().unwrap();
+    world
+        .shared
+        .store
+        .finish(
+            &stored_turn,
+            "completed",
+            &json!({"text": "fixture done"}),
+            None,
+        )
+        .expect("native turn completes");
+    // Its token still has the current generation, but the turn is over.
+    assert!(crate::adapter::registry::turn_token_current(
+        &row.provider,
+        &row.endpoint_kind,
+        row.generation.as_deref(),
+        &token,
+    ));
+    refuse_feedback(agent("cad347-feedback-worker"), valid);
+
+    let stale_mid = "cad347-feedback-stale-generation";
+    let stale_token = cad347_feedback_turn(
+        &world,
+        "cad347-feedback-other",
+        stale_mid,
+        None,
+        Some(&issue),
+    );
+    cad347_vendor_identity(
+        &world,
+        "cad347-feedback-other",
+        None,
+        "fedcba9876543210fedcba9876543210",
+    );
+    // A genuine unadopted restart fences this turn to unknown. Do not
+    // fabricate a still-running old-generation turn or reanimate it.
+    let retired = world.shared.store.message(stale_mid).unwrap().unwrap();
+    let current = world.shared.store.agent("cad347-feedback-other").unwrap();
+    assert_eq!(retired.state, "unknown");
+    assert_eq!(retired.turn_id.as_deref(), Some(stale_token.as_str()));
+    assert_eq!(retired.recipient_uid.as_deref(), Some(current.uid.as_str()));
+    assert_eq!(
+        current.generation.as_deref(),
+        Some("fedcba9876543210fedcba9876543210")
+    );
+    assert!(!crate::adapter::registry::turn_token_current(
+        &current.provider,
+        &current.endpoint_kind,
+        current.generation.as_deref(),
+        &stale_token,
+    ));
+    refuse_feedback(
+        agent("cad347-feedback-other"),
+        cad347_feedback_params(&digest, stale_mid, &stale_token, "used"),
+    );
+}
+
+#[test]
+fn cad347_feedback_job_task_requires_current_dispatch_assignee_and_active_state() {
+    for binding in ["same-project", "foreign-project", "unbound"] {
+        let (world, digest, old_expiry) = cad347_feedback_world();
+        let issue = match binding {
+            "same-project" => Some(cad347_feedback_issue(&world, PROJECT)),
+            "foreign-project" => Some(cad347_feedback_foreign_project(&world)),
+            "unbound" => None,
+            _ => unreachable!(),
+        };
+        let (task_id, message, token) = cad347_feedback_job_turn(&world, issue.as_deref());
+        let valid = cad347_feedback_params(&digest, &message, &token, "used");
+        if binding != "same-project" {
+            cad347_vendor_refuse(
+                &world,
+                "cad347-feedback-lesson",
+                agent("cad347-feedback-worker"),
+                "memory_feedback",
+                valid,
+            );
+            assert_eq!(
+                cad347_feedback_metadata(&world)["used_reports"].as_u64(),
+                Some(0)
+            );
+            assert!(!cad347_feedback_supplied(&world, old_expiry));
+            continue;
+        }
+        cad347_vendor_rpc(
+            &world,
+            agent("cad347-feedback-worker"),
+            "memory_feedback",
+            valid.clone(),
+        )
+        .expect("native current task and canonical same-project job binding");
+        assert_eq!(
+            cad347_feedback_metadata(&world)["used_reports"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            cad347_feedback_metadata(&world)["last_use"]["task"].as_str(),
+            Some(task_id.as_str()),
+        );
+        assert!(cad347_feedback_supplied(&world, old_expiry + 1));
+
+        // A task-indexed follow-up is not the current task kickoff.
+        // The first case IS assigned to the caller; only dispatch
+        // correlation distinguishes it from the qualifying kickoff.
+        for (alias, mid) in [
+            ("cad347-feedback-worker", "cad347-feedback-own-followup"),
+            ("cad347-feedback-other", "cad347-feedback-foreign-assignee"),
+        ] {
+            let followup_token =
+                cad347_feedback_turn(&world, alias, mid, Some(&task_id), issue.as_deref());
+            assert_eq!(
+                world
+                    .shared
+                    .store
+                    .task(&task_id)
+                    .unwrap()
+                    .dispatch_message
+                    .as_deref(),
+                Some(message.as_str()),
+            );
+            cad347_vendor_refuse(
+                &world,
+                "cad347-feedback-lesson",
+                agent(alias),
+                "memory_feedback",
+                cad347_feedback_params(&digest, mid, &followup_token, "used"),
+            );
+            let followup = world.shared.store.message(mid).unwrap().unwrap();
+            world
+                .shared
+                .store
+                .finish(
+                    &followup,
+                    "completed",
+                    &json!({"text": "fixture followup done"}),
+                    None,
+                )
+                .expect("native follow-up completes without advancing the task");
+        }
+
+        // A failed kickoff is retired; genuine redispatch changes the
+        // native assignee, revision and dispatch_message together.
+        let first_turn = world.shared.store.message(&message).unwrap().unwrap();
+        world
+            .shared
+            .store
+            .finish(
+                &first_turn,
+                "failed",
+                &json!({"reason": "fixture retry"}),
+                None,
+            )
+            .expect("native failed turn");
+        let (_, next_message, duplicate, _) = world
+            .shared
+            .store
+            .dispatch_task(
+                &task_id,
+                Some("cad347-feedback-other"),
+                None,
+                "cad347-feedback-pm",
+            )
+            .expect("native second-revision reassignment");
+        assert!(!duplicate);
+        assert_ne!(next_message, message);
+        let next_token = cad347_feedback_start(&world, "cad347-feedback-other", &next_message);
+        let task = world.shared.store.task(&task_id).unwrap();
+        assert_eq!(task.revision, 2);
+        assert_eq!(task.assignee.as_deref(), Some("cad347-feedback-other"));
+        assert_eq!(
+            task.dispatch_message.as_deref(),
+            Some(next_message.as_str())
+        );
+        assert_eq!(task.state, "running");
+        cad347_vendor_refuse(
+            &world,
+            "cad347-feedback-lesson",
+            agent("cad347-feedback-worker"),
+            "memory_feedback",
+            valid,
+        );
+        let next = cad347_feedback_params(&digest, &next_message, &next_token, "used");
+        cad347_vendor_rpc(
+            &world,
+            agent("cad347-feedback-other"),
+            "memory_feedback",
+            next.clone(),
+        )
+        .expect("current assigned revision can report use");
+        assert_eq!(
+            cad347_feedback_metadata(&world)["used_reports"].as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            cad347_feedback_metadata(&world)["last_use"]["message"].as_str(),
+            Some(next_message.as_str()),
+        );
+        let current_assignee = world.shared.store.agent("cad347-feedback-other").unwrap();
+        assert_eq!(
+            cad347_feedback_metadata(&world)["last_use"]["actor"]["uid"].as_str(),
+            Some(current_assignee.uid.as_str()),
+        );
+
+        // Native cancellation deliberately cannot unpaste a running
+        // turn: the message stays running, but task authority is gone.
+        let cancelled = world
+            .shared
+            .store
+            .cancel_task(&task_id, "cad347-feedback-pm")
+            .expect("native task cancellation");
+        assert_eq!(cancelled.state, "cancelled");
+        assert_eq!(
+            world
+                .shared
+                .store
+                .message(&next_message)
+                .unwrap()
+                .unwrap()
+                .state,
+            "running"
+        );
+        assert_eq!(
+            world.shared.store.job("cad347-feedback-job").unwrap().state,
+            "open"
+        );
+        cad347_vendor_refuse(
+            &world,
+            "cad347-feedback-lesson",
+            agent("cad347-feedback-other"),
+            "memory_feedback",
+            next,
+        );
+        assert_eq!(
+            crate::memory::semantic_digest(&stored(&world, "cad347-feedback-lesson")),
+            digest
+        );
+        let bytes = std::fs::read_to_string(stored(&world, "cad347-feedback-lesson").path).unwrap();
+        assert!(!bytes.contains(&token));
+        assert!(!bytes.contains(&next_token));
+    }
+}
+
+#[test]
+fn cad347_external_source_judgement_requires_operator_release_without_fake_freshness() {
+    let world = World::open();
+    cad347_vendor_agent(&world, "cad347-author", "inbox", Some("openai/gpt-5"));
+    cad347_vendor_agent(
+        &world,
+        "cad347-curator",
+        "inbox",
+        Some("anthropic/claude-sonnet-4-5"),
+    );
+    let slug = "cad347-external-judgement";
+    let mut params = propose_params(
+        slug,
+        "decision",
+        json!({}),
+        "An external judgement remains unavailable until explicitly released by the operator",
+    );
+    params["source"] = json!("https://example.invalid/cad347/external-judgement");
+    params["nature"] = json!("judgement");
+    let proposal = cad347_vendor_rpc(&world, agent("cad347-author"), "memory_propose", params)
+        .expect("native external-source proposal without asserted provenance authority");
+    let digest = proposal["digest"].as_str().unwrap().to_string();
+    let withheld = stored(&world, slug);
+    assert_ne!(withheld.front.status, "accepted");
+    let front = serde_json::to_value(&withheld.front).unwrap();
+    assert_eq!(
+        front["policy"]["provenance"].as_str(),
+        Some("external-derived")
+    );
+    assert!(
+        !retrieval(&world, slug).0,
+        "external judgement must be withheld before operator release"
+    );
+    assert!(crate::memory::last_verified(&withheld).is_none());
+    for who in [
+        agent("cad347-author"),
+        agent("cad347-curator"),
+        Asserted::Unproven,
+    ] {
+        cad347_vendor_refuse(
+            &world,
+            slug,
+            who,
+            "memory_finalize",
+            finalize_params(slug, "accept", &digest),
+        );
+        assert_eq!(digest_of(&world, slug), digest);
+        assert!(
+            !retrieval(&world, slug).0,
+            "refused caller must not release the external judgement"
+        );
+    }
+    cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_finalize",
+        finalize_params(slug, "accept", &digest),
+    )
+    .expect("positively asserted operator releases the withheld external judgement");
+    let released = stored(&world, slug);
+    assert_eq!(released.front.status, "accepted");
+    assert_eq!(digest_of(&world, slug), digest);
+    let front = serde_json::to_value(&released.front).unwrap();
+    assert_eq!(
+        front["policy"]["provenance"].as_str(),
+        Some("external-derived")
+    );
+    assert!(
+        retrieval(&world, slug).0,
+        "operator release makes the external judgement eligible"
+    );
+    assert!(
+        crate::memory::last_verified(&released).is_none(),
+        "operator release of external judgement must not invent mechanical freshness"
+    );
+}
+
+#[test]
+fn cad347_operator_origin_judgement_needs_actual_operator_decision_before_supply() {
+    let world = World::open();
+    world.memory_agent("cad347-op-worker", "worker");
+    world.memory_agent("cad347-op-pm", "pm");
+    let slug = "cad347-operator-origin";
+    let proposal = cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_propose",
+        propose_params(
+            slug,
+            "rule",
+            json!({"project": true}),
+            "OPERATOR FACT — origin is not an implicit approval or a worker's authority",
+        ),
+    )
+    .expect("positively proven operator originates a native judgement");
+    let digest = proposal["digest"].as_str().unwrap().to_string();
+    let candidate = stored(&world, slug);
+    let candidate_front = serde_json::to_value(&candidate.front).unwrap();
+    assert_eq!(
+        candidate_front["policy"]["provenance"].as_str(),
+        Some("operator")
+    );
+    assert_eq!(
+        candidate_front["policy"]["nature"].as_str(),
+        Some("judgement")
+    );
+    assert_eq!(
+        candidate_front["policy"]["author"]["actor"]["kind"].as_str(),
+        Some("operator")
+    );
+    let operator_uid = candidate_front["policy"]["author"]["actor"]["uid"]
+        .as_u64()
+        .expect("native operator origin uid");
+    assert!(candidate_front["policy"]["finalizations"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(!crate::memory::retrieval_status(&candidate).0);
+    let pm = crate::issue::Pm::at(&world.pm()).unwrap();
+    let (before, errors) = crate::memory::project_rules(&pm, PROJECT, None);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(!slugs(&before).contains(slug));
+    let (_, before_supply) = crate::memory::render_lessons(&before);
+    assert!(!before_supply.iter().any(|supplied| supplied == slug));
+
+    for who in [
+        agent("cad347-op-worker"),
+        agent("cad347-op-pm"),
+        Asserted::Unproven,
+    ] {
+        cad347_vendor_refuse(
+            &world,
+            slug,
+            who,
+            "memory_finalize",
+            finalize_params(slug, "accept", &digest),
+        );
+    }
+    assert!(!retrieval(&world, slug).0);
+    cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_finalize",
+        finalize_params(slug, "accept", &digest),
+    )
+    .expect("positively proven operator records the judgement decision");
+    let accepted = stored(&world, slug);
+    assert_eq!(crate::memory::semantic_digest(&accepted), digest);
+    assert!(crate::memory::retrieval_status(&accepted).0);
+    let accepted_front = serde_json::to_value(&accepted.front).unwrap();
+    assert!(accepted_front["policy"]["finalizations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|receipt| {
+            receipt["operation"].as_str() == Some("accept")
+                && receipt["digest"].as_str() == Some(digest.as_str())
+                && receipt["status"].as_str() == Some("accepted")
+                && receipt["finalizer"]["kind"].as_str() == Some("operator")
+                && receipt["finalizer"]["uid"].as_u64() == Some(operator_uid)
+        }));
+    assert!(accepted.front.verified_at.is_none());
+    assert!(crate::memory::last_verified(&accepted).is_none());
+    let (after, errors) = crate::memory::project_rules(&pm, PROJECT, None);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(slugs(&after), BTreeSet::from([slug.to_string()]));
+    let (_, after_supply) = crate::memory::render_lessons(&after);
+    assert_eq!(after_supply, vec![slug.to_string()]);
+}
+
+#[test]
+fn cad347_native_role_applicability_withholds_unknown_wrong_and_foreign_project() {
+    let world = World::open();
+    world.memory_agent("cad347-role-author", "worker");
+    for (alias, team_role) in [("cad347-role-target", "dev"), ("cad347-role-other", "qa")] {
+        world
+            .shared
+            .store
+            .register_agent(&NewAgent {
+                alias,
+                provider: "inbox",
+                endpoint_kind: "inbox",
+                role: "worker",
+                cwd: world.root.path().to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: Some(team_role),
+                model_policy: None,
+            })
+            .expect("explicit native target team-role registration");
+    }
+    let target = world.shared.store.agent("cad347-role-target").unwrap();
+    let other = world.shared.store.agent("cad347-role-other").unwrap();
+    let target_role = target
+        .team_role
+        .as_deref()
+        .expect("native target has an explicitly assigned team role")
+        .to_owned();
+    let other_role = other
+        .team_role
+        .as_deref()
+        .expect("native other target has an explicitly assigned team role")
+        .to_owned();
+    assert_eq!(
+        target.role, other.role,
+        "authorization roles must not explain applicability"
+    );
+    assert_ne!(
+        target_role, other_role,
+        "fixture needs distinct assigned team roles"
+    );
+    let pm = crate::issue::Pm::at(&world.pm()).unwrap();
+    let foreign_key = "cad347-role-foreign";
+    crate::issue::write::project_add(&pm, foreign_key, "RF", &[], &[], &[], None)
+        .expect("canonical foreign project");
+    let role_slug = "cad347-role-restricted";
+    let company_slug = "cad347-company-local";
+    let foreign_slug = "cad347-foreign-control";
+    for (project, slug, audience, roles) in [
+        (PROJECT, role_slug, "role", vec![target_role.clone()]),
+        (PROJECT, company_slug, "company", Vec::<String>::new()),
+        (foreign_key, foreign_slug, "project", Vec::<String>::new()),
+    ] {
+        let mut params = propose_params(
+            slug,
+            "rule",
+            json!({"project": true}),
+            "ROLE FACT — applicability follows native team role and canonical project",
+        );
+        params["project"] = json!(project);
+        params["audience"] = json!(audience);
+        params["roles"] = json!(roles);
+        let proposal = cad347_vendor_rpc(
+            &world,
+            agent("cad347-role-author"),
+            "memory_propose",
+            params,
+        )
+        .expect("native audience-scoped judgement proposal");
+        let digest = proposal["digest"].as_str().unwrap();
+        let mut approval = finalize_params(slug, "accept", digest);
+        approval["project"] = json!(project);
+        cad347_vendor_rpc(&world, Asserted::Operator, "memory_finalize", approval)
+            .expect("actual operator judgement approval");
+        let memory = crate::memory::load_project(&world.pm(), project)
+            .unwrap()
+            .into_iter()
+            .find(|memory| memory.front.id == slug)
+            .unwrap();
+        assert_eq!(memory.front.status, "accepted");
+        assert_eq!(crate::memory::semantic_digest(&memory), digest);
+        assert!(crate::memory::retrieval_status(&memory).0);
+        let front = serde_json::to_value(&memory.front).unwrap();
+        assert!(front["policy"]["finalizations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|receipt| {
+                receipt["operation"].as_str() == Some("accept")
+                    && receipt["digest"].as_str() == Some(digest)
+                    && receipt["status"].as_str() == Some("accepted")
+                    && receipt["finalizer"]["kind"].as_str() == Some("operator")
+            }));
+    }
+    let issue = new_task(&world, "Native team-role applicability task", &[]);
+    let assert_projection = |role: Option<&str>, expected: BTreeSet<String>| {
+        let (matched, errors) =
+            crate::memory::match_for_issue(&pm, &issue, Some(target.provider.as_str()), role)
+                .expect("real native-team-role-aware issue match");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(slugs(&matched), expected);
+        let (_, rendered) = crate::memory::render_lessons(&matched);
+        assert_eq!(rendered.into_iter().collect::<BTreeSet<_>>(), expected);
+        let (rules, errors) = crate::memory::project_rules(&pm, PROJECT, role);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(slugs(&rules), expected);
+        if role.is_none() {
+            assert!(matched
+                .withheld
+                .iter()
+                .any(|(memory, _)| memory.front.id == role_slug));
+            assert!(rules
+                .withheld
+                .iter()
+                .any(|(memory, _)| memory.front.id == role_slug));
+        }
+    };
+    let company_only = BTreeSet::from([company_slug.to_string()]);
+    assert_projection(None, company_only.clone());
+    assert_projection(Some(other_role.as_str()), company_only);
+    assert_projection(
+        Some(target_role.as_str()),
+        BTreeSet::from([role_slug.to_string(), company_slug.to_string()]),
+    );
+
+    // Foreign project gets its genuine eligible control, never the
+    // originating project's company audience or role-scoped record.
+    let out = crate::issue::write::new_issue(
+        &pm,
+        &world.checkout(),
+        Some(foreign_key),
+        "Foreign native team-role-consumer task",
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "pm",
+    )
+    .expect("canonical foreign task");
+    let foreign_issue = crate::issue::board::find_issue(&world.pm(), out["id"].as_str().unwrap())
+        .expect("load canonical foreign task");
+    let (foreign, errors) = crate::memory::match_for_issue(
+        &pm,
+        &foreign_issue,
+        Some(target.provider.as_str()),
+        Some(target_role.as_str()),
+    )
+    .expect("foreign project native match");
+    assert!(errors.is_empty(), "{errors:?}");
+    let expected_foreign = BTreeSet::from([foreign_slug.to_string()]);
+    assert_eq!(slugs(&foreign), expected_foreign);
+    let (_, rendered) = crate::memory::render_lessons(&foreign);
+    assert_eq!(
+        rendered.into_iter().collect::<BTreeSet<_>>(),
+        expected_foreign
+    );
+    let (foreign_rules, errors) =
+        crate::memory::project_rules(&pm, foreign_key, Some(target_role.as_str()));
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(slugs(&foreign_rules), expected_foreign);
+}
+
+#[test]
+fn cad347_operator_judgement_revalidation_and_invalidation_preserve_history_and_withhold() {
+    use crate::memory::{self, policy::ActorSnapshot};
+
+    let world = World::open();
+    world.memory_agent("cad347-transition-worker", "worker");
+    world.memory_agent("cad347-transition-pm", "pm");
+    let slug = "cad347-operator-lifecycle";
+    let proposal = cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_propose",
+        propose_params(
+            slug,
+            "rule",
+            json!({"project": true}),
+            "LIFECYCLE FACT — validity decisions retain the original claim and prior decisions",
+        ),
+    )
+    .expect("native operator judgement candidate");
+    let digest = proposal["digest"].as_str().unwrap().to_string();
+    let original = stored(&world, slug);
+    let original_body = original.body.clone();
+    let original_author = original.front.policy.as_ref().unwrap().author.clone();
+    let task = new_task(&world, "Consume native lifecycle guidance", &[]);
+    let pm = crate::issue::Pm::at(&world.pm()).unwrap();
+    let mut mismatched_digest = digest.clone();
+    let replacement = if digest.starts_with('0') { "1" } else { "0" };
+    mismatched_digest.replace_range(..1, replacement);
+    assert_ne!(mismatched_digest, digest);
+
+    let params = |operation: &str, expected: &str, evidence: &str| {
+        let mut params = finalize_params(slug, operation, expected);
+        params["evidence"] = json!(evidence);
+        params
+    };
+    let assert_state = |status: &str, eligible: bool| -> memory::Memory {
+        let memory = stored(&world, slug);
+        assert_eq!(memory.front.status, status);
+        assert_eq!(memory.body, original_body);
+        assert_eq!(memory::semantic_digest(&memory), digest);
+        let policy = memory.front.policy.as_ref().expect("retained v2 policy");
+        assert_eq!(policy.author, original_author);
+        assert_eq!(policy.feedback.used_reports, 0);
+        assert!(policy.feedback.last_use.is_none());
+        assert_eq!(memory::retrieval_status(&memory).0, eligible);
+        assert!(memory.front.verified_at.is_none());
+        assert!(memory::last_verified(&memory).is_none());
+        let fresh = memory::Freshness::for_key(&world.pm(), PROJECT);
+        let detail = memory::detail_json(&memory, &fresh);
+        assert_eq!(detail["status"].as_str(), Some(status));
+        assert_eq!(detail["body"].as_str(), Some(original_body.as_str()));
+        assert_eq!(detail["quorum"]["eligible"].as_bool(), Some(eligible));
+        assert_ne!(detail["evidence"]["state"].as_str(), Some("verified"));
+        let (matched, errors) = memory::match_for_issue(&pm, &task, Some("inbox"), None)
+            .expect("real lifecycle issue match");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            matched.lessons.iter().any(|lesson| lesson.front.id == slug),
+            eligible
+        );
+        let (_, supplied) = memory::render_lessons(&matched);
+        assert_eq!(supplied.iter().any(|supplied| supplied == slug), eligible);
+        let (rules, errors) = memory::project_rules(&pm, PROJECT, None);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            rules.lessons.iter().any(|lesson| lesson.front.id == slug),
+            eligible
+        );
+        memory
+    };
+
+    assert_state("proposed", false);
+    cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_finalize",
+        finalize_params(slug, "accept", &digest),
+    )
+    .expect("actual initial operator judgement decision");
+    let accepted = assert_state("accepted", true);
+    let accepted_history = accepted
+        .front
+        .policy
+        .as_ref()
+        .unwrap()
+        .finalizations
+        .clone();
+    assert_eq!(accepted_history.len(), 1);
+    assert_eq!(accepted_history[0].operation, "accept");
+    assert_eq!(accepted_history[0].digest, digest);
+    assert!(matches!(
+        &accepted_history[0].finalizer,
+        ActorSnapshot::Operator { .. }
+    ));
+
+    // These are real endpoint-qualified native agents, not missing
+    // identities. Neither PM role nor absent identity is operator proof.
+    for operation in ["revalidate", "invalidate"] {
+        for who in [
+            agent("cad347-transition-worker"),
+            agent("cad347-transition-pm"),
+            Asserted::Unproven,
+        ] {
+            cad347_vendor_refuse(
+                &world,
+                slug,
+                who,
+                "memory_finalize",
+                params(
+                    operation,
+                    &digest,
+                    "Non-operator lifecycle attempt must change nothing",
+                ),
+            );
+        }
+        cad347_vendor_refuse(
+            &world,
+            slug,
+            Asserted::Operator,
+            "memory_finalize",
+            params(
+                operation,
+                &mismatched_digest,
+                "Mismatching expected revision must change nothing",
+            ),
+        );
+        assert_state("accepted", true);
+    }
+
+    let revalidation_reason =
+        "Operator requests a current policy review after task assumptions changed";
+    cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_finalize",
+        params("revalidate", &digest, revalidation_reason),
+    )
+    .expect("native operator starts revalidation");
+    let pending = assert_state("pending-revalidation", false);
+    let pending_history = pending.front.policy.as_ref().unwrap().finalizations.clone();
+    assert_eq!(pending_history.len(), accepted_history.len() + 1);
+    assert_eq!(
+        &pending_history[..accepted_history.len()],
+        accepted_history.as_slice()
+    );
+    assert!(pending.front.review_cycle > accepted.front.review_cycle);
+    let pending_decision = pending_history.last().unwrap();
+    assert_eq!(pending_decision.operation, "revalidate");
+    assert_eq!(pending_decision.status, "pending-revalidation");
+    assert_eq!(pending_decision.digest, digest);
+    assert_eq!(
+        pending_decision.evidence.as_deref(),
+        Some(revalidation_reason)
+    );
+    assert!(matches!(
+        &pending_decision.finalizer,
+        ActorSnapshot::Operator { .. }
+    ));
+
+    // The old acceptance receipt still exists but cannot supply the
+    // pending record or substitute for the current verify decision.
+    cad347_vendor_refuse(
+        &world,
+        slug,
+        Asserted::Operator,
+        "memory_finalize",
+        finalize_params(slug, "accept", &digest),
+    );
+    for who in [
+        agent("cad347-transition-worker"),
+        agent("cad347-transition-pm"),
+        Asserted::Unproven,
+    ] {
+        cad347_vendor_refuse(
+            &world,
+            slug,
+            who,
+            "memory_finalize",
+            params(
+                "verify",
+                &digest,
+                "Only the actual operator can decide this judgement",
+            ),
+        );
+    }
+    cad347_vendor_refuse(
+        &world,
+        slug,
+        Asserted::Operator,
+        "memory_finalize",
+        params(
+            "verify",
+            &mismatched_digest,
+            "Stale expected revision cannot complete revalidation",
+        ),
+    );
+    assert_state("pending-revalidation", false);
+
+    let review_reason =
+        "Operator re-examined the unchanged judgement against the current task assumptions";
+    cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_finalize",
+        params("verify", &digest, review_reason),
+    )
+    .expect("actual current-cycle operator policy decision");
+    let restored = assert_state("accepted", true);
+    let restored_history = restored
+        .front
+        .policy
+        .as_ref()
+        .unwrap()
+        .finalizations
+        .clone();
+    assert_eq!(restored_history.len(), pending_history.len() + 1);
+    assert_eq!(
+        &restored_history[..pending_history.len()],
+        pending_history.as_slice()
+    );
+    assert_eq!(restored.front.review_cycle, pending.front.review_cycle);
+    let review_decision = restored_history.last().unwrap();
+    assert_eq!(review_decision.operation, "verify");
+    assert_eq!(review_decision.status, "accepted");
+    assert_eq!(review_decision.cycle, restored.front.review_cycle);
+    assert_eq!(review_decision.digest, digest);
+    assert_eq!(review_decision.evidence.as_deref(), Some(review_reason));
+    assert!(matches!(
+        &review_decision.finalizer,
+        ActorSnapshot::Operator { .. }
+    ));
+
+    let invalidation_reason = "Operator invalidates the guidance after contrary evidence";
+    cad347_vendor_refuse(
+        &world,
+        slug,
+        Asserted::Operator,
+        "memory_finalize",
+        params("invalidate", &mismatched_digest, invalidation_reason),
+    );
+    assert_state("accepted", true);
+    cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_finalize",
+        params("invalidate", &digest, invalidation_reason),
+    )
+    .expect("actual current-digest operator invalidation");
+    let invalidated = assert_state("invalidated", false);
+    let invalidated_history = &invalidated.front.policy.as_ref().unwrap().finalizations;
+    assert_eq!(invalidated_history.len(), restored_history.len() + 1);
+    assert_eq!(
+        &invalidated_history[..restored_history.len()],
+        restored_history.as_slice()
+    );
+    assert!(invalidated.front.review_cycle > restored.front.review_cycle);
+    let invalidation = invalidated_history.last().unwrap();
+    assert_eq!(invalidation.operation, "invalidate");
+    assert_eq!(invalidation.status, "invalidated");
+    assert_eq!(invalidation.digest, digest);
+    assert_eq!(invalidation.evidence.as_deref(), Some(invalidation_reason));
+    assert!(matches!(
+        &invalidation.finalizer,
+        ActorSnapshot::Operator { .. }
+    ));
+
+    for operation in ["accept", "verify", "revalidate"] {
+        cad347_vendor_refuse(
+            &world,
+            slug,
+            Asserted::Operator,
+            "memory_finalize",
+            params(
+                operation,
+                &digest,
+                "Terminal invalidation must not reopen in place",
+            ),
+        );
+    }
+    assert_state("invalidated", false);
+}
+
+#[test]
+fn cad347_operator_rejected_candidate_is_retained_and_cannot_be_resurrected() {
+    let world = World::open();
+    world.memory_agent("cad347-reject-worker", "worker");
+    world.memory_agent("cad347-reject-pm", "pm");
+    let slug = "cad347-rejected-candidate";
+    let proposal = cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_propose",
+        propose_params(
+            slug,
+            "rule",
+            json!({"project": true}),
+            "REJECTED FACT — retain the candidate without ever supplying it",
+        ),
+    )
+    .expect("actual native judgement candidate");
+    let digest = proposal["digest"].as_str().unwrap().to_string();
+    let candidate = stored(&world, slug);
+    assert_eq!(candidate.front.status, "proposed");
+    assert!(!retrieval(&world, slug).0);
+    assert!(candidate
+        .front
+        .policy
+        .as_ref()
+        .unwrap()
+        .finalizations
+        .is_empty());
+    let reason = "Operator rejects the candidate because its evidence does not support the claim";
+    let rejection_params = |expected: &str| {
+        let mut params = finalize_params(slug, "reject", expected);
+        params["evidence"] = json!(reason);
+        params
+    };
+    for who in [
+        agent("cad347-reject-worker"),
+        agent("cad347-reject-pm"),
+        Asserted::Unproven,
+    ] {
+        cad347_vendor_refuse(
+            &world,
+            slug,
+            who,
+            "memory_finalize",
+            rejection_params(&digest),
+        );
+    }
+    let mut mismatched_digest = digest.clone();
+    let replacement = if digest.starts_with('0') { "1" } else { "0" };
+    mismatched_digest.replace_range(..1, replacement);
+    cad347_vendor_refuse(
+        &world,
+        slug,
+        Asserted::Operator,
+        "memory_finalize",
+        rejection_params(&mismatched_digest),
+    );
+    cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_finalize",
+        rejection_params(&digest),
+    )
+    .expect("actual current-digest operator rejection");
+    let rejected = stored(&world, slug);
+    assert_eq!(rejected.front.status, "rejected");
+    assert_eq!(rejected.body, candidate.body);
+    assert_eq!(crate::memory::semantic_digest(&rejected), digest);
+    assert!(!retrieval(&world, slug).0);
+    let history = &rejected.front.policy.as_ref().unwrap().finalizations;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].operation, "reject");
+    assert_eq!(history[0].status, "rejected");
+    assert_eq!(history[0].digest, digest);
+    assert_eq!(history[0].evidence.as_deref(), Some(reason));
+    assert!(matches!(
+        &history[0].finalizer,
+        crate::memory::policy::ActorSnapshot::Operator { .. },
+    ));
+    for operation in ["accept", "verify", "revalidate"] {
+        let mut params = finalize_params(slug, operation, &digest);
+        params["evidence"] = json!("Rejected candidate must not be resurrected in place");
+        cad347_vendor_refuse(&world, slug, Asserted::Operator, "memory_finalize", params);
+    }
+    let pm = crate::issue::Pm::at(&world.pm()).unwrap();
+    let task = new_task(&world, "Rejected guidance remains unavailable", &[]);
+    let (matched, errors) = crate::memory::match_for_issue(&pm, &task, Some("inbox"), None)
+        .expect("real rejected-record match");
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(!slugs(&matched).contains(slug));
+    let (_, supplied) = crate::memory::render_lessons(&matched);
+    assert!(!supplied.iter().any(|supplied| supplied == slug));
+    let (rules, errors) = crate::memory::project_rules(&pm, PROJECT, None);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(!slugs(&rules).contains(slug));
+    let retained = stored(&world, slug);
+    assert_eq!(retained.body, candidate.body);
+    assert_eq!(
+        retained.front.policy.as_ref().unwrap().finalizations,
+        *history
+    );
+}
+
+#[test]
+fn cad347_accepted_classification_preserves_inactivity_until_authenticated_use() {
+    use crate::memory::{self, policy::ActorSnapshot};
+
+    let world = World::open();
+    cad347_vendor_agent(&world, "cad347-author", "inbox", Some("openai/gpt-5"));
+    cad347_vendor_agent(
+        &world,
+        "cad347-curator",
+        "pi",
+        Some("anthropic/claude-sonnet-4-5"),
+    );
+    cad347_vendor_identity(
+        &world,
+        "cad347-curator",
+        Some("anthropic/claude-sonnet-4-5"),
+        "0123456789abcdef0123456789abcdef",
+    );
+    let slug = "cad347-feedback-lesson";
+    let proposal = cad347_vendor_rpc(
+        &world,
+        agent("cad347-author"),
+        "memory_propose",
+        propose_params(
+            slug,
+            "rule",
+            json!({"project": true}),
+            "CLASSIFICATION FACT — source attestation and review are not reported use",
+        ),
+    )
+    .expect("actual new native agent-claimed judgement");
+    let old_digest = proposal["digest"].as_str().unwrap().to_string();
+    cad347_vendor_rpc(
+        &world,
+        Asserted::Operator,
+        "memory_finalize",
+        finalize_params(slug, "accept", &old_digest),
+    )
+    .expect("actual operator acceptance before source classification");
+
+    // Historical-clock fixture only: age the ACTUAL native acceptance.
+    // Do not manufacture any authority, model, usage or check receipt.
+    let mut accepted = stored(&world, slug);
+    assert_eq!(accepted.front.status, "accepted");
+    let accepted_at = crate::issue::time::now_epoch() - 27 * 86_400;
+    let original_expiry = accepted_at + 28 * 86_400;
+    accepted.front.created = crate::issue::time::iso(accepted_at - 86_400);
+    {
+        let policy = accepted.front.policy.as_mut().unwrap();
+        assert_eq!(policy.provenance, memory::policy::Provenance::AgentClaimed);
+        assert_eq!(policy.finalizations.len(), 1);
+        let receipt = &mut policy.finalizations[0];
+        assert_eq!(receipt.operation, "accept");
+        assert_eq!(receipt.status, "accepted");
+        assert_eq!(receipt.digest, old_digest);
+        assert!(matches!(&receipt.finalizer, ActorSnapshot::Operator { .. }));
+        receipt.recorded_at = crate::issue::time::iso(accepted_at);
+    }
+    assert_eq!(memory::semantic_digest(&accepted), old_digest);
+    let pm = crate::issue::Pm::at(&world.pm()).unwrap();
+    {
+        let lock = pm
+            .lock_for_paths(std::slice::from_ref(&accepted.path))
+            .expect("historical timestamp fixture scoped lock");
+        let yaml = serde_yaml::to_string(&accepted.front).unwrap();
+        std::fs::write(
+            &accepted.path,
+            format!("---\n{yaml}---\n\n{}", accepted.body),
+        )
+        .expect("persist only historical timestamp metadata");
+        pm.commit_scoped(
+            &lock,
+            std::slice::from_ref(&accepted.path),
+            "Historical acceptance clock for classification inactivity regression\n\nActor: test\n",
+        )
+        .expect("commit only historical fixture metadata");
+    }
+    let historical = stored(&world, slug);
+    let original_history = historical
+        .front
+        .policy
+        .as_ref()
+        .unwrap()
+        .finalizations
+        .clone();
+    let original_body = historical.body.clone();
+    assert_eq!(memory::semantic_digest(&historical), old_digest);
+    assert!(memory::retrieval_status(&historical).0);
+    assert!(cad347_feedback_supplied(&world, original_expiry - 1));
+    assert!(!cad347_feedback_supplied(&world, original_expiry));
+
+    let digest = cad347_vendor_attest(&world, slug, &old_digest);
+    let classified = stored(&world, slug);
+    assert_eq!(classified.front.status, "pending-revalidation");
+    assert_eq!(classified.body, original_body);
+    assert_eq!(
+        classified.front.policy.as_ref().unwrap().finalizations,
+        original_history
+    );
+    assert!(!cad347_feedback_supplied(&world, original_expiry - 1));
+
+    // Operator source classification cannot replace the first curator.
+    cad347_vendor_refuse(
+        &world,
+        slug,
+        Asserted::Operator,
+        "memory_finalize",
+        finalize_params(slug, "verify", &digest),
+    );
+    cad347_vendor_rpc(
+        &world,
+        agent("cad347-curator"),
+        "memory_review",
+        review_params(slug, "verify", "pass", &digest),
+    )
+    .expect("current-cycle confirmed cross-vendor curator verification");
+    assert!(
+        !retrieval(&world, slug).0,
+        "review alone is not finalization"
+    );
+    cad347_vendor_rpc(
+        &world,
+        agent("cad347-curator"),
+        "memory_finalize",
+        finalize_params(slug, "verify", &digest),
+    )
+    .expect("qualifying curator finalizes current-cycle revalidation");
+
+    let restored = stored(&world, slug);
+    assert_eq!(restored.front.status, "accepted");
+    assert_eq!(restored.body, original_body);
+    assert_eq!(memory::semantic_digest(&restored), digest);
+    assert!(memory::retrieval_status(&restored).0);
+    assert!(restored.front.verified_at.is_none());
+    assert!(memory::last_verified(&restored).is_none());
+    let policy = restored.front.policy.as_ref().unwrap();
+    assert_eq!(
+        &policy.finalizations[..original_history.len()],
+        original_history.as_slice()
+    );
+    let decision = policy.finalizations.last().unwrap();
+    assert_eq!(decision.operation, "verify");
+    assert_eq!(decision.digest, digest);
+    assert!(crate::issue::time::parse_iso(&decision.recorded_at).unwrap() > accepted_at);
+    assert_eq!(policy.feedback.used_reports, 0);
+    assert!(policy.feedback.last_use.is_none());
+
+    // Expected RED on the reviewed head: successful revalidation must
+    // restore supply, without renewing the original inactivity lifetime.
+    assert!(
+        cad347_feedback_supplied(&world, original_expiry - 1),
+        "current-digest revalidation must restore guidance before its original inactivity expiry"
+    );
+    assert!(!cad347_feedback_supplied(&world, original_expiry));
+    assert!(!cad347_feedback_supplied(&world, original_expiry + 1));
+
+    let issue = cad347_feedback_issue(&world, PROJECT);
+    let message = "cad347-classified-use-turn";
+    let token = cad347_feedback_turn(&world, "cad347-curator", message, None, Some(&issue));
+    for kind in ["wrong", "reread"] {
+        cad347_vendor_rpc(
+            &world,
+            agent("cad347-curator"),
+            "memory_feedback",
+            cad347_feedback_params(&digest, message, &token, kind),
+        )
+        .expect("authenticated non-use feedback on the classified claim");
+        assert!(cad347_feedback_metadata(&world)["last_use"].is_null());
+        assert!(!cad347_feedback_supplied(&world, original_expiry));
+    }
+    cad347_vendor_rpc(
+        &world,
+        agent("cad347-curator"),
+        "memory_feedback",
+        cad347_feedback_params(&digest, message, &token, "used"),
+    )
+    .expect("current owned-turn same-project genuine used report");
+    let feedback = cad347_feedback_metadata(&world);
+    assert_eq!(feedback["used_reports"].as_u64(), Some(1));
+    assert_eq!(
+        feedback["last_use"]["digest"].as_str(),
+        Some(digest.as_str())
+    );
+    assert_eq!(feedback["last_use"]["message"].as_str(), Some(message));
+    let used_at =
+        crate::issue::time::parse_iso(feedback["last_use"]["recorded_at"].as_str().unwrap())
+            .unwrap();
+    assert!(cad347_feedback_supplied(&world, original_expiry + 1));
+    assert!(cad347_feedback_supplied(&world, used_at + 28 * 86_400 - 1));
+    assert!(!cad347_feedback_supplied(&world, used_at + 28 * 86_400));
+    let retained = stored(&world, slug);
+    assert_eq!(memory::semantic_digest(&retained), digest);
+    assert_eq!(retained.body, original_body);
+    assert_eq!(
+        &retained.front.policy.as_ref().unwrap().finalizations[..original_history.len()],
+        original_history.as_slice()
+    );
+    assert!(retained.front.verified_at.is_none());
+    assert!(memory::last_verified(&retained).is_none());
+    assert!(!std::fs::read_to_string(&retained.path)
+        .unwrap()
+        .contains(&token));
+}
+
+#[test]
+fn cad347_mixed_case_http_sources_stay_external_and_operator_only() {
+    for source in [
+        "HTTPS://example.invalid/cad347/external-source",
+        "HTTP://example.invalid/cad347/external-source",
+        "HtTpS://example.invalid/cad347/external-source",
+        "hTtP://example.invalid/cad347/external-source",
+    ] {
+        let world = World::open();
+        cad347_vendor_agent(&world, "cad347-author", "inbox", Some("openai/gpt-5"));
+        cad347_vendor_agent(
+            &world,
+            "cad347-curator",
+            "inbox",
+            Some("anthropic/claude-sonnet-4-5"),
+        );
+        let slug = "cad347-mixed-case-external";
+        let mut params = propose_params(
+            slug,
+            "rule",
+            json!({"project": true}),
+            "External source spelling does not grant native provenance or release authority",
+        );
+        params["source"] = json!(source);
+        let proposal = cad347_vendor_rpc(&world, agent("cad347-author"), "memory_propose", params)
+            .expect("native proposal with a valid mixed-case HTTP source");
+        let digest = proposal["digest"].as_str().unwrap().to_string();
+        assert_eq!(proposal["policy_revision"].as_u64(), Some(2));
+        assert_eq!(
+            proposal["status"].as_str(),
+            Some("quarantined"),
+            "HTTP scheme case must not bypass external quarantine: {source}"
+        );
+        let candidate = stored(&world, slug);
+        let front = serde_json::to_value(&candidate.front).unwrap();
+        assert_eq!(candidate.front.status, "quarantined");
+        assert_eq!(candidate.front.source.as_deref(), Some(source));
+        assert_eq!(
+            front["policy"]["provenance"].as_str(),
+            Some("external-derived")
+        );
+        assert!(front["policy"]["attestations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(front["policy"]["finalizations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(!retrieval(&world, slug).0);
+        assert!(crate::memory::last_verified(&candidate).is_none());
+        let pm = crate::issue::Pm::at(&world.pm()).unwrap();
+        let (rules, errors) = crate::memory::project_rules(&pm, PROJECT, None);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!slugs(&rules).contains(slug));
+        assert!(!crate::memory::render_lessons(&rules)
+            .1
+            .iter()
+            .any(|id| id == slug));
+
+        // Even a positively asserted operator's source-classification verb
+        // cannot convert external evidence into native agent verification.
+        cad347_closed_refuse(
+            &world,
+            Asserted::Operator,
+            "memory_classify",
+            json!({
+                "project": PROJECT,
+                "slug": slug,
+                "digest": digest,
+                "provenance": "agent-verified",
+                "evidence": "External evidence must not become native provenance through scheme spelling",
+            }),
+        );
+        assert_eq!(digest_of(&world, slug), digest);
+        assert_eq!(stored(&world, slug).front.status, "quarantined");
+
+        // A confirmed independent curator may record its review, but that
+        // receipt cannot replace the external source's operator release.
+        cad347_vendor_rpc(
+            &world,
+            agent("cad347-curator"),
+            "memory_review",
+            review_params(slug, "accept", "pass", &digest),
+        )
+        .expect("native independent curator review is not an external release");
+        for who in [
+            agent("cad347-author"),
+            agent("cad347-curator"),
+            Asserted::Unproven,
+        ] {
+            cad347_closed_refuse(
+                &world,
+                who,
+                "memory_finalize",
+                finalize_params(slug, "accept", &digest),
+            );
+        }
+        assert!(!retrieval(&world, slug).0);
+        let unreleased = stored(&world, slug);
+        let unreleased_front = serde_json::to_value(&unreleased.front).unwrap();
+        assert_eq!(unreleased.front.status, "quarantined");
+        assert_eq!(
+            unreleased_front["policy"]["provenance"].as_str(),
+            Some("external-derived")
+        );
+        assert!(unreleased_front["policy"]["attestations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(unreleased_front["policy"]["finalizations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        cad347_vendor_rpc(
+            &world,
+            Asserted::Operator,
+            "memory_finalize",
+            finalize_params(slug, "accept", &digest),
+        )
+        .expect("positive operator release of the exact external judgement");
+        let released = stored(&world, slug);
+        let released_front = serde_json::to_value(&released.front).unwrap();
+        assert_eq!(released.front.status, "accepted");
+        assert_eq!(released.front.source.as_deref(), Some(source));
+        assert_eq!(crate::memory::semantic_digest(&released), digest);
+        assert_eq!(
+            released_front["policy"]["provenance"].as_str(),
+            Some("external-derived")
+        );
+        assert!(released_front["policy"]["attestations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let decision = released_front["policy"]["finalizations"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(decision["operation"].as_str(), Some("accept"));
+        assert_eq!(decision["digest"].as_str(), Some(digest.as_str()));
+        assert_eq!(decision["finalizer"]["kind"].as_str(), Some("operator"));
+        assert!(retrieval(&world, slug).0);
+        assert!(released.front.verified_at.is_none());
+        assert!(crate::memory::last_verified(&released).is_none());
+        let (rules, errors) = crate::memory::project_rules(&pm, PROJECT, None);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(slugs(&rules), BTreeSet::from([slug.to_string()]));
+        assert_eq!(
+            crate::memory::render_lessons(&rules).1,
+            vec![slug.to_string()]
+        );
+    }
+}
+
+#[test]
+fn cad347_feedback_rechecks_turn_retired_while_waiting_for_memory_lock() {
+    for retirement in ["completed", "replaced-endpoint"] {
+        let (world, digest, old_expiry) = cad347_feedback_world();
+        let issue = cad347_feedback_issue(&world, PROJECT);
+        let message = "cad347-feedback-lock-wait";
+        let token = cad347_feedback_turn(
+            &world,
+            "cad347-feedback-worker",
+            message,
+            None,
+            Some(&issue),
+        );
+        let request = cad347_feedback_params(&digest, message, &token, "used");
+        let memory = stored(&world, "cad347-feedback-lesson");
+        let pm = crate::issue::Pm::at(&world.pm()).unwrap();
+        let active = world.shared.store.message(message).unwrap().unwrap();
+        assert_eq!(active.state, "running");
+        assert_eq!(active.turn_id.as_deref(), Some(token.as_str()));
+        assert_eq!(
+            cad347_feedback_metadata(&world)["used_reports"].as_u64(),
+            Some(0)
+        );
+        assert!(cad347_feedback_metadata(&world)["last_use"].is_null());
+        assert!(cad347_feedback_supplied(&world, old_expiry - 1));
+        assert!(!cad347_feedback_supplied(&world, old_expiry));
+
+        let successor_message = "cad347-feedback-lock-successor";
+        let successor_token = std::thread::scope(|scope| {
+            let held = pm
+                .lock_for_paths(std::slice::from_ref(&memory.path))
+                .expect("hold the actual canonical memory write lock");
+            let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+            let feedback_world = &world;
+            let waiter = scope.spawn(move || {
+                crate::issue::set_lock_waiting_observer_for_test(Some(waiting_tx));
+                let result = cad347_vendor_rpc(
+                    feedback_world,
+                    agent("cad347-feedback-worker"),
+                    "memory_feedback",
+                    request,
+                );
+                crate::issue::set_lock_waiting_observer_for_test(None);
+                result
+            });
+            waiting_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("native feedback never contended on the real PM lock");
+
+            // The transition must finish while the PM lock remains held.
+            // Holding the store mutex while waiting for PM would deadlock
+            // this ordering and must not satisfy the refusal oracle.
+            let (retired_tx, retired_rx) = std::sync::mpsc::channel();
+            let lifecycle_world = &world;
+            let retired = scope.spawn(move || {
+                match retirement {
+                    "completed" => {
+                        lifecycle_world
+                            .shared
+                            .store
+                            .finish_running(
+                                message,
+                                "completed",
+                                &json!({"text": "Native turn completed while feedback waited"}),
+                                None,
+                            )
+                            .expect("native completion transaction")
+                            .expect("the previously running turn must actually complete");
+                        let current = lifecycle_world
+                            .shared
+                            .store
+                            .message(message)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(current.state, "completed");
+                    }
+                    "replaced-endpoint" => {
+                        cad347_vendor_identity(
+                            lifecycle_world,
+                            "cad347-feedback-worker",
+                            None,
+                            "fedcba9876543210fedcba9876543210",
+                        );
+                        let current = lifecycle_world
+                            .shared
+                            .store
+                            .message(message)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(current.state, "unknown");
+                        let endpoint = lifecycle_world
+                            .shared
+                            .store
+                            .agent("cad347-feedback-worker")
+                            .unwrap();
+                        assert_eq!(
+                            endpoint.generation.as_deref(),
+                            Some("fedcba9876543210fedcba9876543210")
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                let successor_token = cad347_feedback_turn(
+                    lifecycle_world,
+                    "cad347-feedback-worker",
+                    successor_message,
+                    None,
+                    Some(&issue),
+                );
+                let successor = lifecycle_world
+                    .shared
+                    .store
+                    .message(successor_message)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(successor.state, "running");
+                assert_eq!(successor.turn_id.as_deref(), Some(successor_token.as_str()));
+                retired_tx.send(()).unwrap();
+                successor_token
+            });
+            retired_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("native lifecycle could not advance while feedback waited; do not hold Store before PM");
+            let successor_token = retired.join().expect("native lifecycle transition failed");
+            assert_ne!(successor_token, token);
+            assert!(
+                !waiter.is_finished(),
+                "feedback must still be waiting, not have escaped through a timeout or early refusal"
+            );
+
+            // Snapshot AFTER the intentional native lifecycle writes:
+            // only the pending feedback request must leave no effect.
+            let before = world.snap();
+            let before_files = cad347_memory_tree(&world);
+            let before_bytes = std::fs::read(&memory.path).unwrap();
+            let before_head = crate::issue::git(&world.pm(), &["rev-parse", "HEAD"]).unwrap();
+            let before_feedback = cad347_feedback_metadata(&world);
+            drop(held);
+            let result = waiter.join().expect("native feedback thread failed");
+            world.assert_refused(result, &before);
+            assert_eq!(cad347_memory_tree(&world), before_files);
+            assert_eq!(std::fs::read(&memory.path).unwrap(), before_bytes);
+            assert_eq!(
+                crate::issue::git(&world.pm(), &["rev-parse", "HEAD"]).unwrap(),
+                before_head
+            );
+            assert_eq!(cad347_feedback_metadata(&world), before_feedback);
+            assert_eq!(
+                cad347_feedback_metadata(&world)["used_reports"].as_u64(),
+                Some(0)
+            );
+            assert!(cad347_feedback_metadata(&world)["last_use"].is_null());
+            assert_eq!(digest_of(&world, "cad347-feedback-lesson"), digest);
+            assert!(cad347_feedback_supplied(&world, old_expiry - 1));
+            assert!(!cad347_feedback_supplied(&world, old_expiry));
+            let bytes = std::fs::read_to_string(&memory.path).unwrap();
+            assert!(!bytes.contains(&token));
+            assert!(!bytes.contains(&successor_token));
+            successor_token
+        });
+
+        // A current successor remains able to report genuine use: a
+        // blanket feedback refusal cannot make the negative case pass.
+        cad347_vendor_rpc(
+            &world,
+            agent("cad347-feedback-worker"),
+            "memory_feedback",
+            cad347_feedback_params(&digest, successor_message, &successor_token, "used"),
+        )
+        .expect("the current successor turn can report same-project use");
+        let feedback = cad347_feedback_metadata(&world);
+        assert_eq!(feedback["used_reports"].as_u64(), Some(1));
+        assert_eq!(
+            feedback["last_use"]["message"].as_str(),
+            Some(successor_message)
+        );
+        assert_eq!(
+            feedback["last_use"]["digest"].as_str(),
+            Some(digest.as_str())
+        );
+        assert!(cad347_feedback_supplied(&world, old_expiry));
+        assert_eq!(digest_of(&world, "cad347-feedback-lesson"), digest);
+        assert!(crate::memory::last_verified(&stored(&world, "cad347-feedback-lesson")).is_none());
+        let bytes = std::fs::read_to_string(&memory.path).unwrap();
+        assert!(!bytes.contains(&token));
+        assert!(!bytes.contains(&successor_token));
+    }
+}
+
+#[test]
+fn cad347_feedback_post_save_lease_loss_restores_before_any_git_commit() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let (world, digest, old_expiry) = cad347_feedback_world();
+    let issue = cad347_feedback_issue(&world, PROJECT);
+    let message = "cad347-feedback-post-save";
+    let token = cad347_feedback_turn(
+        &world,
+        "cad347-feedback-worker",
+        message,
+        None,
+        Some(&issue),
+    );
+    let request = cad347_feedback_params(&digest, message, &token, "used");
+    let memory = stored(&world, "cad347-feedback-lesson");
+    let before = world.snap();
+    let before_tree = cad347_memory_tree(&world);
+    let before_bytes = std::fs::read(&memory.path).unwrap();
+    let before_head = crate::issue::git(&world.pm(), &["rev-parse", "HEAD"]).unwrap();
+    let before_feedback = cad347_feedback_metadata(&world);
+    assert_eq!(before_feedback["used_reports"].as_u64(), Some(0));
+    assert!(before_feedback["last_use"].is_null());
+    assert!(cad347_feedback_supplied(&world, old_expiry - 1));
+    assert!(!cad347_feedback_supplied(&world, old_expiry));
+
+    let fence = Arc::new(crate::lease::Fence::default());
+    world.shared.store.install_write_fence(Arc::clone(&fence));
+    let reached = Arc::new(AtomicBool::new(false));
+    let hook_reached = Arc::clone(&reached);
+    let hook_fence = Arc::clone(&fence);
+    let hook_path = memory.path.clone();
+    let hook_before_bytes = before_bytes.clone();
+    let hook_digest = digest.clone();
+    let hook_token = token.clone();
+    crate::memory::v2::set_feedback_after_save_hook_for_test(Some(Box::new(move || {
+        // Inspect canonical FILE bytes only: never re-enter Store here.
+        let saved = std::fs::read(&hook_path).expect("canonical feedback was actually saved");
+        assert_ne!(saved, hook_before_bytes);
+        let saved = String::from_utf8(saved).unwrap();
+        let (front, _) = crate::memory::parse_memory(&saved).unwrap();
+        let policy = front.policy.expect("the saved record remains v2");
+        assert_eq!(policy.feedback.used_reports, 1);
+        let receipt = policy
+            .feedback
+            .last_use
+            .expect("the actual save contains the used receipt");
+        assert_eq!(receipt.message, message);
+        assert_eq!(receipt.digest, hook_digest);
+        assert!(!saved.contains(&hook_token));
+        hook_reached.store(true, Ordering::SeqCst);
+        hook_fence
+            .trip("lease lost after canonical feedback save and before Store callback return");
+    })));
+    let result = cad347_vendor_rpc(
+        &world,
+        agent("cad347-feedback-worker"),
+        "memory_feedback",
+        request.clone(),
+    );
+    crate::memory::v2::set_feedback_after_save_hook_for_test(None);
+    assert!(
+        reached.load(Ordering::SeqCst),
+        "the real native handler must save feedback before the fault; blanket refusal is not evidence"
+    );
+    assert!(fence.tripped());
+    world.assert_refused(result, &before);
+
+    // Store rollback alone cannot undo a canonical file: the armed PM
+    // write guard must restore it before the refused RPC returns.
+    assert_eq!(cad347_memory_tree(&world), before_tree);
+    assert_eq!(std::fs::read(&memory.path).unwrap(), before_bytes);
+    assert_eq!(
+        crate::issue::git(&world.pm(), &["rev-parse", "HEAD"]).unwrap(),
+        before_head
+    );
+    assert_eq!(cad347_feedback_metadata(&world), before_feedback);
+    assert_eq!(
+        cad347_feedback_metadata(&world)["used_reports"].as_u64(),
+        Some(0)
+    );
+    assert!(cad347_feedback_metadata(&world)["last_use"].is_null());
+    assert_eq!(digest_of(&world, "cad347-feedback-lesson"), digest);
+    assert!(cad347_feedback_supplied(&world, old_expiry - 1));
+    assert!(!cad347_feedback_supplied(&world, old_expiry));
+    assert!(crate::memory::last_verified(&stored(&world, "cad347-feedback-lesson")).is_none());
+    assert!(!std::fs::read_to_string(&memory.path)
+        .unwrap()
+        .contains(&token));
+
+    // This is the actual installed native write fence, not a fake
+    // callback error or an observer manufacturing a passing check.
+    world
+        .shared
+        .store
+        .event_public("daemon", "cad347-must-refuse-after-save-loss", json!({}))
+        .expect_err("the installed native Store write fence must now refuse writes");
+
+    // An explicit later call remains fenced and cannot renew inactivity,
+    // add a report or create a tracker commit by replaying the first call.
+    let before_retry = world.snap();
+    let retry = cad347_vendor_rpc(
+        &world,
+        agent("cad347-feedback-worker"),
+        "memory_feedback",
+        request,
+    );
+    world.assert_refused(retry, &before_retry);
+    assert_eq!(cad347_memory_tree(&world), before_tree);
+    assert_eq!(std::fs::read(&memory.path).unwrap(), before_bytes);
+    assert_eq!(
+        crate::issue::git(&world.pm(), &["rev-parse", "HEAD"]).unwrap(),
+        before_head
+    );
+    assert_eq!(cad347_feedback_metadata(&world), before_feedback);
+    assert!(!cad347_feedback_supplied(&world, old_expiry));
+}
+
+#[test]
+fn cad347_feedback_rejects_raw_turn_token_in_evidence_without_partial_effects() {
+    let (world, digest, old_expiry) = cad347_feedback_world();
+    let issue = cad347_feedback_issue(&world, PROJECT);
+    let message = "cad347-feedback-token-evidence";
+    let token = cad347_feedback_turn(
+        &world,
+        "cad347-feedback-worker",
+        message,
+        None,
+        Some(&issue),
+    );
+    let safe = cad347_feedback_params(&digest, message, &token, "used");
+    let active = world.shared.store.message(message).unwrap().unwrap();
+    assert_eq!(active.alias, "cad347-feedback-worker");
+    assert_eq!(active.state, "running");
+    assert!(active.turn_id.as_deref() == Some(token.as_str()));
+    let memory = stored(&world, "cad347-feedback-lesson");
+    let before = world.snap();
+    let before_tree = cad347_memory_tree(&world);
+    let before_bytes = std::fs::read(&memory.path).unwrap();
+    let before_head = crate::issue::git(&world.pm(), &["rev-parse", "HEAD"]).unwrap();
+    let before_feedback = cad347_feedback_metadata(&world);
+    assert_eq!(before_feedback["used_reports"].as_u64(), Some(0));
+    assert!(before_feedback["last_use"].is_null());
+    assert!(cad347_feedback_supplied(&world, old_expiry - 1));
+    assert!(!cad347_feedback_supplied(&world, old_expiry));
+    assert!(!std::fs::read_to_string(&memory.path)
+        .unwrap()
+        .contains(&token));
+
+    // The authenticated token belongs only in its native proof field,
+    // never in durable evidence, including when embedded in prose.
+    let mut unsafe_evidence = safe.clone();
+    unsafe_evidence["evidence"] = json!(format!("Manual use recorded during {token}."));
+    let error = match cad347_vendor_rpc(
+        &world,
+        agent("cad347-feedback-worker"),
+        "memory_feedback",
+        unsafe_evidence,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("native feedback accepted a raw active turn token in durable evidence"),
+    };
+    assert!(
+        !error.to_string().contains(&token),
+        "feedback refusal echoed the raw active turn token"
+    );
+    world.assert_refused(Err(error), &before);
+    // Boolean comparisons deliberately avoid printing token-bearing
+    // canonical data if a future implementation partially writes it.
+    assert!(
+        cad347_memory_tree(&world) == before_tree,
+        "refused token-bearing evidence changed the canonical memory tree"
+    );
+    assert!(
+        std::fs::read(&memory.path).unwrap() == before_bytes,
+        "refused token-bearing evidence changed canonical bytes"
+    );
+    assert_eq!(
+        crate::issue::git(&world.pm(), &["rev-parse", "HEAD"]).unwrap(),
+        before_head
+    );
+    assert!(
+        cad347_feedback_metadata(&world) == before_feedback,
+        "refused token-bearing evidence changed counters or latest receipts"
+    );
+    assert_eq!(digest_of(&world, "cad347-feedback-lesson"), digest);
+    assert!(cad347_feedback_supplied(&world, old_expiry - 1));
+    assert!(!cad347_feedback_supplied(&world, old_expiry));
+    assert!(!std::fs::read_to_string(&memory.path)
+        .unwrap()
+        .contains(&token));
+
+    // The SAME active native turn and token must still accept safe
+    // evidence: neither blanket feedback refusal nor turn retirement
+    // may satisfy the bad-case oracle.
+    let still_active = world.shared.store.message(message).unwrap().unwrap();
+    assert_eq!(still_active.state, "running");
+    assert!(still_active.turn_id.as_deref() == Some(token.as_str()));
+    let accepted = cad347_vendor_rpc(
+        &world,
+        agent("cad347-feedback-worker"),
+        "memory_feedback",
+        safe,
+    )
+    .expect("safe evidence succeeds on the same still-active owned turn");
+    assert_eq!(accepted["committed"].as_bool(), Some(true));
+    let feedback = cad347_feedback_metadata(&world);
+    assert_eq!(feedback["used_reports"].as_u64(), Some(1));
+    assert_eq!(feedback["wrong_reports"], before_feedback["wrong_reports"]);
+    assert_eq!(
+        feedback["reread_reports"],
+        before_feedback["reread_reports"]
+    );
+    assert_eq!(feedback["last_use"]["message"].as_str(), Some(message));
+    assert_eq!(
+        feedback["last_use"]["digest"].as_str(),
+        Some(digest.as_str())
+    );
+    let used_at =
+        crate::issue::time::parse_iso(feedback["last_use"]["recorded_at"].as_str().unwrap())
+            .unwrap();
+    assert!(cad347_feedback_supplied(&world, old_expiry));
+    assert!(cad347_feedback_supplied(&world, used_at + 28 * 86_400 - 1));
+    assert!(!cad347_feedback_supplied(&world, used_at + 28 * 86_400));
+    let retained = stored(&world, "cad347-feedback-lesson");
+    assert_eq!(crate::memory::semantic_digest(&retained), digest);
+    assert_eq!(retained.body, memory.body);
+    assert!(retained.front.verified_at.is_none());
+    assert!(crate::memory::last_verified(&retained).is_none());
+    assert!(!std::fs::read_to_string(&retained.path)
+        .unwrap()
+        .contains(&token));
 }

@@ -832,6 +832,7 @@ fn memory_context(pm: &Pm, selected: &project::Project, paths: &[String]) -> Val
         paths: paths.to_vec(),
         providers: Vec::new(),
         tags: Vec::new(),
+        roles: Vec::new(),
     };
     let fresh = memory::Freshness::for_project(Some(selected));
     let matched = memory::match_memories(&pool, &context, &fresh);
@@ -1423,6 +1424,7 @@ mod tests {
                     active_operation: None,
                     reviews: Vec::new(),
                     finalizations: Vec::new(),
+                    policy: None,
                 },
                 path: PathBuf::from(format!("lesson-{index}.md")),
                 body: format!(

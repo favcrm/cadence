@@ -1676,6 +1676,73 @@ impl Store {
         }
     }
 
+    /// The caller already holds its record-scoped PM lock. Keep current native
+    /// ownership and assignment fenced through the local file save, not Git
+    /// hooks or network work. The caller restores the file if this tx fails.
+    pub(crate) fn with_memory_feedback(
+        &self,
+        expected: &Agent,
+        id: &str,
+        token: &str,
+        save: impl FnOnce(Agent, Message, String) -> Result<Value>,
+    ) -> Result<Value> {
+        self.write_tx(|tx| {
+            let agent = self.agent_in(tx, &expected.alias)?;
+            let message = self
+                .message_in(tx, id)?
+                .ok_or_else(|| Error::rejected("unknown feedback message"))?;
+            if !matches!(agent.role.as_str(), "pm" | "worker")
+                || message.alias != expected.alias
+                || message.recipient_uid.as_deref() != Some(agent.uid.as_str())
+                || message.state != "running"
+                || message.turn_id.as_deref() != Some(token)
+                || agent.uid != expected.uid
+                || agent.created.to_bits() != expected.created.to_bits()
+                || agent.generation != expected.generation
+                || agent.pid != expected.pid
+                || agent.pid_start != expected.pid_start
+                || !registry::turn_token_current(
+                    &agent.provider,
+                    &agent.endpoint_kind,
+                    agent.generation.as_deref(),
+                    token,
+                )
+            {
+                return Err(Error::rejected(
+                    "feedback requires this native agent's current owned active turn",
+                ));
+            }
+            let bound_issue = match message.task_id.as_deref() {
+                Some(task_id) => {
+                    let task = self.task_in(tx, task_id)?;
+                    let job = self.job_in(tx, &task.job_id)?;
+                    if task.assignee.as_deref() != Some(message.alias.as_str())
+                        || task.dispatch_message.as_deref() != Some(id)
+                        || !matches!(task.state.as_str(), "dispatched" | "running")
+                        || job.state != "open"
+                    {
+                        return Err(Error::rejected(
+                            "feedback task is not this active native assignment",
+                        ));
+                    }
+                    let issue = job
+                        .issue_id
+                        .ok_or_else(|| Error::rejected("feedback job has no issue scope"))?;
+                    if message.issue.as_deref().is_some_and(|bound| bound != issue) {
+                        return Err(Error::rejected(
+                            "feedback message and native job disagree on issue scope",
+                        ));
+                    }
+                    issue
+                }
+                None => message.issue.clone().ok_or_else(|| {
+                    Error::rejected("feedback message has no trusted issue scope")
+                })?,
+            };
+            save(agent, message, bound_issue)
+        })
+    }
+
     /// Read the recipient binding from the source message's durable queued
     /// event. The event log is the existing cursor/idempotency primitive, so
     /// no schema column or migration is needed for this handoff proof.

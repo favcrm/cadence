@@ -3809,6 +3809,7 @@ fn cad1846_synthetic_eligible_lesson_reaches_all_three_native_entrypoints_once()
         generation: format!("synthetic-generation-{registration}"),
         process_start: registration + 100,
         role: role.to_string(),
+        uid: None,
     };
     let make_memory = |id: &str, fact: &str, apply: &str, stale: Option<&str>| {
         let author = proof("synthetic-author", 1, "worker");
@@ -3835,6 +3836,7 @@ fn cad1846_synthetic_eligible_lesson_reaches_all_three_native_entrypoints_once()
                 active_operation: None,
                 reviews: Vec::new(),
                 finalizations: Vec::new(),
+                policy: None,
             },
             body: format!(
                 "{fact}\n\n**Why:** synthetic consumer-input evidence only\n\n**How to apply:** {apply}\n"

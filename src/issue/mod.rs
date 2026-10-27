@@ -1191,6 +1191,10 @@ mod cad1793_acceptance;
 #[path = "cad1270_screen_decl_acceptance.rs"]
 mod cad1270_screen_decl_acceptance;
 
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) fn set_lock_waiting_observer_for_test(sender: Option<std::sync::mpsc::Sender<()>>) {
+    pmlock::WAITING.with(|observer| *observer.borrow_mut() = sender);
+}
 #[cfg(test)]
 mod tests {
     use super::*;

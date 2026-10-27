@@ -68,12 +68,18 @@ fn issue_paths(pm_dir: &Path, issue: &board::Issue) -> Vec<String> {
 
 /// Match context for an issue: component, frontmatter tags,
 /// recorded-commit paths, and the target worker's provider.
-pub fn issue_ctx(pm: &Pm, issue: &board::Issue, provider: Option<&str>) -> Result<MatchCtx> {
+pub fn issue_ctx(
+    pm: &Pm,
+    issue: &board::Issue,
+    provider: Option<&str>,
+    role: Option<&str>,
+) -> Result<MatchCtx> {
     Ok(MatchCtx {
         components: issue.front.component.clone().into_iter().collect(),
         paths: issue_paths(&pm.dir, issue),
         providers: provider.map(|p| vec![p.to_string()]).unwrap_or_default(),
         tags: issue.front.tags.clone(),
+        roles: role.map(|role| vec![role.to_owned()]).unwrap_or_default(),
     })
 }
 
@@ -84,8 +90,9 @@ pub fn match_for_issue(
     pm: &Pm,
     issue: &board::Issue,
     provider: Option<&str>,
+    role: Option<&str>,
 ) -> Result<(Matched, Vec<String>)> {
-    let ctx = issue_ctx(pm, issue, provider)?;
+    let ctx = issue_ctx(pm, issue, provider, role)?;
     let (pool, errors) = load_project_report(&pm.dir, &issue.project);
     let fresh = Freshness::for_key(&pm.dir, &issue.project);
     Ok((match_memories(&pool, &ctx, &fresh), errors))

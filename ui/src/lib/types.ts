@@ -819,9 +819,9 @@ export interface MemoryQuorum {
   /** Whether this current revision is available to agents. */
   eligible: boolean;
   reason?: string | null;
-  /** Whether proposal receipts are ready for PM finalization. */
+  /** Whether the candidate's policy permits native finalization. */
   accept?: MemoryQuorumCheck | null;
-  /** Whether verification receipts are ready for PM finalization. */
+  /** Whether revalidation requirements permit native finalization. */
   verify?: MemoryQuorumCheck | null;
 }
 
@@ -835,7 +835,7 @@ export interface MemoryFinalization {
 
 /** A lesson's freshness as retrieval reads it (CAD-395). */
 export interface MemoryEvidence {
-  /** verified (inside the window) | unverified | withheld (stale mark). */
+  /** verified | unverified | withheld (stale or unused-expired). */
   state: "verified" | "unverified" | "withheld" | string;
   /** "verified <date>", "unverified (last verified <date>)", "unverified" or "withheld". */
   label: string;
@@ -844,6 +844,30 @@ export interface MemoryEvidence {
   /** The verify finalization time — not the raw verified_at field. */
   last_verified?: string | null;
   window_days?: number | null;
+}
+
+/** Bounded policy projection; canonical audit history stays in project memory. */
+export interface MemoryPolicyV2 {
+  revision: number;
+  nature: string;
+  provenance: string;
+  audience: string;
+  roles: string[];
+  author_vendor?: string | null;
+  contributors_count: number;
+  evidence_refs_count: number;
+  requirements: string[];
+  verification_condition?: {
+    check_id: string;
+    source_revision?: string | null;
+    target_revision?: string | null;
+  } | null;
+  feedback: {
+    used_reports: number;
+    wrong_reports: number;
+    reread_reports: number;
+    last_used_at?: string | null;
+  };
 }
 
 export interface MemoryCard {
@@ -873,7 +897,10 @@ export interface MemoryCard {
   /** Immutable receipts retained across review cycles. */
   review_count?: number | null;
   finalization_count?: number | null;
+  /** V2 returns the latest eight decisions; full counts/history are retained. */
   finalized_operations?: MemoryFinalization[] | null;
+  /** Absent on older daemons or for an existing legacy record. */
+  policy?: MemoryPolicyV2 | null;
   /** Absent on older daemons; absence means verification is unavailable. */
   quorum?: MemoryQuorum | null;
   fact: string;

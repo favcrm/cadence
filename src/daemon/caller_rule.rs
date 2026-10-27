@@ -436,16 +436,18 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("task_cancel", Rule::OnJob(Target::Task)),
     (
         "memory_propose",
-        Rule::Handler("memory_actor: caller_identity (CAD-381)"),
+        Rule::Handler("memory_actor: caller_identity or positive proven_operator"),
     ),
     (
         "memory_review",
-        Rule::Handler("memory_actor: caller_identity (CAD-381)"),
+        Rule::Handler("memory_actor: caller_identity; native curator evidence"),
     ),
     (
         "memory_finalize",
-        Rule::Handler("memory_actor: caller_identity (CAD-381)"),
+        Rule::Handler("memory_actor and schema-bound native finalization policy"),
     ),
+    ("memory_classify", Rule::Handler("rpc_memory_classify: proven_operator")),
+    ("memory_feedback", Rule::Handler("rpc_memory_feedback: caller_identity and owned active turn")),
     (
         "monitor_register",
         Rule::Attributed {

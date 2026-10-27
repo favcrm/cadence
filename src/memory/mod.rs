@@ -4,32 +4,32 @@
 //! frontmatter plus a body holding the fact (≤5 lines), a `**Why:**`
 //! line and a `**How to apply:**` line.
 //!
-//! Authority-bearing writes go through daemon RPC. The daemon resolves the
-//! Unix peer through its one caller-identity verifier (CAD-381) to exactly
-//! one live agent endpoint — an owned pty pane or a managed endpoint's
-//! CAD-230 enrollment — and supplies the authenticated proposer/reviewer
-//! proof; a caller with no agent identity is refused (and is not thereby
-//! the operator). Two distinct non-author PM/worker endpoint identities
-//! review the same semantic digest; an authenticated PM endpoint
-//! finalizes. Legacy records remain readable but are blocked from
-//! retrieval until a corrected native proposal is reviewed.
+//! Authority-bearing writes go through daemon RPC and its native caller
+//! verifier. No agent identity is not operator proof: operator actions need
+//! their own positive connection evidence.
 //!
-//! Only accepted memories with a valid quorum match a dispatch:
-//! `scope.project` or any of components/path-globs/tags/providers intersecting
-//! the dispatch context. A match whose evidence is explicitly marked stale
-//! is withheld with a recorded reason; one never verified, or last verified
-//! outside the project's window, is injected labelled `unverified` (see
-//! `stale_reason`, `evidence_label`). `cadence dispatch` renders the top matches into a
-//! lessons file and names it in the kickoff; the briefing lists eligible
-//! project-wide `rule`s and names withheld ones with their reason. The
-//! board and `memory ls --stale` read freshness the same way
-//! (`evidence_json`).
+//! New proposals use `policy::PolicyV2`; `policy::qualify` owns the approval
+//! matrix and `v2` owns its locked transitions. Existing v1 records retain
+//! their native two-reviewer/PM lifecycle. Incomplete historical receipts
+//! remain readable but never become retrieval authority.
+//!
+//! Retrieval requires an accepted, policy-qualified and applicable claim.
+//! Scope axes retain their union semantics; role restrictions are an
+//! additional gate. `matching` withholds explicit staleness, unknown target
+//! roles and v2 unused expiry, separately from verification-age labels.
+//! Source attestation and policy review never invent mechanical freshness.
+//!
+//! Dispatch and briefing supply bounded claim/application text, not audit
+//! histories or feedback counters. List/detail projections expose the
+//! current policy and withholding reasons on demand.
 
 mod body;
 pub mod cli;
 mod issue_matching;
 mod matching;
+pub mod policy;
 mod rendering;
+pub(crate) mod v2;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -54,7 +54,15 @@ pub use matching::{
 pub use rendering::{card_json, detail_json, render_lessons, LESSON_MAX_BYTES, LESSON_MAX_ENTRIES};
 
 pub const TYPES: &[&str] = &["rule", "gotcha", "decision", "recipe"];
-pub const STATUSES: &[&str] = &["proposed", "accepted", "rejected", "superseded"];
+pub const STATUSES: &[&str] = &[
+    "proposed",
+    "accepted",
+    "pending-revalidation",
+    "invalidated",
+    "quarantined",
+    "rejected",
+    "superseded",
+];
 pub const CONFIDENCES: &[&str] = &["low", "medium", "high"];
 
 /// The small, daemon-issued identity proof that memory records retain.
@@ -74,6 +82,9 @@ pub struct IdentityProof {
     pub generation: String,
     pub process_start: u64,
     pub role: String,
+    /// Native participant uid for v2; omission preserves legacy digest bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
 }
 
 impl IdentityProof {
@@ -212,6 +223,9 @@ pub struct Front {
     /// start a genuinely new cycle.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub finalizations: Vec<FinalizationReceipt>,
+    /// Missing means the existing v1 lifecycle, never an automatic adoption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<policy::PolicyV2>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -462,7 +476,16 @@ pub fn semantic_digest(mem: &Memory) -> String {
         scope: &mem.front.scope,
         supersedes: &mem.front.supersedes,
     };
-    let bytes = serde_json::to_vec(&revision).expect("memory semantic revision is serializable");
+    let bytes = match &mem.front.policy {
+        Some(policy) => serde_json::to_vec(&(
+            "memory-policy-v2",
+            &revision,
+            policy::semantic_fields(policy),
+        )),
+        // Do not serialize even a null policy field into old claim digests.
+        None => serde_json::to_vec(&revision),
+    }
+    .expect("memory semantic revision is serializable");
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -632,6 +655,9 @@ fn quorum_status_for_cycle(mem: &Memory, operation: &str, cycle: u64) -> (bool, 
 }
 
 pub fn quorum_status(mem: &Memory, operation: &str) -> (bool, String) {
+    if mem.front.policy.is_some() {
+        return v2::quorum_status(mem, operation);
+    }
     let Some(author) = mem.front.author_proof.as_ref() else {
         return (
             false,
@@ -658,6 +684,9 @@ pub fn quorum_status(mem: &Memory, operation: &str) -> (bool, String) {
 /// cycle is opened, native reviewer receipts do not make the lesson eligible
 /// until a PM records a matching finalization for that cycle.
 pub fn retrieval_status(mem: &Memory) -> (bool, String) {
+    if mem.front.policy.is_some() {
+        return v2::retrieval_status(mem);
+    }
     if mem.front.status != "accepted" {
         return (
             false,
@@ -764,10 +793,17 @@ pub fn retrieval_status(mem: &Memory) -> (bool, String) {
 /// verify that re-stamps the same second), which callers report
 /// honestly as `committed: false`. Only `mem.path` is staged: a
 /// tracker write never sweeps foreign files (CAD-454).
-fn commit_mem(pm: &Pm, mem: &Memory, subject: &str, actor: &str) -> Result<bool> {
+fn commit_mem(
+    pm: &Pm,
+    lock: &crate::issue::PmLock,
+    mem: &Memory,
+    subject: &str,
+    actor: &str,
+) -> Result<bool> {
     let who = write::actor_who(actor, None);
     let before = git(&pm.dir, &["rev-parse", "HEAD"]).unwrap_or_default();
-    pm.commit(
+    pm.commit_scoped(
+        lock,
         std::slice::from_ref(&mem.path),
         &format!("{subject}\n\nMemory: {}\nActor: {who}\n", mem.front.id),
     )?;
@@ -778,10 +814,16 @@ fn commit_mem(pm: &Pm, mem: &Memory, subject: &str, actor: &str) -> Result<bool>
 /// `save_mem` + `commit_mem` — a refused commit restores the prior
 /// file (or removes a new one), so a failure leaves neither an index
 /// entry nor a half-written memory behind (CAD-454).
-fn save_and_commit_mem(pm: &Pm, mem: &Memory, subject: &str, actor: &str) -> Result<bool> {
+fn save_and_commit_mem(
+    pm: &Pm,
+    lock: &crate::issue::PmLock,
+    mem: &Memory,
+    subject: &str,
+    actor: &str,
+) -> Result<bool> {
     let prev = std::fs::read(&mem.path).ok();
     save_mem(mem)?;
-    match commit_mem(pm, mem, subject, actor) {
+    match commit_mem(pm, lock, mem, subject, actor) {
         Ok(committed) => Ok(committed),
         Err(e) => {
             match &prev {
@@ -827,6 +869,9 @@ fn glob_over_budget(pat: &str) -> bool {
 /// `components` is the project's declared list (empty = anything goes).
 fn check_front(mem: &Memory, components: &[String]) -> Result<()> {
     let f = &mem.front;
+    if let Some(policy) = &f.policy {
+        policy::validate_policy(policy).map_err(Error::rejected)?;
+    }
     if f.id != mem.path.file_stem().unwrap_or_default().to_string_lossy() {
         return Err(Error::rejected(format!(
             "memory id '{}' must match its filename",
@@ -887,133 +932,18 @@ pub fn propose_native(
     pm: &Pm,
     key: &str,
     kind: &str,
-    scope: &Scope,
+    scope: Scope,
     source: Option<&str>,
     confidence: Option<&str>,
     from_text: Option<&str>,
     text: Option<&str>,
     slug: Option<&str>,
-    actor: &NativeIdentity,
+    options: policy::ProposalOptions,
+    actor: &policy::NativeActor,
 ) -> Result<Value> {
-    if !valid_identity_proof(&actor.proof) {
-        return Err(Error::rejected("native proposer identity is incomplete"));
-    }
-    let projects = project::list(&pm.dir)?;
-    let proj = projects
-        .iter()
-        .find(|p| p.key == key)
-        .ok_or_else(|| project::unknown_project(key, &pm.dir))?;
-    let (mut front, body) = match (from_text, text) {
-        (Some(raw), None) => match parse_memory(raw) {
-            Ok((f, b)) => (Some(f), b),
-            Err(_) => (None, raw.to_string()),
-        },
-        (None, Some(t)) => (None, t.to_string()),
-        (None, None) => {
-            return Err(Error::rejected(
-                "propose needs content — text or authenticated file content",
-            ))
-        }
-        (Some(_), Some(_)) => return Err(Error::rejected("propose takes one content source")),
-    };
-    // CAD-109/CAD-192: a candidate is built from verdict notes and command
-    // output, and the file is in git the moment it is written, so a
-    // credential-shaped candidate is refused here rather than quarantined.
-    let scanned = [
-        from_text.or(text).unwrap_or_default(),
-        source.unwrap_or_default(),
-    ]
-    .join("\n");
-    let secret_warnings = crate::secret::guard("memory propose", &scanned)?;
-    let slug = match slug {
-        Some(s) => check_slug(s)?,
-        None => {
-            let base = fact_line(&body);
-            let derived: String = crate::worktree::layout::slugify(&base)
-                .split('-')
-                .filter(|p| !p.is_empty())
-                .collect::<Vec<_>>()
-                .join("-");
-            check_slug(if derived.is_empty() || derived == "work" {
-                "lesson"
-            } else {
-                &derived
-            })?
-        }
-    };
-    if front
-        .as_ref()
-        .is_some_and(|candidate| !candidate.contributors.is_empty())
-    {
-        return Err(Error::rejected(
-            "authenticated multi-contributor proposals are unsupported; submit one native author proposal and review it independently",
-        ));
-    }
-    let now = time::iso(time::now_epoch());
-    let mut front = front.take().unwrap_or_else(|| Front {
-        id: slug.clone(),
-        kind: kind.to_string(),
-        status: "proposed".to_string(),
-        scope: scope.clone(),
-        source: source.map(str::to_string),
-        confidence: confidence.unwrap_or("medium").to_string(),
-        created: now.clone(),
-        verified_at: None,
-        stale: None,
-        supersedes: None,
-        author: None,
-        author_proof: None,
-        contributors: Vec::new(),
-        review_cycle: 0,
-        active_operation: None,
-        reviews: Vec::new(),
-        finalizations: Vec::new(),
-    });
-    front.id = slug.clone();
-    front.status = "proposed".to_string();
-    front.verified_at = None;
-    front.stale = None;
-    front.author = Some(actor.proof.alias.clone());
-    front.author_proof = Some(actor.proof.clone());
-    front.contributors.clear();
-    front.review_cycle = 0;
-    front.active_operation = None;
-    front.reviews.clear();
-    front.finalizations.clear();
-    let path = memory_dir(pm, key).join(format!("{slug}.md"));
-    let mem = Memory {
-        project: key.to_string(),
-        front,
-        body,
-        path,
-    };
-    check_front(&mem, &proj.components)?;
-    let _lock = pm.lock()?;
-    if mem.path.exists() {
-        return Err(Error::rejected(format!(
-            "Memory '{slug}' already exists — use a new authenticated proposal"
-        )));
-    }
-    std::fs::create_dir_all(memory_dir(pm, key))?;
-    let committed = save_and_commit_mem(
-        pm,
-        &mem,
-        &format!("{key}/memory/{slug}: proposed"),
-        &actor.proof.alias,
-    )?;
-    let mut out = json!({
-        "project": key,
-        "slug": slug,
-        "status": "proposed",
-        "digest": semantic_digest(&mem),
-        "quorum": {"eligible": false, "reason": "review required"},
-        "path": mem.path,
-        "committed": committed
-    });
-    if !secret_warnings.is_empty() {
-        out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
-    }
-    Ok(out)
+    v2::propose(
+        pm, key, kind, scope, source, confidence, from_text, text, slug, options, actor,
+    )
 }
 
 /// Submit one native review receipt. All reads that decide the revision are
@@ -1062,17 +992,47 @@ fn after_initial_find_for_test(path: &Path) {
     }
 }
 
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) fn set_review_after_initial_find_hook_for_test(
+    hook: Option<(
+        PathBuf,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+) {
+    AFTER_INITIAL_FIND_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some((path, reached, proceed)) = hook {
+            assert!(
+                slot.is_none(),
+                "native review test hook is already installed"
+            );
+            *slot = Some(AfterInitialFindHook {
+                path,
+                reached,
+                proceed,
+            });
+        } else {
+            *slot = None;
+        }
+    });
+}
+
 pub fn submit_review(
     pm: &Pm,
     flag: Option<&str>,
     slug: &str,
     request: &ReviewRequest<'_>,
-    actor: &NativeIdentity,
+    actor: &policy::NativeActor,
 ) -> Result<Value> {
     let operation = request.operation;
     let verdict = request.verdict;
     let evidence = request.evidence;
     let expected_digest = request.expected_digest;
+    let native_actor = actor;
+    let actor = actor.agent().ok_or_else(|| {
+        Error::rejected("native operators approve decisions, not curator reviews")
+    })?;
     if !matches!(operation, "accept" | "verify") {
         return Err(Error::rejected(
             "memory review operation must be accept or verify",
@@ -1100,11 +1060,14 @@ pub fn submit_review(
             "memory review requires a SHA-256 content digest",
         ));
     }
-    let (proj, _) = find(pm, flag, slug)?;
+    let (proj, initial) = find(pm, flag, slug)?;
     #[cfg(test)]
     after_initial_find_for_test(&memory_dir(pm, &proj.key).join(format!("{slug}.md")));
-    let _lock = pm.lock()?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&initial.path))?;
     let (_, mut mem) = find(pm, Some(&proj.key), slug)?;
+    if mem.front.policy.is_some() {
+        return v2::review_locked(pm, &lock, &proj, &mut mem, request, native_actor);
+    }
     let digest = semantic_digest(&mem);
     if digest != expected_digest {
         return Err(Error::rejected(format!(
@@ -1186,6 +1149,7 @@ pub fn submit_review(
     check_front(&mem, &proj.components)?;
     let committed = save_and_commit_mem(
         pm,
+        &lock,
         &mem,
         &format!("{}/memory/{slug}: review {operation} {verdict}", proj.key),
         &actor.proof.alias,
@@ -1204,16 +1168,52 @@ pub fn submit_review(
     }))
 }
 
-/// PM-only finalization after two distinct non-author PM/worker receipts. A
-/// PM does not become a third reviewer merely by accepting the result.
+/// Schema-bound finalization. Existing v1 records retain their PM quorum;
+/// v2 decisions consume the approved native authority matrix.
 pub fn finalize_native(
     pm: &Pm,
     flag: Option<&str>,
     slug: &str,
     operation: &str,
     expected_digest: &str,
-    actor: &NativeIdentity,
+    evidence: Option<&str>,
+    actor: &policy::NativeActor,
 ) -> Result<Value> {
+    if !matches!(operation, "accept" | "verify" | "revalidate" | "invalidate") {
+        return Err(Error::rejected(
+            "memory finalization operation is unsupported",
+        ));
+    }
+    let (proj, initial) = find(pm, flag, slug)?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&initial.path))?;
+    let (_, mut mem) = find(pm, Some(&proj.key), slug)?;
+    if mem.front.policy.is_some() {
+        return match operation {
+            "accept" | "verify" => v2::finalize_locked(
+                pm,
+                &lock,
+                &proj,
+                &mut mem,
+                operation,
+                expected_digest,
+                evidence,
+                actor,
+            ),
+            _ => v2::transition_locked(
+                pm,
+                &lock,
+                &proj,
+                &mut mem,
+                operation,
+                expected_digest,
+                evidence.ok_or_else(|| Error::rejected("lifecycle evidence is required"))?,
+                actor,
+            ),
+        };
+    }
+    let actor = actor.agent().ok_or_else(|| {
+        Error::rejected("legacy finalization requires its existing native PM role")
+    })?;
     if !valid_identity_proof(&actor.proof) || actor.proof.role != "pm" {
         return Err(Error::rejected(
             "memory finalization is restricted to an authenticated PM endpoint",
@@ -1221,12 +1221,9 @@ pub fn finalize_native(
     }
     if !matches!(operation, "accept" | "verify") {
         return Err(Error::rejected(
-            "memory finalization operation is unsupported",
+            "legacy lifecycle adoption is a separate operation (CAD-382)",
         ));
     }
-    let (proj, _) = find(pm, flag, slug)?;
-    let _lock = pm.lock()?;
-    let (_, mut mem) = find(pm, Some(&proj.key), slug)?;
     let digest = semantic_digest(&mem);
     if digest != expected_digest {
         return Err(Error::rejected(format!(
@@ -1299,6 +1296,7 @@ pub fn finalize_native(
     check_front(&mem, &proj.components)?;
     let committed = save_and_commit_mem(
         pm,
+        &lock,
         &mem,
         &format!("{}/memory/{slug}: {operation} finalized", proj.key),
         &actor.proof.alias,
@@ -1322,16 +1320,36 @@ pub fn reject_native(
     pm: &Pm,
     flag: Option<&str>,
     slug: &str,
-    actor: &NativeIdentity,
+    expected_digest: &str,
+    evidence: Option<&str>,
+    actor: &policy::NativeActor,
 ) -> Result<Value> {
+    let (proj, initial) = find(pm, flag, slug)?;
+    let lock = pm.lock_for_paths(std::slice::from_ref(&initial.path))?;
+    let (_, mut mem) = find(pm, Some(&proj.key), slug)?;
+    if mem.front.policy.is_some() {
+        return v2::transition_locked(
+            pm,
+            &lock,
+            &proj,
+            &mut mem,
+            "reject",
+            expected_digest,
+            evidence.ok_or_else(|| Error::rejected("rejection evidence is required"))?,
+            actor,
+        );
+    }
+    let actor = actor
+        .agent()
+        .ok_or_else(|| Error::rejected("legacy rejection requires its existing native PM role"))?;
     if !valid_identity_proof(&actor.proof) || actor.proof.role != "pm" {
         return Err(Error::rejected(
             "memory rejection is restricted to an authenticated PM endpoint",
         ));
     }
-    let (proj, _) = find(pm, flag, slug)?;
-    let _lock = pm.lock()?;
-    let (_, mut mem) = find(pm, Some(&proj.key), slug)?;
+    if semantic_digest(&mem) != expected_digest {
+        return Err(Error::rejected("memory revision changed before rejection"));
+    }
     if mem.front.status == "superseded" {
         return Err(Error::rejected("a superseded memory cannot be rejected"));
     }
@@ -1341,6 +1359,7 @@ pub fn reject_native(
     check_front(&mem, &proj.components)?;
     let committed = save_and_commit_mem(
         pm,
+        &lock,
         &mem,
         &format!("{}/memory/{slug}: rejected", proj.key),
         &actor.proof.alias,
@@ -1355,14 +1374,14 @@ pub fn reject_native(
 }
 
 /// Pairwise supersede needs a crash-atomic transaction/recovery primitive
-/// that this file writer does not have. Refuse it until CAD-193 supplies
+/// that this file writer does not have. Refuse it until CAD-464 supplies
 /// that primitive rather than performing two sequential writes.
 pub fn supersede_native(
     _pm: &Pm,
     _flag: Option<&str>,
     _old: &str,
     _new: &str,
-    _actor: &NativeIdentity,
+    _actor: &policy::NativeActor,
 ) -> Result<Value> {
     Err(Error::rejected(
         "memory supersede is unsupported until crash-atomic pair recovery is available",
@@ -1399,7 +1418,7 @@ fn git_bounded(dir: &Path, args: &[&str], timeout: Duration) -> Result<String> {
 /// Accepted project-wide `rule`s — the briefing's memory section.
 /// Explicitly stale ones are withheld with their reason, as at dispatch.
 /// Broken files are skipped, not fatal; callers surface the errors.
-pub fn project_rules(pm: &Pm, key: &str) -> (Matched, Vec<String>) {
+pub fn project_rules(pm: &Pm, key: &str, role: Option<&str>) -> (Matched, Vec<String>) {
     let (mems, errors) = load_project_report(&pm.dir, key);
     let mut out = Matched {
         lessons: Vec::new(),
@@ -1414,7 +1433,16 @@ pub fn project_rules(pm: &Pm, key: &str) -> (Matched, Vec<String>) {
         {
             continue;
         }
-        match stale_reason(&m) {
+        if !v2::role_matches(&m, role.into_iter()) {
+            if role.is_none() {
+                out.withheld.push((
+                    m,
+                    "native target role is unavailable for role-scoped guidance".to_owned(),
+                ));
+            }
+            continue;
+        }
+        match matching::withhold_reason(&m, &out.fresh) {
             Some(reason) => out.withheld.push((m, reason)),
             None => out.lessons.push(m),
         }
@@ -1620,6 +1648,7 @@ mod tests {
             } else {
                 "worker".to_string()
             },
+            uid: None,
         }
     }
 
@@ -1647,6 +1676,7 @@ mod tests {
                 active_operation: None,
                 reviews: Vec::new(),
                 finalizations: Vec::new(),
+                policy: None,
             },
             body: "fact\n\n**Why:** evidence\n\n**How to apply:** use it\n".to_string(),
             path: PathBuf::from("/tmp/lesson.md"),
@@ -1709,9 +1739,119 @@ mod tests {
         (dir, pm)
     }
 
-    fn native(alias: &str, registration: u64) -> NativeIdentity {
-        NativeIdentity {
-            proof: proof(alias, registration),
+    fn native(alias: &str, registration: u64) -> policy::NativeActor {
+        policy::NativeActor::Agent {
+            identity: NativeIdentity {
+                proof: proof(alias, registration),
+            },
+            model: None,
+        }
+    }
+
+    fn legacy_candidate(
+        pm: &Pm,
+        slug: &str,
+        body: &str,
+        confidence: &str,
+        author: &policy::NativeActor,
+    ) -> Memory {
+        let author = author
+            .agent()
+            .expect("legacy fixture requires a native agent snapshot");
+        assert!(
+            author.proof.uid.is_none(),
+            "historical v1 proof must not be adopted"
+        );
+        let mut candidate = memory("proposed", 0, Some(author.proof.clone()));
+        candidate.front.id = slug.to_string();
+        candidate.front.confidence = confidence.to_string();
+        candidate.front.policy = None;
+        candidate.body = body.to_string();
+        candidate.path = memory_dir(pm, "demo").join(format!("{slug}.md"));
+        assert!(candidate.front.reviews.is_empty());
+        assert!(candidate.front.finalizations.is_empty());
+        assert!(candidate.front.active_operation.is_none());
+        check_front(&candidate, &[]).expect("valid historical candidate fixture");
+        let digest = semantic_digest(&candidate);
+        {
+            let lock = pm
+                .lock_for_paths(std::slice::from_ref(&candidate.path))
+                .expect("historical candidate fixture lock");
+            assert!(
+                !candidate.path.exists(),
+                "historical fixture must not overwrite a record"
+            );
+            std::fs::create_dir_all(memory_dir(pm, "demo")).unwrap();
+            save_and_commit_mem(
+                pm,
+                &lock,
+                &candidate,
+                "Historical v1 candidate fixture; not a new proposal",
+                "test",
+            )
+            .expect("persist only the historical fixture file");
+        }
+        let (_, loaded) = find(pm, Some("demo"), slug).unwrap();
+        assert!(loaded.front.policy.is_none());
+        assert_eq!(loaded.body, body);
+        assert_eq!(semantic_digest(&loaded), digest);
+        loaded
+    }
+
+    fn proposal_actor(alias: &str) -> policy::NativeActor {
+        let root = tempfile::tempdir().expect("isolated native proposal identity store");
+        let store = crate::store::Store::open(&root.path().join("proposal-identities.sqlite3"))
+            .expect("native proposal identity store");
+        store
+            .register_agent(&crate::store::NewAgent {
+                alias,
+                provider: "inbox",
+                endpoint_kind: "inbox",
+                role: "worker",
+                cwd: root.path().to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .expect("native participant registration");
+        store
+            .set_identity(
+                alias,
+                &crate::adapter::Identity {
+                    thread_id: format!("{alias}-thread"),
+                    session_id: format!("{alias}-session"),
+                    model: None,
+                    effort: None,
+                    pid: std::process::id(),
+                    endpoint: None,
+                    generation: Some(uuid::Uuid::new_v4().simple().to_string()),
+                    attach: None,
+                },
+            )
+            .expect("native endpoint identity snapshot");
+        let row = store.agent(alias).expect("registered native participant");
+        let identity = NativeIdentity {
+            proof: IdentityProof {
+                alias: row.alias,
+                registration: row.created.to_bits(),
+                generation: row.generation.expect("recorded endpoint generation"),
+                process_start: u64::try_from(row.pid_start.expect("recorded process start"))
+                    .expect("positive native process start"),
+                role: row.role,
+                uid: Some(row.uid),
+            },
+        };
+        assert!(valid_identity_proof(&identity.proof));
+        assert!(identity
+            .proof
+            .uid
+            .as_deref()
+            .is_some_and(|uid| !uid.is_empty()));
+        policy::NativeActor::Agent {
+            identity,
+            model: None,
         }
     }
 
@@ -1721,7 +1861,7 @@ mod tests {
     fn propose_refuses_credential_shaped_candidate() {
         use sha2::{Digest, Sha256};
         let (_dir, pm) = mutation_fixture();
-        let author = native("worker-author", 1);
+        let author = proposal_actor("worker-author");
         let digest: String = Sha256::digest(b"memory-fixture")
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -1737,7 +1877,7 @@ mod tests {
                 &pm,
                 "demo",
                 "rule",
-                &Scope {
+                Scope {
                     project: true,
                     ..Scope::default()
                 },
@@ -1746,6 +1886,7 @@ mod tests {
                 None,
                 Some(text),
                 Some("leaky"),
+                policy::ProposalOptions::default(),
                 &author,
             )
             .unwrap_err();
@@ -1765,22 +1906,7 @@ mod tests {
         let worker_a = native("worker-a", 2);
         let worker_b = native("worker-b", 3);
         let body = "fact\n\n**Why:** evidence\n\n**How to apply:** use it\n";
-        propose_native(
-            &pm,
-            "demo",
-            "rule",
-            &Scope {
-                project: true,
-                ..Scope::default()
-            },
-            Some("CAD-191"),
-            Some("high"),
-            None,
-            Some(body),
-            Some("lesson"),
-            &author,
-        )
-        .unwrap();
+        legacy_candidate(&pm, "lesson", body, "high", &author);
         let (_, mem) = find(&pm, Some("demo"), "lesson").unwrap();
         let digest = semantic_digest(&mem);
         submit_review(
@@ -1809,7 +1935,16 @@ mod tests {
             &worker_b,
         )
         .unwrap();
-        finalize_native(&pm, Some("demo"), "lesson", "accept", &digest, &pm_actor).unwrap();
+        finalize_native(
+            &pm,
+            Some("demo"),
+            "lesson",
+            "accept",
+            &digest,
+            None,
+            &pm_actor,
+        )
+        .unwrap();
         let (_, accepted) = find(&pm, Some("demo"), "lesson").unwrap();
         assert!(retrieval_status(&accepted).0);
         // CAD-203: acceptance records the review, not a re-check of the
@@ -1822,8 +1957,16 @@ mod tests {
         );
 
         let bytes_after_accept = std::fs::read(&accepted.path).unwrap();
-        let repeated =
-            finalize_native(&pm, Some("demo"), "lesson", "accept", &digest, &pm_actor).unwrap_err();
+        let repeated = finalize_native(
+            &pm,
+            Some("demo"),
+            "lesson",
+            "accept",
+            &digest,
+            None,
+            &pm_actor,
+        )
+        .unwrap_err();
         assert!(repeated.to_string().contains("already finalized"));
         assert_eq!(bytes_after_accept, std::fs::read(&accepted.path).unwrap());
 
@@ -1848,7 +1991,16 @@ mod tests {
         let (_, before_verify_finalize) = find(&pm, Some("demo"), "lesson").unwrap();
         assert_eq!(before_verify_finalize.front.review_cycle, 2);
         assert!(!retrieval_status(&before_verify_finalize).0);
-        finalize_native(&pm, Some("demo"), "lesson", "verify", &digest, &pm_actor).unwrap();
+        finalize_native(
+            &pm,
+            Some("demo"),
+            "lesson",
+            "verify",
+            &digest,
+            None,
+            &pm_actor,
+        )
+        .unwrap();
         let (_, verified) = find(&pm, Some("demo"), "lesson").unwrap();
         assert!(retrieval_status(&verified).0);
         let stamped = verified.front.verified_at.clone().expect("verify stamps");
@@ -1856,8 +2008,16 @@ mod tests {
         assert!(evidence_label(&verified, &Freshness::for_project(None)).starts_with("verified "));
 
         let bytes_after_verify = std::fs::read(&verified.path).unwrap();
-        let repeated =
-            finalize_native(&pm, Some("demo"), "lesson", "verify", &digest, &pm_actor).unwrap_err();
+        let repeated = finalize_native(
+            &pm,
+            Some("demo"),
+            "lesson",
+            "verify",
+            &digest,
+            None,
+            &pm_actor,
+        )
+        .unwrap_err();
         assert!(repeated.to_string().contains("already finalized"));
         assert_eq!(bytes_after_verify, std::fs::read(&verified.path).unwrap());
 
@@ -1884,7 +2044,16 @@ mod tests {
         let (_, cycle_three) = find(&pm, Some("demo"), "lesson").unwrap();
         assert_eq!(cycle_three.front.review_cycle, 3);
         assert!(!retrieval_status(&cycle_three).0);
-        finalize_native(&pm, Some("demo"), "lesson", "verify", &digest, &pm_actor).unwrap();
+        finalize_native(
+            &pm,
+            Some("demo"),
+            "lesson",
+            "verify",
+            &digest,
+            None,
+            &pm_actor,
+        )
+        .unwrap();
         let (_, final_memory) = find(&pm, Some("demo"), "lesson").unwrap();
         assert_eq!(final_memory.front.finalizations.len(), 3);
         assert!(retrieval_status(&final_memory).0);
@@ -1898,23 +2067,8 @@ mod tests {
         let worker_a = native("worker-a", 2);
         let worker_b = native("worker-b", 3);
         let body = "\nleading blank fact\n\n**Why:** preserve the exact body\n\n**How to apply:** retain it\n";
-        let proposed = propose_native(
-            &pm,
-            "demo",
-            "rule",
-            &Scope {
-                project: true,
-                ..Scope::default()
-            },
-            Some("CAD-191"),
-            Some("high"),
-            None,
-            Some(body),
-            Some("leading-blank"),
-            &author,
-        )
-        .unwrap();
-        let digest = proposed["digest"].as_str().unwrap().to_string();
+        let proposed = legacy_candidate(&pm, "leading-blank", body, "high", &author);
+        let digest = semantic_digest(&proposed);
         let (_, loaded) = find(&pm, Some("demo"), "leading-blank").unwrap();
         assert_eq!(loaded.body, body);
         assert_eq!(semantic_digest(&loaded), digest);
@@ -1943,6 +2097,7 @@ mod tests {
             "leading-blank",
             "accept",
             &digest,
+            None,
             &pm_actor,
         )
         .unwrap();
@@ -1953,16 +2108,15 @@ mod tests {
     }
 
     #[test]
-    fn native_review_refuses_scope_and_source_changes_after_load() {
+    fn new_v2_proposal_leading_blank_body_keeps_digest_through_operator_acceptance() {
         let (_dir, pm) = mutation_fixture();
-        let author = native("worker-author", 1);
-        let reviewer = native("worker-reviewer", 2);
-        let body = "fact\n\n**Why:** evidence\n\n**How to apply:** use it\n";
-        propose_native(
+        let author = proposal_actor("worker-author");
+        let body = "\nleading blank fact\n\n**Why:** preserve the exact body\n\n**How to apply:** retain it\n";
+        let proposed = propose_native(
             &pm,
             "demo",
             "rule",
-            &Scope {
+            Scope {
                 project: true,
                 ..Scope::default()
             },
@@ -1970,10 +2124,65 @@ mod tests {
             Some("high"),
             None,
             Some(body),
-            Some("stale-review"),
+            Some("leading-blank-v2"),
+            policy::ProposalOptions::default(),
             &author,
         )
         .unwrap();
+        assert_eq!(proposed["policy_revision"].as_u64(), Some(2));
+        let digest = proposed["digest"].as_str().unwrap().to_string();
+        let (_, loaded) = find(&pm, Some("demo"), "leading-blank-v2").unwrap();
+        assert_eq!(loaded.body, body);
+        assert_eq!(semantic_digest(&loaded), digest);
+        let policy = loaded
+            .front
+            .policy
+            .as_ref()
+            .expect("server-stamped v2 policy");
+        assert_eq!(policy.revision, 2);
+        assert_eq!(policy.nature, policy::Nature::Judgement);
+        assert_eq!(policy.provenance, policy::Provenance::AgentClaimed);
+        assert!(!retrieval_status(&loaded).0);
+        match &policy.author.actor {
+            policy::ActorSnapshot::Agent { identity } => {
+                assert_eq!(identity.uid, author.agent().unwrap().proof.uid);
+                assert!(identity.uid.as_deref().is_some_and(|uid| !uid.is_empty()));
+            }
+            policy::ActorSnapshot::Operator { .. } => {
+                panic!("native worker became operator author")
+            }
+        }
+        // Unit-core actor fixture only; daemon ancestry/operator proof is
+        // independently exercised by the real-RPC acceptance oracles.
+        let operator = policy::NativeActor::Operator {
+            uid: unsafe { libc::geteuid() },
+        };
+        finalize_native(
+            &pm,
+            Some("demo"),
+            "leading-blank-v2",
+            "accept",
+            &digest,
+            None,
+            &operator,
+        )
+        .unwrap();
+        let (_, accepted) = find(&pm, Some("demo"), "leading-blank-v2").unwrap();
+        assert_eq!(accepted.body, body);
+        assert_eq!(semantic_digest(&accepted), digest);
+        assert!(retrieval_status(&accepted).0);
+        assert_eq!(accepted.front.policy.as_ref().unwrap().revision, 2);
+        assert!(accepted.front.verified_at.is_none());
+        assert!(last_verified(&accepted).is_none());
+    }
+
+    #[test]
+    fn native_review_refuses_scope_and_source_changes_after_load() {
+        let (_dir, pm) = mutation_fixture();
+        let author = native("worker-author", 1);
+        let reviewer = native("worker-reviewer", 2);
+        let body = "fact\n\n**Why:** evidence\n\n**How to apply:** use it\n";
+        legacy_candidate(&pm, "stale-review", body, "high", &author);
         let (_, loaded) = find(&pm, Some("demo"), "stale-review").unwrap();
         let digest = semantic_digest(&loaded);
         let path = loaded.path.clone();
@@ -2039,22 +2248,13 @@ mod tests {
         let (_dir, pm) = mutation_fixture();
         let author = native("worker-author", 1);
         let reviewer = native("worker-reviewer", 2);
-        propose_native(
+        legacy_candidate(
             &pm,
-            "demo",
-            "rule",
-            &Scope {
-                project: true,
-                ..Scope::default()
-            },
-            Some("CAD-191"),
-            Some("high"),
-            None,
-            Some("fact\n\n**Why:** evidence\n\n**How to apply:** use it\n"),
-            Some("overlap-review"),
+            "overlap-review",
+            "fact\n\n**Why:** evidence\n\n**How to apply:** use it\n",
+            "high",
             &author,
-        )
-        .unwrap();
+        );
         let (_, loaded) = find(&pm, Some("demo"), "overlap-review").unwrap();
         let digest = semantic_digest(&loaded);
         let path = loaded.path.clone();
@@ -2136,22 +2336,13 @@ mod tests {
         .unwrap();
         let author = native("worker-author", 1);
         let reviewer = native("worker-reviewer", 2);
-        propose_native(
+        legacy_candidate(
             &pm,
-            "demo",
-            "rule",
-            &Scope {
-                project: true,
-                ..Scope::default()
-            },
-            Some("CAD-191"),
-            Some("high"),
-            None,
-            Some("fact\n\n**Why:** evidence\n\n**How to apply:** use it\n"),
-            Some("project-bound"),
+            "project-bound",
+            "fact\n\n**Why:** evidence\n\n**How to apply:** use it\n",
+            "high",
             &author,
-        )
-        .unwrap();
+        );
         let (_, mem) = find(&pm, Some("demo"), "project-bound").unwrap();
         let digest = semantic_digest(&mem);
         let before = std::fs::read(&mem.path).unwrap();
@@ -2178,13 +2369,13 @@ mod tests {
     #[test]
     fn supersede_refusal_preserves_existing_memory_bytes() {
         let (_dir, pm) = mutation_fixture();
-        let author = native("worker-author", 1);
+        let author = proposal_actor("worker-author");
         let pm_actor = native("pm", 2);
-        propose_native(
+        let proposed = propose_native(
             &pm,
             "demo",
             "rule",
-            &Scope {
+            Scope {
                 project: true,
                 ..Scope::default()
             },
@@ -2193,9 +2384,11 @@ mod tests {
             None,
             Some("old fact\n\n**Why:** evidence\n\n**How to apply:** use it\n"),
             Some("old-memory"),
+            policy::ProposalOptions::default(),
             &author,
         )
         .unwrap();
+        assert_eq!(proposed["policy_revision"].as_u64(), Some(2));
         let (_, old) = find(&pm, Some("demo"), "old-memory").unwrap();
         let before = std::fs::read(&old.path).unwrap();
         let err =
@@ -2212,22 +2405,13 @@ mod tests {
     fn retrieval_rejects_persisted_self_finalizer_corruption() {
         let (_dir, pm) = mutation_fixture();
         let author = native("pm-author", 1);
-        propose_native(
-            &pm,
-            "demo",
-            "rule",
-            &Scope {
-                project: true,
-                ..Scope::default()
-            },
-            Some("CAD-191"),
-            Some("high"),
-            None,
-            Some("self-finalized fact\n\n**Why:** corrupt persisted receipt\n\n**How to apply:** refuse it\n"),
-            Some("corrupt-finalizer"),
-            &author,
-        )
-        .unwrap();
+        legacy_candidate(
+                    &pm,
+                    "corrupt-finalizer",
+                    "self-finalized fact\n\n**Why:** corrupt persisted receipt\n\n**How to apply:** refuse it\n",
+                    "high",
+                    &author,
+                );
         let (_, mut corrupted) = find(&pm, Some("demo"), "corrupt-finalizer").unwrap();
         corrupted.front.status = "accepted".to_string();
         corrupted.front.review_cycle = 1;
@@ -2259,22 +2443,7 @@ mod tests {
         let worker_a = native("worker-a", 2);
         let worker_b = native("worker-b", 3);
         let body = "fact\n\n**Why:** evidence\n\n**How to apply:** use it\n";
-        propose_native(
-            &pm,
-            "demo",
-            "rule",
-            &Scope {
-                project: true,
-                ..Scope::default()
-            },
-            Some("CAD-191"),
-            Some("high"),
-            None,
-            Some(body),
-            Some("pm-authored"),
-            &author,
-        )
-        .unwrap();
+        legacy_candidate(&pm, "pm-authored", body, "high", &author);
         let (_, mem) = find(&pm, Some("demo"), "pm-authored").unwrap();
         let digest = semantic_digest(&mem);
         for (worker, evidence) in [
@@ -2297,8 +2466,16 @@ mod tests {
         }
         let path = find(&pm, Some("demo"), "pm-authored").unwrap().1.path;
         let before = std::fs::read(&path).unwrap();
-        let err = finalize_native(&pm, Some("demo"), "pm-authored", "accept", &digest, &author)
-            .unwrap_err();
+        let err = finalize_native(
+            &pm,
+            Some("demo"),
+            "pm-authored",
+            "accept",
+            &digest,
+            None,
+            &author,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("proposer or contributor"));
         assert_eq!(before, std::fs::read(&path).unwrap());
         assert!(!retrieval_status(&find(&pm, Some("demo"), "pm-authored").unwrap().1).0);
@@ -2309,6 +2486,7 @@ mod tests {
             "pm-authored",
             "accept",
             &digest,
+            None,
             &finalizer,
         )
         .unwrap();
@@ -2515,22 +2693,56 @@ mod tests {
 
     #[test]
     fn every_match_withheld_still_renders_the_withheld_section() {
-        let mut marked = finalized("marked", Some("2026-02-28T00:00:00Z"));
-        marked.front.stale = Some("CAD-1 reverted the fix it cites".to_string());
+        let slug = "all-withheld-lesson";
+        let cause = "CAD-1 reverted the fix it cites";
+        let mut marked = finalized(slug, Some("2026-02-28T00:00:00Z"));
+        let fact = fact_line(&marked.body);
+        let instruction = apply_line(&marked.body);
+        assert!(!fact.is_empty(), "fixture must contain an actual claim");
+        assert!(
+            !instruction.is_empty(),
+            "fixture must contain application instructions"
+        );
+        marked.front.stale = Some(cause.to_string());
         let matched = match_memories(
             &[marked],
             &MatchCtx::default(),
             &fresh_at("2026-03-01T00:00:00Z"),
         );
         assert!(matched.lessons.is_empty());
-        let (text, injected) = render_lessons(&matched);
-        assert!(injected.is_empty());
-        assert_eq!(
-            text,
-            "# Lessons — matched project memories\n\n\
-             \n## Withheld — stale evidence, not applied\n\n\
-             - `marked`: evidence marked stale: CAD-1 reverted the fix it cites\n"
+        assert_eq!(matched.withheld.len(), 1);
+        assert_eq!(matched.withheld[0].0.front.id, slug);
+        assert!(
+            matched.withheld[0].1.contains(cause),
+            "withholding must retain the recorded audit cause"
         );
+
+        let (text, injected) = render_lessons(&matched);
+        assert!(
+            injected.is_empty(),
+            "withheld lessons are not supplied lesson IDs"
+        );
+        assert!(
+            !text.is_empty(),
+            "an all-withheld match must still disclose why guidance is absent"
+        );
+        assert!(
+            text.contains(slug),
+            "disclosure must identify the withheld lesson"
+        );
+        assert!(
+            text.contains(cause),
+            "disclosure must carry the recorded withholding cause"
+        );
+        assert!(
+            !text.contains(&fact),
+            "withheld claims must not become supplied guidance"
+        );
+        assert!(
+            !text.contains(&instruction),
+            "withheld application instructions must not become supplied guidance"
+        );
+
         // Nothing matched at all: still no file.
         let none = match_memories(&[], &MatchCtx::default(), &fresh_at("2026-03-01T00:00:00Z"));
         assert_eq!(render_lessons(&none), (String::new(), vec![]));
@@ -2589,7 +2801,7 @@ mod tests {
             )
             .unwrap();
         }
-        let (matched, errors) = project_rules(&pm, "demo");
+        let (matched, errors) = project_rules(&pm, "demo", None);
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(slugs(&matched.lessons), vec!["kept"]);
         assert_eq!(matched.withheld.len(), 1);
@@ -2786,6 +2998,7 @@ mod tests {
                 paths: vec!["src/adapter/x.rs".to_string()],
                 tags: vec!["flaky".to_string()],
                 providers: vec!["claude".to_string()],
+                roles: vec![],
             }),
             vec![
                 "r-project",
@@ -2973,13 +3186,13 @@ mod tests {
     #[test]
     fn memory_commit_stages_only_its_own_file() {
         let (dir, pm) = mutation_fixture();
-        let author = native("worker-author", 1);
+        let author = proposal_actor("worker-author");
         std::fs::write(dir.path().join("demo/planted.md"), "planted\n").unwrap();
-        propose_native(
+        let proposed = propose_native(
             &pm,
             "demo",
             "rule",
-            &Scope {
+            Scope {
                 project: true,
                 ..Scope::default()
             },
@@ -2988,9 +3201,11 @@ mod tests {
             None,
             Some("fact\n\n**Why:** e\n\n**How to apply:** use it\n"),
             Some("no-sweep"),
+            policy::ProposalOptions::default(),
             &author,
         )
         .unwrap();
+        assert_eq!(proposed["policy_revision"].as_u64(), Some(2));
         let (_, mem) = find(&pm, Some("demo"), "no-sweep").unwrap();
         let rel = mem
             .path

@@ -445,7 +445,8 @@ pub fn briefing_body(
                 crate::issue::project::resolve(&pm.dir, None, Path::new(cwd)).ok()?
             }
         };
-        let (matched, errors) = crate::memory::project_rules(&pm, &proj.key);
+        let (matched, errors) =
+            crate::memory::project_rules(&pm, &proj.key, agent["team_role"].as_str());
         if let Some(line) = crate::memory::load_errors_line(&errors) {
             eprintln!("{line}");
         }

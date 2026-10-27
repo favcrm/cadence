@@ -4,12 +4,12 @@ export type QuorumView = {
   eligible: boolean | null;
   reason: string;
   mode: "acceptance" | "retrieval";
-  /** Retrieval-eligible but withheld: its evidence is marked stale. */
+  /** Policy-qualified but withheld for staleness or unused expiry. */
   withheld?: boolean;
 };
 
 export function quorumView(m: MemoryCard): QuorumView {
-  const mode = m.status === "proposed" ? "acceptance" : "retrieval";
+  const mode = m.status === "proposed" || m.status === "quarantined" ? "acceptance" : "retrieval";
   if (!m.quorum) {
     return {
       eligible: null,
@@ -27,8 +27,8 @@ export function quorumView(m: MemoryCard): QuorumView {
     };
   }
 
-  // The same Freshness retrieval uses: a stale-marked lesson passes its
-  // quorum yet is never injected — show it withheld, with its reason.
+  // Shared retrieval validity includes explicit staleness and unused expiry.
+  // A qualified policy alone never overrides a withheld evidence state.
   if (mode === "retrieval" && check.eligible && m.evidence?.state === "withheld") {
     return {
       eligible: false,
@@ -54,7 +54,7 @@ export function quorumTone(eligible: boolean | null): string {
 export function quorumLabel(q: QuorumView): string {
   if (q.eligible === null) return "verification unavailable";
   if (q.mode === "acceptance") {
-    return q.eligible ? "awaiting PM finalization" : "review blocked";
+    return q.eligible ? "awaiting authorized finalization" : "review blocked";
   }
   if (q.withheld) return "withheld from agents";
   return q.eligible ? "available to agents" : "not available to agents";
