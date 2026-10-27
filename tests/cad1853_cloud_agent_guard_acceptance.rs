@@ -58,6 +58,7 @@ static FIXTURE: Mutex<()> = Mutex::new(());
 // ---------- the published contract, implemented by a real local server ----------
 
 struct Seen {
+    method: String,
     action: String,
     body: Value,
     authorization: String,
@@ -93,6 +94,11 @@ struct Script {
     /// opposed to requests it has merely logged. A case that needs "the
     /// proof completed" synchronizes on this, never on `seen`.
     answered_readbacks: usize,
+    /// Opt-in, stateful first-ack-loss platform fixture; defaults leave every
+    /// existing guard's transport script unchanged.
+    first_ack: Option<FirstAckRemote>,
+    /// Only the boundary case opts into an actual issuer renewal response.
+    renewal_answer: Option<Value>,
 }
 
 impl Script {
@@ -117,6 +123,8 @@ impl Script {
             slow_read_ms: 0,
             cancel_status: 501,
             answered_readbacks: 0,
+            first_ack: None,
+            renewal_answer: None,
         }
     }
     fn calls(&self, action: &str) -> usize {
@@ -154,6 +162,80 @@ impl Stub {
         });
         Self { url, script, stop }
     }
+    /// Real, verified loopback TLS through the existing debug test-seam
+    /// resolver. The issuer pin still requires HTTPS; never relax that guard.
+    fn renewal_tls(root: &Path) -> (Self, PathBuf, std::net::SocketAddr) {
+        let pki = root.join("renewal-tls");
+        std::fs::create_dir(&pki).unwrap();
+        let ca = pki.join("ca.pem");
+        let ca_key = pki.join("ca.key");
+        let key = pki.join("server.key");
+        let csr = pki.join("server.csr");
+        let cert = pki.join("server.pem");
+        let ext = pki.join("server.cnf");
+        std::fs::write(
+            &ext,
+            "subjectAltName=DNS:issuer.board.localhost\nbasicConstraints=CA:FALSE\n",
+        ).unwrap();
+        let run = |command: &mut std::process::Command| {
+            let result = command.stdin(std::process::Stdio::null()).output().unwrap();
+            assert!(result.status.success(), "ephemeral fixture PKI failed: {}", result.status);
+        };
+        run(std::process::Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                "-nodes", "-days", "1", "-subj", "/CN=c1853-boundary-ca", "-keyout"])
+            .arg(&ca_key).arg("-out").arg(&ca));
+        run(std::process::Command::new("openssl")
+            .args(["req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                "-nodes", "-subj", "/CN=issuer.board.localhost", "-keyout"])
+            .arg(&key).arg("-out").arg(&csr));
+        run(std::process::Command::new("openssl")
+            .args(["x509", "-req", "-days", "1", "-in"]).arg(&csr)
+            .arg("-CA").arg(&ca).arg("-CAkey").arg(&ca_key).arg("-CAcreateserial")
+            .arg("-extfile").arg(&ext).arg("-out").arg(&cert));
+        for path in [&ca, &ca_key, &key] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let chain = rustls_pemfile::certs(&mut std::io::BufReader::new(
+            std::fs::File::open(cert).unwrap(),
+        )).collect::<Result<Vec<_>, _>>().unwrap();
+        let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+            std::fs::File::open(key).unwrap(),
+        )).unwrap().unwrap();
+        let config = Arc::new(rustls::ServerConfig::builder()
+            .with_no_client_auth().with_single_cert(chain, key).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("https://issuer.board.localhost:{}", address.port());
+        let script = Arc::new(Mutex::new(Script::new(url.clone())));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (shared, halted) = (Arc::clone(&script), Arc::clone(&stop));
+        thread::spawn(move || {
+            while !halted.load(SeqCst) {
+                match listener.accept() {
+                    Ok((socket, _)) => {
+                        socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                        socket.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+                        let closer = socket.try_clone().unwrap();
+                        let stream = rustls::StreamOwned::new(
+                            rustls::ServerConnection::new(Arc::clone(&config)).unwrap(), socket,
+                        );
+                        let script = Arc::clone(&shared);
+                        thread::spawn(move || serve_io(stream, script, move || {
+                            let _ = closer.shutdown(std::net::Shutdown::Both);
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("loopback TLS fixture accept failed: {error}"),
+                }
+            }
+        });
+        (Self { url, script, stop }, ca, address)
+    }
+
     fn set(&self, change: impl FnOnce(&mut Script)) {
         change(&mut self.script.lock().unwrap_or_else(|e| e.into_inner()));
     }
@@ -213,7 +295,7 @@ impl Stub {
 
 /// Writes the response and reports whether it actually reached the socket, so
 /// a case can synchronize on a COMPLETED answer instead of a prepared one.
-fn reply(stream: &mut TcpStream, status: u16, body: &Value) -> bool {
+fn reply(stream: &mut impl Write, status: u16, body: &Value) -> bool {
     let text = body.to_string();
     write!(
         stream,
@@ -272,7 +354,14 @@ fn truthful_capabilities() -> Value {
     })
 }
 
-fn serve(mut stream: TcpStream, script: Arc<Mutex<Script>>) {
+fn serve(stream: TcpStream, script: Arc<Mutex<Script>>) {
+    let closer = stream.try_clone().unwrap();
+    serve_io(stream, script, move || {
+        let _ = closer.shutdown(std::net::Shutdown::Both);
+    });
+}
+
+fn serve_io(mut stream: impl Read + Write, script: Arc<Mutex<Script>>, close: impl Fn()) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     let head_end = loop {
@@ -308,6 +397,34 @@ fn serve(mut stream: TcpStream, script: Arc<Mutex<Script>>) {
         .next()
         .and_then(|line| line.split(' ').nth(1))
         .unwrap_or_default();
+    let method = head.lines().next().unwrap_or_default()
+        .split_whitespace().next().unwrap_or_default().to_string();
+    let authorization = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if !name.eq_ignore_ascii_case("authorization") {
+                return None;
+            }
+            let (scheme, token) = value.trim().split_once(' ')?;
+            // HTTP schemes are case-insensitive; credentials are NOT. Keep
+            // existing scheme-normalized observations without folding tokens.
+            Some(format!("{} {token}", scheme.to_ascii_lowercase()))
+        })
+        .unwrap_or_default();
+    if path == "/v1/hosted-cadence/cli-session/renew" {
+        let mut recorded = script.lock().unwrap_or_else(|e| e.into_inner());
+        recorded.seen.push(Seen {
+            method, action: "renew".into(), body, authorization,
+        });
+        let answer = recorded.renewal_answer.clone();
+        drop(recorded);
+        match answer {
+            Some(answer) => { reply(&mut stream, 200, &answer); }
+            None => { reply(&mut stream, 500, &json!({"error":"unexpected_renewal"})); }
+        }
+        return;
+    }
     if path != CONTRACT_PATH {
         reply(
             &mut stream,
@@ -329,17 +446,32 @@ fn serve(mut stream: TcpStream, script: Arc<Mutex<Script>>) {
     {
         let mut recorded = script.lock().unwrap_or_else(|e| e.into_inner());
         recorded.seen.push(Seen {
+            method,
             action: action.clone(),
             body: body.clone(),
-            authorization: head
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("authorization:")
-                        .map(|value| value.trim().to_string())
-                })
-                .unwrap_or_default(),
+            authorization: authorization.clone(),
         });
+    }
+    let first_ack = {
+        let mut script = script.lock().unwrap_or_else(|e| e.into_inner());
+        let endpoint = script.endpoint.clone();
+        script
+            .first_ack
+            .as_mut()
+            .map(|remote| remote.answer(&endpoint, &authorization, &action, &arguments))
+    };
+    if let Some(answer) = first_ack {
+        if let Some((status, body)) = answer {
+            let mut script = script.lock().unwrap_or_else(|e| e.into_inner());
+            if reply(&mut stream, status, &body) && action == "readback" {
+                script.answered_readbacks += 1;
+            }
+        } else {
+            // The durable platform ledger and acceptance channel were updated
+            // BEFORE closing the first submit's socket without its acknowledgement.
+            close();
+        }
+        return;
     }
     let delay = {
         let script = script.lock().unwrap_or_else(|e| e.into_inner());
@@ -411,7 +543,7 @@ fn serve(mut stream: TcpStream, script: Arc<Mutex<Script>>) {
             };
             if drop {
                 // An unreachable platform: the socket closes with no answer.
-                let _ = stream.shutdown(std::net::Shutdown::Both);
+                close();
                 return;
             }
             let script = script.lock().unwrap_or_else(|e| e.into_inner());
@@ -1056,6 +1188,7 @@ impl cadence_agent::cloud_agent::CloudTransport for SettledFixtureReply {
         &self,
         _: &cadence_agent::remote_cli::RemoteTarget,
         _: &str,
+        _: Option<&cadence_agent::cloud_agent::Source>,
     ) -> cadence_agent::Result<cadence_agent::cloud_agent::RemoteAgent> {
         Err(cadence_agent::Error::rejected("connect unused"))
     }
@@ -1426,6 +1559,673 @@ fn changed_body_reuse_conflicts_and_same_body_never_re_submits() {
     assert_eq!(replay["operation"]["status"], json!("completed"));
     assert_eq!(fx.stub.calls("submit"), 1);
     assert_eq!(fx.stub.calls("readback"), 1);
+}
+
+// First-ack fixtures implement the CURRENT hosted schema: readback returns
+// operation only; model-free `agent` discovery returns source/session metadata.
+// They exercise the real HostedCloudTransport and durable native service path,
+// not a CloudTransport mock that invents metadata on an operation readback.
+#[derive(Clone, Debug)]
+struct FirstAckAccepted {
+    conversation: String,
+    operation: String,
+    session: String,
+    invoker: String,
+    reply: String,
+}
+
+struct FirstAckContext {
+    session: String,
+    history: Vec<String>,
+}
+
+struct FirstAckRemote {
+    peer: Option<Value>,
+    contexts: std::collections::HashMap<(String, String), FirstAckContext>,
+    turns: std::collections::HashMap<(String, String, String), (String, String)>,
+    accepted: std::sync::mpsc::Sender<FirstAckAccepted>,
+    lose_next_ack: bool,
+    wrong_discovery_invoker: bool,
+}
+
+impl FirstAckRemote {
+    fn answer(
+        &mut self,
+        endpoint: &str,
+        authorization: &str,
+        action: &str,
+        arguments: &Value,
+    ) -> Option<(u16, Value)> {
+        // All tokens here are manufactured fixture credentials. Provenance is
+        // selected by the actual HTTP credential, NEVER by request identity.
+        let provenance = if authorization == format!("bearer hct_{}", "a".repeat(43)) {
+            json!({"kind": "user", "invoker_id": "inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "peer": null})
+        } else if authorization == format!("bearer hct_{}", "b".repeat(43)) {
+            self.peer.clone().expect("peer credential configured")
+        } else {
+            return Some((
+                401,
+                json!({"ok": false, "error": {"code": "unauthorized", "message": "unknown fixture credential"}}),
+            ));
+        };
+        let invoker = provenance["invoker_id"].as_str().unwrap().to_string();
+        let conversation = arguments["conversation_id"].as_str().unwrap().to_string();
+        let context = self
+            .contexts
+            .entry((invoker.clone(), conversation.clone()))
+            .or_insert_with(|| FirstAckContext {
+                session: format!("ns_{}", uuid::Uuid::new_v4().simple()),
+                history: Vec::new(),
+            });
+        let agent = json!({
+            "agent_id": "nca_ssssssssssssssssssssssssssssssss",
+            "organization_id": ORG_ID, "audience": endpoint, "provenance": provenance,
+        });
+        let session = json!({
+            "conversation_id": conversation, "remote_session_id": context.session,
+            // Session1 is intentionally valid in EACH separately named object.
+            "provider_session_id": "1",
+        });
+        if action == "agent" {
+            let mut agent = agent;
+            if self.wrong_discovery_invoker {
+                agent["provenance"]["invoker_id"] = json!("inv_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+            }
+            return Some((
+                200,
+                json!({
+                    "ok": true, "agent": agent, "conversation": session,
+                    "capabilities": truthful_capabilities(),
+                    "runtime": {"kind": "cloudflare-worker-pi-durable", "model_label": "stateful-fixture-not-a-model"},
+                }),
+            ));
+        }
+        let operation = arguments["operation_id"].as_str().unwrap().to_string();
+        let key = (invoker.clone(), conversation.clone(), operation.clone());
+        if action == "submit" {
+            let text = arguments["text"].as_str().unwrap().to_string();
+            let accepted = !self.turns.contains_key(&key);
+            if let Some((original, _)) = self.turns.get(&key) {
+                if original != &text {
+                    return Some((
+                        409,
+                        json!({"ok": false, "error": {"code": "operation_conflict", "message": "changed payload"}}),
+                    ));
+                }
+            } else {
+                context.history.push(text.clone());
+                // Stateful context sentinel, NOT a genuine generated model reply.
+                let reply = format!("fixture history: {}", context.history.join(" | "));
+                self.turns.insert(key.clone(), (text, reply));
+            }
+            let reply = self.turns[&key].1.clone();
+            if accepted && self.lose_next_ack {
+                self.lose_next_ack = false;
+                self.accepted
+                    .send(FirstAckAccepted {
+                        conversation: conversation.clone(),
+                        operation: operation.clone(),
+                        session: context.session.clone(),
+                        invoker,
+                        reply,
+                    })
+                    .unwrap();
+                return None;
+            }
+            return Some((
+                200,
+                json!({
+                    "ok": true, "agent": agent, "conversation": session,
+                    "operation": {"operation_id": operation, "conversation_id": conversation,
+                        "status": "completed", "accepted": accepted, "text": reply, "reason": null},
+                }),
+            ));
+        }
+        assert_eq!(action, "readback", "unexpected first-ack fixture action");
+        let reply = self.turns.get(&key).map(|(_, reply)| reply.clone());
+        Some((
+            200,
+            json!({
+                "ok": true,
+                "operation": {"operation_id": operation, "conversation_id": conversation,
+                    "status": if reply.is_some() { "completed" } else { "unknown" },
+                    "terminal": reply.is_some(), "text": reply, "reason": null},
+            }),
+        ))
+    }
+}
+
+struct FirstAckFixture {
+    fx: Fx,
+    source: cadence_agent::cloud_agent::Source,
+    sender: cadence_agent::cloud_agent::Sender,
+    cloud: cadence_agent::store::CloudAgent,
+    target: cadence_agent::remote_cli::RemoteTarget,
+    accepted: std::sync::mpsc::Receiver<FirstAckAccepted>,
+    original_home: Value,
+}
+
+impl FirstAckFixture {
+    fn start(peer: bool) -> Self {
+        use cadence_agent::cloud_agent::{self, Sender};
+        use cadence_agent::store::cloud_agent::{CloudSource, Owner};
+        let mut fx = Fx::start();
+        let (sent, accepted) = std::sync::mpsc::channel();
+        fx.stub.set(|script| {
+            script.first_ack = Some(FirstAckRemote {
+                peer: None,
+                contexts: Default::default(),
+                turns: Default::default(),
+                accepted: sent,
+                lose_next_ack: true,
+                wrong_discovery_invoker: false,
+            })
+        });
+        let connected = fx.connect();
+        if peer {
+            fx.call(Asserted::Operator, "agent_register", json!({
+                "alias": "first-ack-peer", "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd(),
+            })).unwrap();
+        }
+        // No background reconciliation or elapsed sleep can decide ordering.
+        fx.stop_daemon();
+        let store = fx.store();
+        let cloud = store
+            .cloud_agent(&cloud_agent_id(&connected))
+            .unwrap()
+            .unwrap();
+        let target = cadence_agent::remote_cli::RemoteTarget {
+            org: cloud.org_slug.clone(),
+            endpoint: cloud.endpoint.clone(),
+            org_id: cloud.organization_id.clone(),
+            identity: None,
+        };
+        let home = thread_of(&connected);
+        let original_home = store
+            .cloud_agent_sessions(&cloud.id)
+            .unwrap()
+            .into_iter()
+            .find(|session| session.thread_id == home)
+            .unwrap()
+            .to_json();
+        let sender = if peer {
+            Sender::Agent("first-ack-peer".into())
+        } else {
+            Sender::Operator
+        };
+        let peer_provenance = if peer {
+            let row = store.agent("first-ack-peer").unwrap();
+            let epoch = cloud_agent::registration_epoch(row.created);
+            let owner = Owner::new("https://issuer.example.test", "stub-subject");
+            // Service-level source/custody setup ONLY. This does not establish
+            // split-UID OS enrollment or grant an RPC caller an isolation bypass.
+            let expires = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 600;
+            cadence_agent::remote_cli::cloud_agent_save_peer(
+                &target,
+                &owner,
+                &row.uid,
+                epoch,
+                &json!({"token": format!("hct_{}", "b".repeat(43)), "expires_at": expires}),
+            )
+            .unwrap();
+            store
+                .cloud_agent_source_grant(&CloudSource {
+                    cloud_agent_id: cloud.id.clone(),
+                    kind: "local_peer".into(),
+                    uid: row.uid.clone(),
+                    registration_epoch: epoch,
+                    owner,
+                    label: "first-ack-peer".into(),
+                    scope: "cloud_agent.write".into(),
+                    granted_by: "operator".into(),
+                    granted_at: cadence_agent::store::now_public(),
+                    invoker_id: None,
+                    state: "active".into(),
+                })
+                .unwrap();
+            Some(
+                json!({"kind": "local_peer", "invoker_id": "inv_pppppppppppppppppppppppppppppppp",
+                "peer": {"agent_id": "hca_first_ack_fixture", "client_agent_id": "first-ack-peer", "role": "cloud_agent",
+                    "sender": {"uid": row.uid, "registration_epoch": epoch}}}),
+            )
+        } else {
+            None
+        };
+        let source = sender.source_for(&store, &target).unwrap();
+        fx.stub
+            .set(|script| script.first_ack.as_mut().unwrap().peer = peer_provenance);
+        Self {
+            fx,
+            source,
+            sender,
+            cloud,
+            target,
+            accepted,
+            original_home,
+        }
+    }
+
+    fn new_work(&self, store: &Store) -> String {
+        // The schema currently exposes one selected home per alias, not a
+        // public multi-work-thread creation API. Seed a canonical rollover in
+        // this isolated fixture: retain the old thread AND all cloud bindings,
+        // then let Store mint a new selected work thread. No source, UID,
+        // consent, session, operation, index or guard is edited/deleted.
+        let connection = rusqlite::Connection::open(self.fx.state.join("cadence.sqlite3")).unwrap();
+        connection.execute("UPDATE threads SET archived_alias=alias, alias=NULL WHERE alias=? AND install_id IS NULL", [ALIAS]).unwrap();
+        store.ensure_thread(ALIAS).unwrap().id
+    }
+
+    fn send(
+        &self,
+        store: &Store,
+        thread: &str,
+        operation: &str,
+        text: &str,
+    ) -> cadence_agent::Result<cadence_agent::store::CloudOperation> {
+        cadence_agent::cloud_agent::send(
+            store,
+            &cadence_agent::cloud_agent::wire::HostedCloudTransport,
+            &self.cloud,
+            &self.target,
+            thread,
+            &self.sender,
+            &self.source,
+            operation,
+            text,
+            true,
+            None,
+            || Ok(()),
+        )
+    }
+
+    fn read(
+        &self,
+        store: &Store,
+        operation: &str,
+    ) -> cadence_agent::Result<cadence_agent::store::CloudOperation> {
+        cadence_agent::cloud_agent::read_operation(
+            store,
+            &cadence_agent::cloud_agent::wire::HostedCloudTransport,
+            &self.cloud,
+            &self.target,
+            operation,
+            &self.source,
+            || Ok(()),
+        )
+    }
+
+    fn session(&self, store: &Store, thread: &str) -> Option<cadence_agent::store::CloudSession> {
+        store
+            .cloud_agent_session(
+                &self.cloud.id,
+                self.source.kind,
+                &self.source.uid,
+                self.source.epoch,
+                &self.source.owner,
+                thread,
+            )
+            .unwrap()
+    }
+
+    fn pin(&self, store: &Store) -> Option<String> {
+        store
+            .cloud_agent_source(
+                &self.cloud.id,
+                self.source.kind,
+                &self.source.uid,
+                self.source.epoch,
+                &self.source.owner,
+            )
+            .unwrap()
+            .unwrap()
+            .invoker_id
+    }
+
+    fn lose_first_ack(&self, store: &Store, work: &str) -> FirstAckAccepted {
+        assert!(
+            self.session(store, work).is_none(),
+            "regression requires a NEW unbound work conversation"
+        );
+        assert_ne!(work, self.original_home["thread_id"].as_str().unwrap());
+        let error = self
+            .send(
+                store,
+                work,
+                "first-ack-operation-001",
+                "private first-work marker",
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            "unknown",
+            "lost acknowledgement was not uncertain: {error}"
+        );
+        let accepted = self
+            .accepted
+            .recv_timeout(Duration::from_secs(5))
+            .expect("platform did not accept before losing acknowledgement");
+        let intent = store
+            .cloud_agent_operation(&self.cloud.id, &accepted.operation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.status, "unknown");
+        assert_eq!(intent.conversation_id, accepted.conversation);
+        assert_eq!(intent.remote_operation_id, None);
+        assert!(intent.remote_session_id.is_empty());
+        assert!(intent.claimed_at > 0.0);
+        assert!(self.session(store, work).is_none());
+        assert_eq!(self.fx.stub.calls("submit"), 1);
+        assert_eq!(self.fx.stub.calls("readback"), 0);
+        assert_eq!(
+            self.fx
+                .stub
+                .script
+                .lock()
+                .unwrap()
+                .first_ack
+                .as_ref()
+                .unwrap()
+                .turns
+                .len(),
+            1
+        );
+        accepted
+    }
+
+    fn assert_recovery_wire(&self, before: usize, accepted: &FirstAckAccepted) {
+        let script = self.fx.stub.script.lock().unwrap();
+        let calls = &script.seen[before..];
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.action == "readback")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls.iter().filter(|call| call.action == "agent").count(),
+            1,
+            "missing metadata must come from one model-free source-owned discovery"
+        );
+        let credential = if self.source.kind == "local_peer" {
+            "b"
+        } else {
+            "a"
+        };
+        for call in calls {
+            assert!(
+                matches!(call.action.as_str(), "agent" | "readback"),
+                "recovery attempted another model submit"
+            );
+            assert_eq!(
+                call.authorization,
+                format!("bearer hct_{}", credential.repeat(43)),
+                "recovery borrowed another source's credential"
+            );
+            assert_eq!(
+                call.body["arguments"]["conversation_id"],
+                json!(accepted.conversation)
+            );
+            if call.action == "readback" {
+                assert_eq!(
+                    call.body["arguments"]["operation_id"],
+                    json!(accepted.operation)
+                );
+            }
+        }
+    }
+}
+
+fn first_ack_recovers_new_work(peer: bool) {
+    let fixture = FirstAckFixture::start(peer);
+    let store = fixture.fx.store();
+    let work = fixture.new_work(&store);
+    let accepted = fixture.lose_first_ack(&store, &work);
+    if peer {
+        assert_eq!(
+            fixture.pin(&store),
+            None,
+            "peer was already pinned before its FIRST acknowledgement"
+        );
+    }
+    // Reopen durable state, rather than recovering through an in-memory binding.
+    drop(store);
+    let store = fixture.fx.store();
+    let before = fixture.fx.stub.seen().len();
+    let recovered = fixture.read(&store, &accepted.operation).unwrap();
+    assert_eq!(recovered.status, "completed");
+    assert_eq!(
+        recovered.remote_operation_id.as_deref(),
+        Some(accepted.operation.as_str())
+    );
+    assert_eq!(
+        recovered.reply_text.as_deref(),
+        Some(accepted.reply.as_str())
+    );
+    assert_eq!(
+        fixture.fx.stub.calls("submit"),
+        1,
+        "recovery resubmitted the original turn"
+    );
+    assert_eq!(fixture.fx.stub.calls("readback"), 1);
+    eprintln!("FIRST_ACK_CHECKPOINT source={} accepted_operation={} conversation={} server_session={} durable_operation_session={:?} reply_recovered=true submits=1 readbacks=1 discovery_calls={} source_pin={:?}",
+        fixture.source.kind, accepted.operation, accepted.conversation, accepted.session,
+        recovered.remote_session_id, fixture.fx.stub.calls("agent") - 1, fixture.pin(&store));
+    assert_eq!(
+        recovered.remote_session_id, accepted.session,
+        "lost FIRST acknowledgement recovered reply but lost durable operation/session correlation"
+    );
+    let binding = fixture
+        .session(&store, &work)
+        .expect("readback did not durably bind the new work conversation");
+    assert_eq!(binding.conversation_id, accepted.conversation);
+    assert_eq!(binding.remote_session_id, accepted.session);
+    assert_eq!(binding.provider_session_id.as_deref(), Some("1"));
+    assert_eq!(
+        binding.invoker_id.as_deref(),
+        Some(accepted.invoker.as_str())
+    );
+    assert_eq!(
+        fixture.pin(&store).as_deref(),
+        Some(accepted.invoker.as_str())
+    );
+    assert_eq!(binding.owner, fixture.source.owner);
+    assert_eq!(binding.source_uid, fixture.source.uid);
+    fixture.assert_recovery_wire(before, &accepted);
+    let entries = store.thread_entries_of(&work, 0, 100).unwrap();
+    let results: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.kind == "turn_result")
+        .collect();
+    assert_eq!(
+        results.len(),
+        1,
+        "original canonical work history lost or duplicated the reply"
+    );
+    assert_eq!(
+        results[0].message_id.as_deref(),
+        Some(accepted.operation.as_str())
+    );
+    assert!(results[0].text.contains(&accepted.reply));
+    assert!(
+        results[0]
+            .payload
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains(&accepted.session),
+        "canonical result lost remote-session metadata"
+    );
+
+    let follow = fixture
+        .send(&store, &work, "first-ack-operation-002", "follow-up marker")
+        .unwrap();
+    assert_eq!(follow.remote_session_id, accepted.session);
+    assert!(follow
+        .reply_text
+        .as_ref()
+        .unwrap()
+        .contains("private first-work marker"));
+    assert!(follow
+        .reply_text
+        .as_ref()
+        .unwrap()
+        .contains("follow-up marker"));
+    let other = fixture.new_work(&store);
+    assert!(fixture.session(&store, &other).is_none());
+    let separate = fixture
+        .send(
+            &store,
+            &other,
+            "first-ack-operation-003",
+            "separate-work marker",
+        )
+        .unwrap();
+    let separate_binding = fixture.session(&store, &other).unwrap();
+    assert_ne!(separate_binding.conversation_id, binding.conversation_id);
+    assert_ne!(
+        separate_binding.remote_session_id,
+        binding.remote_session_id
+    );
+    assert_eq!(
+        separate.remote_session_id,
+        separate_binding.remote_session_id
+    );
+    assert_eq!(
+        separate_binding.provider_session_id.as_deref(),
+        Some("1"),
+        "provider session1 is local to each remote object"
+    );
+    assert!(!separate
+        .reply_text
+        .as_ref()
+        .unwrap()
+        .contains("private first-work marker"));
+    assert!(!separate
+        .reply_text
+        .as_ref()
+        .unwrap()
+        .contains("follow-up marker"));
+    assert_eq!(
+        fixture.session(&store, &work).unwrap().to_json(),
+        binding.to_json(),
+        "second conversation overwrote the original binding"
+    );
+    assert_eq!(fixture.fx.stub.calls("submit"), 3);
+    assert_eq!(
+        fixture
+            .fx
+            .stub
+            .script
+            .lock()
+            .unwrap()
+            .first_ack
+            .as_ref()
+            .unwrap()
+            .turns
+            .len(),
+        3
+    );
+    let retained_home = store
+        .cloud_agent_sessions(&fixture.cloud.id)
+        .unwrap()
+        .into_iter()
+        .find(|session| session.thread_id == fixture.original_home["thread_id"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        retained_home.to_json(),
+        fixture.original_home,
+        "recovery adopted or replaced the bound home context"
+    );
+}
+
+#[test]
+fn first_ack_user_recovery_preserves_new_work_session_and_operation() {
+    first_ack_recovers_new_work(false);
+}
+
+#[test]
+fn first_ack_service_peer_recovery_uses_its_own_source_metadata() {
+    first_ack_recovers_new_work(true);
+}
+
+#[test]
+fn first_ack_wrong_discovery_invoker_cannot_adopt_reply_or_overwrite_pin() {
+    let fixture = FirstAckFixture::start(false);
+    let store = fixture.fx.store();
+    let work = fixture.new_work(&store);
+    let pinned = fixture.pin(&store);
+    let accepted = fixture.lose_first_ack(&store, &work);
+    drop(store);
+    let store = fixture.fx.store();
+    fixture
+        .fx
+        .stub
+        .set(|script| script.first_ack.as_mut().unwrap().wrong_discovery_invoker = true);
+    let before = fixture.fx.stub.seen().len();
+    let result = fixture.read(&store, &accepted.operation);
+    assert_eq!(
+        fixture.fx.stub.calls("submit"),
+        1,
+        "bad metadata caused another submit"
+    );
+    assert_eq!(
+        fixture.pin(&store),
+        pinned,
+        "bad metadata overwrote the established source pin"
+    );
+    let error = result.expect_err("wrong-invoker discovery boundary adopted a completed reply without proving its missing metadata");
+    assert_eq!(
+        code(&error),
+        Some("cloud_agent_invoker_changed"),
+        "wrong metadata was not refused by the immutable-invoker guard: {error}"
+    );
+    fixture.assert_recovery_wire(before, &accepted);
+    assert!(
+        fixture.session(&store, &work).is_none(),
+        "wrong invoker bound the new work context"
+    );
+    let operation = store
+        .cloud_agent_operation(&fixture.cloud.id, &accepted.operation)
+        .unwrap()
+        .unwrap();
+    assert_ne!(operation.status, "completed");
+    assert!(operation.remote_session_id.is_empty());
+    assert!(operation.reply_text.is_none());
+    assert!(operation.reply_message_id.is_none());
+    let entries = store.thread_entries_of(&work, 0, 100).unwrap();
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.kind != "turn_result" && !entry.text.contains(&accepted.reply)),
+        "unproved reply leaked into canonical history"
+    );
+    let retained_home = store
+        .cloud_agent_sessions(&fixture.cloud.id)
+        .unwrap()
+        .into_iter()
+        .find(|session| session.thread_id == fixture.original_home["thread_id"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(retained_home.to_json(), fixture.original_home);
+    assert_eq!(
+        fixture
+            .fx
+            .stub
+            .script
+            .lock()
+            .unwrap()
+            .first_ack
+            .as_ref()
+            .unwrap()
+            .turns
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -1900,6 +2700,7 @@ fn admitted_peer_source_settles_canonical_result_and_uid_bound_report() {
             &self,
             _: &cadence_agent::remote_cli::RemoteTarget,
             _: &str,
+            _: Option<&cadence_agent::cloud_agent::Source>,
         ) -> cadence_agent::Result<RemoteAgent> {
             Err(cadence_agent::Error::rejected("connect unused"))
         }
@@ -2141,6 +2942,7 @@ fn admitted_peer_source_settles_canonical_result_and_uid_bound_report() {
             &self,
             _: &cadence_agent::remote_cli::RemoteTarget,
             _: &str,
+            _: Option<&cadence_agent::cloud_agent::Source>,
         ) -> cadence_agent::Result<RemoteAgent> {
             Err(cadence_agent::Error::rejected("connect unused"))
         }
@@ -2373,6 +3175,7 @@ fn a_late_inflight_readback_cannot_reopen_a_completed_receipt() {
             &self,
             _: &cadence_agent::remote_cli::RemoteTarget,
             _: &str,
+            _: Option<&cadence_agent::cloud_agent::Source>,
         ) -> cadence_agent::Result<RemoteAgent> {
             Err(cadence_agent::Error::rejected("connect unused"))
         }
@@ -2952,7 +3755,12 @@ fn a_foreign_owner_cannot_read_the_settled_history() {
     /// way the read is stopped is the source/owner comparison.
     struct WouldAnswer(Arc<AtomicUsize>);
     impl CloudTransport for WouldAnswer {
-        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+        fn connect(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: Option<&cadence_agent::cloud_agent::Source>,
+        ) -> cadence_agent::Result<RemoteAgent> {
             Err(cadence_agent::Error::rejected("connect unused"))
         }
         fn submit(
@@ -3427,6 +4235,7 @@ fn canonical_enqueue_refuses_a_replaced_alias_source_without_transport_or_delive
             &self,
             _: &cadence_agent::remote_cli::RemoteTarget,
             _: &str,
+            _: Option<&cadence_agent::cloud_agent::Source>,
         ) -> cadence_agent::Result<RemoteAgent> {
             Err(cadence_agent::Error::rejected(
                 "no transport in this bad case",
@@ -3559,14 +4368,18 @@ fn crash_before_submit_returns_reconciles_the_persisted_intent_without_resubmit(
         let id = id.clone();
         let home = home.clone();
         thread::spawn(move || {
-            client::rpc(
-                &state,
-                "cloud_agent_send",
-                json!({
-                    "cloud_agent_id": id, "thread_id": home,
-                    "text": TEXT, "operation_id": OPERATION, "wake": true,
-                }),
-            )
+            // Caller scopes are thread-local: assert this intended operator
+            // inside the client thread, just as Fx::call does synchronously.
+            scoped(Asserted::Operator, || {
+                client::rpc(
+                    &state,
+                    "cloud_agent_send",
+                    json!({
+                        "cloud_agent_id": id, "thread_id": home,
+                        "text": TEXT, "operation_id": OPERATION, "wake": true,
+                    }),
+                )
+            })
         })
     };
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -3633,19 +4446,34 @@ fn a_deadline_exhausting_head_does_not_starve_the_next_accepted_turn() {
         .cloud_agent_operation(&id, "operation-00000010")
         .unwrap()
         .expect("template operation");
-    // Exactly eight pending heads on distinct sessions; the FIRST is
-    // authoritative but its HTTP read consumes the tick's wall deadline.
+    // Eight retained work threads each have their own consistent binding;
+    // the FIRST is authoritative but exhausts the tick's HTTP wall deadline.
+    let connection = rusqlite::Connection::open(fx.state.join("cadence.sqlite3")).unwrap();
     for index in 1..=8 {
         let mut draft = template.clone();
         draft.operation_id = format!("deadline-operation-{index:04}");
-        draft.conversation_id = format!("deadline-conversation-{index:04}");
-        draft.remote_session_id = format!("ns_deadline_{index:04}");
+        draft.thread_id = format!("{home}-deadline-{index:04}");
+        draft.conversation_id = format!("conv-deadline-{index:04}");
+        draft.remote_session_id = conversation_object(&draft.conversation_id)["remote_session_id"]
+            .as_str().unwrap().to_string();
         draft.source_uid = "stub-subject".into();
         draft.registration_epoch = 0;
         draft.remote_operation_id = None;
         draft.message_id = None;
         draft.reply_text = None;
         draft.reply_message_id = None;
+        // Retain real prior canonical threads without replacing the current home.
+        connection.execute(
+            "INSERT INTO threads(id, archived_alias, created, updated) \
+             SELECT ?1, COALESCE(alias, archived_alias), created, updated \
+             FROM threads WHERE id=?2",
+            rusqlite::params![draft.thread_id, home],
+        ).unwrap();
+        store.cloud_agent_bind_session(
+            &id, &draft.source_kind, &draft.source_uid, draft.registration_epoch,
+            &draft.owner, &draft.thread_id, &draft.conversation_id,
+            &draft.remote_session_id, None, None,
+        ).unwrap();
         store.cloud_agent_operation_begin(&draft).unwrap();
         store
             .cloud_agent_operation_set(
@@ -3665,7 +4493,7 @@ fn a_deadline_exhausting_head_does_not_starve_the_next_accepted_turn() {
         script.read_state = "completed".into();
         script.read_text = "genuine stub reply".into();
     });
-    // The ninth turn is accepted on its own session while the head is unknown.
+    // The ninth turn is accepted while the head is unknown.
     let ninth = "deadline-accepted-0009";
     fx.call(
         Asserted::Operator,
@@ -4097,7 +4925,12 @@ fn a_lost_submit_claim_returns_the_conflict_without_content_or_a_second_submit()
         reply: &'static str,
     }
     impl CloudTransport for Counted {
-        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+        fn connect(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: Option<&cadence_agent::cloud_agent::Source>,
+        ) -> cadence_agent::Result<RemoteAgent> {
             Err(cadence_agent::Error::rejected("connect unused"))
         }
         fn submit(
@@ -4379,7 +5212,12 @@ fn an_accepted_queued_claim_cannot_re_fire_and_restart_reconciles_by_readback() 
     /// remote operation id came back. Every call is counted.
     struct AcceptedQueued(Arc<AtomicUsize>);
     impl CloudTransport for AcceptedQueued {
-        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+        fn connect(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: Option<&cadence_agent::cloud_agent::Source>,
+        ) -> cadence_agent::Result<RemoteAgent> {
             Err(cadence_agent::Error::rejected("connect unused"))
         }
         fn submit(
@@ -4666,7 +5504,12 @@ fn a_cloud_projection_shows_only_the_callers_own_source_rows() {
 
     struct PeerReply;
     impl CloudTransport for PeerReply {
-        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+        fn connect(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: Option<&cadence_agent::cloud_agent::Source>,
+        ) -> cadence_agent::Result<RemoteAgent> {
             Err(cadence_agent::Error::rejected("connect unused"))
         }
         fn submit(
@@ -5696,7 +6539,12 @@ fn the_body_reader_and_the_wait_do_not_hand_out_a_routed_cloud_result() {
 
     struct PeerReply;
     impl CloudTransport for PeerReply {
-        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+        fn connect(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: Option<&cadence_agent::cloud_agent::Source>,
+        ) -> cadence_agent::Result<RemoteAgent> {
             Err(cadence_agent::Error::rejected("connect unused"))
         }
         fn submit(
@@ -5863,7 +6711,12 @@ fn a_routed_cloud_result_is_not_projected_to_an_unrelated_agent() {
 
     struct PeerReply;
     impl CloudTransport for PeerReply {
-        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+        fn connect(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: Option<&cadence_agent::cloud_agent::Source>,
+        ) -> cadence_agent::Result<RemoteAgent> {
             Err(cadence_agent::Error::rejected("connect unused"))
         }
         fn submit(
@@ -6587,7 +7440,12 @@ fn the_board_thread_page_advances_each_direction_past_filtered_pages() {
 
     struct PeerReply;
     impl CloudTransport for PeerReply {
-        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+        fn connect(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: Option<&cadence_agent::cloud_agent::Source>,
+        ) -> cadence_agent::Result<RemoteAgent> {
             Err(cadence_agent::Error::rejected("connect unused"))
         }
         fn submit(
@@ -6951,7 +7809,12 @@ fn a_portable_round_trip_with_an_enrolled_peer_drops_the_routed_result() {
 
     struct PeerReply;
     impl CloudTransport for PeerReply {
-        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+        fn connect(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: Option<&cadence_agent::cloud_agent::Source>,
+        ) -> cadence_agent::Result<RemoteAgent> {
             Err(cadence_agent::Error::rejected("connect unused"))
         }
         fn submit(
@@ -7312,7 +8175,12 @@ fn a_fully_filtered_thread_page_advances_the_cursor() {
 
     struct PeerReply;
     impl CloudTransport for PeerReply {
-        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+        fn connect(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: Option<&cadence_agent::cloud_agent::Source>,
+        ) -> cadence_agent::Result<RemoteAgent> {
             Err(cadence_agent::Error::rejected("connect unused"))
         }
         fn submit(
@@ -7641,7 +8509,12 @@ fn a_routed_cloud_result_resolving_after_admission_keeps_its_binding() {
 
     struct Reply(&'static str);
     impl CloudTransport for Reply {
-        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+        fn connect(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: Option<&cadence_agent::cloud_agent::Source>,
+        ) -> cadence_agent::Result<RemoteAgent> {
             Err(cadence_agent::Error::rejected("connect unused"))
         }
         fn submit(
@@ -7995,7 +8868,12 @@ fn the_board_thread_stream_advances_past_a_fully_filtered_page() {
 
     struct PeerReply;
     impl CloudTransport for PeerReply {
-        fn connect(&self, _: &RemoteTarget, _: &str) -> cadence_agent::Result<RemoteAgent> {
+        fn connect(
+            &self,
+            _: &RemoteTarget,
+            _: &str,
+            _: Option<&cadence_agent::cloud_agent::Source>,
+        ) -> cadence_agent::Result<RemoteAgent> {
             Err(cadence_agent::Error::rejected("connect unused"))
         }
         fn submit(
@@ -8423,4 +9301,146 @@ fn routed_copies_require_their_own_backing_connection_read_scope_and_proof() {
             "reading routed copies resubmitted a turn"
         );
     }
+}
+
+#[test]
+fn due_cloud_login_renews_at_the_wire_boundary_and_read_only_consent_sends_nothing() {
+    let mut fx = Fx::start();
+    let (stub, ca, address) = Stub::renewal_tls(fx.root.path());
+    fx.stub = stub;
+    // The debug-only fixture still verifies the certificate and hostname;
+    // its resolver refuses every non-fixture host, not just real cloud hosts.
+    for (key, value) in [
+        ("CADENCE_TEST_TLS_CA", ca.into_os_string()),
+        ("CADENCE_TEST_TLS_CONNECT", OsString::from(address.to_string())),
+    ] {
+        fx._env.0.push((key, std::env::var_os(key)));
+        std::env::set_var(key, value);
+    }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let capabilities = ["bridge.enroll", "cloud_agent.read", "cloud_agent.write"];
+    let old_refresh = format!("hcr_{}", "R".repeat(43));
+    let new_access = format!("hct_{}", "N".repeat(43));
+    let session = json!({
+        "session_id": "hcs_12345678-1234-4234-8234-123456789abc",
+        "refresh_token": old_refresh, "generation": 7,
+        "device_label": "independent cloud boundary",
+        "idle_expires_at": at + 1000, "absolute_expires_at": at + 10_000,
+    });
+    write_login_owner(LoginSpec {
+        org: ORG, org_id: ORG_ID, endpoint: &fx.stub.url,
+        capabilities: &capabilities, expires: at + 600,
+        subject: "stub-subject", issuer: &fx.stub.url, token_char: "a",
+    });
+    let path = login_path(ORG);
+    let mut saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    saved["cli_session"] = session.clone();
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let pin = path.parent().unwrap().join("trusted-issuer");
+    std::fs::write(&pin, format!("{}\n", fx.stub.url)).unwrap();
+    std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let connected = fx.connect();
+    assert_eq!(fx.stub.calls("renew"), 0, "fresh discovery unnecessarily renewed");
+
+    // Make the SAME login due only after connection discovery. The next real
+    // operator send, not a direct renewal helper, must rotate before its POST.
+    saved["expires_at"] = json!(at + 45);
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    fx.stub.set(|script| {
+        script.seen.clear();
+        script.submit_state = "completed".into();
+        script.submit_text = Some("reply after cloud-only renewal".into());
+        // Checked against the AOS-395 issuer's cli-session.ts accessResponse
+        // and /renew reply, not copied from the native renewal validator.
+        script.renewal_answer = Some(json!({
+            "version": "hosted-cadence-auth.v1",
+            "organization_id": ORG_ID, "organization_slug": ORG,
+            "audience": fx.stub.url,
+            "principal": {"kind":"user", "current_role":"owner", "subject_id":"stub-subject"},
+            "capabilities": capabilities,
+            "credential": {
+                "credential_id": "hcp_12345678-1234-4234-8234-123456789abc",
+                "access_token": new_access, "token_type":"Bearer",
+                "issued_at":at, "expires_at":at + 300, "renewal":"reexchange",
+            },
+            "cli_session": {
+                "session_id":session["session_id"],
+                "refresh_token":format!("hcr_{}", "S".repeat(43)), "generation":8,
+                "device_label":session["device_label"],
+                "idle_expires_at":at + 1000, "absolute_expires_at":at + 10_000,
+            },
+        }));
+    });
+    let thread = thread_of(&connected);
+    let params = json!({
+        "cloud_agent_id":cloud_agent_id(&connected), "thread_id":thread,
+        "operation_id":OPERATION, "text":TEXT, "wake":true,
+    });
+    let first = fx.call(Asserted::Operator, "cloud_agent_send", params.clone()).unwrap();
+    assert_eq!(first["operation"]["status"], json!("completed"));
+    assert_eq!(first["operation"]["reply"]["text"], json!("reply after cloud-only renewal"));
+    let replay = fx.call(Asserted::Operator, "cloud_agent_send", params).unwrap();
+    assert_eq!(replay["operation"]["operation_id"], json!(OPERATION));
+    assert_eq!(replay["operation"]["status"], json!("completed"));
+    let results: Vec<_> = fx.store().thread_entries_of(&thread, 0, 100).unwrap()
+        .into_iter().filter(|entry| entry.kind == "turn_result").collect();
+    assert_eq!(results.len(), 1, "renewal/replay duplicated canonical completion");
+    assert_eq!(results[0].text, "reply after cloud-only renewal");
+    fx.stop_daemon();
+    {
+        let script = fx.stub.script.lock().unwrap();
+        assert_eq!(script.calls("renew"), 1, "one due login must renew exactly once");
+        assert_eq!(script.calls("submit"), 1, "renewal/replay duplicated model submit");
+        assert!(script.seen.len() >= 2, "renewal never reached a contract POST");
+        let renewal = &script.seen[0];
+        assert_eq!(renewal.action, "renew", "contract POST preceded renewal");
+        assert_eq!(renewal.method, "POST");
+        assert_eq!(renewal.authorization, format!("bearer {old_refresh}"));
+        let operation = &renewal.body["operation_id"];
+        let suffix = operation.as_str().unwrap().strip_prefix("op_").unwrap();
+        assert!((32..=80).contains(&suffix.len()));
+        assert!(suffix.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)));
+        assert_eq!(renewal.body, json!({
+            "version":"hosted-cadence-cli-session.v1",
+            "session_id":session["session_id"], "operation_id":operation,
+            "expected_generation":7, "organization_id":ORG_ID, "organization_slug":ORG,
+            "audience":fx.stub.url, "subject_id":"stub-subject",
+            "device_label":session["device_label"], "capabilities":capabilities,
+        }));
+        for contract in &script.seen[1..] {
+            assert_eq!(contract.method, "POST");
+            assert_eq!(contract.authorization, format!("bearer {new_access}"),
+                "contract POST used stale access token or refresh token");
+        }
+    }
+
+    // A valid, due renewable READ-only login cannot perform a WRITE action.
+    // Reuse the actual submit body and exercise the public send boundary:
+    // scope refusal must precede both issuer renewal and the contract POST.
+    let submit = fx.stub.seen().into_iter()
+        .find(|body| body["action"] == "submit")
+        .expect("the positive half recorded its real submit body");
+    let negative_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    // Keep the newly issued access/session pair, not the spent refresh token.
+    saved = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    saved["capabilities"] = json!(["cloud_agent.read"]);
+    saved["cli_session"] = fx.stub.script.lock().unwrap().renewal_answer
+        .as_ref().unwrap()["cli_session"].clone();
+    saved["expires_at"] = json!(negative_at + 45);
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    fx.stub.set(|script| script.seen.clear());
+    let target = cadence_agent::remote_cli::RemoteTarget {
+        identity:None, org:ORG.into(), org_id:ORG_ID.into(), endpoint:fx.stub.url.clone(),
+    };
+    let refused = cadence_agent::remote_cli::cloud_agent_post(
+        &target, CONTRACT_PATH,
+        &submit,
+        "cloud_agent.write",
+    ).expect_err("read-only consent must be refused before either wire boundary");
+    assert_eq!(fx.stub.calls("renew"), 0, "narrowed consent contacted issuer");
+    assert!(fx.stub.seen().is_empty(), "narrowed consent reached contract transport");
+    println!("CLOUD_RENEWAL_BOUNDARY positive: renew=1 submit=1 canonical_result=1 new_access_only; negative: kind={} code={:?} renew=0 contract=0 (expected cloud_agent_scope_revoked)", refused.kind(), code(&refused));
+    assert_eq!(code(&refused), Some("cloud_agent_scope_revoked"), "{refused}");
 }
