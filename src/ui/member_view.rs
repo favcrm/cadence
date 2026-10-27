@@ -202,6 +202,9 @@ pub(super) fn member_view(page: &mut Value) {
     // and a member; this layer can, and drops the cloud request together with
     // every entry that shares its operation id (the reply lands under the
     // same id). A proven operator never reaches this function.
+    // The daemon marks every cloud row it admitted (`payload.cloud_agent`), and
+    // the request still carries `payload.source`. Neither depends on the
+    // request being on the same page as its reply.
     let cloud_ids: std::collections::BTreeSet<String> = page["entries"]
         .as_array()
         .into_iter()
@@ -218,6 +221,7 @@ pub(super) fn member_view(page: &mut Value) {
                 && !e["kind"]
                     .as_str()
                     .is_some_and(crate::store::operator_only_kind)
+                && e["payload"].get("cloud_agent").is_none()
                 && !e["message"]
                     .as_str()
                     .is_some_and(|id| cloud_ids.contains(id))
@@ -282,6 +286,23 @@ mod tests {
             .map(|e| e["text"].as_str().unwrap_or_default().to_string())
             .collect::<Vec<_>>();
         assert_eq!(text, vec!["ordinary mail".to_string()], "{page}");
+    }
+
+    /// A reply that arrives on a LATER page still goes: the daemon stamps the
+    /// row itself, so the rule never depends on seeing the request.
+    #[test]
+    fn a_member_view_drops_a_stamped_cloud_row_on_its_own_page() {
+        let mut page = json!({
+            "alias": "worker",
+            "thread": {"id": "t", "install_id": null},
+            "entries": [
+                {"seq": 9, "kind": "turn_result", "role": "agent", "message": "op-9",
+                 "text": "cloud reply, later page",
+                 "payload": {"status": "completed", "cloud_agent": "cld-1"}}
+            ]
+        });
+        member_view(&mut page);
+        assert_eq!(page["entries"].as_array().unwrap().len(), 0, "{page}");
     }
 
     /// The operator path never calls this function, so the same page keeps

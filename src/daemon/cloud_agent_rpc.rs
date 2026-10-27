@@ -304,6 +304,23 @@ impl CloudProjection {
                 Row::Never => false,
             };
             if keep {
+                // Mark cloud content where it lives, so a reader that is not
+                // the operator can drop it without having to see the request
+                // and the reply on the same page. The board layer enforces the
+                // member rule; it cannot see the daemon's admission.
+                let mut entry = entry;
+                if !self.scopes.is_empty() {
+                    let mut payload = entry
+                        .payload
+                        .take()
+                        .and_then(|p| p.as_object().cloned())
+                        .unwrap_or_default();
+                    payload.insert(
+                        "cloud_agent".to_string(),
+                        Value::String(self.scopes[0].cloud_agent_id.clone()),
+                    );
+                    entry.payload = Some(Value::Object(payload));
+                }
                 kept.push(entry);
             }
         }
