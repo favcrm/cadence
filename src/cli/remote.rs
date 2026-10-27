@@ -2,7 +2,7 @@
 //! allowlisted local commands to AOS-128 verbs and runs them through
 //! [`cadence_agent::remote_cli`]. Anything outside the allowlist is refused
 //! *here*, before a request is ever built. Operator-only verbs never map.
-//! `issue project policy` is `project_policy`; project add/list stay local.
+//! `issue project policy` is `project_policy`; project add/list/set-remote stay local.
 
 use super::*;
 use cadence_agent::remote_cli::RemoteTarget;
@@ -2192,6 +2192,20 @@ mod read_contract_tests {
         })
         .unwrap_err();
         assert!(ls.contains("not available on a remote org"), "{ls}");
+        let set_remote = outcome(&Commands::Issue {
+            action: IssueAction::Project {
+                action: ProjectAction::SetRemote {
+                    key: "cadence".into(),
+                    from: "github.com/old/name".into(),
+                    to: "github.com/new/name".into(),
+                },
+            },
+        })
+        .unwrap_err();
+        assert!(
+            set_remote.contains("not available on a remote org"),
+            "{set_remote}"
+        );
     }
 
     /// CAD-1568: `cadence send`/`message send` become `message_send` with
