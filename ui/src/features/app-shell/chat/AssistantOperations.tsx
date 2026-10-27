@@ -49,7 +49,6 @@ interface MediaRefinePreview {
   quote: MediaQuote;
   estimate_micros: number;
   currency: "USD";
-  ceiling_micros: number;
   allow_once: true;
 }
 interface PermissionRequest {
@@ -172,7 +171,7 @@ function parseRecordPreview(value: unknown): RecordPreview | null {
     expected_revision: preview.expected_revision as number,
   };
 }
-const MEDIA_PREVIEW_KEYS = ["asset_id", "revision", "sha256", "title", "artifact_ref", "instructions", "workflow", "slot", "model", "quote", "estimate_micros", "currency", "ceiling_micros", "allow_once"] as const;
+const MEDIA_PREVIEW_KEYS = ["asset_id", "revision", "sha256", "title", "artifact_ref", "instructions", "workflow", "slot", "model", "quote", "estimate_micros", "currency", "allow_once"] as const;
 const MEDIA_QUOTE_KEYS = ["schema", "currency", "unit_price_micros", "units", "total_price_micros", "price_revision"] as const;
 function closedKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const seen = Object.keys(value);
@@ -199,7 +198,6 @@ function parseMediaRefinePreview(value: unknown): MediaRefinePreview | null {
   const model = text(preview.model, 80);
   const revision = preview.revision;
   const estimate = usdMicros(preview.estimate_micros);
-  const ceiling = usdMicros(preview.ceiling_micros);
   const unit = usdMicros(quote.unit_price_micros);
   const total = usdMicros(quote.total_price_micros);
   const priceRevision = text(quote.price_revision, 128);
@@ -207,9 +205,9 @@ function parseMediaRefinePreview(value: unknown): MediaRefinePreview | null {
       title === null || artifact === null || instructions === null || slot === null || model === null ||
       preview.workflow !== "refine-image" || preview.currency !== "USD" || preview.allow_once !== true ||
       !Number.isSafeInteger(revision) || (revision as number) < 1 ||
-      estimate === null || ceiling === null || unit === null || total === null || priceRevision === null ||
+      estimate === null || unit === null || total === null || priceRevision === null ||
       quote.schema !== 1 || quote.currency !== "USD" || quote.units !== 1 ||
-      estimate !== total || ceiling !== total || unit !== total) return null;
+      estimate !== total || unit !== total) return null;
   return {
     asset_id: assetId,
     revision: revision as number,
@@ -223,7 +221,6 @@ function parseMediaRefinePreview(value: unknown): MediaRefinePreview | null {
     quote: { schema: 1, currency: "USD", unit_price_micros: unit, units: 1, total_price_micros: total, price_revision: priceRevision },
     estimate_micros: estimate,
     currency: "USD",
-    ceiling_micros: ceiling,
     allow_once: true,
   };
 }
@@ -316,6 +313,10 @@ function resultValues(value: unknown, depth = 0): Array<[string, string]> {
   return rows;
 }
 
+/** Actions the operator may allow always: tags per customer, and the paid
+ *  Social actions for this installation (CAD-1852). Media refine stays allow-once. */
+const STANDING_ACTIONS: ReadonlySet<string> = new Set(["customer.tags.update", "social.posts.fetch", "social.draft.create"]);
+
 function AssistantOperationCard({ operation, installId, contextId, busy, decide, appPath }: {
   operation: Operation;
   installId: string;
@@ -329,7 +330,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
   const request = operation.permission_request;
   const requestMatches = request !== null && request.scope.install_id === installId &&
     request.scope.context_id === contextId && request.scope.action_id === operation.action_id &&
-    (!request.allow_always || operation.action_id === "customer.tags.update");
+    (!request.allow_always || STANDING_ACTIONS.has(operation.action_id));
   const requiresTagPreview = operation.action_id === "customer.tags.update";
   // A declared record change is decided only from its authoritative typed
   // preview, which must name this request's record. Legacy tag preview and
@@ -391,8 +392,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
                   <div><dt>{t("Original")}</dt><dd>{mediaPreview.sha256}</dd></div>
                   <div><dt>{t("Instructions")}</dt><dd>{mediaPreview.instructions}</dd></div>
                   <div><dt>{t("Model")}</dt><dd>{mediaPreview.model}</dd></div>
-                  <div><dt>{t("Price")}</dt><dd>{formatUsdMicros(mediaPreview.quote.total_price_micros)}</dd></div>
-                  <div><dt>{t("Maximum spend")}</dt><dd>{formatUsdMicros(mediaPreview.ceiling_micros)}</dd></div>
+                  <div><dt>{t("Estimated price")}</dt><dd>{t("about")} {formatUsdMicros(mediaPreview.quote.total_price_micros)}</dd></div>
                 </dl>
               </div>
             )}
@@ -408,7 +408,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
             )}
             <div className="app-assistant-controls">
               <Button size="sm" variant="primary" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_once")}>{t("Allow once")}</Button>
-              {request.allow_always && !mediaKind && <Button size="sm" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_always")}>{t("Always allow for this customer")}</Button>}
+              {request.allow_always && !mediaKind && <Button size="sm" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_always")}>{operation.action_id === "customer.tags.update" ? t("Always allow for this customer") : t("Always allow")}</Button>}
               <Button size="sm" variant="danger" disabled={busy || !previewReady} onClick={() => decide(operation, "deny")}>{t("Deny this request")}</Button>
             </div>
           </>}

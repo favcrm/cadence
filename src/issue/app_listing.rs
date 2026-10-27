@@ -12,7 +12,7 @@
 //! keys `cost`, `price` and `pricing` fail the parse wherever they
 //! appear, at any depth, in `listing` or anywhere else in the
 //! frontmatter. The host's spend safety stays in the frozen quote,
-//! `max_charge_minor` and the price_changed refusal — the UI simply
+//! `max_charge_minor` and the global per-call bound — the UI simply
 //! never renders a price.
 
 use serde_json::{json, Value};
@@ -153,7 +153,7 @@ pub(crate) fn refuse_price_keys(value: &serde_yaml::Value) -> Result<()> {
                         return Err(Error::rejected(format!(
                             "app.md key '{key}': prices are not shown (CAD-1129 decision 8) — \
                              spend safety lives in the host's frozen quote, the charge \
-                             ceiling and the price_changed refusal"
+                             ceiling and the global per-call bound"
                         )));
                     }
                 }

@@ -1422,7 +1422,7 @@ fn cad1142_reason_class_is_bounded_and_never_echoes() {
     // free text never passes through verbatim unless it IS the class.
     const CLASSES: &[&str] = &[
         "run binding receipt is no longer current",
-        "capability price changed since run approval",
+        "capability price could not be confirmed",
         "run context was updated or archived",
         "capability connection receipt is stale or unavailable",
         "registered assignment identity or group changed",

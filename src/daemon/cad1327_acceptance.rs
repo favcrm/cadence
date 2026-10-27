@@ -73,6 +73,8 @@ struct Door {
     /// When set, a text call is counted and the connection is dropped
     /// without an answer (an uncertain provider outcome).
     drop_text: AtomicBool,
+    /// When set, a text call is answered 402 `insufficient_funds`.
+    no_credit: AtomicBool,
     text_calls: AtomicUsize,
     reads: AtomicUsize,
 }
@@ -166,6 +168,12 @@ fn serve(stream: std::net::TcpStream, door: &Door) {
         ("POST", "/v1/runtime/tools/call") if sent["slug"] == "generate_text" => {
             door.text_calls.fetch_add(1, SeqCst);
             if door.drop_text.load(SeqCst) {
+                return;
+            }
+            if door.no_credit.load(SeqCst) {
+                door.text_calls.fetch_sub(1, SeqCst);
+                let body = json!({"ok":false,"error":{"code":"insufficient_funds"}}).to_string();
+                let _ = writer.write_all(&raw(402, "application/json", body.as_bytes()));
                 return;
             }
             json_reply(
@@ -282,6 +290,7 @@ impl Fx {
             text_price: Mutex::new("0.002000".into()),
             image_minor: Mutex::new(None),
             drop_text: AtomicBool::new(false),
+            no_credit: AtomicBool::new(false),
             text_calls: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
         });
@@ -609,7 +618,7 @@ impl Fx {
 fn pending(reply: &Value) -> Value {
     let op = reply["operation"].clone();
     assert_eq!(op["status"], "pending_permission", "{reply}");
-    assert_eq!(op["permission_request"]["allow_always"], false, "{reply}");
+    assert_eq!(op["permission_request"]["allow_always"], true, "{reply}");
     op
 }
 
@@ -725,20 +734,17 @@ fn invoke_alone_never_drafts_or_calls_a_paid_door() {
     assert_eq!(fx.door.spent(), (1, 1, 1));
 }
 
-/// (3) A paid social action is allowed one time only: Always allow and a
-/// standing block are refused, and the refusal consumes nothing.
+/// (3) CAD-1852: Always allow on a paid social action is the operator's
+/// standing grant for that action in this installation. A later agent call
+/// runs without a card, revoke parks cards again, and a standing block stays
+/// unsupported for the paid actions.
 #[test]
-fn allow_always_and_standing_grants_are_refused_for_social_actions() {
+fn allow_always_is_a_revocable_standing_grant_for_social_actions() {
     let fx = Fx::new();
     let token = fx.create_turn("m-3");
     let op = pending(
         &fx.invoke("m-3", &token, "social.posts.fetch", "op-3", json!({}))
             .unwrap(),
-    );
-    refused(
-        fx.decide(Asserted::Operator, &op, "allow_always"),
-        "one time only",
-        "allow_always on social.posts.fetch",
     );
     for action in ["social.posts.fetch", "social.draft.create"] {
         assert!(
@@ -751,28 +757,58 @@ fn allow_always_and_standing_grants_are_refused_for_social_actions() {
             "standing block accepted for {action}"
         );
     }
+    assert_eq!(fx.door.spent(), (0, 0, 0));
+    let done = fx.decide(Asserted::Operator, &op, "allow_always").unwrap();
+    assert_eq!(done["operation"]["status"], "succeeded", "{done}");
+    assert_eq!(fx.door.spent(), (1, 0, 0));
     let permissions = fx.operator(
         "app_assistant_permissions",
         json!({"install_id":fx.install,"context_id":fx.context}),
     );
-    assert_eq!(
-        permissions["permissions"].as_array().map(Vec::len),
-        Some(0),
-        "{permissions}"
+    let grants = permissions["permissions"].as_array().unwrap();
+    assert_eq!(grants.len(), 1, "{permissions}");
+    assert_eq!(grants[0]["action_id"], "social.posts.fetch");
+    assert_eq!(grants[0]["effect"], "allow");
+    // The standing grant covers only the granted action.
+    let other = pending(
+        &fx.invoke(
+            "m-3",
+            &token,
+            "social.draft.create",
+            "op-3d",
+            json!({"post":"newest"}),
+        )
+        .unwrap(),
     );
-    assert_eq!(fx.door.spent(), (0, 0, 0));
-    let shown = fx.show("op-3");
-    assert_eq!(shown["status"], "pending_permission", "{shown}");
-    // Positive control: Allow once on the same operation still works.
-    fx.decide(Asserted::Operator, &op, "allow_once").unwrap();
-    assert_eq!(fx.door.spent(), (1, 0, 0));
-    // A later identical request parks again; nothing was remembered.
-    let next = pending(
-        &fx.invoke("m-3", &token, "social.posts.fetch", "op-3b", json!({}))
+    assert_eq!(other["status"], "pending_permission");
+    // A later identical request runs with no card, once.
+    let ran = fx
+        .invoke("m-3", &token, "social.posts.fetch", "op-3b", json!({}))
+        .unwrap();
+    assert_eq!(ran["operation"]["status"], "succeeded", "{ran}");
+    assert_eq!(fx.door.spent(), (2, 0, 0));
+    let replay = fx
+        .invoke("m-3", &token, "social.posts.fetch", "op-3b", json!({}))
+        .unwrap();
+    assert_eq!(replay["operation"]["status"], "succeeded", "{replay}");
+    assert_eq!(fx.door.spent(), (2, 0, 0), "a replay charged again");
+    // An agent cannot create or revoke a grant.
+    assert!(fx
+        .decide(Asserted::Agent("master".into()), &other, "allow_always")
+        .is_err());
+    // Revoke stops the agent: the next call parks a card again.
+    let revision = grants[0]["revision"].clone();
+    fx.operator(
+        "app_assistant_permission_revoke",
+        json!({"install_id":fx.install,"context_id":fx.context,
+            "permission_id":grants[0]["id"],"expected_revision":revision}),
+    );
+    let parked = pending(
+        &fx.invoke("m-3", &token, "social.posts.fetch", "op-3c", json!({}))
             .unwrap(),
     );
-    assert_eq!(next["status"], "pending_permission");
-    assert_eq!(fx.door.spent(), (1, 0, 0));
+    assert_eq!(parked["status"], "pending_permission");
+    assert_eq!(fx.door.spent(), (2, 0, 0));
 }
 
 /// (4) Exactly once: a second Allow (stale or current revision) and a
@@ -842,27 +878,23 @@ fn a_second_allow_and_a_replayed_operation_never_charge_twice() {
     assert_eq!(fx.drafts(&fx.context), 1, "a replay created another draft");
 }
 
-/// (6) A live price above what the operator confirmed fails the operation
-/// before anything is claimed: no provider call, no draft, no image job.
-/// Each slot is held to its own confirmed price.
+/// (6) CAD-1852: the card price is an estimate only. A live price above it
+/// does not stop the action (the live quote is the provider's
+/// `max_charge_minor`), and a 402 `insufficient_funds` is the only cost
+/// stop: it says so and charges nothing.
 #[test]
-fn a_price_above_the_confirmed_estimate_fails_with_nothing_charged() {
+fn a_price_above_the_estimate_runs_and_no_credit_is_the_only_stop() {
     let fx = Fx::new();
     let token = fx.create_turn("m-6");
-    // The paid read.
     let op = pending(
         &fx.invoke("m-6", &token, "social.posts.fetch", "op-f1", json!({}))
             .unwrap(),
     );
-    *fx.door.read_price.lock().unwrap() = "0.500000".into();
+    *fx.door.read_price.lock().unwrap() = "0.003000".into();
     let done = fx.decide(Asserted::Operator, &op, "allow_once").unwrap();
-    assert_eq!(done["operation"]["status"], "failed", "{done}");
-    assert_eq!(fx.door.spent(), (0, 0, 0), "an over-price read was charged");
-    *fx.door.read_price.lock().unwrap() = "0.002000".into();
-    fx.fetched("m-6", &token, "op-f2");
+    assert_eq!(done["operation"]["status"], "succeeded", "{done}");
     assert_eq!(fx.door.spent(), (1, 0, 0));
 
-    // The caption step.
     let op = pending(
         &fx.invoke(
             "m-6",
@@ -873,71 +905,30 @@ fn a_price_above_the_confirmed_estimate_fails_with_nothing_charged() {
         )
         .unwrap(),
     );
-    *fx.door.text_price.lock().unwrap() = "0.900000".into();
+    *fx.door.text_price.lock().unwrap() = "0.003000".into();
     let done = fx.decide(Asserted::Operator, &op, "allow_once").unwrap();
-    assert_eq!(done["operation"]["status"], "failed", "{done}");
-    assert!(
-        done["operation"]["summary"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("price"),
-        "{done}"
-    );
-    assert_eq!(
-        fx.door.spent(),
-        (1, 0, 0),
-        "an over-price caption was charged"
-    );
-    assert_eq!(fx.drafts(&fx.context), 0, "an over-price action drafted");
+    assert_eq!(done["operation"]["status"], "succeeded", "{done}");
+    assert_eq!(fx.door.spent(), (1, 1, 0));
 
-    // The image step: the image price rises above its confirmed share while
-    // the text price drops by more, so the total still looks confirmed.
-    *fx.door.text_price.lock().unwrap() = "0.002000".into();
+    // Balance is the only cost stop.
     let op = pending(
         &fx.invoke(
             "m-6",
             &token,
             "social.draft.create",
             "op-d2",
-            json!({"post":"newest","with_image":true}),
-        )
-        .unwrap(),
-    );
-    let preview = op["permission_request"]["preview"].clone();
-    let image = preview["image_micros"].as_u64().expect("image estimate");
-    assert!(image > 0, "{preview}");
-    *fx.door.text_price.lock().unwrap() = "0.000001".into();
-    // `chargeMinor` is in the door's minor unit; raise it a little.
-    *fx.door.image_minor.lock().unwrap() = Some(31_501);
-    let done = fx.decide(Asserted::Operator, &op, "allow_once").unwrap();
-    assert_eq!(done["operation"]["status"], "failed", "{done}");
-    assert_eq!(
-        fx.door.spent(),
-        (1, 0, 0),
-        "an over-price image was charged or its caption ran: {done}"
-    );
-    assert_eq!(
-        fx.drafts(&fx.context),
-        0,
-        "an over-price image action drafted"
-    );
-
-    // Positive control: at the confirmed prices the same request runs.
-    *fx.door.text_price.lock().unwrap() = "0.002000".into();
-    *fx.door.image_minor.lock().unwrap() = None;
-    let op = pending(
-        &fx.invoke(
-            "m-6",
-            &token,
-            "social.draft.create",
-            "op-d3",
             json!({"post":"newest"}),
         )
         .unwrap(),
     );
+    fx.door.no_credit.store(true, SeqCst);
     let done = fx.decide(Asserted::Operator, &op, "allow_once").unwrap();
-    assert_eq!(done["operation"]["status"], "succeeded", "{done}");
-    assert_eq!(fx.door.spent(), (1, 1, 0));
+    assert_eq!(done["operation"]["status"], "failed", "{done}");
+    assert_eq!(
+        done["operation"]["summary"], "Not enough credit — top up to continue",
+        "{done}"
+    );
+    assert_eq!(fx.door.spent(), (1, 1, 0), "an unfunded call was charged");
 }
 
 /// (7) The draft action cannot reach publish, approve, send, discard,

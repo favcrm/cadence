@@ -5,10 +5,11 @@
 //! price and parks a `pending_permission` operation; it never spends. The
 //! paid work runs inside `decide_assistant_operation`, which is reachable
 //! only with the operator proof (daemon RPC and the OperatorOnly board
-//! route). Every paid step goes through `app_tool_execute`, the same guarded
-//! core the screen uses, with the price the operator confirmed as a ceiling
-//! and a request id derived from (install, context, operation, step), so a
-//! replay can never charge twice. Publish, approve, send, discard and
+//! route) or under that operator's standing grant (CAD-1852). Every paid step
+//! goes through `app_tool_execute`, the same guarded core the screen uses; the
+//! live quote is the provider's `max_charge_minor` and no confirmed price is
+//! compared. Balance is the only cost stop. The request id is derived from
+//! (install, context, operation, step), so a replay can never charge twice. Publish, approve, send, discard and
 //! settings are not registered here at all.
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -24,6 +25,9 @@ use crate::store::app_social_drafts::{DraftSource, SocialDraftEdit, CAPTION_MAX_
 
 const CAPTION_APP_MAX: usize = 2200;
 const MAX_REASON: usize = 280;
+/// The `resource_id` of a paid-action standing grant: the grant is for the
+/// action in this installation's context, not for one handle or post.
+pub(super) const STANDING_RESOURCE: &str = "any";
 
 /// The capability slot a step runs through: its declared slot name and the
 /// alias the installed screen package declares for it.
@@ -337,7 +341,7 @@ impl Shared {
     /// Agent turn: park the paid action with its exact scope and the price
     /// the operator will confirm. Nothing is spent here.
     pub(super) fn social_request_permission(
-        &self,
+        self: &std::sync::Arc<Self>,
         records: &RecordStore,
         install: &str,
         context: &str,
@@ -361,7 +365,7 @@ impl Shared {
             let micros = quoted.source.as_ref().map_or(0, |s| s.micros);
             (
                 format!(
-                    "Read the recent public posts of @{handle}. Estimated cost USD {}, charged once.",
+                    "Read the recent public posts of @{handle}. About USD {} (estimate), charged once.",
                     usd(micros)
                 ),
                 handle.clone(),
@@ -385,7 +389,7 @@ impl Shared {
                 .unwrap_or_default();
             (
                 format!(
-                    "Draft a caption{} from @{}'s post {}.{note} Estimated cost USD {} (text {}{}), charged once.",
+                    "Draft a caption{} from @{}'s post {}.{note} About USD {} (estimate: text {}{}), charged once.",
                     if with_image { " and one image" } else { "" },
                     selected.handle,
                     clip(&selected.post_id, 24),
@@ -411,7 +415,7 @@ impl Shared {
                 "the note is too long to show in full on the confirmation card; shorten it",
             ));
         }
-        records.app_assistant_operation_set(crate::store::app_records::AssistantOperationUpdate {
+        let parked = records.app_assistant_operation_set(crate::store::app_records::AssistantOperationUpdate {
             operation_id,
             context,
             expected_revision: 1,
@@ -422,12 +426,31 @@ impl Shared {
             permission_request: &json!({
                 "reason": reason,
                 "scope": {"install_id":install,"context_id":context,"action_id":action,"resource_id":clip(&resource,128)},
-                "allow_always": false,
+                "allow_always": true,
                 "preview": preview,
             }),
             error: None,
-        })
-        .map(|op| json!({"operation": super::app_assistant_rpc::public_operation(op)}))
+        })?;
+        // Standing grant (CAD-1852): the operator's earlier "Always allow" for
+        // this action in this installation runs it without a new card. A
+        // revoked grant, or one whose action semantics changed, parks the card.
+        let (descriptor_digest, _) = super::app_assistant_rpc::install_descriptor(self, install)?;
+        let meta = crate::app_assistant::registered_action(action)
+            .ok_or_else(|| Error::rejected("unknown assistant action"))?;
+        let grant_digest = crate::store::app_runs::material_digest(
+            &json!({"contract":crate::issue::app_assistant::CONTRACT,"action":action,"schema":meta.input_schema,"handler_version":meta.handler_version,"descriptor_digest":descriptor_digest}),
+        );
+        let granted = records
+            .app_assistant_permission_find(context, action, STANDING_RESOURCE, "allow")?
+            .filter(|p| {
+                p["state"].as_str() == Some("active")
+                    && p["semantics_digest"].as_str() == Some(grant_digest.as_str())
+            });
+        if granted.is_some() {
+            let private = records.app_assistant_operation_get(operation_id, context)?;
+            return self.social_run(records, install, context, &private, input);
+        }
+        Ok(json!({"operation": super::app_assistant_rpc::public_operation(parked)}))
     }
 
     /// `social.drafts.status` — free read of this context's drafts.
@@ -523,9 +546,8 @@ impl Shared {
             Err(error) if super::app_assistant_rpc::assistant_error_is_definite_refusal(&error) => {
                 (
                     "failed",
-                    if error.to_string().contains("price_changed") {
-                        "The price went above what you confirmed; nothing more was charged"
-                            .to_owned()
+                    if super::app_assistant_rpc::assistant_error_is_out_of_credit(&error) {
+                        super::app_assistant_rpc::OUT_OF_CREDIT.to_owned()
                     } else {
                         "Action was refused".to_owned()
                     },
@@ -582,18 +604,10 @@ impl Shared {
         preview: &Value,
     ) -> Result<(String, Value, Value)> {
         let handle = required_str(preview, "handle")?;
-        let confirmed = preview["estimate_micros"]
-            .as_u64()
-            .ok_or_else(|| Error::rejected("confirmed estimate is unavailable"))?;
         let quoted = self.social_quotes(install, context, Need::Source)?;
         let source = quoted
             .source
             .ok_or_else(|| Error::internal("source slot unresolved"))?;
-        if source.micros > confirmed {
-            return Err(Error::rejected(
-                "price_changed: above the confirmed estimate",
-            ));
-        }
         let input = json!({"handle": handle});
         let reply = self.app_tool_execute(
             &Self::social_ctx(install, context, &quoted.digest, quoted.approval_epoch),
@@ -603,7 +617,6 @@ impl Shared {
                 request_id: &rid(install, context, operation_id, "src"),
                 input: &input,
                 generation_scope: None,
-                ceiling_micros: Some(confirmed),
             },
         )?;
         let receipt = &reply["receipt"];
@@ -647,13 +660,7 @@ impl Shared {
             required_str(preview, "post_id")?,
         );
         let with_image = preview["with_image"].as_bool().unwrap_or(false);
-        let (text_ceiling, image_ceiling) = (
-            preview["text_micros"].as_u64().unwrap_or(0),
-            preview["image_micros"].as_u64().unwrap_or(0),
-        );
-        let confirmed = preview["estimate_micros"]
-            .as_u64()
-            .ok_or_else(|| Error::rejected("confirmed estimate is unavailable"))?;
+        let estimate = preview["estimate_micros"].as_u64().unwrap_or(0);
         // The source must still be the latest fetch the operator was shown.
         let source = DraftSource::ToolReceipt {
             receipt_id: receipt_id.to_owned(),
@@ -664,22 +671,13 @@ impl Shared {
         if selected.receipt_id != receipt_id {
             return Err(Error::rejected("the fetched posts changed; ask again"));
         }
-        // Refuse before creating anything when the live price is above the
-        // confirmed estimate.
+        // The live quote is the provider's `max_charge_minor`; it is not
+        // compared with the estimate the card showed.
         let quoted = self.social_quotes(install, context, Need::WriterAndImage(with_image))?;
         let writer = quoted
             .writer
             .clone()
             .ok_or_else(|| Error::internal("writer slot unresolved"))?;
-        let live = writer.micros + quoted.image.as_ref().map_or(0, |s| s.micros);
-        if live > confirmed
-            || writer.micros > text_ceiling
-            || quoted.image.as_ref().map_or(0, |s| s.micros) > image_ceiling
-        {
-            return Err(Error::rejected(
-                "price_changed: above the confirmed estimate",
-            ));
-        }
         let actor = format!("assistant:{}", clip(operation_id, 48));
         let draft = records.app_social_draft_create(
             context,
@@ -721,7 +719,6 @@ impl Shared {
                 request_id: &rid(install, context, operation_id, "cap"),
                 input: &caption_input,
                 generation_scope: Some(&scope),
-                ceiling_micros: Some(text_ceiling),
             },
         )?;
         let Some(text) = reply["receipt"]["result"]["text"]
@@ -751,7 +748,7 @@ impl Shared {
         if !with_image {
             return Ok((
                 "Draft ready".to_owned(),
-                json!({"draft_id":draft_id,"state":"ready","image":"none","estimated_cost_usd":usd(confirmed)}),
+                json!({"draft_id":draft_id,"state":"ready","image":"none","estimated_cost_usd":usd(estimate)}),
                 refs,
             ));
         }
@@ -767,12 +764,11 @@ impl Shared {
                 request_id: &rid(install, context, operation_id, "img"),
                 input: &json!({}),
                 generation_scope: Some(&scope),
-                ceiling_micros: Some(image_ceiling),
             },
         )?;
         Ok((
             "Draft ready; making the image".to_owned(),
-            json!({"draft_id":draft_id,"state":"making_image","image":"making","estimated_cost_usd":usd(confirmed)}),
+            json!({"draft_id":draft_id,"state":"making_image","image":"making","estimated_cost_usd":usd(estimate)}),
             refs,
         ))
     }
