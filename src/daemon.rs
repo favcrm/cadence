@@ -3490,6 +3490,9 @@ impl Shared {
                     // `agent unfence` is the only exit.
                     "unknown": self.store.unknown_messages(&alias)?.len(),
                 });
+                if let Some(reason) = projection.withheld {
+                    out["cloud_withheld"] = json!(reason);
+                }
                 // Exact stored task semantics for a reported-dispatch retry.
                 // Same read authority as this alias's existing event history;
                 // return no source body and never recapture a source file.
@@ -5462,13 +5465,13 @@ pub type DoneRetrySavedHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// its budget. Production leaves it unset.
 pub type FlushGate = Arc<dyn Fn() + Send + Sync>;
 
-/// Per-instance daemon configuration.
-/// Test-seam-only observer: called with (verb, withheld reason) after every
-/// cloud projection decision, so a guard case can prove that a denied read was
-/// decided locally without a platform call. Never sourced from an RPC.
+/// Test-seam-only observer: called with (alias, final withholding code) after
+/// every completed projection decision, including local denials and empty
+/// admissions. The callback must be nonblocking. Never sourced from an RPC.
 #[cfg(feature = "test-seam")]
 pub type CloudProjectionObserver = std::sync::Arc<dyn Fn(&str, Option<&str>) + Send + Sync>;
 
+/// Per-instance daemon configuration.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
     #[cfg(test)]

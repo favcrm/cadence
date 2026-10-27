@@ -7,6 +7,13 @@
     "alias": {
       "type": "string"
     },
+    "cloud_withheld": {
+      "description": "Cloud history is incomplete for this read; ordinary rows remain usable.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "cursor": {
       "type": "integer",
       "format": "int64"

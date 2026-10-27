@@ -457,9 +457,13 @@ fn serve(mut stream: TcpStream, script: Arc<Mutex<Script>>) {
     };
     // Count only a response that reached the wire: a case that waits on this
     // is waiting for the platform's proof to COMPLETE.
-    if action == "readback" && reply(&mut stream, status, &answer) {
+    if action == "readback" {
+        // Keep the completed-answer counter ordered with the wire write. A
+        // client that has its answer and then takes this lock sees completion.
         let mut script = script.lock().unwrap_or_else(|e| e.into_inner());
-        script.answered_readbacks += 1;
+        if reply(&mut stream, status, &answer) {
+            script.answered_readbacks += 1;
+        }
     } else if action != "readback" {
         let _ = reply(&mut stream, status, &answer);
     }
@@ -578,9 +582,19 @@ fn write_login_owner(spec: LoginSpec<'_>) {
 /// Serve one state dir with the same isolated, seam-armed options every
 /// fixture daemon uses, and wait until it answers. The returned flag is the
 /// one the daemon obeys, so a caller can stop it without a `Fx`.
+type ProjectionObserver = Arc<dyn Fn(&str, Option<&str>) + Send + Sync>;
+
 fn spawn_daemon_at(
     state: &Path,
     pm: &Path,
+) -> (Arc<AtomicBool>, JoinHandle<cadence_agent::Result<()>>) {
+    spawn_daemon_observed(state, pm, None)
+}
+
+fn spawn_daemon_observed(
+    state: &Path,
+    pm: &Path,
+    observer: Option<ProjectionObserver>,
 ) -> (Arc<AtomicBool>, JoinHandle<cadence_agent::Result<()>>) {
     let stop = Arc::new(AtomicBool::new(false));
     let env = ProviderEnv::refusing_providers();
@@ -595,6 +609,7 @@ fn spawn_daemon_at(
         agent_gc: Some(Default::default()),
         report_router: Some(0),
         checkup: Some(0),
+        cloud_projection_observer: observer,
         ..Default::default()
     };
     let owned = state.to_path_buf();
@@ -632,6 +647,7 @@ struct Fx {
     board: Option<JoinHandle<()>>,
     cookie: String,
     session_key: String,
+    projection_observer: Option<ProjectionObserver>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -649,6 +665,18 @@ impl Drop for Fx {
 
 impl Fx {
     fn start() -> Self {
+        Self::start_with_observer(None)
+    }
+
+    fn observed() -> (Self, std::sync::mpsc::Receiver<(String, Option<String>)>) {
+        let (send, receive) = std::sync::mpsc::channel();
+        let observer: ProjectionObserver = Arc::new(move |alias, withheld| {
+            let _ = send.send((alias.to_string(), withheld.map(str::to_string)));
+        });
+        (Self::start_with_observer(Some(observer)), receive)
+    }
+
+    fn start_with_observer(observer: Option<ProjectionObserver>) -> Self {
         assert!(
             std::env::var_os("CADENCE_SOCKET").is_none(),
             "fixture BLOCKED: inherited socket override"
@@ -686,6 +714,7 @@ impl Fx {
             board: None,
             cookie: String::new(),
             session_key: String::new(),
+            projection_observer: observer,
             _lock: lock,
         };
         fx.spawn_daemon();
@@ -693,7 +722,8 @@ impl Fx {
     }
 
     fn spawn_daemon(&mut self) {
-        let (stop, handle) = spawn_daemon_at(&self.state, &self.pm);
+        let (stop, handle) =
+            spawn_daemon_observed(&self.state, &self.pm, self.projection_observer.clone());
         self.stop = stop;
         self.daemon = Some(handle);
     }
@@ -946,6 +976,122 @@ fn cloud_agent_id(connect: &Value) -> String {
         .as_str()
         .expect("cloud agent id")
         .to_string()
+}
+
+/// Proof deltas are scoped to ONE invocation, including which operation was
+/// read. An aggregate monotonic counter could pass without any admission.
+fn proof_before(stub: &Stub) -> (usize, usize) {
+    (stub.readback_operations().len(), stub.answered_readbacks())
+}
+
+fn assert_proof_delta(stub: &Stub, before: (usize, usize), operations: &[&str], answers: usize) {
+    let actual = stub.readback_operations();
+    let expected: Vec<String> = operations.iter().map(|id| (*id).to_string()).collect();
+    assert_eq!(
+        &actual[before.0..],
+        expected.as_slice(),
+        "wrong readback operation or count"
+    );
+    assert_eq!(
+        stub.answered_readbacks() - before.1,
+        answers,
+        "wrong completed-proof count"
+    );
+}
+
+fn assert_withheld(value: &Value, reason: &str, request: &str, reply: &str) {
+    let serialized = value.to_string();
+    assert!(
+        !serialized.contains(request),
+        "withheld request leaked: {value}"
+    );
+    assert!(
+        !serialized.contains(reply),
+        "withheld reply leaked: {value}"
+    );
+    assert_eq!(
+        value["cloud_withheld"],
+        json!(reason),
+        "missing coded unavailability: {value}"
+    );
+}
+
+fn assert_projection_notice(
+    receive: &std::sync::mpsc::Receiver<(String, Option<String>)>,
+    alias: &str,
+    reason: Option<&str>,
+) {
+    let observed = receive
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the projection never reached its admission decision");
+    assert_eq!(observed, (alias.to_string(), reason.map(str::to_string)));
+}
+
+fn stream_withheld_notices(stream: &str) -> Vec<Option<String>> {
+    stream
+        .split_inclusive("\n\n")
+        .filter(|frame| frame.ends_with("\n\n"))
+        .filter(|frame| frame.lines().any(|line| line == "event: cloud_withheld"))
+        .map(|frame| {
+            let data = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("cloud-withheld event has no data");
+            let value: Value =
+                serde_json::from_str(data).expect("cloud-withheld event is not JSON");
+            match value.get("cloud_withheld") {
+                Some(Value::Null) => None,
+                Some(Value::String(reason)) => Some(reason.clone()),
+                _ => panic!("cloud-withheld event has no coded state: {value}"),
+            }
+        })
+        .collect()
+}
+
+/// A service-level producer, NOT an enrolled/kernel-peer authority seam.
+struct SettledFixtureReply(&'static str);
+
+impl cadence_agent::cloud_agent::CloudTransport for SettledFixtureReply {
+    fn connect(
+        &self,
+        _: &cadence_agent::remote_cli::RemoteTarget,
+        _: &str,
+    ) -> cadence_agent::Result<cadence_agent::cloud_agent::RemoteAgent> {
+        Err(cadence_agent::Error::rejected("connect unused"))
+    }
+    fn submit(
+        &self,
+        _: &cadence_agent::remote_cli::RemoteTarget,
+        request: &cadence_agent::cloud_agent::SubmitRequest<'_>,
+    ) -> cadence_agent::Result<cadence_agent::cloud_agent::RemoteOperation> {
+        Ok(cadence_agent::cloud_agent::RemoteOperation {
+            status: cadence_agent::cloud_agent::RemoteStatus::Completed,
+            remote_operation_id: Some(request.operation_id.to_string()),
+            remote_session_id: None,
+            provider_session_id: None,
+            reply: Some(self.0.into()),
+            error: None,
+            invoker_id: Some("inv_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into()),
+        })
+    }
+    fn read(
+        &self,
+        _: &cadence_agent::remote_cli::RemoteTarget,
+        _: &str,
+        _: &str,
+        _: &cadence_agent::cloud_agent::Source,
+    ) -> cadence_agent::Result<cadence_agent::cloud_agent::RemoteOperation> {
+        Err(cadence_agent::Error::rejected("read unused"))
+    }
+    fn cancel(
+        &self,
+        _: &cadence_agent::remote_cli::RemoteTarget,
+        _: &str,
+        _: &str,
+        _: &cadence_agent::cloud_agent::Source,
+    ) -> cadence_agent::Result<()> {
+        Err(cadence_agent::Error::rejected("cancel unused"))
+    }
 }
 
 // ---------- acceptance ----------
@@ -3000,7 +3146,6 @@ fn an_expired_enrolled_peer_record_is_refused_locally_before_transport() {
     let fx = Fx::start();
     let connect = fx.connect();
     let id = cloud_agent_id(&connect);
-    let home = thread_of(&connect);
     fx.call(
         Asserted::Operator,
         "agent_register",
@@ -3018,27 +3163,65 @@ fn an_expired_enrolled_peer_record_is_refused_locally_before_transport() {
     };
     let owner = cadence_agent::store::Owner::new("https://issuer.example.test", "stub-subject");
     let stamp = cadence_agent::cloud_agent::registration_epoch(peer.created);
-    let expired = std::time::SystemTime::now()
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs()
-        - 60;
-    cadence_agent::remote_cli::cloud_agent_save_peer(
-        &target,
-        &owner,
-        &peer.uid,
-        stamp,
-        &json!({
-            "agent_id": "hca_native_guard_peer",
-            "credential_id": "hcp_native_guard_peer",
-            "token": format!("hct_{}", "p".repeat(43)),
-            "expires_at": expired,
-            "role": "cloud_agent",
-            "sender": {"uid": peer.uid, "registration_epoch": stamp},
-        }),
-    )
-    .unwrap();
-    let before = fx.stub.calls("readback");
+        .as_secs();
+    let mut record = json!({
+        "agent_id": "hca_native_guard_peer",
+        "credential_id": "hcp_native_guard_peer",
+        "token": format!("hct_{}", "p".repeat(43)),
+        "expires_at": now + 600,
+        "role": "cloud_agent",
+        "sender": {"uid": peer.uid, "registration_epoch": stamp},
+    });
+    cadence_agent::remote_cli::cloud_agent_save_peer(&target, &owner, &peer.uid, stamp, &record)
+        .unwrap();
+
+    // A saved child record is not split-UID enrollment. Exercise the real
+    // local credential guard directly with the exact source binding; a live
+    // record must pass before expiry alone makes that same record unusable.
+    for scope in ["cloud_agent.read", "cloud_agent.write"] {
+        let before = proof_before(&fx.stub);
+        let transport_before = fx.stub.seen().len();
+        cadence_agent::remote_cli::cloud_agent_peer_ready(&target, &owner, &peer.uid, stamp, scope)
+            .expect("the exact unexpired child record must satisfy the credential guard");
+        assert_proof_delta(&fx.stub, before, &[], 0);
+        assert_eq!(
+            fx.stub.seen().len(),
+            transport_before,
+            "credential readiness used transport"
+        );
+    }
+
+    record["expires_at"] = json!(now - 60);
+    cadence_agent::remote_cli::cloud_agent_save_peer(&target, &owner, &peer.uid, stamp, &record)
+        .unwrap();
+    for scope in ["cloud_agent.read", "cloud_agent.write"] {
+        let before = proof_before(&fx.stub);
+        let transport_before = fx.stub.seen().len();
+        let error = cadence_agent::remote_cli::cloud_agent_peer_ready(
+            &target, &owner, &peer.uid, stamp, scope,
+        )
+        .expect_err("the exact expired child record must be refused locally");
+        assert!(
+            matches!(&error, cadence_agent::Error::Rejected(message)
+                if message.contains("cloud-peer credential has expired")),
+            "the expired credential was not refused by the real expiry guard: {error}"
+        );
+        assert_proof_delta(&fx.stub, before, &[], 0);
+        assert_eq!(
+            fx.stub.seen().len(),
+            transport_before,
+            "an expired peer used transport"
+        );
+    }
+
+    // Native dispatch must still enforce the real OS isolation boundary
+    // before credential resolution. This same-UID fixture cannot bypass it
+    // merely by possessing a directly seeded child record.
+    let before = proof_before(&fx.stub);
+    let transport_before = fx.stub.seen().len();
     let error = fx
         .call(
             Asserted::Agent("peer".into()),
@@ -3046,16 +3229,17 @@ fn an_expired_enrolled_peer_record_is_refused_locally_before_transport() {
             json!({"cloud_agent_id": id, "operation_id": OPERATION}),
         )
         .unwrap_err();
-    assert!(
-        error.to_string().to_lowercase().contains("expire"),
-        "an expired peer record was not refused by expiry: {error}"
-    );
     assert_eq!(
-        fx.stub.calls("readback"),
-        before,
-        "an expired peer reached the upstream readback"
+        code(&error),
+        Some("cloud_agent_peer_isolation_required"),
+        "{error}"
     );
-    let _ = home;
+    assert_proof_delta(&fx.stub, before, &[], 0);
+    assert_eq!(
+        fx.stub.seen().len(),
+        transport_before,
+        "a same-UID peer with an expired record reached transport"
+    );
 }
 
 #[test]
@@ -3086,19 +3270,28 @@ fn generic_readers_do_not_expose_a_cloud_reply_to_an_unenrolled_peer() {
     )
     .unwrap();
 
-    // The peer has no cloud enrollment. Refusal or redaction is accepted, but
-    // the reply must never cross these generic projections.
+    // This same-UID peer has no enrollment; its failed isolation proof is a
+    // hard guard failure, not an ordinary cloud-content notice.
     for (method, params) in [
         ("thread_read", json!({"alias": ALIAS})),
         ("agent_show", json!({"alias": ALIAS})),
         ("agent_events", json!({"alias": ALIAS, "after": 0})),
     ] {
-        if let Ok(value) = fx.call(Asserted::Agent("peer".into()), method, params) {
-            assert!(
-                !value.to_string().contains("genuine stub reply"),
-                "{method} exposed the cloud reply to an unenrolled peer: {value}"
-            );
-        }
+        let before = proof_before(&fx.stub);
+        let error = fx
+            .call(Asserted::Agent("peer".into()), method, params)
+            .expect_err("generic projections must preserve the real peer-isolation refusal");
+        assert_eq!(
+            code(&error),
+            Some("cloud_agent_peer_isolation_required"),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains("genuine stub reply"),
+            "{method}: {error}"
+        );
+        assert!(!error.to_string().contains(TEXT), "{method}: {error}");
+        assert_proof_delta(&fx.stub, before, &[], 0);
     }
 
     // The operator still sees the reply; the UID-bound peer report positive
@@ -4373,7 +4566,7 @@ fn an_accepted_queued_claim_cannot_re_fire_and_restart_reconciles_by_readback() 
 /// from `thread_read`, `agent_show` or `agent_events`.
 #[test]
 fn a_write_only_operator_cannot_read_cloud_content_through_generic_projections() {
-    let fx = Fx::start();
+    let (fx, observed) = Fx::observed();
     let connect = fx.connect();
     let id = cloud_agent_id(&connect);
     let home = thread_of(&connect);
@@ -4405,13 +4598,18 @@ fn a_write_only_operator_cannot_read_cloud_content_through_generic_projections()
         ("agent_show", json!({"alias": ALIAS})),
         ("agent_events", json!({"alias": ALIAS, "after": 0})),
     ] {
+        let before = proof_before(&fx.stub);
         let page = fx
             .call(Asserted::Operator, method, params.clone())
             .expect("a denied read serves the rest of the page and withholds the cloud rows");
-        assert!(
-            !page.to_string().contains("genuine stub reply") && !page.to_string().contains(TEXT),
-            "{method}: served cloud content after an upstream revocation: {page}"
+        assert_withheld(
+            &page,
+            "cloud_agent_scope_revoked",
+            TEXT,
+            "genuine stub reply",
         );
+        assert_projection_notice(&observed, ALIAS, Some("cloud_agent_scope_revoked"));
+        assert_proof_delta(&fx.stub, before, &[], 0);
     }
 
     // Positive control: the same three projections serve the durable reply
@@ -4428,6 +4626,7 @@ fn a_write_only_operator_cannot_read_cloud_content_through_generic_projections()
         ("agent_show", json!({"alias": ALIAS})),
         ("agent_events", json!({"alias": ALIAS, "after": 0})),
     ] {
+        let before = proof_before(&fx.stub);
         let value = fx
             .call(Asserted::Operator, method, params)
             .unwrap_or_else(|e| panic!("{method} refused the owner's restored read: {e}"));
@@ -4435,7 +4634,22 @@ fn a_write_only_operator_cannot_read_cloud_content_through_generic_projections()
             value.to_string().contains("genuine stub reply"),
             "{method} did not serve the reply: {value}"
         );
+        assert!(
+            value.get("cloud_withheld").is_none(),
+            "clean read kept a notice: {value}"
+        );
+        assert!(
+            value.to_string().contains(OPERATION),
+            "restored read lost the original id: {value}"
+        );
+        assert_projection_notice(&observed, ALIAS, None);
+        assert_proof_delta(&fx.stub, before, &[OPERATION], 1);
     }
+    assert_eq!(
+        fx.stub.calls("submit"),
+        1,
+        "restoring read scope resubmitted the turn"
+    );
 }
 
 /// The projection binds each row to the source its operation was admitted
@@ -4699,12 +4913,11 @@ fn a_non_cloud_alias_and_a_uid_bound_peer_report_still_project() {
     }
 }
 
-/// Cloud content whose four authority tables do not resolve fails closed:
-/// the projection refuses rather than treating the alias as an ordinary
-/// local agent.
+/// Missing authority withholds cloud content with an explicit reason. It
+/// never reclassifies the request/result as ordinary local history.
 #[test]
 fn cloud_content_without_resolvable_authority_fails_closed() {
-    let fx = Fx::start();
+    let (fx, observed) = Fx::observed();
     let connect = fx.connect();
     let id = cloud_agent_id(&connect);
     let home = thread_of(&connect);
@@ -4754,13 +4967,18 @@ fn cloud_content_without_resolvable_authority_fails_closed() {
         ("agent_show", json!({"alias": ALIAS})),
         ("agent_events", json!({"alias": ALIAS, "after": 0})),
     ] {
+        let before = proof_before(&fx.stub);
         let page = fx
             .call(Asserted::Operator, method, params)
             .expect("missing authority withholds the cloud rows and serves the rest");
-        assert!(
-            !page.to_string().contains("genuine stub reply") && !page.to_string().contains(TEXT),
-            "{method}: served cloud content with no authority: {page}"
+        assert_withheld(
+            &page,
+            "cloud_agent_authority_missing",
+            TEXT,
+            "genuine stub reply",
         );
+        assert_projection_notice(&observed, ALIAS, Some("cloud_agent_authority_missing"));
+        assert_proof_delta(&fx.stub, before, &[], 0);
     }
 }
 
@@ -5050,9 +5268,11 @@ fn a_portable_round_trip_drops_the_cloud_reply_and_the_restored_alias_fails_clos
         !restored_show.to_string().contains("genuine stub reply"),
         "agent_show on restored data served cloud content: {restored_show}"
     );
-    assert!(
-        !restored_show.to_string().contains("genuine stub reply"),
-        "agent_show disclosed the reply: {restored_show}"
+    assert_withheld(
+        &restored_show,
+        "cloud_agent_authority_missing",
+        TEXT,
+        "genuine stub reply",
     );
     // The other two projections are execution-capable verbs, so the restored
     // root's execution-disabled fence refuses them even earlier. Either
@@ -5066,18 +5286,16 @@ fn a_portable_round_trip_drops_the_cloud_reply_and_the_restored_alias_fails_clos
         })
         .unwrap_err();
         assert!(
-            error.to_string().contains("execution-disabled")
-                || code(&error) == Some("cloud_agent_authority_missing"),
-            "{method} was refused by neither the fence nor the projection: {error}"
+            error.to_string().contains("execution-disabled"),
+            "{method} bypassed the restored execution fence: {error}"
         );
+        assert!(!error.to_string().contains("genuine stub reply"));
     }
-    // A caller that proves nothing is refused as well: with no cloud
-    // authority to resolve, the projection's own refusal comes first and a
-    // caller-rule refusal would be equally content-free.
+    // Missing cloud metadata cannot turn a failed identity proof into success.
     let unproven = scoped(Asserted::Unproven, || {
         client::rpc(&restored, "agent_show", json!({"alias": ALIAS}))
     })
-    .expect("an unproven caller still gets an answer, with nothing cloud-shaped in it");
+    .expect_err("missing authority must not swallow a real caller-identity refusal");
     assert!(
         !unproven.to_string().contains("genuine stub reply"),
         "an unproven caller was shown the reply: {unproven}"
@@ -5354,7 +5572,7 @@ fn a_refused_reconnect_leaves_the_pin_and_the_session_unchanged() {
 
 /// The platform's own answer — not the local receipt — decides what a
 /// projection may show: a nonterminal answer withholds that whole operation, a
-/// terminal failed answer that contradicts the settled receipt refuses, and a
+/// terminal failed answer that contradicts the settled receipt withholds it,
 /// terminal-completed answer still serves the reply.
 #[test]
 fn a_nonterminal_or_failed_platform_answer_withholds_the_settled_receipt() {
@@ -5388,6 +5606,7 @@ fn a_nonterminal_or_failed_platform_answer_withholds_the_settled_receipt() {
     // receipt is not an answer, and the whole operation is withheld.
     fx.stub.set(|script| script.read_state = "running".into());
     for (method, params) in projections.clone() {
+        let before = proof_before(&fx.stub);
         let value = fx
             .call(Asserted::Operator, method, params)
             .unwrap_or_else(|e| panic!("{method} refused instead of withholding: {e}"));
@@ -5400,6 +5619,13 @@ fn a_nonterminal_or_failed_platform_answer_withholds_the_settled_receipt() {
             !text.contains(TEXT),
             "{method} served the withheld request: {value}"
         );
+        assert!(
+            value["cloud_withheld"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("cloud_agent_")),
+            "a nonterminal proof hid content without coded unavailable metadata: {value}"
+        );
+        assert_proof_delta(&fx.stub, before, &[OPERATION], 1);
     }
     let kept = fx
         .store()
@@ -5415,19 +5641,31 @@ fn a_nonterminal_or_failed_platform_answer_withholds_the_settled_receipt() {
     // 2. A terminal failed answer contradicts the settled receipt.
     fx.stub.set(|script| script.read_state = "failed".into());
     for (method, params) in projections.clone() {
+        let before = proof_before(&fx.stub);
         let page = fx
             .call(Asserted::Operator, method, params)
             .expect("a contradicting answer withholds the receipt, it does not fail the read");
         assert!(
-            !page.to_string().contains("genuine stub reply"),
-            "{method}: served a receipt the platform contradicts: {page}"
+            !page.to_string().contains(TEXT),
+            "contradicting answer leaked the request: {page}"
         );
+        assert!(
+            !page.to_string().contains("genuine stub reply"),
+            "contradicting answer leaked the result: {page}"
+        );
+        assert_eq!(
+            page["cloud_withheld"],
+            json!("cloud_agent_receipt_conflict"),
+            "{page}"
+        );
+        assert_proof_delta(&fx.stub, before, &[OPERATION], 1);
     }
 
     // 3. Positive control: the platform's terminal-completed answer serves the
     // stored receipt.
     fx.stub.set(|script| script.read_state = "completed".into());
     for (method, params) in projections {
+        let before = proof_before(&fx.stub);
         let value = fx
             .call(Asserted::Operator, method, params)
             .unwrap_or_else(|e| panic!("{method} refused the completed answer: {e}"));
@@ -5435,18 +5673,15 @@ fn a_nonterminal_or_failed_platform_answer_withholds_the_settled_receipt() {
             value.to_string().contains("genuine stub reply"),
             "{method} did not serve the reply: {value}"
         );
+        assert_proof_delta(&fx.stub, before, &[OPERATION], 1);
     }
 }
 
-/// A cloud reply routed onto an ordinary alias stays bound to the UIDs its
-/// delivery carried: the reporting peer and the operator read it, an unrelated
-/// registered agent on the same socket reads neither the message, nor its
-/// thread entry, nor the events naming it — while that alias' ordinary mail
-/// still projects.
-/// The same routed cloud result, read through the two readers that do not go
-/// through a projection: the message body and the metadata-only wait. Both ask
-/// the one cloud-row policy, so an unrelated agent gets neither the body nor
-/// the id, while the delivery's own peer still gets both.
+/// Routed cloud content retains immutable delivery-UID bindings AND requires
+/// current backing-connection read authority. An unrelated peer reads neither
+/// the body nor identifying events. A delivery-bound but unenrolled same-UID
+/// peer also remains denied; only the proven operator positive is exercised
+/// here. The service-level producer is not kernel-peer qualification.
 #[test]
 fn the_body_reader_and_the_wait_do_not_hand_out_a_routed_cloud_result() {
     use cadence_agent::cloud_agent::{
@@ -5587,18 +5822,31 @@ fn the_body_reader_and_the_wait_do_not_hand_out_a_routed_cloud_result() {
         );
     }
 
-    // The delivery's own peer still reads both.
-    let shown = fx
+    // Delivery provenance is necessary, not sufficient: this is a same-UID,
+    // unenrolled fixture peer, NOT a qualified enrolled reader.
+    let before = proof_before(&fx.stub);
+    let denied = fx
         .call(
             Asserted::Agent("peer".into()),
             "message_read",
             json!({"message": routed.id}),
         )
-        .expect("the delivery's own peer reads its result");
-    assert!(
-        shown.to_string().contains(ROUTED),
-        "the bound peer lost the body: {shown}"
+        .expect_err("the delivery binding must not bypass peer isolation/enrollment");
+    assert_eq!(
+        code(&denied),
+        Some("cloud_agent_peer_isolation_required"),
+        "{denied}"
     );
+    assert!(!denied.to_string().contains(ROUTED), "{denied}");
+    assert_proof_delta(&fx.stub, before, &[], 0);
+    let shown = fx
+        .call(
+            Asserted::Operator,
+            "message_read",
+            json!({"message": routed.id}),
+        )
+        .expect("the proven operator can read the delivered result under its live grant");
+    assert!(shown.to_string().contains(ROUTED), "{shown}");
 }
 
 #[test]
@@ -5653,10 +5901,26 @@ fn a_routed_cloud_result_is_not_projected_to_an_unrelated_agent() {
         }
     }
 
-    let fx = Fx::start();
+    let mut fx = Fx::start();
     let connect = fx.connect();
     let id = cloud_agent_id(&connect);
     let home = thread_of(&connect);
+    // A real operator RPC turn gives this connection an operation to prove.
+    // Service-seeded peer content below must not borrow a fabricated peer
+    // credential or treat a missing operator receipt as upstream permission.
+    fx.stub.set(|script| {
+        script.submit_state = "completed".into();
+        script.submit_text = Some("genuine stub reply".into());
+    });
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": TEXT, "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
     for alias in ["peer", "outsider"] {
         fx.call(
             Asserted::Operator,
@@ -5815,17 +6079,20 @@ fn a_routed_cloud_result_is_not_projected_to_an_unrelated_agent() {
 
     // The operator reads it; a peer with no enrolled cloud grant does not,
     // even though the delivery names it.
+    let before = proof_before(&fx.stub);
     let peer_denied = fx
         .call(
             Asserted::Agent("peer".into()),
             "agent_show",
             json!({"alias": "peer"}),
         )
-        .expect("the peer's own read still answers");
-    assert!(
-        !peer_denied.to_string().contains(ROUTED),
-        "an unenrolled peer read a routed cloud result: {peer_denied}"
+        .expect_err("same-UID peer isolation remains a hard refusal");
+    assert_eq!(
+        code(&peer_denied),
+        Some("cloud_agent_peer_isolation_required")
     );
+    assert!(!peer_denied.to_string().contains(ROUTED), "{peer_denied}");
+    assert_proof_delta(&fx.stub, before, &[], 0);
     let shown = fx
         .call(Asserted::Operator, "agent_show", json!({"alias": "peer"}))
         .unwrap();
@@ -5840,6 +6107,220 @@ fn a_routed_cloud_result_is_not_projected_to_an_unrelated_agent() {
         thread.to_string().contains(ROUTED),
         "the operator lost the result entry: {thread}"
     );
+
+    // Mixed ordinary/cloud history: a denial removes only cloud rows, never
+    // the entire otherwise-readable page, and every call proves THIS scope.
+    fx.stub.set(|script| script.read_status = 403);
+    for (method, params) in [
+        ("thread_read", json!({"alias": "peer"})),
+        ("agent_show", json!({"alias": "peer"})),
+        ("agent_events", json!({"alias": "peer", "after": 0})),
+    ] {
+        let before = proof_before(&fx.stub);
+        let page = fx
+            .call(Asserted::Operator, method, params)
+            .expect("revoked routed content must not fail ordinary history");
+        assert_withheld(
+            &page,
+            "cloud_agent_scope_revoked",
+            "peer request body",
+            ROUTED,
+        );
+        assert!(!page.to_string().contains(&routed.id), "{page}");
+        let ordinary = if method == "agent_events" {
+            "m-peer-ordinary"
+        } else {
+            "ordinary peer mail"
+        };
+        assert!(
+            page.to_string().contains(ordinary),
+            "{method} lost ordinary rows: {page}"
+        );
+        assert_proof_delta(&fx.stub, before, &[OPERATION], 1);
+    }
+    fx.start_board();
+    let route = "/api/threads/peer?after=0&limit=100";
+    let before = proof_before(&fx.stub);
+    let (status, page) = fx.get("operator", route, true);
+    assert_eq!(status, 200, "{page}");
+    assert_withheld(
+        &page,
+        "cloud_agent_scope_revoked",
+        "peer request body",
+        ROUTED,
+    );
+    assert!(page.to_string().contains("ordinary peer mail"), "{page}");
+    assert_proof_delta(&fx.stub, before, &[OPERATION], 1);
+
+    for (method, params) in [
+        ("thread_read", json!({"alias": "peer"})),
+        ("agent_show", json!({"alias": "peer"})),
+        ("agent_events", json!({"alias": "peer", "after": 0})),
+        ("message_read", json!({"message": routed.id})),
+    ] {
+        let before = proof_before(&fx.stub);
+        let error = fx
+            .call(Asserted::Unproven, method, params)
+            .expect_err("an identity failure cannot become an ordinary cloud notice");
+        assert!(!error.to_string().contains(ROUTED), "{method}: {error}");
+        assert_proof_delta(&fx.stub, before, &[], 0);
+    }
+    // No authenticated board session means 401, not anonymous cloud metadata.
+    for who in ["unproven", "agent:peer"] {
+        for denied_route in [route, "/api/threads/peer/stream"] {
+            let before = proof_before(&fx.stub);
+            let (status, refused) = fx.get(who, denied_route, false);
+            assert_eq!(status, 401, "{who}: {refused}");
+            assert_eq!(
+                refused["code"],
+                json!("operator_session_required"),
+                "{refused}"
+            );
+            assert!(refused.get("cloud_withheld").is_none(), "{refused}");
+            assert!(!refused.to_string().contains(ROUTED), "{refused}");
+            assert_proof_delta(&fx.stub, before, &[], 0);
+        }
+    }
+
+    // A page scanning exactly the denied result still advances both cursor
+    // directions even though it keeps zero entries.
+    for (query, boundary) in [
+        (format!("after={}&limit=1", peer_entry.seq - 1), "cursor"),
+        (
+            format!("before={}&limit=1", peer_entry.seq + 1),
+            "scanned_before",
+        ),
+    ] {
+        let before = proof_before(&fx.stub);
+        let (status, page) = fx.get("operator", &format!("/api/threads/peer?{query}"), true);
+        assert_eq!(status, 200, "{page}");
+        assert_withheld(
+            &page,
+            "cloud_agent_scope_revoked",
+            "peer request body",
+            ROUTED,
+        );
+        assert!(page["entries"].as_array().unwrap().is_empty(), "{page}");
+        assert_eq!(page[boundary], json!(peer_entry.seq), "{page}");
+        assert_proof_delta(&fx.stub, before, &[OPERATION], 1);
+    }
+
+    fx.stub.set(|script| {
+        script.read_status = 0;
+        script.read_drop = true;
+    });
+    let before = proof_before(&fx.stub);
+    let (status, uncertain) = fx.get("operator", route, true);
+    assert_eq!(status, 200, "{uncertain}");
+    assert_withheld(
+        &uncertain,
+        "cloud_agent_uncertain",
+        "peer request body",
+        ROUTED,
+    );
+    assert!(
+        uncertain.to_string().contains("ordinary peer mail"),
+        "{uncertain}"
+    );
+    assert_proof_delta(&fx.stub, before, &[OPERATION], 0);
+
+    fx.stub.set(|script| script.read_drop = false);
+    let before = proof_before(&fx.stub);
+    let (status, restored) = fx.get("operator", route, true);
+    assert_eq!(status, 200, "{restored}");
+    assert!(restored.get("cloud_withheld").is_none(), "{restored}");
+    assert!(restored.to_string().contains(ROUTED), "{restored}");
+    assert!(
+        restored.to_string().contains(&routed.id),
+        "restored a different row: {restored}"
+    );
+    assert_proof_delta(&fx.stub, before, &[OPERATION], 1);
+    assert_eq!(
+        fx.stub.calls("submit"),
+        1,
+        "restoring READ spent another model turn"
+    );
+
+    // Storage failure is NOT a scope revocation. Break the real grant-table
+    // lookup, not a fake transport; generic RPC and board must remain errors.
+    let conn = rusqlite::Connection::open(fx.state.join("cadence.sqlite3")).unwrap();
+    conn.busy_timeout(Duration::from_secs(10)).unwrap();
+    conn.execute_batch("ALTER TABLE cloud_agent_sources RENAME TO cad1853_unreadable_sources")
+        .unwrap();
+    for (method, params) in [
+        ("thread_read", json!({"alias": "peer"})),
+        ("agent_show", json!({"alias": "peer"})),
+        ("agent_events", json!({"alias": "peer", "after": 0})),
+        ("message_read", json!({"message": routed.id})),
+    ] {
+        let before = proof_before(&fx.stub);
+        let error = fx
+            .call(Asserted::Operator, method, params)
+            .expect_err("a broken authority store must not become a successful cloud notice");
+        assert_eq!(error.kind(), "internal", "{method}: {error}");
+        assert!(!error.to_string().contains(ROUTED), "{error}");
+        assert_proof_delta(&fx.stub, before, &[], 0);
+    }
+    let before = proof_before(&fx.stub);
+    let (status, failed) = fx.get("operator", route, true);
+    assert_eq!(
+        status, 500,
+        "authority storage failure became a page: {failed}"
+    );
+    assert!(failed.get("cloud_withheld").is_none(), "{failed}");
+    assert_proof_delta(&fx.stub, before, &[], 0);
+    conn.execute_batch("ALTER TABLE cad1853_unreadable_sources RENAME TO cloud_agent_sources")
+        .unwrap();
+
+    // With no new entries, an SSE consumer must still get denial THEN clear.
+    // Restore the grant only after the actual denial frame arrives.
+    let after = store
+        .thread_entries("peer", 0, 100)
+        .unwrap()
+        .last()
+        .unwrap()
+        .seq;
+    fx.stub.set(|script| script.read_status = 403);
+    let restored_once = AtomicBool::new(false);
+    let before = proof_before(&fx.stub);
+    let stream = fx.read_stream(
+        "operator",
+        &format!("/api/threads/peer/stream?after={after}"),
+        |text| {
+            let notices = stream_withheld_notices(text);
+            if notices.contains(&Some("cloud_agent_scope_revoked".into()))
+                && !restored_once.swap(true, SeqCst)
+            {
+                fx.stub.set(|script| script.read_status = 0);
+            }
+            restored_once.load(SeqCst) && notices.last() == Some(&None)
+        },
+        Duration::from_secs(12),
+    );
+    assert!(stream.starts_with("HTTP/1.1 200"), "{stream}");
+    let mut notices = stream_withheld_notices(&stream);
+    notices.dedup();
+    assert_eq!(
+        notices,
+        vec![Some("cloud_agent_scope_revoked".into()), None],
+        "the zero-entry stream did not announce denial and clear: {stream}",
+    );
+    assert!(
+        !stream.contains("event: entry"),
+        "the empty stream replayed entries: {stream}"
+    );
+    assert!(!stream.contains(ROUTED), "{stream}");
+    let operations = fx.stub.readback_operations();
+    let reads = &operations[before.0..];
+    assert!(
+        reads.len() >= 2,
+        "denial and clear require separate admissions: {reads:?}"
+    );
+    assert!(
+        reads.iter().all(|id| id == OPERATION),
+        "stream proved the wrong scope: {reads:?}"
+    );
+    assert_eq!(fx.stub.answered_readbacks() - before.1, reads.len());
 }
 
 /// An ordinary alias keeps its own thread entries, including the ones whose
@@ -6012,6 +6493,11 @@ fn a_waiting_thread_read_re_proves_authority_before_projecting_a_new_turn() {
         !page.to_string().contains("revoked wait request")
             && !page.to_string().contains("revoked wait reply"),
         "the revoked wait served the turn it was not admitted for: {page}"
+    );
+    assert_eq!(
+        page["cloud_withheld"],
+        json!("cloud_agent_scope_revoked"),
+        "{page}"
     );
     // The wait asked the platform about the turn it observed. Without that
     // re-proof it would project the new rows under the admission taken before
@@ -6342,11 +6828,9 @@ fn the_board_thread_page_advances_each_direction_past_filtered_pages() {
 
 // ---------- round four: platform-proven projection, derived copies, paging ----------
 
-/// The saved login proves only what this workspace STORED. A read scope
-/// revoked UPSTREAM — login intact, unexpired, still carrying both scopes —
-/// refuses every generic projection after one real platform read; an
-/// unreachable platform is uncertainty; the restored grant serves the reply
-/// again. No refusal serialises stored reply text.
+/// A revoked upstream read scope withholds both halves of the cloud turn,
+/// after proving this invocation's own operation. Unreachability is coded
+/// uncertainty, and restoring authority serves the SAME durable text/id.
 #[test]
 fn an_upstream_read_revocation_refuses_every_generic_projection() {
     let fx = Fx::start();
@@ -6378,18 +6862,17 @@ fn an_upstream_read_revocation_refuses_every_generic_projection() {
     // Revoked at the contract only: the saved login is untouched.
     fx.stub.set(|script| script.read_status = 403);
     for (method, params) in projections.clone() {
-        let before = fx.stub.calls("readback");
+        let before = proof_before(&fx.stub);
         let page = fx
             .call(Asserted::Operator, method, params)
             .expect("a contract refusal withholds the cloud rows and serves the rest");
-        assert!(
-            !page.to_string().contains("genuine stub reply"),
-            "{method}: served cloud content the contract refuses: {page}"
+        assert_withheld(
+            &page,
+            "cloud_agent_scope_revoked",
+            TEXT,
+            "genuine stub reply",
         );
-        assert!(
-            fx.stub.calls("readback") >= before,
-            "{method} went backwards on the platform counter"
-        );
+        assert_proof_delta(&fx.stub, before, &[OPERATION], 1);
     }
     // The refusal is authority, not data loss: the durable receipt and its
     // canonical result are untouched.
@@ -6407,21 +6890,21 @@ fn an_upstream_read_revocation_refuses_every_generic_projection() {
         script.read_drop = true;
     });
     for (method, params) in projections.clone() {
+        let before = proof_before(&fx.stub);
         // The projection asks the platform through the dedicated read again,
         // so an unreachable platform withholds the cloud rows and the read
         // answers — never stored text, never a rejection of the whole page.
         let page = fx
             .call(Asserted::Operator, method, params)
             .expect("an unreachable platform withholds the cloud rows");
-        assert!(
-            !page.to_string().contains("genuine stub reply"),
-            "{method}: served the stored reply while the platform was unreachable: {page}"
-        );
+        assert_withheld(&page, "cloud_agent_uncertain", TEXT, "genuine stub reply");
+        assert_proof_delta(&fx.stub, before, &[OPERATION], 0);
     }
 
     // Positive control: the grant restored upstream serves the reply.
     fx.stub.set(|script| script.read_drop = false);
     for (method, params) in projections {
+        let before = proof_before(&fx.stub);
         let value = fx
             .call(Asserted::Operator, method, params)
             .unwrap_or_else(|e| panic!("{method} refused the restored grant: {e}"));
@@ -6429,7 +6912,21 @@ fn an_upstream_read_revocation_refuses_every_generic_projection() {
             value.to_string().contains("genuine stub reply"),
             "{method} did not serve the reply: {value}"
         );
+        assert!(
+            value.get("cloud_withheld").is_none(),
+            "restored read kept a notice: {value}"
+        );
+        assert!(
+            value.to_string().contains(OPERATION),
+            "the stored id was replaced: {value}"
+        );
+        assert_proof_delta(&fx.stub, before, &[OPERATION], 1);
     }
+    assert_eq!(
+        fx.stub.calls("submit"),
+        1,
+        "read restoration resubmitted the request"
+    );
 }
 
 /// A settled cloud turn also routes its reply as a `worker_result` on the
@@ -6765,6 +7262,12 @@ fn a_portable_round_trip_with_an_enrolled_peer_drops_the_routed_result() {
         client::rpc(&restored, "agent_show", json!({"alias": ALIAS}))
     })
     .expect("the restored alias answers, minus the cloud rows");
+    assert_withheld(
+        &cloud_show,
+        "cloud_agent_authority_missing",
+        "peer request body",
+        ROUTED,
+    );
     assert!(
         !cloud_show.to_string().contains("genuine stub reply"),
         "the restored alias served cloud content with no authority: {cloud_show}"
@@ -7016,7 +7519,7 @@ fn a_fully_filtered_thread_page_advances_the_cursor() {
 /// proof, which here refuses it, and a fresh read follows current authority.
 #[test]
 fn an_operation_created_after_the_snapshot_is_served_only_under_a_fresh_proof() {
-    let fx = Fx::start();
+    let (fx, observed) = Fx::observed();
     let connect = fx.connect();
     let id = cloud_agent_id(&connect);
     let home = thread_of(&connect);
@@ -7039,7 +7542,7 @@ fn an_operation_created_after_the_snapshot_is_served_only_under_a_fresh_proof() 
             })
         })
     };
-    thread::sleep(Duration::from_millis(250));
+    assert_projection_notice(&observed, ALIAS, None);
     assert!(
         fx.stub.readback_operations().is_empty(),
         "an admission with no operation must ask the platform nothing: {:?}",
@@ -7074,6 +7577,11 @@ fn an_operation_created_after_the_snapshot_is_served_only_under_a_fresh_proof() 
             && !page.to_string().contains("post-snapshot reply"),
         "the read served an operation created after its snapshot: {page}"
     );
+    assert_eq!(
+        page["cloud_withheld"],
+        json!("cloud_agent_scope_revoked"),
+        "{page}"
+    );
     // The fresh proof is what asked the platform about it.
     assert_eq!(
         fx.stub.readback_operations(),
@@ -7083,12 +7591,20 @@ fn an_operation_created_after_the_snapshot_is_served_only_under_a_fresh_proof() 
 
     // A NEW read of the same turn follows current authority: refused while
     // the platform refuses that receipt...
+    let before = proof_before(&fx.stub);
     let refused = fx
         .call(Asserted::Operator, "thread_read", json!({"alias": ALIAS}))
         .expect("a refusal withholds the cloud rows, it does not fail the read");
-    assert!(!refused.to_string().contains("post-snapshot reply"));
+    assert_withheld(
+        &refused,
+        "cloud_agent_scope_revoked",
+        "post-snapshot request",
+        "post-snapshot reply",
+    );
+    assert_proof_delta(&fx.stub, before, &["operation-00000051"], 1);
     // ...and served once the platform answers again.
     fx.stub.set(|script| script.refuse_read_operation = None);
+    let before = proof_before(&fx.stub);
     let served = fx
         .call(Asserted::Operator, "thread_read", json!({"alias": ALIAS}))
         .expect("a fresh read under a live grant serves the turn");
@@ -7096,6 +7612,12 @@ fn an_operation_created_after_the_snapshot_is_served_only_under_a_fresh_proof() 
         served.to_string().contains("post-snapshot request"),
         "{served}"
     );
+    assert_proof_delta(&fx.stub, before, &["operation-00000051"], 1);
+    assert!(
+        served.to_string().contains("operation-00000051"),
+        "{served}"
+    );
+    assert_eq!(fx.stub.calls("submit"), 1);
 }
 
 /// A cloud result that resolves AFTER a read was admitted is in neither half
@@ -7157,7 +7679,7 @@ fn a_routed_cloud_result_resolving_after_admission_keeps_its_binding() {
         }
     }
 
-    let fx = Fx::start();
+    let (fx, observed) = Fx::observed();
     let connect = fx.connect();
     let id = cloud_agent_id(&connect);
     let home = thread_of(&connect);
@@ -7280,12 +7802,48 @@ fn a_routed_cloud_result_resolving_after_admission_keeps_its_binding() {
         .expect("the peer alias has its ordinary mail entry")
         .seq;
 
-    // Two reads are admitted before the new result resolves: the delivery's
-    // recipient, and an unrelated agent on the same socket.
+    // The proven operator has its OWN operation on the backing connection:
+    // the routed peer receipt is not a substitute for the caller's proof.
+    fx.stub.set(|script| {
+        script.submit_state = "completed".into();
+        script.submit_text = Some("operator proof reply".into());
+    });
+    fx.call(
+        Asserted::Operator,
+        "cloud_agent_send",
+        json!({
+            "cloud_agent_id": id, "thread_id": home,
+            "text": "operator proof request", "operation_id": OPERATION, "wake": true,
+        }),
+    )
+    .unwrap();
+    let before = proof_before(&fx.stub);
+    let peer_denied = fx
+        .call(
+            Asserted::Agent("peer".into()),
+            "thread_read",
+            json!({"alias": "peer", "after": last}),
+        )
+        .expect_err("delivery provenance cannot qualify this same-UID unenrolled peer");
+    assert_eq!(
+        code(&peer_denied),
+        Some("cloud_agent_peer_isolation_required")
+    );
+    assert!(!peer_denied.to_string().contains(EARLY), "{peer_denied}");
+    assert_proof_delta(&fx.stub, before, &[], 0);
+    // A hard failure may also be observed; do not confuse that completed
+    // invocation with either admission that follows.
+    for (alias, _) in observed.try_iter() {
+        assert_eq!(alias, "peer");
+    }
+
+    // Two reads are admitted before the new result resolves: the proven
+    // operator and an unrelated agent. The observer orders the admissions.
+    let before = proof_before(&fx.stub);
     let recipient = {
         let state = fx.state.clone();
         thread::spawn(move || {
-            scoped(Asserted::Agent("peer".into()), || {
+            scoped(Asserted::Operator, || {
                 client::rpc(
                     &state,
                     "thread_read",
@@ -7294,6 +7852,8 @@ fn a_routed_cloud_result_resolving_after_admission_keeps_its_binding() {
             })
         })
     };
+    assert_projection_notice(&observed, "peer", None);
+    assert_proof_delta(&fx.stub, before, &[OPERATION], 1);
     let unrelated = {
         let state = fx.state.clone();
         thread::spawn(move || {
@@ -7306,7 +7866,11 @@ fn a_routed_cloud_result_resolving_after_admission_keeps_its_binding() {
             })
         })
     };
-    thread::sleep(Duration::from_millis(400));
+    let unrelated_admission = observed
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the unrelated read never reached its admission decision");
+    assert_eq!(unrelated_admission.0, "peer");
+    let before_late = proof_before(&fx.stub);
     // The new cloud result resolves AFTER both admissions: a new operation,
     // then its delivered completion — a derived row in neither snapshot.
     cloud_agent::send(
@@ -7362,16 +7926,21 @@ fn a_routed_cloud_result_resolving_after_admission_keeps_its_binding() {
         "the newly routed result never wrote its reply text"
     );
 
-    // The recipient's admitted read re-resolves and renders it under the
-    // delivery binding...
+    // The operator re-resolves the late derived row and proves the backing
+    // connection again; the fixture peer's delivery binding alone did not.
     let recipient_page = recipient
         .join()
         .unwrap()
-        .expect("the recipient's wait must not refuse");
+        .expect("the proven operator's admitted read must not refuse");
     assert!(
-        !recipient_page.to_string().contains(LATE),
-        "the recipient's wait served a routed copy without a live cloud grant: {recipient_page}"
+        recipient_page.to_string().contains(LATE),
+        "{recipient_page}"
     );
+    assert!(
+        recipient_page.to_string().contains(&routed_late.id),
+        "{recipient_page}"
+    );
+    assert_proof_delta(&fx.stub, before_late, &[OPERATION], 1);
     // ...and the unrelated agent's admitted read withholds it: not rendered
     // as ordinary mail, and not an error that would mask the decision.
     let unrelated_page = unrelated
@@ -7588,4 +8157,270 @@ fn the_board_thread_stream_advances_past_a_fully_filtered_page() {
         !stream.contains("peer stream request"),
         "the stream surfaced the other source's rows: {stream}"
     );
+}
+
+/// A routed copy's delivery UID decides WHO is eligible; each backing
+/// connection independently proves WHETHER. Denying B must never hide A or
+/// borrow A's proof for B. Both producers here are service fixtures only.
+#[test]
+fn routed_copies_require_their_own_backing_connection_read_scope_and_proof() {
+    use cadence_agent::cloud_agent::{self, Sender, Source};
+    use cadence_agent::remote_cli::RemoteTarget;
+    use cadence_agent::store::cloud_agent::{CloudSource, Owner};
+
+    const ORG_B: &str = "stub-org-b";
+    const ORG_ID_B: &str = "ws-stub-org-b";
+    const OP_B: &str = "operation-scope-00000002";
+    const REPLY_A: &str = "routed result from connection A";
+    const REPLY_B: &str = "routed result from connection B";
+
+    let fx = Fx::start();
+    let connect_a = fx.connect();
+    let second = Stub::start();
+    second.set(|script| {
+        script.agent_organization = Some(ORG_ID_B.into());
+        script.submit_state = "completed".into();
+        script.submit_text = Some("genuine stub reply".into());
+    });
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    write_login(
+        ORG_B,
+        ORG_ID_B,
+        &second.url,
+        &["cloud_agent.read", "cloud_agent.write"],
+        expires,
+    );
+    let connect_b = fx
+        .call(
+            Asserted::Operator,
+            "cloud_agent_connect",
+            json!({
+                "org": ORG_B, "org_id": ORG_ID_B, "endpoint": second.url,
+                "alias": ALIAS_B, "accept_assistant_consent": true,
+            }),
+        )
+        .unwrap();
+    let id_a = cloud_agent_id(&connect_a);
+    let id_b = cloud_agent_id(&connect_b);
+    assert_ne!(
+        id_a, id_b,
+        "the fixture must have distinct backing connections"
+    );
+    fx.stub.set(|script| {
+        script.submit_state = "completed".into();
+        script.submit_text = Some("genuine stub reply".into());
+    });
+    fx.call(
+        Asserted::Operator,
+        "agent_register",
+        json!({"alias": "peer", "provider": "fake", "endpoint_kind": "fake", "cwd": fx.cwd()}),
+    )
+    .unwrap();
+    fx.call(
+        Asserted::Operator,
+        "thread_send",
+        json!({"alias": "peer", "message": "m-scope-ordinary", "text": "ordinary scope control"}),
+    )
+    .unwrap();
+    let store = fx.store();
+    let peer = store.agent("peer").unwrap();
+    let source = Source::registered(
+        &peer,
+        Owner::new("https://issuer.example.test", "stub-subject"),
+    );
+    let mut routed_ids = Vec::new();
+    for (id, connect, operation, routed_operation, reply) in [
+        (&id_a, &connect_a, OPERATION, "peer-route-scope-a", REPLY_A),
+        (&id_b, &connect_b, OP_B, "peer-route-scope-b", REPLY_B),
+    ] {
+        let home = thread_of(connect);
+        fx.call(
+            Asserted::Operator,
+            "cloud_agent_send",
+            json!({
+                "cloud_agent_id": id, "thread_id": home, "operation_id": operation,
+                "text": format!("operator proof for {operation}"), "wake": true,
+            }),
+        )
+        .unwrap();
+        store
+            .cloud_agent_source_grant(&CloudSource {
+                cloud_agent_id: id.clone(),
+                kind: "local_peer".into(),
+                uid: peer.uid.clone(),
+                registration_epoch: source.epoch,
+                owner: source.owner.clone(),
+                label: "peer".into(),
+                scope: "cloud_agent.write".into(),
+                granted_by: "operator".into(),
+                granted_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64(),
+                invoker_id: None,
+                state: "active".into(),
+            })
+            .unwrap();
+        let cloud = store.cloud_agent(id).unwrap().unwrap();
+        let target = RemoteTarget {
+            org: cloud.org_slug.clone(),
+            org_id: cloud.organization_id.clone(),
+            endpoint: cloud.endpoint.clone(),
+            identity: None,
+        };
+        cloud_agent::send(
+            &store,
+            &SettledFixtureReply(reply),
+            &cloud,
+            &target,
+            &home,
+            &Sender::Agent("peer".into()),
+            &source,
+            routed_operation,
+            "scoped peer request",
+            true,
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+        let routed = store
+            .messages("peer")
+            .unwrap()
+            .into_iter()
+            .find(|row| {
+                row.source == "worker_result" && row.origin.as_deref() == Some(routed_operation)
+            })
+            .expect("the service producer must route its result");
+        if !matches!(routed.state.as_str(), "completed" | "failed") {
+            store
+                .finish(
+                    &routed,
+                    "completed",
+                    &json!({"status": "completed", "text": reply}),
+                    None,
+                )
+                .unwrap();
+        }
+        routed_ids.push(routed.id);
+    }
+    let projections = [
+        ("thread_read", json!({"alias": "peer"})),
+        ("agent_show", json!({"alias": "peer"})),
+        ("agent_events", json!({"alias": "peer", "after": 0})),
+    ];
+
+    // B is denied LOCALLY: A's proof succeeds, B sends no readback at all.
+    write_login(
+        ORG_B,
+        ORG_ID_B,
+        &second.url,
+        &["cloud_agent.write"],
+        expires,
+    );
+    for (method, params) in projections.clone() {
+        let (before_a, before_b) = (proof_before(&fx.stub), proof_before(&second));
+        let page = fx.call(Asserted::Operator, method, params).unwrap();
+        assert!(
+            page.to_string().contains(REPLY_A),
+            "{method} hid admitted A: {page}"
+        );
+        assert!(
+            !page.to_string().contains(REPLY_B),
+            "{method} disclosed denied B: {page}"
+        );
+        assert!(
+            page.to_string().contains("m-scope-ordinary"),
+            "{method} hid ordinary rows: {page}"
+        );
+        assert_eq!(
+            page["cloud_withheld"],
+            json!("cloud_agent_scope_revoked"),
+            "{page}"
+        );
+        assert_proof_delta(&fx.stub, before_a, &[OPERATION], 1);
+        assert_proof_delta(&second, before_b, &[], 0);
+    }
+
+    // B's saved scope is live, but B's own platform refuses it. A still shows.
+    write_login(
+        ORG_B,
+        ORG_ID_B,
+        &second.url,
+        &["cloud_agent.read", "cloud_agent.write"],
+        expires,
+    );
+    second.set(|script| script.read_status = 403);
+    for (method, params) in projections.clone() {
+        let (before_a, before_b) = (proof_before(&fx.stub), proof_before(&second));
+        let page = fx.call(Asserted::Operator, method, params).unwrap();
+        assert!(
+            page.to_string().contains(REPLY_A),
+            "{method} hid admitted A: {page}"
+        );
+        assert!(
+            !page.to_string().contains(REPLY_B),
+            "{method} borrowed A's proof: {page}"
+        );
+        assert!(!page.to_string().contains(&routed_ids[1]), "{page}");
+        assert_eq!(
+            page["cloud_withheld"],
+            json!("cloud_agent_scope_revoked"),
+            "{page}"
+        );
+        assert_proof_delta(&fx.stub, before_a, &[OPERATION], 1);
+        assert_proof_delta(&second, before_b, &[OP_B], 1);
+    }
+
+    second.set(|script| script.read_status = 0);
+    for (method, params) in projections {
+        let (before_a, before_b) = (proof_before(&fx.stub), proof_before(&second));
+        let page = fx.call(Asserted::Operator, method, params).unwrap();
+        for (reply, id) in [(REPLY_A, &routed_ids[0]), (REPLY_B, &routed_ids[1])] {
+            assert!(
+                page.to_string().contains(reply),
+                "{method} lost restored text: {page}"
+            );
+            assert!(
+                page.to_string().contains(id),
+                "{method} replaced the stored id: {page}"
+            );
+        }
+        assert!(page.get("cloud_withheld").is_none(), "{page}");
+        assert_proof_delta(&fx.stub, before_a, &[OPERATION], 1);
+        assert_proof_delta(&second, before_b, &[OP_B], 1);
+    }
+    for (stub, operation) in [(&fx.stub, OPERATION), (&second, OP_B)] {
+        let seen = stub.seen();
+        let submitted = seen
+            .iter()
+            .find(|body| {
+                body["action"] == "submit" && body["arguments"]["operation_id"] == operation
+            })
+            .expect("the caller's own submitted proof operation");
+        let conversation = &submitted["arguments"]["conversation_id"];
+        assert!(
+            conversation.as_str().is_some_and(|id| !id.is_empty()),
+            "{submitted}"
+        );
+        for read in seen.iter().filter(|body| body["action"] == "readback") {
+            assert_eq!(
+                &read["arguments"]["conversation_id"], conversation,
+                "wrong proof session: {read}"
+            );
+            assert_eq!(
+                read["arguments"]["operation_id"],
+                json!(operation),
+                "wrong proof source: {read}"
+            );
+        }
+        assert_eq!(
+            stub.calls("submit"),
+            1,
+            "reading routed copies resubmitted a turn"
+        );
+    }
 }

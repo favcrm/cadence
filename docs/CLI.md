@@ -319,10 +319,25 @@ from local work history. Refreshing the same owner's credential preserves
 context; another issuer/subject or agent registration cannot inherit it.
 
 Generic body reads, including direct message IDs and board previews, apply the
-same source/owner admission to canonical cloud history. Already-delivered local
-reports instead retain their immutable sender/recipient UID binding and proven
-operator access; they do not acquire an upstream read-scope requirement. An empty
-thread snapshot grants no authority over replies that arrive after admission.
+same source/owner admission to canonical cloud history. Routed local reports
+retain their immutable sender/recipient UID binding **and** require the current
+caller's read authority on each backing cloud connection. One connection's proof
+never authorizes another, and an empty snapshot grants no authority over replies
+that arrive after admission.
+
+Generic `thread_read`, `agent_show` and `agent_events` responses withhold cloud
+request/result content on expected cloud-scope denials, missing cloud authority
+or remote uncertainty, while preserving ordinary local history. An optional
+`cloud_withheld` reason code identifies incomplete history; it is absent on a
+clean read. Identity, isolation, provenance, execution-mode and local storage
+failures remain hard errors. Dedicated cloud read/send refusals are unchanged.
+
+Thread pages retain their raw scanned cursors even when every entry is hidden.
+The thread stream emits `event: cloud_withheld` with
+`{"cloud_withheld":"<reason>"}` or `{"cloud_withheld":null}` to clear it, including
+when no entries arrive. Home and Threads show **Cloud content unavailable**,
+evict cached cloud-marked rows without discarding ordinary history or pending
+messages, and reload cloud history after read authority is restored.
 
 `cloud-agent ls|show` inspect connections. `cloud-agent read <connection-id>
 <operation-id>` reconciles an existing receipt without a new submission.

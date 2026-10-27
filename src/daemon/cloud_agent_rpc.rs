@@ -60,6 +60,72 @@ enum Admission {
     Request,
 }
 
+/// Only cloud-scope refusals and remote uncertainty become incomplete
+/// history. Identity, isolation, execution and local storage errors propagate.
+fn projection_denial(error: Error) -> Result<String> {
+    match error.code() {
+        Some(
+            code @ ("cloud_agent_not_connected"
+            | "cloud_agent_consent_required"
+            | "cloud_agent_scope_revoked"
+            | "cloud_agent_unauthorized"
+            | "cloud_agent_unavailable"
+            | "cloud_agent_uncertain"
+            | "cloud_agent_receipt_conflict"
+            | "cloud_agent_reply_missing"
+            | "cloud_agent_authority_missing"),
+        ) => Ok(code.to_string()),
+        _ if matches!(error, Error::OutcomeUnknown(_)) => Ok("cloud_agent_uncertain".to_string()),
+        _ => Err(error),
+    }
+}
+
+/// Distinguish transport uncertainty from a local receipt-write failure that
+/// the dedicated read path may also wrap as `cloud_agent_uncertain`.
+struct ProjectionReadTransport {
+    remote_failed: std::cell::Cell<bool>,
+}
+
+impl CloudTransport for ProjectionReadTransport {
+    fn connect(
+        &self,
+        target: &RemoteTarget,
+        conversation_id: &str,
+    ) -> Result<cloud_agent::RemoteAgent> {
+        HostedCloudTransport.connect(target, conversation_id)
+    }
+
+    fn submit(
+        &self,
+        target: &RemoteTarget,
+        request: &cloud_agent::SubmitRequest<'_>,
+    ) -> Result<cloud_agent::RemoteOperation> {
+        HostedCloudTransport.submit(target, request)
+    }
+
+    fn read(
+        &self,
+        target: &RemoteTarget,
+        conversation_id: &str,
+        operation_id: &str,
+        source: &Source,
+    ) -> Result<cloud_agent::RemoteOperation> {
+        let answer = HostedCloudTransport.read(target, conversation_id, operation_id, source);
+        self.remote_failed.set(answer.is_err());
+        answer
+    }
+
+    fn cancel(
+        &self,
+        target: &RemoteTarget,
+        conversation_id: &str,
+        operation_id: &str,
+        source: &Source,
+    ) -> Result<()> {
+        HostedCloudTransport.cancel(target, conversation_id, operation_id, source)
+    }
+}
+
 /// What a single row may project under this admission.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Row {
@@ -108,13 +174,20 @@ struct CloudScope {
 /// in the state the admission covered. An ordinary local alias projects
 /// unchanged — except for cloud-DERIVED rows (a routed `worker_result` whose
 /// immutable origin reaches a cloud request/result): those are cloud content
-/// off the cloud alias too, and only a UID the delivery was bound to, or the
-/// operator, may read them.
+/// off the cloud alias too. Delivery-bound UIDs (or the operator) still need
+/// current read admission on each backing connection.
 pub(super) struct CloudProjection {
+    /// A denied cloud alias must not become an ordinary empty snapshot.
+    cloud_alias: bool,
+    /// Observed cloud ids, including denied ones. New ids require readmission;
+    /// already-denied ids do not trigger a second proof in the same call.
+    known: std::collections::BTreeSet<String>,
     scopes: Vec<CloudScope>,
     /// Cloud-derived rows on an ordinary alias by message id, with the
     /// delivered UID binding.
     derived: std::collections::HashMap<String, crate::store::cloud_agent::CloudDerivedRow>,
+    /// Current read admission, separate from immutable delivery provenance.
+    admitted_origins: std::collections::BTreeSet<String>,
     /// The ordinary mail of an ordinary alias, enumerated in the same
     /// snapshot. This is what makes that alias' own rows admitted explicitly
     /// rather than by absence from [`Self::derived`]. Empty when this
@@ -136,8 +209,11 @@ impl Default for CloudProjection {
     /// content that cannot be classified at all.
     fn default() -> Self {
         Self {
+            cloud_alias: true,
+            known: std::collections::BTreeSet::new(),
             scopes: Vec::new(),
             derived: std::collections::HashMap::new(),
+            admitted_origins: std::collections::BTreeSet::new(),
             ordinary: std::collections::BTreeSet::new(),
             viewer: None,
             operator: false,
@@ -148,10 +224,13 @@ impl Default for CloudProjection {
 
 impl CloudProjection {
     /// A cloud alias, admitted per operation for this caller's own source.
-    fn cloud(scopes: Vec<CloudScope>) -> Self {
+    fn cloud(scopes: Vec<CloudScope>, known: std::collections::BTreeSet<String>) -> Self {
         Self {
+            cloud_alias: true,
+            known,
             scopes,
             derived: std::collections::HashMap::new(),
+            admitted_origins: std::collections::BTreeSet::new(),
             ordinary: std::collections::BTreeSet::new(),
             viewer: None,
             operator: false,
@@ -170,11 +249,14 @@ impl CloudProjection {
         operator: bool,
     ) -> Self {
         Self {
+            cloud_alias: false,
+            known: std::collections::BTreeSet::new(),
             scopes: Vec::new(),
             derived: rows
                 .into_iter()
                 .map(|row| (row.message_id.clone(), row))
                 .collect(),
+            admitted_origins: std::collections::BTreeSet::new(),
             ordinary: ordinary.into_iter().collect(),
             viewer,
             operator,
@@ -187,24 +269,10 @@ impl CloudProjection {
     /// attribution witness: the cloud request/reply carries no caller-supplied
     /// owner, and the canonical message id IS the operation id. `None` means
     /// the row is not the caller's own admitted operation.
-    fn admission(
-        &self,
-        store: &crate::store::Store,
-        message_id: &str,
-    ) -> Result<Option<Admission>> {
-        for scope in &self.scopes {
-            if let Some(operation) =
-                store.cloud_agent_operation(&scope.cloud_agent_id, message_id)?
-            {
-                // The operation resolves on this connection: it belongs to
-                // this source or to no one the caller may read.
-                if !scope.source.matches(&operation) {
-                    return Ok(None);
-                }
-                return Ok(scope.admitted.get(message_id).copied());
-            }
-        }
-        Ok(None)
+    fn admission(&self, message_id: &str) -> Option<Admission> {
+        self.scopes
+            .iter()
+            .find_map(|scope| scope.admitted.get(message_id).copied())
     }
 
     /// Whether the delivery binding of a derived row reaches this caller.
@@ -231,27 +299,32 @@ impl CloudProjection {
     /// absent from the derived map may be a routed cloud result that resolved
     /// after admission, and rendering it would hand another source's reply to
     /// whoever asks.
-    fn row(&self, store: &crate::store::Store, message_id: &str) -> Result<Row> {
-        if !self.scopes.is_empty() {
-            return Ok(match self.admission(store, message_id)? {
+    fn row(&self, message_id: &str) -> Row {
+        if self.cloud_alias {
+            return match self.admission(message_id) {
                 Some(Admission::Settled) => Row::Full,
                 Some(Admission::Request) => Row::Request,
                 None => Row::Never,
-            });
+            };
         }
         if let Some(row) = self.derived.get(message_id) {
-            return Ok(if self.bound(row) {
+            return if self.bound(row)
+                && row
+                    .cloud_agent_id
+                    .as_ref()
+                    .is_some_and(|id| self.admitted_origins.contains(id))
+            {
                 Row::Full
             } else {
                 Row::Never
-            });
+            };
         }
         // An ordinary alias: only the mail this snapshot enumerated.
-        Ok(if self.ordinary.contains(message_id) {
+        if self.ordinary.contains(message_id) {
             Row::Full
         } else {
             Row::Never
-        })
+        }
     }
 
     /// Whether this observation names anything the admission snapshot does
@@ -271,17 +344,18 @@ impl CloudProjection {
         store: &crate::store::Store,
         ids: impl IntoIterator<Item = &'a str>,
     ) -> Result<bool> {
-        // No shortcut, not even for an alias that is empty right now: an
-        // empty snapshot is a fact about this instant, and the row that
-        // arrives next would otherwise be rendered by a projection that never
-        // enumerated it. Admission is unconditional; the cost is one lookup
-        // per row on an alias with no cloud content at all.
+        // Empty snapshots never become allow-all. Known denials remain
+        // denials for this invocation; only newly observed ids or a
+        // request-only operation that has since settled require readmission.
         for id in ids {
-            if self.scopes.is_empty() {
+            if !self.cloud_alias {
                 if !self.ordinary.contains(id) && !self.derived.contains_key(id) {
                     return Ok(true);
                 }
                 continue;
+            }
+            if !self.known.contains(id) {
+                return Ok(true);
             }
             for scope in &self.scopes {
                 let Some(operation) = store.cloud_agent_operation(&scope.cloud_agent_id, id)?
@@ -294,7 +368,7 @@ impl CloudProjection {
                 let covered = match scope.admitted.get(id) {
                     Some(Admission::Settled) => true,
                     Some(Admission::Request) => !operation.settled(),
-                    None => false,
+                    None => true,
                 };
                 if !covered {
                     return Ok(true);
@@ -306,17 +380,17 @@ impl CloudProjection {
 
     pub(super) fn entries(
         &self,
-        store: &crate::store::Store,
+        _store: &crate::store::Store,
         entries: Vec<crate::store::ThreadEntry>,
     ) -> Result<Vec<crate::store::ThreadEntry>> {
         let mut kept = Vec::with_capacity(entries.len());
         for entry in entries {
             let row = match entry.message_id.as_deref() {
-                Some(id) => self.row(store, id)?,
+                Some(id) => self.row(id),
                 // A cloud thread carries no unattributable entry: an entry
                 // with no canonical message cannot be shown to be the
                 // caller's own. An ordinary alias keeps its own.
-                None if self.scopes.is_empty() => Row::Full,
+                None if !self.cloud_alias => Row::Full,
                 None => Row::Never,
             };
             let keep = match row {
@@ -330,16 +404,24 @@ impl CloudProjection {
                 // and the reply on the same page. The board layer enforces the
                 // member rule; it cannot see the daemon's admission.
                 let mut entry = entry;
-                if !self.scopes.is_empty() {
-                    let mut payload = entry
-                        .payload
-                        .take()
-                        .and_then(|p| p.as_object().cloned())
-                        .unwrap_or_default();
-                    payload.insert(
-                        "cloud_agent".to_string(),
-                        Value::String(self.scopes[0].cloud_agent_id.clone()),
-                    );
+                let origin = entry.message_id.as_deref().and_then(|id| {
+                    if self.cloud_alias {
+                        self.scopes
+                            .iter()
+                            .find(|scope| scope.admitted.contains_key(id))
+                            .map(|scope| scope.cloud_agent_id.as_str())
+                    } else {
+                        self.derived
+                            .get(id)
+                            .and_then(|row| row.cloud_agent_id.as_deref())
+                    }
+                });
+                if let Some(origin) = origin {
+                    let mut payload = match entry.payload.take() {
+                        Some(Value::Object(payload)) => payload,
+                        _ => serde_json::Map::new(),
+                    };
+                    payload.insert("cloud_agent".to_string(), Value::String(origin.to_string()));
                     entry.payload = Some(Value::Object(payload));
                 }
                 kept.push(entry);
@@ -350,12 +432,12 @@ impl CloudProjection {
 
     pub(super) fn messages(
         &self,
-        store: &crate::store::Store,
+        _store: &crate::store::Store,
         messages: Vec<crate::store::Message>,
     ) -> Result<Vec<crate::store::Message>> {
         let mut kept = Vec::with_capacity(messages.len());
         for mut message in messages {
-            match self.row(store, &message.id)? {
+            match self.row(&message.id) {
                 Row::Full => kept.push(message),
                 Row::Request => {
                     // The request is the caller's own text; the settled
@@ -372,13 +454,13 @@ impl CloudProjection {
 
     pub(super) fn events(
         &self,
-        store: &crate::store::Store,
+        _store: &crate::store::Store,
         events: Vec<crate::store::Event>,
     ) -> Result<Vec<crate::store::Event>> {
         let mut kept = Vec::with_capacity(events.len());
         for event in events {
             let row = match event.payload.get("message").and_then(Value::as_str) {
-                Some(id) => self.row(store, id)?,
+                Some(id) => self.row(id),
                 // Alias-level metadata (the connection itself) carries no
                 // request or result text; the read authority above already
                 // admitted the caller to this connection.
@@ -536,13 +618,14 @@ impl Shared {
                 source.epoch,
                 scope,
             )
-            .map_err(|_| {
-                Error::gate_coded(
+            .map_err(|error| match error {
+                Error::Rejected(_) => Error::gate_coded(
                     "cloud_agent_peer_credential_required",
                     "this peer source has no enrolled cloud-purpose credential under this \
                      verified owner; the operator must run `cloud-agent enroll-peer` first \
                      — nothing was sent",
-                )
+                ),
+                other => other,
             }),
             _ => Err(Error::gate_coded(
                 "cloud_agent_source_refused",
@@ -567,12 +650,12 @@ impl Shared {
         verb: &str,
     ) -> Result<(Sender, Source)> {
         let caller = self.agent_caller(peer_pid, verb)?;
+        if matches!(&caller, crate::peer::AgentCaller::Agent(_)) {
+            self.cloud_peer_isolation(peer_pid)?;
+        }
         let sender = Sender::from_caller(&caller);
         let target = Self::cloud_agent_target(agent);
         let source = sender.source_for(&self.store, &target)?;
-        if source.kind == SOURCE_PEER {
-            self.cloud_peer_isolation(peer_pid)?;
-        }
         self.cloud_agent_source_active(agent, &source)?;
         Ok((sender, source))
     }
@@ -615,6 +698,25 @@ impl Shared {
         peer_pid: u32,
         verb: &str,
     ) -> Result<CloudProjection> {
+        let projection = self.cloud_projection_decision(alias, peer_pid, verb, None)?;
+        self.observe_cloud_projection(alias, &projection);
+        Ok(projection)
+    }
+
+    fn observe_cloud_projection(&self, _alias: &str, _projection: &CloudProjection) {
+        #[cfg(feature = "test-seam")]
+        if let Some(observer) = &self.cloud_projection_observer {
+            observer(_alias, _projection.withheld.as_deref());
+        }
+    }
+
+    fn cloud_projection_decision(
+        &self,
+        alias: &str,
+        peer_pid: u32,
+        verb: &str,
+        message_id: Option<&str>,
+    ) -> Result<CloudProjection> {
         let cloud_agents = self.store.cloud_agents_for_alias(alias)?;
         if cloud_agents.is_empty() {
             let cloud_target = self
@@ -622,25 +724,44 @@ impl Shared {
                 .agent_opt(alias)?
                 .is_some_and(|agent| agent.provider == crate::cloud_agent::PROVIDER);
             if cloud_target || self.store.alias_has_cloud_content(alias)? {
-                // Content with no authority to classify it: admit nothing and
-                // say why. The read still answers, so the page loads and the
-                // reader is told the cloud history is unavailable rather than
-                // shown it.
-                #[cfg(feature = "test-seam")]
-                if let Some(observer) = &self.cloud_projection_observer {
-                    observer(verb, Some("cloud_agent_authority_missing"));
+                // Missing cloud authority never supplies caller authority.
+                if matches!(
+                    self.agent_caller(peer_pid, verb)?,
+                    crate::peer::AgentCaller::Agent(_)
+                ) {
+                    self.cloud_peer_isolation(peer_pid)?;
                 }
+                let (derived, ordinary) = self.store.cloud_projection_rows(alias, message_id)?;
+                let known = derived
+                    .into_iter()
+                    .map(|row| row.message_id)
+                    .chain(ordinary)
+                    .collect();
                 return Ok(CloudProjection {
+                    known,
                     withheld: Some("cloud_agent_authority_missing".to_string()),
                     ..CloudProjection::default()
                 });
             }
-            return self.admit_derived_cloud_rows(alias, peer_pid);
+            return self.admit_derived_cloud_rows(alias, peer_pid, message_id);
         }
         let mut scopes = Vec::with_capacity(cloud_agents.len());
+        let mut known = std::collections::BTreeSet::new();
         let mut withheld: Option<String> = None;
         for agent in cloud_agents {
-            let (_, source) = self.cloud_agent_caller_source(&agent, peer_pid, verb)?;
+            let operations = self.store.cloud_agent_operations(&agent.id, None)?;
+            known.extend(
+                operations
+                    .iter()
+                    .map(|operation| operation.operation_id.clone()),
+            );
+            let source = match self.cloud_agent_caller_source(&agent, peer_pid, verb) {
+                Ok((_, source)) => source,
+                Err(error) => {
+                    withheld = Some(projection_denial(error)?);
+                    continue;
+                }
+            };
             // FIRST the snapshot, before any authority proof: every operation
             // this caller's own source owned, in the state it had when this
             // read began. Freezing the set here is what makes a proof unable
@@ -650,7 +771,7 @@ impl Shared {
             // instead of projecting it (see
             // [`CloudProjection::needs_readmission`]).
             let mut admitted = std::collections::BTreeMap::new();
-            for operation in self.store.cloud_agent_operations(&agent.id, None)? {
+            for operation in &operations {
                 if !source.matches(&operation) {
                     continue;
                 }
@@ -659,7 +780,7 @@ impl Shared {
                 } else {
                     Admission::Request
                 };
-                admitted.insert(operation.operation_id, admission);
+                admitted.insert(operation.operation_id.clone(), admission);
             }
             // THEN the authority proofs. Current READ authority — connection
             // state, the active grant and the scope on the verified
@@ -667,9 +788,7 @@ impl Shared {
             // operator must not read stored replies through a generic
             // projection.
             if let Err(error) = self.cloud_agent_authority(&agent, &source, SCOPE_READ) {
-                // The verb still answers: authority covers this scope's cloud
-                // content, not the rest of the Thread.
-                withheld = Some(error.code().unwrap_or("cloud_agent_authority").to_string());
+                withheld = Some(projection_denial(error)?);
                 continue;
             }
             // The local copy proves what the workspace STORED, not what the
@@ -677,38 +796,18 @@ impl Shared {
             // saved login valid and unexpired. The platform's own answer is
             // required before any stored cloud text is projected — and its
             // state decides whether the stored receipt may be shown at all.
-            let answer = match self.cloud_read_authority(&agent, &source) {
+            let answer = match self.cloud_read_authority(&agent, &source, &operations) {
                 Ok(answer) => answer,
                 Err(error) => {
-                    // Refused, unreachable or contradictory: no stored cloud
-                    // text for this scope, and nothing presented as complete.
-                    withheld = Some(error.code().unwrap_or("cloud_agent_uncertain").to_string());
+                    withheld = Some(projection_denial(error)?);
                     continue;
                 }
             };
-            // Decided from the snapshot AND the answer together: the snapshot
-            // names the operations, the answer may only change the state of
-            // one it names. It never ADMITS an operation the snapshot did not
-            // name — that operation did not exist when the read began, so its
-            // content was never admitted for this read.
-            if let Some((operation_id, state)) = answer {
-                match state {
-                    // Only the platform's own terminal-completed answer
-                    // covers the stored receipt — and only for an operation
-                    // this read already admitted.
-                    PlatformState::Completed => {
-                        if let Some(admission) = admitted.get_mut(&operation_id) {
-                            *admission = Admission::Settled;
-                        }
-                    }
-                    // Nonterminal or failed: the platform does not report
-                    // this operation settled, so no stored reply text for it
-                    // is presented — an unsettled projection, not the cached
-                    // completed receipt.
-                    PlatformState::Unsettled => {
-                        admitted.remove(&operation_id);
-                    }
-                }
+            // The proof cannot widen the snapshot. Even a completed answer
+            // leaves a request-only admission request-only until readmission.
+            if let Some((operation_id, PlatformState::Unsettled)) = answer {
+                admitted.remove(&operation_id);
+                withheld = Some("cloud_agent_not_settled".to_string());
             }
             scopes.push(CloudScope {
                 cloud_agent_id: agent.id,
@@ -716,12 +815,8 @@ impl Shared {
                 admitted,
             });
         }
-        let mut projection = CloudProjection::cloud(scopes);
+        let mut projection = CloudProjection::cloud(scopes, known);
         projection.withheld = withheld;
-        #[cfg(feature = "test-seam")]
-        if let Some(observer) = &self.cloud_projection_observer {
-            observer(verb, projection.withheld.as_deref());
-        }
         Ok(projection)
     }
 
@@ -734,17 +829,15 @@ impl Shared {
         peer_pid: u32,
         alias: &str,
         message_id: &str,
-        sender_uid: Option<&str>,
-        recipient_uid: Option<&str>,
+        _sender_uid: Option<&str>,
+        _recipient_uid: Option<&str>,
     ) -> Result<bool> {
-        // Build the same admission the projection builds and ask the same
-        // predicate: one derivation of the caller, one rule. A row with no
-        // cloud provenance is not this policy's business.
-        let projection = self.admit_derived_cloud_rows(alias, peer_pid)?;
-        if !projection.derived.contains_key(message_id) {
-            return Ok(true);
-        }
-        Ok(projection.cloud_row_readable(sender_uid, recipient_uid))
+        // The stored snapshot supplies BOTH the binding and the authority;
+        // absence from the derived map is never an ordinary allow-all.
+        let projection =
+            self.cloud_projection_decision(alias, peer_pid, "cloud row read", Some(message_id))?;
+        self.observe_cloud_projection(alias, &projection);
+        Ok(!matches!(projection.row(message_id), Row::Never))
     }
 
     /// An ordinary alias can still carry cloud content: settling a turn routes
@@ -763,52 +856,58 @@ impl Shared {
     /// the whole alias, so [`CloudProjection::row`] has no default to fall
     /// back on — a row that resolved after this point is in neither half and
     /// is withheld until a read re-resolves.
-    fn admit_derived_cloud_rows(&self, alias: &str, peer_pid: u32) -> Result<CloudProjection> {
-        let rows = self.store.cloud_derived_messages(alias)?;
-        // An alias with no derived rows is NOT an alias that cannot grow one:
-        // the first routed delivery may resolve after this snapshot. So the
-        // absence of derived rows stays a fact about this snapshot and never
-        // becomes a promise about later observations — the ordinary ids are
-        // enumerated either way, and a row that resolves afterwards is in
-        // neither half, which is what makes `row` withhold it until a read
-        // re-resolves.
-        let ordinary = self.store.ordinary_message_ids(alias)?;
-        let (viewer, operator) = match self.connection_caller(peer_pid) {
-            Ok(caller_rule::Who::Operator) => (None, true),
-            Ok(caller_rule::Who::Agent(caller)) => {
-                (self.store.agent(&caller).ok().map(|agent| agent.uid), false)
+    fn admit_derived_cloud_rows(
+        &self,
+        alias: &str,
+        peer_pid: u32,
+        message_id: Option<&str>,
+    ) -> Result<CloudProjection> {
+        let (rows, ordinary) = self.store.cloud_projection_rows(alias, message_id)?;
+        if rows.is_empty() {
+            return Ok(CloudProjection::derived_rows(rows, ordinary, None, false));
+        }
+        let (viewer, operator) = match self.agent_caller(peer_pid, "cloud read")? {
+            crate::peer::AgentCaller::Operator => (None, true),
+            crate::peer::AgentCaller::Agent(caller) => {
+                (Some(self.store.agent(&caller)?.uid), false)
             }
-            // A connection that derives no identity reads none of the cloud
-            // rows; its ordinary mail still projects as before.
-            Ok(caller_rule::Who::Unproven(_)) | Err(_) => (None, false),
         };
+        // Delivery eligibility comes first: unrelated readers keep ordinary
+        // mail without attempting cloud access. Each eligible origin below
+        // still proves the peer's isolation before resolving its credential.
         let mut projection = CloudProjection::derived_rows(rows, ordinary, viewer, operator);
-        // Provenance binds WHO may read a routed copy. It does not decide
-        // whether the read is still allowed: an upstream read revocation
-        // leaves the delivery binding intact, so each cloud connection behind
-        // these rows must answer for the caller before any of them is served.
-        // One refused, unreachable or unproven connection withholds the routed
-        // rows; the alias' own mail still projects.
-        if !projection.derived.is_empty() {
-            for agent_id in self.store.cloud_derived_origin_agents(alias)? {
-                let Some(agent) = self.store.cloud_agent(&agent_id)? else {
-                    projection.derived.clear();
-                    projection.withheld = Some("cloud_agent_authority_missing".to_string());
-                    break;
-                };
-                let proven = match self.cloud_agent_caller_source(&agent, peer_pid, "cloud read") {
-                    Ok((_, source)) => {
-                        self.cloud_agent_authority(&agent, &source, SCOPE_READ)
-                            .is_ok()
-                            && self.cloud_read_authority(&agent, &source).is_ok()
-                    }
-                    Err(_) => false,
-                };
-                if !proven {
-                    projection.derived.clear();
-                    projection.withheld = Some("cloud_agent_scope_revoked".to_string());
-                    break;
+        let mut origins = std::collections::BTreeSet::new();
+        for row in projection.derived.values() {
+            if !projection.bound(row) {
+                projection.withheld = Some("cloud_agent_delivery_refused".to_string());
+            } else if let Some(id) = &row.cloud_agent_id {
+                origins.insert(id.clone());
+            } else {
+                projection.withheld = Some("cloud_agent_authority_missing".to_string());
+            }
+        }
+        // One proof per backing connection, never one proof reused for A/B.
+        // Failed origins keep their immutable rows and simply gain no
+        // admission; a denied B cannot erase A or become ordinary mail.
+        for agent_id in origins {
+            let Some(agent) = self.store.cloud_agent(&agent_id)? else {
+                projection.withheld = Some("cloud_agent_authority_missing".to_string());
+                continue;
+            };
+            let proof = (|| {
+                let (_, source) = self.cloud_agent_caller_source(&agent, peer_pid, "cloud read")?;
+                self.cloud_agent_authority(&agent, &source, SCOPE_READ)?;
+                let operations = self.store.cloud_agent_operations(&agent.id, None)?;
+                self.cloud_read_authority(&agent, &source, &operations)
+            })();
+            match proof {
+                Ok(Some((_, PlatformState::Unsettled))) => {
+                    projection.withheld = Some("cloud_agent_not_settled".to_string());
                 }
+                Ok(_) => {
+                    projection.admitted_origins.insert(agent_id);
+                }
+                Err(error) => projection.withheld = Some(projection_denial(error)?),
             }
         }
         Ok(projection)
@@ -825,19 +924,17 @@ impl Shared {
     /// The answer is not turned into a second read path: [`cloud_agent::
     /// read_operation`] reconciles the durable receipt (a settled reply is
     /// never withdrawn), and this projection only decides what that receipt
-    /// may show. Nothing is probed when the caller owns no turn that crossed
-    /// the submission boundary — and, crucially, such a caller's later
-    /// settlement is not covered by this admission either, so the waiting
-    /// readers re-prove rather than serve it.
+    /// may show. With no submitted turn, model-free agent discovery proves
+    /// current read capability with this caller's OWN credential and owner
+    /// pin; it never creates a model operation or adopts a provider session.
     fn cloud_read_authority(
         &self,
         agent: &crate::store::CloudAgent,
         source: &Source,
+        operations: &[crate::store::cloud_agent::CloudOperation],
     ) -> Result<Option<(String, PlatformState)>> {
-        let Some(operation) = self
-            .store
-            .cloud_agent_operations(&agent.id, None)?
-            .into_iter()
+        let Some(operation) = operations
+            .iter()
             .filter(|operation| source.matches(operation))
             .filter(|operation| {
                 operation.remote_operation_id.is_some() || operation.claimed_at > 0.0
@@ -848,6 +945,7 @@ impl Shared {
                     .then_with(|| a.operation_id.cmp(&b.operation_id))
             })
         else {
+            self.cloud_discover_read_authority(agent, source)?;
             return Ok(None);
         };
         let target = Self::cloud_agent_target_for(agent, Some(source));
@@ -856,21 +954,215 @@ impl Shared {
         // authority again, refuses a terminal answer that contradicts the
         // settled receipt, and reports an unreachable platform as the coded
         // uncertainty a generic projection must not answer from cache.
+        let transport = ProjectionReadTransport {
+            remote_failed: std::cell::Cell::new(false),
+        };
         let answer = cloud_agent::read_operation(
             &self.store,
-            &HostedCloudTransport,
+            &transport,
             agent,
             &target,
             &operation.operation_id,
             source,
             authorize,
-        )?;
+        )
+        .map_err(|error| {
+            if !transport.remote_failed.get() && error.code() == Some("cloud_agent_uncertain") {
+                Error::internal(format!("cloud receipt reconciliation failed: {error}"))
+            } else {
+                error
+            }
+        })?;
         let state = if answer.status == crate::store::cloud_agent::STATUS_COMPLETED {
             PlatformState::Completed
         } else {
             PlatformState::Unsettled
         };
         Ok(Some((answer.operation_id, state)))
+    }
+
+    /// Model-free `agent` discovery when this source has no submitted turn.
+    /// Use the same canonical home key as connect, but never persist the
+    /// returned session/model metadata: this is a capability proof only.
+    fn cloud_discover_read_authority(
+        &self,
+        agent: &crate::store::CloudAgent,
+        source: &Source,
+    ) -> Result<()> {
+        let grant = self
+            .store
+            .cloud_agent_source(
+                &agent.id,
+                source.kind,
+                &source.uid,
+                source.epoch,
+                &source.owner,
+            )?
+            .ok_or_else(|| {
+                Error::gate_coded(
+                    "cloud_agent_authority_missing",
+                    "the discovery source has no immutable authority record",
+                )
+            })?;
+        let pinned_invoker = grant.invoker_id.as_deref().ok_or_else(|| {
+            Error::gate_coded(
+                "cloud_agent_authority_missing",
+                "the discovery source has no stable upstream owner pin",
+            )
+        })?;
+        let home = self.store.thread(&agent.alias)?.ok_or_else(|| {
+            Error::gate_coded(
+                "cloud_agent_authority_missing",
+                "the connection has no canonical home conversation",
+            )
+        })?;
+        let session = self.store.cloud_agent_session(
+            &agent.id,
+            source.kind,
+            &source.uid,
+            source.epoch,
+            &source.owner,
+            &home.id,
+        )?;
+        let conversation_id = match &session {
+            Some(session) => std::borrow::Cow::Borrowed(session.conversation_id.as_str()),
+            None => {
+                let home_key = format!("home|{}|{}", agent.organization_id, agent.alias);
+                let digest = crate::store::cloud_agent::CloudOperation::digest(
+                    self.store.instance_identity(),
+                    "cloud-conversation",
+                    &home_key,
+                    "",
+                    0,
+                    "",
+                );
+                std::borrow::Cow::Owned(format!("conv-{}", &digest[..40]))
+            }
+        };
+        let target = Self::cloud_agent_target_for(agent, Some(source));
+        let body = json!({
+            "version": cloud_agent::wire::CONTRACT_VERSION,
+            "action": "agent",
+            "arguments": {"conversation_id": conversation_id},
+        });
+        self.cloud_agent_authority(agent, source, SCOPE_READ)?;
+        let (status, answer) = match source.kind {
+            SOURCE_USER => crate::remote_cli::cloud_agent_post(
+                &target,
+                cloud_agent::wire::CONTRACT_PATH,
+                &body,
+                SCOPE_READ,
+            )?,
+            SOURCE_PEER => crate::remote_cli::cloud_agent_peer_post(
+                &target,
+                &source.owner,
+                &source.uid,
+                source.epoch,
+                cloud_agent::wire::CONTRACT_PATH,
+                &body,
+                SCOPE_READ,
+            )?,
+            _ => {
+                return Err(Error::gate_coded(
+                    "cloud_agent_source_refused",
+                    "unknown discovery source kind",
+                ))
+            }
+        };
+        match status {
+            200..=299 => {}
+            401 => {
+                return Err(Error::gate_coded(
+                    "cloud_agent_unauthorized",
+                    "cloud-agent discovery refused the current credential",
+                ))
+            }
+            403 => {
+                return Err(Error::gate_coded(
+                    "cloud_agent_scope_revoked",
+                    "cloud-agent discovery refused current read scope",
+                ))
+            }
+            503 => {
+                return Err(Error::unknown_coded(
+                    "cloud_agent_unavailable",
+                    "cloud-agent discovery is unavailable",
+                ))
+            }
+            500..=599 => {
+                return Err(Error::unknown_coded(
+                    "cloud_agent_uncertain",
+                    "cloud-agent discovery did not prove read authority",
+                ))
+            }
+            _ => {
+                return Err(Error::gate_coded(
+                    "cloud_agent_discovery_refused",
+                    "cloud-agent discovery refused its published contract",
+                ))
+            }
+        }
+        let answer = answer
+            .filter(|a| a["ok"].as_bool() == Some(true))
+            .ok_or_else(|| {
+                Error::unknown_coded(
+                    "cloud_agent_uncertain",
+                    "discovery returned no successful answer",
+                )
+            })?;
+        let remote = &answer["agent"];
+        if remote["agent_id"].as_str() != Some(agent.remote_agent_id.as_str())
+            || remote["organization_id"].as_str() != Some(agent.organization_id.as_str())
+            || remote["audience"].as_str() != Some(agent.endpoint.as_str())
+        {
+            return Err(Error::gate_coded(
+                "cloud_agent_wrong_tenant",
+                "discovery changed the immutable cloud target",
+            ));
+        }
+        let provenance = &remote["provenance"];
+        let peer = &provenance["peer"];
+        if provenance["kind"].as_str() != Some(source.kind)
+            || (source.kind == SOURCE_USER && !peer.is_null())
+            || (source.kind == SOURCE_PEER
+                && (peer["role"].as_str() != Some("cloud_agent")
+                    || peer["sender"]["uid"].as_str() != Some(source.uid.as_str())
+                    || peer["sender"]["registration_epoch"].as_i64() != Some(source.epoch)))
+        {
+            return Err(Error::gate_coded(
+                "cloud_agent_provenance_mismatch",
+                "discovery changed the immutable caller source",
+            ));
+        }
+        if provenance["invoker_id"].as_str() != Some(pinned_invoker) {
+            return Err(Error::gate_coded(
+                "cloud_agent_invoker_changed",
+                "discovery changed the source's stable upstream owner",
+            ));
+        }
+        let conversation = &answer["conversation"];
+        if conversation["conversation_id"].as_str() != Some(conversation_id.as_ref())
+            || session.as_ref().is_some_and(|s| {
+                conversation["remote_session_id"].as_str() != Some(s.remote_session_id.as_str())
+            })
+        {
+            return Err(Error::gate_coded(
+                "cloud_agent_session_mismatch",
+                "discovery changed the source's conversation binding",
+            ));
+        }
+        let capabilities = &answer["capabilities"];
+        if capabilities["conversation"].as_bool() != Some(true)
+            || ["tools", "mcp", "skills", "approvals", "cancellation"]
+                .iter()
+                .any(|name| capabilities[*name].as_bool() == Some(true))
+        {
+            return Err(Error::gate_coded(
+                "cloud_agent_capability_refused",
+                "discovery did not prove the admitted conversational capability",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn rpc_cloud_agent(

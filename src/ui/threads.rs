@@ -10,6 +10,8 @@
 //! - `GET  /api/threads/<alias>/stream[?after=<seq>]` — server-sent
 //!   events, one `entry` frame per entry with `id: <seq>`; a reconnect
 //!   resumes from `Last-Event-ID` (preferred) or `after`.
+//!   `cloud_withheld` frames report unavailable cloud history independently
+//!   of entries; `{"cloud_withheld":null}` clears the notice.
 //! - `GET  /api/app-installations/<id>/conversations` — the master's
 //!   conversations for that installation (CAD-1098; operator-gated in
 //!   serve.rs): `{alias, install_id, general, conversations: [...]}`;
@@ -301,6 +303,14 @@ pub(super) fn stream(
     if !frame(&mut w, head.as_bytes()) {
         return;
     }
+    let cloud_notice = |w: &mut dyn Write, reason: Option<&str>| {
+        let data = json!({"cloud_withheld": reason});
+        frame(w, format!("event: cloud_withheld\ndata: {data}\n\n").as_bytes())
+    };
+    let mut cloud_withheld = first["cloud_withheld"].as_str().map(str::to_owned);
+    if cloud_withheld.is_some() && !cloud_notice(&mut w, cloud_withheld.as_deref()) {
+        return;
+    }
     if let Some(master) = master {
         let bytes = format!("event: master\ndata: {master}\n\n");
         if !frame(&mut w, bytes.as_bytes()) {
@@ -339,7 +349,17 @@ pub(super) fn stream(
                 if !operator {
                     super::member_view::member_view(&mut page);
                 }
-                let entries = page["entries"].as_array().cloned().unwrap_or_default();
+                let reason = page["cloud_withheld"].as_str();
+                if reason != cloud_withheld.as_deref() {
+                    if !cloud_notice(&mut w, reason) {
+                        return;
+                    }
+                    cloud_withheld = reason.map(str::to_owned);
+                }
+                let entries = page["entries"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
                 if entries.is_empty() && !frame(&mut w, b": ping\n\n") {
                     return;
                 }

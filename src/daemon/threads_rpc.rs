@@ -4,15 +4,6 @@ use super::*;
 use cadence_core::board_api::{ThreadEntryRow, ThreadPage};
 
 impl Shared {
-    /// Attach the cloud-withheld reason to a serialized page, so the board can say
-    /// the cloud history is unavailable instead of showing an empty one.
-    fn stamp_withheld(mut page: serde_json::Value, withheld: Option<String>) -> serde_json::Value {
-        if let Some(reason) = withheld {
-            page["cloud_withheld"] = serde_json::Value::String(reason);
-        }
-        page
-    }
-
     /// The entries as JSON. A message-linked entry whose stored message
     /// belongs to this alias and to the entry's own thread carries
     /// `payload.delivery` (`state`, `started`, `completed`); its other
@@ -122,7 +113,6 @@ impl Shared {
         // source, and only that source's rows — so a peer with no grant is
         // refused and an enrolled peer never sees another source's reply.
         let mut projection = self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
-        let mut cloud_withheld = projection.withheld.clone();
         // CAD-1098: `conversation` selects one thread of this alias by
         // id (validated; unknown answers an error and creates nothing).
         // Without it the read is the home thread, unchanged.
@@ -183,7 +173,6 @@ impl Shared {
                 raw.iter().filter_map(|entry| entry.message_id.as_deref()),
             )? {
                 projection = self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
-                cloud_withheld = projection.withheld.clone();
             }
             // The cursor is the last row this page SCANNED, never the last
             // row the projection kept. A projection filters another source's
@@ -205,20 +194,18 @@ impl Shared {
                 Some(thread) => self.store.thread_reply_seq(&thread.id)?,
                 None => 0,
             };
-            return Ok(Self::stamp_withheld(
-                serde_json::to_value(ThreadPage {
-                    alias: alias.clone(),
-                    thread: thread.as_ref().map(store::Thread::info),
-                    entries: self.entries_json(&alias, &entries)?,
-                    cursor,
-                    more_before: Some(more),
-                    scanned_before,
-                    more_after: None,
-                    reply_seq,
-                })
-                .expect("thread page serializes"),
-                cloud_withheld.take(),
-            ));
+            return Ok(serde_json::to_value(ThreadPage {
+                alias: alias.clone(),
+                thread: thread.as_ref().map(store::Thread::info),
+                entries: self.entries_json(&alias, &entries)?,
+                cursor,
+                more_before: Some(more),
+                scanned_before,
+                more_after: None,
+                cloud_withheld: projection.withheld,
+                reply_seq,
+            })
+            .expect("thread page serializes"));
         }
         let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
         let deadline = Instant::now() + Duration::from_secs(wait);
@@ -250,7 +237,6 @@ impl Shared {
                 )?
             {
                 projection = self.admit_cloud_projection(&alias, peer_pid, "thread read")?;
-                cloud_withheld = projection.withheld.clone();
                 readmitted = true;
             }
             // The cursor is the last row this page SCANNED, never the last
@@ -275,20 +261,18 @@ impl Shared {
                     Some(thread) => self.store.thread_reply_seq(&thread.id)?,
                     None => 0,
                 };
-                return Ok(Self::stamp_withheld(
-                    serde_json::to_value(ThreadPage {
-                        alias: alias.clone(),
-                        thread: thread.as_ref().map(store::Thread::info),
-                        entries: self.entries_json(&alias, &entries)?,
-                        cursor: scanned,
-                        more_before: None,
-                        scanned_before: None,
-                        more_after: Some(more_after),
-                        reply_seq,
-                    })
-                    .expect("thread page serializes"),
-                    cloud_withheld.take(),
-                ));
+                return Ok(serde_json::to_value(ThreadPage {
+                    alias: alias.clone(),
+                    thread: thread.as_ref().map(store::Thread::info),
+                    entries: self.entries_json(&alias, &entries)?,
+                    cursor: scanned,
+                    more_before: None,
+                    scanned_before: None,
+                    more_after: Some(more_after),
+                    cloud_withheld: projection.withheld,
+                    reply_seq,
+                })
+                .expect("thread page serializes"));
             }
             let step = deadline.min(Instant::now() + Duration::from_secs(1));
             self.changed.wait_until(step);

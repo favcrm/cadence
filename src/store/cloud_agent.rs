@@ -313,6 +313,9 @@ pub struct CloudDerivedRow {
     pub message_id: String,
     pub sender_uid: Option<String>,
     pub recipient_uid: Option<String>,
+    /// The backing operation's connection, never inferred from the delivered
+    /// alias. Missing authority does not remove the cloud classification.
+    pub cloud_agent_id: Option<String>,
 }
 
 /// One durable request ⇄ remote operation correlation.
@@ -1553,97 +1556,77 @@ impl Store {
         })
     }
 
-    /// The alias' rows whose IMMUTABLE origin provenance reaches a cloud
-    /// request/result — a routed `worker_result`/`worker_notice`, and anything
-    /// derived from that in turn. They are cloud content off the cloud alias
-    /// too, so a projection must bind them to the UIDs the delivery carried
-    /// instead of treating them as ordinary local mail.
+    /// Classify one alias' message/entry ids in ONE database snapshot. Follow
+    /// immutable origins only from the requested rows, stopping at cloud
+    /// requests. A missing operation/connection remains classified as cloud,
+    /// with no authority id; it must never become ordinary mail.
     ///
-    /// `messages.origin` is written by the daemon's outbox and never by a
-    /// request, so following it is not a caller-controlled claim. Rows with no
-    /// origin are ordinary.
-    /// The cloud connections whose operations are behind this alias' routed
-    /// rows. A projection needs them to prove current read authority before it
-    /// serves a routed copy: provenance binds WHO may read the row, not
-    /// whether the read is still allowed.
-    pub fn cloud_derived_origin_agents(&self, alias: &str) -> Result<Vec<String>> {
+    /// `message_id` bounds body/wait/preview checks to that row's ancestry,
+    /// rather than recursively querying the entire alias for every row.
+    /// Thread-only ids (artifact cards, hire proposals) remain explicit
+    /// ordinary members. Unknown ids are in neither returned set.
+    pub fn cloud_projection_rows(
+        &self,
+        alias: &str,
+        message_id: Option<&str>,
+    ) -> Result<(Vec<CloudDerivedRow>, Vec<String>)> {
+        enum ProjectionRow {
+            Cloud(CloudDerivedRow),
+            Ordinary(String),
+        }
         self.read_tx(|conn| {
-            Ok(conn.query_vec(
-                "WITH RECURSIVE cloud(id, agent_alias) AS ( \
-                   SELECT id, alias FROM messages WHERE source='cloud_agent' \
+            let rows = conn.query_vec(
+                "WITH RECURSIVE ids(id) AS ( \
+                   SELECT id FROM messages WHERE alias=?1 AND (?2 IS NULL OR id=?2) \
                    UNION \
-                   SELECT m.id, c.agent_alias FROM messages m JOIN cloud c ON m.origin=c.id \
-                 ) \
-                 SELECT DISTINCT ca.id \
-                   FROM messages d \
-                   JOIN cloud c ON c.id = d.origin \
-                   JOIN cloud_agents ca ON ca.alias = c.agent_alias \
-                  WHERE d.alias = ?1",
-                params![alias],
-                |row| row.get::<_, String>(0),
-            )?)
-        })
-    }
-
-    pub fn cloud_derived_messages(&self, alias: &str) -> Result<Vec<CloudDerivedRow>> {
-        self.read_tx(|conn| {
-            Ok(conn.query_vec(
-                "WITH RECURSIVE cloud(id) AS ( \
-                   SELECT id FROM messages \
-                    WHERE source='cloud_agent' \
-                       OR alias IN (SELECT alias FROM agents WHERE provider=?2) \
+                   SELECT e.message_id FROM thread_entries e \
+                     JOIN threads t ON t.id=e.thread_id \
+                    WHERE t.alias=?1 AND e.message_id IS NOT NULL \
+                      AND (?2 IS NULL OR e.message_id=?2) \
+                 ), origins(message_id, id, origin, is_cloud) AS ( \
+                   SELECT i.id, m.id, m.origin, m.source='cloud_agent' \
+                     FROM ids i JOIN messages m ON m.id=i.id \
                    UNION \
-                   SELECT m.id FROM messages m JOIN cloud c ON m.origin=c.id \
+                   SELECT c.message_id, m.id, m.origin, m.source='cloud_agent' \
+                     FROM origins c JOIN messages m ON m.id=c.origin \
+                    WHERE NOT c.is_cloud \
+                 ), cloud AS ( \
+                   SELECT c.message_id, \
+                          CASE WHEN COUNT(*)=1 THEN MIN(ca.id) END AS agent_id \
+                     FROM origins c JOIN messages m ON m.id=c.id \
+                     LEFT JOIN cloud_agent_operations o \
+                       ON o.operation_id=c.id AND o.message_id=c.id \
+                     LEFT JOIN cloud_agents ca \
+                       ON ca.id=o.cloud_agent_id AND ca.alias=m.alias \
+                    WHERE c.is_cloud GROUP BY c.message_id \
                  ) \
-                 SELECT id, sender_uid, recipient_uid FROM messages \
-                  WHERE alias=?1 AND id IN (SELECT id FROM cloud)",
-                params![alias, crate::cloud_agent::PROVIDER],
+                 SELECT i.id, m.sender_uid, m.recipient_uid, \
+                        c.message_id IS NOT NULL, c.agent_id \
+                   FROM ids i LEFT JOIN messages m ON m.id=i.id \
+                   LEFT JOIN cloud c ON c.message_id=i.id",
+                params![alias, message_id],
                 |row| {
-                    Ok(CloudDerivedRow {
-                        message_id: row.get(0)?,
-                        sender_uid: row.get(1)?,
-                        recipient_uid: row.get(2)?,
+                    Ok(if row.get::<_, bool>(3)? {
+                        ProjectionRow::Cloud(CloudDerivedRow {
+                            message_id: row.get(0)?,
+                            sender_uid: row.get(1)?,
+                            recipient_uid: row.get(2)?,
+                            cloud_agent_id: row.get(4)?,
+                        })
+                    } else {
+                        ProjectionRow::Ordinary(row.get(0)?)
                     })
                 },
-            )?)
-        })
-    }
-
-    /// The alias' message ids whose immutable provenance does NOT reach a
-    /// cloud request/result — the ordinary local mail of an ordinary alias.
-    ///
-    /// This is the complement of [`Self::cloud_derived_messages`] over the
-    /// same alias, so a projection can admit an ordinary alias' own mail
-    /// EXPLICITLY (an enumerated snapshot) instead of assuming that any row
-    /// the derived map does not name is ordinary. It is not: a routed cloud
-    /// result that resolves after the snapshot is absent from both, and
-    /// assuming it ordinary would hand another source's reply to whoever
-    /// asks. Only rows enumerated here render.
-    /// Every id this alias' own rows can carry, so a projection can admit
-    /// them explicitly instead of by absence. Messages are the obvious half;
-    /// thread entries are the other, because an entry's `message_id` need not
-    /// name a message row (artifact cards and hire proposals never do), and a
-    /// projection that enumerated only messages would withhold them.
-    pub fn ordinary_message_ids(&self, alias: &str) -> Result<Vec<String>> {
-        self.read_tx(|conn| {
-            Ok(conn.query_vec(
-                "WITH RECURSIVE cloud(id) AS ( \
-                   SELECT id FROM messages \
-                    WHERE source='cloud_agent' \
-                       OR alias IN (SELECT alias FROM agents WHERE provider=?2) \
-                   UNION \
-                   SELECT m.id FROM messages m JOIN cloud c ON m.origin=c.id \
-                 ) \
-                 SELECT id FROM messages \
-                  WHERE alias=?1 AND id NOT IN (SELECT id FROM cloud) \
-                 UNION \
-                 SELECT e.message_id FROM thread_entries e \
-                   JOIN threads t ON t.id = e.thread_id \
-                  WHERE t.alias = ?1 AND e.message_id IS NOT NULL \
-                    AND e.message_id NOT IN (SELECT id FROM cloud)",
-                params![alias, crate::cloud_agent::PROVIDER],
-                |row| row.get::<_, String>(0),
-            )?)
+            )?;
+            let mut derived = Vec::new();
+            let mut ordinary = Vec::new();
+            for row in rows {
+                match row {
+                    ProjectionRow::Cloud(row) => derived.push(row),
+                    ProjectionRow::Ordinary(id) => ordinary.push(id),
+                }
+            }
+            Ok((derived, ordinary))
         })
     }
 

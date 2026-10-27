@@ -738,6 +738,8 @@ export interface ThreadMessageReq {
  *   remain beyond it. */
 export interface ThreadPage {
   alias: string;
+  /** Cloud history is incomplete for this read; ordinary rows remain usable. */
+  cloud_withheld?: string | null;
   cursor: number;
   entries: ThreadEntryRow[];
   more_after?: boolean | null;

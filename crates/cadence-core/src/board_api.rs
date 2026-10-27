@@ -691,6 +691,9 @@ pub struct ThreadPage {
     pub scanned_before: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub more_after: Option<bool>,
+    /// Cloud history is incomplete for this read; ordinary rows remain usable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud_withheld: Option<String>,
     pub reply_seq: i64,
 }
 

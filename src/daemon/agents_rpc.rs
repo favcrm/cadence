@@ -602,11 +602,15 @@ impl Shared {
                 projection = self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
             }
             let cursor = events.last().map(|e| e.seq).unwrap_or(0);
-            return Ok(json!({
+            let mut page = json!({
                 "events": visible(&projection, events)?.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
                 "cursor": cursor,
                 "has_older": has_older,
-            }));
+            });
+            if let Some(reason) = projection.withheld {
+                page["cloud_withheld"] = json!(reason);
+            }
+            return Ok(page);
         }
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {
@@ -628,13 +632,21 @@ impl Shared {
                     projection = self.admit_cloud_projection(&alias, peer_pid, "agent events")?;
                 }
                 let cursor = events.last().map(|e| e.seq).unwrap_or(after);
-                return Ok(json!({
+                let mut page = json!({
                     "events": visible(&projection, events)?.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
                     "cursor": cursor,
-                }));
+                });
+                if let Some(reason) = projection.withheld {
+                    page["cloud_withheld"] = json!(reason);
+                }
+                return Ok(page);
             }
             if Instant::now() >= deadline {
-                return Ok(json!({"events": [], "cursor": after}));
+                let mut page = json!({"events": [], "cursor": after});
+                if let Some(reason) = projection.withheld {
+                    page["cloud_withheld"] = json!(reason);
+                }
+                return Ok(page);
             }
             let step = deadline.min(Instant::now() + Duration::from_secs(1));
             self.changed.wait_until(step);
