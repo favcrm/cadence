@@ -18,6 +18,7 @@ import {
 } from "./upload";
 import Button from "../../ui/Button";
 import { KindIcon, Note, WikiToolbar } from "./shared";
+import { HOSTED_UPLOAD_MAX_BYTES } from "./hosted";
 import { useTranslate } from "../../lib/locale";
 import { beginPrivateOperation, onPrivateReadsPaused, onPrivateSessionReset, type PrivateOperation } from "../../lib/privateSession";
 
@@ -44,6 +45,7 @@ export default function UploadPane({
   /** Hosted boards upload with one multipart POST; local boards use transfer jobs. */
   multipart?: boolean;
 }) {
+  const t = useTranslate();
   const [items, setItems] = useState<UploadItem[]>([]);
   const [drag, setDrag] = useState(0);
   const [held, setHeld] = useState(false);
@@ -85,6 +87,8 @@ export default function UploadPane({
     const fresh = queued(
       picked.map((f) => ({ name: f.name, size: f.size })),
       nextId.current,
+      multipart ? HOSTED_UPLOAD_MAX_BYTES : undefined,
+      multipart,
     );
     nextId.current += fresh.length;
     picked.forEach((file, i) => files.current.set(fresh[i].id, file));
@@ -181,15 +185,17 @@ export default function UploadPane({
         if (!currentAttempt()) return;
         const abandonedTransfer = operation.signal.aborted || heldRef.current;
         releaseTransport();
-        const detail = `${result.outcome} · extraction ${result.extraction} · index ${result.index}`;
+        const detail = result.detail
+          ? `${t(result.detail)}${result.error ? ` — ${result.error}` : ""}`
+          : `${result.outcome} · extraction ${result.extraction} · index ${result.index}`;
         setItems((current) => {
           const next = uploadDone(current, id).map((item) => item.id === id ? { ...item, detail } : item);
           itemsRef.current = next;
           return next;
         });
         if (abandonedTransfer) return;
-        const blocked = result.index !== "covered" || result.extraction === "failed" || result.extraction === "empty" || result.extraction === "unsupported" || result.extraction === "conflict";
-        if (blocked) onToast("warn", `${file.name} was saved; extraction ${result.extraction}; index ${result.index}${result.error ? `: ${result.error}` : ""}`);
+        const blocked = result.warn ?? (result.index !== "covered" || result.extraction === "failed" || result.extraction === "empty" || result.extraction === "unsupported" || result.extraction === "conflict");
+        if (blocked) onToast("warn", result.detail ? `${file.name}: ${detail}` : `${file.name} was saved; extraction ${result.extraction}; index ${result.index}${result.error ? `: ${result.error}` : ""}`);
         onUploaded();
       })
       .catch((error: unknown) => {
@@ -212,7 +218,6 @@ export default function UploadPane({
   const tally = counts(items);
   const active = items.some((item) => item.state === "queued" || item.state === "uploading");
   const browseHref = navHref({ screen: "wiki", mode: "browse", path: dir || null, query: null });
-  const t = useTranslate();
 
   return (
     <>
@@ -245,7 +250,7 @@ export default function UploadPane({
           <IconUpload />
           <div className="wk-etitle">{t("Drop files to upload")}</div>
           <div className="kicker">
-            {t("Up to")} {capLabel()} {t("per file")}
+            {t("Up to")} {capLabel(multipart ? HOSTED_UPLOAD_MAX_BYTES : undefined)} {t("per file")}
           </div>
           <label className="kicker">
             <input type="checkbox" checked={updateExisting} disabled={readOnly} onChange={(event) => setUpdateExisting(event.target.checked)} /> {t("Update changed files")}
@@ -302,7 +307,7 @@ export default function UploadPane({
                 ) : item.state === "error" ? (
                   <>
                     <IconWarning size={13} />
-                    {item.error ?? "rejected"}
+                    {item.error ? t(item.error) : "rejected"}
                   </>
                 ) : item.state === "uploading" ? (
                   <>

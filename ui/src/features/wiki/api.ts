@@ -31,6 +31,9 @@ export interface WikiEntry {
   /** Read-only for this caller — the row's lock badge. */
   locked?: boolean;
   read_only?: boolean;
+  /** Hosted blobs: the Worker's extraction state (pending, indexed, empty, failed, unsupported). */
+  status?: string;
+  status_reason?: string;
   /** A folder's child count, when the server counts them. */
   entries?: number;
   /** A view over existing agent files (profile/, memory/), not a page. */
@@ -50,6 +53,8 @@ export interface WikiListing {
   mtime?: string | null;
   size?: number;
   mime?: string | null;
+  status?: string;
+  status_reason?: string;
 }
 
 export interface WikiPage {
@@ -62,6 +67,8 @@ export interface WikiPage {
   size?: number;
   mime?: string | null;
   sha256?: string;
+  status?: string;
+  status_reason?: string;
   /** Set when this page was read with an explicit `at` selector. */
   historical?: boolean;
 }
@@ -144,6 +151,8 @@ export function blobPage(entry: WikiEntry): WikiPage {
     rev: entry.rev,
     edited_by: entry.edited_by,
     mtime: entry.mtime ?? null,
+    status: entry.status,
+    status_reason: entry.status_reason,
   };
 }
 

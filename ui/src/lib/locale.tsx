@@ -939,7 +939,7 @@ Object.assign(zhTW, {
   "Project files": "專案檔案", "Project readiness is unknown": "專案就緒狀態未知", "Project readiness is unknown.": "專案就緒狀態未知。", "Project unknown": "未知專案", "Proposes via the daemon's plan_propose — the plan waits in Needs you.": "透過 daemon 的 plan_propose 提出 — 計畫會等待於「需要你處理」。", "Provider and model defaults are in": "提供者與模型預設值位於",
   "Publication ID": "發布 ID", "Publication details": "發布詳細資料", "Published locally": "已在本機發布", "Published posts": "已發布的貼文", "Quick peek": "快速預覽", "Read-only": "唯讀",
   "Recent report reused": "已重用近期報告", "Refresh failed. Showing the last loaded posts from {time}.": "重新整理失敗。顯示 {time} 載入的最後一批貼文。", "Refresh failed. Showing the last loaded posts.": "重新整理失敗。顯示最後載入的貼文。", "Refresh outbox": "重新整理寄件匣", "Refresh post": "重新整理貼文", "Refreshing preview; showing saved details.": "正在重新整理預覽；顯示已儲存的詳細資料。",
-  "Register a repository so the master has a project to work on.": "註冊儲存庫，讓主代理程式有可處理的專案。", "Released posts saved to your local outbox.": "已發布的貼文會儲存於本機寄件匣。", "Rename": "重新命名", "Required checks passed": "必要檢查已通過", "Restore this version": "還原此版本", "Retry content": "重試內容",
+  "Register a repository so the master has a project to work on.": "註冊儲存庫，讓主代理程式有可處理的專案。", "Released posts saved to your local outbox.": "已發布的貼文會儲存於本機寄件匣。", "Rename": "重新命名", "Required checks passed": "必要檢查已通過", "Retry content": "重試內容",
   "Retry projects": "重試專案", "Run its command on the host to prepare and start the master.": "請在主機上執行其指令，以準備並啟動主代理程式。", "Run this command on the host with your project key and repository path:": "請在主機上以您的專案金鑰與儲存庫路徑執行此指令：", "Scoped tasks": "範圍內的任務", "Search pages and files…": "搜尋頁面與檔案…", "Search posts": "搜尋貼文",
   "Search project context": "搜尋專案脈絡", "Search the wiki": "搜尋知識庫", "Setup": "設定", "Setup checks inspect the machine running Cadence. Open the board at": "設定檢查會檢視執行 Cadence 的機器。請在該機器上開啟看板", "Setup checks unavailable": "設定檢查無法使用", "Setup sections": "設定區段",
   "Show achieved & cancelled": "顯示已達成與已取消", "Show completed": "顯示已完成", "Showing last known observations.": "顯示最後已知的觀察結果。", "Showing saved details; the preview may be out of date.": "顯示已儲存的詳細資料；預覽可能已過時。", "Showing the last known list.": "顯示最後已知的清單。", "Sign in to view these pages": "請登入以檢視這些頁面",
@@ -957,7 +957,7 @@ Object.assign(zhTW, {
   "reads as {id} ({source})": "目前讀取為 {id}（{source}）", "registered project": "個已註冊專案", "relative to Wiki": "相對於知識庫", "release to queue them": "放開以排入佇列", "rendered plan": "已渲染的計畫", "rendering…": "渲染中…",
   "sections ready": "個區段已就緒", "select a revision on the left to see what changed since.": "請在左側選擇一個版本，以查看之後的變更。", "show plan": "顯示計畫", "stage history": "階段歷史", "stage move note": "階段移動備註", "stalled": "停滯",
   "start with New page, or drop files to upload.": "請從新增頁面開始，或拖曳檔案以上傳。", "still open": "仍未完成", "then check again.": "然後重新檢查。", "this type has no inline preview — download it, or open it with the tool it belongs to.": "此類型沒有內嵌預覽 — 請下載，或以對應的工具開啟。", "ticket": "個工單", "tickets": "個工單",
-  "to store a workflow for": "用於儲存工作流程於", "uploaded by": "上傳者", "waiting in Needs you": "等待於「需要你處理」", "writes are disabled on this board — restore needs the operator.": "此看板已停用寫入 — 還原需要操作員。", "writes are disabled on this board — sign in as the operator to upload.": "此看板已停用寫入 — 請以操作員身分登入以上傳。", "writes are disabled — sign in as the operator": "已停用寫入 — 請以操作員身分登入",
+  "to store a workflow for": "用於儲存工作流程於", "uploaded by": "上傳者", "waiting in Needs you": "等待於「需要你處理」", "writes are disabled on this board — sign in as the operator to upload.": "此看板已停用寫入 — 請以操作員身分登入以上傳。", "writes are disabled — sign in as the operator": "已停用寫入 — 請以操作員身分登入",
   "your draft vs the server": "您的草稿與伺服器版本的比較", "(limit {limit})": "（上限 {limit}）", "{done}/{total} weight": "{done}/{total} 權重", "day": "天", "days": "天", "on track ·": "正常進行 ·",
   "at risk ·": "有風險 ·", "stalled ·": "停滯 ·", "health unknown": "健康狀態未知", "completed": "已完成", "This board's server does not list stage moves.": "此看板的伺服器未列出階段移動。", "The board is read-only.": "此看板為唯讀。",
   "Stage moves on the board are the operator's. Agents move a stage with `cadence issue epic stage`.": "看板上的階段移動由操作員負責。代理程式請以 `cadence issue epic stage` 移動階段。", "tasks complete": "項任務已完成", "No delivery scope yet": "尚無交付範圍", "loading the page…": "正在載入頁面…", "could not open the page": "無法開啟頁面", "working…": "處理中…",
@@ -1579,4 +1579,14 @@ Object.assign(zhTW, {
   "Tester": "測試",
   "Robot": "機器人",
   "Custom": "自訂",
+});
+
+Object.assign(zhTW, {
+  "a team member": "團隊成員",
+  "extracting text — searchable once it finishes": "正在擷取文字 — 完成後即可搜尋",
+  "indexed — searchable": "已建立索引 — 可搜尋",
+  "saved, but no text was found in it": "已儲存，但在其中找不到文字",
+  "saved, but text extraction failed": "已儲存，但文字擷取失敗",
+  "saved, but this file type is not searchable": "已儲存，但此檔案類型無法搜尋",
+  "empty file — rejected": "空檔案 — 已拒絕",
 });

@@ -16,6 +16,7 @@ interface ContextProps {
   noWiki?: boolean;
   /** Upload through POST /api/wiki/upload (hosted) instead of transfer jobs. */
   multipartUpload?: boolean;
+  viewerSub?: string | null;
 }
 
 export default function Context({
@@ -26,6 +27,7 @@ export default function Context({
   navHref,
   noWiki = false,
   multipartUpload = false,
+  viewerSub,
 }: ContextProps) {
   const t = useTranslate();
   const href = useHref();
@@ -42,7 +44,7 @@ export default function Context({
   return (
     <main className="context-workspace" aria-label={`${project} context`}>
       {project === "all" ? <div className="p-5 text-secondary text-ink-400">{t("Choose a project to open its context.")}</div> : route ? (
-        <Wiki key={project} multipartUpload={multipartUpload} scope={scope} route={route} navHref={wikiHref} readOnly={readOnly} actor={actor} onToast={onToast} />
+        <Wiki key={project} multipartUpload={multipartUpload} viewerSub={viewerSub} scope={scope} route={route} navHref={wikiHref} readOnly={readOnly} actor={actor} onToast={onToast} />
       ) : <div className="p-5" role="alert">{t("This page is outside the project’s context.")} <Link className="lnk" href={`/projects/${encodeURIComponent(project)}/context`}>{t("Open project context")}</Link></div>}
     </main>
   );
