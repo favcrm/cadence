@@ -34,7 +34,7 @@ pub(super) struct Task {
     pub(super) id: String,
     adapter: Arc<dyn ProviderAdapter>,
     stream: Arc<Mutex<StreamState>>,
-    worker: thread::JoinHandle<Result<()>>,
+    worker: crate::thread_budget::Budgeted<Result<()>>,
 }
 impl Task {
     pub(super) fn start(

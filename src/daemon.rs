@@ -531,7 +531,7 @@ struct AgentCtl {
     /// force-close it even while initialization is still in flight.
     adapter: Mutex<Option<Arc<dyn ProviderAdapter>>>,
     wake: Notify,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    thread: Mutex<Option<crate::thread_budget::Budgeted<()>>>,
     /// Stall-watch state for the in-flight turn — updated by provider
     /// events, the turn-start hook and the watch's own sampling.
     stall: Mutex<StallWatch>,
@@ -5715,12 +5715,13 @@ fn spawn_watch<F>(what: &'static str, f: F)
 where
     F: FnOnce() + Send + 'static,
 {
-    if let Err(e) = crate::thread_budget::spawn(f) {
-        eprintln!("cadence: {what} not started: {e}");
+    match crate::thread_budget::spawn(f) {
+        Ok(thread) => thread.detach(),
+        Err(e) => eprintln!("cadence: {what} not started: {e}"),
     }
 }
 
-fn spawn_watch_joined<F>(what: &'static str, f: F) -> Option<std::thread::JoinHandle<()>>
+fn spawn_watch_joined<F>(what: &'static str, f: F) -> Option<crate::thread_budget::Budgeted<()>>
 where
     F: FnOnce() + Send + 'static,
 {
@@ -6093,6 +6094,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             serve_error = Some(Error::internal("injected serve loop fault"));
             break;
         }
+        // Release units of finished handlers only after their join proves
+        // the OS thread is gone, so a finishing handler can never overlap
+        // its replacement under Root's cap.
+        crate::thread_budget::reap_finished();
         let listeners: Vec<&UnixListener> = std::iter::once(&listener)
             .chain(shared_socket.as_ref().map(|socket| &socket.listener))
             .collect();
@@ -6105,8 +6110,9 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
                     // Budget the handler: an exhausted budget drops this socket
                     // and keeps serving, instead of pushing the protected
                     // runtime past Root's thread cap and getting it killed.
-                    if crate::thread_budget::spawn(move || handle_conn(shared, stream)).is_err() {
-                        accept_suppressed = accept_suppressed.saturating_add(1);
+                    match crate::thread_budget::spawn(move || handle_conn(shared, stream)) {
+                        Ok(thread) => thread.detach(),
+                        Err(_) => accept_suppressed = accept_suppressed.saturating_add(1),
                     }
                 }
                 // Both idle and an aborted queued connection are normal.

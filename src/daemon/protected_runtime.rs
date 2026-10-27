@@ -47,7 +47,7 @@ impl Drop for ServingLifetime {
 }
 pub(super) struct Maintenance {
     completed: mpsc::SyncSender<Quiesced>,
-    worker: thread::JoinHandle<Result<()>>,
+    worker: crate::thread_budget::Budgeted<Result<()>>,
 }
 impl Maintenance {
     pub(super) fn start(shared: &Arc<Shared>) -> Option<Self> {

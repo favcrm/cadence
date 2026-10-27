@@ -865,7 +865,7 @@ impl IndexRefresh {
 
     /// Spawn the refresh worker thread; the returned handle is joined at
     /// shutdown after `close`. Refusal is reported, never a panic.
-    pub fn spawn(self: &Arc<Self>) -> Option<thread::JoinHandle<()>> {
+    pub fn spawn(self: &Arc<Self>) -> Option<crate::thread_budget::Budgeted<()>> {
         let me = Arc::clone(self);
         match crate::thread_budget::spawn_named("wiki-index-refresh".to_string(), move || me.run())
         {

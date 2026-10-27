@@ -220,6 +220,7 @@ fn entry() -> Result<()> {
                 Err(_) => unsafe { libc::_exit(125) },
             }
         })
+        .map(|thread| thread.detach())
         .map_err(|_| refused())?;
     }
     let provider_env = crate::adapter::ProviderEnv::default();

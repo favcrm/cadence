@@ -279,13 +279,29 @@ impl StdioAdapter {
         *self.stdin.lock().unwrap() = Some(PipeInput::Protected(stdin));
         inner.remote = Some(Arc::new(control));
         drop(inner);
-        crate::thread_budget::spawn(move || {
+        if let Err(e) = crate::thread_budget::spawn(move || {
             let _ = std::io::copy(&mut stderr, &mut log);
         })
-        .map_err(|e| Error::internal(format!("protected stderr drain not started: {e}")))?;
+        .map(|thread| thread.detach())
+        .map_err(|e| Error::internal(format!("protected stderr drain not started: {e}")))
+        {
+            self.inner.lock().unwrap().remote = None;
+            *self.stdin.lock().unwrap() = None;
+            return Err(e);
+        }
         let adapter = Arc::clone(self);
-        crate::thread_budget::spawn(move || adapter.read_loop(stdout))
-            .map_err(|e| Error::internal(format!("protected reader not started: {e}")))?;
+        if let Err(e) = crate::thread_budget::spawn(move || adapter.read_loop(stdout))
+            .map(|thread| thread.detach())
+            .map_err(|e| Error::internal(format!("protected reader not started: {e}")))
+        {
+            // Drop the retained control/stdio before refusing: a protected
+            // transport must never survive without its reader.
+            let mut inner = self.inner.lock().unwrap();
+            inner.remote = None;
+            drop(inner);
+            *self.stdin.lock().unwrap() = None;
+            return Err(e);
+        }
         Ok(pid)
     }
 
@@ -304,8 +320,20 @@ impl StdioAdapter {
             self.inner.lock().unwrap().child = Some(child);
         }
         let adapter = Arc::clone(self);
-        crate::thread_budget::spawn(move || adapter.read_loop(stdout))
-            .map_err(|e| Error::internal(format!("provider reader not started: {e}")))?;
+        if let Err(e) = crate::thread_budget::spawn(move || adapter.read_loop(stdout))
+            .map(|thread| thread.detach())
+            .map_err(|e| Error::internal(format!("provider reader not started: {e}")))
+        {
+            // No reader means the child would be an unowned writer with no
+            // supervision: stop it and release the transport before refusing.
+            let child = self.inner.lock().unwrap().child.take();
+            if let Some(mut child) = child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            *self.stdin.lock().unwrap() = None;
+            return Err(e);
+        }
         Ok(pid)
     }
 
