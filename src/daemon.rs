@@ -1044,6 +1044,10 @@ impl Shared {
         // read-write and migrates. A direct `daemon run` whose identity
         // does not hold the lease refuses here and leaves the database
         // unchanged. `open_adopting` repeats the same check.
+        // CAD-1163: the persistent execution fence is read before the
+        // store opens. A malformed or unknown receipt refuses here, so a
+        // portable activation in manual mode can never be bypassed.
+        let execution_mode = crate::backup::portable_fence::load(state_dir)?;
         let (mut store, recovered) = if state_dir == Path::new("/srv/cadence/protected/store") {
             // This path only requests protected startup; it is NOT permission.
             // Authentic fixed-owner issuance selects mode/binding BEFORE SQL,
@@ -1056,10 +1060,6 @@ impl Shared {
             Store::open_owned(grant)?
         } else {
             crate::rollout::authorize_migration(&db_path)?;
-            // CAD-1163: the persistent execution fence is read before the
-            // store opens. A malformed or unknown receipt refuses here, so a
-            // portable activation in manual mode can never be bypassed.
-            let execution_mode = crate::backup::portable_fence::load(state_dir)?;
             // CAD-1163: a manual execution-disabled mode opens without the
             // restart sweep, so pending effects stay inert from the first start.
             if execution_mode.fenced() {
