@@ -9,7 +9,10 @@ use std::os::unix::ffi::OsStrExt;
 // (`cadence-agent-exec`), which compiles the graph module separately, reads it.
 #[allow(dead_code)]
 pub(crate) const IMAGE_ROOT: &str = "/opt/cadence/pi";
-#[cfg_attr(not(all(unix, target_os = "linux")), allow(dead_code))] // only pi_guest (linux) uses this
+#[cfg_attr(
+    not(all(unix, target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)] // only the protected linux x86_64 helper/pi_guest path reads these
 pub(crate) const NODE_PATH: &str = "/opt/cadence/pi/node";
 /// Constructor-selected independently pinned artifact; no second helper/SUID election.
 #[cfg_attr(
@@ -17,7 +20,10 @@ pub(crate) const NODE_PATH: &str = "/opt/cadence/pi/node";
     allow(dead_code)
 )] // only the protected helper/pi_guest path on linux x86_64 reads this
 pub(crate) const HELPER_PATH: &str = "/opt/protected/bin/cadence-agent-exec";
-#[cfg_attr(not(all(unix, target_os = "linux")), allow(dead_code))] // only pi_guest (linux) uses this
+#[cfg_attr(
+    not(all(unix, target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)] // only the protected linux x86_64 helper/pi_guest path reads this
 pub(crate) const NODE_DIGEST: Option<[u8; 32]> = None;
 #[cfg_attr(
     not(all(unix, target_os = "linux", target_arch = "x86_64")),
@@ -107,6 +113,10 @@ impl Profile {
         Ok(selection)
     }
 }
+#[cfg_attr(
+    not(all(unix, target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)] // the token split is consumed only by the protected linux x86_64 launch path
 impl Routing {
     pub(crate) fn parse(args: &[OsString]) -> Result<Self, String> {
         if !(2..=5).contains(&args.len()) || args[0] != "--mode" || args[1] != "rpc" {
