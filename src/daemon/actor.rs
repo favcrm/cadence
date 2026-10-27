@@ -212,10 +212,20 @@ impl Shared {
         // Release the alias only after cleanup and the final state write:
         // until this removal, lifecycle callers still see the agent owned.
         let mut lc = self.lifecycle.lock().unwrap();
-        if lc.agents.get(alias).is_some_and(|c| Arc::ptr_eq(c, &ctl)) {
+        let removed = if lc.agents.get(alias).is_some_and(|c| Arc::ptr_eq(c, &ctl)) {
             lc.agents.remove(alias);
-        }
+            true
+        } else {
+            false
+        };
         drop(lc);
+        if removed {
+            // The actor cannot join itself. Hand its budget unit to the reaper,
+            // which joins after this thread exits and only then releases it.
+            if let Some(thread) = ctl.thread.lock().unwrap().take() {
+                thread.detach();
+            }
+        }
         self.wake();
     }
 

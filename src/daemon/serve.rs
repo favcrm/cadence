@@ -1092,12 +1092,13 @@ pub(super) fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
                     };
                     let shared = Arc::clone(shared);
                     let message_id = message.id.clone();
-                    if let Err(e) = crate::thread_budget::spawn(move || {
+                    match crate::thread_budget::spawn(move || {
                         if let Err(error) = shared.run_cloud_dispatch(&task_id, &message_id) {
                             eprintln!("cloud sandbox recovery {task_id} failed: {error}");
                         }
                     }) {
-                        eprintln!("cadence: cloud dispatch recovery not started: {e}");
+                        Ok(thread) => thread.detach(),
+                        Err(e) => eprintln!("cadence: cloud dispatch recovery not started: {e}"),
                     }
                 }
             }
